@@ -39,6 +39,480 @@ fn install_without_package_json_fails() {
     );
 }
 
+// ─── Auto-create + parent-dir walk for `lpm i <pkg>` ─────────────
+//
+// Match npm/pnpm/yarn/bun DX. `lpm i <pkg>` in a directory with no
+// `package.json` and no ancestor `package.json` must create a minimal
+// `{ "dependencies": {} }` manifest in cwd and install into it — not
+// crash with a raw `IO error: No such file or directory`. And both
+// bare `lpm install` and `lpm i <pkg>` must walk up to find a parent
+// `package.json` instead of demanding the user be in the project
+// root directory.
+
+#[tokio::test]
+async fn install_add_in_empty_dir_auto_creates_package_json() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    // Empty project: no package.json on disk.
+    let project = TempProject::empty(r#"{"name":"placeholder","version":"0.0.0"}"#);
+    std::fs::remove_file(project.path().join("package.json")).unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "ms",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install in empty dir should auto-create package.json and succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    assert!(
+        project.file_exists("package.json"),
+        "lpm i <pkg> in an empty dir must auto-create package.json"
+    );
+    let pkg: serde_json::Value = serde_json::from_str(&project.read_file("package.json"))
+        .expect("auto-created package.json must be valid JSON");
+    assert!(
+        pkg.get("dependencies").and_then(|d| d.get("ms")).is_some(),
+        "auto-created package.json must record the installed package under dependencies: {pkg}"
+    );
+
+    assertions::assert_in_node_modules(project.path(), "ms");
+}
+
+#[tokio::test]
+async fn install_add_walks_up_to_parent_package_json() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "parent-walk",
+            "version": "1.0.0",
+            "dependencies": {}
+        }"#,
+    );
+    let child_dir = project.path().join("sample-child");
+    std::fs::create_dir_all(&child_dir).unwrap();
+
+    // Invoke `lpm i ms` from the child subdir (no package.json there).
+    let bin = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let mut cmd = assert_cmd::Command::new(bin);
+    cmd.current_dir(&child_dir);
+    // Mirror lpm_with_registry's env isolation + mock-registry pointer.
+    cmd.env("HOME", project.home());
+    cmd.env("LPM_HOME", project.home().join(".lpm"));
+    cmd.env("LPM_NO_UPDATE_CHECK", "1");
+    cmd.env("NO_COLOR", "1");
+    cmd.env_remove("LPM_TOKEN");
+    cmd.args([
+        "--registry",
+        &mock.url(),
+        "--insecure",
+        "install",
+        "ms",
+        "--no-security-summary",
+        "--no-skills",
+        "--no-editor-setup",
+    ]);
+    let output = cmd.output().expect("failed to run lpm install");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "lpm i <pkg> from child subdir must walk up to parent package.json:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Manifest update + node_modules MUST land in the parent, not the child.
+    let parent_pkg: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert!(
+        parent_pkg
+            .get("dependencies")
+            .and_then(|d| d.get("ms"))
+            .is_some(),
+        "parent package.json must record the new dependency: {parent_pkg}"
+    );
+    assert!(
+        !child_dir.join("package.json").exists(),
+        "child subdir must NOT have a stray package.json created — should use the parent's"
+    );
+    assert!(
+        !child_dir.join("node_modules").exists(),
+        "child subdir must NOT have node_modules — install targets the parent project root"
+    );
+    assertions::assert_in_node_modules(project.path(), "ms");
+}
+
+#[tokio::test]
+async fn install_bare_walks_up_to_parent_package_json() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "bare-parent-walk",
+            "version": "1.0.0",
+            "dependencies": { "ms": "^2.1.3" }
+        }"#,
+    );
+    let child_dir = project.path().join("nested").join("deeper");
+    std::fs::create_dir_all(&child_dir).unwrap();
+
+    let bin = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let mut cmd = assert_cmd::Command::new(bin);
+    cmd.current_dir(&child_dir);
+    cmd.env("HOME", project.home());
+    cmd.env("LPM_HOME", project.home().join(".lpm"));
+    cmd.env("LPM_NO_UPDATE_CHECK", "1");
+    cmd.env("NO_COLOR", "1");
+    cmd.env_remove("LPM_TOKEN");
+    cmd.args([
+        "--registry",
+        &mock.url(),
+        "--insecure",
+        "install",
+        "--no-security-summary",
+        "--no-skills",
+        "--no-editor-setup",
+    ]);
+    let output = cmd.output().expect("failed to run lpm install");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "bare `lpm install` from nested subdir must walk up to parent package.json:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assertions::assert_in_node_modules(project.path(), "ms");
+    assert!(
+        !child_dir.join("node_modules").exists(),
+        "nested subdir must NOT have its own node_modules — install targets the parent project root"
+    );
+}
+
+// ─── audit-after-install ──────────────────────────────────────────
+//
+// Default OFF; opt in per-invocation via `--audit-after-install`, or
+// globally via `LPM_AUDIT_AFTER_INSTALL=1` env / `auditAfterInstall =
+// true` in `~/.lpm/config.toml`. The per-invocation flag pair
+// (`--audit-after-install` / `--no-audit-after-install`) overrides
+// the env + config. Findings are informational — install ALWAYS
+// exits 0 if the install itself succeeded.
+
+#[tokio::test]
+async fn install_default_emits_no_audit_summary_line() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-off","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(output.status.success(), "install must succeed: {combined}");
+    assert!(
+        !combined.contains("Audited"),
+        "audit-after-install is default OFF — no `Audited` line should appear; got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn install_with_audit_after_install_flag_appends_summary_line() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--audit-after-install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install must succeed even when audit finds suspicious behavior:\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Audited") && stderr.contains("run `lpm audit`"),
+        "audit summary line missing; got stderr:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn install_no_audit_after_install_overrides_env() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-env-off","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_AUDIT_AFTER_INSTALL", "1")
+        .args([
+            "install",
+            "--no-audit-after-install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(output.status.success(), "install must succeed: {combined}");
+    assert!(
+        !combined.contains("Audited"),
+        "`--no-audit-after-install` must beat `LPM_AUDIT_AFTER_INSTALL=1`; got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn install_env_audit_after_install_appends_summary_line() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-env-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_AUDIT_AFTER_INSTALL", "1")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "install must succeed:\n{stderr}");
+    assert!(
+        stderr.contains("Audited"),
+        "LPM_AUDIT_AFTER_INSTALL=1 must enable the audit summary line; got stderr:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn install_audit_after_install_attaches_summary_to_json_envelope() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-json","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "install",
+            "--audit-after-install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(output.status.success(), "install must succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("install --json must emit a parseable envelope");
+    let summary = envelope
+        .get("audit_summary")
+        .expect("audit_summary field must appear on the install envelope when opted in");
+    // Shape contract — every field must be present and numeric.
+    for key in &[
+        "packages_audited",
+        "vulnerabilities",
+        "suspicious",
+        "elapsed_ms",
+    ] {
+        assert!(
+            summary.get(key).is_some_and(|v| v.is_number()),
+            "audit_summary.{key} must be a number; got envelope:\n{stdout}"
+        );
+    }
+    // Human stderr must NOT carry the `! Audited …` line in JSON mode.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("Audited"),
+        "human audit line must be suppressed under --json; got stderr:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn install_audit_after_install_enabled_via_config_file() {
+    // Locks the third precedence tier — `~/.lpm/config.toml >
+    // audit-after-install = true`. Without this test, the chain
+    // documented in `lpm install --help` and config-toml.mdx has an
+    // untested rung; only CLI flag + env are otherwise exercised.
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-cfg-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    // Seed `<home>/.lpm/config.toml` with `audit-after-install = true`.
+    // No CLI flag, no env var — only the config-file rung resolves to
+    // true. The audit line MUST still fire.
+    let cfg_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("config.toml"), "audit-after-install = true\n").unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "install must succeed:\n{stderr}");
+    assert!(
+        stderr.contains("Audited"),
+        "`audit-after-install = true` in config.toml must enable the audit summary line; \
+         got stderr:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn install_audit_after_install_failure_does_not_fail_install() {
+    // Locks the "audit findings are informational only" contract.
+    // When the audit pass errors mid-flight — network outage, store-
+    // lock contention, lockfile corruption, etc. — the install
+    // pipeline MUST still exit 0 and MUST NOT attach `audit_summary`
+    // to the JSON envelope. The wrapper at the audit call site in
+    // `run_with_options_under_store_lock` owns this contract; this
+    // test pins it.
+    //
+    // Failure injection uses `LPM_TEST_AUDIT_AFTER_INSTALL_FAIL=1` +
+    // `LPM_TEST_MODE=1` (the latter is implicit in debug builds via
+    // `cfg!(debug_assertions)`). The trigger is owned by
+    // `maybe_test_audit_after_install_should_fail` in install.rs.
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-fail","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TEST_MODE", "1")
+        .env("LPM_TEST_AUDIT_AFTER_INSTALL_FAIL", "1")
+        .args([
+            "--json",
+            "install",
+            "--audit-after-install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install MUST exit 0 even when audit-after-install errors — findings are \
+         informational only; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("install --json must emit a parseable envelope even when audit fails");
+    assert!(
+        envelope.get("audit_summary").is_none(),
+        "audit_summary MUST be absent from the envelope when the audit pass errored — \
+         partial / placeholder counts would mislead operators. Envelope:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("Audited"),
+        "human audit advisory line MUST NOT fire when the audit pass errored; \
+         got stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn install_audit_after_install_flags_are_mutually_exclusive() {
+    let project =
+        TempProject::empty(r#"{"name":"flag-conflict","version":"1.0.0","dependencies":{}}"#);
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--audit-after-install",
+            "--no-audit-after-install",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+    assert!(
+        !output.status.success(),
+        "clap must reject passing both flags simultaneously"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected clap conflict message; got stderr:\n{stderr}"
+    );
+}
+
 // ─── Empty Dependencies ──────────────────────────────────────────
 
 #[test]
@@ -912,8 +1386,9 @@ async fn install_lockfile_reuse_is_fast_path() {
         String::from_utf8_lossy(&output.stderr),
     );
 
+    let combined_lower = combined.to_lowercase();
     assert!(
-        combined.contains("up to date") || combined.contains("Using lockfile"),
+        combined_lower.contains("up to date") || combined_lower.contains("using lockfile"),
         "second install should hit fast path, got:\n{combined}"
     );
 }
@@ -3999,7 +4474,7 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
     assert!(cached.status.success());
     let cached_stderr = String::from_utf8_lossy(&cached.stderr);
     assert!(
-        cached_stderr.contains("up to date"),
+        cached_stderr.to_lowercase().contains("up to date"),
         "no-flag re-install must short-circuit when nothing changed; \
          got stderr:\n{cached_stderr}"
     );
@@ -4033,7 +4508,7 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
     );
     let flipped_stderr = String::from_utf8_lossy(&flipped.stderr);
     assert!(
-        !flipped_stderr.contains("up to date"),
+        !flipped_stderr.to_lowercase().contains("up to date"),
         "freshness cache MUST invalidate on `LPM_LINKER` flip — second \
          install short-circuited as `up to date` despite the layout \
          change. This is the bug GPT's audit caught: pre-fix, the install-\

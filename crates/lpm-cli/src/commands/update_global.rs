@@ -751,6 +751,8 @@ async fn do_install_upgrade(
         // inside `rebuild::run` still applies.
         false, // strict_sandbox
         false, // no_sandbox
+        false, // verbose: internal pipeline, no user-facing Done footer
+        false, // audit_after_install: internal pipeline never runs audit
     )
     .await
 }

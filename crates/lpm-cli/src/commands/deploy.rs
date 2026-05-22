@@ -760,6 +760,8 @@ pub async fn run(
         // inside `rebuild::run` honors that.
         false, // strict_sandbox
         false, // no_sandbox
+        false, // verbose: internal pipeline, no user-facing Done footer
+        false, // audit_after_install: internal pipeline never runs audit
     )
     .await?;
 

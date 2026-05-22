@@ -206,10 +206,6 @@ pub async fn run(
     cli_registry: Option<&str>,
     provenance_flag: bool,
 ) -> Result<(), LpmError> {
-    if !json_output {
-        output::print_header();
-    }
-
     // Step 1: Read package.json
     let pkg_json_path = project_dir.join("package.json");
     if !pkg_json_path.exists() {
