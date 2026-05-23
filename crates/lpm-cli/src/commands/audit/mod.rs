@@ -173,6 +173,8 @@ enum FailPolicy {
     Vuln,
     /// Exit non-zero only for critical/high behavioral flags.
     Behavior,
+    /// Exit non-zero only for hardcoded secret findings from `--secrets` mode.
+    Secrets,
     /// Exit non-zero for either (default).
     All,
 }
@@ -182,9 +184,10 @@ impl FailPolicy {
         match s.to_lowercase().as_str() {
             "vuln" | "vulnerability" | "vulnerabilities" => Ok(Self::Vuln),
             "behavior" | "behavioral" | "behaviour" => Ok(Self::Behavior),
+            "secret" | "secrets" => Ok(Self::Secrets),
             "all" => Ok(Self::All),
             _ => Err(LpmError::Registry(format!(
-                "invalid --fail-on value '{s}'. Expected: vuln, behavior, or all"
+                "invalid --fail-on value '{s}'. Expected: vuln, behavior, secrets, or all"
             ))),
         }
     }
@@ -377,6 +380,7 @@ pub async fn run(
     let should_fail = match fail_policy {
         FailPolicy::Vuln => has_vulns || has_registry_vulns,
         FailPolicy::Behavior => has_critical_behavior || has_high_behavior,
+        FailPolicy::Secrets => false,
         // Default (All): critical behaviors + vulns. High behaviors only
         // trigger failure when --fail-on is explicitly specified, to avoid
         // breaking existing CI pipelines that tolerate eval() usage.
@@ -1773,7 +1777,15 @@ fn cvss_score_to_label(score_str: &str) -> String {
 /// Scan installed packages for hardcoded secrets.
 ///
 /// Walks node_modules and scans each package for API keys, tokens, and private keys.
-pub async fn run_secrets(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
+pub async fn run_secrets(
+    project_dir: &Path,
+    json_output: bool,
+    fail_on: Option<&str>,
+) -> Result<(), LpmError> {
+    let fail_policy = match fail_on {
+        Some(value) => FailPolicy::parse(value)?,
+        None => FailPolicy::All,
+    };
     let node_modules = project_dir.join("node_modules");
     if !node_modules.exists() {
         return Err(LpmError::Script(
@@ -1851,6 +1863,9 @@ pub async fn run_secrets(project_dir: &Path, json_output: bool) -> Result<(), Lp
                 "findings": findings,
             })
         );
+        if should_fail_secrets(fail_policy, !packages_with_secrets.is_empty()) {
+            return Err(LpmError::ExitCode(1));
+        }
         return Ok(());
     }
 
@@ -1907,7 +1922,19 @@ pub async fn run_secrets(project_dir: &Path, json_output: bool) -> Result<(), Lp
     );
     println!();
 
+    if should_fail_secrets(fail_policy, true) {
+        return Err(LpmError::ExitCode(1));
+    }
+
     Ok(())
+}
+
+fn should_fail_secrets(fail_policy: FailPolicy, has_secrets: bool) -> bool {
+    if !has_secrets {
+        return false;
+    }
+
+    matches!(fail_policy, FailPolicy::Secrets | FailPolicy::All)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -2068,6 +2095,8 @@ mod tests {
             FailPolicy::parse("behaviour").unwrap(),
             FailPolicy::Behavior
         );
+        assert_eq!(FailPolicy::parse("secret").unwrap(), FailPolicy::Secrets);
+        assert_eq!(FailPolicy::parse("secrets").unwrap(), FailPolicy::Secrets);
         assert_eq!(FailPolicy::parse("all").unwrap(), FailPolicy::All);
         assert_eq!(FailPolicy::parse("VULN").unwrap(), FailPolicy::Vuln);
     }

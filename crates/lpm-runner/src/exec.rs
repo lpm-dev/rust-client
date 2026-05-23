@@ -131,18 +131,15 @@ fn detect_runtime(ext: &str, project_dir: &Path) -> Result<RuntimeInfo, LpmError
             flags: vec![],
         }),
         "ts" | "tsx" | "mts" | "cts" => {
-            // Check if managed Node supports native TypeScript
-            if let Some(node_version) = detect_managed_node_version(project_dir) {
+            if let Some(node_version) = detect_effective_node_version(project_dir) {
                 let (major, minor) = parse_major_minor(&node_version);
                 if major > 23 || (major == 23 && minor >= 6) {
-                    // Node 23.6+: native TypeScript support, no flags needed
                     return Ok(RuntimeInfo {
                         binary: "node".into(),
                         flags: vec![],
                     });
                 }
                 if (major == 22 && minor >= 6) || (major == 23 && minor < 6) {
-                    // Node 22.6-23.5: --experimental-strip-types
                     return Ok(RuntimeInfo {
                         binary: "node".into(),
                         flags: vec!["--experimental-strip-types".into()],
@@ -171,27 +168,34 @@ fn detect_runtime(ext: &str, project_dir: &Path) -> Result<RuntimeInfo, LpmError
     }
 }
 
-/// Detect the managed Node.js version for the project (if any).
-///
-/// Checks installed managed runtimes matching the project's version spec.
-/// Returns the version string (e.g., "22.22.2") or None if using system Node.
-fn detect_managed_node_version(project_dir: &Path) -> Option<String> {
-    let detected = lpm_runtime::detect::detect_node_version(project_dir)?;
-    let spec = &detected.spec;
+/// Detect the Node.js version that `lpm exec` will actually see on PATH.
+fn detect_effective_node_version(project_dir: &Path) -> Option<String> {
+    let path = bin_path::build_path_with_bins(project_dir);
+    let output = Command::new("node")
+        .arg("--version")
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
 
-    let clean_spec = spec
-        .trim_start_matches(">=")
-        .trim_start_matches("^")
-        .trim_start_matches("~")
-        .trim_start_matches('>');
+    if !output.status.success() {
+        return None;
+    }
 
-    let installed = lpm_runtime::node::list_installed().ok()?;
-    lpm_runtime::node::find_matching_installed(clean_spec, &installed)
+    let version = String::from_utf8(output.stdout).ok()?;
+    let trimmed = version.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Parse major.minor from a version string like "22.6.0" → (22, 6).
 fn parse_major_minor(version: &str) -> (u32, u32) {
-    let mut parts = version.split('.');
+    let mut parts = version.trim_start_matches('v').split('.');
     let major = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     (major, minor)
@@ -201,6 +205,35 @@ fn parse_major_minor(version: &str) -> (u32, u32) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = std::fs::metadata(path)
+            .expect("script must exist")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).expect("failed to mark script executable");
+    }
+
+    fn write_fake_node(project_dir: &std::path::Path, version: &str) {
+        let bin_dir = project_dir.join("node_modules/.bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            let node_path = bin_dir.join("node");
+            fs::write(&node_path, format!("#!/bin/sh\necho {version}\n")).unwrap();
+            make_executable(&node_path);
+        }
+
+        #[cfg(windows)]
+        {
+            let node_path = bin_dir.join("node.cmd");
+            fs::write(&node_path, format!("@echo off\r\necho {version}\r\n")).unwrap();
+        }
+    }
 
     #[test]
     fn exec_js_file() {
@@ -267,7 +300,8 @@ mod tests {
     #[test]
     fn detect_runtime_ts_fallback() {
         let dir = tempfile::tempdir().unwrap();
-        // No tsx in .bin, no managed node → should fall back to npx tsx
+        write_fake_node(dir.path(), "v20.5.0");
+
         let r = detect_runtime("ts", dir.path()).unwrap();
         assert_eq!(r.binary, "npx");
         assert_eq!(r.flags, vec!["tsx"]);
@@ -276,6 +310,8 @@ mod tests {
     #[test]
     fn detect_runtime_ts_with_local_tsx() {
         let dir = tempfile::tempdir().unwrap();
+        write_fake_node(dir.path(), "v20.5.0");
+
         let tsx_bin = dir.path().join("node_modules/.bin/tsx");
         fs::create_dir_all(tsx_bin.parent().unwrap()).unwrap();
         fs::write(&tsx_bin, "#!/bin/sh\necho tsx").unwrap();
@@ -283,6 +319,26 @@ mod tests {
         let r = detect_runtime("ts", dir.path()).unwrap();
         assert_eq!(r.binary, "tsx");
         assert!(r.flags.is_empty());
+    }
+
+    #[test]
+    fn detect_runtime_ts_uses_path_node_native_typescript_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_node(dir.path(), "v23.6.0");
+
+        let r = detect_runtime("ts", dir.path()).unwrap();
+        assert_eq!(r.binary, "node");
+        assert!(r.flags.is_empty());
+    }
+
+    #[test]
+    fn detect_runtime_ts_uses_path_node_strip_types_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_node(dir.path(), "v22.6.0");
+
+        let r = detect_runtime("ts", dir.path()).unwrap();
+        assert_eq!(r.binary, "node");
+        assert_eq!(r.flags, vec!["--experimental-strip-types"]);
     }
 
     #[test]
@@ -321,8 +377,8 @@ mod tests {
         assert_eq!(parse_major_minor(""), (0, 0));
         // Non-numeric
         assert_eq!(parse_major_minor("abc.def"), (0, 0));
-        // Leading v — "v22" fails to parse as u32, so major=0, but "6" parses fine
-        assert_eq!(parse_major_minor("v22.6.0"), (0, 6));
+        // Leading v — matches `node --version` output.
+        assert_eq!(parse_major_minor("v22.6.0"), (22, 6));
     }
 
     #[test]

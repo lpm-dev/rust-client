@@ -1247,18 +1247,28 @@ fn link_workspace_members(
         return Ok(0);
     }
 
-    let node_modules = project_dir.join("node_modules");
-    std::fs::create_dir_all(&node_modules).map_err(LpmError::Io)?;
+    let mut node_modules_roots = vec![project_dir.join("node_modules")];
+    if let Ok(Some(workspace)) = lpm_workspace::discover_workspace(project_dir)
+        && workspace.root != project_dir
+    {
+        node_modules_roots.push(workspace.root.join("node_modules"));
+    }
+
+    for node_modules in &node_modules_roots {
+        std::fs::create_dir_all(node_modules).map_err(LpmError::Io)?;
+    }
 
     let mut linked = 0usize;
     for member in members {
-        lpm_linker::link_workspace_member(&node_modules, &member.name, &member.source_dir)
-            .map_err(|e| {
-                LpmError::Workspace(format!(
-                    "failed to link workspace member {}: {e}",
-                    member.name
-                ))
-            })?;
+        for node_modules in &node_modules_roots {
+            lpm_linker::link_workspace_member(node_modules, &member.name, &member.source_dir)
+                .map_err(|e| {
+                    LpmError::Workspace(format!(
+                        "failed to link workspace member {}: {e}",
+                        member.name
+                    ))
+                })?;
+        }
         linked += 1;
     }
     Ok(linked)
@@ -1318,6 +1328,10 @@ struct InstallPackage {
     integrity: Option<String>,
     /// Tarball URL from resolution — avoids re-fetching metadata during download.
     tarball_url: Option<String>,
+    /// Whether current metadata was already consulted for tarball lookup.
+    /// Distinguishes a fresh-resolution `dist.tarball` miss from an older
+    /// lockfile entry that simply has no cached tarball URL yet.
+    metadata_checked_for_tarball: bool,
 }
 
 impl InstallPackage {
@@ -2111,6 +2125,7 @@ async fn pre_resolve_non_registry_deps(
             peers: Vec::new(),
             integrity: Some(computed_sri),
             tarball_url: Some(url),
+            metadata_checked_for_tarball: false,
         });
     }
 
@@ -2213,6 +2228,7 @@ async fn pre_resolve_non_registry_deps(
             // entries — same posture as 59.0's tarball-URL deps,
             // hardens in 59.x.
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         });
     }
 
@@ -2341,6 +2357,7 @@ async fn pre_resolve_non_registry_deps(
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         });
     }
 
@@ -2440,6 +2457,7 @@ async fn pre_resolve_non_registry_deps(
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         });
     }
 
@@ -3186,6 +3204,7 @@ fn recurse_local_source_deps(
                     peers: Vec::new(),
                     integrity: None,
                     tarball_url: None,
+                    metadata_checked_for_tarball: false,
                 });
                 // Recurse into THIS dep's source at depth + 1.
                 recurse_local_source_deps(
@@ -3749,6 +3768,8 @@ async fn run_with_options_under_store_lock(
         deps.entry(name.clone()).or_insert_with(|| range.clone());
     }
 
+    let declared_deps = deps.clone();
+
     // Resolve `catalog:` protocols and EXTRACT `workspace:*` member references
     // before anything else (lockfile fast path, resolver). This ensures the
     // `deps` HashMap contains only real registry ranges by the time the
@@ -3969,6 +3990,33 @@ async fn run_with_options_under_store_lock(
         output::warn(w);
     }
 
+    // Compute the actual set of registry hosts the resolver will hit
+    // for THIS project's top-level deps. Workspace-member file refs
+    // and other non-registry protocols contribute no origin — they
+    // don't route through a registry. Reused below as `eager_origins`
+    // for the per-origin TLS overrides; computing once here keeps the
+    // slim-UI resolving line and the TLS plumbing in lockstep.
+    //
+    // Showing `client.base_url()` (always `lpm.dev`) for every project
+    // would be a lie for any tree without `@lpm.dev/*` deps — the most
+    // common case. The route table knows the real destination per
+    // package; this line surfaces that truth.
+    let top_level_specs: Vec<String> = deps
+        .iter()
+        .filter_map(
+            |(local_name, range)| match lpm_resolver::Specifier::parse(range) {
+                Ok(lpm_resolver::Specifier::SemverRange(_)) => Some(local_name.clone()),
+                Ok(lpm_resolver::Specifier::NpmAlias { target, .. }) => Some(target),
+                _ => None,
+            },
+        )
+        .collect();
+    let eager_origins = route_table.effective_registry_origins(
+        &top_level_specs,
+        client.base_url(),
+        client.npm_registry_url(),
+    );
+
     // Persistent `› Resolving …` phase line. Sits ABOVE the resolver so
     // the user sees what hosts are about to be hit before any network
     // I/O. `is_add_invocation` distinguishes `lpm i <pkg>` (already named
@@ -3977,12 +4025,28 @@ async fn run_with_options_under_store_lock(
     // resolved).
     let is_add_invocation = direct_versions_out.is_some();
     if !json_output {
-        let host = install_ui::short_registry_host(client.base_url());
+        let hosts_label = if eager_origins.is_empty() {
+            // No top-level registry deps (workspace-only or empty
+            // install). Fall back to the configured worker host so the
+            // line isn't empty in the user's terminal.
+            install_ui::short_registry_host(client.base_url())
+        } else {
+            eager_origins
+                .iter()
+                .map(|o| {
+                    o.host_lower
+                        .strip_prefix("registry.")
+                        .unwrap_or(&o.host_lower)
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let line = if is_add_invocation {
-            format!("Resolving dependencies from {host}")
+            format!("Resolving dependencies from {hosts_label}")
         } else {
             format!(
-                "Resolving dependencies from {host} for {}",
+                "Resolving dependencies from {hosts_label} for {}",
                 install_ui::bold(pkg_name)
             )
         };
@@ -4152,37 +4216,12 @@ async fn run_with_options_under_store_lock(
     // directly, not `arc_client`) sees the configured client. The
     // `route_table` itself was built earlier (above the empty-deps
     // short-circuit) so its warnings always surface.
-    // — request-aware eager-build (Δ1). Filter `deps` to
-    // entries that ACTUALLY route through a registry by package name;
-    // local/file/link/tarball-URL/git/workspace specs don't, and
-    // would either eager-build unrelated origins (causing failures
-    // on configured-but-unused TLS) or mask the real registry origin
-    // for npm aliases. GPT post-T4 MEDIUM finding.
     //
-    // Mapping per Specifier variant:
-    // - SemverRange     → local_name routes through scope/default
-    // - NpmAlias{target} → target routes (NOT the local alias)
-    // - File/Link/Workspace/Tarball/Git → no registry route, skip
-    // - parse error     → skip (the install will fail later anyway)
-    //
-    // Workspace-member deps are local file refs — they don't route
-    // through registries, so they stay out of the effective set.
-    // Transitive deps surfacing later go through the lazy path.
-    let top_level_specs: Vec<String> = deps
-        .iter()
-        .filter_map(
-            |(local_name, range)| match lpm_resolver::Specifier::parse(range) {
-                Ok(lpm_resolver::Specifier::SemverRange(_)) => Some(local_name.clone()),
-                Ok(lpm_resolver::Specifier::NpmAlias { target, .. }) => Some(target),
-                _ => None,
-            },
-        )
-        .collect();
-    let eager_origins = route_table.effective_registry_origins(
-        &top_level_specs,
-        client.base_url(),
-        client.npm_registry_url(),
-    );
+    // `top_level_specs` + `eager_origins` are computed above (where the
+    // slim-UI resolving line consumes them) — both surfaces must agree
+    // on the same route map, so they share one derivation. Workspace-
+    // member file refs, link/file/tarball/git specs, and unparseable
+    // ranges all contribute no origin per `Specifier::parse`.
     let owned_client = client
         .clone_with_config()
         .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?;
@@ -4665,442 +4704,456 @@ async fn run_with_options_under_store_lock(
     // arms; hoisted it further to above the empty-deps
     // short-circuit so TLS overrides + `strict-ssl=false` security
     // warning surface for empty-deps installs too).
-    let (mut packages, resolve_ms, used_lockfile, platform_skipped) = match lockfile_result {
-        Some(fast_path) => {
-            if !json_output {
-                output::info(&format!(
-                    "Using lockfile ({} packages)",
-                    fast_path.packages.len().to_string().bold()
-                ));
+    let (mut packages, resolve_ms, used_lockfile, platform_skipped, latest_stable_versions) =
+        match lockfile_result {
+            Some(fast_path) => {
+                if !json_output {
+                    output::info(&format!(
+                        "Using lockfile ({} packages)",
+                        fast_path.packages.len().to_string().bold()
+                    ));
+                }
+                fast_path_lockfile = Some(fast_path.lockfile);
+                needs_binary_upgrade = fast_path.needs_binary_upgrade;
+                // Fast path doesn't run the resolver, so we have no
+                // registry metadata — the `+` list's "(vX.Y.Z available)"
+                // hint is suppressed in this branch. Honest > guessing.
+                (fast_path.packages, 0u128, true, 0usize, HashMap::new())
             }
-            fast_path_lockfile = Some(fast_path.lockfile);
-            needs_binary_upgrade = fast_path.needs_binary_upgrade;
-            (fast_path.packages, 0u128, true, 0usize)
-        }
-        None => {
-            let resolve_start = Instant::now();
-            // The persistent `› Resolving …` phase line above already
-            // narrates that resolution is in flight — no spinner needed.
+            None => {
+                let resolve_start = Instant::now();
+                // The persistent `› Resolving …` phase line above already
+                // narrates that resolution is in flight — no spinner needed.
 
-            // route_table is constructed above the lockfile match
-            // (day-4.5) — we just borrow/clone it here.
+                // route_table is constructed above the lockfile match
+                // (day-4.5) — we just borrow/clone it here.
 
-            // **Default flip .** Greedy-fusion is now the
-            // global install default. The fused dispatcher
-            // (`resolve_greedy_fused`) skips the walker spawn entirely
-            // and IS the metadata fetch dispatcher.
-            //
-            // Resolver dispatch matrix:
-            //
-            // | LPM_RESOLVER    | LPM_GREEDY_FUSION | Result                  |
-            // |-----------------|-------------------|-------------------------|
-            // | unset (default) | unset / non-"0"   | greedy-fusion (new)     |
-            // | unset (default) | "0"               | greedy + legacy walker  |
-            // | "greedy"        | unset / non-"0"   | greedy-fusion           |
-            // | "greedy"        | "0"               | greedy + legacy walker  |
-            // | "pubgrub"       | (any)             | PubGrub + legacy walker |
-            //
-            // Escape hatches:
-            //   - `LPM_RESOLVER=pubgrub` — full opt-out to the previous
-            //     install default (PubGrub-with-split-retry + walker).
-            //     Use only if you hit a greedy-fusion edge case in the
-            //     wild and need a tested fallback while we land a fix.
-            //   - `LPM_GREEDY_FUSION=0` — opt-out from the fused
-            //     dispatcher to the legacy walker arm (            //     orchestration: walker + dispatcher +
-            //     resolver_with_shared_cache in parallel) while still
-            //     using the greedy resolver. Useful for debugging
-            //     dispatcher-specific issues with greedy-resolver
-            //     behavior held constant.
-            //
-            // Reference n=20 bench (median, bench/fixture-large) from
-            //:
-            //   greedy-stream (walker)  4,521 ms total
-            //   greedy-fusion           918 ms total — 1.10× bun
-            //   bun reference           833 ms
-            // -3,603 ms median delta, paired t = -23.27. The default-
-            // flip preserves these numbers (now reachable without the
-            // `LPM_RESOLVER=greedy` opt-in env var).
-            //  `pubgrub_opt_out` and `auto_install_peers`
-            // are computed at the top of `run_with_options` (above
-            // the lockfile fast-path call) so the v1-lockfile gate
-            // and the pubgrub-mismatch warning fire even on warm
-            // installs that take the lockfile fast path. The two
-            // values are reused unchanged here.
-            let fusion_disabled = std::env::var("LPM_GREEDY_FUSION").as_deref() == Ok("0");
-            let fusion_enabled_local = !pubgrub_opt_out && !fusion_disabled;
-
-            // Stamp `lpm.lock`'s `resolved-with` field with the arm
-            // that's about to run. Mirrors the dispatch matrix in the
-            // comment block above. Read by the cold-resolve writer
-            // at the bottom of `run_with_options`.
-            resolved_with = if pubgrub_opt_out {
-                "pubgrub"
-            } else if fusion_disabled {
-                "greedy"
-            } else {
-                "greedy-fusion"
-            };
-
-            let (resolve_res, initial_batch_ms_measured): (
-                Result<lpm_resolver::ResolveResult, LpmError>,
-                u128,
-            ) = if fusion_enabled_local {
-                // ── FUSION PATH ─────────────────────────────────────
-                fusion_enabled = true;
-
-                // Speculation dispatcher reads from spec_rx; resolver
-                // owns spec_tx and drops it on return, signaling the
-                // dispatcher to drain and exit. Capacity 512 matches
-                // the walker arm's channel size.
-                let (spec_tx, spec_rx) =
-                    tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
-                let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
-                    spec_rx,
-                    arc_client.clone(),
-                    route_table.clone(),
-                    store.clone(),
-                    fetch_semaphore.clone(),
-                    fetch_coord.clone(),
-                    deps.clone(),
-                    store_v2_handle.clone(),
-                );
-
-                // No-op walker stub keeps `WalkerJoin` shape uniform
-                // so the post-fetch drain below doesn't need a fusion
-                // branch. The drained `WalkerSummary::default()` is
-                // suppressed at the JSON-emit site via `fusion_enabled`.
-                let walker_handle = tokio::spawn(async {
-                    Ok::<_, lpm_resolver::WalkerError>(lpm_resolver::WalkerSummary::default())
-                });
-
-                // Metadata semaphore size. Pre-plan: 256 sits at
-                // the H2 single-connection multiplex cap; lets the
-                // registry's flow control set the actual pace.
-                // `LPM_NPM_FANOUT` overrides for bench tuning, matches
-                // the walker arm's env var.
-                let npm_fanout = std::env::var("LPM_NPM_FANOUT")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .filter(|&n| n > 0)
-                    .unwrap_or(256);
-
-                let res = lpm_resolver::resolve_greedy_fused(
-                    arc_client.clone(),
-                    deps.clone(),
-                    override_set.clone(),
-                    route_table.clone(),
-                    npm_fanout,
-                    Some(spec_tx),
-                    auto_install_peers,
-                )
-                .await
-                .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
-
-                walker_join = Some(WalkerJoin {
-                    walker: walker_handle,
-                    dispatcher: dispatcher_handle,
-                    dispatched: dispatcher_counters.dispatched,
-                    completed: dispatcher_counters.completed,
-                    task_ms_sum: dispatcher_counters.task_ms_sum,
-                    transitive_dispatched: dispatcher_counters.transitive_dispatched,
-                    max_depth_reached: dispatcher_counters.max_depth_reached,
-                    no_version_match: dispatcher_counters.no_version_match,
-                    unresolved_parked: dispatcher_counters.unresolved_parked,
-                });
-
-                // initial_batch_ms is meaningless under fusion (no
-                // walker → no roots-ready boundary); 0 reads as
-                // "lockfile fast path" in --json which is technically
-                // wrong but harmless — the real story is in
-                // `timing.resolve.dispatcher.*` (W1 plumbing).
-                (res, 0u128)
-            } else {
-                // ── LEGACY PATH (walker + spec dispatcher) ──
-                let dep_names: Vec<String> = deps.keys().cloned().collect();
-
-                // orchestration (preplan): spawn walker +
-                // dispatcher; resolve concurrently waiting on roots_ready.
-                // Walker is the manifest producer; the dispatcher is the
-                // pure consumer of the existing `(name, PackageMetadata)`
-                // mpsc. The three run in parallel — walker fetches,
-                // dispatcher speculates tarballs, resolver waits on
-                // roots_ready_rx then solves against the shared cache.
+                // **Default flip .** Greedy-fusion is now the
+                // global install default. The fused dispatcher
+                // (`resolve_greedy_fused`) skips the walker spawn entirely
+                // and IS the metadata fetch dispatcher.
                 //
-                // Critically: walker + dispatcher `JoinHandle`s are NOT
-                // awaited here. They're bundled into `WalkerJoin` below
-                // and drained at the existing post-fetch drain point —
-                // preserving the speculation overlap and
-                // matching preplan's "tail drains post-fetch, not
-                // aborted" invariant.
-                use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
-                let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
-                let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
-                // wait-loop shutdown handshake: the walker stores
-                // `true` (Release) and broadcasts `notify_waiters()` across
-                // every notify_map entry at the end of its `run()`. The
-                // resolver's wait-loop in `ensure_cached` checks this flag
-                // after `Notified::enable()` and short-circuits to the
-                // escape-hatch fetch in microseconds, instead of burning
-                // the full `fetch_wait_timeout` for keys the walker decided
-                // not to fetch. Same Arc on both sides — must be allocated
-                // before either is constructed.
-                let walker_done: WalkerDone = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let (spec_tx, spec_rx) =
-                    tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
-                let (roots_ready_tx, roots_ready_rx) = tokio::sync::oneshot::channel::<()>();
+                // Resolver dispatch matrix:
+                //
+                // | LPM_RESOLVER    | LPM_GREEDY_FUSION | Result                  |
+                // |-----------------|-------------------|-------------------------|
+                // | unset (default) | unset / non-"0"   | greedy-fusion (new)     |
+                // | unset (default) | "0"               | greedy + legacy walker  |
+                // | "greedy"        | unset / non-"0"   | greedy-fusion           |
+                // | "greedy"        | "0"               | greedy + legacy walker  |
+                // | "pubgrub"       | (any)             | PubGrub + legacy walker |
+                //
+                // Escape hatches:
+                //   - `LPM_RESOLVER=pubgrub` — full opt-out to the previous
+                //     install default (PubGrub-with-split-retry + walker).
+                //     Use only if you hit a greedy-fusion edge case in the
+                //     wild and need a tested fallback while we land a fix.
+                //   - `LPM_GREEDY_FUSION=0` — opt-out from the fused
+                //     dispatcher to the legacy walker arm (            //     orchestration: walker + dispatcher +
+                //     resolver_with_shared_cache in parallel) while still
+                //     using the greedy resolver. Useful for debugging
+                //     dispatcher-specific issues with greedy-resolver
+                //     behavior held constant.
+                //
+                // Reference n=20 bench (median, bench/fixture-large) from
+                //:
+                //   greedy-stream (walker)  4,521 ms total
+                //   greedy-fusion           918 ms total — 1.10× bun
+                //   bun reference           833 ms
+                // -3,603 ms median delta, paired t = -23.27. The default-
+                // flip preserves these numbers (now reachable without the
+                // `LPM_RESOLVER=greedy` opt-in env var).
+                //  `pubgrub_opt_out` and `auto_install_peers`
+                // are computed at the top of `run_with_options` (above
+                // the lockfile fast-path call) so the v1-lockfile gate
+                // and the pubgrub-mismatch warning fire even on warm
+                // installs that take the lockfile fast path. The two
+                // values are reused unchanged here.
+                let fusion_disabled = std::env::var("LPM_GREEDY_FUSION").as_deref() == Ok("0");
+                let fusion_enabled_local = !pubgrub_opt_out && !fusion_disabled;
 
-                let batch_start = Instant::now();
-
-                // Walker — metadata producer.
-                let walker_handle = if dep_names.is_empty() {
-                    // No deps → fire roots_ready immediately + flip the
-                    // walker_done flag so any (vacuously-empty) wait-loop
-                    // sleeper short-circuits, then spawn a no-op task so
-                    // the `WalkerJoin` shape stays uniform.
-                    let _ = roots_ready_tx.send(());
-                    walker_done.store(true, std::sync::atomic::Ordering::Release);
-                    tokio::spawn(async { Ok(lpm_resolver::WalkerSummary::default()) })
+                // Stamp `lpm.lock`'s `resolved-with` field with the arm
+                // that's about to run. Mirrors the dispatch matrix in the
+                // comment block above. Read by the cold-resolve writer
+                // at the bottom of `run_with_options`.
+                resolved_with = if pubgrub_opt_out {
+                    "pubgrub"
+                } else if fusion_disabled {
+                    "greedy"
                 } else {
-                    tokio::spawn(
-                        BfsWalker::new(
-                            arc_client.clone(),
-                            shared_cache.clone(),
-                            notify_map.clone(),
-                            walker_done.clone(),
-                            spec_tx,
-                            roots_ready_tx,
-                            dep_names.clone(),
-                            route_table.clone(),
-                        )
-                        .run(),
-                    )
+                    "greedy-fusion"
                 };
 
-                // Dispatcher — speculation consumer.
-                let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
-                    spec_rx,
-                    arc_client.clone(),
-                    route_table.clone(),
-                    store.clone(),
-                    fetch_semaphore.clone(),
-                    fetch_coord.clone(),
-                    deps.clone(),
-                    store_v2_handle.clone(),
-                );
-
-                // Resolver — awaits roots_ready then solves against the
-                // shared cache. `fetch_wait_timeout` = 5s is the preplan
-                // default: the provider waits on the per-canonical
-                // Notify for up to 5s before falling through to its
-                // escape-hatch fetch.
-                let resolve_client = arc_client.clone();
-                let resolve_deps = deps.clone();
-                let resolve_overrides = override_set.clone();
-                let shared_cache_for_resolve = shared_cache.clone();
-                let notify_map_for_resolve = notify_map.clone();
-                let walker_done_for_resolve = walker_done.clone();
-                //: clone the outer-scope metrics Arc for the
-                // resolver's ownership; the outer `streaming_metrics`
-                // stays readable by the JSON-emit block via its own Arc
-                // handle.
-                let streaming_metrics_for_resolve = streaming_metrics.clone();
-                // `initial_batch_ms` captures the time from
-                // orchestration start to the moment the resolver could
-                // begin solving — i.e. roots-ready fire. This is the
-                // new-shape analog of the pre-49 "batch prefetch done"
-                // timestamp. Measuring it at the end of resolve (as the
-                // pre-fix code did) lumped in PubGrub wall-clock, which
-                // made the JSON output internally inconsistent — PubGrub
-                // timing is already reported separately by
-                // `resolver_stage_timing.pubgrub_ms`.
-                let (resolve_res_legacy, batch_ms): (
+                let (resolve_res, initial_batch_ms_measured): (
                     Result<lpm_resolver::ResolveResult, LpmError>,
                     u128,
-                ) = async {
-                    let _ = roots_ready_rx.await;
-                    let roots_ready_at = batch_start.elapsed().as_millis();
-                    let w2_resolve_start = Instant::now();
-                    let result = lpm_resolver::resolve_with_shared_cache(
-                        resolve_client,
-                        resolve_deps,
-                        resolve_overrides,
-                        shared_cache_for_resolve,
-                        notify_map_for_resolve,
-                        walker_done_for_resolve,
-                        std::time::Duration::from_secs(5),
+                ) = if fusion_enabled_local {
+                    // ── FUSION PATH ─────────────────────────────────────
+                    fusion_enabled = true;
+
+                    // Speculation dispatcher reads from spec_rx; resolver
+                    // owns spec_tx and drops it on return, signaling the
+                    // dispatcher to drain and exit. Capacity 512 matches
+                    // the walker arm's channel size.
+                    let (spec_tx, spec_rx) =
+                        tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
+                    let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
+                        spec_rx,
+                        arc_client.clone(),
                         route_table.clone(),
-                        streaming_metrics_for_resolve,
+                        store.clone(),
+                        fetch_semaphore.clone(),
+                        fetch_coord.clone(),
+                        deps.clone(),
+                        store_v2_handle.clone(),
+                    );
+
+                    // No-op walker stub keeps `WalkerJoin` shape uniform
+                    // so the post-fetch drain below doesn't need a fusion
+                    // branch. The drained `WalkerSummary::default()` is
+                    // suppressed at the JSON-emit site via `fusion_enabled`.
+                    let walker_handle = tokio::spawn(async {
+                        Ok::<_, lpm_resolver::WalkerError>(lpm_resolver::WalkerSummary::default())
+                    });
+
+                    // Metadata semaphore size. Pre-plan: 256 sits at
+                    // the H2 single-connection multiplex cap; lets the
+                    // registry's flow control set the actual pace.
+                    // `LPM_NPM_FANOUT` overrides for bench tuning, matches
+                    // the walker arm's env var.
+                    let npm_fanout = std::env::var("LPM_NPM_FANOUT")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .filter(|&n| n > 0)
+                        .unwrap_or(256);
+
+                    let res = lpm_resolver::resolve_greedy_fused(
+                        arc_client.clone(),
+                        deps.clone(),
+                        override_set.clone(),
+                        route_table.clone(),
+                        npm_fanout,
+                        Some(spec_tx),
                         auto_install_peers,
                     )
                     .await
                     .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
-                    tracing::debug!(
-                        "perf.w2_resolve_after_roots ms={}",
-                        w2_resolve_start.elapsed().as_millis()
+
+                    walker_join = Some(WalkerJoin {
+                        walker: walker_handle,
+                        dispatcher: dispatcher_handle,
+                        dispatched: dispatcher_counters.dispatched,
+                        completed: dispatcher_counters.completed,
+                        task_ms_sum: dispatcher_counters.task_ms_sum,
+                        transitive_dispatched: dispatcher_counters.transitive_dispatched,
+                        max_depth_reached: dispatcher_counters.max_depth_reached,
+                        no_version_match: dispatcher_counters.no_version_match,
+                        unresolved_parked: dispatcher_counters.unresolved_parked,
+                    });
+
+                    // initial_batch_ms is meaningless under fusion (no
+                    // walker → no roots-ready boundary); 0 reads as
+                    // "lockfile fast path" in --json which is technically
+                    // wrong but harmless — the real story is in
+                    // `timing.resolve.dispatcher.*` (W1 plumbing).
+                    (res, 0u128)
+                } else {
+                    // ── LEGACY PATH (walker + spec dispatcher) ──
+                    let dep_names: Vec<String> = deps.keys().cloned().collect();
+
+                    // orchestration (preplan): spawn walker +
+                    // dispatcher; resolve concurrently waiting on roots_ready.
+                    // Walker is the manifest producer; the dispatcher is the
+                    // pure consumer of the existing `(name, PackageMetadata)`
+                    // mpsc. The three run in parallel — walker fetches,
+                    // dispatcher speculates tarballs, resolver waits on
+                    // roots_ready_rx then solves against the shared cache.
+                    //
+                    // Critically: walker + dispatcher `JoinHandle`s are NOT
+                    // awaited here. They're bundled into `WalkerJoin` below
+                    // and drained at the existing post-fetch drain point —
+                    // preserving the speculation overlap and
+                    // matching preplan's "tail drains post-fetch, not
+                    // aborted" invariant.
+                    use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
+                    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+                    let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
+                    // wait-loop shutdown handshake: the walker stores
+                    // `true` (Release) and broadcasts `notify_waiters()` across
+                    // every notify_map entry at the end of its `run()`. The
+                    // resolver's wait-loop in `ensure_cached` checks this flag
+                    // after `Notified::enable()` and short-circuits to the
+                    // escape-hatch fetch in microseconds, instead of burning
+                    // the full `fetch_wait_timeout` for keys the walker decided
+                    // not to fetch. Same Arc on both sides — must be allocated
+                    // before either is constructed.
+                    let walker_done: WalkerDone =
+                        Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (spec_tx, spec_rx) =
+                        tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
+                    let (roots_ready_tx, roots_ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+                    let batch_start = Instant::now();
+
+                    // Walker — metadata producer.
+                    let walker_handle = if dep_names.is_empty() {
+                        // No deps → fire roots_ready immediately + flip the
+                        // walker_done flag so any (vacuously-empty) wait-loop
+                        // sleeper short-circuits, then spawn a no-op task so
+                        // the `WalkerJoin` shape stays uniform.
+                        let _ = roots_ready_tx.send(());
+                        walker_done.store(true, std::sync::atomic::Ordering::Release);
+                        tokio::spawn(async { Ok(lpm_resolver::WalkerSummary::default()) })
+                    } else {
+                        tokio::spawn(
+                            BfsWalker::new(
+                                arc_client.clone(),
+                                shared_cache.clone(),
+                                notify_map.clone(),
+                                walker_done.clone(),
+                                spec_tx,
+                                roots_ready_tx,
+                                dep_names.clone(),
+                                route_table.clone(),
+                            )
+                            .run(),
+                        )
+                    };
+
+                    // Dispatcher — speculation consumer.
+                    let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
+                        spec_rx,
+                        arc_client.clone(),
+                        route_table.clone(),
+                        store.clone(),
+                        fetch_semaphore.clone(),
+                        fetch_coord.clone(),
+                        deps.clone(),
+                        store_v2_handle.clone(),
                     );
-                    (result, roots_ready_at)
+
+                    // Resolver — awaits roots_ready then solves against the
+                    // shared cache. `fetch_wait_timeout` = 5s is the preplan
+                    // default: the provider waits on the per-canonical
+                    // Notify for up to 5s before falling through to its
+                    // escape-hatch fetch.
+                    let resolve_client = arc_client.clone();
+                    let resolve_deps = deps.clone();
+                    let resolve_overrides = override_set.clone();
+                    let shared_cache_for_resolve = shared_cache.clone();
+                    let notify_map_for_resolve = notify_map.clone();
+                    let walker_done_for_resolve = walker_done.clone();
+                    //: clone the outer-scope metrics Arc for the
+                    // resolver's ownership; the outer `streaming_metrics`
+                    // stays readable by the JSON-emit block via its own Arc
+                    // handle.
+                    let streaming_metrics_for_resolve = streaming_metrics.clone();
+                    // `initial_batch_ms` captures the time from
+                    // orchestration start to the moment the resolver could
+                    // begin solving — i.e. roots-ready fire. This is the
+                    // new-shape analog of the pre-49 "batch prefetch done"
+                    // timestamp. Measuring it at the end of resolve (as the
+                    // pre-fix code did) lumped in PubGrub wall-clock, which
+                    // made the JSON output internally inconsistent — PubGrub
+                    // timing is already reported separately by
+                    // `resolver_stage_timing.pubgrub_ms`.
+                    let (resolve_res_legacy, batch_ms): (
+                        Result<lpm_resolver::ResolveResult, LpmError>,
+                        u128,
+                    ) = async {
+                        let _ = roots_ready_rx.await;
+                        let roots_ready_at = batch_start.elapsed().as_millis();
+                        let w2_resolve_start = Instant::now();
+                        let result = lpm_resolver::resolve_with_shared_cache(
+                            resolve_client,
+                            resolve_deps,
+                            resolve_overrides,
+                            shared_cache_for_resolve,
+                            notify_map_for_resolve,
+                            walker_done_for_resolve,
+                            std::time::Duration::from_secs(5),
+                            route_table.clone(),
+                            streaming_metrics_for_resolve,
+                            auto_install_peers,
+                        )
+                        .await
+                        .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
+                        tracing::debug!(
+                            "perf.w2_resolve_after_roots ms={}",
+                            w2_resolve_start.elapsed().as_millis()
+                        );
+                        (result, roots_ready_at)
+                    }
+                    .await;
+
+                    walker_join = Some(WalkerJoin {
+                        walker: walker_handle,
+                        dispatcher: dispatcher_handle,
+                        dispatched: dispatcher_counters.dispatched,
+                        completed: dispatcher_counters.completed,
+                        task_ms_sum: dispatcher_counters.task_ms_sum,
+                        transitive_dispatched: dispatcher_counters.transitive_dispatched,
+                        max_depth_reached: dispatcher_counters.max_depth_reached,
+                        no_version_match: dispatcher_counters.no_version_match,
+                        unresolved_parked: dispatcher_counters.unresolved_parked,
+                    });
+
+                    (resolve_res_legacy, batch_ms)
+                };
+                initial_batch_ms = initial_batch_ms_measured;
+
+                let resolve_result = resolve_res?;
+
+                //: drain-wait removed. `speculation_join` is
+                // preserved on the outer scope and drained AFTER the fetch
+                // loop below, so speculative tarball downloads can overlap
+                // the real fetch loop (straggling specs race with the real
+                // fetches for the same 24-permit download pool). The
+                // `fetch_coord` serializes per-(name, version) work, so a
+                // real fetch for a package spec is still downloading just
+                // waits on the coord's per-key lock and returns as soon as
+                // spec's atomic-rename makes it visible.
+                let ms = resolve_start.elapsed().as_millis();
+
+                // Post-resolution peer dependency check: warn about unmet peers
+                // using each package's actual selected version (not a union).
+                //
+                // #33: peer rules from `package.json > lpm.peerDependencyRules`
+                // (translated from `pnpm.peerDependencyRules` by `lpm migrate`)
+                // are compiled once and applied inside the warning loop.
+                // `ignore_missing` suppresses missing-peer warnings,
+                // `allow_any` suppresses version-mismatch warnings, and
+                // `allowed_versions` widens the accepted range as a fallback.
+                //
+                // Compile is **fail-closed** — any unparseable selector key
+                // or version range in `allowed_versions` aborts the install
+                // before any further work. Mirrors the `OverrideSet::parse`
+                // posture for `lpm.overrides`. Hand-authored typos surface
+                // here rather than silently no-op'ing the rule.
+                let peer_rules_cfg = pkg.lpm.as_ref().map(|l| &l.peer_dependency_rules);
+                let compiled_peer_rules = match peer_rules_cfg {
+                    Some(r) => CompiledPeerRules::compile(
+                        &r.ignore_missing,
+                        &r.allowed_versions,
+                        &r.allow_any,
+                    )
+                    .map_err(|e| {
+                        LpmError::Script(format!("invalid lpm.peerDependencyRules: {e}"))
+                    })?,
+                    None => CompiledPeerRules::default(),
+                };
+                let peer_warnings = check_unmet_peers(
+                    &resolve_result.packages,
+                    &resolve_result.cache,
+                    &compiled_peer_rules,
+                );
+                if !peer_warnings.is_empty() && !json_output {
+                    for w in &peer_warnings {
+                        output::warn(&format!("peer dep: {w}"));
+                    }
                 }
-                .await;
 
-                walker_join = Some(WalkerJoin {
-                    walker: walker_handle,
-                    dispatcher: dispatcher_handle,
-                    dispatched: dispatcher_counters.dispatched,
-                    completed: dispatcher_counters.completed,
-                    task_ms_sum: dispatcher_counters.task_ms_sum,
-                    transitive_dispatched: dispatcher_counters.transitive_dispatched,
-                    max_depth_reached: dispatcher_counters.max_depth_reached,
-                    no_version_match: dispatcher_counters.no_version_match,
-                    unresolved_parked: dispatcher_counters.unresolved_parked,
-                });
+                // capture the override apply trace
+                // from this fresh resolution. We surface it to the install
+                // summary, the JSON output, and `.lpm/overrides-state.json`.
+                applied_overrides = resolve_result.applied_overrides.clone();
 
-                (resolve_res_legacy, batch_ms)
-            };
-            initial_batch_ms = initial_batch_ms_measured;
+                //capture best-effort peer-conflict reports. Drained
+                // alongside applied_overrides so the JSON envelope below
+                // can serialize them whether or not the user is running
+                // with `--json`. Cloned (not moved) because
+                // `resolve_result` is consumed by `resolved_to_install_packages`
+                // a few lines down.
+                peer_conflicts = resolve_result.peer_conflicts.clone();
 
-            let resolve_result = resolve_res?;
+                // — capture the platform-filtered optional
+                // skip count. Surfaced as `timing.resolve.platform_skipped`
+                // in `--json` output.
+                let platform_skipped = resolve_result.platform_skipped;
 
-            //: drain-wait removed. `speculation_join` is
-            // preserved on the outer scope and drained AFTER the fetch
-            // loop below, so speculative tarball downloads can overlap
-            // the real fetch loop (straggling specs race with the real
-            // fetches for the same 24-permit download pool). The
-            // `fetch_coord` serializes per-(name, version) work, so a
-            // real fetch for a package spec is still downloading just
-            // waits on the coord's per-key lock and returns as soon as
-            // spec's atomic-rename makes it visible.
-            let ms = resolve_start.elapsed().as_millis();
+                // capture the resolver substage
+                // breakdown. Combined with the `initial_batch_ms`
+                // measurement above, these feed the cold-resolve
+                // observability story in `timing.resolve.*`.
+                resolver_stage_timing = resolve_result.stage_timing;
 
-            // Post-resolution peer dependency check: warn about unmet peers
-            // using each package's actual selected version (not a union).
-            //
-            // #33: peer rules from `package.json > lpm.peerDependencyRules`
-            // (translated from `pnpm.peerDependencyRules` by `lpm migrate`)
-            // are compiled once and applied inside the warning loop.
-            // `ignore_missing` suppresses missing-peer warnings,
-            // `allow_any` suppresses version-mismatch warnings, and
-            // `allowed_versions` widens the accepted range as a fallback.
-            //
-            // Compile is **fail-closed** — any unparseable selector key
-            // or version range in `allowed_versions` aborts the install
-            // before any further work. Mirrors the `OverrideSet::parse`
-            // posture for `lpm.overrides`. Hand-authored typos surface
-            // here rather than silently no-op'ing the rule.
-            let peer_rules_cfg = pkg.lpm.as_ref().map(|l| &l.peer_dependency_rules);
-            let compiled_peer_rules = match peer_rules_cfg {
-                Some(r) => {
-                    CompiledPeerRules::compile(&r.ignore_missing, &r.allowed_versions, &r.allow_any)
-                        .map_err(|e| {
-                            LpmError::Script(format!("invalid lpm.peerDependencyRules: {e}"))
-                        })?
-                }
-                None => CompiledPeerRules::default(),
-            };
-            let peer_warnings = check_unmet_peers(
-                &resolve_result.packages,
-                &resolve_result.cache,
-                &compiled_peer_rules,
-            );
-            if !peer_warnings.is_empty() && !json_output {
-                for w in &peer_warnings {
-                    output::warn(&format!("peer dep: {w}"));
-                }
-            }
+                // clone the ambient peer install set BEFORE we
+                // hand `resolve_result` off to `resolved_to_install_packages`
+                // (which only borrows it). Persisted to the lockfile far
+                // below at the cold-resolve write site so warm reinstalls
+                // reproduce the same top-level node_modules layout.
+                ambient_peer_installs_for_lockfile = resolve_result.ambient_peer_installs.clone();
 
-            // capture the override apply trace
-            // from this fresh resolution. We surface it to the install
-            // summary, the JSON output, and `.lpm/overrides-state.json`.
-            applied_overrides = resolve_result.applied_overrides.clone();
+                let mut packages = resolved_to_install_packages(
+                    &resolve_result.packages,
+                    &deps,
+                    &resolve_result.root_aliases,
+                    &resolve_result.ambient_peer_installs,
+                    &route_table,
+                );
 
-            //capture best-effort peer-conflict reports. Drained
-            // alongside applied_overrides so the JSON envelope below
-            // can serialize them whether or not the user is running
-            // with `--json`. Cloned (not moved) because
-            // `resolve_result` is consumed by `resolved_to_install_packages`
-            // a few lines down.
-            peer_conflicts = resolve_result.peer_conflicts.clone();
+                // Snapshot the resolver's metadata cache as
+                // `canonical_name → latest stable version`. The map drives
+                // the post-install `+` list's `(vX.Y.Z available)` hint
+                // when a direct dep was pinned to an older version than
+                // the registry's current `latest` stable release.
+                let latest_stable = build_latest_stable_versions(&resolve_result.cache);
 
-            // — capture the platform-filtered optional
-            // skip count. Surfaced as `timing.resolve.platform_skipped`
-            // in `--json` output.
-            let platform_skipped = resolve_result.platform_skipped;
+                // F4 + F6 (manifest wiring): merge
+                // in the non-registry InstallPackages produced by
+                // `pre_resolve_non_registry_deps`. They were fetched +
+                // extracted before the resolver ran (so the source-aware
+                // fast-path will mark them cached on the next iteration),
+                // but they aren't part of the resolver's output — append
+                // them here so the install loop sees the full set.
+                packages.extend(tarball_url_install_pkgs.iter().cloned());
 
-            // capture the resolver substage
-            // breakdown. Combined with the `initial_batch_ms`
-            // measurement above, these feed the cold-resolve
-            // observability story in `timing.resolve.*`.
-            resolver_stage_timing = resolve_result.stage_timing;
+                // day-5 (F7-transitive): post-resolve fix-up.
+                // Now that BOTH the resolver output AND the non-registry
+                // InstallPackages are in `packages`, populate each
+                // directory/link InstallPackage's `dependencies` field
+                // from its stashed source-deps. Resolver-agnostic per
+                // plan — runs once after the merge regardless of
+                // PubGrub vs fusion.
+                apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps);
 
-            // clone the ambient peer install set BEFORE we
-            // hand `resolve_result` off to `resolved_to_install_packages`
-            // (which only borrows it). Persisted to the lockfile far
-            // below at the cold-resolve write site so warm reinstalls
-            // reproduce the same top-level node_modules layout.
-            ambient_peer_installs_for_lockfile = resolve_result.ambient_peer_installs.clone();
-
-            let mut packages = resolved_to_install_packages(
-                &resolve_result.packages,
-                &deps,
-                &resolve_result.root_aliases,
-                &resolve_result.ambient_peer_installs,
-                &route_table,
-            );
-
-            // F4 + F6 (manifest wiring): merge
-            // in the non-registry InstallPackages produced by
-            // `pre_resolve_non_registry_deps`. They were fetched +
-            // extracted before the resolver ran (so the source-aware
-            // fast-path will mark them cached on the next iteration),
-            // but they aren't part of the resolver's output — append
-            // them here so the install loop sees the full set.
-            packages.extend(tarball_url_install_pkgs.iter().cloned());
-
-            // day-5 (F7-transitive): post-resolve fix-up.
-            // Now that BOTH the resolver output AND the non-registry
-            // InstallPackages are in `packages`, populate each
-            // directory/link InstallPackage's `dependencies` field
-            // from its stashed source-deps. Resolver-agnostic per
-            // plan — runs once after the merge regardless of
-            // PubGrub vs fusion.
-            apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps);
-
-            if !json_output {
-                // Persistent second phase line. Sub-second resolves don't
-                // need their own "Resolved in Xms" beat — the count is
-                // the signal, the timing lands in the verbose footer.
-                install_ui::phase(&format!(
-                    "Installing {} {}",
-                    packages.len().to_string().bold(),
-                    install_ui::packages_word(packages.len()),
-                ));
-                //surface best-effort peer-conflict reports as
-                // warnings so the user knows which transitive
-                // consumers got a peer version outside their declared
-                // range. Mirrors npm v7+'s unconditional `npm WARN`
-                // behavior. Suppressed under `--json` to keep
-                // machine-readable output clean; `--json` consumers
-                // get the same data on the always-present
-                // `peer_conflicts` array in the install JSON envelope
-                // (constructed below).
-                for report in &resolve_result.peer_conflicts {
-                    let unsatisfied_str = report
-                        .unsatisfied_consumers
-                        .iter()
-                        .map(|(c, r)| format!("{c} wants {r}"))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    output::warn(&format!(
-                        "peer {} pinned to {} but {} unsatisfied consumer(s): {}",
-                        report.canonical.bold(),
-                        report.chosen_version,
-                        report.unsatisfied_consumers.len(),
-                        unsatisfied_str,
+                if !json_output {
+                    // Persistent second phase line. Sub-second resolves don't
+                    // need their own "Resolved in Xms" beat — the count is
+                    // the signal, the timing lands in the verbose footer.
+                    install_ui::phase(&format!(
+                        "Installing {} {}",
+                        packages.len().to_string().bold(),
+                        install_ui::packages_word(packages.len()),
                     ));
+                    //surface best-effort peer-conflict reports as
+                    // warnings so the user knows which transitive
+                    // consumers got a peer version outside their declared
+                    // range. Mirrors npm v7+'s unconditional `npm WARN`
+                    // behavior. Suppressed under `--json` to keep
+                    // machine-readable output clean; `--json` consumers
+                    // get the same data on the always-present
+                    // `peer_conflicts` array in the install JSON envelope
+                    // (constructed below).
+                    for report in &resolve_result.peer_conflicts {
+                        let unsatisfied_str = report
+                            .unsatisfied_consumers
+                            .iter()
+                            .map(|(c, r)| format!("{c} wants {r}"))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        output::warn(&format!(
+                            "peer {} pinned to {} but {} unsatisfied consumer(s): {}",
+                            report.canonical.bold(),
+                            report.chosen_version,
+                            report.unsatisfied_consumers.len(),
+                            unsatisfied_str,
+                        ));
+                    }
                 }
+                (packages, ms, false, platform_skipped, latest_stable)
             }
-            (packages, ms, false, platform_skipped)
-        }
-    };
+        };
 
     // Step 3: Download & store (parallel).: `store` is
     // already bound above — speculative dispatcher writes into it
@@ -7036,18 +7089,12 @@ async fn run_with_options_under_store_lock(
 
         // Phantom dependency detection
         let phantom_result =
-            crate::intelligence::detect_phantom_deps(project_dir, &deps, &installed_names);
+            crate::intelligence::detect_phantom_deps(project_dir, &declared_deps, &installed_names);
 
         if !phantom_result.phantom_imports.is_empty() {
-            let icon = if strict_deps == "strict" {
-                "✖"
-            } else {
-                "⚠"
-            };
-            println!();
-            output::warn(&format!(
-                "{}  {} phantom dependency import(s) detected:",
-                icon,
+            eprintln!();
+            install_ui::warn(&format!(
+                "{} phantom dependency import(s) detected:",
                 phantom_result.phantom_imports.len()
             ));
             for phantom in phantom_result.phantom_imports.iter().take(5) {
@@ -7055,22 +7102,22 @@ async fn run_with_options_under_store_lock(
                     .file
                     .strip_prefix(project_dir)
                     .unwrap_or(&phantom.file);
-                println!(
+                eprintln!(
                     "    {} ({}:{})",
                     phantom.package_name.bold(),
                     rel_file.display().to_string().dimmed(),
                     phantom.line,
                 );
                 if let Some(via) = &phantom.available_via {
-                    println!("      {}", via.dimmed());
+                    eprintln!("      {}", via.dimmed());
                 }
-                println!(
+                eprintln!(
                     "      Fix: {}",
                     format!("lpm install {}", phantom.package_name).dimmed()
                 );
             }
             if phantom_result.phantom_imports.len() > 5 {
-                println!(
+                eprintln!(
                     "    ... and {} more",
                     phantom_result.phantom_imports.len() - 5
                 );
@@ -7082,9 +7129,9 @@ async fn run_with_options_under_store_lock(
             let verification =
                 crate::intelligence::verify_imports(project_dir, &installed_names, &deps);
             if !verification.unresolved.is_empty() {
-                println!();
-                output::warn(&format!(
-                    "✖  {} import(s) will fail at runtime:",
+                eprintln!();
+                install_ui::warn(&format!(
+                    "{} import(s) will fail at runtime:",
                     verification.unresolved.len()
                 ));
                 for unresolved in &verification.unresolved {
@@ -7092,13 +7139,13 @@ async fn run_with_options_under_store_lock(
                         .file
                         .strip_prefix(project_dir)
                         .unwrap_or(&unresolved.file);
-                    println!(
+                    eprintln!(
                         "    {}:{} → {}",
                         rel_file.display().to_string().dimmed(),
                         unresolved.line,
                         format!("import \"{}\"", unresolved.specifier).bold(),
                     );
-                    println!("      {}", unresolved.suggestion.dimmed());
+                    eprintln!("      {}", unresolved.suggestion.dimmed());
                 }
             }
         }
@@ -7213,6 +7260,12 @@ async fn run_with_options_under_store_lock(
                 .iter()
                 .map(|(name, version)| format!("{name}@{version}"))
                 .collect();
+            let tarball_field_hint =
+                if matches!(p.source_kind(), Ok(lpm_lockfile::Source::Registry { .. })) {
+                    p.tarball_url.clone()
+                } else {
+                    None
+                };
 
             lockfile.add_package(lpm_lockfile::LockedPackage {
                 name: p.name.clone(),
@@ -7226,7 +7279,7 @@ async fn run_with_options_under_store_lock(
                 // returned at resolve time so warm installs can skip
                 // the per-package metadata round-trip. Consumed by
                 // `try_lockfile_fast_path` through `evaluate_cached_url`.
-                tarball: p.tarball_url.clone(),
+                tarball: tarball_field_hint,
             });
         }
 
@@ -7964,10 +8017,27 @@ async fn run_with_options_under_store_lock(
         // Only deps whose resolved version CHANGED in this run land in
         // the `+ pkg@version` list — a no-op refresh prints no list,
         // `lpm i react` prints just `+ react@…`, and a hand-edited
-        // manifest prints exactly the diff. `collect_direct_versions`
-        // honors the resolver's `is_direct` flag so transitives never
+        // manifest prints exactly the diff. The resolver's `is_direct`
+        // flag scopes the diff to top-level deps so transitives never
         // pollute the list.
-        let post_direct_versions = collect_direct_versions(&packages);
+        //
+        // Inlined silent variant of [`collect_direct_versions`]. The
+        // canonical helper emits a `tracing::warn!` on duplicate
+        // `is_direct = true` entries — useful as a diagnostic for the
+        // `lpm i <pkg>` finalize path, but a latent resolver bug
+        // occasionally double-marks deps like `chalk` / `ora` when
+        // peer-rule auto-installs collide with their declared positions.
+        // Surfacing that warning on every bare install of a typical
+        // project would look broken. Silent last-wins instead.
+        let post_direct_versions: HashMap<String, lpm_semver::Version> = packages
+            .iter()
+            .filter(|p| p.is_direct)
+            .filter_map(|p| {
+                lpm_semver::Version::parse(&p.version)
+                    .ok()
+                    .map(|v| (p.name.clone(), v))
+            })
+            .collect();
         let mut changed_direct: Vec<(String, String)> = Vec::new();
         for (name, post_v) in &post_direct_versions {
             let post_str = post_v.to_string();
@@ -7981,7 +8051,18 @@ async fn run_with_options_under_store_lock(
         if !changed_direct.is_empty() {
             eprintln!();
             for (name, version) in &changed_direct {
-                install_ui::plus(name, version, None);
+                // Annotate with `(vX.Y.Z available)` when the
+                // resolver's metadata cache has a stable release newer
+                // than the version we just installed. Suppressed for:
+                //   * lockfile fast-path (no cache → empty map),
+                //   * non-registry sources (filtered out of `cache`),
+                //   * unparseable / equal / older latest versions.
+                let hint = latest_stable_versions.get(name).and_then(|latest| {
+                    let installed = lpm_semver::Version::parse(version).ok()?;
+                    let candidate = lpm_semver::Version::parse(latest).ok()?;
+                    (candidate > installed).then(|| format!("(v{latest} available)"))
+                });
+                install_ui::plus(name, version, hint.as_deref());
             }
         }
 
@@ -9148,6 +9229,7 @@ fn try_lockfile_fast_path(
                         }
                     }
                 }),
+                metadata_checked_for_tarball: false,
             }
         })
         .collect();
@@ -9206,6 +9288,34 @@ fn root_aliases_for_lockfile(
 /// aren't user-declared — they shouldn't trigger scripts that the
 /// user didn't opt into. They DO get root-link entries so the
 /// linker exposes them at the canonical module-resolution path.
+///
+/// Compute a `canonical_name → highest-stable-version` map from the
+/// resolver's metadata cache. Used by the post-install `+` list to
+/// annotate direct deps with `(vX.Y.Z available)` when the registry
+/// has a newer stable release than the resolver picked.
+///
+/// "Stable" excludes pre-releases (anything carrying a `-alpha` /
+/// `-beta` / `-rc` / etc. tag in the semver). `versions` is sorted
+/// descending in [`lpm_resolver::CachedPackageInfo`], so we scan from
+/// the top and pick the first stable. Returns no entry when the cache
+/// has no stable version at all (rare — usually a private one-off pkg).
+fn build_latest_stable_versions(
+    cache: &HashMap<lpm_resolver::CanonicalKey, std::sync::Arc<lpm_resolver::CachedPackageInfo>>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::with_capacity(cache.len());
+    for (key, info) in cache {
+        let name = match key {
+            lpm_resolver::CanonicalKey::Root => continue,
+            lpm_resolver::CanonicalKey::Lpm { owner, name } => format!("@lpm.dev/{owner}.{name}"),
+            lpm_resolver::CanonicalKey::Npm { name } => name.clone(),
+        };
+        if let Some(latest) = info.versions.iter().find(|v| !v.is_prerelease()) {
+            out.insert(name, latest.to_string());
+        }
+    }
+    out
+}
+
 fn resolved_to_install_packages(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
@@ -9346,6 +9456,7 @@ fn resolved_to_install_packages(
                 peers: r.peers.clone(),
                 integrity: r.integrity.clone(),
                 tarball_url: r.tarball_url.clone(),
+                metadata_checked_for_tarball: true,
             })
         })
         .collect()
@@ -10318,9 +10429,15 @@ async fn resolve_tarball_url(
     version: &str,
     is_lpm: bool,
     cached_url: Option<&str>,
+    metadata_checked_for_tarball: bool,
 ) -> Result<String, LpmError> {
     if let Some(url) = cached_url {
         return Ok(url.to_string());
+    }
+    if metadata_checked_for_tarball {
+        return Err(LpmError::NotFound(format!(
+            "no tarball URL for {name}@{version}"
+        )));
     }
     if is_lpm {
         let pkg =
@@ -10446,6 +10563,7 @@ async fn fetch_and_store_legacy(
         &p.version,
         p.is_lpm,
         p.tarball_url.as_deref(),
+        p.metadata_checked_for_tarball,
     )
     .await
     {
@@ -10477,21 +10595,28 @@ async fn fetch_and_store_legacy(
             // ONCE with a freshly-resolved URL.
             invalidate_metadata_routed(client, route_table, &p.name);
             let retry_lookup_start = std::time::Instant::now();
-            let fresh_url =
-                match resolve_tarball_url(client, route_table, &p.name, &p.version, p.is_lpm, None)
-                    .await
-                {
-                    Ok(u) => u,
-                    Err(_) => {
-                        gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                        return Err(handle_tarball_not_found(
-                            client,
-                            &p.name,
-                            &p.version,
-                            project_dir,
-                        ));
-                    }
-                };
+            let fresh_url = match resolve_tarball_url(
+                client,
+                route_table,
+                &p.name,
+                &p.version,
+                p.is_lpm,
+                None,
+                false,
+            )
+            .await
+            {
+                Ok(u) => u,
+                Err(_) => {
+                    gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                    return Err(handle_tarball_not_found(
+                        client,
+                        &p.name,
+                        &p.version,
+                        project_dir,
+                    ));
+                }
+            };
             url_lookup_ms += retry_lookup_start.elapsed().as_millis();
             if fresh_url == initial_url {
                 // Loop guard — metadata still points at the same
@@ -10750,6 +10875,7 @@ async fn fetch_and_store_streaming(
         &p.version,
         p.is_lpm,
         p.tarball_url.as_deref(),
+        p.metadata_checked_for_tarball,
     )
     .await
     {
@@ -10779,21 +10905,28 @@ async fn fetch_and_store_streaming(
             // (minus the streaming-specific response handling).
             invalidate_metadata_routed(client, route_table, &p.name);
             let retry_lookup_start = std::time::Instant::now();
-            let fresh_url =
-                match resolve_tarball_url(client, route_table, &p.name, &p.version, p.is_lpm, None)
-                    .await
-                {
-                    Ok(u) => u,
-                    Err(_) => {
-                        gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                        return Err(handle_tarball_not_found(
-                            client,
-                            &p.name,
-                            &p.version,
-                            project_dir,
-                        ));
-                    }
-                };
+            let fresh_url = match resolve_tarball_url(
+                client,
+                route_table,
+                &p.name,
+                &p.version,
+                p.is_lpm,
+                None,
+                false,
+            )
+            .await
+            {
+                Ok(u) => u,
+                Err(_) => {
+                    gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                    return Err(handle_tarball_not_found(
+                        client,
+                        &p.name,
+                        &p.version,
+                        project_dir,
+                    ));
+                }
+            };
             url_lookup_ms += retry_lookup_start.elapsed().as_millis();
             if fresh_url == initial_url {
                 gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
@@ -10923,11 +11056,11 @@ async fn fetch_and_store_streaming(
     ))
 }
 
-/// placeholder spec written into the manifest by
-/// [`stage_packages_to_manifest`] for entries whose final spec depends on
-/// the resolved version. The full install pipeline sees this as "any
-/// version", resolves it normally, and [`finalize_packages_in_manifest`]
-/// then replaces it with the resolved-version-derived spec.
+/// placeholder spec written into the manifest for bare installs whose
+/// final save spec depends on the resolved version. The full install
+/// pipeline sees this as "any version", resolves it normally, and
+/// [`finalize_packages_in_manifest`] then replaces it with the
+/// resolved-version-derived spec.
 ///
 /// This string MUST be a valid `node_semver` range so the resolver
 /// accepts it. `*` is the canonical "any version" spec.
@@ -10939,9 +11072,14 @@ pub(crate) enum StagedKind {
     /// Stage wrote the user's verbatim explicit spec (Exact / Range /
     /// Wildcard / Workspace). Finalize is a no-op.
     Final,
-    /// Stage wrote the [`STAGE_PLACEHOLDER`]. Finalize must replace it
-    /// with `decide_saved_dependency_spec(intent, resolved, flags, config)`.
+    /// Stage wrote the [`STAGE_PLACEHOLDER`] for a bare install. Finalize
+    /// must replace it with `decide_saved_dependency_spec(intent, resolved,
+    /// flags, config)`.
     Placeholder,
+    /// Stage wrote the user's dist-tag literal (`latest`, `beta`, `next`,
+    /// etc.) so the resolver can honor that tag. Finalize still replaces the
+    /// staged tag with the resolved save spec.
+    DistTag,
     /// Stage left the manifest untouched because the dep already exists
     /// and the bare reinstall came with no rewrite-forcing flag.     /// "no churn" rule. Finalize is a no-op.
     Skipped,
@@ -10965,13 +11103,13 @@ pub(crate) struct StagedManifest {
 }
 
 impl StagedManifest {
-    /// Whether this stage produced any placeholders that finalize must
-    /// rewrite. Used by callers to skip the finalize re-read entirely
-    /// when nothing was placeheld.
-    pub fn has_placeholders(&self) -> bool {
+    /// Whether this stage produced any deferred entries that finalize must
+    /// rewrite. Used by callers to skip the finalize re-read entirely when
+    /// every entry was either final or skipped.
+    pub fn needs_finalize(&self) -> bool {
         self.entries
             .iter()
-            .any(|e| matches!(e.kind, StagedKind::Placeholder))
+            .any(|e| matches!(e.kind, StagedKind::Placeholder | StagedKind::DistTag))
     }
 }
 
@@ -10986,11 +11124,14 @@ impl StagedManifest {
 ///   [`UserSaveIntent::Range`], [`UserSaveIntent::Wildcard`],
 ///   [`UserSaveIntent::Workspace`]) — write the verbatim string. Finalize
 ///   skips these.
-/// - **Bare or dist-tag**, dep already in target dep table, no
-///   rewrite-forcing flag — leave the manifest entry alone (///   "no-churn" rule). Finalize skips these.
-/// - **Bare or dist-tag**, otherwise — write [`STAGE_PLACEHOLDER`] so the
-///   resolver picks up the new dep. Finalize will replace it with the
-///   final save spec once the resolved version is known.
+/// - **Dist-tag** (`@latest`, `@beta`, `@next`, etc.) — write the tag
+///   literal so the resolver honors that tag, mark [`StagedKind::DistTag`],
+///   and let finalize rewrite it to the resolved save spec.
+/// - **Bare**, dep already in target dep table, no rewrite-forcing flag —
+///   leave the manifest entry alone ("no-churn" rule). Finalize skips it.
+/// - **Bare**, otherwise — write [`STAGE_PLACEHOLDER`] so the resolver picks
+///   up the new dep. Finalize will replace it with the final save spec once
+///   the resolved version is known.
 ///
 /// Reads → mutates → atomically rewrites the manifest in one go. Does
 /// NOT touch the lockfile, the install pipeline, or any other manifest.
@@ -11065,15 +11206,20 @@ pub(crate) fn stage_packages_to_manifest(
             continue;
         }
 
+        if let UserSaveIntent::DistTag(tag) = &intent {
+            doc[dep_key][&name] = serde_json::Value::String(tag.clone());
+            doc_mutated = true;
+            entries.push(StagedEntry {
+                name,
+                intent,
+                kind: StagedKind::DistTag,
+            });
+            continue;
+        }
+
         // Tier 2: bare reinstall of an existing dep with no rewrite-forcing
         // flag → skip (no-churn rule).
         //
-        // **Audit Finding 3:** dist-tag intents (`react@latest`, `@beta`,
-        // `@next`) are NOT eligible for this skip even when the dep is
-        // already present. The user explicitly typed a tag, which is a
-        // request to re-resolve under that tag and save the new policy-
-        // derived spec. Only the truly-bare `lpm install <name>` form
-        // counts as "no churn" — that's a refresh of lockfile/store state.
         let is_bare_reinstall = matches!(intent, UserSaveIntent::Bare);
         let already_present = doc
             .get(dep_key)
@@ -11093,7 +11239,7 @@ pub(crate) fn stage_packages_to_manifest(
             continue;
         }
 
-        // Tier 3: bare/dist-tag without an existing entry, OR an existing
+        // Tier 3: bare install without an existing entry, OR an existing
         // entry that the user explicitly opted to rewrite via a flag.
         // Stage a placeholder; finalize will replace it after the resolver
         // returns the concrete version. The Done-block `+` list confirms
@@ -11172,29 +11318,28 @@ fn collect_direct_versions(packages: &[InstallPackage]) -> HashMap<String, lpm_s
 
 /// Replay the stage decisions against the
 /// current manifest using the resolver's output, replacing any
-/// [`STAGE_PLACEHOLDER`] entries with the final save spec computed by
+/// deferred entries with the final save spec computed by
 /// [`crate::save_spec::decide_saved_dependency_spec`].
 ///
 /// `resolved_versions` maps direct-dep names → the concrete version
-/// the resolver picked. Entries marked [`StagedKind::Placeholder`] that
-/// are missing from this map are treated as "the resolver dropped them",
-/// which is a hard error: the install pipeline succeeded but failed to
-/// resolve a top-level dep, which would silently leave a `*` in the
-/// manifest. Better to surface it.
+/// the resolver picked. Deferred entries missing from this map are treated
+/// as "the resolver dropped them", which is a hard error: the install
+/// pipeline succeeded but failed to resolve a top-level dep, which would
+/// silently leave a provisional spec in the manifest. Better to surface it.
 ///
 /// Reads the manifest fresh from disk so any unrelated edits the install
 /// pipeline made (it doesn't make any today, but this future-proofs us)
 /// are preserved. Atomic rewrite, same pretty-print conventions as stage.
 ///
-/// Skips entirely if [`StagedManifest::has_placeholders`] is `false` —
-/// nothing to do, and we avoid the read/write round-trip.
+/// Skips entirely if [`StagedManifest::needs_finalize`] is `false` — nothing
+/// to do, and we avoid the read/write round-trip.
 pub(crate) fn finalize_packages_in_manifest(
     staged: &StagedManifest,
     resolved_versions: &HashMap<String, lpm_semver::Version>,
     flags: crate::save_spec::SaveFlags,
     config: crate::save_spec::SaveConfig,
 ) -> Result<(), LpmError> {
-    if !staged.has_placeholders() {
+    if !staged.needs_finalize() {
         return Ok(());
     }
 
@@ -11209,15 +11354,21 @@ pub(crate) fn finalize_packages_in_manifest(
     };
 
     for entry in &staged.entries {
-        if !matches!(entry.kind, StagedKind::Placeholder) {
+        if !matches!(entry.kind, StagedKind::Placeholder | StagedKind::DistTag) {
             continue;
         }
+
+        let staged_spec = match (&entry.kind, &entry.intent) {
+            (StagedKind::Placeholder, _) => STAGE_PLACEHOLDER.to_string(),
+            (StagedKind::DistTag, crate::save_spec::UserSaveIntent::DistTag(tag)) => tag.clone(),
+            _ => unreachable!("deferred staged entry must be bare placeholder or dist-tag"),
+        };
 
         let resolved = resolved_versions.get(&entry.name).ok_or_else(|| {
             LpmError::Registry(format!(
                 "finalize: resolver did not report a concrete version for `{}` \
-                 (staged with placeholder `{STAGE_PLACEHOLDER}`). Refusing to leave the \
-                 placeholder in {}.",
+                 (staged with provisional spec `{staged_spec}`). Refusing to leave the \
+                 provisional spec in {}.",
                 entry.name,
                 staged.pkg_json_path.display(),
             ))
@@ -11227,6 +11378,74 @@ pub(crate) fn finalize_packages_in_manifest(
             crate::save_spec::decide_saved_dependency_spec(&entry.intent, resolved, flags, config);
 
         doc[dep_key][&entry.name] = serde_json::Value::String(decision.spec_to_write);
+    }
+
+    let updated =
+        serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
+    std::fs::write(&staged.pkg_json_path, format!("{updated}\n"))?;
+    Ok(())
+}
+
+/// Rewrite staged dist-tag literals to exact versions before the resolver runs.
+///
+/// The CLI `install pkg@beta` flow needs two different representations of the
+/// same user input:
+///
+/// - the original dist-tag intent for finalize, so `package.json` can later be
+///   saved as `^resolved` or exact-prerelease per save-policy rules
+/// - an exact version in the staged manifest so the resolver never has to parse
+///   a raw dist-tag like `beta`
+///
+/// `stage_packages_to_manifest` preserves the dist-tag literal and stores the
+/// original [`UserSaveIntent::DistTag`] on each [`StagedEntry`]. This helper is
+/// the second step: resolve those staged tags through the same routed metadata
+/// path install already uses (`.npmrc` custom registries included), then patch
+/// just the staged manifest entries to their concrete versions.
+async fn pin_staged_dist_tags_for_resolution(
+    client: &RegistryClient,
+    route_cwd: &Path,
+    staged: &StagedManifest,
+) -> Result<(), LpmError> {
+    let dist_tag_entries: Vec<(&str, &str)> = staged
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.intent {
+            crate::save_spec::UserSaveIntent::DistTag(tag) => {
+                Some((entry.name.as_str(), tag.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    if dist_tag_entries.is_empty() {
+        return Ok(());
+    }
+
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(route_cwd)
+        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+
+    let content = std::fs::read_to_string(&staged.pkg_json_path)?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
+
+    let dep_key = if staged.save_dev {
+        "devDependencies"
+    } else {
+        "dependencies"
+    };
+
+    for (name, tag) in dist_tag_entries {
+        let resolved_version = if lpm_common::package_name::is_lpm_package(name) {
+            let pkg_name = lpm_common::PackageName::parse(name)
+                .map_err(|e| LpmError::Registry(e.to_string()))?;
+            client.get_package_metadata(&pkg_name).await?
+        } else {
+            let route = route_table.route_for_package(name);
+            client.get_npm_metadata_routed(name, route).await?
+        }
+        .resolve_version_spec(tag)?;
+
+        doc[dep_key][name] = serde_json::Value::String(resolved_version);
     }
 
     let updated =
@@ -11380,6 +11599,7 @@ pub async fn run_add_packages(
         let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
         let staged =
             stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
+        pin_staged_dist_tags_for_resolution(client, project_dir, &staged).await?;
         maybe_test_panic("after-stage");
 
         // 3. Remove lockfile so the resolver re-runs against the staged manifest.
@@ -11685,6 +11905,12 @@ pub async fn run_install_filtered_add(
             // exact paths (no double-compute, no path drift).
             let install_root = &member_install_roots[idx];
             let lockfile_path = &lockfile_paths[idx];
+
+            if let Err(e) = pin_staged_dist_tags_for_resolution(client, install_root, &staged).await
+            {
+                last_err = Some(e);
+                break;
+            }
 
             // (b) Remove this member's lockfile so the resolver re-runs.
             //     The transaction snapshot already captured the original
@@ -12107,6 +12333,10 @@ fn resolve_version_from_spec<'a>(
     // If no version specified (wildcard), use latest
     if range_spec == "*" {
         return Ok(latest_ver);
+    }
+
+    if let Some(tagged_version) = metadata.dist_tags.get(range_spec) {
+        return Ok(tagged_version.as_str());
     }
 
     let range = lpm_semver::VersionReq::parse(range_spec).map_err(|_| {
@@ -12903,6 +13133,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_dist_tag_returns_tagged_version() {
+        let mut meta = make_metadata(&["1.9.0", "2.0.0-beta.2"], "1.9.0");
+        meta.dist_tags
+            .insert("beta".to_string(), "2.0.0-beta.2".to_string());
+
+        let result = resolve_version_from_spec("beta", &meta, "1.9.0").unwrap();
+        assert_eq!(result, "2.0.0-beta.2");
+    }
+
+    #[test]
     fn resolve_no_match_returns_error() {
         let meta = make_metadata(&["1.0.0", "1.5.0"], "1.5.0");
         let result = resolve_version_from_spec("^3.0.0", &meta, "1.5.0");
@@ -13475,7 +13715,7 @@ mod tests {
         assert!(after.get("devDependencies").is_none());
         assert_eq!(staged.entries.len(), 1);
         assert!(matches!(staged.entries[0].kind, StagedKind::Final));
-        assert!(!staged.has_placeholders());
+        assert!(!staged.needs_finalize());
     }
 
     #[test]
@@ -13531,7 +13771,7 @@ mod tests {
         assert_eq!(after["dependencies"]["new-pkg"], STAGE_PLACEHOLDER);
         assert_eq!(after["lpm"]["trustedDependencies"][0], "esbuild");
         assert!(matches!(staged.entries[0].kind, StagedKind::Placeholder));
-        assert!(staged.has_placeholders());
+        assert!(staged.needs_finalize());
     }
 
     #[test]
@@ -13625,20 +13865,20 @@ mod tests {
         let after = read_manifest(&pkg_path);
         assert_eq!(after["dependencies"]["ms"], "~2.1.3");
         assert!(matches!(staged.entries[0].kind, StagedKind::Skipped));
-        assert!(!staged.has_placeholders());
+        assert!(!staged.needs_finalize());
     }
 
-    /// A dist-tag install
-    /// against an existing dep is NOT a "bare reinstall" — the user typed
-    /// `@latest`/`@beta`/`@next`, which is explicit input asking for the
-    /// current value of that tag. Stage MUST stage a placeholder so
-    /// finalize can rewrite the manifest with the resolved version.
+    /// A dist-tag install against an existing dep is NOT a "bare
+    /// reinstall" — the user typed `@latest`/`@beta`/`@next`, which is
+    /// explicit input asking for the current value of that tag. Stage must
+    /// keep the tag literal in the manifest so the resolver honors it, then
+    /// finalize rewrites the manifest with the resolved version.
     ///
     /// Pre-fix: `lpm install react@latest` on an existing `react: "17.0.0"`
     /// entry would hit the Skipped branch and never update the manifest,
     /// even though the resolver picked a new version.
     #[test]
-    fn stage_dist_tag_on_existing_dep_writes_placeholder_not_skipped() {
+    fn stage_dist_tag_on_existing_dep_writes_tag_literal_not_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         write_manifest(
@@ -13659,13 +13899,13 @@ mod tests {
 
         let after = read_manifest(&pkg_path);
         assert_eq!(
-            after["dependencies"]["react"], STAGE_PLACEHOLDER,
-            "dist-tag against existing dep must stage a placeholder, not skip — \
-             the user explicitly asked for a new resolution under that tag"
+            after["dependencies"]["react"], "latest",
+            "dist-tag against existing dep must stage the tag literal, not skip — \
+             the resolver needs that literal to honor the user's requested tag"
         );
         assert!(
-            matches!(staged.entries[0].kind, StagedKind::Placeholder),
-            "dist-tag intent must produce StagedKind::Placeholder, not Skipped; \
+            matches!(staged.entries[0].kind, StagedKind::DistTag),
+            "dist-tag intent must produce StagedKind::DistTag, not Skipped; \
              got: {:?}",
             staged.entries[0].kind
         );
@@ -13811,7 +14051,7 @@ mod tests {
         let pkg_path = dir.path().join("package.json");
         write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
 
-        // Stage explicit-only specs → no placeholders.
+        // Stage explicit-only specs → no deferred finalize entries.
         let staged = stage_packages_to_manifest(
             &pkg_path,
             &["react@18.2.0".to_string()],
@@ -13866,6 +14106,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         }
     }
 
@@ -13989,11 +14230,11 @@ mod tests {
         );
     }
 
-    /// Finalize errors loudly if a placeholder entry has no resolved
+    /// Finalize errors loudly if a deferred entry has no resolved
     /// version in the map. Better to surface this than to silently leave
-    /// a `*` in the manifest.
+    /// a provisional spec in the manifest.
     #[test]
-    fn finalize_errors_when_resolved_version_missing_for_placeholder() {
+    fn finalize_errors_when_resolved_version_missing_for_deferred_entry() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
@@ -14016,7 +14257,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("ms"));
-        assert!(err.contains("placeholder"));
+        assert!(err.contains("provisional spec"));
     }
 
     // ── audit fix #1: D2 migration hint on filtered install no-match ──
@@ -14612,6 +14853,53 @@ mod tests {
         let link_path = app_dir.join("node_modules").join("@test").join("core");
         let resolved = std::fs::canonicalize(&link_path).unwrap();
         assert_eq!(resolved, core_dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn link_workspace_members_from_member_also_populates_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_workspace_for_install_tests(
+            root,
+            &[
+                ("@test/app", "packages/app"),
+                ("@test/core", "packages/core"),
+                ("@test/tokens", "packages/tokens"),
+            ],
+        );
+
+        let app_dir = root.join("packages/app");
+        let core_dir = root.join("packages/core");
+        let tokens_dir = root.join("packages/tokens");
+
+        let members = vec![
+            WorkspaceMemberLink {
+                name: "@test/core".to_string(),
+                version: "0.0.0".to_string(),
+                source_dir: core_dir.clone(),
+            },
+            WorkspaceMemberLink {
+                name: "@test/tokens".to_string(),
+                version: "0.0.0".to_string(),
+                source_dir: tokens_dir.clone(),
+            },
+        ];
+
+        link_workspace_members(&app_dir, &members).unwrap();
+
+        let root_core_link = root.join("node_modules").join("@test").join("core");
+        let root_tokens_link = root.join("node_modules").join("@test").join("tokens");
+
+        assert_eq!(
+            std::fs::canonicalize(&root_core_link).unwrap(),
+            core_dir.canonicalize().unwrap(),
+            "workspace-root node_modules must expose @test/core for realpath-based transitive imports"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&root_tokens_link).unwrap(),
+            tokens_dir.canonicalize().unwrap(),
+            "workspace-root node_modules must expose @test/tokens for realpath-based transitive imports"
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -15919,6 +16207,7 @@ mod tests {
             peers: Vec::new(),
             integrity: integrity.map(|s| s.to_string()),
             tarball_url: Some(url.to_string()),
+            metadata_checked_for_tarball: false,
         }
     }
 
@@ -17226,6 +17515,7 @@ mod tests {
                 peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
+                metadata_checked_for_tarball: false,
             };
             let wid = pkg.wrapper_id_for_source();
             match want_prefix {
@@ -17270,6 +17560,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         };
         let local = InstallPackage {
             name: "foo".to_string(),
@@ -17283,6 +17574,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         };
 
         let remote_wid = remote
@@ -17619,6 +17911,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         };
 
         let path = pkg
@@ -17651,6 +17944,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         };
 
         let err = pkg
@@ -18197,6 +18491,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         };
 
         let path = pkg
@@ -18556,6 +18851,7 @@ mod tests {
                 peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
+                metadata_checked_for_tarball: false,
             },
             InstallPackage {
                 name: "lodash".to_string(),
@@ -18569,6 +18865,7 @@ mod tests {
                 peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
+                metadata_checked_for_tarball: false,
             },
             InstallPackage {
                 name: "b".to_string(),
@@ -18582,6 +18879,7 @@ mod tests {
                 peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
+                metadata_checked_for_tarball: false,
             },
         ];
 
@@ -18644,6 +18942,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         }];
 
         let mut source_deps = HashMap::new();

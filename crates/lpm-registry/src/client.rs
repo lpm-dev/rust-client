@@ -2862,6 +2862,94 @@ impl RegistryClient {
             .await
     }
 
+    pub async fn search_npm_packages_routed(
+        &self,
+        query: &str,
+        limit: u32,
+        route: crate::UpstreamRoute,
+    ) -> Result<SearchResponse, LpmError> {
+        match route {
+            crate::UpstreamRoute::LpmWorker => self.search_packages(query, limit).await,
+            crate::UpstreamRoute::NpmDirect => self.search_npm_packages(query, limit).await,
+            crate::UpstreamRoute::Custom { target, auth } => {
+                self.search_npm_packages_from(&target.base_url, query, limit, auth.as_ref())
+                    .await
+            }
+        }
+    }
+
+    pub async fn search_npm_packages(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<SearchResponse, LpmError> {
+        self.search_npm_packages_from(&self.npm_registry_url, query, limit, None)
+            .await
+    }
+
+    pub async fn search_npm_packages_from(
+        &self,
+        base_url: &str,
+        query: &str,
+        limit: u32,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<SearchResponse, LpmError> {
+        #[derive(serde::Deserialize)]
+        struct NpmSearchEnvelope {
+            #[serde(default)]
+            objects: Vec<NpmSearchObject>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct NpmSearchObject {
+            package: NpmSearchPackage,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct NpmSearchPackage {
+            name: String,
+            #[serde(default)]
+            description: Option<String>,
+            version: String,
+        }
+
+        let url = format!(
+            "{base_url}/-/v1/search?text={}&size={}",
+            urlencoding::encode(query),
+            limit.min(20)
+        );
+        let req = self
+            .http
+            .for_url(&url)
+            .await?
+            .get(&url)
+            .header("Accept", "application/json");
+        let req = apply_npmrc_auth(req, &url, auth)?;
+        let response = self.send_with_retry(req).await?;
+        let envelope: NpmSearchEnvelope =
+            parse_capped_api_json(response, &format!("response from {url}")).await?;
+
+        Ok(SearchResponse {
+            packages: envelope
+                .objects
+                .into_iter()
+                .map(|object| SearchPackage {
+                    id: None,
+                    name: object.package.name,
+                    owner: None,
+                    description: object.package.description,
+                    distribution_mode: Some("npm".to_string()),
+                    download_count: None,
+                    latest_version: Some(object.package.version),
+                    category: None,
+                    avatar_url: None,
+                    is_org: None,
+                    archived: None,
+                })
+                .collect(),
+        })
+    }
+
     /// Search owners (users and organizations).
     ///
     /// Posture: `AnonymousPreferred` — public discovery endpoint.

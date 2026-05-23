@@ -42,7 +42,11 @@ fn audit_help_lists_fail_on_policies_on_separate_lines() {
         "expected behavior policy on its own help line; got:\n{combined}"
     );
     assert!(
-        combined.contains("all      — either vulnerabilities or behavioral flags (default)"),
+        combined.contains("secrets  — only hardcoded secret findings from --secrets mode\n"),
+        "expected secrets policy on its own help line; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("all      — vulnerabilities, behavioral flags, or secrets (default)"),
         "expected all policy on its own help line; got:\n{combined}"
     );
     assert!(
@@ -582,6 +586,13 @@ fn audit_secrets_detects_stripe_live_key_in_node_modules() {
         .output()
         .expect("failed to run lpm audit --secrets");
 
+    assert!(
+        !out.status.success(),
+        "default audit --secrets policy must exit non-zero when secrets are found\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("leaky-pkg"),
@@ -648,6 +659,56 @@ fn audit_secrets_json_envelope_carries_findings_array() {
     assert!(
         matches[0]["pattern"].is_string(),
         "each match must carry pattern + severity: {envelope}"
+    );
+}
+
+#[test]
+fn audit_secrets_fail_on_vuln_does_not_trigger_on_secret_finding() {
+    let project = TempProject::empty(r#"{"name":"secrets-vuln-policy","version":"1.0.0"}"#);
+    seed_node_modules_package(
+        &project,
+        "leaky-pkg",
+        &[(
+            "index.js",
+            "const AWS = { accessKey: 'AKIAIOSFODNN7EXAMPLE' };\nmodule.exports = AWS;\n",
+        )],
+    );
+
+    let out = lpm(&project)
+        .args(["audit", "--secrets", "--fail-on=vuln"])
+        .output()
+        .expect("failed to run lpm audit --secrets --fail-on=vuln");
+
+    assert!(
+        out.status.success(),
+        "--fail-on=vuln must not trigger on secret findings alone\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn audit_secrets_fail_on_secrets_triggers_on_secret_finding() {
+    let project = TempProject::empty(r#"{"name":"secrets-policy","version":"1.0.0"}"#);
+    seed_node_modules_package(
+        &project,
+        "leaky-pkg",
+        &[(
+            "index.js",
+            "const AWS = { accessKey: 'AKIAIOSFODNN7EXAMPLE' };\nmodule.exports = AWS;\n",
+        )],
+    );
+
+    let out = lpm(&project)
+        .args(["audit", "--secrets", "--fail-on=secrets"])
+        .output()
+        .expect("failed to run lpm audit --secrets --fail-on=secrets");
+
+    assert!(
+        !out.status.success(),
+        "--fail-on=secrets must trigger on secret findings\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
 }
 

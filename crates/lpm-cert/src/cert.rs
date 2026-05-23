@@ -1,7 +1,7 @@
 //! Project certificate generation and management.
 //!
 //! Generates certificates signed by the LPM root CA for use with local dev servers.
-//! Default SANs: localhost, 127.0.0.1, ::1, *.local — plus any user-specified hostnames.
+//! Default SANs: localhost, 127.0.0.1, ::1 — plus any user-specified hostnames.
 
 use lpm_common::LpmError;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
@@ -144,7 +144,7 @@ pub struct CertInfo {
 
 /// Generate a project certificate signed by the given CA.
 ///
-/// Default SANs: `localhost`, `127.0.0.1`, `::1`, `*.local`
+/// Default SANs: `localhost`, `127.0.0.1`, `::1`
 /// Additional hostnames are appended from `extra_hostnames`.
 ///
 /// Returns `(cert_pem, key_pem)` as PEM-encoded strings.

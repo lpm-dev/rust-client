@@ -277,6 +277,54 @@ fn run_respects_task_dependencies_from_lpm_json() {
     );
 }
 
+#[test]
+fn script_shortcut_runs_lpm_json_meta_task_and_dependencies() {
+    let project = TempProject::from_fixture("with-scripts");
+
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "outputs": ["dist/**"]
+                },
+                "test": {
+                    "dependsOn": ["build"]
+                },
+                "verify": {
+                    "dependsOn": ["lint", "check", "test"]
+                }
+            }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["verify"])
+        .output()
+        .expect("failed to run lpm verify");
+
+    assert!(
+        output.status.success(),
+        "script shortcut must behave like 'lpm run verify'\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    for expected in ["built", "linted", "checked", "tested"] {
+        assert!(
+            combined.contains(expected),
+            "script shortcut must run the full task graph; missing {expected} in:\n{combined}"
+        );
+    }
+}
+
 // ─── Env Loading ─────────────────────────────────────────────────
 
 #[test]
@@ -506,6 +554,48 @@ fn run_multi_task_json_output() {
             task["name"]
         );
     }
+}
+
+#[test]
+fn run_watch_rejects_multiple_scripts() {
+    let project = TempProject::from_fixture("with-scripts");
+
+    let output = lpm(&project)
+        .args(["run", "build", "lint", "--watch"])
+        .output()
+        .expect("failed to run lpm run --watch with multiple scripts");
+
+    assert!(
+        !output.status.success(),
+        "watch with multiple scripts must fail fast"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--watch") && stderr.contains("exactly one script"),
+        "expected a watch single-script error, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn run_watch_rejects_workspace_selection_flags() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    let output = lpm(&project)
+        .args(["run", "echo", "--watch", "--filter", "@test/utils"])
+        .output()
+        .expect("failed to run lpm run --watch --filter");
+
+    assert!(
+        !output.status.success(),
+        "watch with workspace selection flags must fail fast"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--watch") && stderr.contains("--filter"),
+        "expected a watch/workspace-flag error, got:\n{stderr}"
+    );
 }
 
 // ─── Parallel Execution ──────────────────────────────────────────

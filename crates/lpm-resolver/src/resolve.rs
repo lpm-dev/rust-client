@@ -299,6 +299,20 @@ pub async fn resolve_dependencies(
     resolve_dependencies_with_overrides(client, dependencies, OverrideSet::empty()).await
 }
 
+pub async fn resolve_dependencies_routed(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    route_table: RouteTable,
+) -> Result<ResolveResult, ResolveError> {
+    resolve_dependencies_with_overrides_routed(
+        client,
+        dependencies,
+        OverrideSet::empty(),
+        route_table,
+    )
+    .await
+}
+
 /// Resolve with a fully-parsed [`OverrideSet`].
 ///
 /// **Path-selector wiring.** If the override set declares any path
@@ -312,6 +326,21 @@ pub async fn resolve_dependencies_with_overrides(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
     overrides: OverrideSet,
+) -> Result<ResolveResult, ResolveError> {
+    resolve_dependencies_with_overrides_routed(
+        client,
+        dependencies,
+        overrides,
+        RouteTable::from_mode_only(RouteMode::Proxy),
+    )
+    .await
+}
+
+pub async fn resolve_dependencies_with_overrides_routed(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    route_table: RouteTable,
 ) -> Result<ResolveResult, ResolveError> {
     // When no walker is wired, the caller gets a fresh empty shared
     // cache + zero wait-timeout. The provider's `ensure_cached`
@@ -334,7 +363,7 @@ pub async fn resolve_dependencies_with_overrides(
         notify_map,
         walker_done,
         Duration::ZERO,
-        RouteTable::from_mode_only(RouteMode::Proxy), // preserve pre-49 proxy behavior for callers that bypass install.rs
+        route_table,
         StreamingBfsMetrics::new(),
         true, // default: auto-install peers ON.
     )
