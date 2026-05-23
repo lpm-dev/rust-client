@@ -1,3 +1,4 @@
+use crate::npm_public_source::lockfile_source_is_npm_public;
 use crate::output;
 use crate::prompt::prompt_err;
 #[cfg(test)]
@@ -6,6 +7,7 @@ use crate::upgrade_engine::{self, PatchInvalidation, PeerImpact, SemverClass};
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
+use lpm_registry::PackageMetadata;
 use lpm_semver::Version;
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -76,6 +78,20 @@ enum TargetKind {
     AbsoluteLatest,
 }
 
+#[derive(Debug, Clone)]
+enum MetadataLookup {
+    Lpm(PackageName),
+    Npm,
+}
+
+#[derive(Debug, Clone)]
+struct UpgradeDependency {
+    name: String,
+    range: String,
+    is_dev: bool,
+    lookup: MetadataLookup,
+}
+
 /// enriched candidate — drives both the interactive multiselect
 /// and the JSON output.
 #[derive(Clone)]
@@ -133,19 +149,6 @@ pub async fn run(
     let mode = resolve_mode(interactive, yes, json_output, is_tty)?;
     validate_major_for_mode(major, mode)?;
 
-    // Extract deps, filter to @lpm.dev/, parse names upfront
-    let all_deps = extract_deps_from_value(&doc);
-    let lpm_deps: Vec<(String, String, bool, PackageName)> = all_deps
-        .into_iter()
-        .filter_map(|(name, range, is_dev)| {
-            if !name.starts_with("@lpm.dev/") {
-                return None;
-            }
-            let pkg_name = PackageName::parse(&name).ok()?;
-            Some((name, range, is_dev, pkg_name))
-        })
-        .collect();
-
     // Read lockfile ONCE
     let lockfile_path = project_dir.join("lpm.lock");
     let lockfile = if lockfile_path.exists() {
@@ -154,12 +157,42 @@ pub async fn run(
         None
     };
 
+    let mut skipped_private: Vec<String> = Vec::new();
+    let all_deps = extract_deps_from_value(&doc);
+    let upgradeable_deps: Vec<UpgradeDependency> = all_deps
+        .into_iter()
+        .filter_map(|(name, range, is_dev)| {
+            if name.starts_with("@lpm.dev/") {
+                let pkg_name = PackageName::parse(&name).ok()?;
+                return Some(UpgradeDependency {
+                    name,
+                    range,
+                    is_dev,
+                    lookup: MetadataLookup::Lpm(pkg_name),
+                });
+            }
+
+            if lockfile_source_is_npm_public(lockfile.as_ref(), &name) {
+                return Some(UpgradeDependency {
+                    name,
+                    range,
+                    is_dev,
+                    lookup: MetadataLookup::Npm,
+                });
+            }
+
+            skipped_private.push(name);
+            None
+        })
+        .collect();
+    skipped_private.sort();
+
     // Fetch all metadata concurrently
-    let fetch_futures: Vec<_> = lpm_deps
+    let fetch_futures: Vec<_> = upgradeable_deps
         .iter()
-        .map(|(name, range, is_dev, pkg_name)| async move {
-            let result = client.get_package_metadata(pkg_name).await;
-            (name.as_str(), range.as_str(), *is_dev, result)
+        .map(|dep| async move {
+            let result = fetch_metadata(client, &dep.lookup, &dep.name).await;
+            (dep.name.as_str(), dep.range.as_str(), dep.is_dev, result)
         })
         .collect();
     let fetch_results = futures::future::join_all(fetch_futures).await;
@@ -342,16 +375,18 @@ pub async fn run(
 
     if candidates.is_empty() {
         if json_output {
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "success": true,
                 "dry_run": dry_run,
                 "upgraded": 0,
                 "packages": [],
                 "fetch_errors": fetch_errors,
             });
+            attach_skipped_private(&mut json, &skipped_private);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            output::success("All LPM packages are up to date");
+            output::success("All checked package.json dependencies are up to date");
+            warn_skipped_private(&skipped_private);
         }
         return Ok(());
     }
@@ -378,13 +413,14 @@ pub async fn run(
 
     if json_output {
         let pkgs: Vec<serde_json::Value> = deduped.iter().map(candidate_to_json).collect();
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "success": true,
             "dry_run": dry_run,
             "upgraded": deduped.len(),
             "packages": pkgs,
             "fetch_errors": fetch_errors,
         });
+        attach_skipped_private(&mut json, &skipped_private);
         println!(
             "{}",
             serde_json::to_string_pretty(&json).unwrap_or_default()
@@ -420,6 +456,7 @@ pub async fn run(
                 "{} package(s) would be upgraded (dry run)",
                 deduped.len()
             ));
+            warn_skipped_private(&skipped_private);
             return Ok(());
         }
     }
@@ -431,6 +468,9 @@ pub async fn run(
         .map_err(|e| LpmError::Script(format!("failed to serialize package.json: {e}")))?;
 
     let tmp_path = pkg_json_path.with_extension("json.tmp");
+    let lockfile_backup = read_optional_file(&project_dir.join("lpm.lock"))?;
+    let lockfile_binary_backup = read_optional_file(&project_dir.join("lpm.lockb"))?;
+
     std::fs::write(&tmp_path, format!("{updated_content}\n"))
         .map_err(|e| LpmError::Script(format!("failed to write temp package.json: {e}")))?;
     std::fs::rename(&tmp_path, &pkg_json_path)
@@ -448,6 +488,9 @@ pub async fn run(
     if !json_output {
         output::info("running lpm install...");
     }
+
+    remove_optional_file(&project_dir.join("lpm.lock"))?;
+    remove_optional_file(&project_dir.join("lpm.lockb"))?;
 
     let install_result = crate::commands::install::run_with_options(
         client,
@@ -494,14 +537,99 @@ pub async fn run(
         } else if !json_output {
             output::warn("install failed — restored original package.json");
         }
+
+        if let Err(restore_err) = restore_optional_file(&project_dir.join("lpm.lock"), &lockfile_backup)
+        {
+            tracing::error!("failed to restore lpm.lock after install failure: {}", restore_err);
+        }
+        if let Err(restore_err) =
+            restore_optional_file(&project_dir.join("lpm.lockb"), &lockfile_binary_backup)
+        {
+            tracing::error!("failed to restore lpm.lockb after install failure: {}", restore_err);
+        }
         return Err(e);
     }
 
     if !json_output {
         output::success(&format!("{} package(s) upgraded", deduped.len()));
+        warn_skipped_private(&skipped_private);
     }
 
     Ok(())
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, LpmError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(LpmError::Script(format!(
+            "failed to read {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn remove_optional_file(path: &Path) -> Result<(), LpmError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(LpmError::Script(format!(
+            "failed to remove {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn restore_optional_file(path: &Path, backup: &Option<Vec<u8>>) -> std::io::Result<()> {
+    match backup {
+        Some(bytes) => std::fs::write(path, bytes),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        },
+    }
+}
+
+async fn fetch_metadata(
+    client: &RegistryClient,
+    lookup: &MetadataLookup,
+    name: &str,
+) -> Result<PackageMetadata, LpmError> {
+    match lookup {
+        MetadataLookup::Lpm(pkg_name) => client.get_package_metadata(pkg_name).await,
+        MetadataLookup::Npm => client.get_npm_package_metadata(name).await,
+    }
+}
+
+fn attach_skipped_private(json: &mut serde_json::Value, skipped_private: &[String]) {
+    if skipped_private.is_empty() {
+        return;
+    }
+
+    json.as_object_mut().unwrap().insert(
+        "skipped_private".into(),
+        serde_json::json!(skipped_private),
+    );
+    json.as_object_mut().unwrap().insert(
+        "skipped_private_reason".into(),
+        serde_json::json!(
+            "Packages without a recorded npm-public source were skipped to avoid leaking private names to registry.npmjs.org. Run `lpm install` to resolve sources, then re-run."
+        ),
+    );
+}
+
+fn warn_skipped_private(skipped_private: &[String]) {
+    if skipped_private.is_empty() {
+        return;
+    }
+
+    output::warn(&format!(
+        "skipped {} package(s) without a recorded npm-public source to avoid leaking private names to registry.npmjs.org: {}",
+        skipped_private.len(),
+        skipped_private.join(", "),
+    ));
+    output::info("run `lpm install` first to record sources in lpm.lock, then re-run.");
 }
 
 // ── Interactive multiselect ─────────────────────────────────────────

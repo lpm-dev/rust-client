@@ -1247,18 +1247,28 @@ fn link_workspace_members(
         return Ok(0);
     }
 
-    let node_modules = project_dir.join("node_modules");
-    std::fs::create_dir_all(&node_modules).map_err(LpmError::Io)?;
+    let mut node_modules_roots = vec![project_dir.join("node_modules")];
+    if let Ok(Some(workspace)) = lpm_workspace::discover_workspace(project_dir)
+        && workspace.root != project_dir
+    {
+        node_modules_roots.push(workspace.root.join("node_modules"));
+    }
+
+    for node_modules in &node_modules_roots {
+        std::fs::create_dir_all(node_modules).map_err(LpmError::Io)?;
+    }
 
     let mut linked = 0usize;
     for member in members {
-        lpm_linker::link_workspace_member(&node_modules, &member.name, &member.source_dir)
-            .map_err(|e| {
-                LpmError::Workspace(format!(
-                    "failed to link workspace member {}: {e}",
-                    member.name
-                ))
-            })?;
+        for node_modules in &node_modules_roots {
+            lpm_linker::link_workspace_member(node_modules, &member.name, &member.source_dir)
+                .map_err(|e| {
+                    LpmError::Workspace(format!(
+                        "failed to link workspace member {}: {e}",
+                        member.name
+                    ))
+                })?;
+        }
         linked += 1;
     }
     Ok(linked)
@@ -3748,6 +3758,8 @@ async fn run_with_options_under_store_lock(
     for (name, range) in &pkg.dev_dependencies {
         deps.entry(name.clone()).or_insert_with(|| range.clone());
     }
+
+    let declared_deps = deps.clone();
 
     // Resolve `catalog:` protocols and EXTRACT `workspace:*` member references
     // before anything else (lockfile fast path, resolver). This ensures the
@@ -7068,7 +7080,7 @@ async fn run_with_options_under_store_lock(
 
         // Phantom dependency detection
         let phantom_result =
-            crate::intelligence::detect_phantom_deps(project_dir, &deps, &installed_names);
+            crate::intelligence::detect_phantom_deps(project_dir, &declared_deps, &installed_names);
 
         if !phantom_result.phantom_imports.is_empty() {
             eprintln!();
@@ -7239,6 +7251,14 @@ async fn run_with_options_under_store_lock(
                 .iter()
                 .map(|(name, version)| format!("{name}@{version}"))
                 .collect();
+            let tarball_field_hint = if matches!(
+                p.source_kind(),
+                Ok(lpm_lockfile::Source::Registry { .. })
+            ) {
+                p.tarball_url.clone()
+            } else {
+                None
+            };
 
             lockfile.add_package(lpm_lockfile::LockedPackage {
                 name: p.name.clone(),
@@ -7252,7 +7272,7 @@ async fn run_with_options_under_store_lock(
                 // returned at resolve time so warm installs can skip
                 // the per-package metadata round-trip. Consumed by
                 // `try_lockfile_fast_path` through `evaluate_cached_url`.
-                tarball: p.tarball_url.clone(),
+                tarball: tarball_field_hint,
             });
         }
 
@@ -11005,11 +11025,11 @@ async fn fetch_and_store_streaming(
     ))
 }
 
-/// placeholder spec written into the manifest by
-/// [`stage_packages_to_manifest`] for entries whose final spec depends on
-/// the resolved version. The full install pipeline sees this as "any
-/// version", resolves it normally, and [`finalize_packages_in_manifest`]
-/// then replaces it with the resolved-version-derived spec.
+/// placeholder spec written into the manifest for bare installs whose
+/// final save spec depends on the resolved version. The full install
+/// pipeline sees this as "any version", resolves it normally, and
+/// [`finalize_packages_in_manifest`] then replaces it with the
+/// resolved-version-derived spec.
 ///
 /// This string MUST be a valid `node_semver` range so the resolver
 /// accepts it. `*` is the canonical "any version" spec.
@@ -11021,9 +11041,14 @@ pub(crate) enum StagedKind {
     /// Stage wrote the user's verbatim explicit spec (Exact / Range /
     /// Wildcard / Workspace). Finalize is a no-op.
     Final,
-    /// Stage wrote the [`STAGE_PLACEHOLDER`]. Finalize must replace it
-    /// with `decide_saved_dependency_spec(intent, resolved, flags, config)`.
+    /// Stage wrote the [`STAGE_PLACEHOLDER`] for a bare install. Finalize
+    /// must replace it with `decide_saved_dependency_spec(intent, resolved,
+    /// flags, config)`.
     Placeholder,
+    /// Stage wrote the user's dist-tag literal (`latest`, `beta`, `next`,
+    /// etc.) so the resolver can honor that tag. Finalize still replaces the
+    /// staged tag with the resolved save spec.
+    DistTag,
     /// Stage left the manifest untouched because the dep already exists
     /// and the bare reinstall came with no rewrite-forcing flag.     /// "no churn" rule. Finalize is a no-op.
     Skipped,
@@ -11047,13 +11072,13 @@ pub(crate) struct StagedManifest {
 }
 
 impl StagedManifest {
-    /// Whether this stage produced any placeholders that finalize must
-    /// rewrite. Used by callers to skip the finalize re-read entirely
-    /// when nothing was placeheld.
-    pub fn has_placeholders(&self) -> bool {
+    /// Whether this stage produced any deferred entries that finalize must
+    /// rewrite. Used by callers to skip the finalize re-read entirely when
+    /// every entry was either final or skipped.
+    pub fn needs_finalize(&self) -> bool {
         self.entries
             .iter()
-            .any(|e| matches!(e.kind, StagedKind::Placeholder))
+            .any(|e| matches!(e.kind, StagedKind::Placeholder | StagedKind::DistTag))
     }
 }
 
@@ -11068,11 +11093,14 @@ impl StagedManifest {
 ///   [`UserSaveIntent::Range`], [`UserSaveIntent::Wildcard`],
 ///   [`UserSaveIntent::Workspace`]) — write the verbatim string. Finalize
 ///   skips these.
-/// - **Bare or dist-tag**, dep already in target dep table, no
-///   rewrite-forcing flag — leave the manifest entry alone (///   "no-churn" rule). Finalize skips these.
-/// - **Bare or dist-tag**, otherwise — write [`STAGE_PLACEHOLDER`] so the
-///   resolver picks up the new dep. Finalize will replace it with the
-///   final save spec once the resolved version is known.
+/// - **Dist-tag** (`@latest`, `@beta`, `@next`, etc.) — write the tag
+///   literal so the resolver honors that tag, mark [`StagedKind::DistTag`],
+///   and let finalize rewrite it to the resolved save spec.
+/// - **Bare**, dep already in target dep table, no rewrite-forcing flag —
+///   leave the manifest entry alone ("no-churn" rule). Finalize skips it.
+/// - **Bare**, otherwise — write [`STAGE_PLACEHOLDER`] so the resolver picks
+///   up the new dep. Finalize will replace it with the final save spec once
+///   the resolved version is known.
 ///
 /// Reads → mutates → atomically rewrites the manifest in one go. Does
 /// NOT touch the lockfile, the install pipeline, or any other manifest.
@@ -11147,15 +11175,20 @@ pub(crate) fn stage_packages_to_manifest(
             continue;
         }
 
+        if let UserSaveIntent::DistTag(tag) = &intent {
+            doc[dep_key][&name] = serde_json::Value::String(tag.clone());
+            doc_mutated = true;
+            entries.push(StagedEntry {
+                name,
+                intent,
+                kind: StagedKind::DistTag,
+            });
+            continue;
+        }
+
         // Tier 2: bare reinstall of an existing dep with no rewrite-forcing
         // flag → skip (no-churn rule).
         //
-        // **Audit Finding 3:** dist-tag intents (`react@latest`, `@beta`,
-        // `@next`) are NOT eligible for this skip even when the dep is
-        // already present. The user explicitly typed a tag, which is a
-        // request to re-resolve under that tag and save the new policy-
-        // derived spec. Only the truly-bare `lpm install <name>` form
-        // counts as "no churn" — that's a refresh of lockfile/store state.
         let is_bare_reinstall = matches!(intent, UserSaveIntent::Bare);
         let already_present = doc
             .get(dep_key)
@@ -11175,7 +11208,7 @@ pub(crate) fn stage_packages_to_manifest(
             continue;
         }
 
-        // Tier 3: bare/dist-tag without an existing entry, OR an existing
+        // Tier 3: bare install without an existing entry, OR an existing
         // entry that the user explicitly opted to rewrite via a flag.
         // Stage a placeholder; finalize will replace it after the resolver
         // returns the concrete version. The Done-block `+` list confirms
@@ -11254,29 +11287,28 @@ fn collect_direct_versions(packages: &[InstallPackage]) -> HashMap<String, lpm_s
 
 /// Replay the stage decisions against the
 /// current manifest using the resolver's output, replacing any
-/// [`STAGE_PLACEHOLDER`] entries with the final save spec computed by
+/// deferred entries with the final save spec computed by
 /// [`crate::save_spec::decide_saved_dependency_spec`].
 ///
 /// `resolved_versions` maps direct-dep names → the concrete version
-/// the resolver picked. Entries marked [`StagedKind::Placeholder`] that
-/// are missing from this map are treated as "the resolver dropped them",
-/// which is a hard error: the install pipeline succeeded but failed to
-/// resolve a top-level dep, which would silently leave a `*` in the
-/// manifest. Better to surface it.
+/// the resolver picked. Deferred entries missing from this map are treated
+/// as "the resolver dropped them", which is a hard error: the install
+/// pipeline succeeded but failed to resolve a top-level dep, which would
+/// silently leave a provisional spec in the manifest. Better to surface it.
 ///
 /// Reads the manifest fresh from disk so any unrelated edits the install
 /// pipeline made (it doesn't make any today, but this future-proofs us)
 /// are preserved. Atomic rewrite, same pretty-print conventions as stage.
 ///
-/// Skips entirely if [`StagedManifest::has_placeholders`] is `false` —
-/// nothing to do, and we avoid the read/write round-trip.
+/// Skips entirely if [`StagedManifest::needs_finalize`] is `false` — nothing
+/// to do, and we avoid the read/write round-trip.
 pub(crate) fn finalize_packages_in_manifest(
     staged: &StagedManifest,
     resolved_versions: &HashMap<String, lpm_semver::Version>,
     flags: crate::save_spec::SaveFlags,
     config: crate::save_spec::SaveConfig,
 ) -> Result<(), LpmError> {
-    if !staged.has_placeholders() {
+    if !staged.needs_finalize() {
         return Ok(());
     }
 
@@ -11291,15 +11323,21 @@ pub(crate) fn finalize_packages_in_manifest(
     };
 
     for entry in &staged.entries {
-        if !matches!(entry.kind, StagedKind::Placeholder) {
+        if !matches!(entry.kind, StagedKind::Placeholder | StagedKind::DistTag) {
             continue;
         }
+
+        let staged_spec = match (&entry.kind, &entry.intent) {
+            (StagedKind::Placeholder, _) => STAGE_PLACEHOLDER.to_string(),
+            (StagedKind::DistTag, crate::save_spec::UserSaveIntent::DistTag(tag)) => tag.clone(),
+            _ => unreachable!("deferred staged entry must be bare placeholder or dist-tag"),
+        };
 
         let resolved = resolved_versions.get(&entry.name).ok_or_else(|| {
             LpmError::Registry(format!(
                 "finalize: resolver did not report a concrete version for `{}` \
-                 (staged with placeholder `{STAGE_PLACEHOLDER}`). Refusing to leave the \
-                 placeholder in {}.",
+                 (staged with provisional spec `{staged_spec}`). Refusing to leave the \
+                 provisional spec in {}.",
                 entry.name,
                 staged.pkg_json_path.display(),
             ))
@@ -11309,6 +11347,74 @@ pub(crate) fn finalize_packages_in_manifest(
             crate::save_spec::decide_saved_dependency_spec(&entry.intent, resolved, flags, config);
 
         doc[dep_key][&entry.name] = serde_json::Value::String(decision.spec_to_write);
+    }
+
+    let updated =
+        serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
+    std::fs::write(&staged.pkg_json_path, format!("{updated}\n"))?;
+    Ok(())
+}
+
+/// Rewrite staged dist-tag literals to exact versions before the resolver runs.
+///
+/// The CLI `install pkg@beta` flow needs two different representations of the
+/// same user input:
+///
+/// - the original dist-tag intent for finalize, so `package.json` can later be
+///   saved as `^resolved` or exact-prerelease per save-policy rules
+/// - an exact version in the staged manifest so the resolver never has to parse
+///   a raw dist-tag like `beta`
+///
+/// `stage_packages_to_manifest` preserves the dist-tag literal and stores the
+/// original [`UserSaveIntent::DistTag`] on each [`StagedEntry`]. This helper is
+/// the second step: resolve those staged tags through the same routed metadata
+/// path install already uses (`.npmrc` custom registries included), then patch
+/// just the staged manifest entries to their concrete versions.
+async fn pin_staged_dist_tags_for_resolution(
+    client: &RegistryClient,
+    route_cwd: &Path,
+    staged: &StagedManifest,
+) -> Result<(), LpmError> {
+    let dist_tag_entries: Vec<(&str, &str)> = staged
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.intent {
+            crate::save_spec::UserSaveIntent::DistTag(tag) => {
+                Some((entry.name.as_str(), tag.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    if dist_tag_entries.is_empty() {
+        return Ok(());
+    }
+
+    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(route_cwd)
+        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+
+    let content = std::fs::read_to_string(&staged.pkg_json_path)?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
+
+    let dep_key = if staged.save_dev {
+        "devDependencies"
+    } else {
+        "dependencies"
+    };
+
+    for (name, tag) in dist_tag_entries {
+        let resolved_version = if lpm_common::package_name::is_lpm_package(name) {
+            let pkg_name = lpm_common::PackageName::parse(name)
+                .map_err(|e| LpmError::Registry(e.to_string()))?;
+            client.get_package_metadata(&pkg_name).await?
+        } else {
+            let route = route_table.route_for_package(name);
+            client.get_npm_metadata_routed(name, route).await?
+        }
+        .resolve_version_spec(tag)?;
+
+        doc[dep_key][name] = serde_json::Value::String(resolved_version);
     }
 
     let updated =
@@ -11462,6 +11568,7 @@ pub async fn run_add_packages(
         let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
         let staged =
             stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
+        pin_staged_dist_tags_for_resolution(client, project_dir, &staged).await?;
         maybe_test_panic("after-stage");
 
         // 3. Remove lockfile so the resolver re-runs against the staged manifest.
@@ -11767,6 +11874,11 @@ pub async fn run_install_filtered_add(
             // exact paths (no double-compute, no path drift).
             let install_root = &member_install_roots[idx];
             let lockfile_path = &lockfile_paths[idx];
+
+            if let Err(e) = pin_staged_dist_tags_for_resolution(client, install_root, &staged).await {
+                last_err = Some(e);
+                break;
+            }
 
             // (b) Remove this member's lockfile so the resolver re-runs.
             //     The transaction snapshot already captured the original
@@ -12189,6 +12301,10 @@ fn resolve_version_from_spec<'a>(
     // If no version specified (wildcard), use latest
     if range_spec == "*" {
         return Ok(latest_ver);
+    }
+
+    if let Some(tagged_version) = metadata.dist_tags.get(range_spec) {
+        return Ok(tagged_version.as_str());
     }
 
     let range = lpm_semver::VersionReq::parse(range_spec).map_err(|_| {
@@ -12985,6 +13101,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_dist_tag_returns_tagged_version() {
+        let mut meta = make_metadata(&["1.9.0", "2.0.0-beta.2"], "1.9.0");
+        meta.dist_tags
+            .insert("beta".to_string(), "2.0.0-beta.2".to_string());
+
+        let result = resolve_version_from_spec("beta", &meta, "1.9.0").unwrap();
+        assert_eq!(result, "2.0.0-beta.2");
+    }
+
+    #[test]
     fn resolve_no_match_returns_error() {
         let meta = make_metadata(&["1.0.0", "1.5.0"], "1.5.0");
         let result = resolve_version_from_spec("^3.0.0", &meta, "1.5.0");
@@ -13557,7 +13683,7 @@ mod tests {
         assert!(after.get("devDependencies").is_none());
         assert_eq!(staged.entries.len(), 1);
         assert!(matches!(staged.entries[0].kind, StagedKind::Final));
-        assert!(!staged.has_placeholders());
+        assert!(!staged.needs_finalize());
     }
 
     #[test]
@@ -13613,7 +13739,7 @@ mod tests {
         assert_eq!(after["dependencies"]["new-pkg"], STAGE_PLACEHOLDER);
         assert_eq!(after["lpm"]["trustedDependencies"][0], "esbuild");
         assert!(matches!(staged.entries[0].kind, StagedKind::Placeholder));
-        assert!(staged.has_placeholders());
+        assert!(staged.needs_finalize());
     }
 
     #[test]
@@ -13707,20 +13833,20 @@ mod tests {
         let after = read_manifest(&pkg_path);
         assert_eq!(after["dependencies"]["ms"], "~2.1.3");
         assert!(matches!(staged.entries[0].kind, StagedKind::Skipped));
-        assert!(!staged.has_placeholders());
+        assert!(!staged.needs_finalize());
     }
 
-    /// A dist-tag install
-    /// against an existing dep is NOT a "bare reinstall" — the user typed
-    /// `@latest`/`@beta`/`@next`, which is explicit input asking for the
-    /// current value of that tag. Stage MUST stage a placeholder so
-    /// finalize can rewrite the manifest with the resolved version.
+    /// A dist-tag install against an existing dep is NOT a "bare
+    /// reinstall" — the user typed `@latest`/`@beta`/`@next`, which is
+    /// explicit input asking for the current value of that tag. Stage must
+    /// keep the tag literal in the manifest so the resolver honors it, then
+    /// finalize rewrites the manifest with the resolved version.
     ///
     /// Pre-fix: `lpm install react@latest` on an existing `react: "17.0.0"`
     /// entry would hit the Skipped branch and never update the manifest,
     /// even though the resolver picked a new version.
     #[test]
-    fn stage_dist_tag_on_existing_dep_writes_placeholder_not_skipped() {
+    fn stage_dist_tag_on_existing_dep_writes_tag_literal_not_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         write_manifest(
@@ -13741,13 +13867,13 @@ mod tests {
 
         let after = read_manifest(&pkg_path);
         assert_eq!(
-            after["dependencies"]["react"], STAGE_PLACEHOLDER,
-            "dist-tag against existing dep must stage a placeholder, not skip — \
-             the user explicitly asked for a new resolution under that tag"
+            after["dependencies"]["react"], "latest",
+            "dist-tag against existing dep must stage the tag literal, not skip — \
+             the resolver needs that literal to honor the user's requested tag"
         );
         assert!(
-            matches!(staged.entries[0].kind, StagedKind::Placeholder),
-            "dist-tag intent must produce StagedKind::Placeholder, not Skipped; \
+            matches!(staged.entries[0].kind, StagedKind::DistTag),
+            "dist-tag intent must produce StagedKind::DistTag, not Skipped; \
              got: {:?}",
             staged.entries[0].kind
         );
@@ -13893,7 +14019,7 @@ mod tests {
         let pkg_path = dir.path().join("package.json");
         write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
 
-        // Stage explicit-only specs → no placeholders.
+        // Stage explicit-only specs → no deferred finalize entries.
         let staged = stage_packages_to_manifest(
             &pkg_path,
             &["react@18.2.0".to_string()],
@@ -14071,11 +14197,11 @@ mod tests {
         );
     }
 
-    /// Finalize errors loudly if a placeholder entry has no resolved
+    /// Finalize errors loudly if a deferred entry has no resolved
     /// version in the map. Better to surface this than to silently leave
-    /// a `*` in the manifest.
+    /// a provisional spec in the manifest.
     #[test]
-    fn finalize_errors_when_resolved_version_missing_for_placeholder() {
+    fn finalize_errors_when_resolved_version_missing_for_deferred_entry() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_path = dir.path().join("package.json");
         write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
@@ -14098,7 +14224,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("ms"));
-        assert!(err.contains("placeholder"));
+        assert!(err.contains("provisional spec"));
     }
 
     // ── audit fix #1: D2 migration hint on filtered install no-match ──
@@ -14694,6 +14820,53 @@ mod tests {
         let link_path = app_dir.join("node_modules").join("@test").join("core");
         let resolved = std::fs::canonicalize(&link_path).unwrap();
         assert_eq!(resolved, core_dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn link_workspace_members_from_member_also_populates_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_workspace_for_install_tests(
+            root,
+            &[
+                ("@test/app", "packages/app"),
+                ("@test/core", "packages/core"),
+                ("@test/tokens", "packages/tokens"),
+            ],
+        );
+
+        let app_dir = root.join("packages/app");
+        let core_dir = root.join("packages/core");
+        let tokens_dir = root.join("packages/tokens");
+
+        let members = vec![
+            WorkspaceMemberLink {
+                name: "@test/core".to_string(),
+                version: "0.0.0".to_string(),
+                source_dir: core_dir.clone(),
+            },
+            WorkspaceMemberLink {
+                name: "@test/tokens".to_string(),
+                version: "0.0.0".to_string(),
+                source_dir: tokens_dir.clone(),
+            },
+        ];
+
+        link_workspace_members(&app_dir, &members).unwrap();
+
+        let root_core_link = root.join("node_modules").join("@test").join("core");
+        let root_tokens_link = root.join("node_modules").join("@test").join("tokens");
+
+        assert_eq!(
+            std::fs::canonicalize(&root_core_link).unwrap(),
+            core_dir.canonicalize().unwrap(),
+            "workspace-root node_modules must expose @test/core for realpath-based transitive imports"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&root_tokens_link).unwrap(),
+            tokens_dir.canonicalize().unwrap(),
+            "workspace-root node_modules must expose @test/tokens for realpath-based transitive imports"
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────

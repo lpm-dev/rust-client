@@ -1633,29 +1633,57 @@ mod tests {
         assert!(err.to_string().contains("no package.json"));
     }
 
-    // --- bench detection (logic only — async path tested separately) ---
+    // --- bench detection ---
 
     #[test]
-    fn bench_detects_vitest() {
+    fn detect_bench_runner_vitest_priority() {
         let dir = tempfile::tempdir().unwrap();
         write_package_json(
             dir.path(),
-            r#"{"name":"test","devDependencies":{"vitest":"^1.0"}}"#,
+            r#"{"name":"bench","devDependencies":{"vitest":"^1.0"},"scripts":{"bench":"node bench.js"}}"#,
         );
-        let pkg = lpm_workspace::read_package_json(&dir.path().join("package.json")).unwrap();
-        assert!(pkg.dev_dependencies.contains_key("vitest"));
+        let (name, cmd) = detect_bench_runner(dir.path()).unwrap();
+        assert_eq!(name, "vitest");
+        assert_eq!(cmd, "vitest bench");
     }
 
     #[test]
-    fn bench_fallback_to_scripts() {
+    fn detect_bench_runner_scripts_fallback() {
         let dir = tempfile::tempdir().unwrap();
         write_package_json(
             dir.path(),
-            r#"{"name":"test","scripts":{"bench":"node bench.js"}}"#,
+            r#"{"name":"bench","scripts":{"bench":"node bench.js"}}"#,
         );
-        let pkg = lpm_workspace::read_package_json(&dir.path().join("package.json")).unwrap();
-        assert!(!pkg.dev_dependencies.contains_key("vitest"));
-        assert_eq!(pkg.scripts.get("bench").unwrap(), "node bench.js");
+        let (name, cmd) = detect_bench_runner(dir.path()).unwrap();
+        assert_eq!(name, "scripts.bench");
+        assert_eq!(cmd, "node bench.js");
+    }
+
+    #[test]
+    fn detect_bench_runner_deps_not_just_dev_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_json(
+            dir.path(),
+            r#"{"name":"bench","dependencies":{"vitest":"^1.0"}}"#,
+        );
+        let (name, cmd) = detect_bench_runner(dir.path()).unwrap();
+        assert_eq!(name, "vitest");
+        assert_eq!(cmd, "vitest bench");
+    }
+
+    #[test]
+    fn detect_bench_runner_no_runner_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_json(dir.path(), r#"{"name":"bench"}"#);
+        let err = detect_bench_runner(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("no benchmark runner found"));
+    }
+
+    #[test]
+    fn detect_bench_runner_no_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = detect_bench_runner(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("no package.json"));
     }
 
     // --- CLI parser tests ---

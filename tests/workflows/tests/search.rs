@@ -18,10 +18,11 @@ fn sample_search_package(description: &str, download_count: u64) -> serde_json::
 async fn search_without_matches_warns_and_exits_zero() {
     let project = TempProject::empty(r#"{"name":"search-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    mock.with_search_results("nothing-here", 20, vec![]).await;
+    mock.with_search_results("@lpm.dev/nothing-here", 20, vec![])
+        .await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["search", "nothing-here"])
+        .args(["search", "@lpm.dev/nothing-here"])
         .output()
         .expect("failed to run lpm search");
 
@@ -36,7 +37,7 @@ async fn search_without_matches_warns_and_exits_zero() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("No packages found for \"nothing-here\""),
+        combined.contains("No packages found for \"@lpm.dev/nothing-here\""),
         "expected empty-result warning, got:\n{combined}"
     );
 }
@@ -47,14 +48,14 @@ async fn search_human_output_truncates_long_description_and_compacts_download_co
     let mock = MockRegistry::start().await;
     let long_description = "This description is intentionally long so the human output path must truncate it before rendering to the terminal.";
     mock.with_search_results(
-        "react",
+        "@lpm.dev/react",
         20,
         vec![sample_search_package(long_description, 12_345)],
     )
     .await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["search", "react"])
+        .args(["search", "@lpm.dev/react"])
         .output()
         .expect("failed to run lpm search");
 
@@ -95,14 +96,14 @@ async fn search_json_envelope_one_result_matches_snapshot() {
     let project = TempProject::empty(r#"{"name":"search-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     mock.with_search_results(
-        "react",
+        "@lpm.dev/react",
         20,
         vec![sample_search_package("Fast UI package", 12_345)],
     )
     .await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["search", "react", "--json"])
+        .args(["search", "@lpm.dev/react", "--json"])
         .output()
         .expect("failed to run lpm search --json");
 

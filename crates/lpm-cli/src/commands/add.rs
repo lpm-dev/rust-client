@@ -659,6 +659,7 @@ pub async fn run(
     let mut copied = 0;
     let mut skipped = 0;
     let mut file_actions: Vec<(String, String, String)> = Vec::new(); // (src, dest, action)
+    let mut written_dest_paths: Vec<PathBuf> = Vec::with_capacity(files.len());
     std::fs::create_dir_all(&target_dir)?;
     let target_root_canonical = target_dir.canonicalize().map_err(|e| {
         LpmError::Registry(format!(
@@ -700,6 +701,7 @@ pub async fn run(
     let pkg_json_path = project_dir.join("package.json");
     let lpm_lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     let lpm_lock_bin_path = lpm_lock_path.with_extension("lockb");
+    let added_sources_state_path = crate::added_sources_state::state_path(project_dir);
     let install_hash_path = project_dir.join(".lpm").join("install-hash");
     let effective_pm = if pm == "auto" {
         detect_package_manager(project_dir)
@@ -718,6 +720,7 @@ pub async fn run(
         pkg_json_path.as_path(),
         lpm_lock_path.as_path(),
         lpm_lock_bin_path.as_path(),
+        added_sources_state_path.as_path(),
     ];
     for p in &pm_lockfiles {
         optional_snapshot.push(p.as_path());
@@ -762,7 +765,6 @@ pub async fn run(
         // Try to read as text for import rewriting
         let content = std::fs::read_to_string(&src_path).ok();
         let rewritten = content.as_deref().and_then(|text| {
-            // Only rewrite JS/TS files
             let ext = src_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if !matches!(ext, "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") {
                 return None;
@@ -806,6 +808,7 @@ pub async fn run(
             std::fs::copy(&src_path, dest_path)?;
         }
         copied += 1;
+        written_dest_paths.push(dest_path.clone());
         file_actions.push((
             src_rel.clone(),
             dest_rel.clone(),
@@ -866,8 +869,7 @@ pub async fn run(
         let mut collected: HashSet<String> = HashSet::new();
         for (src_rel, _dest_rel) in &files {
             let src_path = temp_dir.path().join(src_rel);
-            let ext = src_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if !matches!(ext, "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") {
+            if !is_runtime_source_text_file(&src_path) {
                 continue;
             }
             if let Ok(text) = std::fs::read_to_string(&src_path) {
@@ -889,6 +891,24 @@ pub async fn run(
             external_imports.join(", "),
         ));
     }
+
+    // Persist exact source-delivery outputs so `lpm remove` can reverse the
+    // add precisely for npm/private-registry packages and custom `--path`
+    // installs, instead of guessing from a fixed directory list.
+    let tracked_files = written_dest_paths
+        .iter()
+        .map(|path| crate::added_sources_state::manifest_path_for_file(project_dir, path));
+    let tracked_skill_short = match (&target, no_skills) {
+        (AddTarget::Lpm(pkg), false) => Some(pkg.short()),
+        _ => None,
+    };
+    let mut added_sources_state = crate::added_sources_state::load_state(project_dir)?;
+    added_sources_state.record_package_files(
+        &target.json_name(),
+        tracked_files,
+        tracked_skill_short.as_deref(),
+    );
+    crate::added_sources_state::write_state(project_dir, &added_sources_state)?;
 
     // Step 9.2: Commit the rollback transaction (finding #9.3).
     //
@@ -1756,6 +1776,20 @@ fn preflight_no_manifest_with_deps(
 ///
 /// Reads `compilerOptions.paths` and returns the first alias ending with `/*`.
 /// e.g., `{ "@/*": ["./src/*"] }` -> `"@/"`
+fn is_runtime_source_text_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if file_name.ends_with(".d.ts") || file_name.ends_with(".d.cts") || file_name.ends_with(".d.mts") {
+        return false;
+    }
+
+    matches!(
+        path.extension().and_then(|e| e.to_str()).unwrap_or(""),
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
+    )
+}
+
 fn detect_buyer_alias(project_dir: &Path) -> Option<String> {
     for config_name in ["tsconfig.json", "jsconfig.json"] {
         let path = project_dir.join(config_name);

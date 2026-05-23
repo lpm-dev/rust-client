@@ -41,6 +41,7 @@ pub mod quality;
 pub mod query;
 pub mod rebuild;
 pub mod remove;
+pub mod registry_reads;
 pub mod resolve;
 pub mod run;
 pub mod schema;

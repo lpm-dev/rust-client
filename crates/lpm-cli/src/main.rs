@@ -4,6 +4,7 @@ use lpm_common::color::Painted;
 use miette::{IntoDiagnostic, Result};
 
 mod auth;
+mod added_sources_state;
 pub mod build_state;
 pub mod capability;
 mod color_policy;
@@ -22,6 +23,7 @@ pub mod intelligence;
 mod linker_config;
 mod manifest_tx;
 pub mod migration_warnings;
+mod npm_public_source;
 mod oidc;
 mod output;
 pub mod overrides_state;
@@ -1032,7 +1034,8 @@ enum Commands {
             long_help = "CI exit code policy: what triggers a non-zero exit code.\n\n\
   vuln     — only confirmed vulnerabilities (OSV/registry)\n\
   behavior — only critical/high behavioral flags\n\
-  all      — either vulnerabilities or behavioral flags (default)"
+      secrets  — only hardcoded secret findings from --secrets mode\n\
+      all      — vulnerabilities, behavioral flags, or secrets (default)"
         )]
         fail_on: Option<String>,
 
@@ -2873,9 +2876,14 @@ async fn async_main() -> Result<()> {
         Commands::Info {
             package,
             package_version,
-        } => commands::info::run(&client, &package, package_version.as_deref(), cli.json).await,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::info::run(&client, &cwd, &package, package_version.as_deref(), cli.json)
+                .await
+        }
         Commands::Search { query, limit } => {
-            commands::search::run(&client, &query, limit, cli.json).await
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::search::run(&client, &cwd, &query, limit, cli.json).await
         }
         Commands::Quality { package } => commands::quality::run(&client, &package, cli.json).await,
         Commands::Whoami => commands::whoami::run(&client, cli.json).await,
@@ -2886,8 +2894,10 @@ async fn async_main() -> Result<()> {
             output,
             allow_unverified,
         } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::download::run(
                 &client,
+                &cwd,
                 &package,
                 package_version.as_deref(),
                 output.as_deref(),
@@ -2897,7 +2907,8 @@ async fn async_main() -> Result<()> {
             .await
         }
         Commands::Resolve { packages } => {
-            commands::resolve::run(&client, &packages, cli.json).await
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::resolve::run(&client, &cwd, &packages, cli.json).await
         }
         Commands::Install {
             packages,
@@ -3805,7 +3816,7 @@ async fn async_main() -> Result<()> {
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if secrets {
-                commands::audit::run_secrets(&cwd, cli.json).await
+                commands::audit::run_secrets(&cwd, cli.json, fail_on.as_deref()).await
             } else {
                 commands::audit::run(
                     &client,
@@ -4009,6 +4020,17 @@ async fn async_main() -> Result<()> {
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if watch {
+                if scripts.len() != 1 {
+                    return Err(lpm_common::LpmError::Script(
+                        "--watch supports exactly one script".into(),
+                    ));
+                }
+                if all || !filter.is_empty() || affected {
+                    return Err(lpm_common::LpmError::Script(
+                        "--watch does not support --all/--filter/--affected; run the watcher inside a single package instead"
+                            .into(),
+                    ));
+                }
                 let bin_hint = commands::run::ensure_runtime(&cwd).await;
                 commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), bin_hint)
             } else if all || !filter.is_empty() || affected {
@@ -4447,29 +4469,32 @@ async fn async_main() -> Result<()> {
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            // tunnel requires a session-backed login (same
-            // contract as `dev --tunnel` above). The session is
-            // attached to `client` from main.rs; ask it for a
-            // `SessionRequired` bearer.
-            let resolved_token = match client.session() {
-                Some(s) => Some(
-                    s.bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
-                        .await
-                        .map_err(|_| {
-                            lpm_common::LpmError::Tunnel(
-                                "tunnel requires a refresh-backed `lpm login` session.\n  \
-                                 `--token` / `LPM_TOKEN` / CI tokens are not accepted."
-                                    .into(),
-                            )
-                        })?,
-                ),
-                None => None,
-            };
             // Determine if action is a port number or a named action
             let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
                 ("start", p)
             } else {
                 (action.as_str(), 3000u16)
+            };
+            // Only the relay-facing tunnel actions need a refresh-backed session.
+            // Local log inspection and replay stay useful on a fresh machine and
+            // should not depend on keychain-backed auth state.
+            let resolved_token = if tunnel_action_requires_session(effective_action) {
+                match client.session() {
+                    Some(s) => Some(
+                        s.bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
+                            .await
+                            .map_err(|_| {
+                                lpm_common::LpmError::Tunnel(
+                                    "tunnel requires a refresh-backed `lpm login` session.\n  \
+                                     `--token` / `LPM_TOKEN` / CI tokens are not accepted."
+                                        .into(),
+                                )
+                            })?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
             };
             commands::tunnel::run(
                 &client,
@@ -4543,10 +4568,10 @@ async fn async_main() -> Result<()> {
         Commands::External(args) => {
             // Try as package.json script shortcut: `lpm dev` → `lpm run dev`
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            let script_name = &args[0];
+            let scripts = vec![args[0].clone()];
             let extra_args = if args.len() > 1 { &args[1..] } else { &[] };
-            let bin_hint = commands::run::ensure_runtime(&cwd).await;
-            commands::run::run(&cwd, script_name, extra_args, None, false, &bin_hint).await
+            commands::run::run_multi(&cwd, &scripts, extra_args, None, false, false, false, false, cli.json)
+                .await
         }
     }
     }
@@ -4618,6 +4643,10 @@ async fn async_main() -> Result<()> {
     }
 
     result.into_diagnostic()
+}
+
+fn tunnel_action_requires_session(action: &str) -> bool {
+    !matches!(action, "inspect" | "replay" | "log" | "logs")
 }
 
 #[cfg(test)]
@@ -6515,6 +6544,22 @@ mod tests {
                 assert_eq!(inspect_port, Some(4500));
             }
             _ => panic!("expected Tunnel command"),
+        }
+    }
+
+    #[test]
+    fn tunnel_local_actions_do_not_require_session() {
+        for action in ["inspect", "replay", "log", "logs"] {
+            assert!(
+                !tunnel_action_requires_session(action),
+                "expected {action} to stay local-only"
+            );
+        }
+        for action in ["start", "claim", "unclaim", "list", "domains"] {
+            assert!(
+                tunnel_action_requires_session(action),
+                "expected {action} to require a relay-backed session"
+            );
         }
     }
 

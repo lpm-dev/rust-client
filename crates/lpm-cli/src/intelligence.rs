@@ -120,13 +120,24 @@ fn scan_dir(dir: &Path, aliases: &ProjectAliases, is_root: bool, imports: &mut V
                 continue;
             }
             scan_dir(&path, aliases, false, imports);
-        } else if path.is_file() {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if matches!(ext, "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") {
-                scan_file(&path, aliases, imports);
-            }
+        } else if path.is_file() && is_runtime_source_file(&path) {
+            scan_file(&path, aliases, imports);
         }
     }
+}
+
+fn is_runtime_source_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if file_name.ends_with(".d.ts") || file_name.ends_with(".d.cts") || file_name.ends_with(".d.mts") {
+        return false;
+    }
+
+    matches!(
+        path.extension().and_then(|e| e.to_str()).unwrap_or(""),
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
+    )
 }
 
 /// Extract import specifiers from a single source file.
@@ -309,6 +320,7 @@ fn is_valid_npm_segment(s: &str) -> bool {
 pub struct ProjectAliases {
     prefixes: Vec<String>,
     exact: HashSet<String>,
+    base_url_roots: Vec<PathBuf>,
 }
 
 impl ProjectAliases {
@@ -321,7 +333,7 @@ impl ProjectAliases {
         for cfg in ["tsconfig.json", "jsconfig.json"] {
             let path = project_dir.join(cfg);
             if let Ok(content) = std::fs::read_to_string(&path)
-                && absorb_ts_paths(&content, &mut aliases)
+                && absorb_ts_config(&content, project_dir, &mut aliases)
             {
                 break;
             }
@@ -343,29 +355,47 @@ impl ProjectAliases {
         self.prefixes
             .iter()
             .any(|p| specifier.starts_with(p) || specifier == p.trim_end_matches('/'))
+            || self
+                .base_url_roots
+                .iter()
+                .any(|root| specifier_resolves_under_base_url(root, specifier))
     }
 }
 
 /// Parse the input as JSONC (JSON + `//` / `/* */` comments + trailing
-/// commas) and absorb every `compilerOptions.paths` key as an alias.
-/// Returns true when a `paths` object was found.
-fn absorb_ts_paths(content: &str, aliases: &mut ProjectAliases) -> bool {
+/// commas) and absorb `compilerOptions.paths` aliases plus a `baseUrl`
+/// root when present. Returns true when the config contributed at least
+/// one aliasing rule.
+fn absorb_ts_config(content: &str, project_dir: &Path, aliases: &mut ProjectAliases) -> bool {
     let stripped = strip_trailing_commas(&strip_jsonc_comments(content));
     let value: serde_json::Value = match serde_json::from_str(&stripped) {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let paths = value
-        .get("compilerOptions")
-        .and_then(|c| c.get("paths"))
-        .and_then(|p| p.as_object());
-    let Some(paths) = paths else {
-        return false;
+
+    let compiler_options = match value.get("compilerOptions") {
+        Some(options) => options,
+        None => return false,
     };
-    for key in paths.keys() {
-        absorb_alias_key(key, aliases);
+
+    let mut found = false;
+
+    if let Some(paths) = compiler_options.get("paths").and_then(|p| p.as_object()) {
+        for key in paths.keys() {
+            absorb_alias_key(key, aliases);
+        }
+        found = found || !paths.is_empty();
     }
-    !paths.is_empty()
+
+    if let Some(base_url) = compiler_options.get("baseUrl").and_then(|v| v.as_str()) {
+        let trimmed = base_url.trim();
+        if !trimmed.is_empty() {
+            aliases.base_url_roots.push(project_dir.join(trimmed));
+            found = true;
+        }
+    }
+
+    found
 }
 
 /// Absorb the `importAlias` field from an `lpm.config.json`.
@@ -377,7 +407,7 @@ fn absorb_lpm_import_alias(content: &str, aliases: &mut ProjectAliases) {
     if let Some(prefix) = value.get("importAlias").and_then(|v| v.as_str())
         && !prefix.is_empty()
     {
-        absorb_alias_key(prefix, aliases);
+        absorb_import_alias_prefix(prefix, aliases);
     }
 }
 
@@ -394,6 +424,40 @@ fn absorb_alias_key(key: &str, aliases: &mut ProjectAliases) {
     } else {
         aliases.exact.insert(key.to_string());
     }
+}
+
+fn absorb_import_alias_prefix(alias: &str, aliases: &mut ProjectAliases) {
+    let trimmed = alias.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return;
+    }
+    aliases.prefixes.push(format!("{trimmed}/"));
+}
+
+fn specifier_resolves_under_base_url(base_url_root: &Path, specifier: &str) -> bool {
+    if specifier.is_empty() {
+        return false;
+    }
+
+    let candidate = base_url_root.join(specifier);
+    if candidate.is_file() || candidate.is_dir() {
+        return true;
+    }
+
+    static LOCAL_IMPORT_EXTENSIONS: &[&str] = &[
+        "js", "jsx", "ts", "tsx", "mjs", "cjs", "json", "css", "scss", "sass", "less", "md", "mdx",
+    ];
+
+    for extension in LOCAL_IMPORT_EXTENSIONS {
+        if candidate.with_extension(extension).is_file() {
+            return true;
+        }
+        if candidate.join(format!("index.{extension}")).is_file() {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Strip `//` line comments and `/* … */` block comments from JSONC
@@ -943,6 +1007,47 @@ mod tests {
     }
 
     #[test]
+    fn project_aliases_treat_baseurl_only_root_imports_as_local() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("components")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/lib")).unwrap();
+        std::fs::write(dir.path().join("components/Button.js"), "export default 1;").unwrap();
+        std::fs::write(dir.path().join("src/lib/foo.ts"), "export default 1;").unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{
+                "compilerOptions": {
+                    "baseUrl": "."
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let aliases = ProjectAliases::load(dir.path());
+
+        assert!(aliases.matches("components/Button"));
+        assert!(aliases.matches("src/lib/foo"));
+        assert!(!aliases.matches("react"));
+        assert!(!aliases.matches("@types/node"));
+    }
+
+    #[test]
+    fn project_aliases_treat_bare_import_alias_as_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.config.json"),
+            r#"{ "importAlias": "components" }"#,
+        )
+        .unwrap();
+
+        let aliases = ProjectAliases::load(dir.path());
+
+        assert!(aliases.matches("components/Button"));
+        assert!(aliases.matches("components/forms/input"));
+        assert!(!aliases.matches("component-kit/Button"));
+    }
+
+    #[test]
     fn project_aliases_tolerates_jsonc_comments_and_trailing_commas() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1010,6 +1115,86 @@ mod tests {
         let specifiers: HashSet<&str> = imports.iter().map(|i| i.specifier.as_str()).collect();
         assert!(specifiers.contains("react"));
         assert!(!specifiers.contains("@/components/Button"));
+    }
+
+    #[test]
+    fn scan_file_filters_baseurl_only_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "baseUrl": "." } }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("package.json"), r#"{"name":"root"}"#).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("components")).unwrap();
+        std::fs::write(root.join("components/Button.js"), "export default 1;").unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"
+            import { Button } from "components/Button";
+            import React from "react";
+            "#,
+        )
+        .unwrap();
+
+        let imports = scan_source_imports(root);
+        let specifiers: HashSet<&str> = imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(specifiers.contains("react"));
+        assert!(!specifiers.contains("components/Button"));
+    }
+
+    #[test]
+    fn scan_file_filters_bare_import_alias_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("lpm.config.json"),
+            r#"{ "importAlias": "components" }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("package.json"), r#"{"name":"root"}"#).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("components")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"
+            import { Button } from "components/Button";
+            import React from "react";
+            "#,
+        )
+        .unwrap();
+
+        let imports = scan_source_imports(root);
+        let specifiers: HashSet<&str> = imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(specifiers.contains("react"));
+        assert!(!specifiers.contains("components/Button"));
+    }
+
+    #[test]
+    fn scan_source_imports_skips_declaration_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"root"}"#).unwrap();
+        std::fs::create_dir_all(root.join("components/dialog")).unwrap();
+        std::fs::write(
+            root.join("components/dialog/Dialog.d.ts"),
+            r#"
+            import { ReactNode } from "react";
+            export interface DialogProps {
+                children?: ReactNode;
+            }
+            "#,
+        )
+        .unwrap();
+
+        let imports = scan_source_imports(root);
+        let specifiers: HashSet<&str> = imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(
+            !specifiers.contains("react"),
+            "declaration files are type-only and must not contribute runtime import warnings"
+        );
     }
 
     #[test]

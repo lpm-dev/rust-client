@@ -15,6 +15,7 @@
 mod support;
 
 use support::{TempProject, lpm};
+use std::fs;
 
 // ─── dev: --help dispatches and exits cleanly ─────────────────────────
 
@@ -142,27 +143,37 @@ fn tunnel_list_without_auth_under_json_emits_error_envelope_on_stdout() {
 }
 
 #[test]
-fn tunnel_inspect_without_auth_under_json_emits_error_envelope_on_stdout() {
+fn tunnel_inspect_without_auth_reads_local_log_under_json() {
     let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
 
+    let lpm_dir = project.path().join(".lpm");
+    fs::create_dir_all(&lpm_dir).expect("failed to create .lpm fixture dir");
+    fs::write(
+        lpm_dir.join("webhook-log.jsonl"),
+        "{\"id\":\"wh-stripe-402\",\"ts\":\"2026-05-22T10:05:00Z\",\"method\":\"POST\",\"path\":\"/webhooks/stripe\",\"status\":402,\"ms\":18,\"provider\":\"Stripe\",\"summary\":\"Stripe: payment_intent.payment_failed\",\"req_size\":56,\"res_size\":27}\n",
+    )
+    .expect("failed to seed webhook log");
+
     let output = lpm(&project)
-        .args([
-            "--registry",
-            "http://127.0.0.1:1",
-            "--insecure",
-            "--json",
-            "tunnel",
-            "inspect",
-        ])
+        .args(["--json", "tunnel", "inspect"])
         .output()
         .expect("failed to run lpm --json tunnel inspect");
 
+    assert!(
+        output.status.success(),
+        "local tunnel inspect should not require auth when only reading the on-disk log"
+    );
+
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("--json tunnel inspect error path must emit JSON: {e}\n---\n{stdout}")
+    let entries: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json tunnel inspect must emit the local webhook list: {e}\n---\n{stdout}")
     });
-    assert_eq!(envelope["success"], serde_json::json!(false));
-    assert_eq!(envelope["error_code"], serde_json::json!("tunnel"));
+    let rows = entries
+        .as_array()
+        .expect("expected tunnel inspect JSON output to be an array");
+    assert_eq!(rows.len(), 1, "expected one seeded webhook row");
+    assert_eq!(rows[0]["provider"], serde_json::json!("Stripe"));
+    assert_eq!(rows[0]["status"], serde_json::json!(402));
 }
 
 #[test]

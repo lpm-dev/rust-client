@@ -1,9 +1,8 @@
 //! Workflow tests for `lpm upgrade`.
 //!
-//! `lpm upgrade` is `@lpm.dev/*`-only (same scope as `lpm outdated`,
-//! filed at phase-64 finding #67). It rewrites the manifest range and
-//! runs install. Tests cover: error paths, dry-run safety, the npm-skip
-//! contract, the manifest-rewrite happy path, and the JSON envelope.
+//! `lpm upgrade` rewrites the manifest range and runs install. Tests
+//! cover: error paths, dry-run safety, npm/public-source eligibility,
+//! the manifest-rewrite happy path, and the JSON envelope.
 //!
 //! Non-TTY subprocess mode resolves to `NonInteractive` automatically;
 //! `--json` and `-y` also force non-interactive. No TTY-mocking needed.
@@ -122,12 +121,11 @@ async fn upgrade_emits_zero_upgraded_when_lpm_dep_already_at_latest() {
 
 // ─── Behavior contracts ─────────────────────────────────────────────────
 
-/// `lpm upgrade` filters to `@lpm.dev/*` packages — same contract as
-/// `lpm outdated` (phase-64 finding #67). Pins the filter so a
-/// regression that started rewriting npm dep ranges to "latest" without
-/// going through the resolver doesn't slip through.
+/// A dependency whose lockfile source is the public npm registry should
+/// be eligible for `lpm upgrade`, matching `lpm outdated`'s default
+/// cross-ecosystem surface.
 #[tokio::test]
-async fn upgrade_skips_npm_packages_in_dependencies() {
+async fn upgrade_upgrades_npm_packages_with_public_npm_lock_source() {
     let project = TempProject::empty(
         r#"{"name":"npm-only-up","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
@@ -135,33 +133,95 @@ async fn upgrade_skips_npm_packages_in_dependencies() {
         "lpm.lock",
         "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
          [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\n\
-         source = \"registry+https://lpm.dev\"\n",
+         source = \"registry+https://registry.npmjs.org\"\n",
     );
 
     let mock = MockRegistry::start().await;
-    // Mount ms with a much newer version; the filter regression would
-    // rewrite the manifest to ^9.9.9.
-    mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9"))
+    mock.with_full_package_metadata(
+        "ms",
+        "2.5.0",
+        &[
+            ("2.1.3", serde_json::json!({}), Some(make_tarball("ms", "2.1.3"))),
+            ("2.5.0", serde_json::json!({}), Some(make_tarball("ms", "2.5.0"))),
+        ],
+    )
         .await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["upgrade", "-y", "--json"])
+        .args(["upgrade", "-y"])
         .output()
-        .expect("spawn lpm upgrade --json");
+        .expect("spawn lpm upgrade");
     assert!(
         out.status.success(),
-        "upgrade should exit 0 on npm-only project"
+        "upgrade should succeed on an npm-only project when the lockfile records a public npm source\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(
+        pkg_json["dependencies"]["ms"],
+        serde_json::json!("^2.5.0"),
+        "manifest must be rewritten to the latest matching npm version; got: {pkg_json:#}"
+    );
+
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read lpm.lock after npm upgrade");
+    let entry = lockfile
+        .packages
+        .iter()
+        .find(|p| p.name == "ms")
+        .expect("lockfile must still contain ms after upgrade");
+    assert_eq!(
+        entry.version, "2.5.0",
+        "lockfile must record the upgraded npm version"
+    );
+}
+
+/// A non-`@lpm.dev/*` dependency whose lockfile source is not the
+/// public npm registry must still be skipped to avoid leaking private
+/// package names to registry.npmjs.org.
+#[tokio::test]
+async fn upgrade_skips_non_public_npm_sources_and_reports_them() {
+    let project = TempProject::empty(
+        r#"{"name":"npm-private-up","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
+         [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\n\
+         source = \"registry+https://npm.internal.example.com\"\n",
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "ms",
+        "2.5.0",
+        &[
+            ("2.1.3", serde_json::json!({}), Some(make_tarball("ms", "2.1.3"))),
+            ("2.5.0", serde_json::json!({}), Some(make_tarball("ms", "2.5.0"))),
+        ],
+    )
+    .await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y", "--dry-run", "--json"])
+        .output()
+        .expect("spawn lpm upgrade --dry-run --json");
+    assert!(
+        out.status.success(),
+        "upgrade should exit 0 when private-source npm names are skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 
     let envelope: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
-    assert_eq!(
-        envelope["upgraded"],
-        serde_json::json!(0),
-        "npm packages must be filtered out of upgrade candidates; envelope: {envelope:#}"
-    );
+    assert_eq!(envelope["upgraded"], serde_json::json!(0));
+    assert_eq!(envelope["packages"], serde_json::json!([]));
+    assert_eq!(envelope["skipped_private"], serde_json::json!(["ms"]));
 
-    // Manifest must be untouched.
     let pkg_json: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
     assert_eq!(pkg_json["dependencies"]["ms"], serde_json::json!("^2.1.3"));
@@ -922,12 +982,16 @@ async fn upgrade_yes_marks_patch_invalidation_in_json() {
 }
 
 /// When the install pipeline fails after manifest mutation, the
-/// manifest is restored byte-equal. Pins the rollback / restore path.
+/// manifest and lockfile are restored byte-equal. Pins the rollback /
+/// restore path after upgrade now drops stale lockfiles before the
+/// internal install.
 #[tokio::test]
 async fn upgrade_yes_install_failure_restores_manifest() {
     let project = TempProject::empty("");
     let mock = setup_up7_failed_install_fixture(&project).await;
+    up7_write_lockfile(&project, &[(UP7_PKG, UP7_CURRENT)]);
     let before = project.read_file("package.json");
+    let lockfile_before = project.read_file("lpm.lock");
 
     let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", "-y"])
@@ -939,6 +1003,11 @@ async fn upgrade_yes_install_failure_restores_manifest() {
         before,
         project.read_file("package.json"),
         "package.json must be restored byte-equal on install failure"
+    );
+    assert_eq!(
+        lockfile_before,
+        project.read_file("lpm.lock"),
+        "lpm.lock must be restored byte-equal on install failure"
     );
 }
 

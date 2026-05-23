@@ -58,6 +58,9 @@ pub enum TrustCmd {
         /// Emit machine-readable JSON instead of human output.
         #[arg(long)]
         json: bool,
+        /// Exit non-zero if any diff entries are present.
+        #[arg(long)]
+        assert_none: bool,
     },
     /// Remove stale `trustedDependencies` entries (packages no
     /// longer in the resolved tree).
@@ -79,7 +82,7 @@ pub enum TrustCmd {
 /// Entry point called from main.rs.
 pub async fn run(cmd: &TrustCmd, project_dir: &Path) -> Result<(), LpmError> {
     match cmd {
-        TrustCmd::Diff { json } => run_diff(project_dir, *json).await,
+        TrustCmd::Diff { json, assert_none } => run_diff(project_dir, *json, *assert_none).await,
         TrustCmd::Prune { yes, dry_run, json } => {
             run_prune(project_dir, *yes, *dry_run, *json).await
         }
@@ -160,7 +163,7 @@ fn compute_full_diff(snapshot: Option<&TrustSnapshot>, current: &TrustSnapshot) 
     added
 }
 
-async fn run_diff(project_dir: &Path, json: bool) -> Result<(), LpmError> {
+async fn run_diff(project_dir: &Path, json: bool, assert_none: bool) -> Result<(), LpmError> {
     let pkg_json_path = project_dir.join("package.json");
     if !pkg_json_path.exists() {
         return Err(LpmError::NotFound(
@@ -185,6 +188,15 @@ async fn run_diff(project_dir: &Path, json: bool) -> Result<(), LpmError> {
     } else {
         print_diff_human(&entries, snapshot.as_ref());
     }
+
+    if assert_none && !entries.is_empty() {
+        return Err(LpmError::Registry(format!(
+            "assertion failed: {} trust diff entr{} present",
+            entries.len(),
+            if entries.len() == 1 { "y is" } else { "ies are" }
+        )));
+    }
+
     Ok(())
 }
 

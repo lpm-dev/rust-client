@@ -1,15 +1,20 @@
+use crate::commands::registry_reads::{prepare_routed_read_context, search_route_for_query};
 use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
+use std::path::Path;
 
 pub async fn run(
     client: &RegistryClient,
+    project_dir: &Path,
     query: &str,
     limit: u32,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let results = client.search_packages(query, limit).await?;
+    let context = prepare_routed_read_context(client, project_dir, &[query.to_string()], json_output)?;
+    let route = search_route_for_query(&context.route_table, query);
+    let results = context.client.search_npm_packages_routed(query, limit, route).await?;
 
     if json_output {
         let mut json = serde_json::to_value(&results)?;
@@ -38,17 +43,20 @@ pub async fn run(
     println!();
 
     for pkg in &results.packages {
-        let owner = pkg.owner.as_deref().unwrap_or("?");
         let version = pkg.latest_version.as_deref().unwrap_or("?");
         let mode = pkg
             .distribution_mode
             .as_deref()
             .map(output::mode_badge)
             .unwrap_or_default();
+        let package_name = match pkg.owner.as_deref() {
+            Some(owner) => format!("@lpm.dev/{owner}.{}", pkg.name),
+            None => pkg.name.clone(),
+        };
 
         println!(
             "  {}  {}  {mode}",
-            format!("@lpm.dev/{owner}.{}", pkg.name).bold(),
+            package_name.bold(),
             format!("v{version}").dimmed(),
         );
 

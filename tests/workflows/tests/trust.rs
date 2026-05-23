@@ -192,6 +192,64 @@ fn trust_diff_reports_changed_binding_when_integrity_drifts() {
 }
 
 #[test]
+fn trust_diff_assert_none_exits_zero_when_diff_is_empty() {
+    let project = TempProject::empty(r#"{}"#);
+
+    write_trust_snapshot(
+        &project,
+        json!({ "esbuild@0.25.1": { "integrity": "sha512-e" } }),
+    );
+    write_pkg_with_trust(
+        &project,
+        json!({ "esbuild@0.25.1": { "integrity": "sha512-e" } }),
+    );
+
+    let output = lpm(&project)
+        .args(["trust", "diff", "--assert-none"])
+        .output()
+        .expect("failed to run lpm trust diff --assert-none");
+
+    assert!(
+        output.status.success(),
+        "trust diff --assert-none must exit 0 when no diff entries exist\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn trust_diff_assert_none_exits_nonzero_when_diff_entries_exist() {
+    let project = TempProject::empty(r#"{}"#);
+
+    write_trust_snapshot(
+        &project,
+        json!({ "esbuild@0.25.1": { "integrity": "sha512-e" } }),
+    );
+    write_pkg_with_trust(
+        &project,
+        json!({
+            "esbuild@0.25.1": { "integrity": "sha512-e" },
+            "sharp@0.33.0": { "integrity": "sha512-s" }
+        }),
+    );
+
+    let output = lpm(&project)
+        .args(["trust", "diff", "--assert-none"])
+        .output()
+        .expect("failed to run lpm trust diff --assert-none");
+
+    assert!(
+        !output.status.success(),
+        "trust diff --assert-none must exit non-zero when diff entries exist"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("assertion failed") || stderr.contains("diff") || stderr.contains("matched"),
+        "stderr must explain the assert-none failure, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn trust_diff_without_package_json_fails_with_helpful_message() {
     let project = TempProject::empty(r#"{}"#);
     // Remove the seeded package.json so the not-found branch fires.

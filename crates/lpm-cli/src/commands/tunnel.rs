@@ -43,14 +43,21 @@ pub async fn run(
         "list" | "ls" => run_list(client, org, json_output).await,
         "domains" => run_domains(client, json_output).await,
         "inspect" => {
+            let local_args = local_action_args(domain, extra_args);
             // `lpm tunnel inspect --ui` opens the browser inspector on historical data
-            if extra_args.contains(&"--ui".to_string()) {
+            if local_args.contains(&"--ui".to_string()) {
                 return run_inspect_ui(project_dir, inspect_port).await;
             }
-            run_inspect(project_dir, extra_args, json_output).await
+            run_inspect(project_dir, &local_args, json_output).await
         }
-        "replay" => run_replay(project_dir, extra_args, port).await,
-        "log" | "logs" => run_log(project_dir, extra_args, json_output).await,
+        "replay" => {
+            let local_args = local_action_args(domain, extra_args);
+            run_replay(project_dir, &local_args, port).await
+        }
+        "log" | "logs" => {
+            let local_args = local_action_args(domain, extra_args);
+            run_log(project_dir, &local_args, json_output).await
+        }
         "start" | "" => {
             run_start(
                 token,
@@ -86,6 +93,15 @@ pub async fn run(
             )))
         }
     }
+}
+
+fn local_action_args(second_positional: Option<&str>, extra_args: &[String]) -> Vec<String> {
+    let mut normalized_args = Vec::with_capacity(extra_args.len() + usize::from(second_positional.is_some()));
+    if let Some(value) = second_positional {
+        normalized_args.push(value.to_string());
+    }
+    normalized_args.extend(extra_args.iter().cloned());
+    normalized_args
 }
 
 /// Start a tunnel to expose a local port.
@@ -985,6 +1001,21 @@ mod tests {
     fn parse_flag_str_missing() {
         let args: Vec<String> = vec!["--last".into(), "5".into()];
         assert_eq!(parse_flag_str(&args, "--filter"), None);
+    }
+
+    #[test]
+    fn local_action_args_prepends_second_positional_before_trailing_args() {
+        let args: Vec<String> = vec!["--port".into(), "4100".into()];
+        assert_eq!(
+            local_action_args(Some("3"), &args),
+            vec!["3".to_string(), "--port".to_string(), "4100".to_string()]
+        );
+    }
+
+    #[test]
+    fn local_action_args_preserves_trailing_args_when_second_positional_missing() {
+        let args: Vec<String> = vec!["--last".into(), "5".into()];
+        assert_eq!(local_action_args(None, &args), args);
     }
 
     // ── Filter building ──

@@ -49,6 +49,10 @@ fn cleanup_removed_packages(project_dir: &Path, removed: &[String]) -> Result<()
     if lockfile_path.exists() {
         std::fs::remove_file(&lockfile_path)?;
     }
+    let binary_lockfile_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    if binary_lockfile_path.exists() {
+        std::fs::remove_file(&binary_lockfile_path)?;
+    }
 
     let node_modules = project_dir.join("node_modules");
     for name in removed {

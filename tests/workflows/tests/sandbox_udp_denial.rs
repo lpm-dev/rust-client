@@ -472,15 +472,17 @@ async fn postinstall_raw_packet_netlink_sockets_are_denied() {
         return;
     }
 
-    // Locate the `socket-probe` test bin. `cargo_bin!` only
+    // Locate the workflows-local `workflows-socket-probe` test bin.
+    // `cargo_bin!` only
     // works for same-crate integration tests; this workflow
     // crate is separate from `lpm-sandbox` where `socket-probe`
     // lives. Resolve at runtime from `current_exe()`:
     //   current_exe = target/<profile>/deps/<test>-<hash>
-    //   bin         = target/<profile>/socket-probe
-    // The dev-dependency on `lpm-sandbox` in
-    // `tests/workflows/Cargo.toml` makes cargo build the bin
-    // before this test runs, so it's guaranteed present.
+    //   bin         = target/<profile>/workflows-socket-probe
+    // The workflows-local `[[bin]]` in `tests/workflows/Cargo.toml`
+    // makes cargo build that bin before this test runs, so it's
+    // guaranteed present without depending on `lpm-sandbox`'s own
+    // output name.
     let src_probe = match std::env::var_os("LPM_TEST_SOCKET_PROBE_SOURCE") {
         Some(p) => PathBuf::from(p),
         None => {
@@ -489,13 +491,13 @@ async fn postinstall_raw_packet_netlink_sockets_are_denied() {
                 .parent()
                 .and_then(std::path::Path::parent)
                 .expect("test binary lives at target/<profile>/deps/<file>");
-            target_dir.join("socket-probe")
+            target_dir.join("workflows-socket-probe")
         }
     };
     assert!(
         src_probe.exists(),
-        "socket-probe test bin not at {}. Cargo should build it via the \
-         `lpm-sandbox` dev-dependency in `tests/workflows/Cargo.toml`. If \
+        "workflows-socket-probe test bin not at {}. Cargo should build it \
+         via the local `[[bin]]` in `tests/workflows/Cargo.toml`. If \
          running with a custom CARGO_TARGET_DIR, set \
          `LPM_TEST_SOCKET_PROBE_SOURCE=<absolute path>` before invoking \
          the test.",

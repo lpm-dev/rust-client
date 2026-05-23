@@ -166,6 +166,234 @@ async fn phantom_scanner_skips_tsconfig_path_aliases() {
     );
 }
 
+#[tokio::test]
+async fn phantom_scanner_skips_baseurl_only_root_imports() {
+    let mock = MockRegistry::start().await;
+    let pkg_json_ms = serde_json::json!({
+        "name": "ms",
+        "version": "2.1.3",
+        "main": "index.js"
+    });
+    let tarball = make_tarball_from_pkg_json(pkg_json_ms, &[]);
+    mock.with_full_package_metadata(
+        "ms",
+        "2.1.3",
+        &[("2.1.3", serde_json::json!({}), Some(tarball))],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "baseurl-only-project",
+            "version": "1.0.0",
+            "dependencies": { "ms": "^2.1.3" }
+        }"#,
+    );
+
+    project.write_file(
+        "tsconfig.json",
+        r#"{
+            "compilerOptions": {
+                "baseUrl": "."
+            }
+        }"#,
+    );
+    project.write_file("components/Button.js", "export default 1\n");
+    project.write_file(
+        "src/app.js",
+        r#"
+        import Button from "components/Button";
+        import ms from "ms";
+        console.log(Button, ms);
+        "#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install must succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        !combined.contains("phantom dependency import"),
+        "baseUrl-rooted local imports must not be flagged as phantoms:\n{combined}"
+    );
+    assert!(
+        !combined.contains("lpm install components"),
+        "baseUrl-rooted local imports must not suggest `lpm install components`:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn phantom_scanner_skips_bare_lpm_import_alias_prefixes() {
+    let mock = MockRegistry::start().await;
+    let pkg_json_ms = serde_json::json!({
+        "name": "ms",
+        "version": "2.1.3",
+        "main": "index.js"
+    });
+    let tarball = make_tarball_from_pkg_json(pkg_json_ms, &[]);
+    mock.with_full_package_metadata(
+        "ms",
+        "2.1.3",
+        &[("2.1.3", serde_json::json!({}), Some(tarball))],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "bare-import-alias-project",
+            "version": "1.0.0",
+            "dependencies": { "ms": "^2.1.3" }
+        }"#,
+    );
+
+    project.write_file(
+        "lpm.config.json",
+        r#"{
+            "importAlias": "components"
+        }"#,
+    );
+    project.write_file("components/Button.js", "export default 1\n");
+    project.write_file(
+        "src/app.js",
+        r#"
+        import Button from "components/Button";
+        import ms from "ms";
+        console.log(Button, ms);
+        "#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install must succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        !combined.contains("phantom dependency import"),
+        "bare lpm.config importAlias prefixes must not be flagged as phantoms:\n{combined}"
+    );
+    assert!(
+        !combined.contains("lpm install components"),
+        "bare lpm.config importAlias prefixes must not suggest `lpm install components`:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn phantom_scanner_skips_declared_workspace_member_imports() {
+    let mock = MockRegistry::start().await;
+    let pkg_json_kleur = serde_json::json!({
+        "name": "kleur",
+        "version": "4.1.5",
+        "main": "index.js"
+    });
+    let tarball = make_tarball_from_pkg_json(pkg_json_kleur, &[]);
+    mock.with_full_package_metadata(
+        "kleur",
+        "4.1.5",
+        &[("4.1.5", serde_json::json!({}), Some(tarball))],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "workspace-phantom-root",
+            "private": true,
+            "version": "1.0.0",
+            "workspaces": ["apps/*", "packages/*"]
+        }"#,
+    );
+
+    project.write_file(
+        "apps/app/package.json",
+        r#"{
+            "name": "@smoke/app",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+                "@smoke/core": "workspace:*",
+                "kleur": "^4.1.5"
+            }
+        }"#,
+    );
+    project.write_file(
+        "apps/app/index.js",
+        r#"
+        import { describeCore } from "@smoke/core";
+        import kleur from "kleur";
+
+        console.log(kleur.green(describeCore()));
+        "#,
+    );
+    project.write_file(
+        "packages/core/package.json",
+        r#"{
+            "name": "@smoke/core",
+            "version": "1.0.0",
+            "main": "index.js"
+        }"#,
+    );
+    project.write_file(
+        "packages/core/index.js",
+        r#"
+        export function describeCore() {
+            return "workspace core ready";
+        }
+        "#,
+    );
+
+    let mut cmd = lpm_with_registry(&project, &mock.url());
+    cmd.current_dir(project.path().join("apps/app"));
+    let output = cmd
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install from workspace member");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install must succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        !combined.contains("phantom dependency import"),
+        "declared workspace member imports must not be flagged as phantoms:\n{combined}"
+    );
+    assert!(
+        !combined.contains("lpm install @smoke/core"),
+        "declared workspace member imports must not suggest installing the local member from a registry:\n{combined}"
+    );
+}
+
 // ─── Phantom scanner: real phantom still gets a Fix line ─────────
 
 #[tokio::test]

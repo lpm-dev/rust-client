@@ -624,6 +624,48 @@ fn test_workspace_json_emits_valid_envelope_per_member() {
     }
 }
 
+#[test]
+fn bench_workspace_json_emits_valid_envelope_per_member() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    let output = lpm(&project)
+        .args(["--json", "bench", "--all"])
+        .output()
+        .expect("failed to run lpm bench --all --json");
+
+    assert!(!output.status.success());
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_else(|e| {
+        panic!("workspace --json must emit a single valid JSON document. Parse error: {e}\nRaw stdout:\n{raw}")
+    });
+
+    assert_eq!(json["success"], serde_json::json!(false));
+    assert_eq!(json["packages"], serde_json::json!(3));
+    assert_eq!(json["failed"], serde_json::json!(3));
+
+    let members = json["members"]
+        .as_array()
+        .expect("members must be an array");
+    assert_eq!(members.len(), 3);
+
+    for member in members {
+        assert_eq!(member["success"], serde_json::json!(false));
+        assert_eq!(
+            member["exit_code"],
+            serde_json::Value::Null,
+            "detect_bench_runner failure must surface as exit_code: null"
+        );
+        let err = member["error"]
+            .as_str()
+            .expect("error must be populated for detection failure");
+        assert!(
+            err.contains("no benchmark runner found"),
+            "error must reference the missing-runner cause, got: {err}"
+        );
+    }
+}
+
 // ─── compat-seam end-to-end ────────────────────────────
 //
 // The reviewer's load-bearing test: prove that `lpm test -- --all` still

@@ -4,7 +4,8 @@
 //! The install step is handled in the CLI layer (self-hosted via LPM's resolver/store/linker).
 
 use crate::bin_path;
-use lpm_common::{LpmError, LpmRoot};
+use lpm_common::{as_extended_path, LpmError, LpmRoot};
+use lpm_workspace::read_package_json;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Once;
@@ -362,6 +363,60 @@ pub fn bin_name_from_spec(spec: &str) -> &str {
     }) as _
 }
 
+fn resolve_dlx_bin_name(cache_dir: &Path, package_spec: &str) -> Result<String, LpmError> {
+    let (package_name, _) = parse_package_spec(package_spec);
+    let pkg_json_path = as_extended_path(
+        &cache_dir
+            .join("node_modules")
+            .join(&package_name)
+            .join("package.json"),
+    );
+    let package = read_package_json(&pkg_json_path).map_err(|e| {
+        LpmError::Script(format!(
+            "could not read installed package.json at {}: {e}",
+            pkg_json_path.display()
+        ))
+    })?;
+
+    let manifest_name = package
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&package_name);
+    let Some(bin_config) = package.bin.as_ref() else {
+        return Err(LpmError::Script(format!(
+            "package '{manifest_name}' does not expose a binary"
+        )));
+    };
+
+    let mut bin_names: Vec<String> = bin_config
+        .entries(manifest_name)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    bin_names.sort();
+    bin_names.dedup();
+
+    if bin_names.is_empty() {
+        return Err(LpmError::Script(format!(
+            "package '{manifest_name}' does not expose a binary"
+        )));
+    }
+    if bin_names.len() == 1 {
+        return Ok(bin_names.remove(0));
+    }
+
+    let preferred = bin_name_from_spec(package_spec);
+    if bin_names.iter().any(|name| name == preferred) {
+        return Ok(preferred.to_string());
+    }
+
+    Err(LpmError::Script(format!(
+        "package '{manifest_name}' exposes multiple binaries ({}); lpm dlx needs an unambiguous default",
+        bin_names.join(", ")
+    )))
+}
+
 /// Build a `Command` for executing a dlx binary.
 ///
 /// Uses direct process spawn (`Command::new`) instead of `sh -c` to prevent
@@ -382,9 +437,9 @@ pub fn build_dlx_command(
     cache_dir: &Path,
     package_spec: &str,
     extra_args: &[String],
-) -> Command {
+) -> Result<Command, LpmError> {
     let bin_dir = cache_dir.join("node_modules").join(".bin");
-    let bin_name = bin_name_from_spec(package_spec);
+    let bin_name = resolve_dlx_bin_name(cache_dir, package_spec)?;
     let bin_path = bin_dir.join(bin_name);
 
     // Build PATH with the dlx cache's .bin prepended
@@ -414,7 +469,7 @@ pub fn build_dlx_command(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    command
+    Ok(command)
 }
 
 /// Execute the dlx binary from the cache directory.
@@ -427,10 +482,14 @@ pub fn exec_dlx_binary(
     package_spec: &str,
     extra_args: &[String],
 ) -> Result<(), LpmError> {
-    let mut command = build_dlx_command(project_dir, cache_dir, package_spec, extra_args);
+    let mut command = build_dlx_command(project_dir, cache_dir, package_spec, extra_args)?;
+    let bin_name = Path::new(command.get_program())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| bin_name_from_spec(package_spec))
+        .to_string();
 
     let status = command.status().map_err(|e| {
-        let bin_name = bin_name_from_spec(package_spec);
         LpmError::Script(format!("failed to execute '{bin_name}': {e}"))
     })?;
 
@@ -471,6 +530,21 @@ pub fn deterministic_hash(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seed_installed_package(cache_dir: &Path, package_name: &str, bin_json: &str, bins: &[&str]) {
+        let package_dir = cache_dir.join("node_modules").join(package_name);
+        let bin_dir = cache_dir.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            format!(r#"{{"name":"{package_name}","bin":{bin_json}}}"#),
+        )
+        .unwrap();
+        for bin in bins {
+            std::fs::write(bin_dir.join(bin), "").unwrap();
+        }
+    }
 
     #[test]
     fn dlx_cache_dir_at_is_stable() {
@@ -754,8 +828,7 @@ mod tests {
     fn build_dlx_command_no_shell_injection() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        let bin_dir = cache_dir.join("node_modules/.bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
+        seed_installed_package(&cache_dir, "cowsay", r#"{"cowsay":"./cli.js"}"#, &["cowsay"]);
 
         // Arguments with shell metacharacters should be passed as literals
         let malicious_args: Vec<String> = vec![
@@ -766,7 +839,7 @@ mod tests {
             "`id`".into(),
         ];
 
-        let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &malicious_args);
+        let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &malicious_args).unwrap();
 
         // Verify the command is a direct binary invocation, not sh -c
         let program = cmd.get_program().to_string_lossy().to_string();
@@ -792,21 +865,65 @@ mod tests {
     fn build_dlx_command_no_args() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        let bin_dir = cache_dir.join("node_modules/.bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
+        seed_installed_package(&cache_dir, "cowsay", r#"{"cowsay":"./cli.js"}"#, &["cowsay"]);
 
-        let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &[]);
+        let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &[]).unwrap();
         assert!(cmd.get_args().next().is_none(), "should have no args");
+    }
+
+    #[test]
+    fn build_dlx_command_uses_package_bin_metadata_when_command_name_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        seed_installed_package(&cache_dir, "foo", r#"{"serve":"./cli.js"}"#, &["serve"]);
+
+        let expected = cache_dir.join("node_modules/.bin/serve");
+
+        let cmd = build_dlx_command(dir.path(), &cache_dir, "foo", &[]).unwrap();
+        assert_eq!(cmd.get_program(), expected.as_os_str());
+    }
+
+    #[test]
+    fn build_dlx_command_prefers_short_package_name_for_multi_bin_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        seed_installed_package(
+            &cache_dir,
+            "@scope/foo",
+            r#"{"foo":"./cli.js","other":"./other.js"}"#,
+            &["foo", "other"],
+        );
+
+        let expected = cache_dir.join("node_modules/.bin/foo");
+        let cmd = build_dlx_command(dir.path(), &cache_dir, "@scope/foo", &[]).unwrap();
+        assert_eq!(cmd.get_program(), expected.as_os_str());
+    }
+
+    #[test]
+    fn build_dlx_command_errors_for_ambiguous_multi_bin_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        seed_installed_package(
+            &cache_dir,
+            "@scope/toolkit",
+            r#"{"serve":"./serve.js","lint":"./lint.js"}"#,
+            &["serve", "lint"],
+        );
+
+        let err = build_dlx_command(dir.path(), &cache_dir, "@scope/toolkit", &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("multiple binaries"));
+        assert!(msg.contains("serve"));
+        assert!(msg.contains("lint"));
     }
 
     #[test]
     fn build_dlx_command_strips_credential_and_hijack_env_carriers() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        let bin_dir = cache_dir.join("node_modules/.bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
+        seed_installed_package(&cache_dir, "cowsay", r#"{"cowsay":"./cli.js"}"#, &["cowsay"]);
 
-        let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &[]);
+        let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &[]).unwrap();
 
         let stripped: Vec<&str> = cmd
             .get_envs()

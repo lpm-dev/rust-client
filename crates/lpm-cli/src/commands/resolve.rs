@@ -1,14 +1,17 @@
+use crate::commands::registry_reads::prepare_routed_read_context;
 use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use lpm_resolver::resolve_dependencies;
+use lpm_resolver::resolve_dependencies_routed;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 pub async fn run(
     client: &RegistryClient,
+    project_dir: &Path,
     packages: &[String],
     json_output: bool,
 ) -> Result<(), LpmError> {
@@ -39,15 +42,11 @@ pub async fn run(
         deps.len().to_string().bold()
     ));
 
-    // Step 6 fix: use the injected client. Pre-fix this site
-    // hardcoded `https://lpm.dev` and only honored `LPM_TOKEN`,
-    // ignoring `--registry` and the stored session entirely. The
-    // injected client carries both the user's `--registry` URL and
-    // the shared `SessionManager`, so this respects every layer of
-    // the auth model with zero local construction.
-    let arc_client = Arc::new(client.clone_with_config());
+    let top_level_specs: Vec<String> = deps.keys().cloned().collect();
+    let context = prepare_routed_read_context(client, project_dir, &top_level_specs, json_output)?;
+    let arc_client = Arc::new(context.client.clone_with_config());
 
-    match resolve_dependencies(arc_client, deps).await {
+    match resolve_dependencies_routed(arc_client, deps, context.route_table).await {
         Ok(result) => {
             let elapsed = start.elapsed();
             let resolved = &result.packages;

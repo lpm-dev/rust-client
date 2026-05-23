@@ -211,6 +211,115 @@ async fn lpm_add_with_mixed_registry_deps_installs_and_writes_resolved_specs() {
     );
 }
 
+#[tokio::test]
+async fn lpm_add_config_aware_pkg_ignores_declaration_file_imports_in_phantom_scan() {
+    let mock = MockRegistry::start().await;
+
+    let lpm_config = json!({
+        "ecosystem": "js",
+        "configSchema": {
+            "styling": {
+                "type": "select",
+                "required": true,
+                "options": ["panda"]
+            }
+        },
+        "defaultConfig": {
+            "styling": "panda"
+        },
+        "dependencies": {
+            "styling": {
+                "panda": ["kleur"]
+            }
+        },
+        "files": [
+            { "src": "components/dialog/Dialog.jsx", "dest": "dialog/Dialog.jsx" },
+            { "src": "components/dialog/Dialog.d.ts", "dest": "dialog/Dialog.d.ts" },
+            { "src": "components/dialog/index.js", "dest": "dialog/index.js" }
+        ]
+    });
+    let dialog_jsx = b"export default function Dialog({ children }) {\n  return children ?? null;\n}\n";
+    let dialog_dts = b"import { ReactNode } from \"react\";\nexport interface DialogProps {\n  children?: ReactNode;\n}\nexport default function Dialog(props: DialogProps): JSX.Element;\n";
+    let index_js = b"export { default } from \"./Dialog\";\n";
+    let source_tarball = make_source_pkg_tarball(
+        "typed-config-pkg",
+        "1.0.0",
+        lpm_config,
+        &[
+            ("components/dialog/Dialog.jsx", dialog_jsx),
+            ("components/dialog/Dialog.d.ts", dialog_dts),
+            ("components/dialog/index.js", index_js),
+        ],
+    );
+    mock.with_package("typed-config-pkg", "1.0.0", &source_tarball)
+        .await;
+
+    let kleur_tarball =
+        make_tarball_from_pkg_json(json!({ "name": "kleur", "version": "4.1.5" }), &[]);
+    mock.with_package("kleur", "4.1.5", &kleur_tarball).await;
+    mock.with_batch_metadata(vec![json!({
+        "name": "kleur",
+        "dist-tags": { "latest": "4.1.5" },
+        "versions": {
+            "4.1.5": {
+                "name": "kleur",
+                "version": "4.1.5",
+                "dist": {
+                    "tarball": format!("{}/tarballs/kleur/-/kleur-4.1.5.tgz", mock.url()),
+                    "integrity": "sha512-placeholder"
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "4.1.5": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project =
+        TempProject::empty(r#"{"name":"typed-config-host","version":"1.0.0","dependencies":{}}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "typed-config-pkg?styling=panda",
+            "--yes",
+            "--path",
+            "components",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run config-aware lpm add");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        output.status.success(),
+        "config-aware lpm add failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        project.file_exists("components/dialog/Dialog.d.ts"),
+        "typed declaration file must be copied; stderr: {stderr}"
+    );
+    assert!(
+        !combined.contains("phantom dependency import"),
+        "declaration-only imports must not trigger phantom warnings; output:\n{combined}"
+    );
+
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let deps = pkg_json
+        .get("dependencies")
+        .and_then(|v| v.as_object())
+        .expect("dependencies object should exist");
+    assert_eq!(
+        deps.get("kleur").and_then(|v| v.as_str()),
+        Some("^4.1.5"),
+        "config-aware dependencies should still install normally; got {deps:?}"
+    );
+}
+
 // ─── JSON envelope contract ────────────────────────
 
 /// `lpm add --json` envelope shape locked via insta. Source-package add

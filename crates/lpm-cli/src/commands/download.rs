@@ -1,52 +1,60 @@
+use crate::commands::registry_reads::{fetch_routed_package_metadata, prepare_routed_read_context};
 use crate::output;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, PackageName};
+use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
 pub async fn run(
     client: &RegistryClient,
+    project_dir: &Path,
     package: &str,
     version: Option<&str>,
     output_dir: Option<&str>,
     allow_unverified: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let name = PackageName::parse(package)?;
+    let context = prepare_routed_read_context(client, project_dir, &[package.to_string()], json_output)?;
     let start = Instant::now();
 
     // Step 1: Fetch metadata
     let spinner = if !json_output {
         let s = cliclack::spinner();
-        s.start(format!("Fetching metadata for {name}..."));
+        s.start(format!("Fetching metadata for {package}..."));
         Some(s)
     } else {
         None
     };
 
-    let metadata = client.get_package_metadata(&name).await?;
+    let (package_ref, metadata) = fetch_routed_package_metadata(&context, package).await?;
+    let package_name = metadata.name.clone();
 
     // Resolve version
     let version_key = version
         .map(|v| v.to_string())
         .or_else(|| metadata.latest_version_tag().map(|s| s.to_string()))
-        .ok_or_else(|| LpmError::NotFound(format!("no versions found for {name}")))?;
+        .ok_or_else(|| LpmError::NotFound(format!("no versions found for {package_name}")))?;
 
     let ver = metadata
         .version(&version_key)
-        .ok_or_else(|| LpmError::NotFound(format!("version {version_key} not found for {name}")))?;
+        .ok_or_else(|| {
+            LpmError::NotFound(format!("version {version_key} not found for {package_name}"))
+        })?;
 
     let tarball_url = ver
         .tarball_url()
-        .ok_or_else(|| LpmError::Registry(format!("no tarball URL for {name}@{version_key}")))?;
+        .ok_or_else(|| {
+            LpmError::Registry(format!("no tarball URL for {package_name}@{version_key}"))
+        })?;
 
     let integrity_str = ver.integrity();
 
     if let Some(s) = spinner {
         s.stop(format!(
             "Resolved {} {}",
-            name.bold(),
+            package_name.bold(),
             format!("v{version_key}").dimmed()
         ));
     }
@@ -60,13 +68,17 @@ pub async fn run(
         None
     };
 
-    let tarball_data = client.download_tarball(tarball_url).await?;
+    let downloaded = context
+        .client
+        .download_tarball_routed(&context.route_table, &package_ref.route_name(), tarball_url)
+        .await?;
+    let tarball_data = std::fs::read(downloaded.file.path()).map_err(LpmError::Io)?;
     let size = tarball_data.len();
 
     if let Some(s) = spinner {
         s.stop(format!(
             "Downloaded {} ({})",
-            format!("{name}@{version_key}").bold(),
+            format!("{package_name}@{version_key}").bold(),
             format_bytes(size).dimmed()
         ));
     }
@@ -80,7 +92,7 @@ pub async fn run(
     // integrity.
     if integrity_str.is_none() && !allow_unverified {
         return Err(LpmError::Registry(format!(
-            "{name}@{version_key}: registry returned no integrity hash; \
+            "{package_name}@{version_key}: registry returned no integrity hash; \
              refusing to extract an unverified tarball. Re-run with \
              --allow-unverified if you accept the risk (audit use \
              should not normally take that path).",
@@ -142,7 +154,7 @@ pub async fn run(
         );
         let json = serde_json::json!({
             "success": true,
-            "package": name.to_string(),
+            "package": package_name,
             "version": version_key,
             "tarball_url": tarball_url,
             "integrity": integrity_str,

@@ -65,13 +65,13 @@ hex = { workspace = true }
 #
 # Without this `[[bin]]` entry, a focused
 # `cargo test -p lpm-workflows --test sandbox_udp_denial` build
-# does NOT build `socket-probe`: cargo's dev-dependency
+# does NOT build `workflows-socket-probe`: cargo's dev-dependency
 # resolution pulls in the dep crate's lib but not its bins. The
 # workflow test's runtime resolver
-# (`current_exe().parent().parent().join("socket-probe")`) then
+# (`current_exe().parent().parent().join("workflows-socket-probe")`) then
 # fails the `probe.exists()` precondition.
 [[bin]]
-name = "socket-probe"
+name = "workflows-socket-probe"
 path = "../../crates/lpm-sandbox/src/bin/socket-probe.rs"
 
 [lints]

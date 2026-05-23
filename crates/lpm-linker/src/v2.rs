@@ -698,6 +698,12 @@ fn derive_graph_keys(
         HashMap::with_capacity(targets.len());
 
     for v2t in targets {
+        let graph_key_peers: &[(String, String)] = if matches!(linker_tag, LinkerModeTag::Hoisted)
+        {
+            &[]
+        } else {
+            &v2t.target.peers
+        };
         let key = Arc::new(GraphKey::derive_raw(
             &v2t.target.name,
             &v2t.target.version,
@@ -705,7 +711,7 @@ fn derive_graph_keys(
             linker_tag,
             &v2t.target.dependencies,
             &v2t.target.aliases,
-            &v2t.target.peers,
+            graph_key_peers,
             v2t.target.root_link_names.as_deref(),
             v2t.target.wrapper_id.as_deref(),
             v2t.target.patch_fingerprint.as_deref(),
@@ -1635,6 +1641,51 @@ mod tests {
             c_dest_p1, c_dest_p2,
             "same edge graph + same peer pinning across two projects must share the link entry"
         );
+    }
+
+    #[test]
+    fn link_packages_v2_hoisted_mode_accepts_targets_with_peer_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let consumer_sri = synthetic_sri(b"hoisted_peers/consumer");
+        write_object(
+            &store,
+            &consumer_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"consumer\",\"version\":\"1.0.0\",\"peerDependencies\":{\"react\":\"*\"}}",
+            )],
+        );
+
+        let react_sri = synthetic_sri(b"hoisted_peers/react");
+        write_object(
+            &store,
+            &react_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"18.3.1\"}",
+            )],
+        );
+
+        let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
+        consumer.target.peers = vec![("react".into(), "18.3.1".into())];
+        let react = target("react", "18.3.1", &react_sri, false);
+
+        let result = link_packages_v2(
+            &project,
+            vec![consumer, react],
+            &store,
+            LinkerMode::Hoisted,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.linked, 2);
+        assert_eq!(result.symlinked, 1);
+        assert!(project.join("node_modules").join("consumer").exists());
     }
 
     /// Multi-source-same-coords (two `LinkTarget`s with the same
