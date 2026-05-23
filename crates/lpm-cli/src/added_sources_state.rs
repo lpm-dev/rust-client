@@ -72,7 +72,7 @@ pub fn state_path(project_dir: &Path) -> PathBuf {
 
 pub fn manifest_path_for_file(project_dir: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(project_dir)
-    .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
+        .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
 }
 
 pub fn resolve_manifest_path(project_dir: &Path, path: &Path) -> PathBuf {
@@ -96,10 +96,7 @@ pub fn read_state(project_dir: &Path) -> Result<Option<AddedSourcesState>, LpmEr
     };
 
     let state: AddedSourcesState = serde_json::from_str(&content).map_err(|error| {
-        LpmError::Registry(format!(
-            "failed to parse {}: {error}",
-            path.display()
-        ))
+        LpmError::Registry(format!("failed to parse {}: {error}", path.display()))
     })?;
 
     if state.schema_version > SCHEMA_VERSION {
@@ -134,9 +131,7 @@ pub fn write_state(project_dir: &Path, state: &AddedSourcesState) -> Result<(), 
     }
 
     let body = serde_json::to_string_pretty(state).map_err(|error| {
-        LpmError::Registry(format!(
-            "failed to serialize added-sources state: {error}"
-        ))
+        LpmError::Registry(format!("failed to serialize added-sources state: {error}"))
     })?;
 
     let tmp = path.with_extension("json.tmp");

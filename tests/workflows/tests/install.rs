@@ -217,7 +217,10 @@ async fn install_add_with_dist_tag_resolves_tagged_prerelease_and_saves_exact() 
         .mount(mock.server())
         .await;
     Mock::given(method("GET"))
-        .and(path(MockRegistry::tarball_path(package_name, stable_version)))
+        .and(path(MockRegistry::tarball_path(
+            package_name,
+            stable_version,
+        )))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_bytes(stable_tarball)
@@ -3245,7 +3248,8 @@ async fn install_tarball_url_with_declared_sri_writes_non_registry_lockfile_entr
     "tarball-url-pkg": "{}/tarball-url-pkg-1.0.0.tgz#{}"
   }}
 }}"#,
-        server.uri(), expected_integrity,
+        server.uri(),
+        expected_integrity,
     ));
 
     let output = lpm(&project)

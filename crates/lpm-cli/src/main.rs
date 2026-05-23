@@ -3,8 +3,8 @@ use clap_complete::Shell;
 use lpm_common::color::Painted;
 use miette::{IntoDiagnostic, Result};
 
-mod auth;
 mod added_sources_state;
+mod auth;
 pub mod build_state;
 pub mod capability;
 mod color_policy;
@@ -2027,7 +2027,8 @@ enum Commands {
         yes: bool,
     },
 
-    /// Open the LPM Vault app (install if not found, check for updates).
+    /// Internal macOS vault app surface.
+    #[command(hide = true)]
     Vault {
         /// Action: open (default), update, version.
         #[arg(default_value = "")]

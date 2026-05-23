@@ -12,9 +12,13 @@ pub async fn run(
     limit: u32,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let context = prepare_routed_read_context(client, project_dir, &[query.to_string()], json_output)?;
+    let context =
+        prepare_routed_read_context(client, project_dir, &[query.to_string()], json_output)?;
     let route = search_route_for_query(&context.route_table, query);
-    let results = context.client.search_npm_packages_routed(query, limit, route).await?;
+    let results = context
+        .client
+        .search_npm_packages_routed(query, limit, route)
+        .await?;
 
     if json_output {
         let mut json = serde_json::to_value(&results)?;

@@ -238,7 +238,8 @@ async fn lpm_add_config_aware_pkg_ignores_declaration_file_imports_in_phantom_sc
             { "src": "components/dialog/index.js", "dest": "dialog/index.js" }
         ]
     });
-    let dialog_jsx = b"export default function Dialog({ children }) {\n  return children ?? null;\n}\n";
+    let dialog_jsx =
+        b"export default function Dialog({ children }) {\n  return children ?? null;\n}\n";
     let dialog_dts = b"import { ReactNode } from \"react\";\nexport interface DialogProps {\n  children?: ReactNode;\n}\nexport default function Dialog(props: DialogProps): JSX.Element;\n";
     let index_js = b"export { default } from \"./Dialog\";\n";
     let source_tarball = make_source_pkg_tarball(

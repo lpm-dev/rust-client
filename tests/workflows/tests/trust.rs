@@ -244,7 +244,9 @@ fn trust_diff_assert_none_exits_nonzero_when_diff_entries_exist() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("assertion failed") || stderr.contains("diff") || stderr.contains("matched"),
+        stderr.contains("assertion failed")
+            || stderr.contains("diff")
+            || stderr.contains("matched"),
         "stderr must explain the assert-none failure, got:\n{stderr}"
     );
 }

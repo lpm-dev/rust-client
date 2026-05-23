@@ -4,7 +4,7 @@
 //! The install step is handled in the CLI layer (self-hosted via LPM's resolver/store/linker).
 
 use crate::bin_path;
-use lpm_common::{as_extended_path, LpmError, LpmRoot};
+use lpm_common::{LpmError, LpmRoot, as_extended_path};
 use lpm_workspace::read_package_json;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -489,9 +489,9 @@ pub fn exec_dlx_binary(
         .unwrap_or_else(|| bin_name_from_spec(package_spec))
         .to_string();
 
-    let status = command.status().map_err(|e| {
-        LpmError::Script(format!("failed to execute '{bin_name}': {e}"))
-    })?;
+    let status = command
+        .status()
+        .map_err(|e| LpmError::Script(format!("failed to execute '{bin_name}': {e}")))?;
 
     if !status.success() {
         #[cfg(not(unix))]
@@ -828,7 +828,12 @@ mod tests {
     fn build_dlx_command_no_shell_injection() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        seed_installed_package(&cache_dir, "cowsay", r#"{"cowsay":"./cli.js"}"#, &["cowsay"]);
+        seed_installed_package(
+            &cache_dir,
+            "cowsay",
+            r#"{"cowsay":"./cli.js"}"#,
+            &["cowsay"],
+        );
 
         // Arguments with shell metacharacters should be passed as literals
         let malicious_args: Vec<String> = vec![
@@ -865,7 +870,12 @@ mod tests {
     fn build_dlx_command_no_args() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        seed_installed_package(&cache_dir, "cowsay", r#"{"cowsay":"./cli.js"}"#, &["cowsay"]);
+        seed_installed_package(
+            &cache_dir,
+            "cowsay",
+            r#"{"cowsay":"./cli.js"}"#,
+            &["cowsay"],
+        );
 
         let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &[]).unwrap();
         assert!(cmd.get_args().next().is_none(), "should have no args");
@@ -921,7 +931,12 @@ mod tests {
     fn build_dlx_command_strips_credential_and_hijack_env_carriers() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("cache");
-        seed_installed_package(&cache_dir, "cowsay", r#"{"cowsay":"./cli.js"}"#, &["cowsay"]);
+        seed_installed_package(
+            &cache_dir,
+            "cowsay",
+            r#"{"cowsay":"./cli.js"}"#,
+            &["cowsay"],
+        );
 
         let cmd = build_dlx_command(dir.path(), &cache_dir, "cowsay", &[]).unwrap();
 

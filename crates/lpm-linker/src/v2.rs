@@ -698,8 +698,7 @@ fn derive_graph_keys(
         HashMap::with_capacity(targets.len());
 
     for v2t in targets {
-        let graph_key_peers: &[(String, String)] = if matches!(linker_tag, LinkerModeTag::Hoisted)
-        {
+        let graph_key_peers: &[(String, String)] = if matches!(linker_tag, LinkerModeTag::Hoisted) {
             &[]
         } else {
             &v2t.target.peers

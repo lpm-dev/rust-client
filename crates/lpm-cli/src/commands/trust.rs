@@ -193,7 +193,11 @@ async fn run_diff(project_dir: &Path, json: bool, assert_none: bool) -> Result<(
         return Err(LpmError::Registry(format!(
             "assertion failed: {} trust diff entr{} present",
             entries.len(),
-            if entries.len() == 1 { "y is" } else { "ies are" }
+            if entries.len() == 1 {
+                "y is"
+            } else {
+                "ies are"
+            }
         )));
     }
 

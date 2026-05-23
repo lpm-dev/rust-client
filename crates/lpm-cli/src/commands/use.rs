@@ -140,7 +140,10 @@ pub async fn run(
                     serde_json::json!({"success": true, "pinned": {"node": pinned_version}})
                 );
             } else {
-                output::success(&format!("Pinned node@{} in lpm.json", pinned_version.bold()));
+                output::success(&format!(
+                    "Pinned node@{} in lpm.json",
+                    pinned_version.bold()
+                ));
             }
         }
 
@@ -169,10 +172,10 @@ fn select_pinned_node_version(version_spec: &str, installed: &[String]) -> Strin
 }
 
 fn resolve_pinned_node_version(version_spec: &str) -> String {
-    lpm_runtime::node::list_installed()
-        .ok()
-        .map(|installed| select_pinned_node_version(version_spec, &installed))
-        .unwrap_or_else(|| version_spec.to_string())
+    lpm_runtime::node::list_installed().ok().map_or_else(
+        || version_spec.to_string(),
+        |installed| select_pinned_node_version(version_spec, &installed),
+    )
 }
 
 fn write_node_pin(project_dir: &std::path::Path, node_version: &str) -> Result<(), LpmError> {

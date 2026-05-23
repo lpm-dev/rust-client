@@ -337,10 +337,10 @@ pub async fn resolve_dependencies_with_overrides(
 }
 
 pub async fn resolve_dependencies_with_overrides_routed(
-	client: Arc<RegistryClient>,
-	dependencies: HashMap<String, String>,
-	overrides: OverrideSet,
-	route_table: RouteTable,
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    route_table: RouteTable,
 ) -> Result<ResolveResult, ResolveError> {
     // When no walker is wired, the caller gets a fresh empty shared
     // cache + zero wait-timeout. The provider's `ensure_cached`

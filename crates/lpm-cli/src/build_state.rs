@@ -495,9 +495,8 @@ pub fn compute_blocked_packages_with_metadata(
 }
 
 struct BlockedPackageComputationExtras<'a> {
-    advisor_approvals: Option<
-        &'a std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
-    >,
+    advisor_approvals:
+        Option<&'a std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>>,
     baseline_index: Option<&'a lpm_store::V2BaselineIndex>,
 }
 
@@ -720,9 +719,10 @@ fn resolve_blocked_package_dir(
 ) -> PathBuf {
     baseline_index
         .and_then(|index| index.lookup(name, version))
-        .map_or_else(|| store.package_dir(name, version), |baseline| {
-            baseline.package_dir.clone()
-        })
+        .map_or_else(
+            || store.package_dir(name, version),
+            |baseline| baseline.package_dir.clone(),
+        )
 }
 
 /// The end-to-end install hook: compute → compare to previous → write →

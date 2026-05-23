@@ -121,12 +121,24 @@ async fn outdated_reports_non_lpm_packages_by_default() {
         "ms",
         "9.9.9",
         &[
-            ("2.1.3", serde_json::json!({}), Some(make_tarball("ms", "2.1.3"))),
-            ("2.9.9", serde_json::json!({}), Some(make_tarball("ms", "2.9.9"))),
-            ("9.9.9", serde_json::json!({}), Some(make_tarball("ms", "9.9.9"))),
+            (
+                "2.1.3",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.1.3")),
+            ),
+            (
+                "2.9.9",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.9.9")),
+            ),
+            (
+                "9.9.9",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "9.9.9")),
+            ),
         ],
     )
-        .await;
+    .await;
 
     let out = lpm_with_registry(&project, &mock.url())
         .args(["outdated", "--json"])
@@ -173,9 +185,21 @@ async fn outdated_includes_dev_dependencies_by_default() {
         "vite",
         "6.0.0",
         &[
-            ("5.0.0", serde_json::json!({}), Some(make_tarball("vite", "5.0.0"))),
-            ("5.9.1", serde_json::json!({}), Some(make_tarball("vite", "5.9.1"))),
-            ("6.0.0", serde_json::json!({}), Some(make_tarball("vite", "6.0.0"))),
+            (
+                "5.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("vite", "5.0.0")),
+            ),
+            (
+                "5.9.1",
+                serde_json::json!({}),
+                Some(make_tarball("vite", "5.9.1")),
+            ),
+            (
+                "6.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("vite", "6.0.0")),
+            ),
         ],
     )
     .await;
@@ -287,9 +311,21 @@ async fn outdated_reports_newer_version_for_outdated_lpm_dep() {
         pkg,
         "2.5.0",
         &[
-            ("1.0.0", serde_json::json!({}), Some(make_tarball(pkg, "1.0.0"))),
-            ("1.8.9", serde_json::json!({}), Some(make_tarball(pkg, "1.8.9"))),
-            ("2.5.0", serde_json::json!({}), Some(make_tarball(pkg, "2.5.0"))),
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "1.0.0")),
+            ),
+            (
+                "1.8.9",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "1.8.9")),
+            ),
+            (
+                "2.5.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "2.5.0")),
+            ),
         ],
     )
     .await;
@@ -365,9 +401,21 @@ async fn outdated_json_envelope_with_one_outdated_pkg_matches_snapshot() {
         pkg,
         "2.0.0",
         &[
-            ("1.0.0", serde_json::json!({}), Some(make_tarball(pkg, "1.0.0"))),
-            ("1.6.0", serde_json::json!({}), Some(make_tarball(pkg, "1.6.0"))),
-            ("2.0.0", serde_json::json!({}), Some(make_tarball(pkg, "2.0.0"))),
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "1.0.0")),
+            ),
+            (
+                "1.6.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "1.6.0")),
+            ),
+            (
+                "2.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "2.0.0")),
+            ),
         ],
     )
     .await;

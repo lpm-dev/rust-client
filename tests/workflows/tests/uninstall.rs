@@ -159,8 +159,11 @@ fn uninstall_drops_lpm_lock_entirely_after_removal() {
 fn uninstall_drops_lpm_lockb_alongside_lpm_lock_after_removal() {
     let project = TempProject::empty("");
     seed_installed_package(&project, "drop-lockb", "2.0.0");
-    std::fs::write(project.path().join("lpm.lockb"), b"placeholder-binary-lockfile")
-        .expect("seed lpm.lockb");
+    std::fs::write(
+        project.path().join("lpm.lockb"),
+        b"placeholder-binary-lockfile",
+    )
+    .expect("seed lpm.lockb");
     assert!(
         project.path().join("lpm.lock").exists(),
         "seed must produce lpm.lock"

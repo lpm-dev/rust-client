@@ -1,10 +1,10 @@
 use crate::commands::registry_reads::{fetch_routed_package_metadata, prepare_routed_read_context};
 use crate::output;
-use lpm_common::color::Painted;
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
-use std::path::PathBuf;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 pub async fn run(
@@ -16,7 +16,8 @@ pub async fn run(
     allow_unverified: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let context = prepare_routed_read_context(client, project_dir, &[package.to_string()], json_output)?;
+    let context =
+        prepare_routed_read_context(client, project_dir, &[package.to_string()], json_output)?;
     let start = Instant::now();
 
     // Step 1: Fetch metadata
@@ -37,17 +38,15 @@ pub async fn run(
         .or_else(|| metadata.latest_version_tag().map(|s| s.to_string()))
         .ok_or_else(|| LpmError::NotFound(format!("no versions found for {package_name}")))?;
 
-    let ver = metadata
-        .version(&version_key)
-        .ok_or_else(|| {
-            LpmError::NotFound(format!("version {version_key} not found for {package_name}"))
-        })?;
+    let ver = metadata.version(&version_key).ok_or_else(|| {
+        LpmError::NotFound(format!(
+            "version {version_key} not found for {package_name}"
+        ))
+    })?;
 
-    let tarball_url = ver
-        .tarball_url()
-        .ok_or_else(|| {
-            LpmError::Registry(format!("no tarball URL for {package_name}@{version_key}"))
-        })?;
+    let tarball_url = ver.tarball_url().ok_or_else(|| {
+        LpmError::Registry(format!("no tarball URL for {package_name}@{version_key}"))
+    })?;
 
     let integrity_str = ver.integrity();
 

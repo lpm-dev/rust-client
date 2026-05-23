@@ -39,8 +39,7 @@ pub async fn run(
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
-    let mut dep_entries =
-        Vec::with_capacity(pkg.dependencies.len() + pkg.dev_dependencies.len());
+    let mut dep_entries = Vec::with_capacity(pkg.dependencies.len() + pkg.dev_dependencies.len());
     for (name, range) in pkg.dependencies {
         dep_entries.push(DependencyEntry {
             name,

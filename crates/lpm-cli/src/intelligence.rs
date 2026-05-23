@@ -130,7 +130,10 @@ fn is_runtime_source_file(path: &Path) -> bool {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    if file_name.ends_with(".d.ts") || file_name.ends_with(".d.cts") || file_name.ends_with(".d.mts") {
+    if file_name.ends_with(".d.ts")
+        || file_name.ends_with(".d.cts")
+        || file_name.ends_with(".d.mts")
+    {
         return false;
     }
 

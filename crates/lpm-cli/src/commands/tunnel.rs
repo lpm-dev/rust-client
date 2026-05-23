@@ -96,7 +96,8 @@ pub async fn run(
 }
 
 fn local_action_args(second_positional: Option<&str>, extra_args: &[String]) -> Vec<String> {
-    let mut normalized_args = Vec::with_capacity(extra_args.len() + usize::from(second_positional.is_some()));
+    let mut normalized_args =
+        Vec::with_capacity(extra_args.len() + usize::from(second_positional.is_some()));
     if let Some(value) = second_positional {
         normalized_args.push(value.to_string());
     }

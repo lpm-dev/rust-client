@@ -119,7 +119,8 @@ async fn remove_reverses_manifest_tracked_custom_path_add_for_bare_package() {
     mock.with_package("source-pkg", "1.0.0", &source_tarball)
         .await;
 
-    let project = TempProject::empty(r#"{"name":"remove-test","version":"1.0.0","dependencies":{}}"#);
+    let project =
+        TempProject::empty(r#"{"name":"remove-test","version":"1.0.0","dependencies":{}}"#);
 
     let add_output = lpm_with_registry(&project, &mock.url())
         .args([
@@ -164,9 +165,9 @@ async fn remove_reverses_manifest_tracked_custom_path_add_for_bare_package() {
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["package"], serde_json::json!("source-pkg"));
     assert!(
-        envelope["removed"]
-            .as_array()
-            .is_some_and(|removed| removed.iter().any(|value| value == "custom/widgets/Foo.tsx")),
+        envelope["removed"].as_array().is_some_and(|removed| removed
+            .iter()
+            .any(|value| value == "custom/widgets/Foo.tsx")),
         "remove must report the manifest-tracked custom file path, got: {envelope}"
     );
     assert!(

@@ -1328,6 +1328,10 @@ struct InstallPackage {
     integrity: Option<String>,
     /// Tarball URL from resolution — avoids re-fetching metadata during download.
     tarball_url: Option<String>,
+    /// Whether current metadata was already consulted for tarball lookup.
+    /// Distinguishes a fresh-resolution `dist.tarball` miss from an older
+    /// lockfile entry that simply has no cached tarball URL yet.
+    metadata_checked_for_tarball: bool,
 }
 
 impl InstallPackage {
@@ -2121,6 +2125,7 @@ async fn pre_resolve_non_registry_deps(
             peers: Vec::new(),
             integrity: Some(computed_sri),
             tarball_url: Some(url),
+            metadata_checked_for_tarball: false,
         });
     }
 
@@ -2223,6 +2228,7 @@ async fn pre_resolve_non_registry_deps(
             // entries — same posture as 59.0's tarball-URL deps,
             // hardens in 59.x.
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         });
     }
 
@@ -2351,6 +2357,7 @@ async fn pre_resolve_non_registry_deps(
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         });
     }
 
@@ -2450,6 +2457,7 @@ async fn pre_resolve_non_registry_deps(
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         });
     }
 
@@ -3196,6 +3204,7 @@ fn recurse_local_source_deps(
                     peers: Vec::new(),
                     integrity: None,
                     tarball_url: None,
+                    metadata_checked_for_tarball: false,
                 });
                 // Recurse into THIS dep's source at depth + 1.
                 recurse_local_source_deps(
@@ -7251,14 +7260,12 @@ async fn run_with_options_under_store_lock(
                 .iter()
                 .map(|(name, version)| format!("{name}@{version}"))
                 .collect();
-            let tarball_field_hint = if matches!(
-                p.source_kind(),
-                Ok(lpm_lockfile::Source::Registry { .. })
-            ) {
-                p.tarball_url.clone()
-            } else {
-                None
-            };
+            let tarball_field_hint =
+                if matches!(p.source_kind(), Ok(lpm_lockfile::Source::Registry { .. })) {
+                    p.tarball_url.clone()
+                } else {
+                    None
+                };
 
             lockfile.add_package(lpm_lockfile::LockedPackage {
                 name: p.name.clone(),
@@ -9222,6 +9229,7 @@ fn try_lockfile_fast_path(
                         }
                     }
                 }),
+                metadata_checked_for_tarball: false,
             }
         })
         .collect();
@@ -9448,6 +9456,7 @@ fn resolved_to_install_packages(
                 peers: r.peers.clone(),
                 integrity: r.integrity.clone(),
                 tarball_url: r.tarball_url.clone(),
+                metadata_checked_for_tarball: true,
             })
         })
         .collect()
@@ -10420,9 +10429,15 @@ async fn resolve_tarball_url(
     version: &str,
     is_lpm: bool,
     cached_url: Option<&str>,
+    metadata_checked_for_tarball: bool,
 ) -> Result<String, LpmError> {
     if let Some(url) = cached_url {
         return Ok(url.to_string());
+    }
+    if metadata_checked_for_tarball {
+        return Err(LpmError::NotFound(format!(
+            "no tarball URL for {name}@{version}"
+        )));
     }
     if is_lpm {
         let pkg =
@@ -10548,6 +10563,7 @@ async fn fetch_and_store_legacy(
         &p.version,
         p.is_lpm,
         p.tarball_url.as_deref(),
+        p.metadata_checked_for_tarball,
     )
     .await
     {
@@ -10579,21 +10595,28 @@ async fn fetch_and_store_legacy(
             // ONCE with a freshly-resolved URL.
             invalidate_metadata_routed(client, route_table, &p.name);
             let retry_lookup_start = std::time::Instant::now();
-            let fresh_url =
-                match resolve_tarball_url(client, route_table, &p.name, &p.version, p.is_lpm, None)
-                    .await
-                {
-                    Ok(u) => u,
-                    Err(_) => {
-                        gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                        return Err(handle_tarball_not_found(
-                            client,
-                            &p.name,
-                            &p.version,
-                            project_dir,
-                        ));
-                    }
-                };
+            let fresh_url = match resolve_tarball_url(
+                client,
+                route_table,
+                &p.name,
+                &p.version,
+                p.is_lpm,
+                None,
+                false,
+            )
+            .await
+            {
+                Ok(u) => u,
+                Err(_) => {
+                    gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                    return Err(handle_tarball_not_found(
+                        client,
+                        &p.name,
+                        &p.version,
+                        project_dir,
+                    ));
+                }
+            };
             url_lookup_ms += retry_lookup_start.elapsed().as_millis();
             if fresh_url == initial_url {
                 // Loop guard — metadata still points at the same
@@ -10852,6 +10875,7 @@ async fn fetch_and_store_streaming(
         &p.version,
         p.is_lpm,
         p.tarball_url.as_deref(),
+        p.metadata_checked_for_tarball,
     )
     .await
     {
@@ -10881,21 +10905,28 @@ async fn fetch_and_store_streaming(
             // (minus the streaming-specific response handling).
             invalidate_metadata_routed(client, route_table, &p.name);
             let retry_lookup_start = std::time::Instant::now();
-            let fresh_url =
-                match resolve_tarball_url(client, route_table, &p.name, &p.version, p.is_lpm, None)
-                    .await
-                {
-                    Ok(u) => u,
-                    Err(_) => {
-                        gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                        return Err(handle_tarball_not_found(
-                            client,
-                            &p.name,
-                            &p.version,
-                            project_dir,
-                        ));
-                    }
-                };
+            let fresh_url = match resolve_tarball_url(
+                client,
+                route_table,
+                &p.name,
+                &p.version,
+                p.is_lpm,
+                None,
+                false,
+            )
+            .await
+            {
+                Ok(u) => u,
+                Err(_) => {
+                    gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
+                    return Err(handle_tarball_not_found(
+                        client,
+                        &p.name,
+                        &p.version,
+                        project_dir,
+                    ));
+                }
+            };
             url_lookup_ms += retry_lookup_start.elapsed().as_millis();
             if fresh_url == initial_url {
                 gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
@@ -11875,7 +11906,8 @@ pub async fn run_install_filtered_add(
             let install_root = &member_install_roots[idx];
             let lockfile_path = &lockfile_paths[idx];
 
-            if let Err(e) = pin_staged_dist_tags_for_resolution(client, install_root, &staged).await {
+            if let Err(e) = pin_staged_dist_tags_for_resolution(client, install_root, &staged).await
+            {
                 last_err = Some(e);
                 break;
             }
@@ -14074,6 +14106,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         }
     }
 
@@ -16174,6 +16207,7 @@ mod tests {
             peers: Vec::new(),
             integrity: integrity.map(|s| s.to_string()),
             tarball_url: Some(url.to_string()),
+            metadata_checked_for_tarball: false,
         }
     }
 
@@ -17481,6 +17515,7 @@ mod tests {
                 peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
+                metadata_checked_for_tarball: false,
             };
             let wid = pkg.wrapper_id_for_source();
             match want_prefix {
@@ -17525,6 +17560,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         };
         let local = InstallPackage {
             name: "foo".to_string(),
@@ -17538,6 +17574,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         };
 
         let remote_wid = remote
@@ -17874,6 +17911,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         };
 
         let path = pkg
@@ -17906,6 +17944,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         };
 
         let err = pkg
@@ -18452,6 +18491,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         };
 
         let path = pkg
@@ -18811,6 +18851,7 @@ mod tests {
                 peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
+                metadata_checked_for_tarball: false,
             },
             InstallPackage {
                 name: "lodash".to_string(),
@@ -18824,6 +18865,7 @@ mod tests {
                 peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
+                metadata_checked_for_tarball: false,
             },
             InstallPackage {
                 name: "b".to_string(),
@@ -18837,6 +18879,7 @@ mod tests {
                 peers: Vec::new(),
                 integrity: None,
                 tarball_url: None,
+                metadata_checked_for_tarball: false,
             },
         ];
 
@@ -18899,6 +18942,7 @@ mod tests {
             peers: Vec::new(),
             integrity: None,
             tarball_url: None,
+            metadata_checked_for_tarball: false,
         }];
 
         let mut source_deps = HashMap::new();

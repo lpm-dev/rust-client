@@ -14,8 +14,8 @@
 
 mod support;
 
-use support::{TempProject, lpm};
 use std::fs;
+use support::{TempProject, lpm};
 
 // ─── dev: --help dispatches and exits cleanly ─────────────────────────
 

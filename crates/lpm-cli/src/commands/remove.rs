@@ -22,12 +22,13 @@ fn legacy_skill_short(package: &str) -> Option<String> {
 
 fn legacy_candidate_dir_hints(package: &str) -> Vec<String> {
     if let Ok(name) = lpm_common::PackageName::parse(package) {
-        return vec![name
-            .short()
-            .split('.')
-            .next_back()
-            .unwrap_or(package)
-            .to_string()];
+        return vec![
+            name.short()
+                .split('.')
+                .next_back()
+                .unwrap_or(package)
+                .to_string(),
+        ];
     }
 
     let mut hints = Vec::new();

@@ -6,8 +6,8 @@ use crate::upgrade_engine::PeerViolation;
 use crate::upgrade_engine::{self, PatchInvalidation, PeerImpact, SemverClass};
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
-use lpm_registry::RegistryClient;
 use lpm_registry::PackageMetadata;
+use lpm_registry::RegistryClient;
 use lpm_semver::Version;
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -538,14 +538,21 @@ pub async fn run(
             output::warn("install failed — restored original package.json");
         }
 
-        if let Err(restore_err) = restore_optional_file(&project_dir.join("lpm.lock"), &lockfile_backup)
+        if let Err(restore_err) =
+            restore_optional_file(&project_dir.join("lpm.lock"), &lockfile_backup)
         {
-            tracing::error!("failed to restore lpm.lock after install failure: {}", restore_err);
+            tracing::error!(
+                "failed to restore lpm.lock after install failure: {}",
+                restore_err
+            );
         }
         if let Err(restore_err) =
             restore_optional_file(&project_dir.join("lpm.lockb"), &lockfile_binary_backup)
         {
-            tracing::error!("failed to restore lpm.lockb after install failure: {}", restore_err);
+            tracing::error!(
+                "failed to restore lpm.lockb after install failure: {}",
+                restore_err
+            );
         }
         return Err(e);
     }
@@ -607,10 +614,9 @@ fn attach_skipped_private(json: &mut serde_json::Value, skipped_private: &[Strin
         return;
     }
 
-    json.as_object_mut().unwrap().insert(
-        "skipped_private".into(),
-        serde_json::json!(skipped_private),
-    );
+    json.as_object_mut()
+        .unwrap()
+        .insert("skipped_private".into(), serde_json::json!(skipped_private));
     json.as_object_mut().unwrap().insert(
         "skipped_private_reason".into(),
         serde_json::json!(

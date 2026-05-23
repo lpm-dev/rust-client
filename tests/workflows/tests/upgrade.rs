@@ -141,11 +141,19 @@ async fn upgrade_upgrades_npm_packages_with_public_npm_lock_source() {
         "ms",
         "2.5.0",
         &[
-            ("2.1.3", serde_json::json!({}), Some(make_tarball("ms", "2.1.3"))),
-            ("2.5.0", serde_json::json!({}), Some(make_tarball("ms", "2.5.0"))),
+            (
+                "2.1.3",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.1.3")),
+            ),
+            (
+                "2.5.0",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.5.0")),
+            ),
         ],
     )
-        .await;
+    .await;
 
     let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", "-y"])
@@ -199,8 +207,16 @@ async fn upgrade_skips_non_public_npm_sources_and_reports_them() {
         "ms",
         "2.5.0",
         &[
-            ("2.1.3", serde_json::json!({}), Some(make_tarball("ms", "2.1.3"))),
-            ("2.5.0", serde_json::json!({}), Some(make_tarball("ms", "2.5.0"))),
+            (
+                "2.1.3",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.1.3")),
+            ),
+            (
+                "2.5.0",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.5.0")),
+            ),
         ],
     )
     .await;
