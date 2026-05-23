@@ -33,6 +33,13 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+use security_framework::passwords::{
+    delete_generic_password as macos_delete_generic_password,
+    get_generic_password as macos_get_generic_password,
+    set_generic_password as macos_set_generic_password,
+};
+
 mod session;
 pub use session::{
     AuthRequirement, RefreshPolicy, SessionManager, TokenSource, compute_device_fingerprint,
@@ -43,6 +50,12 @@ const KEYCHAIN_SERVICE: &str = "lpm-cli";
 
 /// Keychain account prefix (matches JS CLI scoped format).
 const KEYCHAIN_ACCOUNT_PREFIX: &str = "auth-token";
+
+#[cfg(target_os = "macos")]
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+#[cfg(test)]
+const KEYCHAIN_SERVICE_TEST_ENV: &str = "LPM_AUTH_TEST_KEYCHAIN_SERVICE";
 
 fn force_file_auth() -> bool {
     // Release binaries always use the OS keychain — env contamination
@@ -931,26 +944,49 @@ fn scoped_account(registry_url: &str) -> String {
     format!("{}:{}", KEYCHAIN_ACCOUNT_PREFIX, hex::encode(&hash[..8]))
 }
 
+fn keychain_service() -> std::borrow::Cow<'static, str> {
+    #[cfg(test)]
+    {
+        if let Ok(service) = std::env::var(KEYCHAIN_SERVICE_TEST_ENV)
+            && !service.is_empty()
+        {
+            return std::borrow::Cow::Owned(service);
+        }
+    }
+
+    std::borrow::Cow::Borrowed(KEYCHAIN_SERVICE)
+}
+
 fn get_password_from_keychain_account(account: &str) -> Option<String> {
     if force_file_auth() {
         return None;
     }
 
-    tracing::debug!("keychain lookup: service={KEYCHAIN_SERVICE}, account={account}");
+    let service = keychain_service();
+    tracing::debug!(
+        "keychain lookup: service={}, account={account}",
+        service.as_ref()
+    );
 
-    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, account)
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(token) = get_password_from_macos_keychain_native(service.as_ref(), account) {
+            tracing::debug!("keychain hit via Security.framework");
+            return Some(token);
+        }
+
+        if let Some(token) = get_token_from_macos_keychain(service.as_ref(), account) {
+            tracing::debug!("keychain hit via security command fallback");
+            return Some(token);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(entry) = keyring::Entry::new(service.as_ref(), account)
         && let Ok(token) = entry.get_password()
     {
         tracing::debug!("keychain hit via keyring crate");
         return Some(token);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(token) = get_token_from_macos_keychain(KEYCHAIN_SERVICE, account) {
-            tracing::debug!("keychain hit via security command");
-            return Some(token);
-        }
     }
 
     tracing::debug!("keychain miss for {account}");
@@ -962,26 +998,16 @@ fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), St
         return Err("keychain disabled by LPM_FORCE_FILE_AUTH".to_string());
     }
 
+    let service = keychain_service();
+
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                account,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-
-        macos_security_add_generic_password(KEYCHAIN_SERVICE, account, token, &[])
+        set_password_in_macos_keychain(service.as_ref(), account, token)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, account)
+        let entry = keyring::Entry::new(service.as_ref(), account)
             .map_err(|e| format!("keychain error: {e}"))?;
         entry
             .set_password(token)
@@ -989,66 +1015,34 @@ fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), St
     }
 }
 
-/// Spawn `security add-generic-password` with the password piped via
-/// stdin rather than passed as `-w <value>` argv.
-///
-/// The argv form (`-w <password>`) leaves the secret visible in `ps`
-/// for the lifetime of the subprocess — every local user on the
-/// machine can sniff a `lpm login`. `security` prompts for the
-/// password twice (initial + retype confirmation); we feed it both
-/// times via stdin and let the CLI run to completion. The argv now
-/// contains only `add-generic-password [-A] -s <svc> -a <acct> -w`.
 #[cfg(target_os = "macos")]
-fn macos_security_add_generic_password(
-    service: &str,
-    account: &str,
-    password: &str,
-    extra_args: &[&str],
-) -> Result<(), String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let mut args: Vec<&str> = vec!["add-generic-password"];
-    args.extend_from_slice(extra_args);
-    args.extend(["-s", service, "-a", account, "-w"]);
-
-    let mut child = Command::new("security")
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("keychain spawn error: {e}"))?;
-
-    {
-        // `security` calls readpassphrase() twice (initial entry + retype
-        // verification). Feed the password on both lines and close stdin
-        // so the CLI proceeds to write the item.
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "keychain stdin not piped".to_string())?;
-        stdin
-            .write_all(password.as_bytes())
-            .and_then(|_| stdin.write_all(b"\n"))
-            .and_then(|_| stdin.write_all(password.as_bytes()))
-            .and_then(|_| stdin.write_all(b"\n"))
-            .map_err(|e| format!("keychain stdin write error: {e}"))?;
+fn get_password_from_macos_keychain_native(service: &str, account: &str) -> Option<String> {
+    match macos_get_generic_password(service, account) {
+        Ok(password) => String::from_utf8(password)
+            .ok()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty()),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => None,
+        Err(error) => {
+            tracing::debug!("Security.framework keychain lookup failed for {account}: {error}");
+            None
+        }
     }
-    drop(child.stdin.take());
+}
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("keychain wait error: {e}"))?;
-    if output.status.success() {
-        return Ok(());
+#[cfg(target_os = "macos")]
+fn set_password_in_macos_keychain(service: &str, account: &str, token: &str) -> Result<(), String> {
+    macos_set_generic_password(service, account, token.as_bytes())
+        .map_err(|error| format!("keychain write error: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn clear_password_from_macos_keychain(service: &str, account: &str) -> Result<(), String> {
+    match macos_delete_generic_password(service, account) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
+        Err(error) => Err(format!("keychain delete error: {error}")),
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!(
-        "security add-generic-password failed (exit {}): {}",
-        output.status.code().unwrap_or(-1),
-        stderr.trim()
-    ))
 }
 
 fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
@@ -1056,46 +1050,16 @@ fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    let service = keychain_service();
+
     #[cfg(target_os = "macos")]
     {
-        // Capture stderr so we can include it in error messages; previously
-        // every non-zero exit was reported as "keychain entry not found",
-        // conflating idempotent "already absent" with real failures
-        // (locked keychain, permission denied, framework error). The
-        // distinction matters because callers like `lpm logout` need to
-        // know whether the user's token was actually wiped.
-        let output = std::process::Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                KEYCHAIN_SERVICE,
-                "-a",
-                account,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|e| format!("keychain delete error: {e}"))?;
-
-        if output.status.success() {
-            return Ok(());
-        }
-        // Exit 44 = errSecItemNotFound. Already-absent is success for our
-        // idempotent delete semantics — don't surface to the caller.
-        if output.status.code() == Some(44) {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "security delete-generic-password failed (exit {}): {}",
-            output.status.code().unwrap_or(-1),
-            stderr.trim()
-        ))
+        clear_password_from_macos_keychain(service.as_ref(), account)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, account)
+        let entry = keyring::Entry::new(service.as_ref(), account)
             .map_err(|e| format!("keychain error: {e}"))?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
@@ -1110,9 +1074,11 @@ fn get_token_from_keychain(registry_url: &str) -> Option<String> {
     get_password_from_keychain_account(&account)
 }
 
-/// Read a password from macOS keychain using the `security` CLI tool.
-/// This is needed because the Rust `keyring` crate can't read entries
-/// written by Node.js `keytar` (different keychain API usage).
+/// Legacy macOS CLI fallback.
+///
+/// `security find-generic-password` can still read older entries that
+/// the direct API path may miss, notably auth items written by the JS
+/// client via Node's keytar integration.
 #[cfg(target_os = "macos")]
 fn get_token_from_macos_keychain(service: &str, account: &str) -> Option<String> {
     let output = std::process::Command::new("security")
@@ -1636,6 +1602,41 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn require_keychain_opt_in() {
+        if std::env::var("LPM_RUN_KEYCHAIN_TESTS").is_err() {
+            panic!(
+                "keychain integration test requires `LPM_RUN_KEYCHAIN_TESTS=1`. \
+                 Run via: `LPM_RUN_KEYCHAIN_TESTS=1 cargo test -p lpm-auth --lib tests::macos_auth_h4_write_round_trip -- --ignored --exact --test-threads=1`"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn with_test_keychain_service<T>(test: impl FnOnce(&str) -> T) -> T {
+        let service = format!("lpm-cli.test.{}", std::process::id());
+        let _env = super::test_env::ScopedEnv::update([(
+            super::KEYCHAIN_SERVICE_TEST_ENV,
+            Some(service.clone().into()),
+        )]);
+
+        let result = catch_unwind(AssertUnwindSafe(|| test(&service)));
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cleanup_keychain_item(service: &str, account: &str) {
+        let _ = std::process::Command::new("security")
+            .args(["delete-generic-password", "-s", service, "-a", account])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
     // `should_revalidate_when_marker_missing` and
     // `mark_and_check_token_validated` were retired alongside the
     // marker functions they exercised. Session health is now passive.
@@ -1651,6 +1652,37 @@ mod tests {
             a1, b,
             "different URLs should produce different account names"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "macOS keychain integration; opt-in only and serial execution required"]
+    fn macos_auth_h4_write_round_trip() {
+        require_keychain_opt_in();
+
+        with_test_keychain_service(|service| {
+            let registry = "https://registry.test.lpm.dev";
+            let access_account = scoped_account(registry);
+            let refresh_account = scoped_refresh_account(registry);
+
+            cleanup_keychain_item(service, &access_account);
+            cleanup_keychain_item(service, &refresh_account);
+
+            set_password_in_keychain_account(&access_account, "lpm_access_token").unwrap();
+            set_password_in_keychain_account(&refresh_account, "lpm_refresh_token").unwrap();
+
+            assert_eq!(
+                get_token_from_macos_keychain(service, &access_account).as_deref(),
+                Some("lpm_access_token")
+            );
+            assert_eq!(
+                get_token_from_macos_keychain(service, &refresh_account).as_deref(),
+                Some("lpm_refresh_token")
+            );
+
+            cleanup_keychain_item(service, &access_account);
+            cleanup_keychain_item(service, &refresh_account);
+        });
     }
 
     /// Write a `.npmrc` test fixture with 0o600 perms so the
