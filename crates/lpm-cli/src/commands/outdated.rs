@@ -1,8 +1,28 @@
+use crate::npm_public_source::lockfile_source_is_npm_public;
 use crate::output;
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
+use std::collections::BTreeSet;
 use std::path::Path;
+
+const OUTDATED_JSON_SCHEMA_VERSION: u32 = 2;
+
+struct DependencyEntry {
+    name: String,
+    range: String,
+    section: &'static str,
+}
+
+struct OutdatedResult {
+    name: String,
+    current: String,
+    wanted: Option<String>,
+    wanted_range: String,
+    latest: String,
+    section: &'static str,
+    outdated: bool,
+}
 
 /// Check for newer versions of installed dependencies.
 pub async fn run(
@@ -19,10 +39,26 @@ pub async fn run(
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
-    let deps = pkg.dependencies;
-    if deps.is_empty() {
+    let mut dep_entries = Vec::with_capacity(pkg.dependencies.len() + pkg.dev_dependencies.len());
+    for (name, range) in pkg.dependencies {
+        dep_entries.push(DependencyEntry {
+            name,
+            range,
+            section: "dependencies",
+        });
+    }
+    for (name, range) in pkg.dev_dependencies {
+        dep_entries.push(DependencyEntry {
+            name,
+            range,
+            section: "devDependencies",
+        });
+    }
+
+    if dep_entries.is_empty() {
         if json_output {
             let json = serde_json::json!({
+                "schema_version": OUTDATED_JSON_SCHEMA_VERSION,
                 "success": true,
                 "packages": [],
                 "count": 0,
@@ -42,15 +78,18 @@ pub async fn run(
         None
     };
 
-    let mut dep_entries: Vec<_> = deps.iter().collect();
-    dep_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    dep_entries.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.section.cmp(right.section))
+    });
 
     let mut results = Vec::new();
-    let mut skipped_private: Vec<String> = Vec::new();
+    let mut skipped_private: BTreeSet<String> = BTreeSet::new();
 
-    for (name, range) in dep_entries {
-        let metadata = if name.starts_with("@lpm.dev/") {
-            let pkg_name = match PackageName::parse(name) {
+    for dep in dep_entries {
+        let metadata = if dep.name.starts_with("@lpm.dev/") {
+            let pkg_name = match PackageName::parse(&dep.name) {
                 Ok(n) => n,
                 Err(_) => continue,
             };
@@ -69,11 +108,11 @@ pub async fn run(
             // leak the name. The operator should run `lpm install`
             // first so the source is recorded, then re-run
             // `lpm outdated --include-npm`.
-            if !lockfile_source_is_npm_public(lockfile.as_ref(), name) {
-                skipped_private.push(name.clone());
+            if !lockfile_source_is_npm_public(lockfile.as_ref(), &dep.name) {
+                skipped_private.insert(dep.name.clone());
                 continue;
             }
-            client.get_npm_package_metadata(name).await
+            client.get_npm_package_metadata(&dep.name).await
         } else {
             continue;
         };
@@ -84,31 +123,49 @@ pub async fn run(
                     .latest_version_tag()
                     .unwrap_or("unknown")
                     .to_string();
+                let wanted = metadata.resolve_version_spec(&dep.range).ok();
 
                 let installed = lockfile
                     .as_ref()
-                    .and_then(|lf| lf.find_package(name).map(|p| p.version.clone()));
+                    .and_then(|lf| lf.find_package(&dep.name).map(|p| p.version.clone()));
 
                 let installed_str = installed.as_deref().unwrap_or("?");
                 let is_outdated = installed.as_deref() != Some(latest.as_str());
 
-                results.push(serde_json::json!({
-                    "name": name,
-                    "current": installed_str,
-                    "wanted": range,
-                    "latest": latest,
-                    "outdated": is_outdated,
-                }));
+                results.push(OutdatedResult {
+                    name: dep.name,
+                    current: installed_str.to_string(),
+                    wanted,
+                    wanted_range: dep.range,
+                    latest,
+                    section: dep.section,
+                    outdated: is_outdated,
+                });
             }
             Err(_) => continue,
         }
     }
 
     if json_output {
-        let outdated_count = results.iter().filter(|r| r["outdated"] == true).count();
+        let outdated_count = results.iter().filter(|result| result.outdated).count();
+        let package_json: Vec<_> = results
+            .iter()
+            .map(|result| {
+                serde_json::json!({
+                    "name": result.name,
+                    "current": result.current,
+                    "wanted": result.wanted,
+                    "wanted_range": result.wanted_range,
+                    "latest": result.latest,
+                    "section": result.section,
+                    "outdated": result.outdated,
+                })
+            })
+            .collect();
         let mut json = serde_json::json!({
+            "schema_version": OUTDATED_JSON_SCHEMA_VERSION,
             "success": true,
-            "packages": results,
+            "packages": package_json,
             "count": results.len(),
             "outdated_count": outdated_count,
         });
@@ -125,38 +182,43 @@ pub async fn run(
         }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        let outdated: Vec<_> = results.iter().filter(|r| r["outdated"] == true).collect();
+        let outdated: Vec<_> = results.iter().filter(|result| result.outdated).collect();
         if outdated.is_empty() {
             let message = if include_npm {
-                "All checked package.json dependencies are up to date"
+                "All checked package.json dependency entries are up to date"
             } else {
-                "All checked LPM dependencies are up to date"
+                "All checked LPM dependency entries are up to date"
             };
             output::success(message);
         } else {
             println!();
             println!(
-                "  {:<40} {:<12} {:<12}",
+                "  {:<18} {:<34} {:<12} {:<12} {}",
+                "Section".bold(),
                 "Package".bold(),
                 "Current".bold(),
+                "Wanted".bold(),
                 "Latest".bold()
             );
-            for r in &outdated {
+            for result in &outdated {
                 println!(
-                    "  {:<40} {:<12} {}",
-                    r["name"].as_str().unwrap_or(""),
-                    r["current"].as_str().unwrap_or("?").dimmed(),
-                    r["latest"].as_str().unwrap_or("?").green(),
+                    "  {:<18} {:<34} {:<12} {:<12} {}",
+                    result.section.dimmed(),
+                    result.name,
+                    result.current.dimmed(),
+                    result.wanted.as_deref().unwrap_or("?").yellow(),
+                    result.latest.green(),
                 );
             }
             println!();
             output::info(&format!("{} package(s) can be updated", outdated.len()));
         }
         if !skipped_private.is_empty() {
+            let skipped_private_list = skipped_private.iter().cloned().collect::<Vec<_>>();
             output::warn(&format!(
                 "skipped {} package(s) without a recorded npm-public source to avoid leaking private names to registry.npmjs.org: {}",
                 skipped_private.len(),
-                skipped_private.join(", "),
+                skipped_private_list.join(", "),
             ));
             output::info("run `lpm install` first to record sources in lpm.lock, then re-run.");
         }
@@ -164,65 +226,4 @@ pub async fn run(
     }
 
     Ok(())
-}
-
-/// M15: returns `true` only when the lockfile entry for `name` exists
-/// AND records a `registry+https://registry.npmjs.org` (or
-/// `registry+https://registry.npmjs.com`) source. Used by the
-/// `--include-npm` gate to refuse leaking private package names to
-/// the public npm registry.
-///
-/// Private mirrors (Verdaccio, GitHub Packages, self-hosted Nexus,
-/// etc.) explicitly do NOT count as "npm-public" here — those mirrors
-/// host private code, so a name resolved against them shouldn't be
-/// re-queried against the public npm. Only the actual public npm
-/// origins pass this gate.
-fn lockfile_source_is_npm_public(lockfile: Option<&lpm_lockfile::Lockfile>, name: &str) -> bool {
-    let Some(lf) = lockfile else {
-        return false;
-    };
-    let Some(pkg) = lf.find_package(name) else {
-        return false;
-    };
-    match pkg.source_kind() {
-        Some(Ok(lpm_lockfile::Source::Registry { url })) => is_public_npm_origin(&url),
-        _ => false,
-    }
-}
-
-fn is_public_npm_origin(url: &str) -> bool {
-    let lower = url.trim_end_matches('/').to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "https://registry.npmjs.org" | "https://registry.npmjs.com"
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// M15: every shape that resolves to the canonical public npm
-    /// origin (with or without trailing slash, with the `.com` alias)
-    /// passes the gate.
-    #[test]
-    fn public_npm_origin_recognises_canonical_shapes() {
-        assert!(is_public_npm_origin("https://registry.npmjs.org"));
-        assert!(is_public_npm_origin("https://registry.npmjs.org/"));
-        assert!(is_public_npm_origin("https://registry.npmjs.com"));
-        assert!(is_public_npm_origin("https://REGISTRY.NPMJS.ORG"));
-    }
-
-    /// M15: every other origin — private mirrors, GitHub Packages,
-    /// self-hosted — is treated as "not public npm" so the
-    /// `--include-npm` gate refuses to send the package name to the
-    /// public registry.
-    #[test]
-    fn public_npm_origin_rejects_private_mirrors() {
-        assert!(!is_public_npm_origin("https://npm.internal.example.com"));
-        assert!(!is_public_npm_origin("https://npm.pkg.github.com"));
-        assert!(!is_public_npm_origin("https://verdaccio.local"));
-        assert!(!is_public_npm_origin("http://localhost:4873"));
-        assert!(!is_public_npm_origin(""));
-    }
 }

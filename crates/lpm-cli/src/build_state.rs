@@ -480,6 +480,35 @@ pub fn compute_blocked_packages_with_metadata(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> Vec<BlockedPackage> {
+    compute_blocked_packages_with_metadata_and_baseline(
+        store,
+        installed,
+        policy,
+        metadata,
+        requested_capabilities,
+        user_bound,
+        BlockedPackageComputationExtras {
+            advisor_approvals,
+            baseline_index: None,
+        },
+    )
+}
+
+struct BlockedPackageComputationExtras<'a> {
+    advisor_approvals:
+        Option<&'a std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>>,
+    baseline_index: Option<&'a lpm_store::V2BaselineIndex>,
+}
+
+fn compute_blocked_packages_with_metadata_and_baseline(
+    store: &PackageStore,
+    installed: &[(String, String, Option<String>)],
+    policy: &SecurityPolicy,
+    metadata: &BlockedSetMetadata,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    extras: BlockedPackageComputationExtras<'_>,
+) -> Vec<BlockedPackage> {
     use rayon::prelude::*;
 
     // Parallelize the per-package walk via rayon. Each iteration is
@@ -511,7 +540,7 @@ pub fn compute_blocked_packages_with_metadata(
             // classification) so an iter+match-on-three-fields is
             // unambiguous. A future per-phase classification refactor
             // would tighten this to a full 4-tuple lookup.
-            if let Some(set) = advisor_approvals
+            if let Some(set) = extras.advisor_approvals
                 && set
                     .iter()
                     .any(|(n, v, i, _)| n == name && v == version && i == integrity)
@@ -519,7 +548,7 @@ pub fn compute_blocked_packages_with_metadata(
                 return None;
             }
 
-            let pkg_dir = store.package_dir(name, version);
+            let pkg_dir = resolve_blocked_package_dir(store, name, version, extras.baseline_index);
 
             // Compute the script hash. None means "no install-phase scripts" —
             // such a package is not blockable, skip.
@@ -682,6 +711,20 @@ pub fn compute_blocked_packages_with_metadata(
     blocked
 }
 
+fn resolve_blocked_package_dir(
+    store: &PackageStore,
+    name: &str,
+    version: &str,
+    baseline_index: Option<&lpm_store::V2BaselineIndex>,
+) -> PathBuf {
+    baseline_index
+        .and_then(|index| index.lookup(name, version))
+        .map_or_else(
+            || store.package_dir(name, version),
+            |baseline| baseline.package_dir.clone(),
+        )
+}
+
 /// The end-to-end install hook: compute → compare to previous → write →
 /// return whether to emit a banner.
 ///
@@ -752,14 +795,26 @@ pub fn capture_blocked_set_after_install_with_metadata(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> Result<BlockedSetCapture, LpmError> {
-    let blocked = compute_blocked_packages_with_metadata(
+    let baseline_index = if lpm_store::StoreVersion::from_env() == lpm_store::StoreVersion::V2 {
+        Some(lpm_store::V2BaselineIndex::for_project(
+            project_dir,
+            &store.lpm_root()?,
+        )?)
+    } else {
+        None
+    };
+
+    let blocked = compute_blocked_packages_with_metadata_and_baseline(
         store,
         installed,
         policy,
         metadata,
         requested_capabilities,
         user_bound,
-        advisor_approvals,
+        BlockedPackageComputationExtras {
+            advisor_approvals,
+            baseline_index: baseline_index.as_ref(),
+        },
     );
     let fingerprint = compute_blocked_set_fingerprint(&blocked);
 

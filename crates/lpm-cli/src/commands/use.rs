@@ -120,53 +120,30 @@ pub async fn run(
                 )));
             }
 
-            // Validate pin version before writing
-            if !is_valid_pin_version(&version_spec) {
-                return Err(LpmError::Script(format!(
-                    "invalid pin version '{version_spec}'. Version must only contain alphanumeric characters, dots, hyphens, or underscores"
-                )));
-            }
+            lpm_runtime::node::validate_version_spec(&version_spec)?;
+
+            let pinned_version = resolve_pinned_node_version(&version_spec);
 
             // Warn if the version is not currently installed
-            if !json_output && !lpm_runtime::node::is_installed(&version_spec) {
+            if !json_output && !lpm_runtime::node::is_installed(&pinned_version) {
                 output::warn(&format!(
                     "node@{} is not currently installed. Run `lpm use node@{}` to install it",
                     version_spec, version_spec
                 ));
             }
 
-            // Write to lpm.json
-            let lpm_json_path = project_dir.join("lpm.json");
-            let mut config: serde_json::Value = if lpm_json_path.exists() {
-                let content = std::fs::read_to_string(&lpm_json_path)?;
-                serde_json::from_str(&content)
-                    .map_err(|e| LpmError::Script(format!("failed to parse lpm.json: {e}")))?
-            } else {
-                serde_json::json!({})
-            };
-
-            // Ensure runtime section exists
-            if config.get("runtime").is_none() {
-                config["runtime"] = serde_json::json!({});
-            }
-            config["runtime"]["node"] = serde_json::Value::String(version_spec.clone());
-
-            let content = serde_json::to_string_pretty(&config)
-                .map_err(|e| LpmError::Script(format!("failed to serialize lpm.json: {e}")))?
-                + "\n";
-
-            // Atomic write: write to temp file, then rename
-            let tmp_path = lpm_json_path.with_extension("json.tmp");
-            std::fs::write(&tmp_path, &content)?;
-            std::fs::rename(&tmp_path, &lpm_json_path)?;
+            write_node_pin(project_dir, &pinned_version)?;
 
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"success": true, "pinned": {"node": version_spec}})
+                    serde_json::json!({"success": true, "pinned": {"node": pinned_version}})
                 );
             } else {
-                output::success(&format!("Pinned node@{} in lpm.json", version_spec.bold()));
+                output::success(&format!(
+                    "Pinned node@{} in lpm.json",
+                    pinned_version.bold()
+                ));
             }
         }
 
@@ -189,13 +166,48 @@ fn parse_runtime_spec(spec: &str) -> (String, String) {
     }
 }
 
+fn select_pinned_node_version(version_spec: &str, installed: &[String]) -> String {
+    lpm_runtime::node::find_matching_installed(version_spec, installed)
+        .unwrap_or_else(|| version_spec.to_string())
+}
+
+fn resolve_pinned_node_version(version_spec: &str) -> String {
+    lpm_runtime::node::list_installed().ok().map_or_else(
+        || version_spec.to_string(),
+        |installed| select_pinned_node_version(version_spec, &installed),
+    )
+}
+
+fn write_node_pin(project_dir: &std::path::Path, node_version: &str) -> Result<(), LpmError> {
+    let lpm_json_path = project_dir.join("lpm.json");
+    let mut config: serde_json::Value = if lpm_json_path.exists() {
+        let content = std::fs::read_to_string(&lpm_json_path)?;
+        serde_json::from_str(&content)
+            .map_err(|e| LpmError::Script(format!("failed to parse lpm.json: {e}")))?
+    } else {
+        serde_json::json!({})
+    };
+
+    if config.get("runtime").is_none() {
+        config["runtime"] = serde_json::json!({});
+    }
+    config["runtime"]["node"] = serde_json::Value::String(node_version.to_string());
+
+    let content = serde_json::to_string_pretty(&config)
+        .map_err(|e| LpmError::Script(format!("failed to serialize lpm.json: {e}")))?
+        + "\n";
+
+    let tmp_path = lpm_json_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &content)?;
+    std::fs::rename(&tmp_path, &lpm_json_path)?;
+    Ok(())
+}
+
 /// Validate a pin version string.
-/// Must be non-empty and only contain alphanumeric characters, dots, hyphens, or underscores.
-/// This prevents path traversal and shell injection in lpm.json.
+/// Must satisfy the runtime layer's safe version-spec grammar.
+#[cfg(test)]
 fn is_valid_pin_version(v: &str) -> bool {
-    !v.is_empty()
-        && v.chars()
-            .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+    lpm_runtime::node::validate_version_spec(v).is_ok()
 }
 
 #[cfg(test)]
@@ -210,6 +222,8 @@ mod tests {
         assert!(is_valid_pin_version("latest"));
         assert!(is_valid_pin_version("22.0.0-rc.1"));
         assert!(is_valid_pin_version("v20_lts"));
+        assert!(is_valid_pin_version("^20"));
+        assert!(is_valid_pin_version(">=20.0.0 <22.0.0"));
     }
 
     #[test]
@@ -220,6 +234,28 @@ mod tests {
         assert!(!is_valid_pin_version("path/to/node"));
         assert!(!is_valid_pin_version("22\n23"));
         assert!(!is_valid_pin_version("node@22")); // @ is not allowed
+    }
+
+    #[test]
+    fn pin_prefers_highest_matching_installed_version() {
+        let installed = vec![
+            "22.12.0".to_string(),
+            "22.8.0".to_string(),
+            "20.18.0".to_string(),
+        ];
+
+        assert_eq!(select_pinned_node_version("22", &installed), "22.12.0");
+        assert_eq!(
+            select_pinned_node_version(">=20.0.0 <22.0.0", &installed),
+            "20.18.0"
+        );
+    }
+
+    #[test]
+    fn pin_keeps_alias_when_it_cannot_resolve_locally() {
+        let installed = vec!["22.12.0".to_string()];
+
+        assert_eq!(select_pinned_node_version("lts", &installed), "lts");
     }
 
     #[test]

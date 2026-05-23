@@ -1505,11 +1505,10 @@ pub async fn exec(
     file_path: &str,
     extra_args: &[String],
 ) -> Result<(), LpmError> {
-    // We capture the hint to keep the call shape consistent and to record the
-    // user-visible runtime notice, but `lpm_runner::exec::exec_file` does its
-    // own runtime probe (different shape — it needs the major/minor version
-    // string for tsx vs --experimental-strip-types decisions, not just bin_dir).
-    // Threading exec.rs is queued as a follow-up.
+    // `ensure_runtime` is still responsible for the user-visible runtime
+    // notice and auto-install path, but `exec_file` re-probes the effective
+    // PATH so it can choose between native TS, `--experimental-strip-types`,
+    // local `tsx`, and `npx tsx` using the actual `node` binary that will run.
     let _ = ensure_runtime(project_dir).await;
     output::info(&format!("exec {}", file_path.bold()));
     lpm_runner::exec::exec_file(project_dir, file_path, extra_args)

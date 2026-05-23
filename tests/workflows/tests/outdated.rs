@@ -117,8 +117,28 @@ async fn outdated_reports_non_lpm_packages_by_default() {
     );
 
     let mock = MockRegistry::start().await;
-    mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9"))
-        .await;
+    mock.with_full_package_metadata(
+        "ms",
+        "9.9.9",
+        &[
+            (
+                "2.1.3",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.1.3")),
+            ),
+            (
+                "2.9.9",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.9.9")),
+            ),
+            (
+                "9.9.9",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "9.9.9")),
+            ),
+        ],
+    )
+    .await;
 
     let out = lpm_with_registry(&project, &mock.url())
         .args(["outdated", "--json"])
@@ -131,6 +151,7 @@ async fn outdated_reports_non_lpm_packages_by_default() {
 
     let envelope: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["schema_version"], serde_json::json!(2));
     assert_eq!(
         envelope["count"],
         serde_json::json!(1),
@@ -141,8 +162,69 @@ async fn outdated_reports_non_lpm_packages_by_default() {
     let entry = &envelope["packages"][0];
     assert_eq!(entry["name"], serde_json::json!("ms"));
     assert_eq!(entry["current"], serde_json::json!("2.1.3"));
-    assert_eq!(entry["wanted"], serde_json::json!("^2.1.3"));
+    assert_eq!(entry["wanted"], serde_json::json!("2.9.9"));
     assert_eq!(entry["latest"], serde_json::json!("9.9.9"));
+    assert_eq!(entry["section"], serde_json::json!("dependencies"));
+    assert_eq!(entry["outdated"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn outdated_includes_dev_dependencies_by_default() {
+    let project = TempProject::empty(
+        r#"{"name":"dev-only","version":"1.0.0","devDependencies":{"vite":"^5.0.0"}}"#,
+    );
+    write_minimal_lockfile_with_source(
+        &project,
+        "vite",
+        "5.0.0",
+        "registry+https://registry.npmjs.org/",
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "vite",
+        "6.0.0",
+        &[
+            (
+                "5.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("vite", "5.0.0")),
+            ),
+            (
+                "5.9.1",
+                serde_json::json!({}),
+                Some(make_tarball("vite", "5.9.1")),
+            ),
+            (
+                "6.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("vite", "6.0.0")),
+            ),
+        ],
+    )
+    .await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn lpm outdated --json");
+    assert!(
+        out.status.success(),
+        "outdated should exit 0 for a devDependencies-only project"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["schema_version"], serde_json::json!(2));
+    assert_eq!(envelope["count"], serde_json::json!(1));
+    assert_eq!(envelope["outdated_count"], serde_json::json!(1));
+
+    let entry = &envelope["packages"][0];
+    assert_eq!(entry["name"], serde_json::json!("vite"));
+    assert_eq!(entry["current"], serde_json::json!("5.0.0"));
+    assert_eq!(entry["wanted"], serde_json::json!("5.9.1"));
+    assert_eq!(entry["latest"], serde_json::json!("6.0.0"));
+    assert_eq!(entry["section"], serde_json::json!("devDependencies"));
     assert_eq!(entry["outdated"], serde_json::json!(true));
 }
 
@@ -225,7 +307,28 @@ async fn outdated_reports_newer_version_for_outdated_lpm_dep() {
     write_minimal_lockfile(&project, pkg, "1.0.0");
 
     let mock = MockRegistry::start().await;
-    mount_lpm_package_latest(&mock, pkg, "2.5.0").await;
+    mock.with_full_package_metadata(
+        pkg,
+        "2.5.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "1.0.0")),
+            ),
+            (
+                "1.8.9",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "1.8.9")),
+            ),
+            (
+                "2.5.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "2.5.0")),
+            ),
+        ],
+    )
+    .await;
 
     let out = lpm_with_registry(&project, &mock.url())
         .args(["outdated", "--json"])
@@ -238,14 +341,16 @@ async fn outdated_reports_newer_version_for_outdated_lpm_dep() {
 
     let envelope: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["schema_version"], serde_json::json!(2));
     assert_eq!(envelope["count"], serde_json::json!(1));
     assert_eq!(envelope["outdated_count"], serde_json::json!(1));
 
     let entry = &envelope["packages"][0];
     assert_eq!(entry["name"], serde_json::json!(pkg));
     assert_eq!(entry["current"], serde_json::json!("1.0.0"));
-    assert_eq!(entry["wanted"], serde_json::json!("^1.0.0"));
+    assert_eq!(entry["wanted"], serde_json::json!("1.8.9"));
     assert_eq!(entry["latest"], serde_json::json!("2.5.0"));
+    assert_eq!(entry["section"], serde_json::json!("dependencies"));
     assert_eq!(entry["outdated"], serde_json::json!(true));
 }
 
@@ -292,7 +397,28 @@ async fn outdated_json_envelope_with_one_outdated_pkg_matches_snapshot() {
     write_minimal_lockfile(&project, pkg, "1.0.0");
 
     let mock = MockRegistry::start().await;
-    mount_lpm_package_latest(&mock, pkg, "2.0.0").await;
+    mock.with_full_package_metadata(
+        pkg,
+        "2.0.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "1.0.0")),
+            ),
+            (
+                "1.6.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "1.6.0")),
+            ),
+            (
+                "2.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "2.0.0")),
+            ),
+        ],
+    )
+    .await;
 
     let out = lpm_with_registry(&project, &mock.url())
         .args(["outdated", "--json"])

@@ -11,6 +11,18 @@ mod support;
 
 use support::{TempProject, lpm};
 
+fn seed_installed_node(project: &TempProject, version: &str) {
+    let bin_dir = project
+        .home()
+        .join(".lpm")
+        .join("runtimes")
+        .join("node")
+        .join(version)
+        .join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("failed to create runtime bin dir");
+    std::fs::write(bin_dir.join("node"), "").expect("failed to seed node binary");
+}
+
 #[test]
 fn use_list_on_empty_runtime_succeeds_with_empty_set() {
     let project = TempProject::empty(r#"{"name":"use-list","version":"1.0.0"}"#);
@@ -153,6 +165,27 @@ fn use_pin_without_spec_under_json_emits_error_envelope_on_stdout() {
             .is_some_and(|s| s.contains("missing version") || s.contains("Usage")),
         "error must reference the missing-version condition, got: {envelope}",
     );
+}
+
+#[test]
+fn use_pin_major_spec_writes_matching_installed_exact_version() {
+    let project = TempProject::empty(r#"{"name":"use-pin","version":"1.0.0"}"#);
+    seed_installed_node(&project, "22.12.0");
+
+    let output = lpm(&project)
+        .args(["use", "node@22", "--pin"])
+        .output()
+        .expect("failed to run lpm use node@22 --pin");
+
+    assert!(
+        output.status.success(),
+        "lpm use node@22 --pin must succeed when a matching version is already installed\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let lpm_json: serde_json::Value = serde_json::from_str(&project.read_file("lpm.json"))
+        .expect("lpm use --pin must write valid lpm.json");
+    assert_eq!(lpm_json["runtime"]["node"], serde_json::json!("22.12.0"));
 }
 
 #[test]

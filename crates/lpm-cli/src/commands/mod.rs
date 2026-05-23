@@ -40,6 +40,7 @@ pub mod publish_npm;
 pub mod quality;
 pub mod query;
 pub mod rebuild;
+pub mod registry_reads;
 pub mod remove;
 pub mod resolve;
 pub mod run;

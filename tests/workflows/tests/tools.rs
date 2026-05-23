@@ -1,14 +1,108 @@
 //! Workflow tests for `lpm lint` / `lpm fmt` / `lpm check` workspace mode.
 //!
-//! These tests exercise the orchestrator's selection, JSON envelope, and
-//! failure-mode contracts WITHOUT requiring oxlint / biome / tsc to actually
-//! execute — every test runs against the empty-set or spawn-failure paths
-//! so they're fast and network-free in CI.
+//! These tests primarily exercise the orchestrator's selection, JSON
+//! envelope, and failure-mode contracts without requiring real tool
+//! downloads. Happy-path coverage uses seeded local stand-ins: a cached
+//! fake Biome binary for `fmt`, a fake root `tsc` for `check`, and one
+//! optional real-network `lint` path gated behind `LPM_E2E_NETWORK=1`.
 
 mod support;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use support::assertions::parse_json_output;
 use support::{TempProject, lpm};
+
+#[cfg(unix)]
+const WORKSPACE_MEMBERS: [&str; 3] = ["packages/utils", "packages/core", "packages/app"];
+
+#[cfg(unix)]
+fn current_plugin_platform() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", "x86_64") => "darwin-x64",
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("windows", "x86_64") => "win-x64",
+        other => panic!("unsupported plugin test platform: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(unix)]
+fn write_unix_executable(path: &std::path::Path, script: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("failed to create executable parent dir");
+    }
+    std::fs::write(path, script).expect("failed to write executable script");
+    let mut perms = std::fs::metadata(path)
+        .expect("failed to stat executable script")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).expect("failed to chmod executable script");
+}
+
+#[cfg(unix)]
+fn seed_workspace_tool_pin(project: &TempProject, tool: &str, version: &str) {
+    let body = format!(r#"{{"tools":{{"{tool}":"{version}"}}}}"#);
+    project.write_file("lpm.json", &body);
+    for member in WORKSPACE_MEMBERS {
+        project.write_file(&format!("{member}/lpm.json"), &body);
+    }
+}
+
+#[cfg(unix)]
+fn seed_fake_plugin(project: &TempProject, plugin: &str, version: &str, marker_file: &str) {
+    let platform = current_plugin_platform();
+    let plugin_dir = project
+        .home()
+        .join(".lpm")
+        .join("plugins")
+        .join(plugin)
+        .join(version)
+        .join(platform);
+    let bin_path = plugin_dir.join(plugin);
+    let sidecar_path = plugin_dir.join(".lpm-plugin.json");
+    let script = format!("#!/bin/sh\n: > {marker_file}\n");
+
+    write_unix_executable(&bin_path, &script);
+
+    let hash = sha256_hex(&std::fs::read(&bin_path).expect("failed to read fake plugin binary"));
+    let sidecar = serde_json::json!({
+        "schema_version": 1,
+        "plugin_name": plugin,
+        "version": version,
+        "platform": platform,
+        "asset_name": plugin,
+        "asset_url": format!("https://example.invalid/{plugin}"),
+        "asset_sha256": hash,
+        "binary_sha256": hash,
+        "verification_source": "bundled",
+        "verified_at_unix": 0,
+    });
+    std::fs::create_dir_all(&plugin_dir).expect("failed to create fake plugin dir");
+    std::fs::write(
+        &sidecar_path,
+        serde_json::to_vec_pretty(&sidecar).expect("failed to serialize fake sidecar"),
+    )
+    .expect("failed to write fake plugin sidecar");
+}
+
+#[cfg(unix)]
+fn seed_fake_root_tsc(project: &TempProject, marker_file: &str) {
+    let script = format!("#!/bin/sh\n: > {marker_file}\n");
+    let bin_path = project.path().join("node_modules").join(".bin").join("tsc");
+    write_unix_executable(&bin_path, &script);
+}
 
 // ─── empty-match contract ───────────────────────────────────────
 
@@ -345,6 +439,123 @@ fn lint_all_happy_path_e2e_network_gated() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn fmt_all_happy_path_with_seeded_plugin_cache() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_tool_pin(&project, "biome", "1.0.0");
+    seed_fake_plugin(&project, "biome", "1.0.0", ".fmt-ok");
+
+    let output = lpm(&project)
+        .args(["--json", "fmt", "--all", "--check"])
+        .output()
+        .expect("failed to run lpm fmt --all --check --json");
+
+    assert!(
+        output.status.success(),
+        "happy-path fmt must exit 0, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_else(|e| {
+        panic!("happy-path workspace fmt must emit a single valid JSON envelope. Parse error: {e}\nRaw stdout:\n{raw}\nstderr:\n{}", String::from_utf8_lossy(&output.stderr))
+    });
+
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["packages"], serde_json::json!(3));
+    assert_eq!(json["succeeded"], serde_json::json!(3));
+    assert_eq!(json["failed"], serde_json::json!(0));
+
+    let members = json["members"]
+        .as_array()
+        .expect("members must be an array");
+    assert_eq!(members.len(), 3, "envelope must list all 3 members");
+
+    for member in members {
+        assert_eq!(member["success"], serde_json::json!(true));
+        assert_eq!(member["exit_code"], serde_json::json!(0));
+        assert!(
+            member.get("stdout").is_none(),
+            "success member must not include stdout, got: {member}"
+        );
+        assert!(
+            member.get("stderr").is_none(),
+            "success member must not include stderr, got: {member}"
+        );
+        assert!(
+            member.get("error").is_none(),
+            "success member must not include error, got: {member}"
+        );
+    }
+
+    for member in WORKSPACE_MEMBERS {
+        assert!(
+            project.file_exists(&format!("{member}/.fmt-ok")),
+            "fmt stand-in must execute inside {member}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_all_happy_path_with_seeded_root_tsc() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_fake_root_tsc(&project, ".check-ok");
+
+    let output = lpm(&project)
+        .args(["--json", "check", "--all"])
+        .output()
+        .expect("failed to run lpm check --all --json");
+
+    assert!(
+        output.status.success(),
+        "happy-path check must exit 0, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_else(|e| {
+        panic!("happy-path workspace check must emit a single valid JSON envelope. Parse error: {e}\nRaw stdout:\n{raw}\nstderr:\n{}", String::from_utf8_lossy(&output.stderr))
+    });
+
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["packages"], serde_json::json!(3));
+    assert_eq!(json["succeeded"], serde_json::json!(3));
+    assert_eq!(json["failed"], serde_json::json!(0));
+
+    let members = json["members"]
+        .as_array()
+        .expect("members must be an array");
+    assert_eq!(members.len(), 3, "envelope must list all 3 members");
+
+    for member in members {
+        assert_eq!(member["success"], serde_json::json!(true));
+        assert_eq!(member["exit_code"], serde_json::json!(0));
+        assert!(
+            member.get("stdout").is_none(),
+            "success member must not include stdout, got: {member}"
+        );
+        assert!(
+            member.get("stderr").is_none(),
+            "success member must not include stderr, got: {member}"
+        );
+        assert!(
+            member.get("error").is_none(),
+            "success member must not include error, got: {member}"
+        );
+    }
+
+    for member in WORKSPACE_MEMBERS {
+        assert!(
+            project.file_exists(&format!("{member}/.check-ok")),
+            "check stand-in must execute inside {member}"
+        );
+    }
+}
+
 // Parser-level coverage for `--filter` / `--fail-if-no-match` lives in
 // `crates/lpm-cli/src/commands/tools.rs::tests` (lint_filter_parses_with_grammar,
 // fmt_filter_and_check_compose, check_filter_parses). The compat contract that
@@ -557,6 +768,50 @@ fn bench_filter_one_member_with_watch_hands_off_to_single_package() {
 }
 
 #[test]
+fn bench_filter_one_member_with_watch_executes_member_bench_script() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    project.write_file(
+        "packages/utils/package.json",
+        r#"{
+  "name": "@test/utils",
+  "version": "1.0.0",
+  "scripts": {
+    "bench": "echo bench-args:"
+  },
+  "dependencies": {
+    "ms": "2.1.3"
+  }
+}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["bench", "--filter", "@test/utils", "--watch"])
+        .output()
+        .expect("failed to run lpm bench --filter @test/utils --watch");
+
+    assert!(
+        output.status.success(),
+        "bench script should run successfully after one-member watch handoff\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("bench-args: '--watch'") || combined.contains("bench-args: --watch"),
+        "bench runner must receive the forwarded --watch arg after handoff, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("would start one watcher per member"),
+        "successful one-member handoff must not trigger the workspace-watch reject, got:\n{combined}"
+    );
+}
+
+#[test]
 fn test_zero_member_watch_rejects_with_nothing_to_watch() {
     // A filter that resolves to zero members + --watch is degenerate. Distinct
     // from the multi-member reject (different message).
@@ -624,6 +879,48 @@ fn test_workspace_json_emits_valid_envelope_per_member() {
     }
 }
 
+#[test]
+fn bench_workspace_json_emits_valid_envelope_per_member() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    let output = lpm(&project)
+        .args(["--json", "bench", "--all"])
+        .output()
+        .expect("failed to run lpm bench --all --json");
+
+    assert!(!output.status.success());
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or_else(|e| {
+        panic!("workspace --json must emit a single valid JSON document. Parse error: {e}\nRaw stdout:\n{raw}")
+    });
+
+    assert_eq!(json["success"], serde_json::json!(false));
+    assert_eq!(json["packages"], serde_json::json!(3));
+    assert_eq!(json["failed"], serde_json::json!(3));
+
+    let members = json["members"]
+        .as_array()
+        .expect("members must be an array");
+    assert_eq!(members.len(), 3);
+
+    for member in members {
+        assert_eq!(member["success"], serde_json::json!(false));
+        assert_eq!(
+            member["exit_code"],
+            serde_json::Value::Null,
+            "detect_bench_runner failure must surface as exit_code: null"
+        );
+        let err = member["error"]
+            .as_str()
+            .expect("error must be populated for detection failure");
+        assert!(
+            err.contains("no benchmark runner found"),
+            "error must reference the missing-runner cause, got: {err}"
+        );
+    }
+}
+
 // ─── compat-seam end-to-end ────────────────────────────
 //
 // The reviewer's load-bearing test: prove that `lpm test -- --all` still
@@ -668,6 +965,39 @@ fn test_double_dash_still_forwards_recognized_flags_to_runner() {
     assert!(
         combined.contains("args: '--all'") || combined.contains("args: --all"),
         "with `--`, --all MUST reach the runner. Got:\n{combined}"
+    );
+}
+
+#[test]
+fn bench_double_dash_still_forwards_recognized_flags_to_runner() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "compat-bench",
+            "version": "1.0.0",
+            "scripts": { "bench": "echo args:" }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["bench", "--", "--all"])
+        .output()
+        .expect("failed to run lpm bench -- --all");
+
+    assert!(
+        output.status.success(),
+        "exit code: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("args: '--all'") || combined.contains("args: --all"),
+        "with `--`, --all MUST reach the bench runner. Got:\n{combined}"
     );
 }
 

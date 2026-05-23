@@ -21,8 +21,33 @@
 //! cliclack code path that this module replaces — install progress is
 //! progress, not the "answer" of the command. Keeps stdout reserved for
 //! `--json` envelopes and for output piped to another tool.
+//!
+//! **ANSI reset hardening.** Every line is prefixed with [`reset_prefix`]
+//! — `\x1b[0m` when colors are enabled, empty otherwise. Cliclack's
+//! `▲` warning / `●` info shapes sometimes emit ANSI attributes
+//! (dim / color) without a clean reset before the newline, and any
+//! subsequent `eprintln!` on stderr inherits the open attribute until
+//! something closes it. The defensive prefix means each slim-UI line
+//! starts from a known-clean ANSI state regardless of what cliclack
+//! left behind — a `+ pkg@version` line will never inherit a dim or
+//! color attribute from a warning printed above it.
 
 use lpm_common::color::Painted;
+
+/// ANSI full-reset (`SGR 0`) prefix, gated on the global color policy.
+///
+/// Empty string when colors are disabled (`NO_COLOR`, `--color=never`,
+/// non-TTY pipe) so we don't emit a literal escape sequence into a
+/// piped file. Always-emitted when colors are on, even if the previous
+/// terminal state is unknown — that's the point.
+#[inline]
+fn reset_prefix() -> &'static str {
+    if lpm_common::color::enabled() {
+        "\x1b[0m"
+    } else {
+        ""
+    }
+}
 
 /// Phase / progress line: `› {msg}`.
 ///
@@ -30,7 +55,7 @@ use lpm_common::color::Painted;
 /// `phase` line per logical step so the transcript narrates what the
 /// install is doing without spinners.
 pub fn phase(msg: &str) {
-    eprintln!("{} {msg}", "›".blue());
+    eprintln!("{}{} {msg}", reset_prefix(), "›".blue());
 }
 
 /// Short, user-facing form of a registry URL. Strips the `registry.`
@@ -50,12 +75,12 @@ pub fn short_registry_host(url: &str) -> String {
 
 /// Success terminus: `✓ {msg}`.
 pub fn done(msg: &str) {
-    eprintln!("{} {msg}", "✓".green());
+    eprintln!("{}{} {msg}", reset_prefix(), "✓".green());
 }
 
 /// Failure terminus: `✗ {msg}`.
 pub fn failed(msg: &str) {
-    eprintln!("{} {msg}", "✗".red());
+    eprintln!("{}{} {msg}", reset_prefix(), "✗".red());
 }
 
 /// Advisory / warning line: `! {msg}`.
@@ -63,7 +88,7 @@ pub fn failed(msg: &str) {
 /// Used for the audit summary, peer-dependency mismatch notices, and
 /// any other non-fatal but operator-relevant signal.
 pub fn warn(msg: &str) {
-    eprintln!("{} {msg}", "!".yellow());
+    eprintln!("{}{} {msg}", reset_prefix(), "!".yellow());
 }
 
 /// Direct-dependency diff entry: `+ {name}@{version}{?hint}`.
@@ -77,7 +102,7 @@ pub fn plus(name: &str, version: &str, hint: Option<&str>) {
         Some(h) => format!("@{version} {h}").dimmed(),
         None => format!("@{version}").dimmed(),
     };
-    eprintln!("+ {name}{suffix}");
+    eprintln!("{}+ {name}{suffix}", reset_prefix());
 }
 
 /// Render a Duration as a short human string suitable for inlining in

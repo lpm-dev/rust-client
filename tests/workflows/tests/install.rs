@@ -10,6 +10,8 @@ use support::mock_registry::{
     MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json,
 };
 use support::{TempProject, lpm, lpm_with_registry};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── No package.json ─────────────────────────────────────────────
 
@@ -156,6 +158,130 @@ async fn install_add_walks_up_to_parent_package_json() {
         "child subdir must NOT have node_modules — install targets the parent project root"
     );
     assertions::assert_in_node_modules(project.path(), "ms");
+}
+
+#[tokio::test]
+async fn install_add_with_dist_tag_resolves_tagged_prerelease_and_saves_exact() {
+    let mock = MockRegistry::start().await;
+    let package_name = "dist-tag-save-policy";
+    let stable_version = "1.9.0";
+    let beta_version = "2.0.0-beta.2";
+
+    let stable_tarball = make_tarball(package_name, stable_version);
+    let beta_tarball = make_tarball(package_name, beta_version);
+    let stable_integrity = compute_integrity(&stable_tarball);
+    let beta_integrity = compute_integrity(&beta_tarball);
+    let stable_tarball_url = mock.tarball_url(package_name, stable_version);
+    let beta_tarball_url = mock.tarball_url(package_name, beta_version);
+
+    let metadata = serde_json::json!({
+        "name": package_name,
+        "dist-tags": {
+            "latest": stable_version,
+            "beta": beta_version,
+        },
+        "versions": {
+            stable_version: {
+                "name": package_name,
+                "version": stable_version,
+                "dist": {
+                    "tarball": stable_tarball_url,
+                    "integrity": stable_integrity,
+                },
+                "dependencies": {},
+            },
+            beta_version: {
+                "name": package_name,
+                "version": beta_version,
+                "dist": {
+                    "tarball": beta_tarball_url,
+                    "integrity": beta_integrity,
+                },
+                "dependencies": {},
+            },
+        },
+        "time": {
+            stable_version: "2025-01-01T00:00:00.000Z",
+            beta_version: "2025-01-02T00:00:00.000Z",
+        },
+    });
+
+    Mock::given(method("GET"))
+        .and(path(format!("/{package_name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package_name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path(
+            package_name,
+            stable_version,
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(stable_tarball)
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path(package_name, beta_version)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(beta_tarball)
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(mock.server())
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "dist-tag-project-install",
+            "version": "1.0.0",
+            "dependencies": {}
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            &format!("{package_name}@beta"),
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install {package_name}@beta must succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(&project.read_file("package.json"))
+        .expect("package.json must stay valid json");
+    assert_eq!(
+        manifest["dependencies"][package_name],
+        serde_json::Value::String(beta_version.to_string()),
+        "dist-tag install must save the resolved prerelease exactly, not the latest stable"
+    );
+
+    let installed_pkg: serde_json::Value = serde_json::from_str(
+        &project.read_file(&format!("node_modules/{package_name}/package.json")),
+    )
+    .expect("installed package.json must be valid json");
+    assert_eq!(
+        installed_pkg["version"],
+        serde_json::Value::String(beta_version.to_string()),
+        "node_modules must contain the dist-tag target version"
+    );
 }
 
 #[tokio::test]
@@ -3094,6 +3220,88 @@ async fn install_lockfile_integrity_matches_stored_tarball_sha512() {
     assert_eq!(
         stored_integrity, expected_integrity,
         "store .integrity file must match the lockfile claim and the tarball hash"
+    );
+}
+
+/// A manifest-level tarball URL with an inline SRI must install cleanly and
+/// serialize as a non-Registry `source` entry without populating the
+/// registry-only `tarball` field-hint. A recent regression wrote both,
+/// which made `lpm.lock` fail its writer/reader invariant and aborted the
+/// install after the download had already succeeded.
+#[tokio::test]
+async fn install_tarball_url_with_declared_sri_writes_non_registry_lockfile_entry() {
+    let server = MockServer::start().await;
+    let tarball = make_tarball("tarball-url-pkg", "1.0.0");
+    let expected_integrity = compute_integrity(&tarball);
+
+    Mock::given(method("GET"))
+        .and(path("/tarball-url-pkg-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+        .mount(&server)
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "tarball-url-lockfile",
+  "version": "1.0.0",
+  "dependencies": {{
+    "tarball-url-pkg": "{}/tarball-url-pkg-1.0.0.tgz#{}"
+  }}
+}}"#,
+        server.uri(),
+        expected_integrity,
+    ));
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        output.status.success(),
+        "install must succeed for a tarball URL dep with declared SRI; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read lpm.lock");
+    let pkg = lockfile
+        .packages
+        .iter()
+        .find(|p| p.name == "tarball-url-pkg" && p.version == "1.0.0")
+        .expect("lockfile must contain tarball-url-pkg@1.0.0");
+
+    assert_eq!(
+        pkg.integrity.as_deref(),
+        Some(expected_integrity.as_str()),
+        "lockfile integrity must preserve the manifest-declared SRI"
+    );
+    assert!(
+        pkg.tarball.is_none(),
+        "non-registry tarball sources must not populate the registry-only tarball hint: {:?}",
+        pkg.tarball
+    );
+    assert!(
+        pkg.source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("tarball+http://")),
+        "lockfile source must remain the tarball source identity: {:?}",
+        pkg.source
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules")
+            .join("tarball-url-pkg")
+            .join("package.json")
+            .exists(),
+        "installed tree must contain the tarball package"
     );
 }
 

@@ -4,13 +4,22 @@ use lpm_common::LpmRoot;
 use std::time::{Duration, SystemTime};
 use support::{TempProject, lpm};
 
-fn seed_dlx_cache(project: &TempProject, spec: &str) -> std::path::PathBuf {
+fn seed_dlx_cache(
+    project: &TempProject,
+    spec: &str,
+    package_name: &str,
+    installed_package_json: &str,
+) -> std::path::PathBuf {
     let root = LpmRoot::from_dir(project.home().join(".lpm"));
     let cache_dir = lpm_runner::dlx::dlx_cache_dir_at(&root, spec);
     let bin_dir = cache_dir.join("node_modules").join(".bin");
+    let package_dir = cache_dir.join("node_modules").join(package_name);
     std::fs::create_dir_all(&bin_dir).expect("failed to create dlx bin dir");
+    std::fs::create_dir_all(&package_dir).expect("failed to create installed package dir");
     std::fs::write(cache_dir.join("package.json"), r#"{"private":true}"#)
         .expect("failed to seed dlx package.json");
+    std::fs::write(package_dir.join("package.json"), installed_package_json)
+        .expect("failed to seed installed package.json");
     cache_dir
 }
 
@@ -55,9 +64,14 @@ fn dlx_malformed_spec_under_json_emits_error_envelope_on_stdout() {
 #[test]
 fn dlx_cache_hit_executes_cached_binary_and_refreshes_ttl() {
     let project = TempProject::empty(r#"{"name":"dlx-test","version":"1.0.0"}"#);
-    let spec = "cowsay@1.0.0";
-    let cache_dir = seed_dlx_cache(&project, spec);
-    let bin_path = cache_dir.join("node_modules").join(".bin").join("cowsay");
+    let spec = "npm-check-updates@1.0.0";
+    let cache_dir = seed_dlx_cache(
+        &project,
+        spec,
+        "npm-check-updates",
+        r#"{"name":"npm-check-updates","bin":{"ncu":"./build/cli.js"}}"#,
+    );
+    let bin_path = cache_dir.join("node_modules").join(".bin").join("ncu");
 
     std::fs::write(
         &bin_path,

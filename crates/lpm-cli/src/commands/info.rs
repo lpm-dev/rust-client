@@ -1,16 +1,20 @@
+use crate::commands::registry_reads::{fetch_routed_package_metadata, prepare_routed_read_context};
 use crate::output;
+use lpm_common::LpmError;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
+use std::path::Path;
 
 pub async fn run(
     client: &RegistryClient,
+    project_dir: &Path,
     package: &str,
     version: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let name = PackageName::parse(package)?;
-    let metadata = client.get_package_metadata(&name).await?;
+    let context =
+        prepare_routed_read_context(client, project_dir, &[package.to_string()], json_output)?;
+    let (_package_ref, metadata) = fetch_routed_package_metadata(&context, package).await?;
 
     if json_output {
         let mut json = serde_json::to_value(&metadata)?;

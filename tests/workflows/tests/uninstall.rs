@@ -150,6 +150,44 @@ fn uninstall_drops_lpm_lock_entirely_after_removal() {
     );
 }
 
+/// The binary lockfile is committed as the twin of `lpm.lock`, not an
+/// independent cache. Uninstall must therefore remove `lpm.lockb`
+/// alongside `lpm.lock`; leaving the binary lockfile behind creates a
+/// brief split-brain state where the text lockfile is gone but tooling
+/// can still read stale package entries from `lpm.lockb`.
+#[test]
+fn uninstall_drops_lpm_lockb_alongside_lpm_lock_after_removal() {
+    let project = TempProject::empty("");
+    seed_installed_package(&project, "drop-lockb", "2.0.0");
+    std::fs::write(
+        project.path().join("lpm.lockb"),
+        b"placeholder-binary-lockfile",
+    )
+    .expect("seed lpm.lockb");
+    assert!(
+        project.path().join("lpm.lock").exists(),
+        "seed must produce lpm.lock"
+    );
+    assert!(
+        project.path().join("lpm.lockb").exists(),
+        "seed must produce lpm.lockb"
+    );
+
+    lpm(&project)
+        .args(["uninstall", "drop-lockb"])
+        .assert()
+        .success();
+
+    assert!(
+        !project.path().join("lpm.lock").exists(),
+        "lpm.lock must be deleted after uninstall (delete-and-regenerate model)"
+    );
+    assert!(
+        !project.path().join("lpm.lockb").exists(),
+        "lpm.lockb must be deleted alongside lpm.lock after uninstall"
+    );
+}
+
 // ─── Diverging-from-npm contracts (worth pinning) ───────────────────────
 
 /// `lpm uninstall <nonexistent>` exits 0 with a warning rather than
