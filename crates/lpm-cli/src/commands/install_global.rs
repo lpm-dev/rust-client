@@ -599,6 +599,7 @@ async fn do_install(
         overrides.auto_build,
         None,
         None,
+        None,
         overrides.script_policy_override,
         // `lpm install -g` does not expose its own
         // `--advisor` flag yet. The global install path stays portable-

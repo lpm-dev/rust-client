@@ -120,6 +120,46 @@ async fn setup_npmrc_non_json_output_uses_current_command_name() {
         ".npmrc must identify the current command name, got:\n{npmrc}"
     );
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "human setup-npmrc should not write to stdout, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Creating read-only token..."),
+        "human setup-npmrc should announce token creation with the slim phase line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Read-only token created."),
+        "human setup-npmrc should report token creation with the slim done line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ .npmrc configured with read-only LPM token."),
+        "human setup-npmrc should report final success with the slim done line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("› .npmrc added to .gitignore to prevent token leaks."),
+        "human setup-npmrc should keep the gitignore note on a slim info line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("› Only @lpm.dev packages will route through lpm.dev."),
+        "human setup-npmrc should keep the scoped-routing note on a slim info line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("› Token expires: 2030-01-02T03:04:05Z"),
+        "human setup-npmrc should keep the expiry line on a slim info line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("› Run `lpm setup-npmrc` again to refresh when expired."),
+        "human setup-npmrc should mention the current command name on the slim info line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
+        "legacy cliclack glyphs must be gone from setup-npmrc stderr, got:\n{stderr}"
+    );
+
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -24,7 +24,7 @@ pub async fn run(
     let gitignore_path = project_dir.join(".gitignore");
 
     if !pkg_json_path.exists() && !json_output {
-        output::warn("No package.json found. Run this command in your project root.");
+        install_ui::warn("No package.json found. Run this command in your project root.");
     }
 
     // Derive project name for the token label
@@ -52,7 +52,7 @@ pub async fn run(
     };
 
     if !json_output {
-        output::info("Creating read-only token...");
+        install_ui::phase("Creating read-only token...");
     }
 
     // Create scoped read-only token via API
@@ -95,7 +95,7 @@ pub async fn run(
         .to_string();
 
     if !json_output {
-        output::success("Read-only token created.");
+        install_ui::done("Read-only token created.");
     }
 
     // Build .npmrc content
@@ -115,15 +115,14 @@ pub async fn run(
                 Ok(info) => {
                     let tier = info.plan_tier.as_deref().unwrap_or("free");
                     if tier == "free" {
-                        output::warn("Proxy mode routes all npm traffic through lpm.dev.");
-                        output::warn(&format!(
+                        install_ui::warn("Proxy mode routes all npm traffic through lpm.dev.");
+                        install_ui::warn(&format!(
                             "This is designed for Pro/Org accounts. Your plan: {}.",
                             tier.bold()
                         ));
-                        output::info(
+                        install_ui::phase(
                             "Upgrade at https://lpm.dev/pricing for dependency analytics and org audit.",
                         );
-                        println!();
                     }
                 }
                 Err(_) => {
@@ -141,7 +140,7 @@ pub async fn run(
                 && !line.contains("lpm.dev")
         });
         if has_custom_registry && !json_output {
-            output::info("Found existing custom default registry. Using scoped mode.");
+            install_ui::phase("Found existing custom default registry. Using scoped mode.");
         }
         false // Always scoped when custom registry exists
     } else {
@@ -221,22 +220,20 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        println!();
-        output::success(".npmrc configured with read-only LPM token.");
+        install_ui::done(".npmrc configured with read-only LPM token.");
         if gitignore_updated {
-            output::info(".npmrc added to .gitignore to prevent token leaks.");
+            install_ui::phase(".npmrc added to .gitignore to prevent token leaks.");
         }
         if use_proxy {
-            output::info("All packages (LPM + npm) will route through lpm.dev.");
-            output::info("Note: First install may update resolved URLs in your lockfile.");
+            install_ui::phase("All packages (LPM + npm) will route through lpm.dev.");
+            install_ui::phase("Note: First install may update resolved URLs in your lockfile.");
         } else {
-            output::info("Only @lpm.dev packages will route through lpm.dev.");
+            install_ui::phase("Only @lpm.dev packages will route through lpm.dev.");
         }
         if !expires_at.is_empty() {
-            output::info(&format!("Token expires: {}", expires_at.dimmed()));
+            install_ui::phase(&format!("Token expires: {}", expires_at.dimmed()));
         }
-        output::info("Run `lpm setup-npmrc` again to refresh when expired.");
-        println!();
+        install_ui::phase("Run `lpm setup-npmrc` again to refresh when expired.");
     }
 
     Ok(())

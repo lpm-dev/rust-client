@@ -3393,6 +3393,12 @@ pub async fn run_with_options(
     // over the lockfile (which can't distinguish direct from transitive
     // when the same name appears at different versions). Non-    // callers pass `None`.
     direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
+    // add-path reporting count. `Some(n)` means this install was
+    // triggered by `lpm install <pkg...>` after staging `n` explicit
+    // package specs into the manifest; the phase / Done lines should
+    // report the user-requested count, not the full resolved graph.
+    // Bare `lpm install` callers pass `None`.
+    requested_add_count: Option<usize>,
     // CLI-side `--policy` / `--yolo` / `--triage`
     // override, already collapsed to at most one value by
     // [`crate::script_policy_config::collapse_policy_flags`]. `None`
@@ -3497,6 +3503,7 @@ pub async fn run_with_options(
             auto_build,
             target_set,
             direct_versions_out,
+            requested_add_count,
             script_policy_override,
             advisor_override,
             min_release_age_override,
@@ -3530,6 +3537,7 @@ async fn run_with_options_under_store_lock(
     auto_build: bool,
     target_set: Option<&[String]>,
     direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
+    requested_add_count: Option<usize>,
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     // see `run_with_options` for the contract.
     advisor_override: Option<String>,
@@ -4023,7 +4031,7 @@ async fn run_with_options_under_store_lock(
     // the target on the command line) from bare `lpm install` (where the
     // project name is the only handle the user has on what's being
     // resolved).
-    let is_add_invocation = direct_versions_out.is_some();
+    let is_add_invocation = requested_add_count.is_some();
     if !json_output {
         let hosts_label = if eager_origins.is_empty() {
             // No top-level registry deps (workspace-only or empty
@@ -4186,24 +4194,9 @@ async fn run_with_options_under_store_lock(
     // diff. Reading from the lockfile (not from `node_modules`) keeps
     // the snapshot cheap and robust against partial installs.
     let pre_install_direct_versions: HashMap<String, String> = if lockfile_path.exists() {
-        let direct_names: std::collections::HashSet<&str> = pkg
-            .dependencies
-            .keys()
-            .chain(pkg.dev_dependencies.keys())
-            .map(String::as_str)
-            .collect();
         lpm_lockfile::Lockfile::read_fast(&lockfile_path)
             .ok()
-            .map(|lf| {
-                let mut map: HashMap<String, String> = HashMap::with_capacity(direct_names.len());
-                for p in &lf.packages {
-                    if direct_names.contains(p.name.as_str()) {
-                        map.entry(p.name.clone())
-                            .or_insert_with(|| p.version.clone());
-                    }
-                }
-                map
-            })
+            .map(|lf| collect_locked_direct_versions(&pkg, &lf))
             .unwrap_or_default()
     } else {
         HashMap::new()
@@ -4447,7 +4440,11 @@ async fn run_with_options_under_store_lock(
     // patch that's been added or moved since the last install requires
     // a clean re-link from store before the patch engine runs, and the
     // lockfile fast path bypasses linker work.
-    let lockfile_result = if force || overrides_changed || patches_changed {
+    // Add-path installs also skip it: once the manifest has been
+    // staged with new top-level entries, a stale lockfile can contain
+    // the same package name only transitively, which is insufficient to
+    // answer what concrete direct version the add path should pick.
+    let lockfile_result = if force || overrides_changed || patches_changed || is_add_invocation {
         None
     } else {
         // Online installs keep the safety gate strict
@@ -5121,10 +5118,11 @@ async fn run_with_options_under_store_lock(
                     // Persistent second phase line. Sub-second resolves don't
                     // need their own "Resolved in Xms" beat — the count is
                     // the signal, the timing lands in the verbose footer.
+                    let reported_install_count = requested_add_count.unwrap_or(packages.len());
                     install_ui::phase(&format!(
                         "Installing {} {}",
-                        packages.len().to_string().bold(),
-                        install_ui::packages_word(packages.len()),
+                        reported_install_count.to_string().bold(),
+                        install_ui::packages_word(reported_install_count),
                     ));
                     //surface best-effort peer-conflict reports as
                     // warnings so the user knows which transitive
@@ -8076,17 +8074,22 @@ async fn run_with_options_under_store_lock(
             .filter(|s| matches!(s, lpm_common::ProvenanceStatus::Verified(_)))
             .count();
 
+        let reported_count = if is_add_invocation {
+            changed_direct.len()
+        } else {
+            packages.len()
+        };
         let action = if is_add_invocation {
             "added"
         } else {
             "installed"
         };
         let duration_str = install_ui::format_duration(elapsed);
-        let pkg_word = install_ui::packages_word(packages.len());
+        let pkg_word = install_ui::packages_word(reported_count);
         eprintln!();
         install_ui::done(&format!(
             "Done · {action} {} {pkg_word} in {}",
-            install_ui::bold(&packages.len().to_string()),
+            install_ui::bold(&reported_count.to_string()),
             install_ui::green(&duration_str),
         ));
         if verified_count > 0 {
@@ -8901,6 +8904,89 @@ fn lockfile_needs_r25_repair(lockfile: &lpm_lockfile::Lockfile, auto_install_pee
     auto_install_peers && lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION
 }
 
+fn requested_range_for_locked_lookup(requested_spec: &str) -> Option<String> {
+    match lpm_resolver::Specifier::parse(requested_spec).ok()? {
+        lpm_resolver::Specifier::SemverRange(range) => Some(range),
+        lpm_resolver::Specifier::NpmAlias { range, .. } => Some(range),
+        _ => None,
+    }
+}
+
+fn select_locked_package_for_requested_spec<'a>(
+    lockfile: &'a lpm_lockfile::Lockfile,
+    target: &str,
+    requested_spec: &str,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
+    let requested_range = requested_range_for_locked_lookup(requested_spec)
+        .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
+    let mut first_match: Option<&lpm_lockfile::LockedPackage> = None;
+    let mut best_satisfying: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> =
+        None;
+    let mut best_any: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> = None;
+
+    for candidate in lockfile.packages.iter().filter(|pkg| pkg.name == target) {
+        if first_match.is_none() {
+            first_match = Some(candidate);
+        }
+
+        let Ok(version) = lpm_resolver::NpmVersion::parse(&candidate.version) else {
+            continue;
+        };
+
+        let better_any = best_any.as_ref().is_none_or(|(best, _)| version > *best);
+        if better_any {
+            best_any = Some((version.clone(), candidate));
+        }
+
+        if let Some(range) = requested_range.as_ref()
+            && range.satisfies(&version)
+        {
+            let better_satisfying = best_satisfying
+                .as_ref()
+                .is_none_or(|(best, _)| version > *best);
+            if better_satisfying {
+                best_satisfying = Some((version, candidate));
+            }
+        }
+    }
+
+    best_satisfying
+        .map(|(_, candidate)| candidate)
+        .or_else(|| best_any.map(|(_, candidate)| candidate))
+        .or(first_match)
+}
+
+fn collect_locked_direct_versions(
+    pkg: &lpm_workspace::PackageJson,
+    lockfile: &lpm_lockfile::Lockfile,
+) -> HashMap<String, String> {
+    let mut versions = HashMap::with_capacity(pkg.dependencies.len() + pkg.dev_dependencies.len());
+
+    for (local, requested_spec) in pkg.dependencies.iter().chain(pkg.dev_dependencies.iter()) {
+        let target = lockfile
+            .root_aliases
+            .get(local)
+            .cloned()
+            .unwrap_or_else(|| local.clone());
+        if let Some(candidate) =
+            select_locked_package_for_requested_spec(lockfile, &target, requested_spec)
+        {
+            versions
+                .entry(target)
+                .or_insert_with(|| candidate.version.clone());
+        }
+    }
+
+    versions
+}
+
+fn install_package_is_direct(
+    root_link_names: Option<&[String]>,
+    deps: &HashMap<String, String>,
+) -> bool {
+    root_link_names.is_some_and(|names| names.iter().any(|local| deps.contains_key(local)))
+}
+
 fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
@@ -9004,32 +9090,18 @@ fn try_lockfile_fast_path(
     // entry. For aliased roots, check the ALIAS TARGET (looked up via
     // `lockfile.root_aliases`) rather than the alias key, since the
     // lockfile is keyed by canonical registry names.
-    for local in deps.keys() {
+    for (local, requested_spec) in deps {
         let target = lockfile
             .root_aliases
             .get(local)
             .map_or(local.as_str(), String::as_str);
-        if lockfile.find_package(target).is_none() {
+        if select_locked_package_for_requested_spec(&lockfile, target, requested_spec).is_none() {
             tracing::debug!(
                 "lockfile miss: {local} (resolved target {target}) not found, re-resolving"
             );
             return None;
         }
     }
-
-    // Build the direct-target-name set: root deps (via alias redirect)
-    // → their canonical names. Matches the fresh-resolve logic in
-    // `resolved_to_install_packages`.
-    let direct_target_names: std::collections::HashSet<String> = deps
-        .keys()
-        .map(|local| {
-            lockfile
-                .root_aliases
-                .get(local)
-                .cloned()
-                .unwrap_or_else(|| local.clone())
-        })
-        .collect();
 
     // Rebuild per-package root_link_names from root_aliases + deps,
     // using the same algorithm as `resolved_to_install_packages` so
@@ -9060,13 +9132,15 @@ fn try_lockfile_fast_path(
         k
     };
     let mut root_link_map: HashMap<String, Vec<String>> = HashMap::new();
-    for local in deps.keys() {
+    for (local, requested_spec) in deps {
         let target = lockfile
             .root_aliases
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
-        if let Some(lp) = lockfile.find_package(&target) {
+        if let Some(lp) =
+            select_locked_package_for_requested_spec(&lockfile, &target, requested_spec)
+        {
             root_link_map
                 .entry(root_link_key(&lp.name, &lp.version))
                 .or_default()
@@ -9159,6 +9233,7 @@ fn try_lockfile_fast_path(
             let root_link_names = root_link_map
                 .get(&root_link_key(&lp.name, &lp.version))
                 .cloned();
+            let is_direct = install_package_is_direct(root_link_names.as_deref(), deps);
 
             InstallPackage {
                 name: lp.name.clone(),
@@ -9174,7 +9249,7 @@ fn try_lockfile_fast_path(
                 // (no root symlink); `Some(vec)` for direct deps,
                 // including aliased ones.
                 root_link_names,
-                is_direct: direct_target_names.contains(&lp.name),
+                is_direct,
                 is_lpm,
                 peers,
                 integrity: lp.integrity.clone(),
@@ -9338,16 +9413,6 @@ fn resolved_to_install_packages(
     // into `direct_target_names` — they aren't user-declared, so
     // they don't get `is_direct = true` (which gates script
     // execution + display). They DO get root_link entries below.
-    let direct_target_names: std::collections::HashSet<String> = deps
-        .keys()
-        .map(|local| {
-            root_aliases
-                .get(local)
-                .cloned()
-                .unwrap_or_else(|| local.clone())
-        })
-        .collect();
-
     // For each resolved direct package, capture its resolved
     // version. Keyed by canonical_name. Used below to compute the
     // `(name, version, source_id)` triple under which the package
@@ -9439,15 +9504,16 @@ fn resolved_to_install_packages(
             let registry_url = registry_source_url_for(&name, route_table);
             let source = format!("registry+{registry_url}");
             let root_link_names = root_link_map.get(&rlk(&name, &version)).cloned();
+            let is_direct = install_package_is_direct(root_link_names.as_deref(), deps);
 
             Some(InstallPackage {
-                name: name.clone(),
+                name,
                 version,
                 source,
                 dependencies: r.dependencies.clone(),
                 aliases: r.aliases.clone(),
                 root_link_names,
-                is_direct: direct_target_names.contains(&name),
+                is_direct,
                 is_lpm,
                 // — peer-context threading. The resolver
                 // intersected this package's declared peers against
@@ -11602,17 +11668,15 @@ pub async fn run_add_packages(
         pin_staged_dist_tags_for_resolution(client, project_dir, &staged).await?;
         maybe_test_panic("after-stage");
 
-        // 3. Remove lockfile so the resolver re-runs against the staged manifest.
-        //    The transaction snapshot above already captured the original bytes,
-        //    so this delete is rolled back if the install pipeline fails.
-        if lockfile_path.exists() {
-            std::fs::remove_file(&lockfile_path)?;
-        }
-
-        // 4. Run the full install pipeline, capturing the direct-dep version
+        // 3. Run the full install pipeline, capturing the direct-dep version
         //    map via the out-param. If anything fails, the `?`
         //    returns early — `tx` drops without `commit()` and the manifest
         //    snaps back to its pre-stage state. The placeholder never survives.
+        //    We intentionally keep any existing lockfile on disk so the
+        //    pipeline can diff against the pre-install direct graph. The warm
+        //    fast-path validator below now rejects stale lockfiles whose kept
+        //    entries no longer satisfy the staged manifest, so keeping the file
+        //    does not suppress a needed re-resolve.
         let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
         run_with_options(
             client,
@@ -11629,6 +11693,7 @@ pub async fn run_add_packages(
             false, // auto_build
             None,  // target_set: legacy single-project path
             Some(&mut direct_versions),
+            Some(js_packages.len()),
             script_policy_override,
             advisor_override,
             min_release_age_override,
@@ -11900,11 +11965,10 @@ pub async fn run_install_filtered_add(
                     }
                 };
 
-            // Use the precomputed install root + lockfile path so the
-            // transaction snapshot above and the loop below agree on the
-            // exact paths (no double-compute, no path drift).
+            // Use the precomputed install root so the transaction
+            // snapshot above and the loop below agree on the exact
+            // member path (no double-compute, no path drift).
             let install_root = &member_install_roots[idx];
-            let lockfile_path = &lockfile_paths[idx];
 
             if let Err(e) = pin_staged_dist_tags_for_resolution(client, install_root, &staged).await
             {
@@ -11912,18 +11976,12 @@ pub async fn run_install_filtered_add(
                 break;
             }
 
-            // (b) Remove this member's lockfile so the resolver re-runs.
-            //     The transaction snapshot already captured the original
-            //     bytes; the delete is rolled back if install fails below.
-            if lockfile_path.exists()
-                && let Err(e) = std::fs::remove_file(lockfile_path)
-            {
-                last_err = Some(LpmError::Io(e));
-                break;
-            }
-
-            // (c) Run the install pipeline at THIS member's directory,
+            // (b) Run the install pipeline at THIS member's directory,
             //     capturing the direct-dep map for finalize via  the             //     out-param.
+            //     We intentionally keep each member's existing lockfile so the
+            //     install pipeline can diff against the pre-install direct
+            //     graph. The warm fast-path validator rejects stale lockfiles
+            //     that no longer satisfy the staged manifest.
             let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
             let result = run_with_options(
                 client,
@@ -11940,6 +11998,7 @@ pub async fn run_install_filtered_add(
                 false, // auto_build
                 Some(&target_paths),
                 Some(&mut direct_versions),
+                Some(packages.len()),
                 script_policy_override,
                 // Same per-iteration clone rationale as `drift_ignore_policy`
                 // below: each loop pass moves the override into

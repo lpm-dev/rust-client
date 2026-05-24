@@ -695,10 +695,10 @@ enum Commands {
 
     /// Add source files from a package into your project (shadcn-style).
     Add {
-        /// Package to add (e.g., @lpm.dev/owner.package@1.0.0?component=dialog).
+        /// Package to add (e.g. `@lpm.dev/owner.package`, `react`).
         package: String,
 
-        /// Target directory (overrides auto-detection).
+        /// Target directory for extracted files.
         #[arg(long)]
         path: Option<String>,
 
@@ -1302,16 +1302,20 @@ enum Commands {
     /// `lpm use node@22` installs Node 22 and pins it in lpm.json.
     /// Scripts then auto-use the pinned version via PATH injection.
     Use {
-        /// Node.js version spec (e.g., node@22, node@lts, 22.5.0). For env vars and secrets, use `lpm env`.
-        spec: Option<String>,
+        /// Runtime spec or explicit action, e.g. `node@22`, `remove node@20`.
+        args: Vec<String>,
 
         /// List installed runtime versions.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["pin", "remove"])]
         list: bool,
 
         /// Pin only (skip install if already installed).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["list", "remove"])]
         pin: bool,
+
+        /// Remove installed managed runtimes matching a spec.
+        #[arg(long, conflicts_with_all = ["list", "pin"])]
+        remove: bool,
     },
 
     /// Manage project environment variables and secrets.
@@ -3277,6 +3281,7 @@ async fn async_main() -> Result<()> {
                         eff_auto_build,
                         None, // target_set: bare-install path is single-target
                         None, // direct_versions_out: bare install does not finalize a manifest
+                        None, // requested_add_count: bare install reports the full graph
                         cli_script_policy_override,
                         advisor.clone(),
                         min_release_age_override,
@@ -3963,35 +3968,24 @@ async fn async_main() -> Result<()> {
         },
         Commands::SwiftRegistry { force } => {
             commands::swift_registry::run(registry_url, cli.json, force).await
-        }
+        },
         Commands::Mcp { action, name } => {
             commands::mcp::run(&action, name.as_deref(), cli.json).await
-        }
-        Commands::Use { spec, list, pin } => {
+        },
+        Commands::Use {
+            args,
+            list,
+            pin,
+            remove,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if list {
-                commands::r#use::run("list", spec.as_deref(), &cwd, cli.json).await
-            } else if pin {
-                let s = spec.as_deref().ok_or_else(|| {
-                    lpm_common::LpmError::Script(
-                        "missing version. Usage: lpm use --pin node@22.5.0".into(),
-                    )
-                })?;
-                commands::r#use::run("pin", Some(s), &cwd, cli.json).await
-            } else if let Some(s) = &spec {
-                // `lpm use node@20` = install + pin (one command does both)
-                commands::r#use::run("install", Some(s.as_str()), &cwd, cli.json).await?;
-                commands::r#use::run("pin", Some(s.as_str()), &cwd, cli.json).await
-            } else {
-                // No spec, no flags — show list
-                commands::r#use::run("list", None, &cwd, cli.json).await
-            }
-        }
+            commands::r#use::run_cli(&args, list, pin, remove, &cwd, cli.json).await
+        },
         Commands::Env { extra: _ } => {
             // Subcommand args are re-parsed from raw argv inside run().
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::env::run(&client, &cwd, cli.json).await
-        }
+        },
         Commands::SetupNpmrc {
             days,
             proxy,
@@ -4001,7 +3995,7 @@ async fn async_main() -> Result<()> {
             let cfg = commands::config::GlobalConfig::load();
             let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
             commands::npmrc::run(&client, &cwd, registry_url, days, eff_proxy, cli.json).await
-        }
+        },
         Commands::Run {
             scripts,
             env,

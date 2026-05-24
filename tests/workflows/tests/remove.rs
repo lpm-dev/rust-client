@@ -80,7 +80,50 @@ fn remove_json_cleans_source_package_paths_and_editor_links() {
 }
 
 #[test]
-fn rm_alias_warns_and_exits_zero_when_no_files_match() {
+fn remove_human_output_uses_slim_done_line_and_stderr_only_paths() {
+    let project = TempProject::empty(r#"{"name":"remove-test","version":"1.0.0"}"#);
+    project.write_file(".lpm/skills/owner.widget/build.md", "# Widget skill\n");
+    project.write_file(
+        "components/widget/index.ts",
+        "export const widget = true;\n",
+    );
+    project.write_file(".cursor/rules/owner.widget--build.md", "linked skill\n");
+
+    let output = lpm(&project)
+        .args(["remove", "owner.widget"])
+        .output()
+        .expect("failed to run lpm remove");
+
+    assert!(
+        output.status.success(),
+        "lpm remove failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "human remove should not write to stdout, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Removed owner.widget"),
+        "remove should use the slim done line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(".lpm/skills/owner.widget/") && stderr.contains("components/widget/"),
+        "remove should keep the removed path list on stderr, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
+        "legacy cliclack glyphs must be gone from remove stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn rm_alias_uses_slim_warning_and_exits_zero_when_no_files_match() {
     let project = TempProject::empty(r#"{"name":"remove-test","version":"1.0.0"}"#);
 
     let output = lpm(&project)
@@ -93,14 +136,20 @@ fn rm_alias_warns_and_exits_zero_when_no_files_match() {
         "lpm rm must exit zero when nothing matches"
     );
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "human rm should not write to stdout when nothing matches, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("! No files found for owner.widget") && stderr.contains("custom path"),
+        "expected slim missing-files warning, got:\n{stderr}"
     );
     assert!(
-        combined.contains("No files found for") && combined.contains("custom path"),
-        "expected missing-files warning, got:\n{combined}"
+        !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
+        "legacy cliclack glyphs must be gone from rm stderr, got:\n{stderr}"
     );
 }
 

@@ -1,8 +1,106 @@
-use crate::output;
+use super::use_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 
-/// Handle `lpm use` subcommands: install, list, pin.
+#[derive(Debug, PartialEq, Eq)]
+enum UseRequest {
+    InstallAndPin(String),
+    Pin(String),
+    Remove(String),
+    List(Option<String>),
+}
+
+pub async fn run_cli(
+    args: &[String],
+    list: bool,
+    pin: bool,
+    remove: bool,
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    match parse_cli_request(args, list, pin, remove)? {
+        UseRequest::InstallAndPin(spec) => {
+            run("install", Some(spec.as_str()), project_dir, json_output).await?;
+            run("pin", Some(spec.as_str()), project_dir, json_output).await
+        }
+        UseRequest::Pin(spec) => run("pin", Some(spec.as_str()), project_dir, json_output).await,
+        UseRequest::Remove(spec) => {
+            run("remove", Some(spec.as_str()), project_dir, json_output).await
+        }
+        UseRequest::List(spec) => run("list", spec.as_deref(), project_dir, json_output).await,
+    }
+}
+
+fn parse_cli_request(
+    args: &[String],
+    list: bool,
+    pin: bool,
+    remove: bool,
+) -> Result<UseRequest, LpmError> {
+    if list {
+        return match args {
+            [] => Ok(UseRequest::List(None)),
+            [runtime] => Ok(UseRequest::List(Some(runtime.clone()))),
+            _ => Err(LpmError::Script(
+                "too many arguments. Usage: lpm use --list [node]".into(),
+            )),
+        };
+    }
+
+    if pin {
+        return match args {
+            [spec] => Ok(UseRequest::Pin(spec.clone())),
+            [] => Err(LpmError::Script(
+                "missing version. Usage: lpm use --pin node@22.5.0".into(),
+            )),
+            _ => Err(LpmError::Script(
+                "too many arguments. Usage: lpm use --pin node@22.5.0".into(),
+            )),
+        };
+    }
+
+    if remove {
+        return match args {
+            [spec] => Ok(UseRequest::Remove(spec.clone())),
+            [] => Err(LpmError::Script(
+                "missing version. Usage: lpm use --remove node@20".into(),
+            )),
+            _ => Err(LpmError::Script(
+                "too many arguments. Usage: lpm use --remove node@20".into(),
+            )),
+        };
+    }
+
+    match args {
+        [] => Ok(UseRequest::List(None)),
+        [action] if matches!(action.as_str(), "list" | "ls") => Ok(UseRequest::List(None)),
+        [action, runtime] if matches!(action.as_str(), "list" | "ls") => {
+            Ok(UseRequest::List(Some(runtime.clone())))
+        }
+        [action] if matches!(action.as_str(), "pin") => Err(LpmError::Script(
+            "missing version. Usage: lpm use pin node@22.5.0".into(),
+        )),
+        [action, spec] if action == "pin" => Ok(UseRequest::Pin(spec.clone())),
+        [action] if matches!(action.as_str(), "remove" | "rm" | "uninstall") => Err(
+            LpmError::Script("missing version. Usage: lpm use remove node@20".into()),
+        ),
+        [action, spec] if matches!(action.as_str(), "remove" | "rm" | "uninstall") => {
+            Ok(UseRequest::Remove(spec.clone()))
+        }
+        [action] if matches!(action.as_str(), "install" | "i") => Err(LpmError::Script(
+            "missing version spec. Usage: lpm use install node@22".into(),
+        )),
+        [action, spec] if matches!(action.as_str(), "install" | "i") => {
+            Ok(UseRequest::InstallAndPin(spec.clone()))
+        }
+        [spec] => Ok(UseRequest::InstallAndPin(spec.clone())),
+        _ => Err(LpmError::Script(
+            "too many arguments. Usage: lpm use [install|pin|remove|list] [node@version]".into(),
+        )),
+    }
+}
+
+/// Handle `lpm use` actions: install, list, pin, remove.
 ///
 /// `lpm use` manages Node.js runtime versions for the project. Env-vars
 /// management was split into its own top-level command (`lpm env`) — see
@@ -13,13 +111,13 @@ pub async fn run(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
-
     match action {
         "install" | "i" => {
+            let http_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
+
             let spec = spec.ok_or_else(|| {
                 LpmError::Script("missing version spec. Usage: lpm use node@22".into())
             })?;
@@ -32,7 +130,7 @@ pub async fn run(
             }
 
             let platform = lpm_runtime::platform::Platform::current()?;
-            output::info(&format!(
+            use_ui::phase(&format!(
                 "resolving node@{} for {}...",
                 version_spec, platform
             ));
@@ -54,12 +152,12 @@ pub async fn run(
                         serde_json::json!({"success": true, "status": "already_installed", "version": version})
                     );
                 } else {
-                    output::success(&format!("Node.js {} is already installed", version.bold()));
+                    use_ui::done(&format!("Node {} already installed", version.bold()));
                 }
                 return Ok(());
             }
 
-            output::info(&format!(
+            use_ui::phase(&format!(
                 "downloading Node.js {}...",
                 release.version.bold()
             ));
@@ -73,9 +171,81 @@ pub async fn run(
                     serde_json::json!({"success": true, "status": "installed", "version": installed})
                 );
             } else {
-                output::success(&format!("Node.js {} installed", installed.bold()));
+                use_ui::done(&format!("Installed Node {}", installed.bold()));
                 let bin_dir = lpm_runtime::node::node_bin_dir(&installed)?;
-                println!("  {} {}", "location:".dimmed(), bin_dir.display());
+                use_ui::hint_line(&format!("installed at {}", bin_dir.display()));
+            }
+        }
+
+        "remove" | "rm" | "uninstall" => {
+            let spec = spec.ok_or_else(|| {
+                LpmError::Script("missing version. Usage: lpm use remove node@20".into())
+            })?;
+
+            let (runtime, version_spec) = parse_runtime_spec(spec);
+            if runtime != "node" {
+                return Err(LpmError::Script(format!(
+                    "runtime '{runtime}' not yet supported. Currently supported: node"
+                )));
+            }
+
+            lpm_runtime::node::validate_version_spec(&version_spec)?;
+            if matches!(version_spec.to_ascii_lowercase().as_str(), "lts" | "latest") {
+                return Err(LpmError::Script(
+                    "remove requires an explicit version, prefix, or semver range; `lts` and `latest` are not supported"
+                        .into(),
+                ));
+            }
+
+            let installed = lpm_runtime::node::list_installed()?;
+            let removed_versions = matching_installed_versions(&version_spec, &installed);
+            if removed_versions.is_empty() {
+                return Err(LpmError::Script(format!(
+                    "node@{} is not currently installed. Run `lpm use --list` to see installed versions",
+                    version_spec
+                )));
+            }
+
+            for version in &removed_versions {
+                lpm_runtime::node::uninstall(version)?;
+            }
+
+            let pin_warning = read_pinned_node_version(project_dir)?.filter(|pinned| {
+                lpm_runtime::node::find_matching_installed(pinned, &removed_versions).is_some()
+            });
+
+            if json_output {
+                let mut envelope = serde_json::json!({
+                    "success": true,
+                    "status": "removed",
+                    "runtime": "node",
+                    "versions": removed_versions,
+                });
+                if let Some(pinned) = pin_warning {
+                    envelope["warning"] = serde_json::Value::String(format!(
+                        "lpm.json still pins node@{}; a later run may reinstall it",
+                        pinned
+                    ));
+                }
+                println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+            } else {
+                if removed_versions.len() == 1 {
+                    use_ui::done(&format!("Removed Node {}", removed_versions[0].bold()));
+                } else {
+                    use_ui::done(&format!(
+                        "Removed {} Node versions",
+                        removed_versions.len().to_string().bold()
+                    ));
+                    for version in &removed_versions {
+                        use_ui::list_item(version);
+                    }
+                }
+                if let Some(pinned) = pin_warning {
+                    use_ui::warn(&format!(
+                        "lpm.json still pins node@{}; a later run may reinstall it",
+                        pinned
+                    ));
+                }
             }
         }
 
@@ -98,12 +268,12 @@ pub async fn run(
                     .unwrap()
                 );
             } else if versions.is_empty() {
-                output::info("No Node.js versions installed via LPM");
-                println!("  Run {} to install one", "lpm use node@22".cyan());
+                use_ui::phase("No Node versions installed");
+                use_ui::hint_line("Run lpm use node@22 to install one");
             } else {
-                output::info(&format!("Installed Node.js versions ({})", versions.len()));
+                use_ui::phase(&format!("Installed Node versions ({})", versions.len()));
                 for v in &versions {
-                    println!("  {} {v}", "●".green());
+                    use_ui::list_item(v);
                 }
             }
         }
@@ -126,7 +296,7 @@ pub async fn run(
 
             // Warn if the version is not currently installed
             if !json_output && !lpm_runtime::node::is_installed(&pinned_version) {
-                output::warn(&format!(
+                use_ui::warn(&format!(
                     "node@{} is not currently installed. Run `lpm use node@{}` to install it",
                     version_spec, version_spec
                 ));
@@ -140,7 +310,7 @@ pub async fn run(
                     serde_json::json!({"success": true, "pinned": {"node": pinned_version}})
                 );
             } else {
-                output::success(&format!(
+                use_ui::done(&format!(
                     "Pinned node@{} in lpm.json",
                     pinned_version.bold()
                 ));
@@ -149,7 +319,7 @@ pub async fn run(
 
         _ => {
             return Err(LpmError::Script(format!(
-                "unknown action: '{action}'. Available: install, list, pin"
+                "unknown action: '{action}'. Available: install, list, pin, remove"
             )));
         }
     }
@@ -176,6 +346,80 @@ fn resolve_pinned_node_version(version_spec: &str) -> String {
         || version_spec.to_string(),
         |installed| select_pinned_node_version(version_spec, &installed),
     )
+}
+
+fn matching_installed_versions(version_spec: &str, installed: &[String]) -> Vec<String> {
+    let spec = version_spec.strip_prefix('v').unwrap_or(version_spec);
+
+    if spec.eq_ignore_ascii_case("lts") || spec.eq_ignore_ascii_case("latest") {
+        return Vec::new();
+    }
+
+    if let Some(version) = installed.iter().find(|version| version.as_str() == spec) {
+        return vec![version.clone()];
+    }
+
+    if is_range_spec(spec) {
+        let Ok(req) = lpm_semver::VersionReq::parse(spec) else {
+            return Vec::new();
+        };
+        let mut matches: Vec<String> = installed
+            .iter()
+            .filter(|version| {
+                lpm_semver::Version::parse(version)
+                    .ok()
+                    .is_some_and(|parsed| req.matches(&parsed))
+            })
+            .cloned()
+            .collect();
+        sort_versions_desc(&mut matches);
+        return matches;
+    }
+
+    if lpm_semver::Version::parse(spec).is_ok() {
+        return Vec::new();
+    }
+
+    let prefix = format!("{spec}.");
+    let mut matches: Vec<String> = installed
+        .iter()
+        .filter(|version| version.starts_with(&prefix) || version.as_str() == spec)
+        .cloned()
+        .collect();
+    sort_versions_desc(&mut matches);
+    matches
+}
+
+fn is_range_spec(spec: &str) -> bool {
+    spec.contains('>')
+        || spec.contains('<')
+        || spec.contains('^')
+        || spec.contains('~')
+        || spec.contains('|')
+        || spec.contains('*')
+        || spec.split_whitespace().count() > 1
+}
+
+fn sort_versions_desc(versions: &mut [String]) {
+    versions.sort_by(
+        |a, b| match (lpm_semver::Version::parse(a), lpm_semver::Version::parse(b)) {
+            (Ok(a), Ok(b)) => b.cmp(&a),
+            _ => b.cmp(a),
+        },
+    );
+}
+
+fn read_pinned_node_version(project_dir: &std::path::Path) -> Result<Option<String>, LpmError> {
+    let lpm_json_path = project_dir.join("lpm.json");
+    if !lpm_json_path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(&lpm_json_path)?;
+    let config: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| LpmError::Script(format!("failed to parse lpm.json: {e}")))?;
+
+    Ok(config["runtime"]["node"].as_str().map(str::to_string))
 }
 
 fn write_node_pin(project_dir: &std::path::Path, node_version: &str) -> Result<(), LpmError> {
@@ -256,6 +500,40 @@ mod tests {
         let installed = vec!["22.12.0".to_string()];
 
         assert_eq!(select_pinned_node_version("lts", &installed), "lts");
+    }
+
+    #[test]
+    fn parse_cli_request_accepts_positional_remove_action() {
+        let request = parse_cli_request(
+            &["remove".to_string(), "node@20".to_string()],
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(request, UseRequest::Remove("node@20".to_string()));
+    }
+
+    #[test]
+    fn parse_cli_request_preserves_legacy_bare_install_and_pin_flow() {
+        let request = parse_cli_request(&["node@22".to_string()], false, false, false).unwrap();
+
+        assert_eq!(request, UseRequest::InstallAndPin("node@22".to_string()));
+    }
+
+    #[test]
+    fn matching_installed_versions_returns_all_matching_major_versions() {
+        let installed = vec![
+            "22.12.0".to_string(),
+            "20.18.0".to_string(),
+            "20.17.0".to_string(),
+        ];
+
+        assert_eq!(
+            matching_installed_versions("20", &installed),
+            vec!["20.18.0".to_string(), "20.17.0".to_string()]
+        );
     }
 
     #[test]
