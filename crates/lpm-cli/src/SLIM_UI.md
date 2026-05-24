@@ -9,9 +9,9 @@ Read this before rewriting human output for any command.
 
 ## When to use slim UI vs cliclack
 
-| Command shape | Use |
-| --- | --- |
-| Non-interactive: prints progress / status, never prompts (`install`, `audit`, `outdated`, `doctor list`, `publish`) | **Slim UI** (this doc) |
+| Command shape                                                                                                          | Use                                 |
+| ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| Non-interactive: prints progress / status, never prompts (`install`, `audit`, `outdated`, `doctor list`, `publish`)    | **Slim UI** (this doc)              |
 | Interactive: confirms an action, multi-selects, masked input (`login`, `approve-scripts`, `init`, `add` source picker) | **cliclack** via `crate::output::*` |
 
 A command that does both (interactive intro + long progress phase)
@@ -30,23 +30,24 @@ These are project-wide. Don't introduce new glyphs or color choices in
 a single command — bring it up for design alignment first so the whole
 CLI stays coherent.
 
-| Glyph | Color  | Meaning                                                  | Helper                  |
-| ----- | ------ | -------------------------------------------------------- | ----------------------- |
-| `›`   | blue   | Phase / progress line (persistent, stays on screen)      | `install_ui::phase`     |
-| `✓`   | green  | Success terminus or per-item verified                    | `install_ui::done`      |
-| `✗`   | red    | Failure terminus                                         | `install_ui::failed`    |
-| `!`   | yellow | Advisory / warning (informational, never fails the cmd)  | `install_ui::warn`      |
-| `+`   | plain  | Diff entry (added / changed)                             | `install_ui::plus`      |
+| Glyph | Color  | Meaning                                                 | Helper               |
+| ----- | ------ | ------------------------------------------------------- | -------------------- |
+| `›`   | blue   | Phase / progress line (persistent, stays on screen)     | `install_ui::phase`  |
+| `✓`   | green  | Success terminus or per-item verified                   | `install_ui::done`   |
+| `✗`   | red    | Failure terminus                                        | `install_ui::failed` |
+| `!`   | yellow | Advisory / warning (informational, never fails the cmd) | `install_ui::warn`   |
+| `+`   | plain  | Diff entry (added / changed)                            | `install_ui::plus`   |
+| `-`   | plain  | Diff entry (removed)                                    | `install_ui::minus`  |
 
 Within message bodies:
 
-| Element                                | Style                          |
-| -------------------------------------- | ------------------------------ |
-| Project / package name                 | **bold** (`install_ui::bold`)  |
-| Resolved duration in a terminus line   | green (`install_ui::green`)    |
-| Vulnerability / failure count when > 0 | red (`install_ui::red`)        |
-| Hints, suffix metadata, parentheticals | dimmed (`install_ui::dim`)     |
-| Plain text                             | unstyled                       |
+| Element                                | Style                         |
+| -------------------------------------- | ----------------------------- |
+| Project / package name                 | **bold** (`install_ui::bold`) |
+| Resolved duration in a terminus line   | green (`install_ui::green`)   |
+| Vulnerability / failure count when > 0 | red (`install_ui::red`)       |
+| Hints, suffix metadata, parentheticals | dimmed (`install_ui::dim`)    |
+| Plain text                             | unstyled                      |
 
 ## Reusable helpers in `install_ui`
 
@@ -55,7 +56,7 @@ reimplement:
 
 - `phase(msg)` / `done(msg)` / `failed(msg)` / `warn(msg)` — the five
   line shapes.
-- `plus(name, version, hint)` — the diff entry shape.
+- `plus(name, version, hint)` / `minus(name, version, hint)` — the diff entry shapes.
 - `bold` / `dim` / `green` / `red` — color helpers that honor
   `NO_COLOR` / `--color` via `lpm_common::color`.
 - `format_duration(Duration)` — sub-second → `"Xms"`, else `"X.XXs"`.
@@ -72,10 +73,12 @@ treatment and the install pipeline isn't the only consumer.
    section inside the command file if it only needs the five core
    line shapes).
 2. **Don't** reimplement the glyphs / colors. Either:
-   - Call `install_ui::phase` / `done` / `failed` / `warn` / `plus`
-     directly, or
-   - Re-export them from your `<command>_ui` module with
-     command-specific helpers layered on top.
+
+- Call `install_ui::phase` / `done` / `failed` / `warn` / `plus` / `minus`
+  directly, or
+- Re-export them from your `<command>_ui` module with
+  command-specific helpers layered on top.
+
 3. Keep every existing `if !json_output { ... }` gate in place. The
    slim UI is the **interior** of those gates; never the gate itself.
 4. After: rebuild `lpm-rs` and smoke-test the human output in a temp

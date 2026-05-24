@@ -101,7 +101,54 @@ const COLORS: &[&str] = &[
     "\x1b[34m", // blue
     "\x1b[31m", // red
 ];
+const CYAN: &str = "\x1b[36m";
+const YELLOW: &str = "\x1b[33m";
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
+
+fn ui_paint(color: &str, text: &str) -> String {
+    format!("{color}{text}{RESET}")
+}
+
+fn ui_phase(msg: &str) {
+    eprintln!("  {} {msg}", ui_paint(CYAN, "›"));
+}
+
+fn ui_warn(msg: &str) {
+    eprintln!("  {} {msg}", ui_paint(YELLOW, "!"));
+}
+
+fn ui_service_prefix(color: &str, name: &str) -> String {
+    format!("{color}[{name}]{RESET}")
+}
+
+fn ui_service_status(color: &str, name: &str, status_color: &str, glyph: &str, msg: &str) {
+    eprintln!(
+        "  {} {} {msg}",
+        ui_paint(status_color, glyph),
+        ui_service_prefix(color, name),
+    );
+}
+
+fn ui_service_note(color: &str, name: &str, msg: &str) {
+    eprintln!("  {} {msg}", ui_service_prefix(color, name));
+}
+
+fn ui_format_duration(duration: Duration) -> String {
+    let ms = duration.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.2}s", ms as f64 / 1000.0)
+    }
+}
+
+fn ui_readiness_timing(duration: Option<Duration>) -> String {
+    duration
+        .map(|duration| format!(" ({})", ui_paint(GREEN, &ui_format_duration(duration))))
+        .unwrap_or_default()
+}
 
 /// Safely resolve a service `cwd` relative to the project root.
 ///
@@ -364,20 +411,27 @@ pub fn run_services(
         .collect();
 
     // Print startup banner with port reassignment info
-    println!();
+    eprintln!();
     for name in &service_names {
         let config = &active_services[name];
         let color = color_map[name];
 
         let port_info = if let Some(reassignment) = port_reassignments.get(name) {
             format!(
-                " → :{} \x1b[33m(port {} in use by {})\x1b[0m",
-                reassignment.new, reassignment.original, reassignment.reason
+                " -> :{} {}",
+                reassignment.new,
+                ui_paint(
+                    YELLOW,
+                    &format!(
+                        "(port {} in use by {})",
+                        reassignment.original, reassignment.reason
+                    ),
+                )
             )
         } else {
             port_map
                 .get(name)
-                .map(|p| format!(" → :{p}"))
+                .map(|p| format!(" -> :{p}"))
                 .unwrap_or_default()
         };
 
@@ -386,12 +440,13 @@ pub fn run_services(
         } else {
             format!(" (after {})", config.depends_on.join(", "))
         };
-        println!(
-            "  {color}●{RESET} {color}{name}{RESET}  {}{port_info}{dep_info}",
-            config.command
-        );
+        ui_phase(&format!(
+            "{} {}{port_info}{dep_info}",
+            ui_service_prefix(color, name),
+            config.command,
+        ));
     }
-    println!();
+    eprintln!();
 
     // Shutdown state: 0 = running, 1 = graceful shutdown (SIGTERM), 2+ = force kill (SIGKILL)
     let shutdown_state = Arc::new(AtomicU8::new(0));
@@ -529,17 +584,8 @@ pub fn run_services(
                     }
 
                     let color = color_map[&name];
-                    let timing = duration
-                        .map(|d| {
-                            let ms = d.as_millis();
-                            if ms < 1000 {
-                                format!(" ({ms}ms)")
-                            } else {
-                                format!(" ({:.1}s)", ms as f64 / 1000.0)
-                            }
-                        })
-                        .unwrap_or_default();
-                    eprintln!("  {color}[{name}]{RESET} \x1b[32m✔ ready{timing}\x1b[0m");
+                    let timing = ui_readiness_timing(duration);
+                    ui_service_status(color, &name, GREEN, "✓", &format!("ready{timing}"));
                     send_status(
                         &options.event_tx,
                         &service_names,
@@ -557,7 +603,7 @@ pub fn run_services(
                     // The service process is still running — it may just be slow.
                     // Print the error but continue so the browser opens and the
                     // user can see the actual state in their browser.
-                    eprintln!("  \x1b[33m[{name}]\x1b[0m \x1b[33m⚠ not ready — {e}\x1b[0m");
+                    ui_service_status(RESET, &name, YELLOW, "!", &format!("not ready - {e}"));
                     // Still mark as Ready — the service is running, just slow to respond.
                     // Timeout is a warning, not a state change to Crashed.
                     send_status(
@@ -568,7 +614,7 @@ pub fn run_services(
                     );
                 }
                 Err(_) => {
-                    eprintln!("  \x1b[31m[{name}]\x1b[0m readiness check panicked");
+                    ui_service_status(RESET, &name, RED, "✗", "readiness check panicked");
                     if shutdown_state.load(Ordering::Relaxed) == 0 {
                         shutdown_state.store(1, Ordering::Relaxed);
                         shutdown_children(&children, false);
@@ -613,7 +659,7 @@ pub fn run_services(
                     Ok(Some(status)) => {
                         let color = color_map.get(name.as_str()).unwrap_or(&RESET);
                         if status.success() {
-                            eprintln!("  {color}[{name}]{RESET} exited");
+                            ui_service_note(color, name, "exited");
                             send_status(
                                 &options.event_tx,
                                 &service_names,
@@ -627,8 +673,12 @@ pub fn run_services(
 
                             if should_restart && shutdown_state.load(Ordering::Relaxed) == 0 {
                                 to_restart.push(name.clone());
-                                eprintln!(
-                                    "  \x1b[33m[{name}]\x1b[0m \x1b[33mcrashed (exit {code}), restarting...\x1b[0m"
+                                ui_service_status(
+                                    RESET,
+                                    name,
+                                    YELLOW,
+                                    "!",
+                                    &format!("crashed (exit {code}), restarting..."),
                                 );
                                 send_status(
                                     &options.event_tx,
@@ -637,8 +687,12 @@ pub fn run_services(
                                     ServiceStatus::Crashed(code),
                                 );
                             } else {
-                                eprintln!(
-                                    "  \x1b[31m[{name}]\x1b[0m \x1b[31mcrashed (exit {code})\x1b[0m"
+                                ui_service_status(
+                                    RESET,
+                                    name,
+                                    RED,
+                                    "✗",
+                                    &format!("crashed (exit {code})"),
                                 );
                                 send_status(
                                     &options.event_tx,
@@ -669,8 +723,12 @@ pub fn run_services(
                         let _ = child.kill();
                         let _ = child.wait();
                         tracing::warn!("stopped {name} (depends on crashed {crashed_name})");
-                        eprintln!(
-                            "  \x1b[31m[{name}]\x1b[0m \x1b[31mstopped (depends on crashed {crashed_name})\x1b[0m"
+                        ui_service_status(
+                            RESET,
+                            &name,
+                            RED,
+                            "✗",
+                            &format!("stopped (depends on crashed {crashed_name})"),
                         );
                         send_status(
                             &options.event_tx,
@@ -704,8 +762,14 @@ pub fn run_services(
             // Max restart attempts
             if *attempts > MAX_RESTART_ATTEMPTS {
                 let color = color_map.get(name.as_str()).unwrap_or(&RESET);
-                eprintln!(
-                    "  {color}[{name}]{RESET} \x1b[31mexceeded max restart attempts ({MAX_RESTART_ATTEMPTS}), marking as permanently failed\x1b[0m"
+                ui_service_status(
+                    color,
+                    &name,
+                    RED,
+                    "✗",
+                    &format!(
+                        "exceeded max restart attempts ({MAX_RESTART_ATTEMPTS}), marking as permanently failed"
+                    ),
                 );
                 tracing::error!(
                     "{name} exceeded max restart attempts ({MAX_RESTART_ATTEMPTS}), marking as permanently failed"
@@ -728,8 +792,12 @@ pub fn run_services(
                             tracing::warn!(
                                 "stopped {dname} (depends on permanently failed {name})"
                             );
-                            eprintln!(
-                                "  \x1b[31m[{dname}]\x1b[0m \x1b[31mstopped (depends on permanently failed {name})\x1b[0m"
+                            ui_service_status(
+                                RESET,
+                                &dname,
+                                RED,
+                                "✗",
+                                &format!("stopped (depends on permanently failed {name})"),
                             );
                             send_status(
                                 &options.event_tx,
@@ -747,8 +815,14 @@ pub fn run_services(
             // Non-blocking backoff — schedule restart for later instead of sleeping
             let delay_secs = std::cmp::min(1u64 << (*attempts - 1), 30);
             let color = color_map.get(name.as_str()).unwrap_or(&RESET);
-            eprintln!(
-                "  {color}[{name}]{RESET} restarting in {delay_secs}s (attempt {attempts}/{MAX_RESTART_ATTEMPTS})..."
+            ui_service_status(
+                color,
+                &name,
+                YELLOW,
+                "!",
+                &format!(
+                    "restarting in {delay_secs}s (attempt {attempts}/{MAX_RESTART_ATTEMPTS})..."
+                ),
             );
             let restart_at = std::time::Instant::now() + std::time::Duration::from_secs(delay_secs);
             pending_restarts.insert(name, restart_at);
@@ -787,8 +861,12 @@ pub fn run_services(
                     match safe_resolve_cwd(project_dir, sub) {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!(
-                                "  \x1b[31m[{name}]\x1b[0m \x1b[31mfailed to restart: {e}\x1b[0m"
+                            ui_service_status(
+                                RESET,
+                                &name,
+                                RED,
+                                "✗",
+                                &format!("failed to restart: {e}"),
                             );
                             continue;
                         }
@@ -856,18 +934,13 @@ pub fn run_services(
                                     continue;
                                 }
 
-                                let timing = duration
-                                    .map(|d| {
-                                        let ms = d.as_millis();
-                                        if ms < 1000 {
-                                            format!(" ({ms}ms)")
-                                        } else {
-                                            format!(" ({:.1}s)", ms as f64 / 1000.0)
-                                        }
-                                    })
-                                    .unwrap_or_default();
-                                eprintln!(
-                                    "  {color}[{name}]{RESET} \x1b[32m✔ restarted{timing}\x1b[0m"
+                                let timing = ui_readiness_timing(duration);
+                                ui_service_status(
+                                    color,
+                                    &name,
+                                    GREEN,
+                                    "✓",
+                                    &format!("restarted{timing}"),
                                 );
                                 send_status(
                                     &options.event_tx,
@@ -877,8 +950,12 @@ pub fn run_services(
                                 );
                             }
                             Err(error) => {
-                                eprintln!(
-                                    "  \x1b[33m[{name}]\x1b[0m \x1b[33m⚠ restarted but not ready — {error}\x1b[0m"
+                                ui_service_status(
+                                    RESET,
+                                    &name,
+                                    YELLOW,
+                                    "!",
+                                    &format!("restarted but not ready - {error}"),
                                 );
                                 send_status(
                                     &options.event_tx,
@@ -890,8 +967,12 @@ pub fn run_services(
                         }
                     }
                     Err(e) => {
-                        eprintln!(
-                            "  \x1b[31m[{name}]\x1b[0m \x1b[31mfailed to restart: {e}\x1b[0m"
+                        ui_service_status(
+                            RESET,
+                            &name,
+                            RED,
+                            "✗",
+                            &format!("failed to restart: {e}"),
                         );
                     }
                 }
@@ -916,7 +997,7 @@ pub fn run_services(
                                 let (sname, mut child) = locked.remove(pos);
                                 let _ = child.kill();
                                 let _ = child.wait();
-                                eprintln!("  \x1b[33m[{sname}]\x1b[0m stopped by user");
+                                ui_service_status(RESET, &sname, YELLOW, "!", "stopped by user");
                                 send_status(
                                     &options.event_tx,
                                     &service_names,
@@ -1101,10 +1182,12 @@ fn ctrlc_handler(shutdown_state: Arc<AtomicU8>, children: Arc<Mutex<Vec<(String,
                     let prev = state.fetch_add(1, Ordering::Relaxed);
                     if prev == 0 {
                         // First signal: graceful shutdown
-                        eprintln!("\n  Stopping services...");
+                        eprintln!();
+                        ui_warn("Stopping services...");
                     } else {
                         // Second+ signal: force kill
-                        eprintln!("\n  Force-killing services...");
+                        eprintln!();
+                        ui_warn("Force-killing services...");
                         force_kill_children(&kids);
                         break;
                     }
@@ -1122,7 +1205,7 @@ fn force_kill_children(children: &Arc<Mutex<Vec<(String, Child)>>>) {
             Ok(Some(_)) => {} // Already exited
             _ => {
                 let _ = child.kill();
-                eprintln!("  [{name}] force-killed");
+                ui_service_status(RESET, name, RED, "✗", "force-killed");
             }
         }
     }
@@ -1164,10 +1247,11 @@ fn shutdown_children_ordered(
 
     if force {
         let mut locked = children.lock();
-        eprintln!("\n  Force-killing {count} services...");
+        eprintln!();
+        ui_warn(&format!("Force-killing {count} services..."));
         for (name, child) in locked.iter_mut() {
             let _ = child.kill();
-            eprintln!("  [{name}] force-killed");
+            ui_service_status(RESET, name, RED, "✗", "force-killed");
         }
         for (_, child) in locked.iter_mut() {
             let _ = child.wait();
@@ -1175,7 +1259,8 @@ fn shutdown_children_ordered(
         return;
     }
 
-    eprintln!("\n  Stopping {count} services...");
+    eprintln!();
+    ui_warn(&format!("Stopping {count} services..."));
 
     // Build the shutdown order: reverse topological levels (dependents first)
     let shutdown_order: Vec<Vec<String>> = if let Some(groups) = groups {
@@ -1218,12 +1303,16 @@ fn shutdown_children_ordered(
     for (name, child) in locked.iter_mut() {
         match child.try_wait() {
             Ok(Some(status)) => {
-                eprintln!("  [{name}] stopped (exit {})", status.code().unwrap_or(-1));
+                ui_service_note(
+                    RESET,
+                    name,
+                    &format!("stopped (exit {})", status.code().unwrap_or(-1)),
+                );
             }
             _ => {
                 tracing::debug!("force-killing service '{name}'");
                 let _ = child.kill();
-                eprintln!("  [{name}] force-killed");
+                ui_service_status(RESET, name, RED, "✗", "force-killed");
             }
         }
     }

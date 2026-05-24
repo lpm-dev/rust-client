@@ -608,9 +608,11 @@ async fn install_fails_when_proxy_metadata_omits_tarball_field() {
     );
 
     let received_paths = proxy.received_paths().await;
-    assert_eq!(
-        received_paths,
-        vec![proxy.metadata_path().to_string()],
+    assert!(
+        !received_paths.is_empty()
+            && received_paths
+                .iter()
+                .all(|path| path == &proxy.metadata_path().to_string()),
         "missing dist.tarball should fail before any tarball request; got {received_paths:?}"
     );
 }

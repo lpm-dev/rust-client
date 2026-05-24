@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::path::{Path, PathBuf};
@@ -148,16 +148,15 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
             .unwrap()
         );
     } else if removed_paths.is_empty() {
-        output::warn(&format!(
+        install_ui::warn(&format!(
             "No files found for {} — it may not have been added, or was added to a custom path",
             package.bold()
         ));
     } else {
-        output::success(&format!("Removed {}", package.bold()));
+        install_ui::done(&format!("Removed {}", package.bold()));
         for path in &removed_paths {
-            println!("  {}", path.dimmed());
+            eprintln!("  {}", path.dimmed());
         }
-        println!();
     }
 
     Ok(())

@@ -1,8 +1,8 @@
-//! Workflow tests for `lpm use --list`.
+//! Workflow tests for `lpm use`.
 //!
-//! The local-only "list installed Node versions" path. `lpm use node@<v>`
-//! itself triggers a real download from nodejs.org and is out of scope
-//! for the workflow tier — `--list` is the deterministic read surface.
+//! The local-only list/pin/remove paths are deterministic under an isolated
+//! HOME. `lpm use node@<v>` itself triggers a real download from nodejs.org
+//! and stays out of scope for the workflow tier.
 //!
 //! `lpm_runtime::node::list_installed()` reads `<HOME>/.lpm/runtime/node/`,
 //! which is empty in a fresh isolated HOME.
@@ -23,6 +23,15 @@ fn seed_installed_node(project: &TempProject, version: &str) {
     std::fs::write(bin_dir.join("node"), "").expect("failed to seed node binary");
 }
 
+fn managed_node_dir(project: &TempProject, version: &str) -> std::path::PathBuf {
+    project
+        .home()
+        .join(".lpm")
+        .join("runtimes")
+        .join("node")
+        .join(version)
+}
+
 #[test]
 fn use_list_on_empty_runtime_succeeds_with_empty_set() {
     let project = TempProject::empty(r#"{"name":"use-list","version":"1.0.0"}"#);
@@ -37,6 +46,58 @@ fn use_list_on_empty_runtime_succeeds_with_empty_set() {
         "lpm use --list on a fresh HOME must exit 0, got: {}\nstderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "human use --list should not write to stdout, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› No Node versions installed"),
+        "empty human use --list should use the slim info line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Run lpm use node@22 to install one"),
+        "empty human use --list should keep the install hint, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
+        "legacy cliclack glyphs must be gone from use --list stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn use_list_human_output_renders_plain_installed_versions() {
+    let project = TempProject::empty(r#"{"name":"use-list","version":"1.0.0"}"#);
+    seed_installed_node(&project, "22.12.0");
+    seed_installed_node(&project, "20.18.0");
+
+    let output = lpm(&project)
+        .args(["use", "--list"])
+        .output()
+        .expect("failed to run lpm use --list with seeded versions");
+
+    assert!(
+        output.status.success(),
+        "seeded use --list must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Installed Node versions (2)"),
+        "installed human use --list should use the slim summary line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("22.12.0") && stderr.contains("20.18.0"),
+        "installed human use --list should list the available versions, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
+        "installed human use --list must not use legacy bullets or gutters, got:\n{stderr}"
     );
 }
 
@@ -183,9 +244,102 @@ fn use_pin_major_spec_writes_matching_installed_exact_version() {
         String::from_utf8_lossy(&output.stderr),
     );
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "human use --pin should not write to stdout, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Pinned node@22.12.0 in lpm.json"),
+        "human use --pin should use the slim done line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
+        "legacy cliclack glyphs must be gone from use --pin stderr, got:\n{stderr}"
+    );
+
     let lpm_json: serde_json::Value = serde_json::from_str(&project.read_file("lpm.json"))
         .expect("lpm use --pin must write valid lpm.json");
     assert_eq!(lpm_json["runtime"]["node"], serde_json::json!("22.12.0"));
+}
+
+#[test]
+fn use_remove_major_spec_removes_all_matching_installed_versions() {
+    let project = TempProject::empty(r#"{"name":"use-remove","version":"1.0.0"}"#);
+    seed_installed_node(&project, "22.12.0");
+    seed_installed_node(&project, "20.18.0");
+    seed_installed_node(&project, "20.17.0");
+
+    let output = lpm(&project)
+        .args(["use", "remove", "node@20"])
+        .output()
+        .expect("failed to run lpm use remove node@20");
+
+    assert!(
+        output.status.success(),
+        "lpm use remove node@20 must succeed when matching managed runtimes exist\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(
+        !managed_node_dir(&project, "20.18.0").exists()
+            && !managed_node_dir(&project, "20.17.0").exists(),
+        "remove must delete all matching 20.x runtimes"
+    );
+    assert!(
+        managed_node_dir(&project, "22.12.0").exists(),
+        "remove must not delete non-matching runtimes"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "human use remove should not write to stdout, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Removed 2 Node versions"),
+        "remove must report the number of deleted runtimes, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("20.18.0") && stderr.contains("20.17.0"),
+        "remove must list each deleted runtime, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn use_remove_warns_when_project_pin_still_matches_removed_runtime() {
+    let project = TempProject::empty(r#"{"name":"use-remove","version":"1.0.0"}"#);
+    seed_installed_node(&project, "20.18.0");
+    project.write_file(
+        "lpm.json",
+        r#"{
+  "runtime": {
+    "node": "20"
+  }
+}
+"#,
+    );
+
+    let output = lpm(&project)
+        .args(["use", "remove", "node@20"])
+        .output()
+        .expect("failed to run lpm use remove node@20 with existing pin");
+
+    assert!(
+        output.status.success(),
+        "lpm use remove node@20 must succeed when the runtime is pinned\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lpm.json still pins node@20"),
+        "remove must warn when the project pin would auto-reinstall the deleted runtime, got:\n{stderr}"
+    );
 }
 
 #[test]

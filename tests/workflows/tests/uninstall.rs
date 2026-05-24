@@ -124,14 +124,13 @@ fn uninstall_removes_dev_dependency_in_same_pass() {
     );
 }
 
-/// LPM's uninstall drops `lpm.lock` entirely rather than rewriting it
-/// without the removed entry. A subsequent `lpm install` regenerates it
-/// from the (now-correct) manifest. Pinning this contract because a
-/// regression to "selectively edit the lockfile" would re-introduce the
-/// stale-entry-survival bugs that the delete-and-regenerate model was
-/// chosen to avoid.
+/// LPM's uninstall keeps `lpm.lock` on disk, but rewrites it to the
+/// post-uninstall graph. A subsequent `lpm install <pkg>` diff relies on
+/// that preserved file; deleting it would lose the prior direct-dep
+/// snapshot, while keeping stale entries would misreport unchanged deps
+/// as newly added.
 #[test]
-fn uninstall_drops_lpm_lock_entirely_after_removal() {
+fn uninstall_preserves_lpm_lock_after_removal() {
     let project = TempProject::empty("");
     seed_installed_package(&project, "drop-lock", "2.0.0");
     assert!(
@@ -145,18 +144,16 @@ fn uninstall_drops_lpm_lock_entirely_after_removal() {
         .success();
 
     assert!(
-        !project.path().join("lpm.lock").exists(),
-        "lpm.lock must be deleted after uninstall (delete-and-regenerate model)"
+        project.path().join("lpm.lock").exists(),
+        "lpm.lock must remain after uninstall so follow-up adds can diff against the prior graph"
     );
 }
 
 /// The binary lockfile is committed as the twin of `lpm.lock`, not an
-/// independent cache. Uninstall must therefore remove `lpm.lockb`
-/// alongside `lpm.lock`; leaving the binary lockfile behind creates a
-/// brief split-brain state where the text lockfile is gone but tooling
-/// can still read stale package entries from `lpm.lockb`.
+/// independent cache. Uninstall must therefore preserve `lpm.lockb`
+/// alongside the rewritten text lockfile so the pair stays in sync.
 #[test]
-fn uninstall_drops_lpm_lockb_alongside_lpm_lock_after_removal() {
+fn uninstall_preserves_lpm_lockb_alongside_lpm_lock_after_removal() {
     let project = TempProject::empty("");
     seed_installed_package(&project, "drop-lockb", "2.0.0");
     std::fs::write(
@@ -179,12 +176,12 @@ fn uninstall_drops_lpm_lockb_alongside_lpm_lock_after_removal() {
         .success();
 
     assert!(
-        !project.path().join("lpm.lock").exists(),
-        "lpm.lock must be deleted after uninstall (delete-and-regenerate model)"
+        project.path().join("lpm.lock").exists(),
+        "lpm.lock must remain after uninstall"
     );
     assert!(
-        !project.path().join("lpm.lockb").exists(),
-        "lpm.lockb must be deleted alongside lpm.lock after uninstall"
+        project.path().join("lpm.lockb").exists(),
+        "lpm.lockb must remain alongside lpm.lock after uninstall"
     );
 }
 
@@ -219,6 +216,71 @@ fn uninstall_unknown_package_warns_and_exits_zero() {
         pkg_json["dependencies"]["present"],
         serde_json::json!("^1.0.0"),
         "manifest must be untouched when no target was actually removed"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("! No packages were removed (not found in any target manifest)"),
+        "human stderr should use the slim warning line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
+        "legacy cliclack gutter glyphs must be gone from uninstall stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn uninstall_human_output_uses_slim_ui_diff_and_done_lines() {
+    let project = TempProject::empty(
+        r#"{"name":"ui-test","version":"1.0.0","dependencies":{"diff":"^1.0.0","husky":"^9.0.0"}}"#,
+    );
+    project.write_file("lpm.lock", "placeholder lockfile");
+    project.write_file(
+        "node_modules/diff/package.json",
+        r#"{"name":"diff","version":"1.0.0"}"#,
+    );
+    project.write_file(
+        "node_modules/husky/package.json",
+        r#"{"name":"husky","version":"9.0.0"}"#,
+    );
+
+    let out = lpm(&project)
+        .args(["uninstall", "diff", "husky"])
+        .output()
+        .expect("spawn lpm uninstall slim-ui test");
+
+    assert!(
+        out.status.success(),
+        "uninstall must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "human uninstall should not write to stdout, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("› Removing 2 packages from 1 target manifest"),
+        "expected slim phase line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("- diff") && stderr.contains("- husky"),
+        "expected removal diff rows, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · removed 2 packages in "),
+        "expected slim completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Removed diff from dependencies")
+            && !stderr.contains("Removed husky from dependencies")
+            && !stderr.contains("●")
+            && !stderr.contains("◆")
+            && !stderr.contains("│"),
+        "legacy uninstall chatter must be gone, got:\n{stderr}"
     );
 }
 

@@ -1798,6 +1798,53 @@ async fn mount_ms_2_1_3(mock: &MockRegistry) {
     mock.with_batch_metadata(vec![batch_meta]).await;
 }
 
+async fn mount_registry_version(
+    mock: &MockRegistry,
+    name: &str,
+    version: &str,
+    dependencies: serde_json::Value,
+) -> serde_json::Value {
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": name,
+            "version": version,
+            "dependencies": dependencies,
+        }),
+        &[],
+    );
+    let integrity = compute_integrity(&tarball);
+    mock.with_package_and_deps(name, version, &tarball, dependencies.clone())
+        .await;
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "dist": {
+            "tarball": format!("{}/tarballs/{name}/-/{name}-{version}.tgz", mock.url()),
+            "integrity": integrity,
+        },
+        "dependencies": dependencies,
+    })
+}
+
+fn packument(name: &str, latest: &str, versions: Vec<serde_json::Value>) -> serde_json::Value {
+    let mut versions_map = serde_json::Map::new();
+    let mut time_map = serde_json::Map::new();
+    for version in versions {
+        let version_str = version["version"]
+            .as_str()
+            .expect("packument versions must have a version string")
+            .to_string();
+        versions_map.insert(version_str.clone(), version);
+        time_map.insert(version_str, serde_json::json!("2025-01-01T00:00:00.000Z"));
+    }
+    serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": latest },
+        "versions": versions_map,
+        "time": time_map,
+    })
+}
+
 /// row 1 (smoke): a bare `lpm install ms` must write
 /// `"ms": "^2.1.3"` into `package.json`, NOT `"ms": "*"`.
 ///
@@ -1843,6 +1890,189 @@ async fn install_bare_writes_caret_resolved_not_wildcard() {
         ms_spec, "^2.1.3",
         "default: bare `lpm install ms` must save `^<resolved>`, got `{ms_spec}`. \
          If this is `\"*\"`, the placeholder is leaking into the final manifest."
+    );
+}
+
+#[tokio::test]
+async fn install_add_with_transitive_same_name_keeps_only_the_new_direct_version() {
+    let mock = MockRegistry::start().await;
+
+    let kit_v1 = mount_registry_version(
+        &mock,
+        "kit",
+        "1.0.0",
+        serde_json::json!({ "chalk": "4.1.2" }),
+    )
+    .await;
+    let chalk_v4 = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "chalk",
+            "version": "4.1.2",
+            "dependencies": {},
+        }),
+        &[],
+    );
+    let chalk_v5 = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "chalk",
+            "version": "5.0.0",
+            "dependencies": {},
+        }),
+        &[],
+    );
+    mock.with_full_package_metadata(
+        "chalk",
+        "5.0.0",
+        &[
+            ("4.1.2", serde_json::json!({}), Some(chalk_v4)),
+            ("5.0.0", serde_json::json!({}), Some(chalk_v5)),
+        ],
+    )
+    .await;
+
+    mock.with_batch_metadata(vec![packument("kit", "1.0.0", vec![kit_v1])])
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "direct-vs-transitive-name-collision",
+        "version": "1.0.0",
+        "dependencies": {
+            "kit": "^1.0.0"
+        }
+    }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "chalk",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install add-path for direct/transitive name collision");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "install add-path must succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("appears as a direct dep more than once"),
+        "install must not misclassify the transitive chalk as a second direct dep:\n{stderr}"
+    );
+    assert!(
+        stderr.matches("+ chalk@").count() == 1,
+        "added-list must contain exactly one chalk entry:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("+ chalk@5.0.0"),
+        "added-list must keep the newly added direct chalk version:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("+ chalk@4.1.2"),
+        "added-list must not surface the transitive chalk version as direct:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn uninstall_then_reinstall_same_packages_reports_only_readded_direct_deps() {
+    let mock = MockRegistry::start().await;
+
+    let alpha_v1 = mount_registry_version(&mock, "alpha", "1.0.0", serde_json::json!({})).await;
+    let beta_v1 = mount_registry_version(&mock, "beta", "1.0.0", serde_json::json!({})).await;
+    let gamma_v1 = mount_registry_version(&mock, "gamma", "1.0.0", serde_json::json!({})).await;
+
+    mock.with_batch_metadata(vec![
+        packument("alpha", "1.0.0", vec![alpha_v1]),
+        packument("beta", "1.0.0", vec![beta_v1]),
+        packument("gamma", "1.0.0", vec![gamma_v1]),
+    ])
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "reinstall-only-removed-direct-deps",
+        "version": "1.0.0",
+        "dependencies": {
+            "alpha": "^1.0.0",
+            "beta": "^1.0.0",
+            "gamma": "^1.0.0"
+        }
+    }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let uninstall = lpm(&project)
+        .args(["uninstall", "alpha", "beta"])
+        .output()
+        .expect("failed to run lpm uninstall for round-trip regression test");
+    assert!(
+        uninstall.status.success(),
+        "uninstall must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&uninstall.stdout),
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    assert!(
+        project.file_exists("lpm.lock"),
+        "uninstall must preserve lpm.lock so a follow-up add can diff against the prior install"
+    );
+
+    let reinstall = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "alpha",
+            "beta",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to re-add previously removed deps");
+
+    let stderr = String::from_utf8_lossy(&reinstall.stderr);
+    let stdout = String::from_utf8_lossy(&reinstall.stdout);
+    assert!(
+        reinstall.status.success(),
+        "reinstall must succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("› Installing 2 packages"),
+        "reinstall phase must report only the requested packages:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("+ alpha@1.0.0") && stderr.contains("+ beta@1.0.0"),
+        "reinstall must surface only the re-added direct deps:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("+ gamma@1.0.0"),
+        "reinstall must not report unchanged direct deps as added:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · added 2 packages in "),
+        "reinstall completion line must report only the requested packages:\n{stderr}"
     );
 }
 

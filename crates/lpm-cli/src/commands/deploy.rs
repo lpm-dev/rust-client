@@ -739,6 +739,7 @@ pub async fn run(
         false, // auto_build — build is a separate concern
         Some(&target_set),
         None, // direct_versions_out: deploy does not finalize placeholders
+        None, // requested_add_count: deploy is not an add-path install
         None, // script_policy_override: `lpm deploy` does not expose policy flags
         None, // advisor_override: `lpm deploy` does not expose `--advisor`
         None, // min_release_age_override: deploy already bypasses via allow_new=true above

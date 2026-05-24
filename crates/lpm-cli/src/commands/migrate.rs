@@ -465,6 +465,7 @@ pub async fn run(
             false, // auto_build
             None,  // target_set: migrate is single-project
             None,  // direct_versions_out: migrate does not finalize placeholders
+            None,  // requested_add_count: migrate is not an add-path install
             None,  // script_policy_override: `lpm migrate` does not expose policy flags
             None,  // advisor_override: `lpm migrate` does not expose `--advisor`
             None,  // min_release_age_override: `lpm migrate` uses the chain

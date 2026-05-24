@@ -1,17 +1,16 @@
-use crate::{auth, output};
+use super::whoami_ui;
+use crate::auth;
 use lpm_common::color::Painted;
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError};
 use lpm_registry::RegistryClient;
 
 pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmError> {
     if !json_output && !has_local_whoami_auth(client.base_url()) {
-        println!();
-        output::info(&format!("Not logged in to {}.", client.base_url().bold()));
-        output::info(&format!(
+        whoami_ui::phase(&format!("Not logged in to {}.", client.base_url().bold()));
+        whoami_ui::phase(&format!(
             "Run {} to authenticate.",
             login_command_for_registry(client.base_url()).dimmed()
         ));
-        println!();
         return Ok(());
     }
 
@@ -56,26 +55,24 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         return Ok(());
     }
 
-    println!();
     if let Some(email_str) = email {
-        output::success(&format!(
+        whoami_ui::done(&format!(
             "Logged in as {} — {}",
             display_name.bold(),
             email_str.dimmed()
         ));
     } else {
-        output::success(&format!("Logged in as {}", display_name.bold()));
+        whoami_ui::done(&format!("Logged in as {}", display_name.bold()));
     }
 
     // Plan & Pool
     if let Some(tier) = &user.plan_tier {
-        println!();
-        output::field("Plan", &tier.to_uppercase());
+        whoami_ui::detail("Plan", &tier.to_uppercase());
 
         if user.has_pool_access == Some(true) {
-            output::success_inline("Pool", "Active");
+            whoami_ui::detail("Pool", "Active");
         } else {
-            output::field("Pool", "Not subscribed");
+            whoami_ui::detail("Pool", "Not subscribed");
         }
     }
 
@@ -86,7 +83,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         } else {
             "disabled".yellow()
         };
-        output::field("2FA", &status);
+        whoami_ui::detail("2FA", &status);
     }
 
     // Usage & Limits
@@ -99,31 +96,31 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 let limit_mb = limit_bytes as f64 / (1024.0 * 1024.0);
                 let storage_msg = format!("{:.2}MB / {:.0}MB", storage_mb, limit_mb);
                 if usage.storage_bytes > limit_bytes {
-                    output::warn(&format!("Storage: {} (OVER LIMIT)", storage_msg));
+                    whoami_ui::warn(&format!("Storage: {} (OVER LIMIT)", storage_msg));
                 } else {
-                    output::field("Storage", &storage_msg);
+                    whoami_ui::detail("Storage", &storage_msg);
                 }
             } else {
-                output::field("Storage", &format!("{:.2}MB", storage_mb));
+                whoami_ui::detail("Storage", &format!("{:.2}MB", storage_mb));
             }
 
             // Package count
             if let Some(limit_pkgs) = limits.private_packages {
                 if limit_pkgs == 0 || limit_pkgs == u32::MAX {
-                    output::field(
+                    whoami_ui::detail(
                         "Private Packages",
                         &format!("{} (Unlimited)", usage.private_packages),
                     );
                 } else {
                     let pkg_msg = format!("{} / {}", usage.private_packages, limit_pkgs);
                     if usage.private_packages > limit_pkgs {
-                        output::warn(&format!("Private Packages: {} (OVER LIMIT)", pkg_msg));
+                        whoami_ui::warn(&format!("Private Packages: {} (OVER LIMIT)", pkg_msg));
                     } else {
-                        output::field("Private Packages", &pkg_msg);
+                        whoami_ui::detail("Private Packages", &pkg_msg);
                     }
                 }
             } else {
-                output::field("Private Packages", &format!("{}", usage.private_packages));
+                whoami_ui::detail("Private Packages", &format!("{}", usage.private_packages));
             }
 
             // Over-limit warning
@@ -135,55 +132,55 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 .is_some_and(|l| l > 0 && l != u32::MAX && usage.private_packages > l);
 
             if over_storage || over_packages {
-                println!();
-                output::warn("Your account is over its plan limits.");
-                output::warn("Write access (publishing, inviting members) is restricted.");
-                output::warn("Upgrade your plan: https://lpm.dev/dashboard/settings/billing");
+                whoami_ui::warn("Your account is over its plan limits.");
+                whoami_ui::warn("Write access (publishing, inviting members) is restricted.");
+                whoami_ui::warn("Upgrade your plan: https://lpm.dev/dashboard/settings/billing");
             }
         } else {
-            output::field("Storage", &format!("{:.2}MB", storage_mb));
-            output::field("Private Packages", &format!("{}", usage.private_packages));
+            whoami_ui::detail("Storage", &format!("{:.2}MB", storage_mb));
+            whoami_ui::detail("Private Packages", &format!("{}", usage.private_packages));
         }
     }
 
     // Available Scopes
-    println!();
-    output::header("Available Scopes");
+    whoami_ui::blank_line();
+    whoami_ui::phase("Available Scopes");
     if let Some(profile) = &user.profile_username {
-        println!("    Personal: {}", format!("@lpm.dev/{profile}.*").cyan());
+        whoami_ui::list_item(&format!(
+            "Personal: {}",
+            format!("@lpm.dev/{profile}.*").cyan()
+        ));
     } else {
-        output::warn("  Personal: Not set (https://lpm.dev/dashboard/settings)");
+        whoami_ui::warn("Personal: Not set (https://lpm.dev/dashboard/settings)");
     }
 
     if !user.organizations.is_empty() {
-        println!("    Organizations:");
+        whoami_ui::list_item("Organizations:");
         for org in &user.organizations {
             let role = org.role.as_deref().unwrap_or("member");
-            println!(
-                "      {} {}",
+            whoami_ui::list_item(&format!(
+                "  {} {}",
                 format!("@lpm.dev/{}.*", org.slug).cyan(),
                 format!("({role})").dimmed()
-            );
+            ));
         }
     }
 
     // B4: Show external registries with stored tokens
     let external_registries = auth::list_stored_registries();
     if !external_registries.is_empty() {
-        println!();
-        output::header("External Registries");
+        whoami_ui::blank_line();
+        whoami_ui::phase("External Registries");
         for (name, status) in &external_registries {
-            println!("    {} {}", format!("● {name}").cyan(), status.dimmed());
+            whoami_ui::list_item(&format!("{name} {}", status.dimmed()));
         }
     }
 
     // Show token expiry warnings
     let expiry_warnings = auth::check_token_expiry_warnings();
     for warning in &expiry_warnings {
-        output::warn(warning);
+        whoami_ui::warn(warning);
     }
-
-    println!();
     Ok(())
 }
 

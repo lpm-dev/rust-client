@@ -1,7 +1,10 @@
-use crate::{oidc, output};
+use crate::{install_ui, oidc};
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use std::path::Path;
+
+fn hint_line(message: &str) {
+    eprintln!("  {}", install_ui::dim(message));
+}
 
 /// resolve a usable LPM bearer for CI/CD `.npmrc` generation.
 /// `setup` is best-effort — when no token is available it falls back
@@ -41,8 +44,8 @@ pub async fn run(
             Ok(oidc_token) => Some(oidc_token.token),
             Err(e) => {
                 if !json_output {
-                    output::warn(&format!("OIDC token exchange failed: {e}"));
-                    output::warn("Falling back to stored token / ${LPM_TOKEN} placeholder.");
+                    install_ui::warn(&format!("OIDC token exchange failed: {e}"));
+                    install_ui::warn("Falling back to stored token / ${LPM_TOKEN} placeholder.");
                 }
                 resolve_lpm_bearer_optional(registry_url).await
             }
@@ -113,22 +116,23 @@ pub async fn run(
             let _ = std::fs::set_permissions(&npmrc_path, std::fs::Permissions::from_mode(0o600));
         }
 
-        output::success(&format!("Generated {}", ".npmrc".bold()));
-        println!("  {}", npmrc_path.display().to_string().dimmed());
+        install_ui::done(&format!("Generated {}", install_ui::bold(".npmrc")));
+        hint_line(&npmrc_path.display().to_string());
 
         if use_oidc && token.is_some() {
-            output::info("Using OIDC-exchanged token.");
+            install_ui::phase("Using OIDC-exchanged token.");
         }
         if proxy {
-            output::info("Using proxy mode — all npm traffic routed through lpm.dev.");
+            install_ui::phase("Using proxy mode — all npm traffic routed through lpm.dev.");
         }
 
         if uses_env {
-            println!();
-            output::warn("No token found — .npmrc uses ${LPM_TOKEN} placeholder.");
-            println!("  Set {} in your CI environment.", "LPM_TOKEN".bold());
+            install_ui::warn("No token found — .npmrc uses ${LPM_TOKEN} placeholder.");
+            hint_line(&format!(
+                "Set {} in your CI environment.",
+                install_ui::bold("LPM_TOKEN")
+            ));
         }
-        println!();
     }
 
     Ok(())

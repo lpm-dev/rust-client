@@ -14,6 +14,18 @@ pub fn suppress_stdout(enabled: bool) -> Result<Option<gag::Gag>, String> {
         .map_err(|error| format!("failed to suppress stdout: {error}"))
 }
 
+/// Suppress stderr for nested command execution when the outer command
+/// owns the human-readable stderr contract.
+pub fn suppress_stderr(enabled: bool) -> Result<Option<gag::Gag>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+
+    gag::Gag::stderr()
+        .map(Some)
+        .map_err(|error| format!("failed to suppress stderr: {error}"))
+}
+
 /// Print a success message.
 pub fn success(msg: &str) {
     let _ = cliclack::log::success(msg);
@@ -32,11 +44,6 @@ pub fn info(msg: &str) {
 /// Print a label: value pair with the label dimmed.
 pub fn field(label: &str, value: &str) {
     println!("  {}: {value}", label.dimmed());
-}
-
-/// Print a success field (green checkmark + label + value).
-pub fn success_inline(label: &str, value: &str) {
-    println!("  {} {}: {value}", "✔".green(), label.dimmed());
 }
 
 /// Print a section header.
