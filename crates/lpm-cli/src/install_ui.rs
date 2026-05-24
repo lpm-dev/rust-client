@@ -13,6 +13,7 @@
 //!   * `✗` red    — failure terminus
 //!   * `!` yellow — warning / advisory line (e.g. audit summary)
 //!   * `+` plain  — direct-dep change in the post-install diff list
+//!   * `-` plain  — removed entry in an uninstall / prune diff list
 //!
 //! Caller is responsible for `if json_output { … } else { install_ui::… }`
 //! gating; this module never inspects `--json`.
@@ -91,6 +92,24 @@ pub fn warn(msg: &str) {
     eprintln!("{}{} {msg}", reset_prefix(), "!".yellow());
 }
 
+fn diff_entry(glyph: &str, name: &str, version: Option<&str>, hint: Option<&str>) {
+    let mut suffix = String::new();
+    if let Some(version) = version {
+        suffix.push('@');
+        suffix.push_str(version);
+    }
+    if let Some(hint) = hint {
+        suffix.push(' ');
+        suffix.push_str(hint);
+    }
+
+    if suffix.is_empty() {
+        eprintln!("{}{glyph} {name}", reset_prefix());
+    } else {
+        eprintln!("{}{glyph} {name}{}", reset_prefix(), suffix.dimmed());
+    }
+}
+
 /// Direct-dependency diff entry: `+ {name}@{version}{?hint}`.
 ///
 /// `name` renders unstyled; `@{version}` and the optional `hint` render
@@ -98,11 +117,16 @@ pub fn warn(msg: &str) {
 /// `hint` is for "(v6.0.3 available)" / "(deprecated)" / "(offline)" —
 /// caller passes the parenthesized suffix verbatim.
 pub fn plus(name: &str, version: &str, hint: Option<&str>) {
-    let suffix = match hint {
-        Some(h) => format!("@{version} {h}").dimmed(),
-        None => format!("@{version}").dimmed(),
-    };
-    eprintln!("{}+ {name}{suffix}", reset_prefix());
+    diff_entry("+", name, Some(version), hint);
+}
+
+/// Removal diff entry: `- {name}{?@version}{?hint}`.
+///
+/// Used by uninstall / prune style flows. `name` renders unstyled; the
+/// optional `@{version}` and optional `hint` render dimmed so the removed
+/// thing remains the visual anchor of the line.
+pub fn minus(name: &str, version: Option<&str>, hint: Option<&str>) {
+    diff_entry("-", name, version, hint);
 }
 
 /// Render a Duration as a short human string suitable for inlining in

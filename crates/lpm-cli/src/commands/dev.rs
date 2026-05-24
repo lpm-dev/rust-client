@@ -1,4 +1,5 @@
-use crate::output;
+use super::dev_ui;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::io::IsTerminal;
@@ -99,7 +100,7 @@ pub async fn run(
 
     // Warn about privileged ports that may require elevated permissions
     if is_privileged_port(port) {
-        output::warn(&format!(
+        dev_ui::warn(&format!(
             "Port {} is privileged. You may need elevated permissions (sudo) on Linux.",
             port
         ));
@@ -214,10 +215,10 @@ pub async fn run(
     let https_setup: Option<lpm_cert::HttpsSetup> = https_result?;
     if let Some(setup) = https_setup {
         if setup.ca_freshly_installed {
-            output::success("root CA generated and installed to trust store");
+            dev_ui::done("root CA generated and installed to trust store");
         }
         if setup.cert_freshly_generated {
-            output::success("project certificate generated");
+            dev_ui::done("project certificate generated");
         }
         extra_env.extend(setup.env_vars);
         startup.https_active = true;
@@ -235,17 +236,16 @@ pub async fn run(
             };
             startup.network_addr = Some(addr_str);
 
-            println!();
             let url = if primary.is_ipv6 {
                 format!("{scheme}://[{}]:{port}", primary.ip)
             } else {
                 format!("{scheme}://{}:{port}", primary.ip)
             };
-            println!(
-                "  {} {} {}",
-                "●".green(),
-                format!("Network: {}", url.bold()).green(),
-                format!("({})", primary.interface_type).dimmed()
+            dev_ui::blank_line();
+            dev_ui::detail_with_hint(
+                "Network",
+                &install_ui::bold(&url),
+                &format!("({})", primary.interface_type),
             );
 
             // Show additional addresses
@@ -256,22 +256,22 @@ pub async fn run(
                     } else {
                         format!("{scheme}://{}:{port}", addr.ip)
                     };
-                    println!("    {} ({})", url, addr.interface_type.to_string().dimmed());
+                    dev_ui::hint_line(&format!("{} ({})", url, addr.interface_type));
                 }
             }
         } else {
-            output::warn("no network interfaces found");
+            dev_ui::warn("no network interfaces found");
         }
 
         // QR code
         if !net_info.qr_code.is_empty() {
-            println!();
-            print!("{}", net_info.qr_code);
+            dev_ui::blank_line();
+            dev_ui::raw_block(&net_info.qr_code);
         }
 
         // Warnings
         for warning in &net_info.warnings {
-            output::warn(warning);
+            dev_ui::warn(warning);
         }
 
         if https
@@ -284,20 +284,24 @@ pub async fn run(
                 if !ca_cert_data.is_empty() {
                     let ca_port = port + 1;
                     tokio::spawn(serve_ca_cert(ca_port, ca_cert_data));
-                    println!();
-                    println!(
-                        "  {} First time on mobile? Visit {} to install the CA certificate",
-                        "📱".dimmed(),
-                        format!("http://{}:{ca_port}", primary.ip).bold()
+                    dev_ui::blank_line();
+                    dev_ui::detail(
+                        "Mobile",
+                        &format!(
+                            "First time on mobile? Visit {} to install the CA certificate",
+                            install_ui::bold(&format!("http://{}:{ca_port}", primary.ip))
+                        ),
                     );
                 }
             } else {
-                println!();
-                println!(
-                    "  {} mobile setup: enable with {} or copy {} to the device manually",
-                    "📱".dimmed(),
-                    "--allow-ca-bootstrap".bold(),
-                    "rootCA.pem".bold()
+                dev_ui::blank_line();
+                dev_ui::detail(
+                    "Mobile",
+                    &format!(
+                        "enable with {} or copy {} to the device manually",
+                        install_ui::bold("--allow-ca-bootstrap"),
+                        install_ui::bold("rootCA.pem")
+                    ),
                 );
             }
         }
@@ -313,7 +317,7 @@ pub async fn run(
             }
         }
 
-        println!();
+        dev_ui::blank_line();
     }
 
     // ── Dashboard event channel ─────────────────────────────────────
@@ -341,7 +345,7 @@ pub async fn run(
         if let Some(domain) = tunnel_domain
             && !quiet
         {
-            output::info(&format!("tunnel domain: {domain}"));
+            dev_ui::detail("Tunnel domain", domain);
         }
 
         // ── Inspector startup (paired with tunnel) ──────────────────
@@ -354,7 +358,7 @@ pub async fn run(
             Ok(db) => lpm_inspect::state::InspectorState::with_db(port, db),
             Err(e) => {
                 if !quiet {
-                    output::warn(&format!("inspector db failed: {e} — using in-memory only"));
+                    dev_ui::warn(&format!("inspector db failed: {e} — using in-memory only"));
                 }
                 lpm_inspect::state::InspectorState::new(port)
             }
@@ -375,7 +379,7 @@ pub async fn run(
                 Err(e) if strict => return Err(e),
                 Err(e) => {
                     if !quiet {
-                        output::warn(&format!("inspector failed to start: {e}"));
+                        dev_ui::warn(&format!("inspector failed to start: {e}"));
                     }
                 }
             }
@@ -405,7 +409,7 @@ pub async fn run(
              .gitignore if you haven't already."
         );
         if !quiet {
-            output::warn(
+            dev_ui::warn(
                 "tunnel webhook capture persists full request/response bodies and headers \
                  under .lpm/webhooks/ + .lpm/webhook-log*.jsonl. \
                  Add `.lpm/webhooks/` and `.lpm/webhook-log*` to .gitignore.",
@@ -543,39 +547,33 @@ pub async fn run(
                         });
                     }
 
-                    println!(
-                        "  {} {}",
-                        "●".green(),
-                        format!(
-                            "Tunnel: {} → localhost:{}",
-                            session.tunnel_url.bold(),
+                    dev_ui::detail(
+                        "Tunnel",
+                        &format!(
+                            "{} → localhost:{}",
+                            install_ui::bold(&session.tunnel_url),
                             session.local_port,
-                        )
-                        .green()
+                        ),
                     );
                     if let Some(ref auth) = tunnel_auth_display {
-                        println!(
-                            "  {} {}",
-                            "🔒".dimmed(),
-                            format!("Auth required: add header X-Tunnel-Auth: {auth}").dimmed()
-                        );
-                        println!(
-                            "  {} {}",
-                            " ".dimmed(),
-                            format!("Browser: {}?__tunnel_auth={auth}", session.tunnel_url)
-                                .dimmed()
-                        );
+                        dev_ui::hint_line(&format!(
+                            "Auth required: add header X-Tunnel-Auth: {auth}"
+                        ));
+                        dev_ui::hint_line(&format!(
+                            "Browser: {}?__tunnel_auth={auth}",
+                            session.tunnel_url
+                        ));
                     }
                 },
                 |msg| {
-                    eprintln!("  {} {}", "⚠".yellow(), msg);
+                    dev_ui::warn(msg);
                     // Provide actionable hints based on Worker error messages
                     if msg.contains("not claimed") {
-                        eprintln!("    Run: lpm tunnel claim <domain>");
+                        dev_ui::hint_line("Run: lpm tunnel claim <domain>");
                     } else if msg.contains("Pro plan") || msg.contains("plan_required") {
-                        eprintln!("    Upgrade at: https://lpm.dev/pricing");
+                        dev_ui::hint_line("Upgrade at: https://lpm.dev/pricing");
                     } else if msg.contains("concurrent") {
-                        eprintln!("    Close other tunnels first, or upgrade your plan");
+                        dev_ui::hint_line("Close other tunnels first, or upgrade your plan");
                     }
                 },
             )
@@ -775,8 +773,8 @@ pub async fn run(
     // ── Single service: start dev server ────────────────────────────
     let scheme = if https { "https" } else { "http" };
     let url = format!("{scheme}://localhost:{port}");
-    println!("  {} {}", "●".cyan(), format!("Local: {url}").cyan());
-    println!();
+    dev_ui::detail("Local", &install_ui::bold(&url));
+    dev_ui::blank_line();
 
     // Start readiness check + browser open in background thread (non-blocking)
     {
@@ -787,12 +785,11 @@ pub async fn run(
             // Wait for port to be ready (up to 30s)
             match lpm_runner::ready::wait_for_port(port_check, 30) {
                 Ok(duration) => {
-                    eprintln!("  {} ready ({})", "✔".green(), format_duration(duration));
+                    dev_ui::done_ready("Local server", duration);
                 }
                 Err(msg) => {
-                    output::warn(&format!(
-                        "Service not ready after 30s — opening browser anyway\n  {msg}"
-                    ));
+                    dev_ui::warn("Service not ready after 30s — opening browser anyway");
+                    dev_ui::hint_line(&msg);
                 }
             }
             // Open browser regardless of readiness outcome — on timeout the user
@@ -850,67 +847,109 @@ struct StartupInfo {
     inspector_url: Option<String>,
 }
 
-fn print_startup_banner(info: &StartupInfo, project_dir: &Path) {
-    println!();
+#[derive(Debug, PartialEq, Eq)]
+struct StartupBannerLine {
+    label: &'static str,
+    value: String,
+    hint: Option<String>,
+}
 
-    // Node version (pre-fetched in parallel)
+fn node_source_hint(project_dir: &Path) -> &'static str {
+    if project_dir.join(".nvmrc").exists() {
+        ".nvmrc"
+    } else if project_dir.join(".node-version").exists() {
+        ".node-version"
+    } else {
+        "system"
+    }
+}
+
+fn normalize_env_banner_status(status: &str) -> (String, Option<String>) {
+    match status {
+        ".env loaded" => ("loaded".to_string(), Some("(.env)".to_string())),
+        "created from .env.example" => ("created".to_string(), Some("(.env.example)".to_string())),
+        _ => (status.to_string(), None),
+    }
+}
+
+fn startup_banner_lines(info: &StartupInfo, project_dir: &Path) -> Vec<StartupBannerLine> {
+    let mut lines = Vec::new();
+
     if let Some(ref version) = info.node_version {
-        // Check for .nvmrc / .node-version to show source
-        let source = if project_dir.join(".nvmrc").exists() {
-            "from .nvmrc"
-        } else if project_dir.join(".node-version").exists() {
-            "from .node-version"
-        } else {
-            "system"
-        };
-        let node_label = format!("Node     {version}");
-        let source_str = format!("({source})");
-        println!("  {} {node_label}  {}", "●".cyan(), source_str.dimmed());
+        lines.push(StartupBannerLine {
+            label: "Using Node",
+            value: version.clone(),
+            hint: Some(format!("({})", node_source_hint(project_dir))),
+        });
     }
 
-    // Deps status
     if !info.deps_status.is_empty() {
-        println!("  {} Deps  {}", "●".cyan(), info.deps_status.dimmed());
+        lines.push(StartupBannerLine {
+            label: "Dependencies",
+            value: info.deps_status.clone(),
+            hint: None,
+        });
     }
 
-    // Env status
     if let Some(ref status) = info.env_status {
-        println!("  {} Env  {}", "●".cyan(), status.dimmed());
+        let (value, hint) = normalize_env_banner_status(status);
+        lines.push(StartupBannerLine {
+            label: "Env",
+            value,
+            hint,
+        });
     }
 
-    // HTTPS
     if info.https_active {
-        println!("  {} HTTPS  {}", "●".cyan(), "certificate valid".dimmed());
+        lines.push(StartupBannerLine {
+            label: "HTTPS",
+            value: "enabled".to_string(),
+            hint: Some("(trusted local certificate)".to_string()),
+        });
     }
 
-    // Tunnel
     if let Some(ref source) = info.tunnel_source {
-        if let Some(ref url) = info.tunnel_url {
-            let tunnel_label = format!("Tunnel   {url}");
-            let source_str = format!("({source})");
-            println!("  {} {tunnel_label}  {}", "●".cyan(), source_str.dimmed());
+        lines.push(StartupBannerLine {
+            label: "Tunnel",
+            value: info
+                .tunnel_url
+                .clone()
+                .unwrap_or_else(|| "connecting...".to_string()),
+            hint: Some(format!("({source})")),
+        });
+    }
+
+    if let Some(ref url) = info.inspector_url {
+        lines.push(StartupBannerLine {
+            label: "Inspect",
+            value: url.clone(),
+            hint: None,
+        });
+    }
+
+    if let Some(ref addr) = info.network_addr {
+        lines.push(StartupBannerLine {
+            label: "Network",
+            value: addr.clone(),
+            hint: None,
+        });
+    }
+
+    lines
+}
+
+fn print_startup_banner(info: &StartupInfo, project_dir: &Path) {
+    dev_ui::blank_line();
+
+    for line in startup_banner_lines(info, project_dir) {
+        if let Some(hint) = line.hint {
+            dev_ui::detail_with_hint(line.label, &line.value, &hint);
         } else {
-            println!(
-                "  {} Tunnel  {}",
-                "●".cyan(),
-                format!("connecting... ({source})").dimmed()
-            );
+            dev_ui::detail(line.label, &line.value);
         }
     }
 
-    // Inspector (browser webhook UI). Only printed when running, so the
-    // line is absent for `lpm dev` without `--tunnel` or when the user
-    // passed `--no-inspect`.
-    if let Some(ref url) = info.inspector_url {
-        println!("  {} {}", "●".cyan(), format!("Inspect  {url}").dimmed(),);
-    }
-
-    // Network
-    if let Some(ref addr) = info.network_addr {
-        println!("  {} {}", "●".cyan(), format!("Network  {addr}").dimmed());
-    }
-
-    println!();
+    dev_ui::blank_line();
 }
 
 // ── Zero-config helpers ──────────────────────────────────────────────
@@ -955,7 +994,7 @@ async fn auto_install_if_stale(
         return Ok(format!("up to date ({})", format_duration(elapsed)));
     }
 
-    output::info("Dependencies out of date, installing...");
+    dev_ui::phase("Dependencies out of date, installing...");
 
     // Single-writer ownership: `run_with_options` is the only writer
     // of `.lpm/install-hash`. Pre-fix this branch wrote a stale,
@@ -970,36 +1009,43 @@ async fn auto_install_if_stale(
     // built a fresh `RegistryClient::new()` with no token, so any
     // `@lpm.dev` package required by the dev project would have been
     // unauthenticated.
-    match crate::commands::install::run_with_options(
-        client,
-        project_dir,
-        false,                                                   // json_output
-        false,                                                   // offline
-        false,                                                   // force
-        false,                                                   // allow_new
-        false,                                                   // strict_integrity
-        None,                                                    // linker_override
-        false,                                                   // no_skills
-        false,                                                   // no_editor_setup
-        true,                                                    // no_security_summary
-        false,                                                   // auto_build
-        None, // target_set: dev is single-project
-        None, // direct_versions_out: dev does not finalize placeholders
-        None, // script_policy_override: `lpm dev` does not expose policy flags
-        None, // advisor_override: `lpm dev` does not expose `--advisor`
-        None, // min_release_age_override: `lpm dev` uses the chain
-        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dev` enforces drift
-        crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: `lpm dev` honors env + config posture chain
-        // `lpm dev` does not surface its own
-        // sandbox-mode flags. The env / config / default chain
-        // inside `rebuild::run` still applies.
-        false, // strict_sandbox
-        false, // no_sandbox
-        false, // verbose: internal pipeline, no user-facing Done footer
-        false, // audit_after_install: internal pipeline never runs audit
-    )
-    .await
-    {
+    let nested_install_result = {
+        let _stdout_suppressed = crate::output::suppress_stdout(true).map_err(LpmError::Script)?;
+        let _stderr_suppressed = crate::output::suppress_stderr(true).map_err(LpmError::Script)?;
+
+        crate::commands::install::run_with_options(
+            client,
+            project_dir,
+            false,                                                   // json_output
+            false,                                                   // offline
+            false,                                                   // force
+            false,                                                   // allow_new
+            false,                                                   // strict_integrity
+            None,                                                    // linker_override
+            false,                                                   // no_skills
+            false,                                                   // no_editor_setup
+            true,                                                    // no_security_summary
+            false,                                                   // auto_build
+            None, // target_set: dev is single-project
+            None, // direct_versions_out: dev does not finalize placeholders
+            None, // requested_add_count: dev auto-install is not an add-path install
+            None, // script_policy_override: `lpm dev` does not expose policy flags
+            None, // advisor_override: `lpm dev` does not expose `--advisor`
+            None, // min_release_age_override: `lpm dev` uses the chain
+            crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dev` enforces drift
+            crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: `lpm dev` honors env + config posture chain
+            // `lpm dev` does not surface its own
+            // sandbox-mode flags. The env / config / default chain
+            // inside `rebuild::run` still applies.
+            false, // strict_sandbox
+            false, // no_sandbox
+            false, // verbose: internal pipeline, no user-facing Done footer
+            false, // audit_after_install: internal pipeline never runs audit
+        )
+        .await
+    };
+
+    match nested_install_result {
         Ok(()) => {
             let elapsed = start.elapsed();
             Ok(format!("installed in {}", format_duration(elapsed)))
@@ -1038,25 +1084,27 @@ fn auto_copy_env_example(project_dir: &std::path::Path) -> Option<String> {
             match std::fs::File::open(&example_file) {
                 Ok(mut src) => {
                     if let Err(e) = io::copy(&mut src, &mut dest) {
-                        output::warn(&format!(
-                            "Created .env but failed to copy from .env.example: {e}\n    Fill in .env manually or delete it and retry."
+                        dev_ui::warn(&format!(
+                            "Created .env but failed to copy from .env.example: {e}"
                         ));
+                        dev_ui::hint_line("Fill in .env manually or delete it and retry.");
                         return Some("created (copy failed, fill manually)".to_string());
                     }
                 }
                 Err(e) => {
-                    output::warn(&format!(
-                        "Created .env but could not read .env.example: {e}\n    Fill in .env manually."
+                    dev_ui::warn(&format!(
+                        "Created .env but could not read .env.example: {e}"
                     ));
+                    dev_ui::hint_line("Fill in .env manually.");
                     return Some("created (empty, could not read .env.example)".to_string());
                 }
             }
-            output::warn("No .env file found. Created from .env.example");
-            eprintln!("    Review .env and fill in missing values");
-            eprintln!(
-                "    Or use {} to store secrets in the vault",
-                "lpm env vars set".cyan()
-            );
+            dev_ui::warn("No .env file found. Created from .env.example");
+            dev_ui::hint_line("Review .env and fill in missing values");
+            dev_ui::hint_line(&format!(
+                "Or use {} to store secrets in the vault",
+                install_ui::bold("lpm env vars set")
+            ));
             Some("created from .env.example".to_string())
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -1064,9 +1112,8 @@ fn auto_copy_env_example(project_dir: &std::path::Path) -> Option<String> {
             Some(".env loaded".to_string())
         }
         Err(e) => {
-            output::warn(&format!(
-                "Could not create .env file: {e}\n    Create it manually or check directory permissions."
-            ));
+            dev_ui::warn(&format!("Could not create .env file: {e}"));
+            dev_ui::hint_line("Create it manually or check directory permissions.");
             None
         }
     }
@@ -1261,6 +1308,106 @@ mod tests {
 
         let status = auto_copy_env_example(dir.path());
         assert_eq!(status, Some(".env loaded".to_string()));
+    }
+
+    #[test]
+    fn startup_banner_lines_use_slim_wording_for_created_env() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".nvmrc"), "22\n").unwrap();
+
+        let info = StartupInfo {
+            deps_status: "installed in 11ms".to_string(),
+            env_status: Some("created from .env.example".to_string()),
+            https_active: true,
+            tunnel_url: None,
+            tunnel_source: Some("lpm.json".to_string()),
+            network_addr: Some("192.168.1.42:3000".to_string()),
+            node_version: Some("v22.22.1".to_string()),
+            inspector_url: Some("http://127.0.0.1:53412".to_string()),
+        };
+
+        assert_eq!(
+            startup_banner_lines(&info, dir.path()),
+            vec![
+                StartupBannerLine {
+                    label: "Using Node",
+                    value: "v22.22.1".to_string(),
+                    hint: Some("(.nvmrc)".to_string()),
+                },
+                StartupBannerLine {
+                    label: "Dependencies",
+                    value: "installed in 11ms".to_string(),
+                    hint: None,
+                },
+                StartupBannerLine {
+                    label: "Env",
+                    value: "created".to_string(),
+                    hint: Some("(.env.example)".to_string()),
+                },
+                StartupBannerLine {
+                    label: "HTTPS",
+                    value: "enabled".to_string(),
+                    hint: Some("(trusted local certificate)".to_string()),
+                },
+                StartupBannerLine {
+                    label: "Tunnel",
+                    value: "connecting...".to_string(),
+                    hint: Some("(lpm.json)".to_string()),
+                },
+                StartupBannerLine {
+                    label: "Inspect",
+                    value: "http://127.0.0.1:53412".to_string(),
+                    hint: None,
+                },
+                StartupBannerLine {
+                    label: "Network",
+                    value: "192.168.1.42:3000".to_string(),
+                    hint: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_banner_lines_use_system_node_and_loaded_env_wording() {
+        let dir = TempDir::new().unwrap();
+
+        let info = StartupInfo {
+            deps_status: "up to date (2ms)".to_string(),
+            env_status: Some(".env loaded".to_string()),
+            https_active: false,
+            tunnel_url: Some("https://demo.lpm.dev".to_string()),
+            tunnel_source: Some("--domain".to_string()),
+            network_addr: None,
+            node_version: Some("v20.11.0".to_string()),
+            inspector_url: None,
+        };
+
+        assert_eq!(
+            startup_banner_lines(&info, dir.path()),
+            vec![
+                StartupBannerLine {
+                    label: "Using Node",
+                    value: "v20.11.0".to_string(),
+                    hint: Some("(system)".to_string()),
+                },
+                StartupBannerLine {
+                    label: "Dependencies",
+                    value: "up to date (2ms)".to_string(),
+                    hint: None,
+                },
+                StartupBannerLine {
+                    label: "Env",
+                    value: "loaded".to_string(),
+                    hint: Some("(.env)".to_string()),
+                },
+                StartupBannerLine {
+                    label: "Tunnel",
+                    value: "https://demo.lpm.dev".to_string(),
+                    hint: Some("(--domain)".to_string()),
+                },
+            ]
+        );
     }
 
     #[test]

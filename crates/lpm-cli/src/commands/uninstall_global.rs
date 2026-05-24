@@ -46,9 +46,8 @@
 //! install). Conservative posture — stale trust > lost trust, since
 //! an over-broad prune could re-block scripts in unrelated installs.
 
-use crate::output;
+use super::uninstall_ui;
 use chrono::Utc;
-use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock};
 use lpm_global::{
     AliasEntry, GlobalManifest, IntentPayload, PackageEntry, Shim, TrustPruneEntry, TxKind,
@@ -575,49 +574,23 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
     }
     let package_safe = sanitize_for_terminal(&out.package);
     let version_safe = sanitize_for_terminal(&out.version);
-    output::success(&format!(
-        "Uninstalled {}@{}",
-        package_safe.bold(),
-        version_safe.dimmed()
-    ));
+    uninstall_ui::done_global(&package_safe, &version_safe);
     if !out.commands.is_empty() {
-        let commands_safe: Vec<String> = out
-            .commands
-            .iter()
-            .map(|c| sanitize_for_terminal(c))
-            .collect();
-        output::info(&format!(
-            "Removed command{}: {}",
-            if out.commands.len() == 1 { "" } else { "s" },
-            commands_safe.join(", ")
-        ));
+        for command in &out.commands {
+            uninstall_ui::minus_command(&sanitize_for_terminal(command));
+        }
     }
     if !out.aliases.is_empty() {
-        let aliases_safe: Vec<String> = out
-            .aliases
-            .iter()
-            .map(|a| sanitize_for_terminal(a))
-            .collect();
-        output::info(&format!(
-            "Removed alias{}: {}",
-            if out.aliases.len() == 1 { "" } else { "es" },
-            aliases_safe.join(", ")
-        ));
+        for alias in &out.aliases {
+            uninstall_ui::minus_alias(&sanitize_for_terminal(alias));
+        }
     }
     if out.trust_entries_pruned > 0 {
-        output::info(&format!(
-            "Pruned {} host-global trust entr{} reachable only through this install.",
-            out.trust_entries_pruned,
-            if out.trust_entries_pruned == 1 {
-                "y"
-            } else {
-                "ies"
-            },
-        ));
+        uninstall_ui::warn_pruned_trust_entries(out.trust_entries_pruned);
     }
     if out.install_root_remaining {
         let root_safe = sanitize_for_terminal(&out.install_root.display().to_string());
-        output::warn(&format!(
+        crate::install_ui::warn(&format!(
             "Install root could not be removed (locked or permission). Queued as tombstone for `lpm cache prune --apply` to retry: {root_safe}"
         ));
     }

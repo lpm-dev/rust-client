@@ -1,4 +1,4 @@
-use crate::{auth, output};
+use crate::{auth, install_ui};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -14,7 +14,7 @@ pub async fn run(
 
     if token.is_none() && !has_refresh {
         if !json_output {
-            output::info("Not currently logged in.");
+            install_ui::phase("Not currently logged in.");
         }
         return Ok(());
     }
@@ -22,13 +22,13 @@ pub async fn run(
     // Optionally revoke on server
     if revoke {
         if !json_output {
-            output::info("Revoking token on server...");
+            install_ui::phase("Revoking token on server...");
         }
         // Best-effort: don't fail logout if revocation fails
         if let Err(e) = client.revoke_token().await
             && !json_output
         {
-            output::warn(&format!(
+            install_ui::warn(&format!(
                 "Token revocation failed: {}",
                 e.to_string().dimmed()
             ));
@@ -43,7 +43,7 @@ pub async fn run(
         && let Err(e) = lpm_vault::sync::unpair_all(registry_url, t).await
         && !json_output
     {
-        output::warn(&format!(
+        install_ui::warn(&format!(
             "Failed to revoke browser pairings: {}",
             e.dimmed()
         ));
@@ -60,12 +60,7 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        println!();
-        output::success("Successfully logged out.");
-        if revoke {
-            println!("  {}", "Token revoked on server".dimmed());
-        }
-        println!();
+        install_ui::done("Successfully logged out.");
     }
 
     Ok(())

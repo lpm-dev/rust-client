@@ -741,6 +741,7 @@ async fn do_install_upgrade(
         false, // auto_build
         None,
         None,
+        None,
         None, // script_policy_override: global update does not expose policy flags
         None, // advisor_override: global update does not expose `--advisor`
         None, // min_release_age_override: D13/D19 — global scope is out of, cooldown uses the chain

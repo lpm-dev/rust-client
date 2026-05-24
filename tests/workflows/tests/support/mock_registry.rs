@@ -130,11 +130,18 @@ impl MockRegistry {
 
     /// Mount a healthy `/api/registry/health` endpoint.
     pub async fn with_health(&self) -> &Self {
+        self.with_health_status(200).await
+    }
+
+    /// Mount `/api/registry/health` with an explicit HTTP status.
+    pub async fn with_health_status(&self, status: u16) -> &Self {
         Mock::given(method("GET"))
             .and(path("/api/registry/health"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "status": "ok"
-            })))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "status": if (200..300).contains(&status) { "ok" } else { "error" }
+                })),
+            )
             .mount(&self.server)
             .await;
         self
@@ -156,8 +163,8 @@ impl MockRegistry {
                     "private_packages": 3
                 },
                 "limits": {
-                    "storage_bytes": 1024 * 1024 * 500,
-                    "private_packages": 100
+                    "storageBytes": 1024 * 1024 * 500,
+                    "privatePackages": 100
                 },
                 "organizations": []
             })))
@@ -188,8 +195,8 @@ impl MockRegistry {
                     "private_packages": 3
                 },
                 "limits": {
-                    "storage_bytes": 1024 * 1024 * 500,
-                    "private_packages": 100
+                    "storageBytes": 1024 * 1024 * 500,
+                    "privatePackages": 100
                 },
                 "organizations": []
             })))
@@ -251,6 +258,30 @@ impl MockRegistry {
     pub async fn with_revoke_all_pairings_expected(&self, expected_calls: u64) -> &Self {
         Mock::given(method("POST"))
             .and(path("/api/vault/pair/revoke-all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a successful token revocation endpoint.
+    pub async fn with_revoke_token(&self, bearer_token: &str) -> &Self {
+        self.with_revoke_token_expected(bearer_token, 1).await
+    }
+
+    /// Mount token revocation with an explicit expected call count.
+    pub async fn with_revoke_token_expected(
+        &self,
+        bearer_token: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/tokens/revoke"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(bearer_token.to_string()))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true
             })))

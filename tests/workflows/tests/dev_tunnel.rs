@@ -42,6 +42,53 @@ fn dev_help_emits_command_usage_and_flags() {
     );
 }
 
+#[test]
+fn dev_human_output_suppresses_nested_install_chatter_and_legacy_glyphs() {
+    let project =
+        TempProject::empty(r#"{"name":"dev-output","version":"1.0.0","dependencies":{}}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "services": {
+                "web": {
+                    "command": "node -e \"setTimeout(() => process.exit(0), 300)\""
+                }
+            }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["dev", "--no-open"])
+        .output()
+        .expect("failed to run lpm dev for human-output regression test");
+
+    assert!(
+        output.status.success(),
+        "lpm dev fixture must exit cleanly; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "human lpm dev should not write progress chatter to stdout, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Dependencies out of date, installing..."),
+        "expected dev-owned install phase line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Resolving dependencies from")
+            && !stderr.contains("No dependencies to install")
+            && !stderr.contains("◆")
+            && !stderr.contains("▲")
+            && !stderr.contains("│"),
+        "nested install chatter and legacy glyphs must be absent from dev stderr, got:\n{stderr}"
+    );
+}
+
 // ─── tunnel: --help dispatches and exits cleanly ──────────────────────
 
 #[test]

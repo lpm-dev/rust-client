@@ -507,6 +507,7 @@ pub async fn run(
         false,                                                 // auto_build
         None,                                                  // target_set
         None,                                                  // direct_versions_out
+        None, // requested_add_count: upgrade is not an add-path install
         None, // script_policy_override: `lpm upgrade` does not expose policy flags
         None, // advisor_override: `lpm upgrade` does not expose `--advisor`
         None, // min_release_age_override: `lpm upgrade` uses the chain

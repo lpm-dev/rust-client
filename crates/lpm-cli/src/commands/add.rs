@@ -2514,6 +2514,7 @@ async fn handle_dependencies(
                 false, // auto_build
                 None,  // target_set: shadcn-style add never targets multiple workspace members
                 None, // direct_versions_out: shadcn-style add does not finalize placeholders
+                None, // requested_add_count: `lpm add` is source-copy, not install add-path reporting
                 None, // script_policy_override: `lpm add` does not expose policy flags
                 None, // advisor_override: `lpm add` does not expose `--advisor`
                 None, // min_release_age_override: shadcn-style add uses the chain

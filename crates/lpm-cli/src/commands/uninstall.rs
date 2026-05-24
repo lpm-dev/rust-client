@@ -1,9 +1,11 @@
-use crate::output;
+use super::uninstall_ui;
+use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 #[derive(Debug, PartialEq, Eq)]
 struct UninstallResult {
@@ -11,11 +13,7 @@ struct UninstallResult {
     not_found: Vec<String>,
 }
 
-fn remove_from_manifest(
-    doc: &mut Value,
-    packages: &[String],
-    json_output: bool,
-) -> UninstallResult {
+fn remove_from_manifest(doc: &mut Value, packages: &[String]) -> UninstallResult {
     let mut removed = Vec::new();
     let mut not_found = Vec::new();
 
@@ -28,9 +26,6 @@ fn remove_from_manifest(
                 && obj.remove(name).is_some()
             {
                 found = true;
-                if !json_output {
-                    output::info(&format!("Removed {} from {}", name.bold(), key));
-                }
             }
         }
 
@@ -45,13 +40,11 @@ fn remove_from_manifest(
 }
 
 fn cleanup_removed_packages(project_dir: &Path, removed: &[String]) -> Result<(), LpmError> {
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if lockfile_path.exists() {
-        std::fs::remove_file(&lockfile_path)?;
-    }
-    let binary_lockfile_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
-    if binary_lockfile_path.exists() {
-        std::fs::remove_file(&binary_lockfile_path)?;
+    prune_lockfile_to_current_manifest(project_dir)?;
+
+    let install_hash_path = project_dir.join(".lpm").join("install-hash");
+    if install_hash_path.exists() {
+        std::fs::remove_file(&install_hash_path)?;
     }
 
     let node_modules = project_dir.join("node_modules");
@@ -77,6 +70,182 @@ fn cleanup_removed_packages(project_dir: &Path, removed: &[String]) -> Result<()
     Ok(())
 }
 
+fn collect_manifest_dependency_specs(doc: &Value) -> HashMap<String, String> {
+    let mut specs = HashMap::new();
+
+    for section in ["dependencies", "devDependencies"] {
+        let Some(obj) = doc.get(section).and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, spec) in obj {
+            if let Some(spec) = spec.as_str() {
+                specs.insert(name.clone(), spec.to_string());
+            }
+        }
+    }
+
+    specs
+}
+
+fn requested_range_for_locked_lookup(requested_spec: &str) -> Option<String> {
+    match lpm_resolver::Specifier::parse(requested_spec).ok()? {
+        lpm_resolver::Specifier::SemverRange(range) => Some(range),
+        lpm_resolver::Specifier::NpmAlias { range, .. } => Some(range),
+        _ => None,
+    }
+}
+
+fn select_locked_package_for_requested_spec<'a>(
+    lockfile: &'a lpm_lockfile::Lockfile,
+    target: &str,
+    requested_spec: &str,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
+    let requested_range = requested_range_for_locked_lookup(requested_spec)
+        .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
+    let mut first_match: Option<&lpm_lockfile::LockedPackage> = None;
+    let mut best_satisfying: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> =
+        None;
+    let mut best_any: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> = None;
+
+    for candidate in lockfile.packages.iter().filter(|pkg| pkg.name == target) {
+        if first_match.is_none() {
+            first_match = Some(candidate);
+        }
+
+        let Ok(version) = lpm_resolver::NpmVersion::parse(&candidate.version) else {
+            continue;
+        };
+
+        let better_any = best_any.as_ref().is_none_or(|(best, _)| version > *best);
+        if better_any {
+            best_any = Some((version.clone(), candidate));
+        }
+
+        if let Some(range) = requested_range.as_ref()
+            && range.satisfies(&version)
+        {
+            let better_satisfying = best_satisfying
+                .as_ref()
+                .is_none_or(|(best, _)| version > *best);
+            if better_satisfying {
+                best_satisfying = Some((version, candidate));
+            }
+        }
+    }
+
+    best_satisfying
+        .map(|(_, candidate)| candidate)
+        .or_else(|| best_any.map(|(_, candidate)| candidate))
+        .or(first_match)
+}
+
+fn split_locked_dependency(entry: &str) -> Option<(&str, &str)> {
+    let at = entry.rfind('@')?;
+    (at > 0).then(|| (&entry[..at], &entry[at + 1..]))
+}
+
+fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<(), LpmError> {
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    if !lockfile_path.exists() {
+        return Ok(());
+    }
+
+    let manifest_path = project_dir.join("package.json");
+    let manifest_content = std::fs::read_to_string(&manifest_path)?;
+    let manifest: Value =
+        serde_json::from_str(&manifest_content).map_err(|e| LpmError::Registry(e.to_string()))?;
+    let direct_specs = collect_manifest_dependency_specs(&manifest);
+
+    let Ok(mut lockfile) = lpm_lockfile::Lockfile::read_fast(&lockfile_path) else {
+        return Ok(());
+    };
+
+    let package_key = |name: &str, version: &str| -> String {
+        let mut key = String::with_capacity(name.len() + 1 + version.len());
+        key.push_str(name);
+        key.push('\x00');
+        key.push_str(version);
+        key
+    };
+
+    if direct_specs.is_empty() {
+        lockfile.packages.clear();
+        lockfile.root_aliases.clear();
+        lockfile.ambient_peer_installs.clear();
+        lockfile
+            .write_all(&lockfile_path)
+            .map_err(|e| LpmError::Registry(e.to_string()))?;
+        return Ok(());
+    }
+
+    let package_index: HashMap<String, &lpm_lockfile::LockedPackage> = lockfile
+        .packages
+        .iter()
+        .map(|pkg| (package_key(&pkg.name, &pkg.version), pkg))
+        .collect();
+    let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+
+    for (local, requested_spec) in &direct_specs {
+        let target = lockfile
+            .root_aliases
+            .get(local)
+            .cloned()
+            .unwrap_or_else(|| local.clone());
+        if let Some(candidate) =
+            select_locked_package_for_requested_spec(&lockfile, &target, requested_spec)
+        {
+            queue.push_back(package_key(&candidate.name, &candidate.version));
+        }
+    }
+
+    while let Some(next) = queue.pop_front() {
+        if !reachable.insert(next.clone()) {
+            continue;
+        }
+        let Some(pkg) = package_index.get(&next) else {
+            continue;
+        };
+
+        for dep in pkg.dependencies.iter().chain(pkg.peers.iter()) {
+            let Some((local_name, version)) = split_locked_dependency(dep) else {
+                continue;
+            };
+            let target = pkg
+                .alias_dependencies
+                .iter()
+                .find(|pair| pair[0] == local_name)
+                .map_or(local_name, |pair| pair[1].as_str());
+            let dep_key = package_key(target, version);
+            if package_index.contains_key(&dep_key) {
+                queue.push_back(dep_key);
+            }
+        }
+    }
+
+    lockfile
+        .packages
+        .retain(|pkg| reachable.contains(&package_key(&pkg.name, &pkg.version)));
+    lockfile
+        .root_aliases
+        .retain(|local, _| direct_specs.contains_key(local));
+
+    let kept_names: std::collections::HashSet<&str> = lockfile
+        .packages
+        .iter()
+        .map(|pkg| pkg.name.as_str())
+        .collect();
+    lockfile
+        .ambient_peer_installs
+        .retain(|name| kept_names.contains(name.as_str()));
+
+    lockfile
+        .write_all(&lockfile_path)
+        .map_err(|e| LpmError::Registry(e.to_string()))?;
+
+    Ok(())
+}
+
 /// per-manifest uninstall helper.
 ///
 /// Reads `pkg_json_path`, removes the requested package entries from
@@ -86,7 +255,7 @@ fn cleanup_removed_packages(project_dir: &Path, removed: &[String]) -> Result<()
 fn uninstall_from_manifest(
     pkg_json_path: &Path,
     packages: &[String],
-    json_output: bool,
+    _json_output: bool,
 ) -> Result<UninstallResult, LpmError> {
     if !pkg_json_path.exists() {
         return Err(LpmError::NotFound(format!(
@@ -99,7 +268,7 @@ fn uninstall_from_manifest(
     let mut doc: Value =
         serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
 
-    let result = remove_from_manifest(&mut doc, packages, json_output);
+    let result = remove_from_manifest(&mut doc, packages);
     if result.removed.is_empty() {
         return Ok(result);
     }
@@ -173,11 +342,11 @@ pub async fn run(
             }));
         }
         if !json_output {
-            output::warn("No packages matched the filter; nothing to uninstall.");
+            uninstall_ui::warn_no_filter_match();
             if let Some(h) = hint {
                 eprintln!();
                 for line in h.lines() {
-                    eprintln!("  {}", line.dimmed());
+                    eprintln!("  {}", install_ui::dim(line));
                 }
                 eprintln!();
             }
@@ -196,6 +365,11 @@ pub async fn run(
             yes,
             json_output,
         )?;
+    }
+
+    let uninstall_start = Instant::now();
+    if !json_output {
+        uninstall_ui::phase_removing(packages.len(), targets.member_manifests.len());
     }
 
     // Run uninstall against every target manifest. Aggregate results so we
@@ -235,7 +409,7 @@ pub async fn run(
 
     if all_removed.is_empty() {
         if !json_output {
-            output::warn("No packages were removed (not found in any target manifest)");
+            uninstall_ui::warn_no_packages_removed();
         }
         return Ok(());
     }
@@ -254,18 +428,16 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        if !all_not_found.is_empty() {
-            output::warn(&format!(
-                "Not found in any targeted manifest: {}",
-                all_not_found.join(", ")
-            ));
+        eprintln!();
+        for name in &all_removed {
+            uninstall_ui::minus_package(name);
         }
-        println!();
-        output::success(&format!(
-            "Removed {} package(s)",
-            all_removed.len().to_string().bold()
-        ));
-        println!();
+        if !all_not_found.is_empty() {
+            eprintln!();
+            uninstall_ui::warn_not_found(&all_not_found);
+        }
+        eprintln!();
+        uninstall_ui::done_removed(all_removed.len(), uninstall_start.elapsed());
     }
 
     Ok(())
@@ -297,7 +469,7 @@ mod tests {
         });
         let packages = vec!["foo".to_string(), "baz".to_string(), "missing".to_string()];
 
-        let result = remove_from_manifest(&mut manifest, &packages, true);
+        let result = remove_from_manifest(&mut manifest, &packages);
 
         assert_eq!(
             result,
@@ -312,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_from_project_removes_targeted_dependency_and_lockfile_only_when_changed() {
+    fn uninstall_from_project_preserves_lockfile_and_invalidates_install_hash_when_changed() {
         let dir = tempfile::tempdir().unwrap();
         write_package_json(
             dir.path(),
@@ -328,6 +500,8 @@ mod tests {
             }),
         );
         std::fs::write(dir.path().join(lpm_lockfile::LOCKFILE_NAME), "lock").unwrap();
+        std::fs::create_dir_all(dir.path().join(".lpm")).unwrap();
+        std::fs::write(dir.path().join(".lpm").join("install-hash"), "hash").unwrap();
         std::fs::create_dir_all(dir.path().join("node_modules").join("foo")).unwrap();
         std::fs::create_dir_all(dir.path().join("node_modules").join("bar")).unwrap();
 
@@ -335,8 +509,12 @@ mod tests {
 
         assert_eq!(result.removed, vec!["foo".to_string()]);
         assert!(
-            !dir.path().join(lpm_lockfile::LOCKFILE_NAME).exists(),
-            "lockfile should be removed when manifest changes"
+            dir.path().join(lpm_lockfile::LOCKFILE_NAME).exists(),
+            "lockfile should stay on disk when manifest changes"
+        );
+        assert!(
+            !dir.path().join(".lpm").join("install-hash").exists(),
+            "install-hash must be invalidated when manifest changes"
         );
         assert!(
             !dir.path().join("node_modules").join("foo").exists(),
@@ -369,6 +547,8 @@ mod tests {
             }),
         );
         std::fs::write(dir.path().join(lpm_lockfile::LOCKFILE_NAME), "lock").unwrap();
+        std::fs::create_dir_all(dir.path().join(".lpm")).unwrap();
+        std::fs::write(dir.path().join(".lpm").join("install-hash"), "hash").unwrap();
 
         let original_manifest = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
         let result = uninstall_from_project(dir.path(), &["missing".to_string()], true).unwrap();
@@ -378,6 +558,10 @@ mod tests {
         assert!(
             dir.path().join(lpm_lockfile::LOCKFILE_NAME).exists(),
             "lockfile should remain when nothing was removed"
+        );
+        assert!(
+            dir.path().join(".lpm").join("install-hash").exists(),
+            "install-hash should remain when nothing was removed"
         );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
@@ -401,7 +585,6 @@ mod tests {
         let result = remove_from_manifest(
             &mut manifest,
             &["@lpm.dev/acme.foo".to_string(), "@scope/bar".to_string()],
-            true,
         );
 
         assert_eq!(
@@ -425,7 +608,7 @@ mod tests {
             "optionalDependencies": { "foo": "1.0.0" }
         });
 
-        let result = remove_from_manifest(&mut manifest, &["foo".to_string()], true);
+        let result = remove_from_manifest(&mut manifest, &["foo".to_string()]);
 
         assert_eq!(result.removed, vec!["foo".to_string()]);
         assert!(manifest["dependencies"].get("foo").is_none());
@@ -445,7 +628,7 @@ mod tests {
         // succeed (every requested package becomes not_found).
         let mut manifest = json!({ "name": "demo" });
 
-        let result = remove_from_manifest(&mut manifest, &["foo".to_string()], true);
+        let result = remove_from_manifest(&mut manifest, &["foo".to_string()]);
 
         assert!(result.removed.is_empty());
         assert_eq!(result.not_found, vec!["foo".to_string()]);
@@ -473,6 +656,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("node_modules").join("bar")).unwrap();
         std::fs::create_dir_all(dir.path().join("node_modules").join("baz")).unwrap();
         std::fs::create_dir_all(dir.path().join("node_modules").join("keep")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".lpm")).unwrap();
+        std::fs::write(dir.path().join(".lpm").join("install-hash"), "hash").unwrap();
 
         let result = uninstall_from_project(
             dir.path(),
@@ -500,7 +685,8 @@ mod tests {
         assert!(!dir.path().join("node_modules").join("bar").exists());
         assert!(!dir.path().join("node_modules").join("baz").exists());
         assert!(dir.path().join("node_modules").join("keep").exists());
-        assert!(!dir.path().join(lpm_lockfile::LOCKFILE_NAME).exists());
+        assert!(dir.path().join(lpm_lockfile::LOCKFILE_NAME).exists());
+        assert!(!dir.path().join(".lpm").join("install-hash").exists());
     }
 
     #[test]
@@ -1131,8 +1317,8 @@ mod tests {
         // member node_modules/lockfiles were left stale, and the workspace
         // root lockfile (if any) might not even be related to the members.
         //
-        // This test asserts the corrected behavior:
-        //   1. Each TARGETED member's lockfile is removed.
+        // This test asserts the current behavior:
+        //   1. Each TARGETED member's lockfile is preserved in place.
         //   2. The workspace root lockfile is NOT touched.
         //   3. Unrelated members' lockfiles are NOT touched.
         let dir = tempfile::tempdir().unwrap();
@@ -1181,14 +1367,14 @@ mod tests {
         .await;
         assert!(result.is_ok(), "uninstall should succeed: {result:?}");
 
-        // CRITICAL: targeted members' lockfiles must be removed
+        // CRITICAL: targeted members' lockfiles must remain in place
         assert!(
-            !ui_a_lock.exists(),
-            "ui-a lockfile must be removed (it's a filter target)"
+            ui_a_lock.exists(),
+            "ui-a lockfile must remain (it's a filter target)"
         );
         assert!(
-            !ui_b_lock.exists(),
-            "ui-b lockfile must be removed (it's a filter target)"
+            ui_b_lock.exists(),
+            "ui-b lockfile must remain (it's a filter target)"
         );
 
         // CRITICAL: unrelated members' lockfiles must be preserved
@@ -1235,8 +1421,8 @@ mod tests {
         assert!(result.is_ok());
 
         assert!(
-            !foo_lock.exists(),
-            "member lockfile must be removed when uninstalling from inside the member dir"
+            foo_lock.exists(),
+            "member lockfile must remain when uninstalling from inside the member dir"
         );
         assert!(
             root_lock.exists(),

@@ -7,8 +7,8 @@ expression: json
   "email": "test@example.com",
   "has_pool_access": true,
   "limits": {
-    "private_packages": null,
-    "storage_bytes": null
+    "private_packages": 100,
+    "storage_bytes": 524288000
   },
   "mfa_enabled": false,
   "orgs": [],
