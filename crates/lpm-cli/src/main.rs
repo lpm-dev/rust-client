@@ -915,19 +915,20 @@ enum Commands {
     /// Manage CLI configuration.
     Config {
         /// Action: get, set, delete, list, scripts, triage, sandbox,
-        /// sigstore.
+        /// sigstore, release-age.
         action: String,
         /// Config key (for get/set/delete).
         key: Option<String>,
         /// Config value (for set).
         value: Option<String>,
         /// Non-interactive value for the `scripts` / `triage` /
-        /// `sandbox` / `sigstore` wizards. Required when stdin is not
+        /// `sandbox` / `sigstore` / `release-age` wizards. Required when stdin is not
         /// a TTY. Examples:
         ///   `lpm config scripts --set triage`
         ///   `lpm config triage --set claude-cli`
         ///   `lpm config sandbox --set strict`
         ///   `lpm config sigstore --set deny`
+        ///   `lpm config release-age --set 3d`
         #[arg(long = "set", value_name = "VALUE")]
         set: Option<String>,
     },
