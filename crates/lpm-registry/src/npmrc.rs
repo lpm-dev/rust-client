@@ -804,7 +804,7 @@ impl NpmrcConfig {
     }
 
     /// Single-file convenience: `parse_layer` then `finalize`. Used by
-    /// tests and by callers (like the existing `lpm npmrc` helper) that
+    /// tests and by callers (like the existing `lpm setup local` helper) that
     /// don't need to compose layers.
     pub fn parse(
         content: &str,

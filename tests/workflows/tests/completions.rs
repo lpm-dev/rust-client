@@ -24,8 +24,8 @@ fn completions_zsh_stdout_uses_lpm_bin_name_and_lists_live_commands() {
         "zsh completions must target the user-facing `lpm` bin name, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("setup-npmrc"),
-        "completion script must include shipped subcommands, got:\n{stdout}"
+        stdout.contains("setup") && stdout.contains("local") && stdout.contains("ci"),
+        "completion script must include the renamed setup subcommands, got:\n{stdout}"
     );
     assert!(
         stdout.contains("token-rotate"),

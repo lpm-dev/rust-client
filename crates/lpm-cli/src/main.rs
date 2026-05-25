@@ -848,23 +848,10 @@ enum Commands {
         logout_registry: Option<String>,
     },
 
-    /// Generate .npmrc for CI/CD.
+    /// Configure project `.npmrc` for CI or local development.
     Setup {
-        /// Override the registry URL for .npmrc (default: current --registry or LPM_REGISTRY_URL).
-        #[arg(short = 'r', long)]
-        registry: Option<String>,
-
-        /// Use OIDC token exchange instead of stored token.
-        #[arg(long)]
-        oidc: bool,
-
-        /// Route all npm traffic through lpm.dev (Pro/Org feature for dependency visibility).
-        #[arg(long, conflicts_with = "scoped")]
-        proxy: bool,
-
-        /// Use scoped registry (@lpm.dev:registry=). This is the default.
-        #[arg(long, conflicts_with = "proxy")]
-        scoped: bool,
+        #[command(subcommand)]
+        action: SetupAction,
     },
 
     /// Rotate your auth token.
@@ -1280,22 +1267,6 @@ enum Commands {
         action: String,
         /// Server name (for setup/remove).
         name: Option<String>,
-    },
-
-    /// Generate a read-only .npmrc token for local development.
-    #[command(name = "setup-npmrc")]
-    SetupNpmrc {
-        /// Token validity in days (default: 30).
-        #[arg(short = 'd', long, default_value = "30")]
-        days: u32,
-
-        /// Route all npm traffic through lpm.dev (Pro/Org feature for dependency visibility).
-        #[arg(long, conflicts_with = "scoped")]
-        proxy: bool,
-
-        /// Use scoped registry (@lpm.dev:registry=). This is the default.
-        #[arg(long, conflicts_with = "proxy")]
-        scoped: bool,
     },
 
     /// Install, pin, and manage Node.js versions (e.g., lpm use node@22).
@@ -2103,6 +2074,44 @@ enum Commands {
     /// e.g., `lpm dev` runs the "dev" script if no built-in command matches.
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+/// Subcommands of `lpm setup`.
+#[derive(Subcommand)]
+enum SetupAction {
+    /// Generate `.npmrc` for CI/CD.
+    Ci {
+        /// Override the registry URL for `.npmrc` (default: current `--registry` or `LPM_REGISTRY_URL`).
+        #[arg(short = 'r', long)]
+        registry: Option<String>,
+
+        /// Use OIDC token exchange instead of stored token.
+        #[arg(long)]
+        oidc: bool,
+
+        /// Route all npm traffic through lpm.dev (Pro/Org feature for dependency visibility).
+        #[arg(long, conflicts_with = "scoped")]
+        proxy: bool,
+
+        /// Use scoped registry (`@lpm.dev:registry=`). This is the default.
+        #[arg(long, conflicts_with = "proxy")]
+        scoped: bool,
+    },
+
+    /// Generate a read-only `.npmrc` token for local development.
+    Local {
+        /// Token validity in days (default: 30).
+        #[arg(short = 'd', long, default_value = "30")]
+        days: u32,
+
+        /// Route all npm traffic through lpm.dev (Pro/Org feature for dependency visibility).
+        #[arg(long, conflicts_with = "scoped")]
+        proxy: bool,
+
+        /// Use scoped registry (`@lpm.dev:registry=`). This is the default.
+        #[arg(long, conflicts_with = "proxy")]
+        scoped: bool,
+    },
 }
 
 /// Subcommands of `lpm doctor`. Currently only `list` (the inventory
@@ -3729,18 +3738,31 @@ async fn async_main() -> Result<()> {
 
             Ok(())
         }
-        Commands::Setup {
-            registry: setup_registry,
-            oidc,
-            proxy,
-            scoped: _,
-        } => {
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
-            let cfg = commands::config::GlobalConfig::load();
-            let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
-            commands::setup::run(effective_registry, &cwd, cli.json, oidc, eff_proxy).await
-        }
+        Commands::Setup { action } => match action {
+            SetupAction::Ci {
+                registry: setup_registry,
+                oidc,
+                proxy,
+                scoped: _,
+            } => {
+                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
+                let cfg = commands::config::GlobalConfig::load();
+                let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
+                commands::setup::run(effective_registry, &cwd, cli.json, oidc, eff_proxy).await
+            }
+            SetupAction::Local {
+                days,
+                proxy,
+                scoped: _,
+            } => {
+                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                let cfg = commands::config::GlobalConfig::load();
+                let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
+                commands::npmrc::run(&client, &cwd, registry_url, days, eff_proxy, cli.json)
+                    .await
+            }
+        },
         Commands::TokenRotate => commands::token::run_rotate(&client, registry_url, cli.json).await,
         Commands::Outdated { registry_only } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -3986,16 +4008,6 @@ async fn async_main() -> Result<()> {
             // Subcommand args are re-parsed from raw argv inside run().
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::env::run(&client, &cwd, cli.json).await
-        },
-        Commands::SetupNpmrc {
-            days,
-            proxy,
-            scoped: _,
-        } => {
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            let cfg = commands::config::GlobalConfig::load();
-            let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
-            commands::npmrc::run(&client, &cwd, registry_url, days, eff_proxy, cli.json).await
         },
         Commands::Run {
             scripts,
