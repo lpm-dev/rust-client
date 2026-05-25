@@ -988,7 +988,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/token_rotate.rs", 1)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 41: lpm setup (.npmrc CI gen) ──
+    // ── id 41: lpm setup ci (.npmrc CI gen) ──
     SurfaceV2 {
         id: 41,
         scenarios: 3,
@@ -1004,22 +1004,22 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup against an .npmrc that already has conflicting scoped entries",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/setup.rs", 3)],
+        scenarios_by_file: &[("tests/workflows/tests/setup_ci.rs", 3)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 42: lpm setup-npmrc ──
+    // ── id 42: lpm setup local ──
     SurfaceV2 {
         id: 42,
         scenarios: 1,
         failure_modes_tested: &["writes scoped config + gitignore + read-only token"],
         failure_modes_known: &[
             ".npmrc path is symlink outside project",
-            "concurrent setup-npmrc writes",
+            "concurrent setup local writes",
             "backup file creation on overwrite",
-            "setup-npmrc when project root is a git submodule",
+            "setup local when project root is a git submodule",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/setup_npmrc.rs", 1)],
+        scenarios_by_file: &[("tests/workflows/tests/setup_local.rs", 1)],
         last_audited_at: "2026-05-14",
     },
     // ── id 43: lpm config get ──

@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 /// [`lpm_security::SecurityPolicy::DEFAULT_MIN_RELEASE_AGE`]; copied
 /// here to keep this module self-contained and to avoid poking at
 /// lpm-security's private constant).
-const DEFAULT_MIN_RELEASE_AGE_SECS: u64 = 86400;
+pub(crate) const DEFAULT_MIN_RELEASE_AGE_SECS: u64 = 86400;
 
 /// TOML key in `~/.lpm/config.toml` holding the global override.
 const GLOBAL_KEY: &str = "minimum-release-age-secs";

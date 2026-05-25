@@ -2,19 +2,19 @@
 //! Discipline`). Justification class: **intentionally minimal
 //! binary-surface repros**. Cross-command contract pin: ensures the
 //! `lpm ci setup gitlab` snippet's `LPM_OIDC_TOKEN` env var name +
-//! `aud=https://lpm.dev` audience match what `lpm setup --oidc`
+//! `aud=https://lpm.dev` audience match what `lpm setup ci --oidc`
 //! actually exchanges. Single focused assertion against a raw
 //! wiremock request body. A workflow tier port would inflate this
 //! tight contract pin into harness boilerplate that doesn't add
 //! coverage.
 //!
 //! Locks the contract emitted by `lpm ci setup gitlab` against the resolver
-//! that backs `lpm setup --oidc`.
+//! that backs `lpm setup ci --oidc`.
 //!
 //! The CLI's GitLab snippet generator (`crates/lpm-cli/src/commands/ci.rs`)
 //! tells users to mint a `LPM_OIDC_TOKEN` env var via the `id_tokens` block
 //! with `aud: https://lpm.dev`. This test spawns the actual binary, sets
-//! `LPM_OIDC_TOKEN`, and confirms `lpm setup --oidc` POSTs that JWT to the
+//! `LPM_OIDC_TOKEN`, and confirms `lpm setup ci --oidc` POSTs that JWT to the
 //! origin's OIDC-exchange endpoint and writes the exchanged session token
 //! into `.npmrc`. If anyone ever renames the env var, repurposes the
 //! variable's audience, or short-circuits the resolver, this test fails
@@ -52,7 +52,7 @@ async fn gitlab_snippet_lpm_oidc_token_drives_setup_oidc() {
 
     let exe = env!("CARGO_BIN_EXE_lpm-rs");
     let output = Command::new(exe)
-        .args(["setup", "--oidc", "--registry", &server_url])
+        .args(["setup", "ci", "--oidc", "--registry", &server_url])
         .current_dir(cwd)
         .env("HOME", cwd.join(".home"))
         .env("NO_COLOR", "1")
@@ -71,7 +71,7 @@ async fn gitlab_snippet_lpm_oidc_token_drives_setup_oidc() {
 
     assert!(
         output.status.success(),
-        "lpm setup --oidc must succeed when LPM_OIDC_TOKEN is set\n  exit: {:?}\n  stdout:\n{}\n  stderr:\n{}",
+        "lpm setup ci --oidc must succeed when LPM_OIDC_TOKEN is set\n  exit: {:?}\n  stdout:\n{}\n  stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),

@@ -3,7 +3,7 @@
 //! Two distinct consumer surfaces, each with its own audience and trust input:
 //!
 //! - **Registry exchange** (audience `https://lpm.dev`) — used by
-//!   `lpm setup --oidc`, the `lpm publish` auto-exchange path, and
+//!   `lpm setup ci --oidc`, the `lpm publish` auto-exchange path, and
 //!   `lpm env pull --oidc`. Honors `LPM_OIDC_TOKEN` as the canonical
 //!   pre-supplied bypass; `LPM_GITLAB_OIDC_TOKEN` is kept as a legacy alias.
 //! - **Sigstore provenance** (audience `sigstore`) — used by

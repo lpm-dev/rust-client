@@ -56,7 +56,6 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Doctor",
     "SwiftRegistry",
     "Mcp",
-    "SetupNpmrc",
     "Use",
     "Env",
     "Run",
@@ -552,7 +551,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
     },
     SurfaceBaseline {
         id: 41,
-        name: "`lpm setup` (.npmrc CI gen)",
+        name: "`lpm setup ci` (.npmrc CI gen)",
         unit: false,
         integration: false,
         workflow: true,
@@ -560,18 +559,18 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         json_contract: true,
         references: &[
             "crates/lpm-cli/tests/oidc_setup_snippet_contract.rs",
-            "tests/workflows/tests/setup.rs",
+            "tests/workflows/tests/setup_ci.rs",
         ],
     },
     SurfaceBaseline {
         id: 42,
-        name: "`lpm setup-npmrc`",
+        name: "`lpm setup local`",
         unit: false,
         integration: false,
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &["tests/workflows/tests/setup_npmrc.rs"],
+        references: &["tests/workflows/tests/setup_local.rs"],
     },
     SurfaceBaseline {
         id: 43,

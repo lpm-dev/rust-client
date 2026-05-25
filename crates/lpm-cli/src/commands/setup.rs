@@ -7,8 +7,8 @@ fn hint_line(message: &str) {
 }
 
 /// resolve a usable LPM bearer for CI/CD `.npmrc` generation.
-/// `setup` is best-effort — when no token is available it falls back
-/// to the `${LPM_TOKEN}` placeholder so CI can interpolate at runtime.
+/// `setup ci` is best-effort — when no token is available it falls
+/// back to the `${LPM_TOKEN}` placeholder so CI can interpolate at runtime.
 async fn resolve_lpm_bearer_optional(registry_url: &str) -> Option<String> {
     let session = lpm_auth::SessionManager::new(registry_url, None);
     session
