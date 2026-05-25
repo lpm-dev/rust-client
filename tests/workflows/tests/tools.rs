@@ -18,6 +18,9 @@ use support::{TempProject, lpm};
 const WORKSPACE_MEMBERS: [&str; 3] = ["packages/utils", "packages/core", "packages/app"];
 
 #[cfg(unix)]
+const TSGO_VERSION: &str = "7.0.0-dev.20260525.1";
+
+#[cfg(unix)]
 fn current_plugin_platform() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "darwin-arm64",
@@ -105,13 +108,112 @@ fn seed_fake_root_tsc(project: &TempProject, marker_file: &str) {
 }
 
 #[cfg(unix)]
-fn seed_fake_root_tool(project: &TempProject, tool_name: &str, script: &str) {
-    let bin_path = project
-        .path()
-        .join("node_modules")
-        .join(".bin")
-        .join(tool_name);
-    write_unix_executable(&bin_path, script);
+fn current_engine_platform() -> (&'static str, &'static str) {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("darwin-arm64", "lib/tsgo"),
+        ("macos", "x86_64") => ("darwin-x64", "lib/tsgo"),
+        ("linux", "x86_64") => ("linux-x64", "lib/tsgo"),
+        ("linux", "arm") => ("linux-arm", "lib/tsgo"),
+        ("linux", "aarch64") => ("linux-arm64", "lib/tsgo"),
+        ("windows", "x86_64") => ("win-x64", "lib/tsgo.exe"),
+        ("windows", "aarch64") => ("win-arm64", "lib/tsgo.exe"),
+        other => panic!("unsupported tsgo test platform: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn normalize_rel_path(path: &std::path::Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[cfg(unix)]
+fn hash_directory_tree_for_test(root: &std::path::Path) -> String {
+    use sha2::Digest;
+    use std::io::Read;
+
+    fn collect_files(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        rel_files: &mut Vec<std::path::PathBuf>,
+    ) {
+        for entry in std::fs::read_dir(current).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                collect_files(root, &path, rel_files);
+            } else {
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                if rel == std::path::PathBuf::from(".lpm-engine.json") {
+                    continue;
+                }
+                rel_files.push(rel);
+            }
+        }
+    }
+
+    let mut rel_files = Vec::new();
+    collect_files(root, root, &mut rel_files);
+    rel_files.sort();
+
+    let mut hasher = sha2::Sha256::new();
+    for rel in rel_files {
+        hasher.update(normalize_rel_path(&rel).as_bytes());
+        hasher.update([0]);
+        let mut file = std::fs::File::open(root.join(&rel)).unwrap();
+        let mut buf = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buf).unwrap();
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+        }
+        hasher.update([0]);
+    }
+
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(unix)]
+fn seed_fake_tsgo_engine(project: &TempProject, marker_file: &str) {
+    let (platform, entry_rel_path) = current_engine_platform();
+    let engine_dir = project
+        .home()
+        .join(".lpm")
+        .join("engines")
+        .join("tsgo")
+        .join(TSGO_VERSION)
+        .join(platform);
+    let entry_path = engine_dir.join(entry_rel_path);
+    std::fs::create_dir_all(entry_path.parent().unwrap()).expect("failed to create tsgo parent");
+
+    let script = format!("#!/bin/sh\nprintf '%s\n' \"$PWD\" >> '{}'\nexit 0\n", marker_file);
+    write_unix_executable(&entry_path, &script);
+    std::fs::write(engine_dir.join("lib/lib.d.ts"), b"declare const x: string;\n")
+        .expect("failed to write tsgo lib.d.ts");
+
+    let layout_sha256 = hash_directory_tree_for_test(&engine_dir);
+    let sidecar = serde_json::json!({
+        "schema_version": 1,
+        "engine_name": "tsgo",
+        "version": TSGO_VERSION,
+        "platform": platform,
+        "entry_rel_path": entry_rel_path,
+        "tarball_url": "https://example.invalid/native-preview.tgz",
+        "tarball_integrity": "sha512-test",
+        "tarball_sha256": "test-sha256",
+        "layout_sha256": layout_sha256,
+        "verified_at_unix": 0,
+    });
+    std::fs::write(
+        engine_dir.join(".lpm-engine.json"),
+        serde_json::to_vec_pretty(&sidecar).expect("failed to serialize tsgo sidecar"),
+    )
+    .expect("failed to write tsgo sidecar");
 }
 
 // ─── empty-match contract ───────────────────────────────────────
@@ -261,11 +363,7 @@ fn check_workspace_json_emits_valid_envelope_per_member() {
 fn check_workspace_json_uses_selected_tsgo_engine_per_member() {
     let project = TempProject::from_fixture("workspace-monorepo");
     let marker = project.path().join(".tsgo-workspace-members.txt");
-    let script = format!(
-        "#!/bin/sh\nprintf '%s\n' \"$PWD\" >> '{}'\nexit 0\n",
-        marker.display()
-    );
-    seed_fake_root_tool(&project, "tsgo", &script);
+    seed_fake_tsgo_engine(&project, &marker.display().to_string());
 
     let output = lpm(&project)
         .env("PATH", "")

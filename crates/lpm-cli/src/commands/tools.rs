@@ -128,7 +128,7 @@ pub async fn check(
         check_preflight(project_dir, engine)?;
     }
 
-    let outcome = run_check_engine(project_dir, args, engine, StdioMode::Inherit)?;
+    let outcome = run_check_engine(project_dir, args, engine, StdioMode::Inherit).await?;
     outcome.into_result()
 }
 
@@ -380,21 +380,23 @@ fn check_engine_binary(engine: CheckEngine) -> &'static str {
 fn check_engine_spawn_hint(engine: CheckEngine) -> &'static str {
     match engine {
         CheckEngine::Tsc => "Is typescript installed? Run: lpm install -D typescript",
-        CheckEngine::Tsgo => {
-            "Is @typescript/native-preview installed? Run: lpm install -D @typescript/native-preview"
-        }
+        CheckEngine::Tsgo => "The managed tsgo engine failed to start after install",
     }
 }
 
 /// Run the selected type-check engine with the configured stdio mode.
 /// Honors `node_modules/.bin` PATH injection so project-local tools win
 /// over a system install.
-fn run_check_engine(
+async fn run_check_engine(
     project_dir: &Path,
     args: &[String],
     engine: CheckEngine,
     stdio: StdioMode,
 ) -> Result<ToolOutcome, LpmError> {
+    if matches!(engine, CheckEngine::Tsgo) {
+        return run_tsgo(project_dir, args, stdio).await;
+    }
+
     let binary = check_engine_binary(engine);
     let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
     let mut cmd_args = vec!["--noEmit".to_string()];
@@ -437,6 +439,17 @@ fn run_check_engine(
     }
 
     Ok(outcome)
+}
+
+async fn run_tsgo(
+    project_dir: &Path,
+    args: &[String],
+    stdio: StdioMode,
+) -> Result<ToolOutcome, LpmError> {
+    let bin = lpm_plugin::ensure_engine("tsgo", None, matches!(stdio, StdioMode::Capture)).await?;
+    let mut cmd_args = vec!["--noEmit".to_string()];
+    cmd_args.extend_from_slice(args);
+    run_tool_binary(&bin, &cmd_args, project_dir, stdio)
 }
 
 fn apply_stdio(cmd: &mut Command, stdio: StdioMode) {
@@ -873,16 +886,19 @@ async fn run_one_member(
     let outcome_result = match tool {
         "lint" => run_lint_member(member_dir, args, stdio, root_pin).await,
         "fmt" => run_fmt_member(member_dir, args, check, stdio, root_pin).await,
-        "check" => Ok(run_check_engine(
-            member_dir,
-            args,
-            check_engine.unwrap_or(CheckEngine::Tsc),
-            stdio,
-        )
-        .unwrap_or_else(|e| ToolOutcome {
-            error: Some(e.to_string()),
-            ..Default::default()
-        })),
+        "check" => Ok(
+            run_check_engine(
+                member_dir,
+                args,
+                check_engine.unwrap_or(CheckEngine::Tsc),
+                stdio,
+            )
+            .await
+            .unwrap_or_else(|e| ToolOutcome {
+                error: Some(e.to_string()),
+                ..Default::default()
+            }),
+        ),
         "test" | "bench" => Ok(run_test_or_bench_member(member_dir, tool, args, stdio)),
         _ => Err(LpmError::Script(format!("unknown tool: {tool}"))),
     };

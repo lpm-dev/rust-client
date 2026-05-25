@@ -18,6 +18,8 @@ mod support;
 use support::assertions::parse_json_output;
 use support::{TempProject, lpm, lpm_with_registry};
 
+const TSGO_VERSION: &str = "7.0.0-dev.20260525.1";
+
 fn make_local_tool(project: &TempProject, rel_dir: &str, tool_name: &str, script: &str) {
     let bin_rel = if rel_dir.is_empty() {
         format!("node_modules/.bin/{tool_name}")
@@ -40,6 +42,118 @@ fn make_local_tsc(project: &TempProject, rel_dir: &str) {
     // Create a fake tsc shim inside `<rel_dir>/node_modules/.bin/`.
     // We never spawn it — the predicate only checks file existence.
     make_local_tool(project, rel_dir, "tsc", "#!/bin/sh\nexit 0\n");
+}
+
+fn current_engine_platform() -> (&'static str, &'static str) {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => ("darwin-arm64", "lib/tsgo"),
+        ("macos", "x86_64") => ("darwin-x64", "lib/tsgo"),
+        ("linux", "x86_64") => ("linux-x64", "lib/tsgo"),
+        ("linux", "arm") => ("linux-arm", "lib/tsgo"),
+        ("linux", "aarch64") => ("linux-arm64", "lib/tsgo"),
+        ("windows", "x86_64") => ("win-x64", "lib/tsgo.exe"),
+        ("windows", "aarch64") => ("win-arm64", "lib/tsgo.exe"),
+        other => panic!("unsupported tsgo test platform: {other:?}"),
+    }
+}
+
+fn normalize_rel_path(path: &std::path::Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn hash_directory_tree_for_test(root: &std::path::Path) -> String {
+    use sha2::Digest;
+    use std::io::Read;
+
+    fn collect_files(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        rel_files: &mut Vec<std::path::PathBuf>,
+    ) {
+        for entry in std::fs::read_dir(current).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                collect_files(root, &path, rel_files);
+            } else {
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                if rel == std::path::PathBuf::from(".lpm-engine.json") {
+                    continue;
+                }
+                rel_files.push(rel);
+            }
+        }
+    }
+
+    let mut rel_files = Vec::new();
+    collect_files(root, root, &mut rel_files);
+    rel_files.sort();
+
+    let mut hasher = sha2::Sha256::new();
+    for rel in rel_files {
+        hasher.update(normalize_rel_path(&rel).as_bytes());
+        hasher.update([0]);
+        let mut file = std::fs::File::open(root.join(&rel)).unwrap();
+        let mut buf = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buf).unwrap();
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+        }
+        hasher.update([0]);
+    }
+
+    format!("{:x}", hasher.finalize())
+}
+
+fn seed_fake_tsgo_engine(project: &TempProject, entry_script: &str) {
+    let (platform, entry_rel_path) = current_engine_platform();
+    let engine_dir = project
+        .home()
+        .join(".lpm")
+        .join("engines")
+        .join("tsgo")
+        .join(TSGO_VERSION)
+        .join(platform);
+    let entry_path = engine_dir.join(entry_rel_path);
+    let lib_dts_path = engine_dir.join("lib/lib.d.ts");
+
+    std::fs::create_dir_all(entry_path.parent().unwrap()).unwrap();
+    std::fs::write(&entry_path, entry_script).unwrap();
+    std::fs::write(&lib_dts_path, b"declare const x: string\n").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&entry_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&entry_path, perms).unwrap();
+    }
+
+    let layout_sha256 = hash_directory_tree_for_test(&engine_dir);
+    let sidecar = serde_json::json!({
+        "schema_version": 1,
+        "engine_name": "tsgo",
+        "version": TSGO_VERSION,
+        "platform": platform,
+        "entry_rel_path": entry_rel_path,
+        "tarball_url": "https://example.invalid/native-preview.tgz",
+        "tarball_integrity": "sha512-test",
+        "tarball_sha256": "test-sha256",
+        "layout_sha256": layout_sha256,
+        "verified_at_unix": 0,
+    });
+    std::fs::write(
+        engine_dir.join(".lpm-engine.json"),
+        serde_json::to_vec_pretty(&sidecar).unwrap(),
+    )
+    .unwrap();
 }
 
 fn find_check_by_code<'a>(
@@ -304,13 +418,11 @@ fn check_preflight_errors_when_typescript_declared_but_not_installed() {
 // ─── lpm check --engine tsgo: local shim + noEmit contract ───────
 
 #[test]
-fn check_tsgo_engine_uses_project_local_binary_with_no_emit() {
+fn check_tsgo_engine_uses_seeded_managed_engine_with_no_emit() {
     let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
     project.write_file("tsconfig.json", r#"{"compilerOptions": {}}"#);
-    make_local_tool(
+    seed_fake_tsgo_engine(
         &project,
-        "",
-        "tsgo",
         "#!/bin/sh\nprintf '%s\n' \"$@\" > .tsgo-args.txt\nexit 0\n",
     );
 
@@ -322,7 +434,7 @@ fn check_tsgo_engine_uses_project_local_binary_with_no_emit() {
 
     assert!(
         output.status.success(),
-        "project-local tsgo should satisfy lpm check; stderr:\n{}",
+        "seeded managed tsgo should satisfy lpm check; stderr:\n{}",
         String::from_utf8_lossy(&output.stderr),
     );
 
@@ -331,25 +443,6 @@ fn check_tsgo_engine_uses_project_local_binary_with_no_emit() {
     assert!(
         args.lines().any(|line| line == "--noEmit"),
         "lpm check must preserve no-emit semantics for tsgo; got args:\n{args}"
-    );
-}
-
-#[test]
-fn check_tsgo_engine_suggests_native_preview_when_binary_is_missing() {
-    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
-    project.write_file("tsconfig.json", r#"{"compilerOptions": {}}"#);
-
-    let output = lpm(&project)
-        .env("PATH", "")
-        .args(["check", "--engine", "tsgo"])
-        .output()
-        .expect("failed to run lpm check --engine tsgo");
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("@typescript/native-preview") && stderr.contains("tsgo"),
-        "missing tsgo should point users at the native-preview package; got:\n{stderr}"
     );
 }
 

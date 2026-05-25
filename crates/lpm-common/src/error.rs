@@ -156,6 +156,13 @@ pub enum LpmError {
     )]
     Plugin(String),
 
+    #[error("engine error: {0}")]
+    #[diagnostic(
+        code(lpm::engine),
+        help("Retry the command, or remove the cached engine under ~/.lpm/engines if it looks corrupted.")
+    )]
+    Engine(String),
+
     #[error("workspace error: {0}")]
     #[diagnostic(
         code(lpm::workspace),
@@ -275,6 +282,7 @@ impl LpmError {
             LpmError::Json(_) => "json",
             LpmError::Task(_) => "task",
             LpmError::Plugin(_) => "plugin",
+            LpmError::Engine(_) => "engine",
             LpmError::Workspace(_) => "workspace",
             LpmError::EnvValidation(_) => "env_validation",
             LpmError::EngineMismatch { .. } => "engine_mismatch",
@@ -335,6 +343,26 @@ mod tests {
             help.to_string(),
             "Run `lpm plugin list` to see installed plugins"
         );
+    }
+
+    #[test]
+    fn engine_error_display() {
+        let err = LpmError::Engine("version mismatch".to_string());
+        assert_eq!(err.to_string(), "engine error: version mismatch");
+    }
+
+    #[test]
+    fn engine_error_diagnostic_code() {
+        let err = LpmError::Engine("version mismatch".to_string());
+        let code = err.code().unwrap();
+        assert_eq!(code.to_string(), "lpm::engine");
+    }
+
+    #[test]
+    fn engine_error_help() {
+        let err = LpmError::Engine("version mismatch".to_string());
+        let help = err.help().unwrap();
+        assert!(help.to_string().contains("~/.lpm/engines"));
     }
 
     #[test]
@@ -399,6 +427,7 @@ mod tests {
             LpmError::Json(serde_json::from_str::<serde_json::Value>("bad").unwrap_err()),
             LpmError::Task("x".into()),
             LpmError::Plugin("x".into()),
+            LpmError::Engine("x".into()),
             LpmError::Workspace("x".into()),
             LpmError::EnvValidation("x".into()),
             LpmError::EngineMismatch {
@@ -497,6 +526,7 @@ mod tests {
         assert_eq!(LpmError::Store("x".into()).error_code(), "store");
         assert_eq!(LpmError::Task("x".into()).error_code(), "task");
         assert_eq!(LpmError::Plugin("x".into()).error_code(), "plugin");
+        assert_eq!(LpmError::Engine("x".into()).error_code(), "engine");
         assert_eq!(LpmError::Workspace("x".into()).error_code(), "workspace");
         assert_eq!(
             LpmError::EnvValidation("x".into()).error_code(),
