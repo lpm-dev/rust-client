@@ -104,6 +104,16 @@ fn seed_fake_root_tsc(project: &TempProject, marker_file: &str) {
     write_unix_executable(&bin_path, &script);
 }
 
+#[cfg(unix)]
+fn seed_fake_root_tool(project: &TempProject, tool_name: &str, script: &str) {
+    let bin_path = project
+        .path()
+        .join("node_modules")
+        .join(".bin")
+        .join(tool_name);
+    write_unix_executable(&bin_path, script);
+}
+
 // ─── empty-match contract ───────────────────────────────────────
 
 #[test]
@@ -245,6 +255,42 @@ fn check_workspace_json_emits_valid_envelope_per_member() {
             "duration_ms must be numeric, member: {member}"
         );
     }
+}
+
+#[test]
+fn check_workspace_json_uses_selected_tsgo_engine_per_member() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let marker = project.path().join(".tsgo-workspace-members.txt");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\n' \"$PWD\" >> '{}'\nexit 0\n",
+        marker.display()
+    );
+    seed_fake_root_tool(&project, "tsgo", &script);
+
+    let output = lpm(&project)
+        .env("PATH", "")
+        .args(["--json", "check", "--engine", "tsgo", "--all"])
+        .output()
+        .expect("failed to run lpm check --engine tsgo --all --json");
+
+    assert!(
+        output.status.success(),
+        "workspace tsgo check should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["packages"], serde_json::json!(3));
+    assert_eq!(json["succeeded"], serde_json::json!(3));
+    assert_eq!(json["failed"], serde_json::json!(0));
+
+    let members = std::fs::read_to_string(&marker).expect("expected tsgo marker file");
+    assert_eq!(
+        members.lines().count(),
+        3,
+        "expected one tsgo invocation per workspace member; got:\n{members}"
+    );
 }
 
 // ─── --affected with no changes keeps its specific success message ──

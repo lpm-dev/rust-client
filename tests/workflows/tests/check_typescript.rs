@@ -18,15 +18,13 @@ mod support;
 use support::assertions::parse_json_output;
 use support::{TempProject, lpm, lpm_with_registry};
 
-fn make_local_tsc(project: &TempProject, rel_dir: &str) {
-    // Create a fake tsc shim inside `<rel_dir>/node_modules/.bin/`.
-    // We never spawn it — the predicate only checks file existence.
+fn make_local_tool(project: &TempProject, rel_dir: &str, tool_name: &str, script: &str) {
     let bin_rel = if rel_dir.is_empty() {
-        "node_modules/.bin/tsc".to_string()
+        format!("node_modules/.bin/{tool_name}")
     } else {
-        format!("{rel_dir}/node_modules/.bin/tsc")
+        format!("{rel_dir}/node_modules/.bin/{tool_name}")
     };
-    project.write_file(&bin_rel, "#!/bin/sh\nexit 0\n");
+    project.write_file(&bin_rel, script);
 
     #[cfg(unix)]
     {
@@ -36,6 +34,12 @@ fn make_local_tsc(project: &TempProject, rel_dir: &str) {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
     }
+}
+
+fn make_local_tsc(project: &TempProject, rel_dir: &str) {
+    // Create a fake tsc shim inside `<rel_dir>/node_modules/.bin/`.
+    // We never spawn it — the predicate only checks file existence.
+    make_local_tool(project, rel_dir, "tsc", "#!/bin/sh\nexit 0\n");
 }
 
 fn find_check_by_code<'a>(
@@ -294,6 +298,58 @@ fn check_preflight_errors_when_typescript_declared_but_not_installed() {
         stderr.contains("declared in package.json but not installed")
             && stderr.contains("lpm install"),
         "preflight should distinguish declared-vs-not-declared; got:\n{stderr}"
+    );
+}
+
+// ─── lpm check --engine tsgo: local shim + noEmit contract ───────
+
+#[test]
+fn check_tsgo_engine_uses_project_local_binary_with_no_emit() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    project.write_file("tsconfig.json", r#"{"compilerOptions": {}}"#);
+    make_local_tool(
+        &project,
+        "",
+        "tsgo",
+        "#!/bin/sh\nprintf '%s\n' \"$@\" > .tsgo-args.txt\nexit 0\n",
+    );
+
+    let output = lpm(&project)
+        .env("PATH", "")
+        .args(["check", "--engine", "tsgo"])
+        .output()
+        .expect("failed to run lpm check --engine tsgo");
+
+    assert!(
+        output.status.success(),
+        "project-local tsgo should satisfy lpm check; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let args = std::fs::read_to_string(project.path().join(".tsgo-args.txt"))
+        .expect("expected tsgo shim to capture args");
+    assert!(
+        args.lines().any(|line| line == "--noEmit"),
+        "lpm check must preserve no-emit semantics for tsgo; got args:\n{args}"
+    );
+}
+
+#[test]
+fn check_tsgo_engine_suggests_native_preview_when_binary_is_missing() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    project.write_file("tsconfig.json", r#"{"compilerOptions": {}}"#);
+
+    let output = lpm(&project)
+        .env("PATH", "")
+        .args(["check", "--engine", "tsgo"])
+        .output()
+        .expect("failed to run lpm check --engine tsgo");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("@typescript/native-preview") && stderr.contains("tsgo"),
+        "missing tsgo should point users at the native-preview package; got:\n{stderr}"
     );
 }
 

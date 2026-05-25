@@ -134,6 +134,12 @@ enum LinkerCli {
     Hoisted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum CheckEngine {
+    Tsc,
+    Tsgo,
+}
+
 impl LinkerCli {
     fn into_linker_mode(self) -> lpm_linker::LinkerMode {
         match self {
@@ -1633,7 +1639,7 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Type-check the project (runs tsc --noEmit).
+    /// Type-check the project (runs tsc --noEmit by default).
     Check {
         /// Run in all workspace packages. Mutually exclusive with `--filter`
         /// and `--affected` — pick one selection mode.
@@ -1652,7 +1658,10 @@ enum Commands {
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
-        /// Extra arguments passed to tsc.
+        /// Type-check engine to run.
+        #[arg(long, value_enum, default_value_t = CheckEngine::Tsc)]
+        engine: CheckEngine,
+        /// Extra arguments passed to the selected engine.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -4194,6 +4203,7 @@ async fn async_main() -> Result<()> {
                     "lint",
                     &args,
                     false,
+                    None,
                     &filter,
                     affected_ref,
                     fail_if_no_match,
@@ -4222,6 +4232,7 @@ async fn async_main() -> Result<()> {
                     "fmt",
                     &args,
                     check,
+                    None,
                     &filter,
                     affected_ref,
                     fail_if_no_match,
@@ -4238,6 +4249,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             fail_if_no_match,
+            engine,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -4249,6 +4261,7 @@ async fn async_main() -> Result<()> {
                     "check",
                     &args,
                     false,
+                    Some(engine),
                     &filter,
                     affected_ref,
                     fail_if_no_match,
@@ -4256,7 +4269,7 @@ async fn async_main() -> Result<()> {
                 )
                 .await
             } else {
-                commands::tools::check(&cwd, &args, cli.json).await
+                commands::tools::check(&cwd, &args, engine, cli.json).await
             }
         }
         Commands::Test {
