@@ -1725,6 +1725,60 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Build package-oriented library output through a stable LPM command surface.
+    Pack {
+        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// and `--affected` — pick one selection mode.
+        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        all: bool,
+        /// Filter workspace packages with the grammar. Can be passed
+        /// multiple times: `--filter foo --filter bar` unions the two sets.
+        #[arg(long)]
+        filter: Vec<String>,
+        /// Run only in packages affected by git changes (vs base branch).
+        #[arg(long)]
+        affected: bool,
+        /// Git base ref for --affected (default: main).
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Exit non-zero if no workspace package matches the filter set.
+        #[arg(long)]
+        fail_if_no_match: bool,
+        /// Entry file to pack.
+        #[arg(long)]
+        entry: Option<String>,
+        /// Output directory for packed files.
+        #[arg(long)]
+        out_dir: Option<String>,
+        /// Explicit tsdown config path.
+        #[arg(long)]
+        config: Option<String>,
+        /// Explicit tsconfig path.
+        #[arg(long)]
+        tsconfig: Option<String>,
+        /// Target runtime for the generated code.
+        #[arg(long)]
+        target: Option<String>,
+        /// Output format for the generated package build.
+        #[arg(long, value_enum)]
+        format: Option<BundleFormat>,
+        /// Target platform for the generated code.
+        #[arg(long, value_enum)]
+        platform: Option<BundlePlatform>,
+        /// Generate declaration files.
+        #[arg(long)]
+        dts: bool,
+        /// Minify the packed output.
+        #[arg(long)]
+        minify: bool,
+        /// Generate a sourcemap alongside the output.
+        #[arg(long)]
+        sourcemap: bool,
+        /// Extra arguments passed through to tsdown.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Run tests (auto-detects vitest/jest/mocha).
     ///
     /// Workspace flags (`--all` / `--filter` / `--affected`) target the test
@@ -4358,6 +4412,50 @@ async fn async_main() -> Result<()> {
                 args,
             };
             commands::bundle::dispatch(
+                &cwd,
+                &options,
+                all,
+                &filter,
+                affected,
+                &base,
+                fail_if_no_match,
+                cli.json,
+            )
+            .await
+        }
+        Commands::Pack {
+            all,
+            filter,
+            affected,
+            base,
+            fail_if_no_match,
+            entry,
+            out_dir,
+            config,
+            tsconfig,
+            target,
+            format,
+            platform,
+            dts,
+            minify,
+            sourcemap,
+            args,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let options = commands::pack::PackOptions {
+                entry,
+                out_dir,
+                config,
+                tsconfig,
+                target,
+                format,
+                platform,
+                dts,
+                minify,
+                sourcemap,
+                args,
+            };
+            commands::pack::dispatch(
                 &cwd,
                 &options,
                 all,

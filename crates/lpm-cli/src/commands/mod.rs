@@ -32,6 +32,7 @@ pub mod migrate_patches;
 pub mod migrate_peer_rules;
 pub mod npmrc;
 pub mod outdated;
+pub mod pack;
 pub mod patch;
 pub mod plugin;
 pub mod pool;

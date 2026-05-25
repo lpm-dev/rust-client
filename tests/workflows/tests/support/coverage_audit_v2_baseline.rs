@@ -2951,6 +2951,24 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/bundle.rs", 3)],
         last_audited_at: "2026-05-25",
     },
+    // ── id 139: lpm pack ──
+    SurfaceV2 {
+        id: 139,
+        scenarios: 3,
+        failure_modes_tested: &[
+            "single-package pack runs the project-local tsdown binary with forwarded flags",
+            "workspace pack emits per-member JSON envelope",
+            "fail-if-no-match turns filter typos into non-zero exit",
+        ],
+        failure_modes_known: &[
+            "workspace watch selection rejects multi-member fan-out",
+            "tsdown missing from the reachable node_modules/.bin chain",
+            "spawn failure when node is unavailable on PATH",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/pack.rs", 3)],
+        last_audited_at: "2026-05-25",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────
