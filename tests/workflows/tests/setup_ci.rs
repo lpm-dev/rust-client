@@ -32,8 +32,8 @@ fn setup_ci_default_writes_scoped_registry_line_to_dot_npmrc() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let npmrc = std::fs::read_to_string(project.path().join(".npmrc"))
-        .expect("setup ci must write .npmrc");
+    let npmrc =
+        std::fs::read_to_string(project.path().join(".npmrc")).expect("setup ci must write .npmrc");
     assert!(
         npmrc.contains("@lpm.dev:registry=https://lpm.example.test/api/registry/"),
         ".npmrc must use the scoped registry line by default, got:\n{npmrc}",
@@ -74,14 +74,20 @@ fn setup_ci_proxy_flag_writes_non_scoped_registry_line() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["--registry", "https://lpm.example.test", "setup", "ci", "--proxy"])
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "--proxy",
+        ])
         .output()
         .expect("failed to run lpm setup ci --proxy");
 
     assert!(output.status.success(), "lpm setup ci --proxy failed");
 
-    let npmrc = std::fs::read_to_string(project.path().join(".npmrc"))
-        .expect("setup ci must write .npmrc");
+    let npmrc =
+        std::fs::read_to_string(project.path().join(".npmrc")).expect("setup ci must write .npmrc");
     // `--proxy` mode: bare `registry=` (catches all packages), NOT scoped.
     assert!(
         npmrc.contains("registry=https://lpm.example.test/api/registry/"),
@@ -148,7 +154,9 @@ fn setup_ci_json_envelope_carries_path_content_and_flag_state() {
         "envelope path must point at .npmrc, got: {path}"
     );
 
-    let content = envelope["content"].as_str().expect("content must be a string");
+    let content = envelope["content"]
+        .as_str()
+        .expect("content must be a string");
     assert!(
         content.contains("registry=https://lpm.example.test/api/registry/"),
         "envelope content must include the unscoped registry line under --proxy, got:\n{content}",

@@ -81,8 +81,7 @@ fn release_age_wizard_set_duration_with_json_announces_canonical_seconds() {
 fn release_age_wizard_set_default_with_json_deletes_override_and_announces_null() {
     let (project, lpm_home) = isolated_project();
     let config_path = project_config_path(&project);
-    std::fs::create_dir_all(config_path.parent().expect("config dir"))
-        .expect("create .lpm dir");
+    std::fs::create_dir_all(config_path.parent().expect("config dir")).expect("create .lpm dir");
     std::fs::write(&config_path, "minimum-release-age-secs = \"259200\"\n")
         .expect("seed release-age override");
 

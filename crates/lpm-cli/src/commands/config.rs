@@ -351,29 +351,24 @@ async fn run_release_age_wizard(
 
         let current = read_release_age_override(config_path)?;
         println!();
-        println!(
-            "  current: {}",
-            format_current_release_age(current).cyan()
-        );
-        let preset: &str = cliclack::select(
-            "How long should LPM wait before allowing newly published packages?",
-        )
-        .item("default", "Default (1 day)", "recommended")
-        .item("cautious", "Cautious (3 days)", "stricter")
-        .item("off", "Off", "NOT recommended — disables the cooldown")
-        .item("custom", "Custom", "enter 12h / 7d / 0")
-        .initial_value(release_age_initial_choice(current))
-        .interact()
-        .map_err(prompt_err)?;
+        println!("  current: {}", format_current_release_age(current).cyan());
+        let preset: &str =
+            cliclack::select("How long should LPM wait before allowing newly published packages?")
+                .item("default", "Default (1 day)", "recommended")
+                .item("cautious", "Cautious (3 days)", "stricter")
+                .item("off", "Off", "NOT recommended — disables the cooldown")
+                .item("custom", "Custom", "enter 12h / 7d / 0")
+                .initial_value(release_age_initial_choice(current))
+                .interact()
+                .map_err(prompt_err)?;
 
         match preset {
             "default" => ReleaseAgeSelection::Default,
             "cautious" => ReleaseAgeSelection::Seconds(CAUTIOUS_RELEASE_AGE_SECS),
             "off" => ReleaseAgeSelection::Seconds(0),
             "custom" => {
-                let default_input = current
-                    .map(format_release_age_cli_value)
-                    .unwrap_or_else(|| "1d".to_string());
+                let default_input =
+                    current.map_or_else(|| "1d".to_string(), format_release_age_cli_value);
                 let duration: String = cliclack::input("Minimum release age")
                     .default_input(&default_input)
                     .placeholder("1d, 12h, 0")
@@ -1256,7 +1251,10 @@ mod wizard_tests {
     fn release_age_wizard_initial_choice_treats_explicit_one_day_as_custom() {
         assert_eq!(release_age_initial_choice(None), "default");
         assert_eq!(release_age_initial_choice(Some(0)), "off");
-        assert_eq!(release_age_initial_choice(Some(CAUTIOUS_RELEASE_AGE_SECS)), "cautious");
+        assert_eq!(
+            release_age_initial_choice(Some(CAUTIOUS_RELEASE_AGE_SECS)),
+            "cautious"
+        );
         assert_eq!(
             release_age_initial_choice(Some(DEFAULT_RELEASE_AGE_SECS)),
             "custom",

@@ -56,7 +56,6 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Doctor",
     "SwiftRegistry",
     "Mcp",
-    "SetupNpmrc",
     "Use",
     "Env",
     "Run",
