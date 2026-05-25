@@ -73,7 +73,7 @@ impl MockRegistry {
         self
     }
 
-    /// Mount `POST /api/registry/-/token/create` for `lpm setup-npmrc`.
+    /// Mount `POST /api/registry/-/token/create` for `lpm setup local`.
     pub async fn with_npmrc_token_create(
         &self,
         expiry_days: u32,

@@ -9,14 +9,16 @@ use std::io::IsTerminal;
 /// Stores config in ~/.lpm/config.toml (user/machine config).
 /// Project config lives in package.json under "lpm" key.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, four focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, five focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
 /// - `lpm config sigstore` owns `[sigstore] verify = deny | warn | off`
 ///   (operator persistent toggle for Sigstore provenance verification).
+/// - `lpm config release-age` owns `minimum-release-age-secs = <seconds>`
+///   via human-friendly duration inputs.
 ///
-/// All four default to interactive in a TTY; `--set <value>` is the
+/// All five default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: &str,
@@ -41,6 +43,9 @@ pub async fn run(
     }
     if action == "sigstore" {
         return run_sigstore_wizard(&config_path, set, json_output).await;
+    }
+    if action == "release-age" {
+        return run_release_age_wizard(&config_path, set, json_output).await;
     }
 
     match action {
@@ -128,7 +133,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore"
+                 scripts, triage, sandbox, sigstore, release-age"
             )));
         }
     }
@@ -301,6 +306,185 @@ impl GlobalConfig {
             toml::Value::String(s) => crate::release_age_config::parse_strict_u64_string(s),
             _ => None,
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// `lpm config release-age` wizard
+// ─────────────────────────────────────────────────────────────────────
+//
+// Persists the existing global `minimum-release-age-secs` override,
+// but exposes a human-friendly command surface:
+//   - interactive (TTY): presets for Default / Cautious / Off plus a
+//     Custom duration prompt.
+//   - `--set <value>`: accepts `default`, `off`, or the same duration
+//     grammar as `lpm install --min-release-age` (`12h`, `3d`, `0`).
+//
+// Deliberate contract: `default` removes the global override rather
+// than persisting `86400`, so users stay on the product default if it
+// changes later.
+
+const RELEASE_AGE_KEY: &str = "minimum-release-age-secs";
+const DEFAULT_RELEASE_AGE_SECS: u64 = crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS;
+const CAUTIOUS_RELEASE_AGE_SECS: u64 = 3 * DEFAULT_RELEASE_AGE_SECS;
+
+#[derive(Clone, Copy)]
+enum ReleaseAgeSelection {
+    Default,
+    Seconds(u64),
+}
+
+async fn run_release_age_wizard(
+    config_path: &std::path::Path,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let selection = if let Some(value) = set {
+        parse_release_age_selection(value)?
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err(LpmError::Registry(
+                "lpm config release-age requires a TTY; use `--set default|off|0|<N>h|<N>d` instead"
+                    .to_string(),
+            ));
+        }
+
+        let current = read_release_age_override(config_path)?;
+        println!();
+        println!("  current: {}", format_current_release_age(current).cyan());
+        let preset: &str =
+            cliclack::select("How long should LPM wait before allowing newly published packages?")
+                .item("default", "Default (1 day)", "recommended")
+                .item("cautious", "Cautious (3 days)", "stricter")
+                .item("off", "Off", "NOT recommended — disables the cooldown")
+                .item("custom", "Custom", "enter 12h / 7d / 0")
+                .initial_value(release_age_initial_choice(current))
+                .interact()
+                .map_err(prompt_err)?;
+
+        match preset {
+            "default" => ReleaseAgeSelection::Default,
+            "cautious" => ReleaseAgeSelection::Seconds(CAUTIOUS_RELEASE_AGE_SECS),
+            "off" => ReleaseAgeSelection::Seconds(0),
+            "custom" => {
+                let default_input =
+                    current.map_or_else(|| "1d".to_string(), format_release_age_cli_value);
+                let duration: String = cliclack::input("Minimum release age")
+                    .default_input(&default_input)
+                    .placeholder("1d, 12h, 0")
+                    .validate(|input: &String| {
+                        crate::release_age_config::parse_duration(input)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+                    .interact()
+                    .map_err(prompt_err)?;
+                ReleaseAgeSelection::Seconds(crate::release_age_config::parse_duration(&duration)?)
+            }
+            _ => unreachable!("release-age select returned unexpected preset"),
+        }
+    };
+
+    let persisted = persist_release_age_selection(config_path, selection)?;
+    announce_release_age_set(persisted, json_output);
+    Ok(())
+}
+
+fn parse_release_age_selection(input: &str) -> Result<ReleaseAgeSelection, LpmError> {
+    match input {
+        "default" => Ok(ReleaseAgeSelection::Default),
+        "off" => Ok(ReleaseAgeSelection::Seconds(0)),
+        other => crate::release_age_config::parse_duration(other).map(ReleaseAgeSelection::Seconds),
+    }
+}
+
+fn read_release_age_override(config_path: &std::path::Path) -> Result<Option<u64>, LpmError> {
+    let cfg = read_config(config_path)?;
+    let table = match cfg {
+        toml::Value::Table(table) => table,
+        _ => return Ok(None),
+    };
+    Ok(GlobalConfig { table }.get_u64(RELEASE_AGE_KEY))
+}
+
+fn persist_release_age_selection(
+    config_path: &std::path::Path,
+    selection: ReleaseAgeSelection,
+) -> Result<Option<u64>, LpmError> {
+    let mut cfg = read_config(config_path)?;
+    let top = cfg.as_table_mut().ok_or_else(|| {
+        LpmError::Registry("config.toml must be a TOML table at the top level".into())
+    })?;
+
+    let persisted = match selection {
+        ReleaseAgeSelection::Default => {
+            top.remove(RELEASE_AGE_KEY);
+            None
+        }
+        ReleaseAgeSelection::Seconds(secs) => {
+            top.insert(
+                RELEASE_AGE_KEY.to_string(),
+                toml::Value::String(secs.to_string()),
+            );
+            Some(secs)
+        }
+    };
+
+    write_config(config_path, &cfg)?;
+    Ok(persisted)
+}
+
+fn format_release_age_cli_value(secs: u64) -> String {
+    if secs == 0 {
+        return "0".to_string();
+    }
+    if secs.is_multiple_of(86400) {
+        return format!("{}d", secs / 86400);
+    }
+    if secs.is_multiple_of(3600) {
+        return format!("{}h", secs / 3600);
+    }
+    secs.to_string()
+}
+
+fn format_current_release_age(current: Option<u64>) -> String {
+    match current {
+        None => "default (1d)".to_string(),
+        Some(0) => "off".to_string(),
+        Some(secs) if secs == DEFAULT_RELEASE_AGE_SECS => "1d (explicit override)".to_string(),
+        Some(secs) => format_release_age_cli_value(secs),
+    }
+}
+
+fn release_age_initial_choice(current: Option<u64>) -> &'static str {
+    match current {
+        None => "default",
+        Some(0) => "off",
+        Some(secs) if secs == CAUTIOUS_RELEASE_AGE_SECS => "cautious",
+        Some(_) => "custom",
+    }
+}
+
+fn announce_release_age_set(value: Option<u64>, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                RELEASE_AGE_KEY: value,
+            }))
+            .unwrap()
+        );
+        return;
+    }
+
+    match value {
+        None => output::success("Using default minimum release age (1d)"),
+        Some(0) => output::success("Set minimum release age = off"),
+        Some(secs) => output::success(&format!(
+            "Set minimum release age = {}",
+            format_release_age_cli_value(secs).bold()
+        )),
     }
 }
 
@@ -976,6 +1160,105 @@ mod wizard_tests {
         assert_eq!(
             table.get(SCRIPT_POLICY_KEY).and_then(|v| v.as_str()),
             Some("deny")
+        );
+    }
+
+    // ── release-age wizard (--set path) ────────────────────────
+
+    #[tokio::test]
+    async fn release_age_wizard_set_persists_canonical_seconds_for_human_durations() {
+        let (_dir, path) = tmp_config();
+        run_release_age_wizard(&path, Some("3d"), true)
+            .await
+            .unwrap();
+
+        assert_eq!(read_release_age_override(&path).unwrap(), Some(259200));
+        let cfg = read_config(&path).unwrap();
+        let table = cfg.as_table().unwrap();
+        assert_eq!(
+            table.get(RELEASE_AGE_KEY).and_then(|v| v.as_str()),
+            Some("259200"),
+            "release-age wizard should persist canonical seconds, not the raw duration string",
+        );
+    }
+
+    #[tokio::test]
+    async fn release_age_wizard_set_accepts_off_alias_and_zero() {
+        for value in ["off", "0"] {
+            let (_dir, path) = tmp_config();
+            run_release_age_wizard(&path, Some(value), true)
+                .await
+                .unwrap();
+            assert_eq!(
+                read_release_age_override(&path).unwrap(),
+                Some(0),
+                "value '{value}' must persist as zero seconds",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn release_age_wizard_set_default_deletes_existing_override() {
+        let (_dir, path) = tmp_config();
+        std::fs::write(&path, "minimum-release-age-secs = \"259200\"\n").unwrap();
+
+        run_release_age_wizard(&path, Some("default"), true)
+            .await
+            .unwrap();
+
+        assert_eq!(read_release_age_override(&path).unwrap(), None);
+        let cfg = read_config(&path).unwrap();
+        let table = cfg.as_table().unwrap();
+        assert!(
+            !table.contains_key(RELEASE_AGE_KEY),
+            "default must remove the explicit global override",
+        );
+    }
+
+    #[tokio::test]
+    async fn release_age_wizard_set_rejects_invalid_value() {
+        let (_dir, path) = tmp_config();
+        let err = run_release_age_wizard(&path, Some("1w"), true)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported unit"), "got: {msg}");
+        assert!(read_release_age_override(&path).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn release_age_wizard_preserves_unrelated_keys() {
+        let (_dir, path) = tmp_config();
+        std::fs::write(&path, "script-policy = \"triage\"\n").unwrap();
+
+        run_release_age_wizard(&path, Some("12h"), true)
+            .await
+            .unwrap();
+
+        let cfg = read_config(&path).unwrap();
+        let table = cfg.as_table().unwrap();
+        assert_eq!(
+            table.get("script-policy").and_then(|v| v.as_str()),
+            Some("triage"),
+        );
+        assert_eq!(
+            table.get(RELEASE_AGE_KEY).and_then(|v| v.as_str()),
+            Some("43200"),
+        );
+    }
+
+    #[test]
+    fn release_age_wizard_initial_choice_treats_explicit_one_day_as_custom() {
+        assert_eq!(release_age_initial_choice(None), "default");
+        assert_eq!(release_age_initial_choice(Some(0)), "off");
+        assert_eq!(
+            release_age_initial_choice(Some(CAUTIOUS_RELEASE_AGE_SECS)),
+            "cautious"
+        );
+        assert_eq!(
+            release_age_initial_choice(Some(DEFAULT_RELEASE_AGE_SECS)),
+            "custom",
+            "explicit 1d override must stay distinguishable from true default",
         );
     }
 

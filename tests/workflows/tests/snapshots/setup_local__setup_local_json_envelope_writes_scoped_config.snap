@@ -1,5 +1,5 @@
 ---
-source: tests/workflows/tests/setup_npmrc.rs
+source: tests/workflows/tests/setup_local.rs
 assertion_line: 43
 expression: envelope
 ---

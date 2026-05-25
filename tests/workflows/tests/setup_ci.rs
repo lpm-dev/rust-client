@@ -1,4 +1,4 @@
-//! Workflow tests for `lpm setup` (CI .npmrc generation).
+//! Workflow tests for `lpm setup ci` (CI `.npmrc` generation).
 //!
 //! The OIDC contract paths are pinned by the cli-binary survivor
 //! [`crates/lpm-cli/tests/oidc_setup_snippet_contract.rs`]. This file
@@ -17,23 +17,23 @@ use support::{TempProject, lpm};
 // ─── default scoped config ────────────────────────────────────────────
 
 #[test]
-fn setup_default_writes_scoped_registry_line_to_dot_npmrc() {
+fn setup_ci_default_writes_scoped_registry_line_to_dot_npmrc() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["--registry", "https://lpm.example.test", "setup"])
+        .args(["--registry", "https://lpm.example.test", "setup", "ci"])
         .output()
-        .expect("failed to run lpm setup");
+        .expect("failed to run lpm setup ci");
 
     assert!(
         output.status.success(),
-        "lpm setup failed:\nstdout: {}\nstderr: {}",
+        "lpm setup ci failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
 
     let npmrc =
-        std::fs::read_to_string(project.path().join(".npmrc")).expect("setup must write .npmrc");
+        std::fs::read_to_string(project.path().join(".npmrc")).expect("setup ci must write .npmrc");
     assert!(
         npmrc.contains("@lpm.dev:registry=https://lpm.example.test/api/registry/"),
         ".npmrc must use the scoped registry line by default, got:\n{npmrc}",
@@ -47,41 +47,47 @@ fn setup_default_writes_scoped_registry_line_to_dot_npmrc() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.trim().is_empty(),
-        "human setup should not write to stdout, got:\n{stdout}"
+        "human setup ci should not write to stdout, got:\n{stdout}"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("✓ Generated .npmrc"),
-        "human setup should report file generation with the slim done line, got:\n{stderr}"
+        "human setup ci should report file generation with the slim done line, got:\n{stderr}"
     );
     assert!(
         stderr.contains("! No token found — .npmrc uses ${LPM_TOKEN} placeholder."),
-        "human setup should surface the placeholder warning on stderr, got:\n{stderr}"
+        "human setup ci should surface the placeholder warning on stderr, got:\n{stderr}"
     );
     assert!(
         stderr.contains("Set LPM_TOKEN in your CI environment."),
-        "human setup should keep the CI env-var hint, got:\n{stderr}"
+        "human setup ci should keep the CI env-var hint, got:\n{stderr}"
     );
     assert!(
         !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
-        "legacy cliclack glyphs must be gone from setup stderr, got:\n{stderr}"
+        "legacy cliclack glyphs must be gone from setup ci stderr, got:\n{stderr}"
     );
 }
 
 #[test]
-fn setup_proxy_flag_writes_non_scoped_registry_line() {
+fn setup_ci_proxy_flag_writes_non_scoped_registry_line() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["--registry", "https://lpm.example.test", "setup", "--proxy"])
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "--proxy",
+        ])
         .output()
-        .expect("failed to run lpm setup --proxy");
+        .expect("failed to run lpm setup ci --proxy");
 
-    assert!(output.status.success(), "lpm setup --proxy failed");
+    assert!(output.status.success(), "lpm setup ci --proxy failed");
 
     let npmrc =
-        std::fs::read_to_string(project.path().join(".npmrc")).expect("setup must write .npmrc");
+        std::fs::read_to_string(project.path().join(".npmrc")).expect("setup ci must write .npmrc");
     // `--proxy` mode: bare `registry=` (catches all packages), NOT scoped.
     assert!(
         npmrc.contains("registry=https://lpm.example.test/api/registry/"),
@@ -95,28 +101,28 @@ fn setup_proxy_flag_writes_non_scoped_registry_line() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.trim().is_empty(),
-        "human setup --proxy should not write to stdout, got:\n{stdout}"
+        "human setup ci --proxy should not write to stdout, got:\n{stdout}"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("✓ Generated .npmrc"),
-        "human setup --proxy should report file generation with the slim done line, got:\n{stderr}"
+        "human setup ci --proxy should report file generation with the slim done line, got:\n{stderr}"
     );
     assert!(
         stderr.contains("› Using proxy mode — all npm traffic routed through lpm.dev."),
-        "human setup --proxy should report proxy mode on a slim phase line, got:\n{stderr}"
+        "human setup ci --proxy should report proxy mode on a slim phase line, got:\n{stderr}"
     );
     assert!(
         stderr.contains("! No token found — .npmrc uses ${LPM_TOKEN} placeholder."),
-        "human setup --proxy should surface the placeholder warning on stderr, got:\n{stderr}"
+        "human setup ci --proxy should surface the placeholder warning on stderr, got:\n{stderr}"
     );
 }
 
 // ─── --json envelope ──────────────────────────────────────────────────
 
 #[test]
-fn setup_json_envelope_carries_path_content_and_flag_state() {
+fn setup_ci_json_envelope_carries_path_content_and_flag_state() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
 
     let output = lpm(&project)
@@ -125,16 +131,17 @@ fn setup_json_envelope_carries_path_content_and_flag_state() {
             "https://lpm.example.test",
             "--json",
             "setup",
+            "ci",
             "--proxy",
         ])
         .output()
-        .expect("failed to run lpm setup --json");
+        .expect("failed to run lpm setup ci --json");
 
-    assert!(output.status.success(), "lpm setup --json failed");
+    assert!(output.status.success(), "lpm setup ci --json failed");
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("setup --json must be valid JSON: {e}\n---\n{stdout}"));
+        .unwrap_or_else(|e| panic!("setup ci --json must be valid JSON: {e}\n---\n{stdout}"));
 
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["proxy"], serde_json::json!(true));
