@@ -140,6 +140,20 @@ pub(crate) enum CheckEngine {
     Tsgo,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum BundleFormat {
+    Esm,
+    Cjs,
+    Iife,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum BundlePlatform {
+    Node,
+    Browser,
+    Neutral,
+}
+
 impl LinkerCli {
     fn into_linker_mode(self) -> lpm_linker::LinkerMode {
         match self {
@@ -1662,6 +1676,51 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = CheckEngine::Tsc)]
         engine: CheckEngine,
         /// Extra arguments passed to the selected engine.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Bundle the project with Rolldown through an LPM-owned command surface.
+    Bundle {
+        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// and `--affected` — pick one selection mode.
+        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        all: bool,
+        /// Filter workspace packages with the grammar. Can be passed
+        /// multiple times: `--filter foo --filter bar` unions the two sets.
+        #[arg(long)]
+        filter: Vec<String>,
+        /// Run only in packages affected by git changes (vs base branch).
+        #[arg(long)]
+        affected: bool,
+        /// Git base ref for --affected (default: main).
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Exit non-zero if no workspace package matches the filter set.
+        #[arg(long)]
+        fail_if_no_match: bool,
+        /// Entry file to bundle.
+        #[arg(long)]
+        entry: Option<String>,
+        /// Output directory for bundled files.
+        #[arg(long)]
+        out_dir: Option<String>,
+        /// Explicit rolldown config path.
+        #[arg(long)]
+        config: Option<String>,
+        /// Output format for the generated bundle.
+        #[arg(long, value_enum)]
+        format: Option<BundleFormat>,
+        /// Target platform for the generated code.
+        #[arg(long, value_enum)]
+        platform: Option<BundlePlatform>,
+        /// Minify the bundle output.
+        #[arg(long)]
+        minify: bool,
+        /// Generate a sourcemap alongside the output.
+        #[arg(long)]
+        sourcemap: bool,
+        /// Extra arguments passed through to rolldown.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -4271,6 +4330,44 @@ async fn async_main() -> Result<()> {
             } else {
                 commands::tools::check(&cwd, &args, engine, cli.json).await
             }
+        }
+        Commands::Bundle {
+            all,
+            filter,
+            affected,
+            base,
+            fail_if_no_match,
+            entry,
+            out_dir,
+            config,
+            format,
+            platform,
+            minify,
+            sourcemap,
+            args,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let options = commands::bundle::BundleOptions {
+                entry,
+                out_dir,
+                config,
+                format,
+                platform,
+                minify,
+                sourcemap,
+                args,
+            };
+            commands::bundle::dispatch(
+                &cwd,
+                &options,
+                all,
+                &filter,
+                affected,
+                &base,
+                fail_if_no_match,
+                cli.json,
+            )
+            .await
         }
         Commands::Test {
             all,

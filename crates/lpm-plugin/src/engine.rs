@@ -5,24 +5,45 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-const ENGINE_SCHEMA_VERSION: u32 = 1;
+const ENGINE_SCHEMA_VERSION: u32 = 2;
 const ENGINE_SIDECAR_FILE_NAME: &str = ".lpm-engine.json";
 const MAX_ENGINE_DOWNLOAD_SIZE: usize = 150 * 1024 * 1024;
+const ROLLDOWN_VERSION: &str = "1.0.2";
+const ROLLDOWN_ROOT_TARBALL_URL: &str = "https://registry.npmjs.org/rolldown/-/rolldown-1.0.2.tgz";
+const ROLLDOWN_ROOT_TARBALL_INTEGRITY: &str = "sha512-oZx5zVDtVB44AW3eaifgDml1gWRDZGvjcfdxonE4swNPG98PrrXjaO/KrnUjzlMnztCCRVlUueA1kCXhARGk6g==";
+const ROLLDOWN_PLUGINUTILS_TARBALL_URL: &str =
+    "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.0.tgz";
+const ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY: &str = "sha512-aKs/3GSWyV0mrhNmt/96/Z3yczC3yvrzYATCiCXQebBsGyYzjNdUphRVLeJQ67ySKVXRfMxt2lm12pmXvbPFQQ==";
+const OXC_TYPES_TARBALL_URL: &str =
+    "https://registry.npmjs.org/@oxc-project/types/-/types-0.132.0.tgz";
+const OXC_TYPES_TARBALL_INTEGRITY: &str = "sha512-FESMOxil5Se014ui/Eq8fT5uHJo6nIRwH0PfJrZJXs6Gek3ZVFOrpUv3YIZT20m+extU98Hg1Ym72U58rlsxUQ==";
 const TSGO_VERSION: &str = "7.0.0-dev.20260525.1";
+
+#[derive(Debug, Clone, Copy)]
+struct EngineInstallAsset {
+    install_subdir: &'static str,
+    tarball_url: &'static str,
+    tarball_integrity: &'static str,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct EnginePlatformAsset {
     platform: &'static str,
-    tarball_url: &'static str,
-    tarball_integrity: &'static str,
     entry_rel_path: &'static str,
+    packages: &'static [EngineInstallAsset],
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedEngineInstallAsset {
+    install_subdir: String,
+    tarball_url: String,
+    tarball_integrity: String,
 }
 
 #[derive(Debug, Clone)]
 struct ResolvedEngineAsset {
-    tarball_url: String,
-    tarball_integrity: String,
     entry_rel_path: String,
+    packages: Vec<ResolvedEngineInstallAsset>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,15 +54,22 @@ pub struct EngineDef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct EngineSidecarPackage {
+    install_subdir: String,
+    tarball_url: String,
+    tarball_integrity: String,
+    tarball_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EngineSidecar {
     schema_version: u32,
     engine_name: String,
     version: String,
     platform: String,
     entry_rel_path: String,
-    tarball_url: String,
-    tarball_integrity: String,
-    tarball_sha256: String,
+    #[serde(default)]
+    packages: Vec<EngineSidecarPackage>,
     layout_sha256: String,
     verified_at_unix: u64,
 }
@@ -52,9 +80,7 @@ impl EngineSidecar {
         version: impl Into<String>,
         platform: impl Into<String>,
         entry_rel_path: impl Into<String>,
-        tarball_url: impl Into<String>,
-        tarball_integrity: impl Into<String>,
-        tarball_sha256: impl Into<String>,
+        packages: Vec<EngineSidecarPackage>,
         layout_sha256: impl Into<String>,
     ) -> Self {
         Self {
@@ -63,9 +89,7 @@ impl EngineSidecar {
             version: version.into(),
             platform: platform.into(),
             entry_rel_path: entry_rel_path.into(),
-            tarball_url: tarball_url.into(),
-            tarball_integrity: tarball_integrity.into(),
-            tarball_sha256: tarball_sha256.into(),
+            packages,
             layout_sha256: layout_sha256.into(),
             verified_at_unix: now_unix(),
         }
@@ -92,53 +116,240 @@ enum EngineMissReason {
 static TSGO_ASSETS: &[EnginePlatformAsset] = &[
     EnginePlatformAsset {
         platform: "darwin-arm64",
-        tarball_url: "https://registry.npmjs.org/@typescript/native-preview-darwin-arm64/-/native-preview-darwin-arm64-7.0.0-dev.20260525.1.tgz",
-        tarball_integrity: "sha512-x0ClBYc6xQDLXvpRn/zg6SViX/r1F8LXHyfSHmKx4ieiaZiVvGsEww/qzdHind+Y62MIUN3e/XfDFrpRxWDv0g==",
         entry_rel_path: "lib/tsgo",
+        packages: &[EngineInstallAsset {
+            install_subdir: "",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-darwin-arm64/-/native-preview-darwin-arm64-7.0.0-dev.20260525.1.tgz",
+            tarball_integrity: "sha512-x0ClBYc6xQDLXvpRn/zg6SViX/r1F8LXHyfSHmKx4ieiaZiVvGsEww/qzdHind+Y62MIUN3e/XfDFrpRxWDv0g==",
+        }],
     },
     EnginePlatformAsset {
         platform: "darwin-x64",
-        tarball_url: "https://registry.npmjs.org/@typescript/native-preview-darwin-x64/-/native-preview-darwin-x64-7.0.0-dev.20260525.1.tgz",
-        tarball_integrity: "sha512-CSHbx6HfM+xXqceGFtG4kcqqoQ5xjT1BHO0bqLfLeQtKlMlze59dIV2DbOb5Aj6wm2ACTKU4K9aurJDdHARx1g==",
         entry_rel_path: "lib/tsgo",
+        packages: &[EngineInstallAsset {
+            install_subdir: "",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-darwin-x64/-/native-preview-darwin-x64-7.0.0-dev.20260525.1.tgz",
+            tarball_integrity: "sha512-CSHbx6HfM+xXqceGFtG4kcqqoQ5xjT1BHO0bqLfLeQtKlMlze59dIV2DbOb5Aj6wm2ACTKU4K9aurJDdHARx1g==",
+        }],
     },
     EnginePlatformAsset {
         platform: "linux-x64",
-        tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-x64/-/native-preview-linux-x64-7.0.0-dev.20260525.1.tgz",
-        tarball_integrity: "sha512-GhC0kXeYxn55Rk3klmWET/Y033AHeMzLBMO58yP7R8m5ZdGiBisejDZnvttzczYJtgT42LNOtVmbtsG/+R8XWw==",
         entry_rel_path: "lib/tsgo",
+        packages: &[EngineInstallAsset {
+            install_subdir: "",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-x64/-/native-preview-linux-x64-7.0.0-dev.20260525.1.tgz",
+            tarball_integrity: "sha512-GhC0kXeYxn55Rk3klmWET/Y033AHeMzLBMO58yP7R8m5ZdGiBisejDZnvttzczYJtgT42LNOtVmbtsG/+R8XWw==",
+        }],
     },
     EnginePlatformAsset {
         platform: "linux-arm",
-        tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-arm/-/native-preview-linux-arm-7.0.0-dev.20260525.1.tgz",
-        tarball_integrity: "sha512-hY2EVAaGc1bsaxthJiNUbzn6ESkMSLBiWRCNhQl8XdhDWew8KhKCjw4DHe0lAYSdxLJBe6fCPpcFjDnoSowBxA==",
         entry_rel_path: "lib/tsgo",
+        packages: &[EngineInstallAsset {
+            install_subdir: "",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-arm/-/native-preview-linux-arm-7.0.0-dev.20260525.1.tgz",
+            tarball_integrity: "sha512-hY2EVAaGc1bsaxthJiNUbzn6ESkMSLBiWRCNhQl8XdhDWew8KhKCjw4DHe0lAYSdxLJBe6fCPpcFjDnoSowBxA==",
+        }],
     },
     EnginePlatformAsset {
         platform: "linux-arm64",
-        tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-arm64/-/native-preview-linux-arm64-7.0.0-dev.20260525.1.tgz",
-        tarball_integrity: "sha512-0DFKd3EuZ/Z0/mB114mATrlRxQUo7rcpXYgd5CJN7y1dbIgkavbjVamzzJKt3s42tkJGfdys83w6aIHDu6fykw==",
         entry_rel_path: "lib/tsgo",
+        packages: &[EngineInstallAsset {
+            install_subdir: "",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-arm64/-/native-preview-linux-arm64-7.0.0-dev.20260525.1.tgz",
+            tarball_integrity: "sha512-0DFKd3EuZ/Z0/mB114mATrlRxQUo7rcpXYgd5CJN7y1dbIgkavbjVamzzJKt3s42tkJGfdys83w6aIHDu6fykw==",
+        }],
     },
     EnginePlatformAsset {
         platform: "win-x64",
-        tarball_url: "https://registry.npmjs.org/@typescript/native-preview-win32-x64/-/native-preview-win32-x64-7.0.0-dev.20260525.1.tgz",
-        tarball_integrity: "sha512-xJCdFz9smVQVpXYW0vZZJsM0GIANPqSt8eMDRYfDY6M/BcXNXYOAt7tsxnSRyYWnFf9Ci7wKNRZaihZrDJ2m6A==",
         entry_rel_path: "lib/tsgo.exe",
+        packages: &[EngineInstallAsset {
+            install_subdir: "",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-win32-x64/-/native-preview-win32-x64-7.0.0-dev.20260525.1.tgz",
+            tarball_integrity: "sha512-xJCdFz9smVQVpXYW0vZZJsM0GIANPqSt8eMDRYfDY6M/BcXNXYOAt7tsxnSRyYWnFf9Ci7wKNRZaihZrDJ2m6A==",
+        }],
     },
     EnginePlatformAsset {
         platform: "win-arm64",
-        tarball_url: "https://registry.npmjs.org/@typescript/native-preview-win32-arm64/-/native-preview-win32-arm64-7.0.0-dev.20260525.1.tgz",
-        tarball_integrity: "sha512-L2+bsx73FyuEzLNgybtIxhnT9lYYAh9rTRFWZ4wZlJg44DGstjgz4FBKVHBO/cm3Hz7YNWeJESrB9ROUNbffPg==",
         entry_rel_path: "lib/tsgo.exe",
+        packages: &[EngineInstallAsset {
+            install_subdir: "",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-win32-arm64/-/native-preview-win32-arm64-7.0.0-dev.20260525.1.tgz",
+            tarball_integrity: "sha512-L2+bsx73FyuEzLNgybtIxhnT9lYYAh9rTRFWZ4wZlJg44DGstjgz4FBKVHBO/cm3Hz7YNWeJESrB9ROUNbffPg==",
+        }],
     },
 ];
 
-static ENGINES: &[EngineDef] = &[EngineDef {
-    name: "tsgo",
-    latest_version: TSGO_VERSION,
-    assets: TSGO_ASSETS,
-}];
+static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
+    EnginePlatformAsset {
+        platform: "darwin-arm64",
+        entry_rel_path: "bin/cli.mjs",
+        packages: &[
+            EngineInstallAsset {
+                install_subdir: "",
+                tarball_url: ROLLDOWN_ROOT_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_ROOT_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/pluginutils",
+                tarball_url: ROLLDOWN_PLUGINUTILS_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@oxc-project/types",
+                tarball_url: OXC_TYPES_TARBALL_URL,
+                tarball_integrity: OXC_TYPES_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/binding-darwin-arm64",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.0.2.tgz",
+                tarball_integrity: "sha512-vdFA9+C/rekyGce7WqHs/xoT0ioZEWaOFyZLIV1mEeNFaFDUQrPIo8Vs2GvJ6eetb3rzDUtUBgzto3ExpXJB3w==",
+            },
+        ],
+    },
+    EnginePlatformAsset {
+        platform: "darwin-x64",
+        entry_rel_path: "bin/cli.mjs",
+        packages: &[
+            EngineInstallAsset {
+                install_subdir: "",
+                tarball_url: ROLLDOWN_ROOT_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_ROOT_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/pluginutils",
+                tarball_url: ROLLDOWN_PLUGINUTILS_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@oxc-project/types",
+                tarball_url: OXC_TYPES_TARBALL_URL,
+                tarball_integrity: OXC_TYPES_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/binding-darwin-x64",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.0.2.tgz",
+                tarball_integrity: "sha512-BewSOwTHazv77DTYiAZXSqqKZ4KP/KonFisDMVU7PImxoWfB2aepnPhd2E4SWz3zDzYgDNbs6jBmTdgNnF02GA==",
+            },
+        ],
+    },
+    EnginePlatformAsset {
+        platform: "linux-x64",
+        entry_rel_path: "bin/cli.mjs",
+        packages: &[
+            EngineInstallAsset {
+                install_subdir: "",
+                tarball_url: ROLLDOWN_ROOT_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_ROOT_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/pluginutils",
+                tarball_url: ROLLDOWN_PLUGINUTILS_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@oxc-project/types",
+                tarball_url: OXC_TYPES_TARBALL_URL,
+                tarball_integrity: OXC_TYPES_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/binding-linux-x64-gnu",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.0.2.tgz",
+                tarball_integrity: "sha512-0+bOkiQ779+r1WpoHOWHqncvyySci0vKph+myNDYb+im6meJAzHQXay6oEgnkHuUGouM1LKTZwqKpBow6Kj7CQ==",
+            },
+        ],
+    },
+    EnginePlatformAsset {
+        platform: "linux-arm64",
+        entry_rel_path: "bin/cli.mjs",
+        packages: &[
+            EngineInstallAsset {
+                install_subdir: "",
+                tarball_url: ROLLDOWN_ROOT_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_ROOT_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/pluginutils",
+                tarball_url: ROLLDOWN_PLUGINUTILS_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@oxc-project/types",
+                tarball_url: OXC_TYPES_TARBALL_URL,
+                tarball_integrity: OXC_TYPES_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/binding-linux-arm64-gnu",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.0.2.tgz",
+                tarball_integrity: "sha512-1jn6qDU5iiOgFgygDzKUuKP0maTi0/f1+sBLgvij/76C77Nm3ts6ufz9Bjg5q5dduxiUIxtq86JIoBvo1xQ4Ig==",
+            },
+        ],
+    },
+    EnginePlatformAsset {
+        platform: "win-x64",
+        entry_rel_path: "bin/cli.mjs",
+        packages: &[
+            EngineInstallAsset {
+                install_subdir: "",
+                tarball_url: ROLLDOWN_ROOT_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_ROOT_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/pluginutils",
+                tarball_url: ROLLDOWN_PLUGINUTILS_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@oxc-project/types",
+                tarball_url: OXC_TYPES_TARBALL_URL,
+                tarball_integrity: OXC_TYPES_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/binding-win32-x64-msvc",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.0.2.tgz",
+                tarball_integrity: "sha512-v7qRI7gXLRINcOGXt+7YmAZ6iFuyZVMIoXAxhd8oP+DR9dLfL9GfNIx7PLMxmhZdvq8waUJBQiWN9EKNy+TRBQ==",
+            },
+        ],
+    },
+    EnginePlatformAsset {
+        platform: "win-arm64",
+        entry_rel_path: "bin/cli.mjs",
+        packages: &[
+            EngineInstallAsset {
+                install_subdir: "",
+                tarball_url: ROLLDOWN_ROOT_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_ROOT_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/pluginutils",
+                tarball_url: ROLLDOWN_PLUGINUTILS_TARBALL_URL,
+                tarball_integrity: ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@oxc-project/types",
+                tarball_url: OXC_TYPES_TARBALL_URL,
+                tarball_integrity: OXC_TYPES_TARBALL_INTEGRITY,
+            },
+            EngineInstallAsset {
+                install_subdir: "node_modules/@rolldown/binding-win32-arm64-msvc",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.0.2.tgz",
+                tarball_integrity: "sha512-SqKonF56vA/L2yHwHYcEp2P34URpOZ7d1fS635cTkpDnUtEGdUbHI6NzsPdqeSWvAAeGDrxjWjNmibDIdFf9/A==",
+            },
+        ],
+    },
+];
+
+static ENGINES: &[EngineDef] = &[
+    EngineDef {
+        name: "tsgo",
+        latest_version: TSGO_VERSION,
+        assets: TSGO_ASSETS,
+    },
+    EngineDef {
+        name: "rolldown",
+        latest_version: ROLLDOWN_VERSION,
+        assets: ROLLDOWN_ASSETS,
+    },
+];
 
 pub async fn ensure_engine(
     engine_name: &str,
@@ -163,6 +374,7 @@ pub async fn ensure_engine(
             &version,
             &platform_str,
             &asset.entry_rel_path,
+            &asset.packages,
         ),
         EngineReuseDecision::Hit,
     ) {
@@ -190,7 +402,10 @@ pub fn get_engine(name: &str) -> Option<&'static EngineDef> {
     ENGINES.iter().find(|engine| engine.name == name)
 }
 
-fn resolve_engine_version(def: &EngineDef, pinned_version: Option<&str>) -> Result<String, LpmError> {
+fn resolve_engine_version(
+    def: &EngineDef,
+    pinned_version: Option<&str>,
+) -> Result<String, LpmError> {
     match pinned_version {
         None => Ok(def.latest_version.to_string()),
         Some(version) if version == def.latest_version => Ok(version.to_string()),
@@ -213,9 +428,16 @@ fn resolve_engine_asset(def: &EngineDef, platform: &str) -> Result<ResolvedEngin
             ))
         })?;
     Ok(ResolvedEngineAsset {
-        tarball_url: asset.tarball_url.to_string(),
-        tarball_integrity: asset.tarball_integrity.to_string(),
         entry_rel_path: asset.entry_rel_path.to_string(),
+        packages: asset
+            .packages
+            .iter()
+            .map(|package| ResolvedEngineInstallAsset {
+                install_subdir: package.install_subdir.to_string(),
+                tarball_url: package.tarball_url.to_string(),
+                tarball_integrity: package.tarball_integrity.to_string(),
+            })
+            .collect(),
     })
 }
 
@@ -256,6 +478,7 @@ async fn install_under_lock_at(
             version,
             platform,
             &asset.entry_rel_path,
+            &asset.packages,
         ),
         EngineReuseDecision::Hit,
     ) {
@@ -269,10 +492,6 @@ async fn install_under_lock_at(
         );
     }
 
-    let bytes = download_tarball(&asset.tarball_url).await?;
-    lpm_extractor::verify_integrity(&bytes, &asset.tarball_integrity)?;
-
-    let tarball_sha256 = compute_sha256(&bytes);
     let version_dir = engine_version_dir_at(engines_root, engine_name, version)?;
     std::fs::create_dir_all(&version_dir)?;
 
@@ -290,9 +509,26 @@ async fn install_under_lock_at(
     let _ = std::fs::remove_dir_all(&stage_dir);
     std::fs::create_dir_all(&stage_dir)?;
 
-    if let Err(error) = verify_and_extract(&bytes, &asset.tarball_integrity, &stage_dir) {
-        let _ = std::fs::remove_dir_all(&stage_dir);
-        return Err(error);
+    let mut sidecar_packages = Vec::with_capacity(asset.packages.len());
+
+    for package in &asset.packages {
+        let bytes = download_tarball(&package.tarball_url).await?;
+        lpm_extractor::verify_integrity(&bytes, &package.tarball_integrity)?;
+
+        sidecar_packages.push(EngineSidecarPackage {
+            install_subdir: package.install_subdir.clone(),
+            tarball_url: package.tarball_url.clone(),
+            tarball_integrity: package.tarball_integrity.clone(),
+            tarball_sha256: compute_sha256(&bytes),
+        });
+
+        let extract_root = install_root_for_stage(&stage_dir, &package.install_subdir)?;
+        std::fs::create_dir_all(&extract_root)?;
+
+        if let Err(error) = verify_and_extract(&bytes, &package.tarball_integrity, &extract_root) {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(error);
+        }
     }
 
     let staged_entry = stage_dir.join(&asset.entry_rel_path);
@@ -324,9 +560,7 @@ async fn install_under_lock_at(
         version,
         platform,
         &asset.entry_rel_path,
-        &asset.tarball_url,
-        &asset.tarball_integrity,
-        tarball_sha256,
+        sidecar_packages,
         layout_sha256,
     );
     if let Err(error) = write_sidecar_atomic(&sidecar_path, &sidecar) {
@@ -374,7 +608,8 @@ async fn download_tarball(url: &str) -> Result<Vec<u8>, LpmError> {
     if bytes.len() > MAX_ENGINE_DOWNLOAD_SIZE {
         return Err(LpmError::Engine(format!(
             "engine download size ({} bytes) exceeds maximum allowed size ({} bytes)",
-            bytes.len(), MAX_ENGINE_DOWNLOAD_SIZE,
+            bytes.len(),
+            MAX_ENGINE_DOWNLOAD_SIZE,
         )));
     }
 
@@ -388,6 +623,7 @@ fn validate_for_reuse(
     requested_version: &str,
     current_platform: &str,
     expected_entry_rel_path: &str,
+    expected_packages: &[ResolvedEngineInstallAsset],
 ) -> EngineReuseDecision {
     let sidecar = match read_sidecar(sidecar_path) {
         Ok(sidecar) => sidecar,
@@ -404,6 +640,21 @@ fn validate_for_reuse(
         return EngineReuseDecision::Miss(EngineMissReason::PlatformMismatch);
     }
     if sidecar.entry_rel_path != expected_entry_rel_path {
+        return EngineReuseDecision::Miss(EngineMissReason::IdentityMismatch);
+    }
+    if sidecar.packages.len() != expected_packages.len() {
+        return EngineReuseDecision::Miss(EngineMissReason::IdentityMismatch);
+    }
+    if sidecar
+        .packages
+        .iter()
+        .zip(expected_packages)
+        .any(|(observed, expected)| {
+            observed.install_subdir != expected.install_subdir
+                || observed.tarball_url != expected.tarball_url
+                || observed.tarball_integrity != expected.tarball_integrity
+        })
+    {
         return EngineReuseDecision::Miss(EngineMissReason::IdentityMismatch);
     }
     if !install_dir.join(expected_entry_rel_path).is_file() {
@@ -465,7 +716,11 @@ fn hash_directory_tree(root: &Path) -> Result<String, LpmError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn collect_files(root: &Path, current: &Path, rel_files: &mut Vec<PathBuf>) -> Result<(), LpmError> {
+fn collect_files(
+    root: &Path,
+    current: &Path,
+    rel_files: &mut Vec<PathBuf>,
+) -> Result<(), LpmError> {
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
@@ -479,7 +734,7 @@ fn collect_files(root: &Path, current: &Path, rel_files: &mut Vec<PathBuf>) -> R
             .strip_prefix(root)
             .map_err(|e| LpmError::Engine(format!("failed to derive engine relative path: {e}")))?
             .to_path_buf();
-        if rel == PathBuf::from(ENGINE_SIDECAR_FILE_NAME) {
+        if rel.as_path() == Path::new(ENGINE_SIDECAR_FILE_NAME) {
             continue;
         }
         rel_files.push(rel);
@@ -515,6 +770,32 @@ fn normalize_rel_path(path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn install_root_for_stage(stage_dir: &Path, install_subdir: &str) -> Result<PathBuf, LpmError> {
+    if install_subdir.is_empty() {
+        return Ok(stage_dir.to_path_buf());
+    }
+
+    let rel = Path::new(install_subdir);
+    if rel.is_absolute() {
+        return Err(LpmError::Engine(format!(
+            "engine install subdir must be relative: {install_subdir}"
+        )));
+    }
+
+    for component in rel.components() {
+        match component {
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+            _ => {
+                return Err(LpmError::Engine(format!(
+                    "engine install subdir contains invalid component: {install_subdir}"
+                )));
+            }
+        }
+    }
+
+    Ok(stage_dir.join(rel))
 }
 
 fn validate_engine_version(version: &str) -> Result<(), LpmError> {
@@ -569,7 +850,11 @@ fn engine_version_dir_at(
     Ok(engines_root.join(engine_name).join(version))
 }
 
-fn engine_platform_dir(engine_name: &str, version: &str, platform: &str) -> Result<PathBuf, LpmError> {
+fn engine_platform_dir(
+    engine_name: &str,
+    version: &str,
+    platform: &str,
+) -> Result<PathBuf, LpmError> {
     let engines_root = engines_dir()?;
     engine_platform_dir_at(&engines_root, engine_name, version, platform)
 }
@@ -585,7 +870,11 @@ fn engine_platform_dir_at(
     Ok(engine_version_dir_at(engines_root, engine_name, version)?.join(platform))
 }
 
-fn engine_sidecar_path(engine_name: &str, version: &str, platform: &str) -> Result<PathBuf, LpmError> {
+fn engine_sidecar_path(
+    engine_name: &str,
+    version: &str,
+    platform: &str,
+) -> Result<PathBuf, LpmError> {
     let engines_root = engines_dir()?;
     engine_sidecar_path_at(&engines_root, engine_name, version, platform)
 }
@@ -596,8 +885,10 @@ fn engine_sidecar_path_at(
     version: &str,
     platform: &str,
 ) -> Result<PathBuf, LpmError> {
-    Ok(engine_platform_dir_at(engines_root, engine_name, version, platform)?
-        .join(ENGINE_SIDECAR_FILE_NAME))
+    Ok(
+        engine_platform_dir_at(engines_root, engine_name, version, platform)?
+            .join(ENGINE_SIDECAR_FILE_NAME),
+    )
 }
 
 fn engine_entry_path(
@@ -607,7 +898,13 @@ fn engine_entry_path(
     entry_rel_path: &str,
 ) -> Result<PathBuf, LpmError> {
     let engines_root = engines_dir()?;
-    engine_entry_path_at(&engines_root, engine_name, version, platform, entry_rel_path)
+    engine_entry_path_at(
+        &engines_root,
+        engine_name,
+        version,
+        platform,
+        entry_rel_path,
+    )
 }
 
 fn engine_entry_path_at(
@@ -668,7 +965,11 @@ mod tests {
         let entry_path = install_dir.join(entry_rel_path);
         std::fs::create_dir_all(entry_path.parent().unwrap()).unwrap();
         std::fs::write(&entry_path, b"engine-bytes").unwrap();
-        std::fs::write(install_dir.join("lib/lib.d.ts"), b"declare const x: string;").unwrap();
+        std::fs::write(
+            install_dir.join("lib/lib.d.ts"),
+            b"declare const x: string;",
+        )
+        .unwrap();
 
         let layout_sha256 = hash_directory_tree(&install_dir).unwrap();
         let sidecar = EngineSidecar::new(
@@ -676,9 +977,12 @@ mod tests {
             "1.0.0",
             "darwin-arm64",
             entry_rel_path,
-            "https://example.test/native-preview.tgz",
-            "sha512-test",
-            "tarball-sha",
+            vec![EngineSidecarPackage {
+                install_subdir: "".into(),
+                tarball_url: "https://example.test/native-preview.tgz".into(),
+                tarball_integrity: "sha512-test".into(),
+                tarball_sha256: "tarball-sha".into(),
+            }],
             layout_sha256,
         );
         write_sidecar_atomic(&install_dir.join(ENGINE_SIDECAR_FILE_NAME), &sidecar).unwrap();
@@ -699,9 +1003,43 @@ mod tests {
             "1.0.0",
             "darwin-arm64",
             "lib/tsgo",
+            &[ResolvedEngineInstallAsset {
+                install_subdir: "".into(),
+                tarball_url: "https://example.test/native-preview.tgz".into(),
+                tarball_integrity: "sha512-test".into(),
+            }],
         );
-        assert_eq!(decision, EngineReuseDecision::Miss(EngineMissReason::LayoutHashMismatch));
+        assert_eq!(
+            decision,
+            EngineReuseDecision::Miss(EngineMissReason::LayoutHashMismatch)
+        );
         assert!(entry_path.exists());
+    }
+
+    #[test]
+    fn validate_for_reuse_detects_engine_package_definition_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let install_dir = dir.path().join("tsgo").join("1.0.0").join("darwin-arm64");
+        install_fake_engine(dir.path(), "lib/tsgo");
+
+        let decision = validate_for_reuse(
+            &install_dir.join(ENGINE_SIDECAR_FILE_NAME),
+            &install_dir,
+            "tsgo",
+            "1.0.0",
+            "darwin-arm64",
+            "lib/tsgo",
+            &[ResolvedEngineInstallAsset {
+                install_subdir: "".into(),
+                tarball_url: "https://example.test/other-native-preview.tgz".into(),
+                tarball_integrity: "sha512-test".into(),
+            }],
+        );
+
+        assert_eq!(
+            decision,
+            EngineReuseDecision::Miss(EngineMissReason::IdentityMismatch)
+        );
     }
 
     #[tokio::test]
@@ -730,9 +1068,12 @@ mod tests {
             "1.0.0",
             "darwin-arm64",
             ResolvedEngineAsset {
-                tarball_url: format!("{}/tsgo.tgz", server.uri()),
-                tarball_integrity: integrity,
                 entry_rel_path: "lib/tsgo".into(),
+                packages: vec![ResolvedEngineInstallAsset {
+                    install_subdir: "".into(),
+                    tarball_url: format!("{}/tsgo.tgz", server.uri()),
+                    tarball_integrity: integrity,
+                }],
             },
             true,
         )
@@ -740,20 +1081,102 @@ mod tests {
         .unwrap();
 
         assert!(result.exists());
+        assert!(
+            home.path()
+                .join("engines/tsgo/1.0.0/darwin-arm64/lib/lib.d.ts")
+                .exists()
+        );
+        assert!(
+            home.path()
+                .join("engines/tsgo/1.0.0/darwin-arm64/.lpm-engine.json")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn install_under_lock_supports_nested_engine_packages() {
+        let rolldown_tarball = create_test_tarball(&[
+            ("bin/cli.mjs", b"#!/usr/bin/env node\n"),
+            ("package.json", br#"{"name":"rolldown","version":"1.0.2"}"#),
+        ]);
+        let binding_tarball = create_test_tarball(&[
+            (
+                "package.json",
+                br#"{"name":"@rolldown/binding-darwin-arm64","version":"1.0.2"}"#,
+            ),
+            ("rolldown-binding.darwin-arm64.node", b"binding-bytes"),
+        ]);
+        let rolldown_integrity = lpm_common::Integrity::from_bytes(
+            lpm_common::integrity::HashAlgorithm::Sha512,
+            &rolldown_tarball,
+        )
+        .to_string();
+        let binding_integrity = lpm_common::Integrity::from_bytes(
+            lpm_common::integrity::HashAlgorithm::Sha512,
+            &binding_tarball,
+        )
+        .to_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rolldown.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(rolldown_tarball.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/binding.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(binding_tarball.clone()))
+            .mount(&server)
+            .await;
+
+        let home = tempfile::tempdir().unwrap();
+        let engines_root = home.path().join("engines");
+        let result = install_under_lock_at(
+            &engines_root,
+            "rolldown",
+            "1.0.2",
+            "darwin-arm64",
+            ResolvedEngineAsset {
+                entry_rel_path: "bin/cli.mjs".into(),
+                packages: vec![
+                    ResolvedEngineInstallAsset {
+                        install_subdir: "".into(),
+                        tarball_url: format!("{}/rolldown.tgz", server.uri()),
+                        tarball_integrity: rolldown_integrity,
+                    },
+                    ResolvedEngineInstallAsset {
+                        install_subdir: "node_modules/@rolldown/binding-darwin-arm64".into(),
+                        tarball_url: format!("{}/binding.tgz", server.uri()),
+                        tarball_integrity: binding_integrity,
+                    },
+                ],
+            },
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.exists());
+        assert!(
+            home.path()
+                .join("engines/rolldown/1.0.2/darwin-arm64/bin/cli.mjs")
+                .exists()
+        );
         assert!(home
             .path()
-            .join("engines/tsgo/1.0.0/darwin-arm64/lib/lib.d.ts")
-            .exists());
-        assert!(home
-            .path()
-            .join("engines/tsgo/1.0.0/darwin-arm64/.lpm-engine.json")
+            .join(
+                "engines/rolldown/1.0.2/darwin-arm64/node_modules/@rolldown/binding-darwin-arm64/package.json"
+            )
             .exists());
     }
 
     #[test]
     fn resolve_engine_version_rejects_unbundled_pin() {
-        let error = resolve_engine_version(get_engine("tsgo").unwrap(), Some("1.0.0"))
-            .unwrap_err();
-        assert!(error.to_string().contains("only supports the bundled version"));
+        let error = resolve_engine_version(get_engine("tsgo").unwrap(), Some("1.0.0")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only supports the bundled version")
+        );
     }
 }

@@ -790,6 +790,7 @@ struct MemberResult {
 
 /// Run all members in a single topological level. Within a level, members are
 /// independent; we fan out across `available_parallelism()` threads.
+#[allow(clippy::too_many_arguments)]
 async fn run_level(
     ws_graph: &lpm_task::graph::WorkspaceGraph,
     level_targets: &[usize],
@@ -867,6 +868,7 @@ async fn run_level(
 }
 
 /// Execute one member's tool invocation and convert into a `MemberResult`.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_member(
     member_dir: &Path,
     member_name: &str,
@@ -886,19 +888,17 @@ async fn run_one_member(
     let outcome_result = match tool {
         "lint" => run_lint_member(member_dir, args, stdio, root_pin).await,
         "fmt" => run_fmt_member(member_dir, args, check, stdio, root_pin).await,
-        "check" => Ok(
-            run_check_engine(
-                member_dir,
-                args,
-                check_engine.unwrap_or(CheckEngine::Tsc),
-                stdio,
-            )
-            .await
-            .unwrap_or_else(|e| ToolOutcome {
-                error: Some(e.to_string()),
-                ..Default::default()
-            }),
-        ),
+        "check" => Ok(run_check_engine(
+            member_dir,
+            args,
+            check_engine.unwrap_or(CheckEngine::Tsc),
+            stdio,
+        )
+        .await
+        .unwrap_or_else(|e| ToolOutcome {
+            error: Some(e.to_string()),
+            ..Default::default()
+        })),
         "test" | "bench" => Ok(run_test_or_bench_member(member_dir, tool, args, stdio)),
         _ => Err(LpmError::Script(format!("unknown tool: {tool}"))),
     };

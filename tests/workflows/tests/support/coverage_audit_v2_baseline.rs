@@ -2932,6 +2932,25 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/install.rs", 6)],
         last_audited_at: "2026-05-14",
     },
+    // ── id 138: lpm bundle ──
+    SurfaceV2 {
+        id: 138,
+        scenarios: 3,
+        failure_modes_tested: &[
+            "single-package bundle reuses seeded managed rolldown engine",
+            "workspace bundle emits per-member JSON envelope",
+            "fail-if-no-match turns filter typos into non-zero exit",
+        ],
+        failure_modes_known: &[
+            "workspace watch selection rejects multi-member fan-out",
+            "spawn failure when node is unavailable on PATH",
+            "engine prewarm failure surfaces exit_code null with error in workspace JSON envelope",
+            "cold managed rolldown install path without seeded cache",
+        ],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/bundle.rs", 3)],
+        last_audited_at: "2026-05-25",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

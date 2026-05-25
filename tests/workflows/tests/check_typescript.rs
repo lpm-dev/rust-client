@@ -57,6 +57,47 @@ fn current_engine_platform() -> (&'static str, &'static str) {
     }
 }
 
+fn seeded_tsgo_sidecar_packages(platform: &str) -> Vec<serde_json::Value> {
+    let (tarball_url, tarball_integrity) = match platform {
+        "darwin-arm64" => (
+            "https://registry.npmjs.org/@typescript/native-preview-darwin-arm64/-/native-preview-darwin-arm64-7.0.0-dev.20260525.1.tgz",
+            "sha512-x0ClBYc6xQDLXvpRn/zg6SViX/r1F8LXHyfSHmKx4ieiaZiVvGsEww/qzdHind+Y62MIUN3e/XfDFrpRxWDv0g==",
+        ),
+        "darwin-x64" => (
+            "https://registry.npmjs.org/@typescript/native-preview-darwin-x64/-/native-preview-darwin-x64-7.0.0-dev.20260525.1.tgz",
+            "sha512-CSHbx6HfM+xXqceGFtG4kcqqoQ5xjT1BHO0bqLfLeQtKlMlze59dIV2DbOb5Aj6wm2ACTKU4K9aurJDdHARx1g==",
+        ),
+        "linux-x64" => (
+            "https://registry.npmjs.org/@typescript/native-preview-linux-x64/-/native-preview-linux-x64-7.0.0-dev.20260525.1.tgz",
+            "sha512-GhC0kXeYxn55Rk3klmWET/Y033AHeMzLBMO58yP7R8m5ZdGiBisejDZnvttzczYJtgT42LNOtVmbtsG/+R8XWw==",
+        ),
+        "linux-arm" => (
+            "https://registry.npmjs.org/@typescript/native-preview-linux-arm/-/native-preview-linux-arm-7.0.0-dev.20260525.1.tgz",
+            "sha512-hY2EVAaGc1bsaxthJiNUbzn6ESkMSLBiWRCNhQl8XdhDWew8KhKCjw4DHe0lAYSdxLJBe6fCPpcFjDnoSowBxA==",
+        ),
+        "linux-arm64" => (
+            "https://registry.npmjs.org/@typescript/native-preview-linux-arm64/-/native-preview-linux-arm64-7.0.0-dev.20260525.1.tgz",
+            "sha512-0DFKd3EuZ/Z0/mB114mATrlRxQUo7rcpXYgd5CJN7y1dbIgkavbjVamzzJKt3s42tkJGfdys83w6aIHDu6fykw==",
+        ),
+        "win-x64" => (
+            "https://registry.npmjs.org/@typescript/native-preview-win32-x64/-/native-preview-win32-x64-7.0.0-dev.20260525.1.tgz",
+            "sha512-xJCdFz9smVQVpXYW0vZZJsM0GIANPqSt8eMDRYfDY6M/BcXNXYOAt7tsxnSRyYWnFf9Ci7wKNRZaihZrDJ2m6A==",
+        ),
+        "win-arm64" => (
+            "https://registry.npmjs.org/@typescript/native-preview-win32-arm64/-/native-preview-win32-arm64-7.0.0-dev.20260525.1.tgz",
+            "sha512-L2+bsx73FyuEzLNgybtIxhnT9lYYAh9rTRFWZ4wZlJg44DGstjgz4FBKVHBO/cm3Hz7YNWeJESrB9ROUNbffPg==",
+        ),
+        other => panic!("unsupported seeded tsgo platform: {other}"),
+    };
+
+    vec![serde_json::json!({
+        "install_subdir": "",
+        "tarball_url": tarball_url,
+        "tarball_integrity": tarball_integrity,
+        "tarball_sha256": "test-sha256",
+    })]
+}
+
 fn normalize_rel_path(path: &std::path::Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
@@ -81,7 +122,7 @@ fn hash_directory_tree_for_test(root: &std::path::Path) -> String {
                 collect_files(root, &path, rel_files);
             } else {
                 let rel = path.strip_prefix(root).unwrap().to_path_buf();
-                if rel == std::path::PathBuf::from(".lpm-engine.json") {
+                if rel.as_path() == std::path::Path::new(".lpm-engine.json") {
                     continue;
                 }
                 rel_files.push(rel);
@@ -138,14 +179,12 @@ fn seed_fake_tsgo_engine(project: &TempProject, entry_script: &str) {
 
     let layout_sha256 = hash_directory_tree_for_test(&engine_dir);
     let sidecar = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "engine_name": "tsgo",
         "version": TSGO_VERSION,
         "platform": platform,
         "entry_rel_path": entry_rel_path,
-        "tarball_url": "https://example.invalid/native-preview.tgz",
-        "tarball_integrity": "sha512-test",
-        "tarball_sha256": "test-sha256",
+        "packages": seeded_tsgo_sidecar_packages(platform),
         "layout_sha256": layout_sha256,
         "verified_at_unix": 0,
     });

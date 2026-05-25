@@ -159,7 +159,9 @@ pub enum LpmError {
     #[error("engine error: {0}")]
     #[diagnostic(
         code(lpm::engine),
-        help("Retry the command, or remove the cached engine under ~/.lpm/engines if it looks corrupted.")
+        help(
+            "Retry the command, or remove the cached engine under ~/.lpm/engines if it looks corrupted."
+        )
     )]
     Engine(String),
 

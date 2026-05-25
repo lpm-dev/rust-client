@@ -1,6 +1,7 @@
 pub mod add;
 pub mod approve_scripts;
 pub mod audit;
+pub mod bundle;
 pub mod cache;
 pub mod cache_prune;
 pub mod cert;

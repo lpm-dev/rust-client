@@ -38,8 +38,8 @@
 //! poison the cache and route every subsequent invocation down a
 //! permanently-failing install path.
 
-pub mod engine;
 pub mod download;
+pub mod engine;
 pub mod registry;
 pub mod sidecar;
 pub mod store;
@@ -48,7 +48,7 @@ pub mod versions;
 use lpm_common::LpmError;
 use std::path::{Path, PathBuf};
 
-pub use engine::ensure_engine;
+pub use engine::{ensure_engine, get_engine};
 
 /// Ensure a plugin is installed for the current platform and return
 /// the path to its binary.
