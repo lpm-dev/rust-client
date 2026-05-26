@@ -252,6 +252,16 @@ pub enum LpmError {
         )
     )]
     SelfUpdate(String),
+
+    #[error("security floor refused: {0}")]
+    #[diagnostic(
+        code(lpm::security_floor),
+        help(
+            "This request would lower the current machine floor while `force-security-floor = true` is active. \
+             Keep the stricter posture, or lower the floor intentionally in ~/.lpm/config.toml before retrying."
+        )
+    )]
+    SecurityFloor(String),
 }
 
 impl LpmError {
@@ -292,6 +302,7 @@ impl LpmError {
             LpmError::SelfUpdateRateLimited(_) => "self_update_rate_limited",
             LpmError::ProvenanceVerification(_) => "provenance_verification",
             LpmError::SelfUpdate(_) => "self_update",
+            LpmError::SecurityFloor(_) => "security_floor",
         }
     }
 }
@@ -440,6 +451,7 @@ mod tests {
             },
             LpmError::SelfUpdatePaused("x".into()),
             LpmError::SelfUpdateRateLimited("x".into()),
+            LpmError::SecurityFloor("x".into()),
         ];
 
         for variant in &variants {
@@ -543,6 +555,10 @@ mod tests {
             }
             .error_code(),
             "engine_mismatch"
+        );
+        assert_eq!(
+            LpmError::SecurityFloor("x".into()).error_code(),
+            "security_floor"
         );
     }
 }

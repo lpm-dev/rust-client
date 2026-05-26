@@ -114,14 +114,74 @@ pub fn resolve_sandbox_mode_from_chain(
     project_dir: &Path,
     no_sandbox_flag: bool,
     strict_sandbox_flag: bool,
+    json_output: bool,
 ) -> Result<(SandboxOptions, ResolvedSandboxMode), LpmError> {
-    if no_sandbox_flag {
+    let project_path = project_dir.join("lpm.toml");
+    let mut project = read_sandbox_keys_from_file(&project_path)?;
+
+    let global_path = dirs::home_dir().map(|h| h.join(".lpm").join("config.toml"));
+    let global = match global_path {
+        Some(ref p) => read_sandbox_keys_from_file(p)?,
+        None => RawSandboxKeys::default(),
+    };
+
+    let force_security_floor = crate::security_floor::force_security_floor_enabled(
+        &crate::commands::config::GlobalConfig::load(),
+    );
+    let mut effective_no_sandbox_flag = no_sandbox_flag;
+    if force_security_floor {
+        let floor_mode = global.mode.unwrap_or(SandboxModeKey::Default);
+        let floor_allow_degraded = global.allow_degraded.unwrap_or(false);
+
+        if effective_no_sandbox_flag && !matches!(floor_mode, SandboxModeKey::None) {
+            crate::security_floor::record_suppression(
+                crate::security_floor::SuppressionRecord::new(
+                    crate::security_floor::GuardedControl::SandboxMode,
+                    crate::security_floor::SuppressionSource::Cli,
+                    "none",
+                    sandbox_mode_key_name(floor_mode),
+                ),
+                json_output,
+            );
+            effective_no_sandbox_flag = false;
+        }
+
+        if let Some(mode) = project.mode
+            && mode.loosens(floor_mode)
+        {
+            crate::security_floor::record_suppression(
+                crate::security_floor::SuppressionRecord::new(
+                    crate::security_floor::GuardedControl::SandboxMode,
+                    crate::security_floor::SuppressionSource::Project,
+                    sandbox_mode_key_name(mode),
+                    sandbox_mode_key_name(floor_mode),
+                ),
+                json_output,
+            );
+            project.mode = None;
+        }
+
+        if project.allow_degraded == Some(true) && !floor_allow_degraded {
+            crate::security_floor::record_suppression(
+                crate::security_floor::SuppressionRecord::new(
+                    crate::security_floor::GuardedControl::SandboxAllowDegraded,
+                    crate::security_floor::SuppressionSource::Project,
+                    "true",
+                    "false",
+                ),
+                json_output,
+            );
+            project.allow_degraded = None;
+        }
+    }
+
+    if effective_no_sandbox_flag {
         // `--no-sandbox` always wins. No env/config consultation —
         // the user explicitly said "no sandbox for this command."
         return Ok((SandboxOptions::default(), ResolvedSandboxMode::None));
     }
     if strict_sandbox_flag {
-        let (options, _) = load_sandbox_options_with_mode(project_dir)?;
+        let (options, _) = merge(project.clone(), global.clone());
         return Ok((
             SandboxOptions {
                 deny_outbound_network: true,
@@ -131,7 +191,7 @@ pub fn resolve_sandbox_mode_from_chain(
         ));
     }
     if env_strict_sandbox_set() {
-        let (options, _) = load_sandbox_options_with_mode(project_dir)?;
+        let (options, _) = merge(project.clone(), global.clone());
         return Ok((
             SandboxOptions {
                 deny_outbound_network: true,
@@ -140,7 +200,7 @@ pub fn resolve_sandbox_mode_from_chain(
             ResolvedSandboxMode::Strict,
         ));
     }
-    load_sandbox_options_with_mode(project_dir)
+    Ok(merge(project, global))
 }
 
 /// `true` when `LPM_STRICT_SANDBOX` is set to a value the user
@@ -196,6 +256,26 @@ impl SandboxModeKey {
             "none" => Some(Self::None),
             _ => None,
         }
+    }
+
+    fn loosens(self, floor: Self) -> bool {
+        self.rank() < floor.rank()
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Default => 1,
+            Self::Strict => 2,
+        }
+    }
+}
+
+fn sandbox_mode_key_name(mode: SandboxModeKey) -> &'static str {
+    match mode {
+        SandboxModeKey::Default => "default",
+        SandboxModeKey::Strict => "strict",
+        SandboxModeKey::None => "none",
     }
 }
 
@@ -328,6 +408,31 @@ impl ResolvedSandboxMode {
             Self::Default => "default",
             Self::Strict => "strict",
             Self::None => "none",
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &'static str {
+        self.name()
+    }
+
+    pub(crate) fn parse_for_security_floor(raw: &str) -> Option<Self> {
+        match raw {
+            "default" => Some(Self::Default),
+            "strict" => Some(Self::Strict),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn loosens(self, floor: Self) -> bool {
+        self.rank() < floor.rank()
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Default => 1,
+            Self::Strict => 2,
         }
     }
 }
@@ -475,6 +580,17 @@ mod tests {
         project: std::path::PathBuf,
     }
 
+    struct ScopedHomeDir {
+        dir: TempDir,
+        _env: crate::test_env::ScopedEnv,
+    }
+
+    impl ScopedHomeDir {
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+    }
+
     fn fixture(lpm_toml_body: Option<&str>) -> Env {
         let tmp = tempfile::tempdir().expect("tempdir");
         let project = tmp.path().to_path_buf();
@@ -482,6 +598,20 @@ mod tests {
             fs::write(project.join("lpm.toml"), body).expect("write lpm.toml");
         }
         Env { _tmp: tmp, project }
+    }
+
+    fn scoped_home_dir() -> ScopedHomeDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = crate::test_env::ScopedEnv::set([("HOME", dir.path().as_os_str().to_owned())]);
+        ScopedHomeDir { dir, _env: env }
+    }
+
+    fn write_global_config(home: &Path, body: &str) {
+        let path = home.join(".lpm").join("config.toml");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create .lpm");
+        }
+        fs::write(path, body).expect("write config.toml");
     }
 
     /// Convenience: read the project-side only (ignore the global
@@ -983,5 +1113,56 @@ allow-degraded = "maybe"
         assert!(
             strict_banner_for_runtime(SandboxMode::LogOnly, ResolvedSandboxMode::None).is_none(),
         );
+    }
+
+    #[test]
+    fn resolve_sandbox_mode_force_floor_suppresses_cli_no_sandbox() {
+        let env = fixture(None);
+        let home = scoped_home_dir();
+        write_global_config(
+            home.path(),
+            "force-security-floor = true\n[sandbox]\nmode = \"strict\"\n",
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+
+        let (_, resolved) =
+            resolve_sandbox_mode_from_chain(&env.project, true, false, true).unwrap();
+
+        assert_eq!(resolved, ResolvedSandboxMode::Strict);
+        let suppressions = crate::security_floor::recorded_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(
+            suppressions[0].control,
+            crate::security_floor::GuardedControl::SandboxMode
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+    }
+
+    #[test]
+    fn resolve_sandbox_mode_force_floor_suppresses_looser_project_mode() {
+        let env = fixture(Some(
+            r#"
+[sandbox]
+mode = "none"
+"#,
+        ));
+        let home = scoped_home_dir();
+        write_global_config(
+            home.path(),
+            "force-security-floor = true\n[sandbox]\nmode = \"strict\"\n",
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+
+        let (_, resolved) =
+            resolve_sandbox_mode_from_chain(&env.project, false, false, true).unwrap();
+
+        assert_eq!(resolved, ResolvedSandboxMode::Strict);
+        let suppressions = crate::security_floor::recorded_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(
+            suppressions[0].source,
+            crate::security_floor::SuppressionSource::Project
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
     }
 }

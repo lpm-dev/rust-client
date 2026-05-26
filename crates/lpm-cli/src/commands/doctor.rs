@@ -2856,8 +2856,9 @@ fn probe_sandbox_backend() -> Check {
         // route through the precedence chain so
         // `LPM_STRICT_SANDBOX=1` and `[sandbox] mode` flow through
         // the doctor probe identically to the install pipeline.
-        Ok(cwd) => match crate::sandbox_config::resolve_sandbox_mode_from_chain(&cwd, false, false)
-        {
+        Ok(cwd) => match crate::sandbox_config::resolve_sandbox_mode_from_chain(
+            &cwd, false, false, true,
+        ) {
             Ok(pair) => pair,
             Err(e) => {
                 return Check::fail(

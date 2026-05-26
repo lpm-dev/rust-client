@@ -41,6 +41,7 @@ mod sandbox_config;
 mod save_config;
 mod save_spec;
 mod script_policy_config;
+mod security_floor;
 pub mod security_check;
 mod sigstore;
 mod sigstore_verify;
