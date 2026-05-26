@@ -124,6 +124,87 @@ pub fn resolve_sandbox_mode_from_chain(
         Some(ref p) => read_sandbox_keys_from_file(p)?,
         None => RawSandboxKeys::default(),
     };
+    let authorized = crate::security_approval::load_authorized_posture()?;
+    let authorized_mode = authorized.sandbox_mode();
+    let authorized_mode_key = match authorized_mode {
+        ResolvedSandboxMode::Default => SandboxModeKey::Default,
+        ResolvedSandboxMode::Strict => SandboxModeKey::Strict,
+        ResolvedSandboxMode::None => SandboxModeKey::None,
+    };
+    let authorized_allow_degraded = authorized.sandbox_allow_degraded();
+
+    let cli_unlock_authorized = if no_sandbox_flag && !matches!(authorized_mode, ResolvedSandboxMode::None) {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::SandboxNone,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            "This install request disables the sandbox for this project.",
+            None,
+        )?;
+        true
+    } else {
+        false
+    };
+
+    let project_mode_unlock_authorized =
+        if let Some(mode) = project.mode && mode.loosens(authorized_mode_key) {
+            crate::security_approval::ensure_project_unlock(
+                crate::security_approval::ApprovalScope::SandboxNone,
+                project_dir,
+                json_output,
+                crate::security_approval::ApprovalSource::ProjectConfig,
+                "lpm.toml requests a weaker sandbox mode than this machine has approved.",
+                None,
+            )?;
+            true
+        } else {
+            false
+        };
+
+    if let Some(mode) = global.mode
+        && mode.loosens(authorized_mode_key)
+    {
+        return Err(crate::security_approval::approval_required_error(
+            "the persisted global sandbox mode is weaker than this machine has approved",
+            vec![
+                crate::security_approval::ApprovalScope::SandboxNone
+                    .as_str()
+                    .to_string(),
+            ],
+            None,
+            Some(format!(
+                "lpm config sandbox --set {}",
+                sandbox_mode_key_name(mode)
+            )),
+        ));
+    }
+    if global.allow_degraded == Some(true) && !authorized_allow_degraded {
+        return Err(crate::security_approval::approval_required_error(
+            "the persisted global sandbox.allow-degraded value is weaker than this machine has approved",
+            vec![
+                crate::security_approval::ApprovalScope::SandboxAllowDegraded
+                    .as_str()
+                    .to_string(),
+            ],
+            None,
+            Some("lpm config sandbox --set default".to_string()),
+        ));
+    }
+    let project_allow_degraded_unlock_authorized =
+        if project.allow_degraded == Some(true) && !authorized_allow_degraded {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::SandboxAllowDegraded,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::ProjectConfig,
+            "lpm.toml enables sandbox.allow-degraded beyond this machine's approved posture.",
+            None,
+        )?;
+        true
+    } else {
+        false
+    };
 
     let force_security_floor = crate::security_floor::force_security_floor_enabled(
         &crate::commands::config::GlobalConfig::load(),
@@ -133,7 +214,10 @@ pub fn resolve_sandbox_mode_from_chain(
         let floor_mode = global.mode.unwrap_or(SandboxModeKey::Default);
         let floor_allow_degraded = global.allow_degraded.unwrap_or(false);
 
-        if effective_no_sandbox_flag && !matches!(floor_mode, SandboxModeKey::None) {
+        if effective_no_sandbox_flag
+            && !matches!(floor_mode, SandboxModeKey::None)
+            && !cli_unlock_authorized
+        {
             crate::security_floor::record_suppression(
                 crate::security_floor::SuppressionRecord::new(
                     crate::security_floor::GuardedControl::SandboxMode,
@@ -148,6 +232,7 @@ pub fn resolve_sandbox_mode_from_chain(
 
         if let Some(mode) = project.mode
             && mode.loosens(floor_mode)
+            && !project_mode_unlock_authorized
         {
             crate::security_floor::record_suppression(
                 crate::security_floor::SuppressionRecord::new(
@@ -161,7 +246,10 @@ pub fn resolve_sandbox_mode_from_chain(
             project.mode = None;
         }
 
-        if project.allow_degraded == Some(true) && !floor_allow_degraded {
+        if project.allow_degraded == Some(true)
+            && !floor_allow_degraded
+            && !project_allow_degraded_unlock_authorized
+        {
             crate::security_floor::record_suppression(
                 crate::security_floor::SuppressionRecord::new(
                     crate::security_floor::GuardedControl::SandboxAllowDegraded,
@@ -602,7 +690,15 @@ mod tests {
 
     fn scoped_home_dir() -> ScopedHomeDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        let env = crate::test_env::ScopedEnv::set([("HOME", dir.path().as_os_str().to_owned())]);
+        let env = crate::test_env::ScopedEnv::set([
+            ("HOME", dir.path().as_os_str().to_owned()),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                std::ffi::OsString::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            ),
+        ]);
         ScopedHomeDir { dir, _env: env }
     }
 
@@ -612,6 +708,14 @@ mod tests {
             fs::create_dir_all(parent).expect("create .lpm");
         }
         fs::write(path, body).expect("write config.toml");
+    }
+
+    fn write_authorized_sandbox_mode(mode: ResolvedSandboxMode) {
+        let posture = crate::security_approval::AuthorizedPosture {
+            sandbox_mode: mode.as_str().to_string(),
+            ..crate::security_approval::AuthorizedPosture::default()
+        };
+        crate::security_approval::persist_authorized_posture(&posture).unwrap();
     }
 
     /// Convenience: read the project-side only (ignore the global
@@ -1119,6 +1223,7 @@ allow-degraded = "maybe"
     fn resolve_sandbox_mode_force_floor_suppresses_cli_no_sandbox() {
         let env = fixture(None);
         let home = scoped_home_dir();
+        write_authorized_sandbox_mode(ResolvedSandboxMode::None);
         write_global_config(
             home.path(),
             "force-security-floor = true\n[sandbox]\nmode = \"strict\"\n",
@@ -1147,6 +1252,7 @@ mode = "none"
 "#,
         ));
         let home = scoped_home_dir();
+        write_authorized_sandbox_mode(ResolvedSandboxMode::None);
         write_global_config(
             home.path(),
             "force-security-floor = true\n[sandbox]\nmode = \"strict\"\n",

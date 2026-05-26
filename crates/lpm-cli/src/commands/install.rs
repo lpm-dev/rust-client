@@ -5579,7 +5579,23 @@ async fn run_with_options_under_store_lock(
     // install-level cooldown halt via `--allow-new`. The two axes
     // (cooldown halt + Lever #4 widening) need the same threshold
     // input.
-    if force_security_floor && allow_new && release_age_floor_secs > 0 {
+    let authorized_release_age_floor = crate::security_approval::load_authorized_posture()?
+        .minimum_release_age_secs();
+    let allow_new_unlock_authorized = if allow_new && authorized_release_age_floor > 0 {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::CooldownBypass,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            "This install bypasses the minimum release age for this project.",
+            Some(0),
+        )?;
+        true
+    } else {
+        false
+    };
+    if force_security_floor && allow_new && release_age_floor_secs > 0 && !allow_new_unlock_authorized
+    {
         crate::security_floor::record_suppression(
             crate::security_floor::SuppressionRecord::new(
                 crate::security_floor::GuardedControl::CooldownBypass,
@@ -6909,10 +6925,13 @@ async fn run_with_options_under_store_lock(
     let step10_script_policy_cfg =
         crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
     let config_auto_build = step10_script_policy_cfg.auto_build;
-    let step10_effective_policy = crate::script_policy_config::resolve_script_policy_with_reporting(
-        script_policy_override,
-        &step10_script_policy_cfg,
-    );
+    let step10_effective_policy =
+        crate::script_policy_config::resolve_script_policy_with_security(
+            project_dir,
+            script_policy_override,
+            &step10_script_policy_cfg,
+            json_output,
+        )?;
 
     //: include integrity so the auto-build predicate's
     // strict gate matches what `rebuild::run` will do. Same data
@@ -7092,10 +7111,13 @@ async fn run_with_options_under_store_lock(
         } else {
             let script_policy_cfg =
                 crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
-            let effective_policy = crate::script_policy_config::resolve_script_policy(
-                script_policy_override,
-                &script_policy_cfg,
-            );
+            let effective_policy =
+                crate::script_policy_config::resolve_script_policy_with_security(
+                    project_dir,
+                    script_policy_override,
+                    &script_policy_cfg,
+                    json_output,
+                )?;
             if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
                 println!();
                 println!(
@@ -9793,10 +9815,13 @@ async fn run_link_and_finish(
         } else {
             let script_policy_cfg =
                 crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
-            let effective_policy = crate::script_policy_config::resolve_script_policy(
-                script_policy_override,
-                &script_policy_cfg,
-            );
+            let effective_policy =
+                crate::script_policy_config::resolve_script_policy_with_security(
+                    project_dir,
+                    script_policy_override,
+                    &script_policy_cfg,
+                    json_output,
+                )?;
             if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
                 println!();
                 println!(

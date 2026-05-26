@@ -75,6 +75,31 @@ pub async fn run(
             let value = value.ok_or_else(|| LpmError::Registry("missing value".into()))?;
             let mut config = read_config(&config_path)?;
             guard_generic_set_against_force_floor(&config, key, value)?;
+            match key {
+                SCRIPT_POLICY_KEY => {
+                    let requested = crate::script_policy_config::ScriptPolicy::parse(value)
+                        .map_err(|e| LpmError::Registry(e.to_string()))?;
+                    crate::security_approval::authorize_persistent_script_policy(
+                        requested,
+                        json_output,
+                        &format!("lpm config set {key} {value}"),
+                    )?;
+                }
+                RELEASE_AGE_KEY => {
+                    let requested_secs = crate::release_age_config::parse_strict_u64_string(value)
+                        .ok_or_else(|| {
+                            LpmError::Registry(format!(
+                                "`{RELEASE_AGE_KEY}` must be a non-negative integer second count"
+                            ))
+                        })?;
+                    crate::security_approval::authorize_persistent_release_age(
+                        requested_secs,
+                        json_output,
+                        &format!("lpm config set {key} {value}"),
+                    )?;
+                }
+                _ => {}
+            }
             if let Some(table) = config.as_table_mut() {
                 table.insert(key.to_string(), toml::Value::String(value.to_string()));
             }
@@ -97,6 +122,24 @@ pub async fn run(
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
             let mut config = read_config(&config_path)?;
             guard_generic_delete_against_force_floor(&config, key)?;
+            match key {
+                SCRIPT_POLICY_KEY => crate::security_approval::authorize_persistent_script_policy(
+                    crate::script_policy_config::ScriptPolicy::Deny,
+                    json_output,
+                    &format!("lpm config delete {key}"),
+                )?,
+                RELEASE_AGE_KEY => crate::security_approval::authorize_persistent_release_age(
+                    crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS,
+                    json_output,
+                    &format!("lpm config delete {key}"),
+                )?,
+                "sandbox" => crate::security_approval::authorize_persistent_sandbox_mode(
+                    ResolvedSandboxMode::Default,
+                    json_output,
+                    "lpm config delete sandbox",
+                )?,
+                _ => {}
+            }
             let existed = config.as_table_mut().and_then(|t| t.remove(key)).is_some();
             write_config(&config_path, &config)?;
             if json_output {
@@ -315,10 +358,22 @@ impl GlobalConfig {
     /// sigstore-scoped knobs (trust-root override path, custom
     /// Rekor URL) without polluting the top-level table.
     pub fn get_sigstore_verify(&self) -> Option<String> {
-        self.get_table("sigstore")?
+        let raw = self
+            .get_table("sigstore")?
             .get("verify")?
             .as_str()
-            .map(String::from)
+            .map(String::from)?;
+        let authorized = crate::security_approval::load_authorized_posture().ok()?;
+        let requested = match raw.as_str() {
+            "deny" => EnforceMode::Deny,
+            "warn" => EnforceMode::Warn,
+            "off" => EnforceMode::Off,
+            _ => return None,
+        };
+        if crate::security_floor::sigstore_loosens(requested, authorized.sigstore_verify()) {
+            return None;
+        }
+        Some(raw)
     }
 
     /// Get a value that should be an array of strings, returning the
@@ -467,6 +522,18 @@ async fn run_release_age_wizard(
         ReleaseAgeSelection::Seconds(secs) => secs,
     };
     crate::security_floor::reject_looser_release_age_write(&global, requested_secs)?;
+    let command_hint = match selection {
+        ReleaseAgeSelection::Default => "lpm config release-age --set default".to_string(),
+        ReleaseAgeSelection::Seconds(0) => "lpm config release-age --set 0".to_string(),
+        ReleaseAgeSelection::Seconds(secs) => {
+            format!("lpm config release-age --set {}", format_release_age_cli_value(secs))
+        }
+    };
+    crate::security_approval::authorize_persistent_release_age(
+        requested_secs,
+        json_output,
+        &command_hint,
+    )?;
 
     let persisted = persist_release_age_selection(config_path, selection)?;
     announce_release_age_set(persisted, json_output);
@@ -617,6 +684,11 @@ async fn run_scripts_wizard(
         let requested = crate::script_policy_config::ScriptPolicy::parse(v)
             .map_err(|e| LpmError::Registry(e.to_string()))?;
         crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
+        crate::security_approval::authorize_persistent_script_policy(
+            requested,
+            json_output,
+            &format!("lpm config scripts --set {v}"),
+        )?;
         persist_string(config_path, SCRIPT_POLICY_KEY, v)?;
         announce_set(SCRIPT_POLICY_KEY, v, json_output);
         if v == "triage" {
@@ -657,6 +729,11 @@ async fn run_scripts_wizard(
     let requested = crate::script_policy_config::ScriptPolicy::parse(new_value)
         .map_err(|e| LpmError::Registry(e.to_string()))?;
     crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
+    crate::security_approval::authorize_persistent_script_policy(
+        requested,
+        json_output,
+        &format!("lpm config scripts --set {new_value}"),
+    )?;
     persist_string(config_path, SCRIPT_POLICY_KEY, new_value)?;
     announce_set(SCRIPT_POLICY_KEY, new_value, json_output);
 
@@ -890,6 +967,11 @@ async fn run_sandbox_wizard(
         let requested = ResolvedSandboxMode::parse_for_security_floor(v)
             .ok_or_else(|| LpmError::Registry(format!("invalid sandbox mode '{v}'")))?;
         crate::security_floor::reject_looser_sandbox_mode_write(&global, requested)?;
+        crate::security_approval::authorize_persistent_sandbox_mode(
+            requested,
+            json_output,
+            &format!("lpm config sandbox --set {v}"),
+        )?;
         persist_sandbox_mode(config_path, v)?;
         announce_sandbox_set(v, json_output);
         return Ok(());
@@ -953,6 +1035,11 @@ async fn run_sandbox_wizard(
     let requested = ResolvedSandboxMode::parse_for_security_floor(new_value)
         .ok_or_else(|| LpmError::Registry(format!("invalid sandbox mode '{new_value}'")))?;
     crate::security_floor::reject_looser_sandbox_mode_write(&global, requested)?;
+    crate::security_approval::authorize_persistent_sandbox_mode(
+        requested,
+        json_output,
+        &format!("lpm config sandbox --set {new_value}"),
+    )?;
     persist_sandbox_mode(config_path, new_value)?;
     announce_sandbox_set(new_value, json_output);
     Ok(())
@@ -1042,6 +1129,11 @@ async fn run_sigstore_wizard(
         }
         let requested = parse_sigstore_enforce_mode(v)?;
         crate::security_floor::reject_looser_sigstore_write(&global, requested)?;
+        crate::security_approval::authorize_persistent_sigstore(
+            requested,
+            json_output,
+            &format!("lpm config sigstore --set {v}"),
+        )?;
         persist_sigstore_verify(config_path, v)?;
         announce_sigstore_set(v, json_output);
         return Ok(());
@@ -1102,6 +1194,11 @@ async fn run_sigstore_wizard(
 
     let requested = parse_sigstore_enforce_mode(new_value)?;
     crate::security_floor::reject_looser_sigstore_write(&global, requested)?;
+    crate::security_approval::authorize_persistent_sigstore(
+        requested,
+        json_output,
+        &format!("lpm config sigstore --set {new_value}"),
+    )?;
     persist_sigstore_verify(config_path, new_value)?;
     announce_sigstore_set(new_value, json_output);
     Ok(())
@@ -1197,15 +1294,36 @@ mod wizard_tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn tmp_config() -> (TempDir, std::path::PathBuf) {
+    fn tmp_config() -> (TempDir, std::path::PathBuf, crate::test_env::ScopedEnv) {
         let dir = TempDir::new().expect("tempdir");
+        let security_dir = dir.path().join("security");
+        let env = crate::test_env::ScopedEnv::set([
+            (
+                "LPM_SECURITY_DIR",
+                security_dir.as_os_str().to_owned(),
+            ),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                std::ffi::OsString::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            ),
+        ]);
+        let posture = crate::security_approval::AuthorizedPosture {
+            script_policy: "allow".to_string(),
+            minimum_release_age_secs: 0,
+            sandbox_mode: "none".to_string(),
+            sigstore_verify: "off".to_string(),
+            ..crate::security_approval::AuthorizedPosture::default()
+        };
+        crate::security_approval::persist_authorized_posture(&posture).unwrap();
         let path = dir.path().join("config.toml");
-        (dir, path)
+        (dir, path, env)
     }
 
     #[tokio::test]
     async fn scripts_wizard_set_persists_valid_value() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         run_scripts_wizard(&path, Some("triage"), true)
             .await
             .unwrap();
@@ -1215,7 +1333,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn scripts_wizard_set_rejects_invalid_value() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         let err = run_scripts_wizard(&path, Some("yolo"), true)
             .await
             .unwrap_err();
@@ -1228,7 +1346,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn scripts_wizard_set_rejects_looser_value_when_force_floor_enabled() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(
             &path,
             "force-security-floor = true\nscript-policy = \"triage\"\n",
@@ -1243,7 +1361,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn triage_wizard_set_persists_valid_provider() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         run_triage_wizard(&path, Some("claude-cli"), true)
             .await
             .unwrap();
@@ -1253,7 +1371,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn triage_wizard_set_accepts_none_as_first_class() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         // Seed something first to confirm "none" can overwrite a prior choice.
         run_triage_wizard(&path, Some("claude-cli"), true)
             .await
@@ -1265,7 +1383,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn triage_wizard_set_rejects_unknown_provider() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         let err = run_triage_wizard(&path, Some("anthropic-api"), true)
             .await
             .unwrap_err();
@@ -1278,7 +1396,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn wizards_do_not_clobber_unrelated_keys() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         // Pre-populate an unrelated key.
         std::fs::write(&path, "unrelated = \"keep-me\"\n").unwrap();
         run_scripts_wizard(&path, Some("deny"), true).await.unwrap();
@@ -1298,7 +1416,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn release_age_wizard_set_persists_canonical_seconds_for_human_durations() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         run_release_age_wizard(&path, Some("3d"), true)
             .await
             .unwrap();
@@ -1316,7 +1434,7 @@ mod wizard_tests {
     #[tokio::test]
     async fn release_age_wizard_set_accepts_off_alias_and_zero() {
         for value in ["off", "0"] {
-            let (_dir, path) = tmp_config();
+            let (_dir, path, _env) = tmp_config();
             run_release_age_wizard(&path, Some(value), true)
                 .await
                 .unwrap();
@@ -1330,7 +1448,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn release_age_wizard_set_default_deletes_existing_override() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(&path, "minimum-release-age-secs = \"259200\"\n").unwrap();
 
         run_release_age_wizard(&path, Some("default"), true)
@@ -1348,7 +1466,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn release_age_wizard_set_rejects_invalid_value() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         let err = run_release_age_wizard(&path, Some("1w"), true)
             .await
             .unwrap_err();
@@ -1359,7 +1477,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn release_age_wizard_set_rejects_lower_value_when_force_floor_enabled() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(
             &path,
             "force-security-floor = true\nminimum-release-age-secs = \"259200\"\n",
@@ -1374,7 +1492,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn release_age_wizard_preserves_unrelated_keys() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(&path, "script-policy = \"triage\"\n").unwrap();
 
         run_release_age_wizard(&path, Some("12h"), true)
@@ -1413,7 +1531,7 @@ mod wizard_tests {
     #[tokio::test]
     async fn sandbox_wizard_set_persists_each_valid_mode() {
         for mode in &["default", "strict", "none"] {
-            let (_dir, path) = tmp_config();
+            let (_dir, path, _env) = tmp_config();
             run_sandbox_wizard(&path, Some(mode), true).await.unwrap();
             let v = read_sandbox_mode(&path).unwrap();
             assert_eq!(
@@ -1426,7 +1544,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn sandbox_wizard_set_rejects_unknown_mode() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         let err = run_sandbox_wizard(&path, Some("paranoid"), true)
             .await
             .unwrap_err();
@@ -1441,7 +1559,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn sandbox_wizard_set_rejects_looser_mode_when_force_floor_enabled() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(
             &path,
             "force-security-floor = true\n[sandbox]\nmode = \"strict\"\n",
@@ -1458,7 +1576,7 @@ mod wizard_tests {
     async fn sandbox_wizard_preserves_sibling_keys() {
         // The wizard writes `[sandbox] mode`; an existing
         // `[sandbox] allow-degraded` must survive.
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(
             &path,
             "unrelated = \"keep-me\"\n[sandbox]\nallow-degraded = true\n",
@@ -1494,7 +1612,7 @@ mod wizard_tests {
         // Defensive: if the user has somehow written `sandbox = "foo"` as
         // a top-level string, refuse rather than clobbering it into a
         // table. Honest error > silent migration on a typed config knob.
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(&path, "sandbox = \"not-a-table\"\n").unwrap();
         let err = run_sandbox_wizard(&path, Some("strict"), true)
             .await
@@ -1505,16 +1623,16 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn sandbox_wizard_overwrites_existing_mode() {
-        let (_dir, path) = tmp_config();
-        run_sandbox_wizard(&path, Some("strict"), true)
+        let (_dir, path, _env) = tmp_config();
+        run_sandbox_wizard(&path, Some("default"), true)
             .await
             .unwrap();
-        run_sandbox_wizard(&path, Some("default"), true)
+        run_sandbox_wizard(&path, Some("strict"), true)
             .await
             .unwrap();
         assert_eq!(
             read_sandbox_mode(&path).unwrap().as_deref(),
-            Some("default")
+            Some("strict")
         );
     }
 
@@ -1529,7 +1647,7 @@ mod wizard_tests {
     /// the persisted value.)
     #[test]
     fn global_config_get_sigstore_verify_returns_string_when_present() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(&path, "[sigstore]\nverify = \"warn\"\n").unwrap();
         let toml_val = read_config(&path).unwrap();
         let table = match toml_val {
@@ -1554,7 +1672,7 @@ mod wizard_tests {
     /// tracing::warn; this layer just signals "no usable value".
     #[test]
     fn global_config_get_sigstore_verify_returns_none_for_non_string_value() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(&path, "[sigstore]\nverify = true\n").unwrap();
         let toml_val = read_config(&path).unwrap();
         let table = match toml_val {
@@ -1574,7 +1692,7 @@ mod wizard_tests {
     #[tokio::test]
     async fn sigstore_wizard_set_persists_each_valid_value() {
         for v in ["deny", "warn", "off"] {
-            let (_dir, path) = tmp_config();
+            let (_dir, path, _env) = tmp_config();
             run_sigstore_wizard(&path, Some(v), true).await.unwrap();
             assert_eq!(
                 read_sigstore_verify(&path).unwrap().as_deref(),
@@ -1589,7 +1707,7 @@ mod wizard_tests {
     /// consulting docs.
     #[tokio::test]
     async fn sigstore_wizard_set_rejects_invalid_value() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         let err = run_sigstore_wizard(&path, Some("yolo"), true)
             .await
             .unwrap_err();
@@ -1616,7 +1734,7 @@ mod wizard_tests {
 
     #[tokio::test]
     async fn sigstore_wizard_set_rejects_looser_value_when_force_floor_enabled() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(
             &path,
             "force-security-floor = true\n[sigstore]\nverify = \"deny\"\n",
@@ -1660,7 +1778,7 @@ mod wizard_tests {
     /// `{success, sigstore: {verify}}` field structure.
     #[tokio::test]
     async fn sigstore_wizard_json_envelope_shape() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         // Capturing stdout cleanly in a unit test is awkward; this test
         // pins that `--set` + json_output returns Ok and the
         // persistence still happens. The envelope shape itself is
@@ -1681,7 +1799,7 @@ mod wizard_tests {
     /// guarantee the sandbox wizard pins.
     #[tokio::test]
     async fn sigstore_wizard_preserves_other_keys() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(
             &path,
             "script-policy = \"triage\"\n\n[sandbox]\nmode = \"strict\"\n\n[sigstore]\ntrust-root-override = \"/path/to/custom-root.json\"\n",
@@ -1731,7 +1849,7 @@ mod wizard_tests {
     /// sandbox wizard's equivalent guard.
     #[tokio::test]
     async fn sigstore_wizard_refuses_to_clobber_non_table_sigstore_key() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         std::fs::write(&path, "sigstore = \"not-a-table\"\n").unwrap();
         let err = run_sigstore_wizard(&path, Some("warn"), true)
             .await
@@ -1744,7 +1862,7 @@ mod wizard_tests {
     /// Pins idempotent re-runs.
     #[tokio::test]
     async fn sigstore_wizard_overwrites_existing_value() {
-        let (_dir, path) = tmp_config();
+        let (_dir, path, _env) = tmp_config();
         run_sigstore_wizard(&path, Some("warn"), true)
             .await
             .unwrap();
