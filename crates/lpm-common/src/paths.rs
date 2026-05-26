@@ -20,6 +20,7 @@
 //!     tasks/                      ← task cache (lpm-task)
 //!     dlx/                        ← ephemeral dlx installs (lpm-runner) — was ~/.lpm/dlx-cache/
 //!     .clean.lock                 ← serializes concurrent `cache clean` ops
+//!   engines/                      ← managed engine installs with preserved layouts
 //!   store/
 //!     v1/                         ← content-addressable package store (lpm-store)
 //!     .gc.lock                    ← serializes `store gc`
@@ -187,6 +188,12 @@ impl LpmRoot {
     /// Plugins are stored as `<plugins_root>/<name>/<version>/<binary>`.
     pub fn plugins_root(&self) -> PathBuf {
         self.home.join("plugins")
+    }
+
+    /// Root of the managed-engine tree: `~/.lpm/engines/`.
+    /// Engines are stored as `<engines_root>/<name>/<version>/<platform>/...`.
+    pub fn engines_root(&self) -> PathBuf {
+        self.home.join("engines")
     }
 
     // ─── Runner: port allocation state ─────────────────────────────

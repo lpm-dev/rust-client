@@ -1,0 +1,32 @@
+---
+source: tests/workflows/tests/pack.rs
+assertion_line: 156
+expression: envelope
+---
+{
+  "success": true,
+  "packages": 3,
+  "succeeded": 3,
+  "failed": 0,
+  "duration_ms":0,
+  "members": [
+    {
+      "name": "@test/utils",
+      "success": true,
+      "exit_code": 0,
+      "duration_ms":0
+    },
+    {
+      "name": "@test/core",
+      "success": true,
+      "exit_code": 0,
+      "duration_ms":0
+    },
+    {
+      "name": "@test/app",
+      "success": true,
+      "exit_code": 0,
+      "duration_ms":0
+    }
+  ]
+}
