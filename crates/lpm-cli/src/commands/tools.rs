@@ -1,4 +1,4 @@
-use crate::output;
+use crate::{CheckEngine, output};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::path::{Path, PathBuf};
@@ -105,24 +105,30 @@ fn build_biome_args(args: &[String], check: bool) -> Vec<String> {
     biome_args
 }
 
-/// Run `lpm check` — delegates to tsc --noEmit from node_modules/.bin.
+/// Run `lpm check` — delegates to the selected engine with `--noEmit`.
 ///
 /// Argument-aware preflight: when the user passes an explicit project
 /// path (`-p` / `--project`) or a positional input file, we trust the
 /// user knows the layout and skip the missing-tsconfig hint. Without
-/// an explicit target, we surface "no tsconfig.json" / "typescript
-/// not installed" as LPM-formatted errors before tsc would emit a
-/// less actionable message.
-pub async fn check(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
+/// an explicit target, we surface "no tsconfig.json" first for every
+/// engine. The default `tsc` engine also keeps the existing
+/// "typescript not installed" preflight so users get the more
+/// actionable LPM hint before the compiler would fail.
+pub async fn check(
+    project_dir: &Path,
+    args: &[String],
+    engine: CheckEngine,
+    json_output: bool,
+) -> Result<(), LpmError> {
     if !json_output {
-        output::info("check (tsc --noEmit)");
+        output::info(&format!("check ({} --noEmit)", check_engine_binary(engine)));
     }
 
     if !user_targeted_explicit_input(args) {
-        check_preflight(project_dir)?;
+        check_preflight(project_dir, engine)?;
     }
 
-    let outcome = run_tsc(project_dir, args, StdioMode::Inherit)?;
+    let outcome = run_check_engine(project_dir, args, engine, StdioMode::Inherit).await?;
     outcome.into_result()
 }
 
@@ -146,16 +152,17 @@ fn user_targeted_explicit_input(args: &[String]) -> bool {
     false
 }
 
-/// Surface the two common setup gaps with LPM-formatted messages
-/// before spawning tsc:
+/// Surface the common setup gaps with LPM-formatted messages before
+/// spawning the selected engine:
 ///
 /// - `tsconfig.json` missing → suggest `lpm init` or pass `-p`.
-/// - typescript not reachable at all → suggest `lpm install -D typescript`
-///   (or `lpm install` when the dep is declared but not installed).
+/// - `tsc` selected but typescript not reachable at all → suggest
+///   `lpm install -D typescript` (or `lpm install` when the dep is
+///   declared but not installed).
 ///
-/// The post-spawn fallback in `run_tsc` still wraps any race-condition
-/// failure with the same install hint.
-fn check_preflight(project_dir: &Path) -> Result<(), LpmError> {
+/// The post-spawn fallback in `run_check_engine` still wraps any
+/// race-condition failure with the matching install hint.
+fn check_preflight(project_dir: &Path, engine: CheckEngine) -> Result<(), LpmError> {
     if !project_dir.join("tsconfig.json").is_file() {
         return Err(LpmError::Script(format!(
             "no tsconfig.json found in {}. Add one (or pass `-p <path>` to use a different one)",
@@ -163,16 +170,19 @@ fn check_preflight(project_dir: &Path) -> Result<(), LpmError> {
         )));
     }
 
-    let status = crate::tsc_status::TscStatus::probe(project_dir);
-    if !status.runnable() {
-        if status.in_deps {
+    if matches!(engine, CheckEngine::Tsc) {
+        let status = crate::tsc_status::TscStatus::probe(project_dir);
+        if !status.runnable() {
+            if status.in_deps {
+                return Err(LpmError::Script(
+                    "typescript declared in package.json but not installed. Run: lpm install"
+                        .into(),
+                ));
+            }
             return Err(LpmError::Script(
-                "typescript declared in package.json but not installed. Run: lpm install".into(),
+                "typescript not installed. Run: lpm install -D typescript".into(),
             ));
         }
-        return Err(LpmError::Script(
-            "typescript not installed. Run: lpm install -D typescript".into(),
-        ));
     }
 
     Ok(())
@@ -360,14 +370,39 @@ fn run_tool_binary(
     Ok(outcome)
 }
 
-/// Run tsc with the configured stdio mode. Honors `node_modules/.bin` PATH
-/// injection so project-local TypeScript wins over a system install.
-fn run_tsc(project_dir: &Path, args: &[String], stdio: StdioMode) -> Result<ToolOutcome, LpmError> {
+fn check_engine_binary(engine: CheckEngine) -> &'static str {
+    match engine {
+        CheckEngine::Tsc => "tsc",
+        CheckEngine::Tsgo => "tsgo",
+    }
+}
+
+fn check_engine_spawn_hint(engine: CheckEngine) -> &'static str {
+    match engine {
+        CheckEngine::Tsc => "Is typescript installed? Run: lpm install -D typescript",
+        CheckEngine::Tsgo => "The managed tsgo engine failed to start after install",
+    }
+}
+
+/// Run the selected type-check engine with the configured stdio mode.
+/// Honors `node_modules/.bin` PATH injection so project-local tools win
+/// over a system install.
+async fn run_check_engine(
+    project_dir: &Path,
+    args: &[String],
+    engine: CheckEngine,
+    stdio: StdioMode,
+) -> Result<ToolOutcome, LpmError> {
+    if matches!(engine, CheckEngine::Tsgo) {
+        return run_tsgo(project_dir, args, stdio).await;
+    }
+
+    let binary = check_engine_binary(engine);
     let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
     let mut cmd_args = vec!["--noEmit".to_string()];
     cmd_args.extend_from_slice(args);
 
-    let mut cmd = Command::new("tsc");
+    let mut cmd = Command::new(binary);
     cmd.args(&cmd_args)
         .current_dir(project_dir)
         .env("PATH", &path);
@@ -380,7 +415,8 @@ fn run_tsc(project_dir: &Path, args: &[String], stdio: StdioMode) -> Result<Tool
         StdioMode::Inherit => {
             let status = cmd.status().map_err(|e| {
                 LpmError::Script(format!(
-                    "failed to run tsc: {e}. Is typescript installed? Run: lpm install -D typescript"
+                    "failed to run {binary}: {e}. {}",
+                    check_engine_spawn_hint(engine)
                 ))
             })?;
             outcome.exit_code = Some(status.code().unwrap_or(1));
@@ -395,13 +431,25 @@ fn run_tsc(project_dir: &Path, args: &[String], stdio: StdioMode) -> Result<Tool
             }
             Err(e) => {
                 outcome.error = Some(format!(
-                    "failed to run tsc: {e}. Is typescript installed? Run: lpm install -D typescript"
+                    "failed to run {binary}: {e}. {}",
+                    check_engine_spawn_hint(engine)
                 ));
             }
         },
     }
 
     Ok(outcome)
+}
+
+async fn run_tsgo(
+    project_dir: &Path,
+    args: &[String],
+    stdio: StdioMode,
+) -> Result<ToolOutcome, LpmError> {
+    let bin = lpm_plugin::ensure_engine("tsgo", None, matches!(stdio, StdioMode::Capture)).await?;
+    let mut cmd_args = vec!["--noEmit".to_string()];
+    cmd_args.extend_from_slice(args);
+    run_tool_binary(&bin, &cmd_args, project_dir, stdio)
 }
 
 fn apply_stdio(cmd: &mut Command, stdio: StdioMode) {
@@ -511,6 +559,7 @@ pub async fn tool_workspace(
     tool: &str,
     args: &[String],
     check: bool,
+    check_engine: Option<CheckEngine>,
     filters: &[String],
     affected_base: Option<&str>,
     fail_if_no_match: bool,
@@ -659,6 +708,7 @@ pub async fn tool_workspace(
             tool,
             args,
             check,
+            check_engine,
             stdio,
             &root_pin,
         )
@@ -740,12 +790,14 @@ struct MemberResult {
 
 /// Run all members in a single topological level. Within a level, members are
 /// independent; we fan out across `available_parallelism()` threads.
+#[allow(clippy::too_many_arguments)]
 async fn run_level(
     ws_graph: &lpm_task::graph::WorkspaceGraph,
     level_targets: &[usize],
     tool: &str,
     args: &[String],
     check: bool,
+    check_engine: Option<CheckEngine>,
     stdio: StdioMode,
     root_pin: &Option<(String, Option<String>, PathBuf)>,
 ) -> Vec<MemberResult> {
@@ -757,6 +809,7 @@ async fn run_level(
             tool,
             args,
             check,
+            check_engine,
             stdio,
             root_pin,
         )
@@ -788,6 +841,7 @@ async fn run_level(
                     &tool_owned,
                     &args_owned,
                     check,
+                    check_engine,
                     stdio,
                     &root_pin_clone,
                 )
@@ -814,12 +868,14 @@ async fn run_level(
 }
 
 /// Execute one member's tool invocation and convert into a `MemberResult`.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_member(
     member_dir: &Path,
     member_name: &str,
     tool: &str,
     args: &[String],
     check: bool,
+    check_engine: Option<CheckEngine>,
     stdio: StdioMode,
     root_pin: &Option<(String, Option<String>, PathBuf)>,
 ) -> MemberResult {
@@ -832,12 +888,17 @@ async fn run_one_member(
     let outcome_result = match tool {
         "lint" => run_lint_member(member_dir, args, stdio, root_pin).await,
         "fmt" => run_fmt_member(member_dir, args, check, stdio, root_pin).await,
-        "check" => Ok(
-            run_tsc(member_dir, args, stdio).unwrap_or_else(|e| ToolOutcome {
-                error: Some(e.to_string()),
-                ..Default::default()
-            }),
-        ),
+        "check" => Ok(run_check_engine(
+            member_dir,
+            args,
+            check_engine.unwrap_or(CheckEngine::Tsc),
+            stdio,
+        )
+        .await
+        .unwrap_or_else(|e| ToolOutcome {
+            error: Some(e.to_string()),
+            ..Default::default()
+        })),
         "test" | "bench" => Ok(run_test_or_bench_member(member_dir, tool, args, stdio)),
         _ => Err(LpmError::Script(format!("unknown tool: {tool}"))),
     };
@@ -1061,6 +1122,7 @@ pub async fn dispatch_test_or_bench(
             tool,
             args,
             false,
+            None,
             filters,
             affected_ref,
             fail_if_no_match,

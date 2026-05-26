@@ -21,7 +21,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 137;
+pub const EXPECTED_SURFACE_COUNT: usize = 139;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -70,6 +70,8 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Lint",
     "Fmt",
     "Check",
+    "Bundle",
+    "Pack",
     "Test",
     "Bench",
     "Ci",
@@ -1650,5 +1652,31 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: false,
         json_contract: true,
         references: &["tests/workflows/tests/install.rs"],
+    },
+    SurfaceBaseline {
+        id: 138,
+        name: "`lpm bundle`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/bundle.rs",
+            "tests/workflows/tests/bundle.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 139,
+        name: "`lpm pack`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/pack.rs",
+            "tests/workflows/tests/pack.rs",
+        ],
     },
 ];
