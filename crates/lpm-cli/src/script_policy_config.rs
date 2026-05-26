@@ -306,6 +306,18 @@ pub fn resolve_script_policy(
     resolution.effective
 }
 
+/// JSON/reporting-aware shim for command paths that need the same
+/// effective policy plus a structured suppression trace.
+pub fn resolve_script_policy_with_reporting(
+    cli_override: Option<ScriptPolicy>,
+    project_config: &ScriptPolicyConfig,
+) -> ScriptPolicy {
+    let resolution = resolve_script_policy_raw(cli_override, project_config);
+    crate::migration_warnings::emit_rejections(&resolution);
+    record_force_floor_rejections(&resolution);
+    resolution.effective
+}
+
 /// Pure variant of [`resolve_script_policy`] that returns the full
 /// [`crate::precedence::Resolution`] without emitting stderr
 /// warnings.
@@ -337,6 +349,35 @@ pub fn resolve_script_policy_raw(
         default: ScriptPolicy::default(),
         force_security_floor,
     })
+}
+
+fn record_force_floor_rejections(resolution: &crate::precedence::Resolution<ScriptPolicy>) {
+    for rejection in &resolution.rejections {
+        let source = match rejection.source {
+            crate::precedence::PolicyTier::Cli => crate::security_floor::SuppressionSource::Cli,
+            crate::precedence::PolicyTier::Project => {
+                crate::security_floor::SuppressionSource::Project
+            }
+            crate::precedence::PolicyTier::User | crate::precedence::PolicyTier::Default => {
+                continue;
+            }
+        };
+        match rejection.reason {
+            crate::precedence::RejectionReason::ForceFlagSuppressesCli
+            | crate::precedence::RejectionReason::ForceFlagRejectsProject => {
+                crate::security_floor::record_suppression(
+                    crate::security_floor::SuppressionRecord::new(
+                        crate::security_floor::GuardedControl::ScriptPolicy,
+                        source,
+                        rejection.rejected_value.as_str(),
+                        resolution.effective.as_str(),
+                    ),
+                    true,
+                );
+            }
+            crate::precedence::RejectionReason::NewKnobProjectLoosens => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -613,6 +654,10 @@ mod tests {
         // Project says triage; CLI forces allow; CLI must win.
         write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "triage"}}"#);
         let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        let _env = crate::test_env::ScopedEnv::set([(
+            "HOME",
+            std::ffi::OsString::from(dir.path().to_str().unwrap()),
+        )]);
         let resolved = resolve_script_policy(Some(ScriptPolicy::Allow), &cfg);
         assert_eq!(resolved, ScriptPolicy::Allow);
     }

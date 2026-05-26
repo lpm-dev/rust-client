@@ -239,6 +239,7 @@ async fn run_under_store_lock(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> Result<(), LpmError> {
+    crate::security_floor::clear_recorded_suppressions();
     // Defense-in-depth on the sandbox flag pair. The CLI boundary
     // (clap `conflicts_with_all` on `--no-sandbox` ⊥ `--strict-sandbox`
     // / `--paranoid`) is the primary guard, but `rebuild::run` is also
@@ -564,7 +565,7 @@ async fn run_under_store_lock(
     // Dry run — show what would be executed
     if dry_run {
         if json_output {
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "dry_run": true,
                 "packages": to_build.iter().map(|p| {
                     serde_json::json!({
@@ -575,6 +576,7 @@ async fn run_under_store_lock(
                     })
                 }).collect::<Vec<_>>(),
             });
+            crate::security_floor::attach_security_posture(&mut json, force_security_floor);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
             output::info(&format!(
@@ -741,6 +743,7 @@ async fn run_under_store_lock(
             project_dir,
             no_sandbox,
             strict_sandbox,
+            json_output,
         )?;
     let (sandbox_mode, scrub_env) = crate::sandbox_config::decide_runtime_sandbox_mode(
         no_sandbox,
@@ -1149,11 +1152,12 @@ async fn run_under_store_lock(
     // Summary
     println!();
     if json_output {
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "success": failures == 0,
             "built": successes,
             "failed": failures,
         });
+        crate::security_floor::attach_security_posture(&mut json, force_security_floor);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if failures == 0 {
         output::success(&format!("{successes} package(s) built successfully."));

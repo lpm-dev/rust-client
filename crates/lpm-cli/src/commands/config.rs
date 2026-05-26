@@ -1,5 +1,7 @@
 use crate::output;
 use crate::prompt::prompt_err;
+use crate::provenance_fetch::EnforceMode;
+use crate::sandbox_config::ResolvedSandboxMode;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::io::IsTerminal;
@@ -72,6 +74,7 @@ pub async fn run(
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
             let value = value.ok_or_else(|| LpmError::Registry("missing value".into()))?;
             let mut config = read_config(&config_path)?;
+            guard_generic_set_against_force_floor(&config, key, value)?;
             if let Some(table) = config.as_table_mut() {
                 table.insert(key.to_string(), toml::Value::String(value.to_string()));
             }
@@ -93,6 +96,7 @@ pub async fn run(
         "delete" | "unset" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
             let mut config = read_config(&config_path)?;
+            guard_generic_delete_against_force_floor(&config, key)?;
             let existed = config.as_table_mut().and_then(|t| t.remove(key)).is_some();
             write_config(&config_path, &config)?;
             if json_output {
@@ -159,6 +163,72 @@ fn write_config(path: &std::path::Path, config: &toml::Value) -> Result<(), LpmE
     Ok(())
 }
 
+fn global_config_view_from_value(config: &toml::Value) -> GlobalConfig {
+    let table = match config {
+        toml::Value::Table(t) => t.clone(),
+        _ => toml::map::Map::new(),
+    };
+    GlobalConfig { table }
+}
+
+fn guard_generic_set_against_force_floor(
+    config: &toml::Value,
+    key: &str,
+    value: &str,
+) -> Result<(), LpmError> {
+    let global = global_config_view_from_value(config);
+    match key {
+        "force-security-floor" => {
+            if crate::security_floor::force_security_floor_enabled(&global)
+                && !matches!(value, "true" | "1" | "yes")
+            {
+                return Err(crate::security_floor::security_floor_write_error(
+                    "force-security-floor",
+                    value,
+                    "true",
+                ));
+            }
+        }
+        SCRIPT_POLICY_KEY => {
+            if let Ok(requested) = crate::script_policy_config::ScriptPolicy::parse(value) {
+                crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
+            }
+        }
+        RELEASE_AGE_KEY => {
+            if let Some(requested_secs) = crate::release_age_config::parse_strict_u64_string(value) {
+                crate::security_floor::reject_looser_release_age_write(&global, requested_secs)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn guard_generic_delete_against_force_floor(config: &toml::Value, key: &str) -> Result<(), LpmError> {
+    let global = global_config_view_from_value(config);
+    match key {
+        RELEASE_AGE_KEY => crate::security_floor::reject_looser_release_age_write(
+            &global,
+            crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS,
+        )?,
+        "sandbox" => crate::security_floor::reject_looser_sandbox_mode_write(
+            &global,
+            ResolvedSandboxMode::Default,
+        )?,
+        "force-security-floor" => {
+            if crate::security_floor::force_security_floor_enabled(&global) {
+                return Err(crate::security_floor::security_floor_write_error(
+                    "force-security-floor",
+                    "unset",
+                    "true",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 // ── Global config reader (used by other commands) ───────────────────
 
 /// Read the global config file (~/.lpm/config.toml) once and provide
@@ -192,6 +262,11 @@ impl GlobalConfig {
         Self {
             table: toml::map::Map::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_table(table: toml::map::Map<String, toml::Value>) -> Self {
+        Self { table }
     }
 
     /// Get a string value.
@@ -339,6 +414,8 @@ async fn run_release_age_wizard(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let existing_cfg = read_config(config_path)?;
+    let global = global_config_view_from_value(&existing_cfg);
     let selection = if let Some(value) = set {
         parse_release_age_selection(value)?
     } else {
@@ -384,6 +461,12 @@ async fn run_release_age_wizard(
             _ => unreachable!("release-age select returned unexpected preset"),
         }
     };
+
+    let requested_secs = match selection {
+        ReleaseAgeSelection::Default => DEFAULT_RELEASE_AGE_SECS,
+        ReleaseAgeSelection::Seconds(secs) => secs,
+    };
+    crate::security_floor::reject_looser_release_age_write(&global, requested_secs)?;
 
     let persisted = persist_release_age_selection(config_path, selection)?;
     announce_release_age_set(persisted, json_output);
@@ -522,6 +605,8 @@ async fn run_scripts_wizard(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let existing_cfg = read_config(config_path)?;
+    let global = global_config_view_from_value(&existing_cfg);
     if let Some(v) = set {
         if !SCRIPT_POLICY_VALUES.contains(&v) {
             return Err(LpmError::Registry(format!(
@@ -529,6 +614,9 @@ async fn run_scripts_wizard(
                 SCRIPT_POLICY_VALUES.join(" | ")
             )));
         }
+        let requested = crate::script_policy_config::ScriptPolicy::parse(v)
+            .map_err(|e| LpmError::Registry(e.to_string()))?;
+        crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
         persist_string(config_path, SCRIPT_POLICY_KEY, v)?;
         announce_set(SCRIPT_POLICY_KEY, v, json_output);
         if v == "triage" {
@@ -566,6 +654,9 @@ async fn run_scripts_wizard(
         .initial_value(current.as_str())
         .interact()
         .map_err(prompt_err)?;
+    let requested = crate::script_policy_config::ScriptPolicy::parse(new_value)
+        .map_err(|e| LpmError::Registry(e.to_string()))?;
+    crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
     persist_string(config_path, SCRIPT_POLICY_KEY, new_value)?;
     announce_set(SCRIPT_POLICY_KEY, new_value, json_output);
 
@@ -787,6 +878,8 @@ async fn run_sandbox_wizard(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let existing_cfg = read_config(config_path)?;
+    let global = global_config_view_from_value(&existing_cfg);
     if let Some(v) = set {
         if !SANDBOX_MODE_VALUES.contains(&v) {
             return Err(LpmError::Registry(format!(
@@ -794,6 +887,9 @@ async fn run_sandbox_wizard(
                 SANDBOX_MODE_VALUES.join(" | ")
             )));
         }
+        let requested = ResolvedSandboxMode::parse_for_security_floor(v)
+            .ok_or_else(|| LpmError::Registry(format!("invalid sandbox mode '{v}'")))?;
+        crate::security_floor::reject_looser_sandbox_mode_write(&global, requested)?;
         persist_sandbox_mode(config_path, v)?;
         announce_sandbox_set(v, json_output);
         return Ok(());
@@ -854,6 +950,9 @@ async fn run_sandbox_wizard(
         }
     }
 
+    let requested = ResolvedSandboxMode::parse_for_security_floor(new_value)
+        .ok_or_else(|| LpmError::Registry(format!("invalid sandbox mode '{new_value}'")))?;
+    crate::security_floor::reject_looser_sandbox_mode_write(&global, requested)?;
     persist_sandbox_mode(config_path, new_value)?;
     announce_sandbox_set(new_value, json_output);
     Ok(())
@@ -932,6 +1031,8 @@ async fn run_sigstore_wizard(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let existing_cfg = read_config(config_path)?;
+    let global = global_config_view_from_value(&existing_cfg);
     if let Some(v) = set {
         if !SIGSTORE_VERIFY_VALUES.contains(&v) {
             return Err(LpmError::Registry(format!(
@@ -939,6 +1040,8 @@ async fn run_sigstore_wizard(
                 SIGSTORE_VERIFY_VALUES.join(" | ")
             )));
         }
+        let requested = parse_sigstore_enforce_mode(v)?;
+        crate::security_floor::reject_looser_sigstore_write(&global, requested)?;
         persist_sigstore_verify(config_path, v)?;
         announce_sigstore_set(v, json_output);
         return Ok(());
@@ -997,9 +1100,22 @@ async fn run_sigstore_wizard(
         }
     }
 
+    let requested = parse_sigstore_enforce_mode(new_value)?;
+    crate::security_floor::reject_looser_sigstore_write(&global, requested)?;
     persist_sigstore_verify(config_path, new_value)?;
     announce_sigstore_set(new_value, json_output);
     Ok(())
+}
+
+fn parse_sigstore_enforce_mode(raw: &str) -> Result<EnforceMode, LpmError> {
+    match raw {
+        "deny" => Ok(EnforceMode::Deny),
+        "warn" => Ok(EnforceMode::Warn),
+        "off" => Ok(EnforceMode::Off),
+        other => Err(LpmError::Registry(format!(
+            "invalid sigstore verify mode '{other}'"
+        ))),
+    }
 }
 
 /// Read the `[sigstore] verify` value from `~/.lpm/config.toml`.
@@ -1108,6 +1224,21 @@ mod wizard_tests {
         // Nothing persisted on validation failure.
         let v = read_string_value(&path, SCRIPT_POLICY_KEY).unwrap();
         assert!(v.is_none());
+    }
+
+    #[tokio::test]
+    async fn scripts_wizard_set_rejects_looser_value_when_force_floor_enabled() {
+        let (_dir, path) = tmp_config();
+        std::fs::write(
+            &path,
+            "force-security-floor = true\nscript-policy = \"triage\"\n",
+        )
+        .unwrap();
+        let err = run_scripts_wizard(&path, Some("allow"), true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains("script-policy"));
     }
 
     #[tokio::test]
@@ -1227,6 +1358,21 @@ mod wizard_tests {
     }
 
     #[tokio::test]
+    async fn release_age_wizard_set_rejects_lower_value_when_force_floor_enabled() {
+        let (_dir, path) = tmp_config();
+        std::fs::write(
+            &path,
+            "force-security-floor = true\nminimum-release-age-secs = \"259200\"\n",
+        )
+        .unwrap();
+        let err = run_release_age_wizard(&path, Some("0"), true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains("minimum-release-age-secs"));
+    }
+
+    #[tokio::test]
     async fn release_age_wizard_preserves_unrelated_keys() {
         let (_dir, path) = tmp_config();
         std::fs::write(&path, "script-policy = \"triage\"\n").unwrap();
@@ -1291,6 +1437,21 @@ mod wizard_tests {
         );
         // No persistence on validation failure.
         assert!(read_sandbox_mode(&path).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sandbox_wizard_set_rejects_looser_mode_when_force_floor_enabled() {
+        let (_dir, path) = tmp_config();
+        std::fs::write(
+            &path,
+            "force-security-floor = true\n[sandbox]\nmode = \"strict\"\n",
+        )
+        .unwrap();
+        let err = run_sandbox_wizard(&path, Some("default"), true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains("[sandbox].mode"));
     }
 
     #[tokio::test]
@@ -1451,6 +1612,47 @@ mod wizard_tests {
         );
         // Nothing persisted on validation failure.
         assert!(read_sigstore_verify(&path).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sigstore_wizard_set_rejects_looser_value_when_force_floor_enabled() {
+        let (_dir, path) = tmp_config();
+        std::fs::write(
+            &path,
+            "force-security-floor = true\n[sigstore]\nverify = \"deny\"\n",
+        )
+        .unwrap();
+        let err = run_sigstore_wizard(&path, Some("warn"), true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains("[sigstore].verify"));
+    }
+
+    #[test]
+    fn guard_generic_set_rejects_disabling_force_floor_when_enabled() {
+        let config: toml::Value = toml::from_str("force-security-floor = true\n").unwrap();
+        let err = guard_generic_set_against_force_floor(&config, "force-security-floor", "false")
+            .unwrap_err();
+        assert_eq!(err.error_code(), "security_floor");
+    }
+
+    #[test]
+    fn guard_generic_delete_rejects_lowering_release_age_to_default() {
+        let config: toml::Value = toml::from_str(
+            "force-security-floor = true\nminimum-release-age-secs = \"259200\"\n",
+        )
+        .unwrap();
+        let err = guard_generic_delete_against_force_floor(&config, RELEASE_AGE_KEY).unwrap_err();
+        assert_eq!(err.error_code(), "security_floor");
+    }
+
+    #[test]
+    fn guard_generic_delete_rejects_unsetting_force_floor_when_enabled() {
+        let config: toml::Value = toml::from_str("force-security-floor = true\n").unwrap();
+        let err =
+            guard_generic_delete_against_force_floor(&config, "force-security-floor").unwrap_err();
+        assert_eq!(err.error_code(), "security_floor");
     }
 
     /// JSON envelope shape for the announce-set path — mirrors the

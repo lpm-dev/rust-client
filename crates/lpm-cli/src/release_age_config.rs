@@ -170,11 +170,43 @@ impl ReleaseAgeResolver {
     /// and is unreadable / malformed / has a garbage
     /// `minimum-release-age-secs` value. A missing global file is fine
     /// (falls through to default).
-    pub fn resolve(project_dir: &Path, cli_override: Option<u64>) -> Result<u64, LpmError> {
+    pub fn resolve(
+        project_dir: &Path,
+        cli_override: Option<u64>,
+        json_output: bool,
+    ) -> Result<u64, LpmError> {
+        let global = crate::commands::config::GlobalConfig::load();
+        let force_security_floor = crate::security_floor::force_security_floor_enabled(&global);
+        let floor = crate::security_floor::current_release_age_floor_secs(&global);
+
         if let Some(secs) = cli_override {
+            if force_security_floor && secs < floor {
+                crate::security_floor::record_suppression(
+                    crate::security_floor::SuppressionRecord::new(
+                        crate::security_floor::GuardedControl::CooldownWindow,
+                        crate::security_floor::SuppressionSource::Cli,
+                        secs.to_string(),
+                        floor.to_string(),
+                    ),
+                    json_output,
+                );
+                return Ok(floor);
+            }
             return Ok(secs);
         }
         if let Some(secs) = read_package_json_min_age(&project_dir.join("package.json")) {
+            if force_security_floor && secs < floor {
+                crate::security_floor::record_suppression(
+                    crate::security_floor::SuppressionRecord::new(
+                        crate::security_floor::GuardedControl::CooldownWindow,
+                        crate::security_floor::SuppressionSource::Project,
+                        secs.to_string(),
+                        floor.to_string(),
+                    ),
+                    json_output,
+                );
+                return Ok(floor);
+            }
             return Ok(secs);
         }
         if let Some(path) = global_config_path()
@@ -599,7 +631,7 @@ mod tests {
         write_package_json_with_min_age(project.path(), Some(1000));
         write_global_config(home.path(), "minimum-release-age-secs = 2000\n");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), Some(500)).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), Some(500), true).unwrap();
         assert_eq!(result, 500, "CLI override must beat package.json + global");
     }
 
@@ -612,7 +644,7 @@ mod tests {
         write_package_json_with_min_age(project.path(), Some(1000));
         write_global_config(home.path(), "minimum-release-age-secs = 2000\n");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), Some(0)).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), Some(0), true).unwrap();
         assert_eq!(result, 0, "CLI --min-release-age=0 must force zero");
     }
 
@@ -623,7 +655,7 @@ mod tests {
         write_package_json_with_min_age(project.path(), Some(1000));
         write_global_config(home.path(), "minimum-release-age-secs = 2000\n");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, 1000, "package.json must beat global config");
     }
 
@@ -634,7 +666,7 @@ mod tests {
         write_package_json_with_min_age(project.path(), None);
         write_global_config(home.path(), "minimum-release-age-secs = 2000\n");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, 2000, "global config must override 24h default");
     }
 
@@ -644,7 +676,7 @@ mod tests {
         let _home = scoped_home_dir();
         write_package_json_with_min_age(project.path(), None);
 
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, DEFAULT_MIN_RELEASE_AGE_SECS);
     }
 
@@ -653,7 +685,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let _home = scoped_home_dir();
         // No package.json written.
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, DEFAULT_MIN_RELEASE_AGE_SECS);
     }
 
@@ -663,7 +695,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let _home = scoped_home_dir();
         write_file(&project.path().join("package.json"), "{ not json ===");
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, DEFAULT_MIN_RELEASE_AGE_SECS);
     }
 
@@ -674,7 +706,7 @@ mod tests {
         write_package_json_with_min_age(project.path(), None);
         write_global_config(home.path(), r#"minimum-release-age-secs = "garbage""#);
 
-        let err = ReleaseAgeResolver::resolve(project.path(), None)
+        let err = ReleaseAgeResolver::resolve(project.path(), None, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("config.toml"), "must name global file: {err}");
@@ -694,7 +726,7 @@ mod tests {
         write_package_json_with_min_age(project.path(), None);
         write_global_config(home.path(), "not valid toml === [[[");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), Some(0)).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), Some(0), true).unwrap();
         assert_eq!(result, 0);
     }
 
@@ -707,8 +739,54 @@ mod tests {
         write_package_json_with_min_age(project.path(), Some(500));
         write_global_config(home.path(), "not valid toml === [[[");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, 500);
+    }
+
+    #[test]
+    fn resolve_force_floor_suppresses_lower_cli_override() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_package_json_with_min_age(project.path(), Some(1000));
+        write_global_config(
+            home.path(),
+            "force-security-floor = true\nminimum-release-age-secs = \"259200\"\n",
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+
+        let result = ReleaseAgeResolver::resolve(project.path(), Some(0), true).unwrap();
+
+        assert_eq!(result, 259200);
+        let suppressions = crate::security_floor::recorded_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(
+            suppressions[0].control,
+            crate::security_floor::GuardedControl::CooldownWindow
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+    }
+
+    #[test]
+    fn resolve_force_floor_suppresses_lower_project_value() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_package_json_with_min_age(project.path(), Some(1000));
+        write_global_config(
+            home.path(),
+            "force-security-floor = true\nminimum-release-age-secs = \"259200\"\n",
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
+
+        assert_eq!(result, 259200);
+        let suppressions = crate::security_floor::recorded_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(
+            suppressions[0].source,
+            crate::security_floor::SuppressionSource::Project
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
     }
 
     // ── GlobalConfig::get_u64 (spot-check in this module) ────────
