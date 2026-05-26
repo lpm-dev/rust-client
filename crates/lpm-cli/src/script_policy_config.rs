@@ -29,6 +29,7 @@
 //! the user can fix it without reading code.
 
 use crate::commands::config::GlobalConfig;
+use crate::precedence::PurePolicyKnob;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -308,6 +309,7 @@ pub fn resolve_script_policy(
 
 /// JSON/reporting-aware shim for command paths that need the same
 /// effective policy plus a structured suppression trace.
+#[allow(dead_code)]
 pub fn resolve_script_policy_with_reporting(
     cli_override: Option<ScriptPolicy>,
     project_config: &ScriptPolicyConfig,
@@ -316,6 +318,92 @@ pub fn resolve_script_policy_with_reporting(
     crate::migration_warnings::emit_rejections(&resolution);
     record_force_floor_rejections(&resolution);
     resolution.effective
+}
+
+fn approval_scope_for_policy(policy: ScriptPolicy) -> crate::security_approval::ApprovalScope {
+    match policy {
+        ScriptPolicy::Deny => crate::security_approval::ApprovalScope::ScriptsTriage,
+        ScriptPolicy::Triage => crate::security_approval::ApprovalScope::ScriptsTriage,
+        ScriptPolicy::Allow => crate::security_approval::ApprovalScope::ScriptsAllow,
+    }
+}
+
+/// Security-aware variant that treats raw config values as proposals
+/// unless they are covered by the approved machine posture or an
+/// active project unlock.
+pub fn resolve_script_policy_with_security(
+    project_dir: &Path,
+    cli_override: Option<ScriptPolicy>,
+    project_config: &ScriptPolicyConfig,
+    json_output: bool,
+) -> Result<ScriptPolicy, lpm_common::LpmError> {
+    let global = GlobalConfig::load();
+    let user = global
+        .get_str("script-policy")
+        .and_then(|s| ScriptPolicy::parse(s).ok());
+    let authorized = crate::security_approval::load_authorized_posture()?;
+    let authorized_floor = authorized.script_policy();
+
+    if let Some(requested) = cli_override
+        && requested.loosens(authorized_floor)
+    {
+        crate::security_approval::ensure_project_unlock(
+            approval_scope_for_policy(requested),
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            &format!(
+                "This command requests `script-policy = {}` for this project.",
+                requested.as_str()
+            ),
+            None,
+        )?;
+    } else if cli_override.is_none()
+        && let Some(requested) = project_config.policy
+        && requested.loosens(authorized_floor)
+    {
+        crate::security_approval::ensure_project_unlock(
+            approval_scope_for_policy(requested),
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::ProjectConfig,
+            "package.json requests a weaker script-policy than this machine has approved.",
+            None,
+        )?;
+    }
+
+    if cli_override.is_none()
+        && project_config.policy.is_none()
+        && let Some(user_policy) = user
+        && user_policy.loosens(authorized_floor)
+    {
+        return Err(crate::security_approval::approval_required_error(
+            "the persisted global script-policy value is weaker than this machine has approved",
+            vec![approval_scope_for_policy(user_policy).as_str().to_string()],
+            None,
+            Some(format!("lpm config scripts --set {}", user_policy.as_str())),
+        ));
+    }
+
+    let override_authorized = if let Some(requested) = cli_override {
+        requested.loosens(authorized_floor)
+    } else if let Some(requested) = project_config.policy {
+        requested.loosens(authorized_floor)
+    } else {
+        false
+    };
+    let force_security_floor =
+        global.get_bool("force-security-floor").unwrap_or(false) && !override_authorized;
+    let resolution = crate::precedence::resolve_pure_policy(crate::precedence::PolicyInputs {
+        cli: cli_override,
+        project: project_config.policy,
+        user,
+        default: ScriptPolicy::default(),
+        force_security_floor,
+    });
+    crate::migration_warnings::emit_rejections(&resolution);
+    record_force_floor_rejections(&resolution);
+    Ok(resolution.effective)
 }
 
 /// Pure variant of [`resolve_script_policy`] that returns the full
@@ -387,6 +475,22 @@ mod tests {
 
     fn write_pkg_json(dir: &Path, content: &str) {
         std::fs::write(dir.join("package.json"), content).unwrap();
+    }
+
+    fn scoped_home_with_security(dir: &Path) -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::set([
+            ("HOME", std::ffi::OsString::from(dir.to_str().unwrap())),
+            (
+                "LPM_SECURITY_DIR",
+                dir.join("security").as_os_str().to_owned(),
+            ),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                std::ffi::OsString::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            ),
+        ])
     }
 
     // ── ScriptPolicy parsing ──────────────────────────────────────
@@ -716,5 +820,33 @@ mod tests {
             ScriptPolicy::Deny,
             "parse-error scriptPolicy falls through to default",
         );
+    }
+
+    #[test]
+    fn resolve_with_security_rejects_unapproved_project_allow() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "allow"}}"#);
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        let _env = scoped_home_with_security(dir.path());
+
+        let err = resolve_script_policy_with_security(dir.path(), None, &cfg, true).unwrap_err();
+        assert_eq!(err.error_code(), "security_approval_required");
+        assert!(err.to_string().contains("security approval required"));
+    }
+
+    #[test]
+    fn resolve_with_security_allows_project_allow_when_authorized() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "allow"}}"#);
+        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
+        let _env = scoped_home_with_security(dir.path());
+        let posture = crate::security_approval::AuthorizedPosture {
+            script_policy: "allow".to_string(),
+            ..crate::security_approval::AuthorizedPosture::default()
+        };
+        crate::security_approval::persist_authorized_posture(&posture).unwrap();
+
+        let resolved = resolve_script_policy_with_security(dir.path(), None, &cfg, true).unwrap();
+        assert_eq!(resolved, ScriptPolicy::Allow);
     }
 }

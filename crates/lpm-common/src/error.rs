@@ -262,6 +262,20 @@ pub enum LpmError {
         )
     )]
     SecurityFloor(String),
+
+    #[error("security approval required: {message}")]
+    #[diagnostic(
+        code(lpm::security_approval_required),
+        help(
+            "Approve the requested weakening explicitly, then retry the original command."
+        )
+    )]
+    SecurityApprovalRequired {
+        message: String,
+        requested_scopes: Vec<String>,
+        project_root: Option<String>,
+        suggested_command: Option<String>,
+    },
 }
 
 impl LpmError {
@@ -303,6 +317,7 @@ impl LpmError {
             LpmError::ProvenanceVerification(_) => "provenance_verification",
             LpmError::SelfUpdate(_) => "self_update",
             LpmError::SecurityFloor(_) => "security_floor",
+            LpmError::SecurityApprovalRequired { .. } => "security_approval_required",
         }
     }
 }
