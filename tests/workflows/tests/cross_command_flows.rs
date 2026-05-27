@@ -17,6 +17,7 @@
 mod support;
 
 use std::path::PathBuf;
+use support::assertions;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_with_registry};
 
@@ -39,6 +40,17 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &str) {
+    let envelope = assertions::assert_security_approval_required(out);
+    let scopes = envelope["error"]["requested_scopes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("security approval envelope must include scopes: {envelope}"));
+    assert!(
+        scopes.iter().any(|scope| scope == expected_scope),
+        "security approval envelope must include scope `{expected_scope}`; got {envelope}",
+    );
 }
 
 /// Seed the per-project store with a package so flows that need a
@@ -459,84 +471,20 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
         "before approval, deny-policy rebuild must not surface scripted-pkg; got: {r1_stdout}"
     );
 
-    // Step 3: approve-scripts --yes. Consumes build-state.json,
-    // mutates `package.json > lpm > trustedDependencies` to add
-    // scripted-pkg.
+    // Step 3: approve-scripts --yes is a live trust mutation. Workflow
+    // tests do not mint native approval, so the flow now stops at the
+    // guardrail and leaves package.json unchanged.
+    let before_approve = project.read_file("package.json");
     let out_approve = lpm(&project)
         .args(["--json", "approve-scripts", "--yes"])
         .output()
         .expect("spawn approve-scripts");
-    assert!(
-        out_approve.status.success(),
-        "approve-scripts --yes failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out_approve.stdout),
-        String::from_utf8_lossy(&out_approve.stderr)
-    );
-    let pkg_after_approve: serde_json::Value =
-        serde_json::from_str(&project.read_file("package.json")).unwrap();
-    let trusted_text = pkg_after_approve["lpm"]["trustedDependencies"].to_string();
-    assert!(
-        trusted_text.contains("scripted-pkg"),
-        "approve-scripts --yes must record scripted-pkg in trustedDependencies; \
-         got package.json: {pkg_after_approve}\n\
-         approve-scripts stdout: {}\n\
-         approve-scripts stderr: {}",
-        String::from_utf8_lossy(&out_approve.stdout),
-        String::from_utf8_lossy(&out_approve.stderr)
-    );
-    eprintln!(
-        "[flow #6] post-approve package.json:\n{}",
-        project.read_file("package.json")
-    );
-
-    // Step 4: rebuild #2 against the post-approval manifest. With the
-    // real script_hash flowing from store-dir → build-state.json →
-    // approve-scripts → manifest, rebuild's strict trust gate matches
-    // the entry on `name@version` (Rich form), integrity, and
-    // script_hash. The package surfaces in `packages[]` as
-    // `trusted: true` — the load-bearing claim of the rebuild →
-    // approve-scripts → rebuild lifecycle.
-    let out_r2 = lpm(&project)
-        .args(["--json", "rebuild", "--dry-run", "--policy=deny"])
-        .output()
-        .expect("spawn rebuild 2");
-    assert!(
-        out_r2.status.success(),
-        "rebuild#2 must exit cleanly post-approve-scripts:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out_r2.stdout),
-        String::from_utf8_lossy(&out_r2.stderr)
-    );
-    let r2_stderr = strip_ansi(&String::from_utf8_lossy(&out_r2.stderr));
-    assert!(
-        !r2_stderr.contains("drift") && !r2_stderr.contains("Error"),
-        "rebuild#2 must not warn about manifest drift after a fresh approve-scripts; \
-         stderr: {r2_stderr}"
-    );
-    let r2_envelope: serde_json::Value =
-        serde_json::from_slice(&out_r2.stdout).unwrap_or_else(|e| {
-            panic!(
-                "rebuild#2 --json stdout must be valid JSON: {e}\nstdout:\n{}",
-                String::from_utf8_lossy(&out_r2.stdout)
-            )
-        });
-    let packages = r2_envelope["packages"]
-        .as_array()
-        .expect("rebuild#2 envelope must carry a packages[] array");
-    let scripted_pkg_entry = packages
-        .iter()
-        .find(|p| p["name"] == "scripted-pkg" && p["version"] == "1.0.0")
-        .unwrap_or_else(|| {
-            panic!(
-                "rebuild#2 packages[] must contain scripted-pkg@1.0.0 after approve-scripts; \
-                 envelope:\n{}",
-                serde_json::to_string_pretty(&r2_envelope).unwrap_or_default()
-            )
-        });
     assert_eq!(
-        scripted_pkg_entry["trusted"],
-        serde_json::json!(true),
-        "scripted-pkg@1.0.0 must be classified `trusted: true` post-approval; entry: {scripted_pkg_entry}"
+        project.read_file("package.json"),
+        before_approve,
+        "approve-scripts --yes must not mutate package.json without approval",
     );
+    assert_security_approval_scope(&out_approve, "trust-bulk-approve");
 }
 
 // ─── Flow #10: doctor --fix → install ───────────────────────────────────

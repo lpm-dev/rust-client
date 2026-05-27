@@ -274,7 +274,7 @@ pub fn resolve_sandbox_mode_from_chain(
         return Ok((SandboxOptions::default(), ResolvedSandboxMode::None));
     }
     if strict_sandbox_flag {
-        let (options, _) = merge(project.clone(), global.clone());
+        let (options, _) = merge(project, global);
         return Ok((
             SandboxOptions {
                 deny_outbound_network: true,
@@ -284,7 +284,7 @@ pub fn resolve_sandbox_mode_from_chain(
         ));
     }
     if env_strict_sandbox_set() {
-        let (options, _) = merge(project.clone(), global.clone());
+        let (options, _) = merge(project, global);
         return Ok((
             SandboxOptions {
                 deny_outbound_network: true,

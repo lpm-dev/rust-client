@@ -266,9 +266,7 @@ pub enum LpmError {
     #[error("security approval required: {message}")]
     #[diagnostic(
         code(lpm::security_approval_required),
-        help(
-            "Approve the requested weakening explicitly, then retry the original command."
-        )
+        help("Approve the requested weakening explicitly, then retry the original command.")
     )]
     SecurityApprovalRequired {
         message: String,

@@ -19,7 +19,6 @@ fn run_install(project: &TempProject) -> Output {
         .env_remove("LPM_TOKEN")
         .args([
             "install",
-            "--allow-new",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",

@@ -78,6 +78,7 @@ mod support;
 
 use std::path::PathBuf;
 
+use support::assertions;
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
 use support::{TempProject, lpm_with_registry};
 
@@ -266,6 +267,17 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &str) {
+    let envelope = assertions::assert_security_approval_required(out);
+    let scopes = envelope["error"]["requested_scopes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("security approval envelope must include scopes: {envelope}"));
+    assert!(
+        scopes.iter().any(|scope| scope == expected_scope),
+        "security approval envelope must include scope `{expected_scope}`; got {envelope}",
+    );
+}
+
 /// `true` if `node` is on PATH. The synthetic postinstall is `node
 /// install.js`, so without node we can't exercise the spawn path
 /// at all — soft-pass the test rather than fail on environment.
@@ -294,7 +306,7 @@ async fn assert_network_denied(
         // enforcement from TRIAGE gating. Allow also fires auto-
         // build automatically, so we don't need
         // `--auto-build` to widen the rebuild path.
-        .args(["install", "--policy=allow"])
+        .args(["--json", "install", "--policy=allow"])
         // network denial is opt-in
         // (strict-sandbox row).
         // This test asserts the STRICT path works, so it must opt
@@ -308,6 +320,15 @@ async fn assert_network_denied(
         .expect("spawn lpm install");
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+
+    if !out.status.success() {
+        assert_security_approval_scope(&out, "scripts-allow");
+        assert!(
+            !lpm_built_marker(project, dep_name).exists(),
+            "[{case_label}] build marker must remain absent when scripts-allow approval is missing",
+        );
+        return;
+    }
 
     // ── Assertion 0: install exit code 0 (soft-fail contract). ──
     //

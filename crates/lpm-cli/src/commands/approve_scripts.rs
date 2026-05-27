@@ -4142,6 +4142,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_install_with_legacy_then_approve_yes_upgrades_to_rich() {
+        ensure_security_test_backend();
         // Migration path: project starts with the legacy array form, a
         // NEW package gets installed that needs approval, --yes upgrades
         // the manifest to the rich form AND preserves the existing legacy
@@ -5048,6 +5049,7 @@ mod tests {
     /// detect bulk-approval flows.
     #[tokio::test]
     async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
+        ensure_security_test_backend();
         let tmp = tempdir().unwrap();
         let root = lpm_common::LpmRoot::from_dir(tmp.path());
         let agg = AggregateBlockedSet {
@@ -5071,6 +5073,7 @@ mod tests {
     /// file, leaving other rows unapproved.
     #[tokio::test]
     async fn run_global_named_approves_only_the_matched_row() {
+        ensure_security_test_backend();
         let tmp = tempdir().unwrap();
         let root = lpm_common::LpmRoot::from_dir(tmp.path());
         let agg = AggregateBlockedSet {
@@ -5336,6 +5339,7 @@ mod tests {
     /// silent clobber is observable as a missing binding.
     #[tokio::test]
     async fn global_named_approvals_do_not_clobber_each_other() {
+        ensure_security_test_backend();
         let tmp = tempdir().unwrap();
         let _env = scoped_lpm_home(tmp.path());
         let root_path = tmp.path().to_path_buf();

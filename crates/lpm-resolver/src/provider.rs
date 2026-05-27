@@ -1026,9 +1026,8 @@ fn is_valid_version_string(v: &str) -> bool {
 /// libc doesn't have to match the host's libc — a glibc-built lpm on
 /// Alpine would mis-detect via `cfg!(target_env)` alone.
 ///
-/// To support cross-platform resolution (e.g., `lpm install --platform=linux-x64-musl`),
-/// this would need to be changed to runtime detection with an overridable parameter.
-/// See: <https://docs.npmjs.com/cli/v9/commands/npm-install#os>
+/// This represents the current host only. Cross-platform resolution would
+/// need a caller-supplied target tuple instead of this helper.
 pub(crate) struct Platform {
     pub os: &'static str,
     pub cpu: &'static str,
