@@ -23,6 +23,7 @@ mod support;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+use support::assertions;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 use wiremock::matchers::{method, path};
@@ -253,8 +254,6 @@ fn write_manifest_with_approval(project: &TempProject, approval: ApprovedRefShap
         "version": "1.0.0",
         "dependencies": { PKG: CANDIDATE_VERSION },
         "lpm": {
-            // Cooldown disabled so the drift gate is exercised in isolation.
-            "minimumReleaseAge": 0,
             "trustedDependencies": rich,
         },
     });
@@ -269,7 +268,6 @@ fn write_manifest_without_approval(project: &TempProject) {
         "name": "provenance-drift-test",
         "version": "1.0.0",
         "dependencies": { PKG: CANDIDATE_VERSION },
-        "lpm": { "minimumReleaseAge": 0 },
     });
     project.write_file(
         "package.json",
@@ -347,6 +345,17 @@ fn assert_drift_not_blocked_and_install_succeeded(out: &std::process::Output) {
          \nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &str) {
+    let envelope = assertions::assert_security_approval_required(out);
+    let scopes = envelope["error"]["requested_scopes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("security approval envelope must include scopes: {envelope}"));
+    assert!(
+        scopes.iter().any(|scope| scope == expected_scope),
+        "security approval envelope must include scope `{expected_scope}`; got {envelope}",
     );
 }
 
@@ -443,71 +452,50 @@ async fn setup_http500_attestation() -> (TempProject, MockRegistry) {
 
 // ─── Tests: ship criteria ────────────────────────────────────────
 
-/// Approved v1 had attestation; candidate v2 has none — drift blocks
-/// install. The axios 1.14.1 scenario, end-to-end.
+/// A hand-edited rich `trustedDependencies` provenance snapshot must not
+/// reach the drift gate. Workflow tests do not mint native approvals, so
+/// this pins the same-user-agent boundary instead of exercising the
+/// approved success path end-to-end.
 #[tokio::test]
-async fn install_drift_blocks_when_approved_attestation_dropped() {
+async fn install_refuses_direct_trust_edits_before_drift_gate() {
     let (project, mock) = setup_approved_present_candidate_absent().await;
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install"])
+        .args(["--json", "install"])
         .output()
         .expect("spawn lpm install");
-    assert_drift_blocked(&out);
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        combined.contains("provenance dropped"),
-        "block message must name the 'provenance dropped' verdict; got:\n{combined}"
-    );
+    assert_security_approval_scope(&out, "trust-bulk-approve");
 }
 
-/// `--ignore-provenance-drift <pkg>` waives the named package's drift
-/// while leaving the rest of the gate live. Stronger assertion: install
-/// must complete end-to-end, not just suppress the drift message.
+/// `--ignore-provenance-drift <pkg>` is a guarded provenance bypass.
+/// The workflow tier asserts the approval boundary; the approved waiver
+/// semantics live in lower-level tests where authority can be modeled
+/// without spoofing native approval.
 #[tokio::test]
-async fn install_ignore_provenance_drift_per_package_unblocks() {
-    let (project, mock) = setup_approved_present_candidate_absent().await;
+async fn install_ignore_provenance_drift_per_package_requires_security_approval() {
+    let project = TempProject::empty("");
+    write_manifest_without_approval(&project);
+    let mock = MockRegistry::start().await;
+    mount_package_version(&mock, CANDIDATE_VERSION, AttestationShape::NoField).await;
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--ignore-provenance-drift", PKG])
+        .args(["--json", "install", "--ignore-provenance-drift", PKG])
         .output()
         .expect("spawn lpm install");
-    assert_drift_not_blocked_and_install_succeeded(&out);
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        combined.contains("waived by --ignore-provenance-drift"),
-        "waived-advisory must appear so the user sees what they opted out of; got:\n{combined}"
-    );
+    assert_security_approval_scope(&out, "provenance-ignore-drift");
 }
 
-/// `--ignore-provenance-drift-all` blanket-waives every package. Held
-/// as a separate test from per-package so CI can pinpoint a regression
-/// to the right code path.
+/// `--ignore-provenance-drift-all` is also guarded. This catches the
+/// blanket form without requiring a forged package-wide unlock.
 #[tokio::test]
-async fn install_ignore_provenance_drift_all_unblocks() {
-    let (project, mock) = setup_approved_present_candidate_absent().await;
+async fn install_ignore_provenance_drift_all_requires_security_approval() {
+    let project = TempProject::empty("");
+    write_manifest_without_approval(&project);
+    let mock = MockRegistry::start().await;
+    mount_package_version(&mock, CANDIDATE_VERSION, AttestationShape::NoField).await;
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--ignore-provenance-drift-all"])
+        .args(["--json", "install", "--ignore-provenance-drift-all"])
         .output()
         .expect("spawn lpm install");
-    assert_drift_not_blocked_and_install_succeeded(&out);
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        combined.contains("waived for this install by --ignore-provenance-drift-all"),
-        "blanket-waive advisory must announce the opt-out; got:\n{combined}"
-    );
+    assert_security_approval_scope(&out, "provenance-ignore-drift");
 }
 
 /// Both versions carry attestations but the publisher differs (repo
@@ -569,32 +557,33 @@ async fn install_legitimate_release_bump_does_not_drift() {
     assert_drift_not_blocked_and_install_succeeded(&out);
 }
 
-/// D16 orthogonality: `--allow-new` is the cooldown override; per D16
-/// it does NOT bypass the drift gate. If this regresses, the two gates
-/// have silently merged and users can't independently ack each signal.
+/// D16 orthogonality still starts at the approval boundary:
+/// `--allow-new` is a guarded cooldown bypass and cannot be used by a
+/// non-interactive workflow test to smuggle execution to the drift gate.
 #[tokio::test]
-async fn install_allow_new_alone_does_not_bypass_drift() {
-    let (project, mock) = setup_approved_present_candidate_absent().await;
+async fn install_allow_new_requires_security_approval_before_drift_gate() {
+    let project = TempProject::empty("");
+    write_manifest_without_approval(&project);
+    let mock = MockRegistry::start().await;
+    mount_package_version(&mock, CANDIDATE_VERSION, AttestationShape::NoField).await;
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--allow-new"])
+        .args(["--json", "install", "--allow-new"])
         .output()
         .expect("spawn lpm install");
-    assert_drift_blocked(&out);
+    assert_security_approval_scope(&out, "cooldown-bypass");
 }
 
-/// Reliability guard: HTTP 500 from the attestation endpoint must NOT
-/// be treated as "provenance dropped." The fetcher degrades (`Ok(None)`),
-/// the comparator returns `NoDrift`, install proceeds. A rate-limited
-/// or transient Sigstore failure shouldn't produce spurious drift
-/// blocks.
+/// Reliability guard at workflow level: a pre-seeded rich approval is
+/// itself guarded before any attestation HTTP outcome is considered.
+/// Drift-comparator behavior for 500s is covered in provenance unit tests.
 #[tokio::test]
-async fn install_drift_does_not_falsely_block_on_attestation_fetch_failure() {
+async fn install_attestation_fetch_failure_fixture_requires_trust_approval_first() {
     let (project, mock) = setup_http500_attestation().await;
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install"])
+        .args(["--json", "install"])
         .output()
         .expect("spawn lpm install");
-    assert_drift_not_blocked_and_install_succeeded(&out);
+    assert_security_approval_scope(&out, "trust-bulk-approve");
 }
 
 /// Observable contract for projects with no rich `trustedDependencies`
@@ -933,24 +922,11 @@ async fn approve_scripts_refuses_under_deny_when_verifier_rejects_bundle() {
     }
 }
 
-/// **Phase 2.2.b warn-mode regression guard.**
-///
-/// Under `LPM_PROVENANCE_ENFORCE=warn`, an unverifiable bundle MUST
-/// emit a loud warning but allow the approval through. The binding
-/// records `provenance_at_approval: None` (today's
-/// transport-degrade shape), but the drift gate's load-bearing
-/// behavior — the `is_some()` filter in
-/// `provenance_reference_for_name` — means a later install with a
-/// prior valid binding for the same package would still see that
-/// prior identity as the drift reference.
-///
-/// This test pins the user-facing contract:
-/// 1. `lpm approve-scripts --yes` exits zero under warn
-/// 2. stderr/stdout contains the `provenance verification FAILED`
-///    warn line naming the package + verifier reason
-/// 3. The recovery hint mentions `LPM_PROVENANCE_ENFORCE=deny`
+/// `LPM_PROVENANCE_ENFORCE=warn` is now a guarded provenance
+/// downgrade. Workflow tests assert that `approve-scripts` refuses it
+/// without native approval instead of silently writing trust state.
 #[tokio::test]
-async fn approve_scripts_under_warn_logs_and_proceeds_when_verifier_rejects() {
+async fn approve_scripts_under_warn_requires_security_approval() {
     let dep = "scripted-pkg-warn";
     let project = TempProject::empty(&format!(
         r#"{{"name":"silent-drop-warn","version":"1.0.0","dependencies":{{"{dep}":"^1.0.0"}}}}"#
@@ -964,62 +940,31 @@ async fn approve_scripts_under_warn_logs_and_proceeds_when_verifier_rejects() {
         .expect("spawn lpm install");
 
     // Warn-mode opt-in. The env knob is per-invocation so the test
-    // doesn't mutate process-global state. Per-package approve flow
-    // for the same reason as the deny test — skip the tier-yes gate
-    // so the verifier-rejection is the only refusal under test.
+    // doesn't mutate process-global state.
     let approve_out = lpm_with_registry(&project, &mock.url())
         .env("LPM_PROVENANCE_ENFORCE", "warn")
-        .args(["approve-scripts", dep])
+        .args(["--json", "approve-scripts", dep])
         .output()
         .expect("spawn lpm approve-scripts <pkg> under warn mode");
 
-    assert!(
-        approve_out.status.success(),
-        "approve-scripts under LPM_PROVENANCE_ENFORCE=warn must succeed (non-blocking);\n\
-         stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&approve_out.stdout),
-        String::from_utf8_lossy(&approve_out.stderr),
-    );
+    assert_security_approval_scope(&approve_out, "provenance-unverified");
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&approve_out.stdout),
-        String::from_utf8_lossy(&approve_out.stderr),
-    );
+    let manifest_str = project.read_file("package.json");
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_str).unwrap();
     assert!(
-        combined.contains("provenance verification FAILED")
-            || combined.contains("provenance verification failed"),
-        "warn mode must emit a loud rejection notice (case-insensitive); got:\n{combined}",
-    );
-    assert!(
-        combined.contains(dep),
-        "warn notice must name the package; got:\n{combined}",
-    );
-    assert!(
-        combined.contains("LPM_PROVENANCE_ENFORCE=deny"),
-        "warn notice must point at the deny re-enable knob so operators know how to tighten back \
-         to fail-closed; got:\n{combined}",
+        manifest
+            .get("lpm")
+            .and_then(|value| value.get("trustedDependencies"))
+            .is_none(),
+        "refused warn-mode approval must not write trustedDependencies; got {manifest}",
     );
 }
 
-/// Warn-mode re-approval of an exact version that already carries
-/// a prior verified snapshot MUST preserve that snapshot rather
-/// than overwriting it with `provenanceAtApproval: null`. Pre-fix,
-/// `approve_with_metadata` unconditionally inserted a new entry
-/// keyed by `name@version`, and snapshot projection returned `None`
-/// under Warn+VerificationRejected — so a re-approval silently
-/// cleared the prior identity reference. Subsequent installs would
-/// then read `(None, _)` in the drift comparator and short-circuit
-/// to `NoDrift`, permanently disarming detection of publisher
-/// rotation for that exact version on that machine.
-///
-/// Setup: same identity in the pre-seed and the served bundle (so
-/// the install-time drift comparator passes), but the bundle is
-/// structurally unverifiable (verifier rejects at the DSSE /
-/// tlogEntries pre-flight). Under warn, install + approve both
-/// proceed; preservation must keep the pre-seeded snapshot intact.
+/// A direct rich approval plus warn-mode is doubly guarded: the
+/// hand-edited trust state itself must be rejected before provenance
+/// verification can be weakened or re-approved.
 #[tokio::test]
-async fn approve_scripts_under_warn_preserves_existing_provenance_on_re_approval() {
+async fn install_with_direct_trust_and_warn_env_requires_security_approval() {
     let dep = "scripted-pkg-warn-preserve";
     let version = "1.0.0";
     let project = TempProject::empty(&format!(
@@ -1035,7 +980,6 @@ async fn approve_scripts_under_warn_preserves_existing_provenance_on_re_approval
         "version": "1.0.0",
         "dependencies": { dep: "^1.0.0" },
         "lpm": {
-            "minimumReleaseAge": 0,
             "trustedDependencies": {
                 format!("{dep}@{version}"): {
                     "integrity": "sha512-prior",
@@ -1069,64 +1013,10 @@ async fn approve_scripts_under_warn_preserves_existing_provenance_on_re_approval
 
     let install_out = lpm_with_registry(&project, &mock.url())
         .env("LPM_PROVENANCE_ENFORCE", "warn")
-        .args(["install"])
+        .args(["--json", "install"])
         .output()
         .expect("spawn lpm install under warn");
-    assert!(
-        install_out.status.success(),
-        "install under warn with identity-matched-but-unverifiable bundle must succeed;\n\
-         stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&install_out.stdout),
-        String::from_utf8_lossy(&install_out.stderr),
-    );
-
-    let approve_out = lpm_with_registry(&project, &mock.url())
-        .env("LPM_PROVENANCE_ENFORCE", "warn")
-        .args(["approve-scripts", dep])
-        .output()
-        .expect("spawn lpm approve-scripts <pkg> under warn mode");
-
-    assert!(
-        approve_out.status.success(),
-        "approve-scripts under warn MUST succeed;\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&approve_out.stdout),
-        String::from_utf8_lossy(&approve_out.stderr),
-    );
-
-    let after = project.read_file("package.json");
-    let after_json: serde_json::Value = serde_json::from_str(&after).expect("manifest parses");
-    let binding = after_json["lpm"]["trustedDependencies"]
-        .as_object()
-        .expect("rich-form trustedDependencies must persist after re-approval")
-        .get(&format!("{dep}@{version}"))
-        .unwrap_or_else(|| {
-            panic!(
-                "rich-form binding for {dep}@{version} must persist after re-approval; \
-                 got manifest:\n{after}",
-            )
-        });
-
-    let pa = binding.get("provenanceAtApproval").unwrap_or_else(|| {
-        panic!(
-            "binding MUST still carry provenanceAtApproval after a warn-mode re-approval — \
-             this is the GPT-flagged erasure regression; got binding:\n{binding:#?}",
-        )
-    });
-    assert_eq!(
-        pa["publisher"].as_str(),
-        Some(pinned_publisher),
-        "preserved publisher must equal the prior verified value, byte-for-byte; got: {pa:#?}",
-    );
-    assert_eq!(
-        pa["workflowPath"].as_str(),
-        Some(pinned_workflow_path),
-        "preserved workflowPath must equal the prior verified value; got: {pa:#?}",
-    );
-    assert_eq!(
-        pa["attestation_cert_sha256"].as_str(),
-        Some(pinned_cert_sha),
-        "preserved cert SHA must equal the prior verified value; got: {pa:#?}",
-    );
+    assert_security_approval_scope(&install_out, "trust-bulk-approve");
 }
 
 // ─── Install drift gate: warn / skip-flag composition pins ───────────
@@ -1163,145 +1053,71 @@ async fn setup_install_drift_gate_with_verifier_rejecting_candidate() -> (TempPr
     (project, mock)
 }
 
-/// Under default `EnforceMode::Deny`, an install-time verifier
-/// rejection refuses the install — `?`-propagates the typed
-/// `LpmError::ProvenanceVerification` so the user sees a real
-/// diagnostic rather than silently weakening drift detection. This
-/// is the load-bearing baseline that the warn-mode degrade test
-/// below contrasts against.
+/// A verifier-rejecting candidate with a hand-edited rich approval stops
+/// at the trust guard first. The lower-level verifier-deny behavior is
+/// covered without spoofing approval state.
 #[tokio::test]
-async fn install_drift_gate_under_deny_blocks_when_verifier_rejects_bundle() {
+async fn install_drift_gate_with_direct_trust_requires_security_approval_first() {
     let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install"])
+        .args(["--json", "install"])
         .output()
         .expect("spawn lpm install");
-    assert!(
-        !out.status.success(),
-        "Deny + verifier rejection MUST block the install — \
-         silent acceptance would let a forged bundle through;\n\
-         stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert!(
-        combined.contains("provenance"),
-        "rejection diagnostic must surface the 'provenance' subsystem so operators can \
-         find the failed gate; got:\n{combined}",
-    );
+    assert_security_approval_scope(&out, "trust-bulk-approve");
 }
 
-/// Under `LPM_PROVENANCE_ENFORCE=warn`, an install-time verifier
-/// rejection on a rich-form-bound package MUST NOT block the
-/// install. The drift gate degrades to NoDrift, emits a loud
-/// `output::warn`, and the install proceeds. This is the rollout-
-/// window posture: ship the verifier in warn mode for one release
-/// so a bundle-shape change at the registry surfaces as a log
-/// line, not a CI nuke.
-///
-/// Contrasts directly with the Deny baseline above: same fixture,
-/// same bundle, only the env knob differs.
+/// `LPM_PROVENANCE_ENFORCE=warn` is guarded even when there is no
+/// existing rich approval. The workflow test asserts the runtime posture
+/// boundary rather than using an in-band env var as approval.
 #[tokio::test]
-async fn install_drift_gate_under_enforce_warn_does_not_block_on_verifier_rejection() {
-    let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;
+async fn install_drift_gate_under_enforce_warn_requires_security_approval() {
+    let project = TempProject::empty("");
+    write_manifest_without_approval(&project);
+    let mock = MockRegistry::start().await;
+    mount_package_version(
+        &mock,
+        CANDIDATE_VERSION,
+        AttestationShape::UrlPresent(AttestationResponse::SigstoreBundle {
+            publisher: APPROVED_PUBLISHER,
+            workflow_path: APPROVED_WORKFLOW_PATH,
+            workflow_ref: "refs/tags/v1.0.1",
+        }),
+    )
+    .await;
     let out = lpm_with_registry(&project, &mock.url())
         .env("LPM_PROVENANCE_ENFORCE", "warn")
-        .args(["install"])
+        .args(["--json", "install"])
         .output()
         .expect("spawn lpm install under LPM_PROVENANCE_ENFORCE=warn");
 
-    assert!(
-        out.status.success(),
-        "Warn mode MUST NOT block the install on verifier rejection (rollout-window \
-         contract); stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert!(
-        !drift_block_message_present(&out),
-        "drift block message must NOT appear under warn mode; got:\n{combined}",
-    );
-    assert!(
-        combined.contains("provenance verification FAILED"),
-        "warn mode MUST emit the loud `provenance verification FAILED` line so the \
-         operator sees the degraded posture; got:\n{combined}",
-    );
-    assert!(
-        combined.contains(PKG),
-        "warn line must name the package whose bundle was rejected so operators can \
-         track which dependency to remediate; got:\n{combined}",
-    );
-    assert!(
-        combined.contains("LPM_PROVENANCE_ENFORCE=deny"),
-        "warn line must point at the re-enable command so operators can tighten back \
-         to fail-closed; got:\n{combined}",
-    );
+    assert_security_approval_scope(&out, "provenance-unverified");
 }
 
-/// The two verification-policy axes (`EnforceMode` and
-/// `SkipPolicy`) MUST compose orthogonally:
-/// `LPM_PROVENANCE_ENFORCE=warn` + `--unverified-provenance <pkg>`
-/// on the same invocation means "warn-mode for the rest of the
-/// install, skip verification entirely for the named package."
-///
-/// Pinned via a side-effect contrast: the skip-listed package's
-/// rejection log line is ABSENT from stderr (because the verifier
-/// never ran for it) — that's the orthogonality signal. If the two
-/// axes collapsed (e.g. warn-mode also short-circuited the skip-
-/// list logic), the warn line would still fire and this test
-/// would catch it.
-///
-/// Unit test `verify_policy_should_skip_verification_unifies_skip_and_off`
-/// pins the policy-decision side; this is the end-to-end pin that
-/// guards against the install pipeline ignoring the skip-list
-/// under warn mode.
+/// `LPM_PROVENANCE_ENFORCE=warn` and `--unverified-provenance <pkg>`
+/// are both provenance downgrades. Without an approval, the combined
+/// request must still stop at the same guardrail.
 #[tokio::test]
-async fn install_skip_flag_short_circuits_verifier_under_enforce_warn() {
-    let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;
+async fn install_skip_flag_under_enforce_warn_requires_security_approval() {
+    let project = TempProject::empty("");
+    write_manifest_without_approval(&project);
+    let mock = MockRegistry::start().await;
+    mount_package_version(
+        &mock,
+        CANDIDATE_VERSION,
+        AttestationShape::UrlPresent(AttestationResponse::SigstoreBundle {
+            publisher: APPROVED_PUBLISHER,
+            workflow_path: APPROVED_WORKFLOW_PATH,
+            workflow_ref: "refs/tags/v1.0.1",
+        }),
+    )
+    .await;
     let out = lpm_with_registry(&project, &mock.url())
         .env("LPM_PROVENANCE_ENFORCE", "warn")
-        .args(["install", "--unverified-provenance", PKG])
+        .args(["--json", "install", "--unverified-provenance", PKG])
         .output()
         .expect("spawn lpm install with both env-warn and skip-flag");
 
-    assert!(
-        out.status.success(),
-        "Warn + skip MUST succeed; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert!(
-        !drift_block_message_present(&out),
-        "drift block message must NOT appear; got:\n{combined}",
-    );
-    // The orthogonality signal: under skip-listed routing, the
-    // verifier never runs, so the warn-mode rejection line MUST NOT
-    // fire. If the two axes collapsed (warn-mode forces verification
-    // to run regardless of skip-list), this line would appear.
-    assert!(
-        !combined.contains("provenance verification FAILED"),
-        "skip-listed package must NOT trigger the warn-mode verifier-rejection line — \
-         the skip path bypasses the verifier entirely. Presence of this line means \
-         the SkipPolicy axis collapsed into the EnforceMode axis (orthogonality \
-         contract broken); got:\n{combined}",
-    );
+    assert_security_approval_scope(&out, "provenance-unverified");
 }
 
 /// Persist `[sigstore] verify = "off"` to the isolated HOME's config
@@ -1313,66 +1129,30 @@ fn write_sigstore_off_to_isolated_config(project: &TempProject) {
     std::fs::write(&cfg, "[sigstore]\nverify = \"off\"\n").expect("write config.toml");
 }
 
-/// Operator-fleet-wide opt-out via `[sigstore] verify = "off"`:
-/// install MUST succeed against a bundle the verifier would reject,
-/// because Off short-circuits to the legacy identity-only parser.
-///
-/// Three signals pin the contract — one positive proof that the Off
-/// code path ran, and two negative proofs that the verifier and the
-/// drift gate didn't intervene:
-///
-/// 1. Positive: stderr contains the
-///    `"operator opted out of cryptographic verification"` warn line
-///    emitted only from `fetch_unverified_snapshot` (the Off /
-///    SkipPolicy code path). Without this assertion the test passes
-///    if Off ever degraded to "Warn-but-silent" — verifier runs,
-///    rejection log suppressed, install succeeds. The positive
-///    log line is what distinguishes those two outcomes.
-/// 2. Negative: stderr does NOT contain the warn-mode rejection
-///    line `"provenance verification FAILED"`.
-/// 3. Negative: install does not surface the drift block message.
+/// Operator-fleet-wide opt-out via `[sigstore] verify = "off"` is a
+/// guarded runtime provenance downgrade. A workflow test should observe
+/// `SECURITY_APPROVAL_REQUIRED`, not an unapproved verifier bypass.
 #[tokio::test]
-async fn install_does_not_run_verifier_when_sigstore_verify_off_in_config() {
-    let (project, mock) = setup_install_drift_gate_with_verifier_rejecting_candidate().await;
+async fn install_sigstore_verify_off_in_config_requires_security_approval() {
+    let project = TempProject::empty("");
+    write_manifest_without_approval(&project);
+    let mock = MockRegistry::start().await;
+    mount_package_version(
+        &mock,
+        CANDIDATE_VERSION,
+        AttestationShape::UrlPresent(AttestationResponse::SigstoreBundle {
+            publisher: APPROVED_PUBLISHER,
+            workflow_path: APPROVED_WORKFLOW_PATH,
+            workflow_ref: "refs/tags/v1.0.1",
+        }),
+    )
+    .await;
     write_sigstore_off_to_isolated_config(&project);
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install"])
+        .args(["--json", "install"])
         .output()
         .expect("spawn lpm install with [sigstore] verify=off");
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert!(
-        out.status.success(),
-        "EnforceMode::Off + verifier-rejecting bundle MUST succeed; verifier shouldn't run. \
-         If this fails, the Off short-circuit in fetch_provenance_for_pkgs has regressed \
-         or [sigstore] verify resolution is no longer reading the config file.\n\
-         stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert!(
-        combined.contains("operator opted out of cryptographic verification"),
-        "Off mode MUST emit the `opted out of cryptographic verification` warn line — \
-         that's the positive proof the legacy identity-only fetch path ran instead of the \
-         verifier. Absence of this line means either Off is silently degrading to a different \
-         path (Warn-but-silent, deny, or transport-degraded), or the `lpm=warn` tracing \
-         filter at main.rs no longer routes the lpm::provenance target to stderr. got:\n{combined}",
-    );
-    assert!(
-        !drift_block_message_present(&out),
-        "drift block message must NOT appear when sigstore.verify=off — the legacy identity-only \
-         parser ran and the candidate's identity matches the approved binding; got:\n{combined}",
-    );
-    assert!(
-        !combined.contains("provenance verification FAILED"),
-        "Off mode must NOT emit the warn-mode verifier-rejection line — the verifier never \
-         ran. If this fires, the SkipPolicy/EnforceMode short-circuit at \
-         `verify_policy_ref.should_skip_verification_for` collapsed and Off is being \
-         treated like Warn; got:\n{combined}",
-    );
+    assert_security_approval_scope(&out, "provenance-unverified");
 }

@@ -380,6 +380,9 @@ pub fn check_install_state(project_dir: &Path) -> InstallState {
         };
     };
 
+    #[cfg(test)]
+    let cfg = crate::commands::config::GlobalConfig::empty();
+    #[cfg(not(test))]
     let cfg = crate::commands::config::GlobalConfig::load();
     let linker_mode = match crate::linker_config::resolve_effective_linker_from_bytes(
         None,
@@ -404,6 +407,9 @@ pub fn check_install_state(project_dir: &Path) -> InstallState {
 /// Saves one redundant file read. Linker resolution still runs
 /// internally with `cli_override = None`.
 pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -> InstallState {
+    #[cfg(test)]
+    let cfg = crate::commands::config::GlobalConfig::empty();
+    #[cfg(not(test))]
     let cfg = crate::commands::config::GlobalConfig::load();
     let linker_mode = match crate::linker_config::resolve_effective_linker_from_bytes(
         None,
@@ -881,6 +887,10 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn scoped_home_for(_path: &Path) -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::update([("LPM_LINKER", None)])
+    }
+
     fn setup_up_to_date_project() -> TempDir {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
@@ -899,6 +909,7 @@ mod tests {
     #[test]
     fn up_to_date_returns_true() {
         let dir = setup_up_to_date_project();
+        let _home = scoped_home_for(dir.path());
         let state = check_install_state(dir.path());
         assert!(state.up_to_date);
         assert!(state.hash.is_some());
@@ -907,6 +918,7 @@ mod tests {
     #[test]
     fn missing_lockfile_returns_false_with_hash() {
         let dir = setup_up_to_date_project();
+        let _home = scoped_home_for(dir.path());
         fs::remove_file(dir.path().join("lpm.lock")).unwrap();
         let state = check_install_state(dir.path());
         assert!(!state.up_to_date);
@@ -917,6 +929,7 @@ mod tests {
     #[test]
     fn missing_node_modules_returns_false() {
         let dir = setup_up_to_date_project();
+        let _home = scoped_home_for(dir.path());
         fs::remove_dir_all(dir.path().join("node_modules")).unwrap();
         let state = check_install_state(dir.path());
         assert!(!state.up_to_date);
@@ -926,6 +939,7 @@ mod tests {
     #[test]
     fn changed_package_json_returns_false() {
         let dir = setup_up_to_date_project();
+        let _home = scoped_home_for(dir.path());
         fs::write(
             dir.path().join("package.json"),
             r#"{"dependencies":{"b":"^2.0.0"}}"#,
@@ -939,6 +953,7 @@ mod tests {
     #[test]
     fn missing_package_json_returns_no_hash() {
         let dir = TempDir::new().unwrap();
+        let _home = scoped_home_for(dir.path());
         let state = check_install_state(dir.path());
         assert!(!state.up_to_date);
         assert!(state.hash.is_none());
@@ -950,6 +965,7 @@ mod tests {
         // install-hash must NOT exit the fast lane with "success: true".
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         let bad_json = "this is not valid json {{{";
         let lock = "lock-content";
         fs::write(p.join("package.json"), bad_json).unwrap();
@@ -973,6 +989,7 @@ mod tests {
         // an array). The fast lane must reject this.
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         let bad_shape = r#"{"dependencies":[]}"#;
         let lock = "lock-content";
         fs::write(p.join("package.json"), bad_shape).unwrap();
@@ -1096,6 +1113,7 @@ mod tests {
     fn missing_install_hash_returns_false() {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
         fs::write(p.join("lpm.lock"), "").unwrap();
         fs::create_dir_all(p.join("node_modules")).unwrap();
@@ -1126,6 +1144,7 @@ mod tests {
     #[test]
     fn v2_fast_path_returns_up_to_date_on_matching_mtimes() {
         let dir = setup_up_to_date_project_v2();
+        let _home = scoped_home_for(dir.path());
         let state = check_install_state(dir.path());
         assert!(state.up_to_date);
         assert!(state.hash.is_some());
@@ -1134,6 +1153,7 @@ mod tests {
     #[test]
     fn v2_fast_path_rejects_when_pkg_mtime_changes() {
         let dir = setup_up_to_date_project_v2();
+        let _home = scoped_home_for(dir.path());
         // Sleep briefly to cross the mtime resolution boundary, then
         // rewrite package.json identically — content-equal but new mtime.
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1152,6 +1172,7 @@ mod tests {
     #[test]
     fn v2_fast_path_rejects_when_content_actually_changed() {
         let dir = setup_up_to_date_project_v2();
+        let _home = scoped_home_for(dir.path());
         // Rewrite package.json with different content (mtime also changes).
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(
@@ -1166,6 +1187,7 @@ mod tests {
     #[test]
     fn v2_fast_path_rejects_on_external_node_modules_mutation() {
         let dir = setup_up_to_date_project_v2();
+        let _home = scoped_home_for(dir.path());
         // Touch node_modules so its mtime is AFTER install-hash's mtime.
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(dir.path().join("node_modules/.marker"), "").unwrap();
@@ -1183,6 +1205,7 @@ mod tests {
         // and the slow path reads + hashes as before.
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         fs::write(p.join("package.json"), r#"{"dependencies":{"a":"^1.0.0"}}"#).unwrap();
         fs::write(p.join("lpm.lock"), "lock-content").unwrap();
         fs::create_dir_all(p.join("node_modules")).unwrap();
@@ -1205,6 +1228,7 @@ mod tests {
         // a post-install linker flip without recomputing the full hash.
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
         fs::write(p.join("lpm.lock"), "").unwrap();
         write_install_hash(p, "abc123", lpm_linker::LinkerMode::Hoisted).unwrap();
@@ -1376,6 +1400,7 @@ mod tests {
         // Contract: the fast-lane variant must behave identically to
         // `check_install_state` when given the correct content.
         let dir = setup_up_to_date_project_v2();
+        let _home = scoped_home_for(dir.path());
         let content = fs::read_to_string(dir.path().join("package.json")).unwrap();
         let state = check_install_state_with_content(dir.path(), &content);
         assert!(state.up_to_date);
@@ -1602,6 +1627,7 @@ mod tests {
         let bytes = collect_file_link_manifest_bytes(p, pkg);
         let initial_hash = compute_install_hash_v3(pkg, "lock-content", &bytes);
         write_install_hash(p, &initial_hash, lpm_linker::LinkerMode::Isolated).unwrap();
+        let _home = scoped_home_for(p);
 
         // Sanity: up-to-date right after install.
         assert!(check_install_state(p).up_to_date);
@@ -1729,6 +1755,7 @@ mod tests {
         // The migration gate must fire and force `up_to_date = false`.
         let dir = setup_up_to_date_project();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         // Populate legacy wrapper root — this is what an
         // upgrade-in-place user's project looks like.
         fs::create_dir_all(p.join("node_modules/.lpm/express@4.22.1")).unwrap();
@@ -1749,6 +1776,7 @@ mod tests {
         // bails via the migration gate.
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
         let lock = "lock-content";
         fs::write(p.join("package.json"), pkg_json).unwrap();
@@ -1785,6 +1813,7 @@ mod tests {
         // check trips first and we never reach the migration gate.
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
         fs::write(p.join("package.json"), pkg_json).unwrap();
         fs::write(p.join("lpm.lock"), "lock-content").unwrap();
@@ -1815,6 +1844,7 @@ mod tests {
     fn populated_v1_wrappers_force_v2_migration_on_default() {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
         fs::write(p.join("package.json"), pkg_json).unwrap();
         fs::write(p.join("lpm.lock"), "lock-content").unwrap();

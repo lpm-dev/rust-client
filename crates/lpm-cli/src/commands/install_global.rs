@@ -193,6 +193,11 @@ pub async fn run(
     overrides: InstallGlobalOverrides,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
+    crate::security_approval::ensure_global_trust_authorized(
+        &root,
+        json_output,
+        crate::security_approval::ApprovalSource::GlobalConfig,
+    )?;
     // Step 6 fix: use the injected client (carries
     // `--registry` + SessionManager). The local `build_registry()`
     // helper is removed.
@@ -583,9 +588,9 @@ async fn do_install(
     crate::commands::install::run_with_options(
         registry,
         &prep.install_root,
-        false, // json_output (outer command owns stdout)
-        false, // offline
-        false, // force
+        suppress_nested_output, // preserve automation semantics; stdout is already suppressed above
+        false,                  // offline
+        false,                  // force
         overrides.allow_new,
         false, // strict_integrity — global installs use lockfile path
         None,  // linker_override

@@ -68,7 +68,7 @@ const GLOBAL_KEY: &str = "minimum-release-age-secs";
 pub fn parse_duration(input: &str) -> Result<u64, LpmError> {
     if input.is_empty() {
         return Err(LpmError::Registry(
-            "release-age duration must not be empty (expected `<N>h`, `<N>d`, or `<N>` seconds)"
+            "release-age duration must not be empty (expected `<N>m`, `<N>h`, `<N>d`, or `<N>` seconds)"
                 .into(),
         ));
     }
@@ -78,7 +78,12 @@ pub fn parse_duration(input: &str) -> Result<u64, LpmError> {
         )));
     }
 
-    if let Some(hours_str) = input.strip_suffix('h') {
+    if let Some(minutes_str) = input.strip_suffix('m') {
+        let minutes = parse_scalar(minutes_str, input)?;
+        minutes
+            .checked_mul(60)
+            .ok_or_else(|| overflow_err(input, "minutes"))
+    } else if let Some(hours_str) = input.strip_suffix('h') {
         let hours = parse_scalar(hours_str, input)?;
         hours
             .checked_mul(3600)
@@ -93,7 +98,7 @@ pub fn parse_duration(input: &str) -> Result<u64, LpmError> {
         .is_some_and(|c| c.is_ascii_alphabetic())
     {
         Err(LpmError::Registry(format!(
-            "release-age duration `{input}` has an unsupported unit (expected `h`, `d`, or plain seconds)"
+            "release-age duration `{input}` has an unsupported unit (expected `m`, `h`, `d`, or plain seconds)"
         )))
     } else {
         parse_scalar(input, input)
@@ -103,7 +108,7 @@ pub fn parse_duration(input: &str) -> Result<u64, LpmError> {
 fn parse_scalar(scalar: &str, original: &str) -> Result<u64, LpmError> {
     if scalar.is_empty() {
         return Err(LpmError::Registry(format!(
-            "release-age duration `{original}` has no numeric value (expected `<N>h`, `<N>d`, or `<N>` seconds)"
+            "release-age duration `{original}` has no numeric value (expected `<N>m`, `<N>h`, `<N>d`, or `<N>` seconds)"
         )));
     }
     if scalar.starts_with('-') {
@@ -170,16 +175,88 @@ impl ReleaseAgeResolver {
     /// and is unreadable / malformed / has a garbage
     /// `minimum-release-age-secs` value. A missing global file is fine
     /// (falls through to default).
-    pub fn resolve(project_dir: &Path, cli_override: Option<u64>) -> Result<u64, LpmError> {
+    pub fn resolve(
+        project_dir: &Path,
+        cli_override: Option<u64>,
+        json_output: bool,
+    ) -> Result<u64, LpmError> {
+        let global = crate::commands::config::GlobalConfig::load();
+        let authorized = crate::security_approval::load_effective_authorized_posture()?.posture;
+        let authorized_floor = authorized.minimum_release_age_secs();
+        let force_security_floor = crate::security_floor::force_security_floor_enabled(&global);
+        let floor = crate::security_floor::current_release_age_floor_secs(&global);
+
         if let Some(secs) = cli_override {
+            if secs < authorized_floor {
+                crate::security_approval::ensure_project_unlock(
+                    crate::security_approval::ApprovalScope::CooldownBypass,
+                    project_dir,
+                    json_output,
+                    crate::security_approval::ApprovalSource::CliFlag,
+                    &format!(
+                        "This install request lowers minimum release age to {secs}s for this project."
+                    ),
+                    Some(secs),
+                    &[],
+                )?;
+                return Ok(secs);
+            }
+            if force_security_floor && secs < floor {
+                crate::security_floor::record_suppression(
+                    crate::security_floor::SuppressionRecord::new(
+                        crate::security_floor::GuardedControl::CooldownWindow,
+                        crate::security_floor::SuppressionSource::Cli,
+                        secs.to_string(),
+                        floor.to_string(),
+                    ),
+                    json_output,
+                );
+                return Ok(floor);
+            }
             return Ok(secs);
         }
         if let Some(secs) = read_package_json_min_age(&project_dir.join("package.json")) {
+            if secs < authorized_floor {
+                crate::security_approval::ensure_project_unlock(
+                    crate::security_approval::ApprovalScope::CooldownBypass,
+                    project_dir,
+                    json_output,
+                    crate::security_approval::ApprovalSource::ProjectConfig,
+                    "package.json requests a lower minimum release age than this machine has approved.",
+                    Some(secs),
+                    &[],
+                )?;
+                return Ok(secs);
+            }
+            if force_security_floor && secs < floor {
+                crate::security_floor::record_suppression(
+                    crate::security_floor::SuppressionRecord::new(
+                        crate::security_floor::GuardedControl::CooldownWindow,
+                        crate::security_floor::SuppressionSource::Project,
+                        secs.to_string(),
+                        floor.to_string(),
+                    ),
+                    json_output,
+                );
+                return Ok(floor);
+            }
             return Ok(secs);
         }
         if let Some(path) = global_config_path()
             && let Some(secs) = read_global_min_age_from_file(&path)?
         {
+            if secs < authorized_floor {
+                return Err(crate::security_approval::approval_required_error(
+                    "the persisted global minimum-release-age-secs value is weaker than this machine has approved",
+                    vec![
+                        crate::security_approval::ApprovalScope::CooldownBypass
+                            .as_str()
+                            .to_string(),
+                    ],
+                    None,
+                    Some(format!("lpm config set {GLOBAL_KEY} {secs}")),
+                ));
+            }
             return Ok(secs);
         }
         Ok(DEFAULT_MIN_RELEASE_AGE_SECS)
@@ -279,6 +356,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_minutes_suffix() {
+        assert_eq!(parse_duration("10m").unwrap(), 600);
+    }
+
+    #[test]
+    fn parse_zero_minutes() {
+        assert_eq!(parse_duration("0m").unwrap(), 0);
+    }
+
+    #[test]
     fn parse_days_suffix() {
         assert_eq!(parse_duration("3d").unwrap(), 3 * 86400);
     }
@@ -332,12 +419,6 @@ mod tests {
     fn reject_lone_days_suffix() {
         let err = parse_duration("d").unwrap_err().to_string();
         assert!(err.contains("no numeric value"), "got: {err}");
-    }
-
-    #[test]
-    fn reject_minutes_suffix() {
-        let err = parse_duration("72m").unwrap_err().to_string();
-        assert!(err.contains("unsupported unit"), "got: {err}");
     }
 
     #[test]
@@ -563,7 +644,15 @@ mod tests {
     /// in [`crate::save_config`].
     fn scoped_home_dir() -> ScopedHomeDir {
         let dir = tempfile::tempdir().unwrap();
-        let env = crate::test_env::ScopedEnv::set([("HOME", dir.path().as_os_str().to_owned())]);
+        let env = crate::test_env::ScopedEnv::set([
+            ("HOME", dir.path().as_os_str().to_owned()),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                std::ffi::OsString::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            ),
+        ]);
         ScopedHomeDir { dir, _env: env }
     }
 
@@ -592,14 +681,23 @@ mod tests {
         write_file(&home.join(".lpm").join("config.toml"), contents);
     }
 
+    fn write_authorized_min_age(secs: u64) {
+        let posture = crate::security_approval::AuthorizedPosture {
+            minimum_release_age_secs: secs,
+            ..crate::security_approval::AuthorizedPosture::default()
+        };
+        crate::security_approval::persist_authorized_posture(&posture).unwrap();
+    }
+
     #[test]
     fn resolve_cli_override_wins_over_everything() {
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
+        write_authorized_min_age(0);
         write_package_json_with_min_age(project.path(), Some(1000));
         write_global_config(home.path(), "minimum-release-age-secs = 2000\n");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), Some(500)).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), Some(500), true).unwrap();
         assert_eq!(result, 500, "CLI override must beat package.json + global");
     }
 
@@ -609,10 +707,11 @@ mod tests {
         // even when package.json / global set a non-zero value.
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
+        write_authorized_min_age(0);
         write_package_json_with_min_age(project.path(), Some(1000));
         write_global_config(home.path(), "minimum-release-age-secs = 2000\n");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), Some(0)).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), Some(0), true).unwrap();
         assert_eq!(result, 0, "CLI --min-release-age=0 must force zero");
     }
 
@@ -620,10 +719,11 @@ mod tests {
     fn resolve_package_json_beats_global() {
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
+        write_authorized_min_age(0);
         write_package_json_with_min_age(project.path(), Some(1000));
         write_global_config(home.path(), "minimum-release-age-secs = 2000\n");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, 1000, "package.json must beat global config");
     }
 
@@ -631,10 +731,11 @@ mod tests {
     fn resolve_global_beats_default_when_package_json_silent() {
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
+        write_authorized_min_age(0);
         write_package_json_with_min_age(project.path(), None);
         write_global_config(home.path(), "minimum-release-age-secs = 2000\n");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, 2000, "global config must override 24h default");
     }
 
@@ -644,7 +745,7 @@ mod tests {
         let _home = scoped_home_dir();
         write_package_json_with_min_age(project.path(), None);
 
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, DEFAULT_MIN_RELEASE_AGE_SECS);
     }
 
@@ -653,7 +754,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let _home = scoped_home_dir();
         // No package.json written.
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, DEFAULT_MIN_RELEASE_AGE_SECS);
     }
 
@@ -663,7 +764,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let _home = scoped_home_dir();
         write_file(&project.path().join("package.json"), "{ not json ===");
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, DEFAULT_MIN_RELEASE_AGE_SECS);
     }
 
@@ -674,7 +775,7 @@ mod tests {
         write_package_json_with_min_age(project.path(), None);
         write_global_config(home.path(), r#"minimum-release-age-secs = "garbage""#);
 
-        let err = ReleaseAgeResolver::resolve(project.path(), None)
+        let err = ReleaseAgeResolver::resolve(project.path(), None, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("config.toml"), "must name global file: {err}");
@@ -691,10 +792,11 @@ mod tests {
         // flag short-circuits the chain.
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
+        write_authorized_min_age(0);
         write_package_json_with_min_age(project.path(), None);
         write_global_config(home.path(), "not valid toml === [[[");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), Some(0)).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), Some(0), true).unwrap();
         assert_eq!(result, 0);
     }
 
@@ -704,11 +806,60 @@ mod tests {
         // in package.json short-circuits the global layer.
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
+        write_authorized_min_age(0);
         write_package_json_with_min_age(project.path(), Some(500));
         write_global_config(home.path(), "not valid toml === [[[");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), None).unwrap();
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, 500);
+    }
+
+    #[test]
+    fn resolve_force_floor_suppresses_lower_cli_override() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_authorized_min_age(0);
+        write_package_json_with_min_age(project.path(), Some(1000));
+        write_global_config(
+            home.path(),
+            "force-security-floor = true\nminimum-release-age-secs = \"259200\"\n",
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+
+        let result = ReleaseAgeResolver::resolve(project.path(), Some(0), true).unwrap();
+
+        assert_eq!(result, 259200);
+        let suppressions = crate::security_floor::recorded_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(
+            suppressions[0].control,
+            crate::security_floor::GuardedControl::CooldownWindow
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+    }
+
+    #[test]
+    fn resolve_force_floor_suppresses_lower_project_value() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_authorized_min_age(0);
+        write_package_json_with_min_age(project.path(), Some(1000));
+        write_global_config(
+            home.path(),
+            "force-security-floor = true\nminimum-release-age-secs = \"259200\"\n",
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
+
+        assert_eq!(result, 259200);
+        let suppressions = crate::security_floor::recorded_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(
+            suppressions[0].source,
+            crate::security_floor::SuppressionSource::Project
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
     }
 
     // ── GlobalConfig::get_u64 (spot-check in this module) ────────

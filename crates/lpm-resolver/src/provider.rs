@@ -211,6 +211,11 @@ pub struct PlatformMeta {
     pub os: Vec<String>,
     /// CPU restrictions: e.g., ["x64", "arm64"] or ["!ia32"].
     pub cpu: Vec<String>,
+    /// Linux libc restrictions: e.g., ["musl"], ["glibc"], or ["!glibc"].
+    /// Same inclusion / exclusion semantics as `os` / `cpu`, per the npm
+    /// spec at <https://docs.npmjs.com/cli/v9/configuring-npm/package-json#libc>.
+    /// Empty when the manifest declares no libc restriction.
+    pub libc: Vec<String>,
 }
 
 /// The DependencyProvider that bridges PubGrub with LPM's registry.
@@ -937,12 +942,13 @@ pub(crate) fn parse_metadata_to_cache_info(
                 }
             }
 
-            if !ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() {
+            if !ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() || !ver_meta.libc.is_empty() {
                 platform.insert(
                     ver_str.clone(),
                     PlatformMeta {
                         os: ver_meta.os.clone(),
                         cpu: ver_meta.cpu.clone(),
+                        libc: ver_meta.libc.clone(),
                     },
                 );
             }
@@ -1011,16 +1017,24 @@ fn is_valid_version_string(v: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
 }
 
-/// Compile-time platform detection for the current build target.
+/// Compile-time platform detection for the current build target, plus
+/// runtime libc probing.
 ///
-/// NOTE: Platform detection uses compile-time cfg!() macros.
-/// This resolves for the current build target only.
-/// To support cross-platform resolution (e.g., `lpm install --platform=linux-x64`),
-/// this would need to be changed to runtime detection with an overridable parameter.
-/// See: https://docs.npmjs.com/cli/v9/commands/npm-install#os
+/// `os` and `cpu` are resolved from `cfg!()` macros against the build
+/// target. `libc` is probed at runtime from the host filesystem (see
+/// [`lpm_common::platform::detect_libc`]) because the lpm binary's own
+/// libc doesn't have to match the host's libc — a glibc-built lpm on
+/// Alpine would mis-detect via `cfg!(target_env)` alone.
+///
+/// This represents the current host only. Cross-platform resolution would
+/// need a caller-supplied target tuple instead of this helper.
 pub(crate) struct Platform {
     pub os: &'static str,
     pub cpu: &'static str,
+    /// `Some("glibc")` / `Some("musl")` on Linux when the loader is
+    /// identifiable; `None` on every other platform and on Linux hosts
+    /// where neither loader can be probed.
+    pub libc: Option<&'static str>,
 }
 
 impl Platform {
@@ -1048,6 +1062,7 @@ impl Platform {
             } else {
                 "unknown"
             },
+            libc: lpm_common::platform::detect_libc(),
         }
     }
 }
@@ -1112,13 +1127,36 @@ fn check_platform_filter(entries: &[String], current: &str, field_name: &str) ->
 }
 
 /// Check if a package version is compatible with the current platform.
-/// Empty os/cpu means no restriction (compatible with all platforms).
+/// Empty os/cpu/libc means no restriction (compatible with all platforms).
 /// Entries starting with `!` are exclusions (e.g., `!win32` = all except win32).
 pub(crate) fn is_platform_compatible(meta: &PlatformMeta) -> bool {
-    let platform = Platform::current();
+    is_platform_compatible_for(meta, &Platform::current())
+}
+
+/// Testable inner gate: the same predicate against an explicit [`Platform`]
+/// rather than the host. Production code calls [`is_platform_compatible`]
+/// which fixes the platform to `Platform::current()`.
+///
+/// libc semantics, when `meta.libc` is non-empty:
+/// - `host_libc == Some(x)` → run `check_platform_filter` normally.
+/// - `host_libc == None` → fail closed. The package declared a libc
+///   requirement and the host couldn't be probed (non-Linux, or a
+///   minimal Linux image with neither `ld-musl-*` nor `libc.so.6`
+///   exposed). Materializing a libc-tagged binary in that state risks
+///   a load-time interpreter mismatch, so the safer choice is to drop
+///   the version and surface a `platform_skipped` count.
+fn is_platform_compatible_for(meta: &PlatformMeta, platform: &Platform) -> bool {
     let os_ok = check_platform_filter(&meta.os, platform.os, "os");
     let cpu_ok = check_platform_filter(&meta.cpu, platform.cpu, "cpu");
-    os_ok && cpu_ok
+    let libc_ok = if meta.libc.is_empty() {
+        true
+    } else {
+        match platform.libc {
+            Some(host_libc) => check_platform_filter(&meta.libc, host_libc, "libc"),
+            None => false,
+        }
+    };
+    os_ok && cpu_ok && libc_ok
 }
 
 impl DependencyProvider for LpmDependencyProvider {
@@ -1595,13 +1633,15 @@ impl DependencyProvider for LpmDependencyProvider {
             if is_optional {
                 let any_satisfies = available.iter().any(|v| npm_range.satisfies(v));
                 if !any_satisfies {
+                    let host = Platform::current();
                     tracing::debug!(
                         "skipping optional dep {dep_name}@{dep_range_str}: \
                          no platform-compatible version satisfies range \
-                         (available={}, os={}, cpu={})",
+                         (available={}, os={}, cpu={}, libc={})",
                         available.len(),
-                        Platform::current().os,
-                        Platform::current().cpu,
+                        host.os,
+                        host.cpu,
+                        host.libc.unwrap_or("none"),
                     );
                     *self.platform_skipped.borrow_mut() += 1;
                     continue;
@@ -1819,8 +1859,200 @@ mod tests {
         let meta = PlatformMeta {
             os: vec![],
             cpu: vec![],
+            libc: vec![],
         };
         assert!(is_platform_compatible(&meta));
+    }
+
+    // === libc filter (npm package.json field) ===
+    //
+    // The bug these tests pin: before libc plumbing, the resolver picked
+    // glibc-built optional native binaries on Alpine because the os+cpu
+    // filter alone matched ("linux" + "x64") on both flavors. The store
+    // layer keyed by `(os, cpu, libc)` correctly, so what landed in the
+    // store was musl-built while what got linked was glibc-built — a
+    // load-time `Error: not a valid ELF interpreter` on first import.
+    //
+    // The npm spec (<https://docs.npmjs.com/cli/v9/configuring-npm/package-json#libc>)
+    // treats `libc` identically to `os`/`cpu`: inclusion list, `!`-prefix
+    // exclusion, mixed entries enter exclusion mode.
+
+    /// Bug-first test: a package that ships separate musl and glibc
+    /// versions on linux-x64 must select the version matching the
+    /// host's libc. With libc unplumbed both versions look identical
+    /// at the os+cpu filter and the resolver picks the newest, which
+    /// silently mismatches the host on Alpine.
+    #[test]
+    fn libc_filter_routes_musl_host_to_musl_only_version() {
+        let musl_only = PlatformMeta {
+            os: vec!["linux".to_string()],
+            cpu: vec!["x64".to_string()],
+            libc: vec!["musl".to_string()],
+        };
+        let glibc_only = PlatformMeta {
+            os: vec!["linux".to_string()],
+            cpu: vec!["x64".to_string()],
+            libc: vec!["glibc".to_string()],
+        };
+
+        let musl_host = Platform {
+            os: "linux",
+            cpu: "x64",
+            libc: Some("musl"),
+        };
+        let glibc_host = Platform {
+            os: "linux",
+            cpu: "x64",
+            libc: Some("glibc"),
+        };
+
+        assert!(
+            is_platform_compatible_for(&musl_only, &musl_host),
+            "musl-only package must install on musl host"
+        );
+        assert!(
+            !is_platform_compatible_for(&musl_only, &glibc_host),
+            "musl-only package must NOT install on glibc host"
+        );
+        assert!(
+            !is_platform_compatible_for(&glibc_only, &musl_host),
+            "glibc-only package must NOT install on musl host"
+        );
+        assert!(
+            is_platform_compatible_for(&glibc_only, &glibc_host),
+            "glibc-only package must install on glibc host"
+        );
+    }
+
+    /// Inclusion form: `libc: ["musl"]` is satisfied only by `musl`.
+    #[test]
+    fn libc_filter_inclusion_only() {
+        let entries = vec!["musl".to_string()];
+        assert!(check_platform_filter(&entries, "musl", "libc"));
+        assert!(!check_platform_filter(&entries, "glibc", "libc"));
+    }
+
+    /// Exclusion form: `libc: ["!glibc"]` matches every libc except glibc.
+    #[test]
+    fn libc_filter_exclusion_only() {
+        let entries = vec!["!glibc".to_string()];
+        assert!(check_platform_filter(&entries, "musl", "libc"));
+        assert!(!check_platform_filter(&entries, "glibc", "libc"));
+    }
+
+    /// Mixed inclusion + exclusion enters exclusion mode (same as os/cpu).
+    /// `["musl", "!glibc"]` → only `!glibc` is honored.
+    #[test]
+    fn libc_filter_mixed_uses_exclusion_mode() {
+        let entries = vec!["musl".to_string(), "!glibc".to_string()];
+        assert!(check_platform_filter(&entries, "musl", "libc"));
+        assert!(!check_platform_filter(&entries, "glibc", "libc"));
+        assert!(
+            check_platform_filter(&entries, "bionic", "libc"),
+            "exclusion mode: any libc other than glibc passes — positive `musl` entry ignored"
+        );
+    }
+
+    /// Empty `meta.libc` always passes regardless of host libc value —
+    /// no restriction declared means no restriction enforced.
+    #[test]
+    fn libc_filter_unspecified_passes_on_every_host() {
+        let meta = PlatformMeta {
+            os: vec![],
+            cpu: vec![],
+            libc: vec![],
+        };
+        for host_libc in [None, Some("musl"), Some("glibc"), Some("uclibc")] {
+            let platform = Platform {
+                os: "linux",
+                cpu: "x64",
+                libc: host_libc,
+            };
+            assert!(
+                is_platform_compatible_for(&meta, &platform),
+                "empty meta.libc must pass on host libc {host_libc:?}"
+            );
+        }
+    }
+
+    /// Mixed os + cpu + libc filters all compose: every axis must accept
+    /// the host for the package to be compatible.
+    #[test]
+    fn libc_filter_composes_with_os_and_cpu() {
+        let meta = PlatformMeta {
+            os: vec!["linux".to_string()],
+            cpu: vec!["x64".to_string()],
+            libc: vec!["musl".to_string()],
+        };
+        let matching = Platform {
+            os: "linux",
+            cpu: "x64",
+            libc: Some("musl"),
+        };
+        let wrong_cpu = Platform {
+            os: "linux",
+            cpu: "arm64",
+            libc: Some("musl"),
+        };
+        let wrong_os = Platform {
+            os: "darwin",
+            cpu: "x64",
+            libc: Some("musl"),
+        };
+        assert!(is_platform_compatible_for(&meta, &matching));
+        assert!(!is_platform_compatible_for(&meta, &wrong_cpu));
+        assert!(!is_platform_compatible_for(&meta, &wrong_os));
+    }
+
+    /// Host libc unknown × package libc declared: refuse the package.
+    /// The package opted into a libc-dependent build; we can't verify
+    /// the host satisfies it, so failing closed avoids materializing
+    /// a binary that may not load. Matches pnpm's package-is-installable
+    /// behavior. If `meta.libc` is non-empty the package is at minimum
+    /// linux-only, and the os filter independently rejects it on
+    /// non-linux hosts — this rule only kicks in on linux hosts where
+    /// libc probing failed (e.g., distroless without `ld-musl-*` or
+    /// `libc.so.6` symlinks and a cross-compiled lpm binary).
+    #[test]
+    fn libc_filter_unknown_host_rejects_libc_declared_package() {
+        let meta = PlatformMeta {
+            os: vec![],
+            cpu: vec![],
+            libc: vec!["musl".to_string()],
+        };
+        let unknown = Platform {
+            os: "linux",
+            cpu: "x64",
+            libc: None,
+        };
+        assert!(
+            !is_platform_compatible_for(&meta, &unknown),
+            "package declares libc requirement but host libc is unknown — must fail closed"
+        );
+    }
+
+    /// Symmetric to the prior test for the exclusion form: even an
+    /// exclusion list against a None host fails closed, because we
+    /// can't tell whether the unknown libc is or is not the excluded
+    /// flavor. This is stricter than `check_platform_filter`'s pure
+    /// string semantics would yield, and is the policy decision the
+    /// libc plumb-in makes explicit.
+    #[test]
+    fn libc_filter_unknown_host_rejects_libc_exclusion_too() {
+        let meta = PlatformMeta {
+            os: vec![],
+            cpu: vec![],
+            libc: vec!["!glibc".to_string()],
+        };
+        let unknown = Platform {
+            os: "linux",
+            cpu: "x64",
+            libc: None,
+        };
+        assert!(
+            !is_platform_compatible_for(&meta, &unknown),
+            "package declares libc exclusion but host libc is unknown — must fail closed"
+        );
     }
 
     // === Platform struct returns known values ===
@@ -1989,6 +2221,7 @@ mod tests {
                         PlatformMeta {
                             os: os.into_iter().map(|s| s.to_string()).collect(),
                             cpu: cpu.into_iter().map(|s| s.to_string()).collect(),
+                            libc: Vec::new(),
                         },
                     )
                 })

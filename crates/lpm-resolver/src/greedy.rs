@@ -2532,6 +2532,7 @@ mod tests {
                     "!android".to_string(),
                 ],
                 cpu: vec![],
+                libc: vec![],
             },
         );
         let range = NpmRange::parse("^1.0.0").unwrap();

@@ -3557,6 +3557,14 @@ async fn run_with_options_under_store_lock(
     audit_after_install: bool,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
+    crate::security_floor::clear_recorded_suppressions();
+    let global_config = crate::commands::config::GlobalConfig::load();
+    let force_security_floor = crate::security_floor::force_security_floor_enabled(&global_config);
+    let release_age_floor_secs =
+        crate::security_floor::current_release_age_floor_secs(&global_config);
+    let mut allow_new = allow_new;
+    let mut drift_ignore_policy = drift_ignore_policy;
+    let mut verify_policy = verify_policy;
 
     // Step 1: Read package.json
     let pkg_json_path = project_dir.join("package.json");
@@ -3571,6 +3579,12 @@ async fn run_with_options_under_store_lock(
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
+    crate::security_approval::ensure_project_policy_authorized(
+        project_dir,
+        json_output,
+        crate::security_approval::ApprovalSource::ProjectConfig,
+    )?;
+
     //  Hoisted
     // here (above the empty-deps short-circuit, the lockfile fast
     // path, and the freshness check) so the v1-lockfile gate AND
@@ -3584,7 +3598,7 @@ async fn run_with_options_under_store_lock(
         .lpm
         .as_ref()
         .and_then(|l| l.auto_install_peers)
-        .or_else(|| crate::commands::config::GlobalConfig::load().get_bool("auto-install-peers"))
+        .or_else(|| global_config.get_bool("auto-install-peers"))
         .unwrap_or(true);
     let pubgrub_opt_out = std::env::var("LPM_RESOLVER").as_deref() == Ok("pubgrub");
 
@@ -3693,6 +3707,7 @@ async fn run_with_options_under_store_lock(
                     targets.iter().map(|s| serde_json::json!(s)).collect(),
                 );
             }
+            crate::security_floor::attach_security_posture(&mut json, force_security_floor);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
             install_ui::done(&format!("Up to date · {total_ms}ms"));
@@ -4094,6 +4109,7 @@ async fn run_with_options_under_store_lock(
                     targets.iter().map(|s| serde_json::json!(s)).collect(),
                 );
             }
+            crate::security_floor::attach_security_posture(&mut json, force_security_floor);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
             output::success("No dependencies to install");
@@ -5569,9 +5585,166 @@ async fn run_with_options_under_store_lock(
     // install-level cooldown halt via `--allow-new`. The two axes
     // (cooldown halt + Lever #4 widening) need the same threshold
     // input.
+    let authorized_release_age_floor =
+        crate::security_approval::load_effective_authorized_posture()?
+            .posture
+            .minimum_release_age_secs();
+    let allow_new_unlock_authorized = if allow_new && authorized_release_age_floor > 0 {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::CooldownBypass,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            "This install bypasses the minimum release age for this project.",
+            Some(0),
+            &[],
+        )?;
+        true
+    } else {
+        false
+    };
+    if force_security_floor
+        && allow_new
+        && release_age_floor_secs > 0
+        && !allow_new_unlock_authorized
+    {
+        crate::security_floor::record_suppression(
+            crate::security_floor::SuppressionRecord::new(
+                crate::security_floor::GuardedControl::CooldownBypass,
+                crate::security_floor::SuppressionSource::Cli,
+                "allow-new",
+                format!("minimum-release-age-secs={release_age_floor_secs}"),
+            ),
+            json_output,
+        );
+        allow_new = false;
+    }
+    let drift_ignore_packages: Vec<String> = match &drift_ignore_policy {
+        crate::provenance_fetch::DriftIgnorePolicy::IgnoreNames(names) => {
+            let mut values: Vec<_> = names.iter().cloned().collect();
+            values.sort();
+            values
+        }
+        _ => Vec::new(),
+    };
+    let drift_ignore_unlock_authorized = if !matches!(
+        drift_ignore_policy,
+        crate::provenance_fetch::DriftIgnorePolicy::EnforceAll
+    ) {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::ProvenanceIgnoreDrift,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            "This install waives provenance drift checks for this project.",
+            None,
+            &drift_ignore_packages,
+        )?;
+        true
+    } else {
+        false
+    };
+    if force_security_floor
+        && !matches!(
+            drift_ignore_policy,
+            crate::provenance_fetch::DriftIgnorePolicy::EnforceAll
+        )
+        && !drift_ignore_unlock_authorized
+    {
+        let requested = match &drift_ignore_policy {
+            crate::provenance_fetch::DriftIgnorePolicy::EnforceAll => "enforce-all".to_string(),
+            crate::provenance_fetch::DriftIgnorePolicy::IgnoreAll => "ignore-all".to_string(),
+            crate::provenance_fetch::DriftIgnorePolicy::IgnoreNames(names) => {
+                let mut values: Vec<_> = names.iter().cloned().collect();
+                values.sort();
+                values.join(",")
+            }
+        };
+        crate::security_floor::record_suppression(
+            crate::security_floor::SuppressionRecord::new(
+                crate::security_floor::GuardedControl::ProvenanceDriftWaiver,
+                crate::security_floor::SuppressionSource::Cli,
+                requested,
+                "enforce-all",
+            ),
+            json_output,
+        );
+        drift_ignore_policy = crate::provenance_fetch::DriftIgnorePolicy::EnforceAll;
+    }
+    let (_resolved_runtime_sigstore, runtime_sigstore_source) =
+        crate::provenance_fetch::EnforceMode::resolve_from_chain(
+            std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref(),
+            || global_config.get_sigstore_verify(),
+        );
+    crate::security_approval::ensure_runtime_sigstore_posture(
+        project_dir,
+        json_output,
+        verify_policy.enforce,
+        runtime_sigstore_source,
+    )?;
+    let unverified_provenance_packages: Vec<String> = match &verify_policy.skip {
+        crate::provenance_fetch::SkipPolicy::Names(names) => {
+            let mut values: Vec<_> = names.iter().cloned().collect();
+            values.sort();
+            values
+        }
+        _ => Vec::new(),
+    };
+    let unverified_provenance_unlock_authorized = if !matches!(
+        verify_policy.skip,
+        crate::provenance_fetch::SkipPolicy::None
+    ) && !matches!(
+        verify_policy.enforce,
+        crate::provenance_fetch::EnforceMode::Off
+    ) {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::ProvenanceUnverified,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            "This install skips Sigstore verification for one or more packages in this project.",
+            None,
+            &unverified_provenance_packages,
+        )?;
+        true
+    } else {
+        false
+    };
+    if force_security_floor
+        && !matches!(
+            verify_policy.skip,
+            crate::provenance_fetch::SkipPolicy::None
+        )
+        && !matches!(
+            verify_policy.enforce,
+            crate::provenance_fetch::EnforceMode::Off
+        )
+        && !unverified_provenance_unlock_authorized
+    {
+        let requested = match &verify_policy.skip {
+            crate::provenance_fetch::SkipPolicy::None => "none".to_string(),
+            crate::provenance_fetch::SkipPolicy::All => "all".to_string(),
+            crate::provenance_fetch::SkipPolicy::Names(names) => {
+                let mut values: Vec<_> = names.iter().cloned().collect();
+                values.sort();
+                values.join(",")
+            }
+        };
+        crate::security_floor::record_suppression(
+            crate::security_floor::SuppressionRecord::new(
+                crate::security_floor::GuardedControl::UnverifiedProvenance,
+                crate::security_floor::SuppressionSource::Cli,
+                requested,
+                "none",
+            ),
+            json_output,
+        );
+        verify_policy.skip = crate::provenance_fetch::SkipPolicy::None;
+    }
     let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
         project_dir,
         min_release_age_override,
+        json_output,
     )?;
     let cooldown_policy = lpm_security::SecurityPolicy::with_resolved_min_age(
         &project_dir.join("package.json"),
@@ -6815,8 +6988,7 @@ async fn run_with_options_under_store_lock(
     let install_requested_capabilities =
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    let install_user_bound =
-        crate::capability::UserBound::from_global_config(&install_capability_cfg);
+    let install_user_bound = crate::security_approval::authorized_capability_user_bound();
 
     // **Resolve script-policy + preflight advisor BEFORE the blocked-set capture.**
     //
@@ -6836,10 +7008,12 @@ async fn run_with_options_under_store_lock(
     let step10_script_policy_cfg =
         crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
     let config_auto_build = step10_script_policy_cfg.auto_build;
-    let step10_effective_policy = crate::script_policy_config::resolve_script_policy(
+    let step10_effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
+        project_dir,
         script_policy_override,
         &step10_script_policy_cfg,
-    );
+        json_output,
+    )?;
 
     //: include integrity so the auto-build predicate's
     // strict gate matches what `rebuild::run` will do. Same data
@@ -7019,10 +7193,13 @@ async fn run_with_options_under_store_lock(
         } else {
             let script_policy_cfg =
                 crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
-            let effective_policy = crate::script_policy_config::resolve_script_policy(
-                script_policy_override,
-                &script_policy_cfg,
-            );
+            let effective_policy =
+                crate::script_policy_config::resolve_script_policy_with_security(
+                    project_dir,
+                    script_policy_override,
+                    &script_policy_cfg,
+                    json_output,
+                )?;
             if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
                 println!();
                 println!(
@@ -7935,6 +8112,7 @@ async fn run_with_options_under_store_lock(
         if let Some(counts) = &audit_summary_for_envelope {
             json["audit_summary"] = serde_json::to_value(counts).unwrap_or(serde_json::Value::Null);
         }
+        crate::security_floor::attach_security_posture(&mut json, force_security_floor);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         // print the override apply summary BEFORE
@@ -9551,6 +9729,10 @@ async fn run_link_and_finish(
     // is `triage`.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
 ) -> Result<(), LpmError> {
+    crate::security_floor::clear_recorded_suppressions();
+    let force_security_floor = crate::security_floor::force_security_floor_enabled(
+        &crate::commands::config::GlobalConfig::load(),
+    );
     let store = PackageStore::default_location()?;
     // confidence-followup S5b — same hoist as `run_with_options`;
     // post-install helpers route through `find_installed_package_baseline`.
@@ -9664,12 +9846,10 @@ async fn run_link_and_finish(
     // without this, the shared `run_link_and_finish` path would
     // silently omit capability-widened packages from build-state.json
     // and leave approve-scripts with nothing actionable.
-    let offline_capability_cfg = crate::commands::config::GlobalConfig::load();
     let offline_requested_capabilities =
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    let offline_user_bound =
-        crate::capability::UserBound::from_global_config(&offline_capability_cfg);
+    let offline_user_bound = crate::security_approval::authorized_capability_user_bound();
     // the fast-path / offline install does NOT
     // run the L4 advisor (scope was tightened to the online install
     // path). `None` passes through `compute_blocked_packages_with_metadata`
@@ -9715,10 +9895,13 @@ async fn run_link_and_finish(
         } else {
             let script_policy_cfg =
                 crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
-            let effective_policy = crate::script_policy_config::resolve_script_policy(
-                script_policy_override,
-                &script_policy_cfg,
-            );
+            let effective_policy =
+                crate::script_policy_config::resolve_script_policy_with_security(
+                    project_dir,
+                    script_policy_override,
+                    &script_policy_cfg,
+                    json_output,
+                )?;
             if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
                 println!();
                 println!(
@@ -9870,6 +10053,7 @@ async fn run_link_and_finish(
                 .map(|bp| crate::version_diff::blocked_to_json(bp, &trusted_for_json))
                 .collect(),
         );
+        crate::security_floor::attach_security_posture(&mut json, force_security_floor);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         // patch summary in human mode.
@@ -13121,6 +13305,7 @@ mod tests {
                     optional_dependencies: Default::default(),
                     os: vec![],
                     cpu: vec![],
+                    libc: vec![],
                     dist: None,
                     readme: None,
                     lpm_config: None,

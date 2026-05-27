@@ -19,6 +19,7 @@ const VERDACCIO_VERSION: &str = "6.5.2";
 const DEFAULT_USERNAME: &str = "lpm-workflows";
 const DEFAULT_PASSWORD: &str = "lpm-workflows-password";
 const DEFAULT_EMAIL: &str = "lpm-workflows@example.test";
+const WORKFLOW_PUBLISHED_AT: &str = "2024-01-01T00:00:00.000Z";
 
 #[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
@@ -222,6 +223,35 @@ impl VerdaccioRegistry {
         });
     }
 
+    fn rewrite_published_at(&self, name: &str, version: &str, published_at: &str) {
+        let metadata_path = self.package_storage_dir(name).join("package.json");
+        let mut value = self.read_package_metadata(name);
+        let time = value
+            .get_mut("time")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap_or_else(|| {
+                panic!(
+                    "verdaccio metadata missing time object for {name} at {}",
+                    metadata_path.display()
+                )
+            });
+        time.insert(
+            version.to_string(),
+            serde_json::Value::String(published_at.to_string()),
+        );
+
+        std::fs::write(
+            &metadata_path,
+            serde_json::to_vec_pretty(&value).expect("verdaccio metadata rewrite should serialize"),
+        )
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to write verdaccio metadata for {name}@{version} at {}: {err}",
+                metadata_path.display()
+            )
+        });
+    }
+
     pub fn publish_package_with_files(&self, name: &str, version: &str, files: &[(&str, &str)]) {
         let pkg_dir = TempDir::new().expect("failed to create verdaccio package temp dir");
         let pkg_json = serde_json::json!({
@@ -277,6 +307,7 @@ impl VerdaccioRegistry {
             String::from_utf8_lossy(&output.stderr),
             self.logs(),
         );
+        self.rewrite_published_at(name, version, WORKFLOW_PUBLISHED_AT);
     }
 
     async fn wait_until_ready(&mut self) {
