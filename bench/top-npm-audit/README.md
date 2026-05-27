@@ -1,7 +1,7 @@
 # top-npm-audit — long-tail npm package install audit
 
-Closes Phase 66 confidence-followup §1b. Generates a single-dep
-fixture per package in [`top-100.txt`](./top-100.txt), runs each
+Closes Phase 66 confidence-followup §1b. Generates a fixture
+per package in [`top-100.txt`](./top-100.txt), runs each
 under both isolated and hoisted modes, and reports any
 mode-asymmetric outcomes.
 
@@ -32,10 +32,12 @@ LPM_TOP_NPM_PARALLEL=8 ./bench/top-npm-audit/run-all.sh
 ## How it works
 
 1. **Generate** — `generate.sh` produces a `package.json` + `smoke.sh`
-   per package under `bench/audit-fixtures/top-npm/<safe-name>/`.
-   Each smoke tries `require('<pkg>')` first, then falls back to
-   `import('<pkg>')` only when the require failure looks genuinely
-   ESM-only.
+  per package under `bench/audit-fixtures/top-npm/<safe-name>/`.
+  Most fixtures keep the default root-load smoke (`require` first,
+  `import` fallback only for genuine ESM-only surfaces), but packages
+  with a different consumer contract get a matching fixture class:
+  CLI bin invocation, type-check smoke, runner smoke, or peer-aware
+  companion deps.
 2. **Run** — `run-all.sh` invokes the existing
    `bench/audit-fixtures/run-audit.sh` for each generated fixture in
    parallel, with per-slot `LPM_HOME` so concurrent installs don't
@@ -45,10 +47,10 @@ LPM_TOP_NPM_PARALLEL=8 ./bench/top-npm-audit/run-all.sh
 ## Result interpretation
 
 - **PASS/PASS** — done.
-- **FAIL/FAIL** — symmetric. Likely bin-only package with no
-  programmatic entry point, native/tooling issue, or a real upstream
-  load failure. Not a hoisted regression. Filter by triaging
-  `results/<name>-<mode>-*.json`.
+- **FAIL/FAIL** — symmetric. Not a hoisted regression. The category-aware
+  summary now tells you whether the residual is a non-runtime package,
+  entrypoint mismatch, fixture limitation, upstream interop failure, or
+  another typed bucket.
 - **PASS/FAIL or FAIL/PASS** — asymmetric. Real hoisted regression.
   Investigate immediately.
 
@@ -60,9 +62,9 @@ stats (npms.io / npm-stat). Skip:
 - Packages requiring native toolchain (better-sqlite3, sharp) — those
   belong in the curated audit-fixtures bucket with a `requirements.sh`.
 
-ESM-only packages are now first-class citizens in this audit tier;
-bin-only packages with no programmatic entry point may still fail
-symmetrically and require manual triage.
+ESM-only packages are first-class citizens in this audit tier, and the
+generator now supports a small number of explicit fixture classes for
+packages whose real consumer contract is not a blank-project root import.
 
 ## CI gating
 
