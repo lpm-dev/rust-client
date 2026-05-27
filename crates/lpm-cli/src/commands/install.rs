@@ -5579,8 +5579,10 @@ async fn run_with_options_under_store_lock(
     // install-level cooldown halt via `--allow-new`. The two axes
     // (cooldown halt + Lever #4 widening) need the same threshold
     // input.
-    let authorized_release_age_floor = crate::security_approval::load_authorized_posture()?
-        .minimum_release_age_secs();
+    let authorized_release_age_floor =
+        crate::security_approval::load_effective_authorized_posture()?
+            .posture
+            .minimum_release_age_secs();
     let allow_new_unlock_authorized = if allow_new && authorized_release_age_floor > 0 {
         crate::security_approval::ensure_project_unlock(
             crate::security_approval::ApprovalScope::CooldownBypass,
@@ -5594,7 +5596,10 @@ async fn run_with_options_under_store_lock(
     } else {
         false
     };
-    if force_security_floor && allow_new && release_age_floor_secs > 0 && !allow_new_unlock_authorized
+    if force_security_floor
+        && allow_new
+        && release_age_floor_secs > 0
+        && !allow_new_unlock_authorized
     {
         crate::security_floor::record_suppression(
             crate::security_floor::SuppressionRecord::new(
@@ -5634,8 +5639,14 @@ async fn run_with_options_under_store_lock(
         drift_ignore_policy = crate::provenance_fetch::DriftIgnorePolicy::EnforceAll;
     }
     if force_security_floor
-        && !matches!(verify_policy.skip, crate::provenance_fetch::SkipPolicy::None)
-        && !matches!(verify_policy.enforce, crate::provenance_fetch::EnforceMode::Off)
+        && !matches!(
+            verify_policy.skip,
+            crate::provenance_fetch::SkipPolicy::None
+        )
+        && !matches!(
+            verify_policy.enforce,
+            crate::provenance_fetch::EnforceMode::Off
+        )
     {
         let requested = match &verify_policy.skip {
             crate::provenance_fetch::SkipPolicy::None => "none".to_string(),
@@ -6925,13 +6936,12 @@ async fn run_with_options_under_store_lock(
     let step10_script_policy_cfg =
         crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
     let config_auto_build = step10_script_policy_cfg.auto_build;
-    let step10_effective_policy =
-        crate::script_policy_config::resolve_script_policy_with_security(
-            project_dir,
-            script_policy_override,
-            &step10_script_policy_cfg,
-            json_output,
-        )?;
+    let step10_effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
+        project_dir,
+        script_policy_override,
+        &step10_script_policy_cfg,
+        json_output,
+    )?;
 
     //: include integrity so the auto-build predicate's
     // strict gate matches what `rebuild::run` will do. Same data

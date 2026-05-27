@@ -176,7 +176,7 @@ impl ReleaseAgeResolver {
         json_output: bool,
     ) -> Result<u64, LpmError> {
         let global = crate::commands::config::GlobalConfig::load();
-        let authorized = crate::security_approval::load_authorized_posture()?;
+        let authorized = crate::security_approval::load_effective_authorized_posture()?.posture;
         let authorized_floor = authorized.minimum_release_age_secs();
         let force_security_floor = crate::security_floor::force_security_floor_enabled(&global);
         let floor = crate::security_floor::current_release_age_floor_secs(&global);

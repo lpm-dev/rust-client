@@ -124,7 +124,7 @@ pub fn resolve_sandbox_mode_from_chain(
         Some(ref p) => read_sandbox_keys_from_file(p)?,
         None => RawSandboxKeys::default(),
     };
-    let authorized = crate::security_approval::load_authorized_posture()?;
+    let authorized = crate::security_approval::load_effective_authorized_posture()?.posture;
     let authorized_mode = authorized.sandbox_mode();
     let authorized_mode_key = match authorized_mode {
         ResolvedSandboxMode::Default => SandboxModeKey::Default,
@@ -133,34 +133,36 @@ pub fn resolve_sandbox_mode_from_chain(
     };
     let authorized_allow_degraded = authorized.sandbox_allow_degraded();
 
-    let cli_unlock_authorized = if no_sandbox_flag && !matches!(authorized_mode, ResolvedSandboxMode::None) {
-        crate::security_approval::ensure_project_unlock(
-            crate::security_approval::ApprovalScope::SandboxNone,
-            project_dir,
-            json_output,
-            crate::security_approval::ApprovalSource::CliFlag,
-            "This install request disables the sandbox for this project.",
-            None,
-        )?;
-        true
-    } else {
-        false
-    };
-
-    let project_mode_unlock_authorized =
-        if let Some(mode) = project.mode && mode.loosens(authorized_mode_key) {
+    let cli_unlock_authorized =
+        if no_sandbox_flag && !matches!(authorized_mode, ResolvedSandboxMode::None) {
             crate::security_approval::ensure_project_unlock(
                 crate::security_approval::ApprovalScope::SandboxNone,
                 project_dir,
                 json_output,
-                crate::security_approval::ApprovalSource::ProjectConfig,
-                "lpm.toml requests a weaker sandbox mode than this machine has approved.",
+                crate::security_approval::ApprovalSource::CliFlag,
+                "This install request disables the sandbox for this project.",
                 None,
             )?;
             true
         } else {
             false
         };
+
+    let project_mode_unlock_authorized = if let Some(mode) = project.mode
+        && mode.loosens(authorized_mode_key)
+    {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::SandboxNone,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::ProjectConfig,
+            "lpm.toml requests a weaker sandbox mode than this machine has approved.",
+            None,
+        )?;
+        true
+    } else {
+        false
+    };
 
     if let Some(mode) = global.mode
         && mode.loosens(authorized_mode_key)
@@ -193,18 +195,18 @@ pub fn resolve_sandbox_mode_from_chain(
     }
     let project_allow_degraded_unlock_authorized =
         if project.allow_degraded == Some(true) && !authorized_allow_degraded {
-        crate::security_approval::ensure_project_unlock(
-            crate::security_approval::ApprovalScope::SandboxAllowDegraded,
-            project_dir,
-            json_output,
-            crate::security_approval::ApprovalSource::ProjectConfig,
-            "lpm.toml enables sandbox.allow-degraded beyond this machine's approved posture.",
-            None,
-        )?;
-        true
-    } else {
-        false
-    };
+            crate::security_approval::ensure_project_unlock(
+                crate::security_approval::ApprovalScope::SandboxAllowDegraded,
+                project_dir,
+                json_output,
+                crate::security_approval::ApprovalSource::ProjectConfig,
+                "lpm.toml enables sandbox.allow-degraded beyond this machine's approved posture.",
+                None,
+            )?;
+            true
+        } else {
+            false
+        };
 
     let force_security_floor = crate::security_floor::force_security_floor_enabled(
         &crate::commands::config::GlobalConfig::load(),
