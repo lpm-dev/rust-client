@@ -7,11 +7,11 @@
 //! decides whether a weaker proposal is already authorized, needs an
 //! interactive approval, or must fail closed for automation.
 
+use crate::precedence::PurePolicyKnob;
 use crate::provenance_fetch::EnforceMode;
 use crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS;
 use crate::sandbox_config::ResolvedSandboxMode;
 use crate::script_policy_config::ScriptPolicy;
-use crate::precedence::PurePolicyKnob;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use lpm_common::LpmError;
@@ -30,7 +30,9 @@ pub const MAX_UNLOCK_TTL_SECS: u64 = 30 * 60;
 const KEYRING_SERVICE: &str = "dev.lpm.security-approval";
 const KEYRING_ACCOUNT: &str = "signing-secret-v1";
 const SECURITY_DIR_ENV: &str = "LPM_SECURITY_DIR";
+const SECURITY_POLICY_PATH_ENV: &str = "LPM_SECURITY_POLICY_PATH";
 const TEST_SECRET_ENV: &str = "LPM_TEST_SECURITY_SECRET_HEX";
+const DEFAULT_SECURITY_POLICY_PATH: &str = "/etc/lpm/security-policy.toml";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -91,6 +93,15 @@ pub struct AuthorizedPosture {
     pub sigstore_verify: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AuthorizedPostureView {
+    pub script_policy: String,
+    pub minimum_release_age_secs: u64,
+    pub sandbox_mode: String,
+    pub sandbox_allow_degraded: bool,
+    pub sigstore_verify: String,
+}
+
 impl Default for AuthorizedPosture {
     fn default() -> Self {
         Self {
@@ -130,6 +141,90 @@ impl AuthorizedPosture {
             _ => EnforceMode::Deny,
         }
     }
+
+    pub fn to_view(&self) -> AuthorizedPostureView {
+        AuthorizedPostureView {
+            script_policy: self.script_policy.clone(),
+            minimum_release_age_secs: self.minimum_release_age_secs,
+            sandbox_mode: self.sandbox_mode.clone(),
+            sandbox_allow_degraded: self.sandbox_allow_degraded,
+            sigstore_verify: self.sigstore_verify.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PostureSourceKind {
+    BuiltinDefault,
+    ApprovedStore,
+    ManagedPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EffectivePostureSources {
+    pub script_policy: PostureSourceKind,
+    pub minimum_release_age_secs: PostureSourceKind,
+    pub sandbox_mode: PostureSourceKind,
+    pub sandbox_allow_degraded: PostureSourceKind,
+    pub sigstore_verify: PostureSourceKind,
+}
+
+impl EffectivePostureSources {
+    fn new(base: PostureSourceKind) -> Self {
+        Self {
+            script_policy: base,
+            minimum_release_age_secs: base,
+            sandbox_mode: base,
+            sandbox_allow_degraded: base,
+            sigstore_verify: base,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManagedPolicyStatus {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enforced_controls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EffectiveAuthorizedPosture {
+    pub posture: AuthorizedPosture,
+    pub sources: EffectivePostureSources,
+    pub approved_posture_path: String,
+    pub approved_posture_source: PostureSourceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_policy: Option<ManagedPolicyStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SecurityStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+    pub effective_floor: AuthorizedPostureView,
+    pub floor_sources: EffectivePostureSources,
+    pub approved_posture_path: String,
+    pub approved_posture_source: PostureSourceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_policy: Option<ManagedPolicyStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_unlocks: Vec<UnlockGrant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedPolicy {
+    status: ManagedPolicyStatus,
+    script_policy: Option<ScriptPolicy>,
+    minimum_release_age_secs: Option<u64>,
+    sandbox_mode: Option<ResolvedSandboxMode>,
+    sandbox_allow_degraded: Option<bool>,
+    sigstore_verify: Option<EnforceMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -177,6 +272,160 @@ fn approved_posture_path() -> Result<PathBuf, LpmError> {
 
 fn unlocks_dir() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("unlocks"))
+}
+
+fn managed_policy_path() -> PathBuf {
+    if let Ok(path) = std::env::var(SECURITY_POLICY_PATH_ENV)
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(DEFAULT_SECURITY_POLICY_PATH)
+}
+
+fn managed_policy_error(path: &Path, message: impl Into<String>) -> LpmError {
+    LpmError::Registry(format!(
+        "managed security policy {} {}",
+        path.display(),
+        message.into()
+    ))
+}
+
+fn parse_policy_u64(path: &Path, key: &str, value: &toml::Value) -> Result<Option<u64>, LpmError> {
+    match value {
+        toml::Value::Integer(raw) => u64::try_from(*raw)
+            .map(Some)
+            .map_err(|_| managed_policy_error(path, format!("has invalid `{key}` value `{raw}`"))),
+        toml::Value::String(raw) => crate::release_age_config::parse_strict_u64_string(raw)
+            .map(Some)
+            .ok_or_else(|| {
+                managed_policy_error(path, format!("has invalid `{key}` value `{raw}`"))
+            }),
+        _ => Err(managed_policy_error(
+            path,
+            format!("must set `{key}` to a non-negative integer second count"),
+        )),
+    }
+}
+
+fn parse_policy_sigstore(path: &Path, raw: &str) -> Result<EnforceMode, LpmError> {
+    match raw {
+        "deny" => Ok(EnforceMode::Deny),
+        "warn" => Ok(EnforceMode::Warn),
+        "off" => Ok(EnforceMode::Off),
+        _ => Err(managed_policy_error(
+            path,
+            format!("has invalid `[sigstore].verify` value `{raw}`"),
+        )),
+    }
+}
+
+fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
+    let path = managed_policy_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(&path)?;
+    let parsed: toml::Value = toml::from_str(&content)
+        .map_err(|e| managed_policy_error(&path, format!("parse error: {e}")))?;
+    let table = parsed
+        .as_table()
+        .ok_or_else(|| managed_policy_error(&path, "must be a TOML table at the top level"))?;
+
+    let policy_meta = table.get("policy").and_then(|value| value.as_table());
+    let name = policy_meta
+        .and_then(|meta| meta.get("name"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let source = policy_meta
+        .and_then(|meta| meta.get("source"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+
+    let script_policy = table
+        .get("script-policy")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| managed_policy_error(&path, "must set `script-policy` to a string"))
+        })
+        .transpose()?
+        .map(|raw| ScriptPolicy::parse(raw).map_err(|e| managed_policy_error(&path, e.to_string())))
+        .transpose()?;
+
+    let minimum_release_age_secs = table
+        .get("minimum-release-age-secs")
+        .map(|value| parse_policy_u64(&path, "minimum-release-age-secs", value))
+        .transpose()?
+        .flatten();
+
+    let sandbox = table.get("sandbox").and_then(|value| value.as_table());
+    let sandbox_mode = sandbox
+        .and_then(|tbl| tbl.get("mode"))
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| managed_policy_error(&path, "must set `[sandbox].mode` to a string"))
+        })
+        .transpose()?
+        .map(|raw| {
+            ResolvedSandboxMode::parse_for_security_floor(raw).ok_or_else(|| {
+                managed_policy_error(&path, format!("has invalid `[sandbox].mode` value `{raw}`"))
+            })
+        })
+        .transpose()?;
+    let sandbox_allow_degraded = sandbox
+        .and_then(|tbl| tbl.get("allow-degraded"))
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                managed_policy_error(&path, "must set `[sandbox].allow-degraded` to a boolean")
+            })
+        })
+        .transpose()?;
+
+    let sigstore = table.get("sigstore").and_then(|value| value.as_table());
+    let sigstore_verify = sigstore
+        .and_then(|tbl| tbl.get("verify"))
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                managed_policy_error(&path, "must set `[sigstore].verify` to a string")
+            })
+        })
+        .transpose()?
+        .map(|raw| parse_policy_sigstore(&path, raw))
+        .transpose()?;
+
+    let mut enforced_controls = Vec::new();
+    if script_policy.is_some() {
+        enforced_controls.push("script-policy".to_string());
+    }
+    if minimum_release_age_secs.is_some() {
+        enforced_controls.push("minimum-release-age-secs".to_string());
+    }
+    if sandbox_mode.is_some() {
+        enforced_controls.push("sandbox.mode".to_string());
+    }
+    if sandbox_allow_degraded.is_some() {
+        enforced_controls.push("sandbox.allow-degraded".to_string());
+    }
+    if sigstore_verify.is_some() {
+        enforced_controls.push("sigstore.verify".to_string());
+    }
+
+    Ok(Some(ManagedPolicy {
+        status: ManagedPolicyStatus {
+            path: path.display().to_string(),
+            name,
+            source,
+            enforced_controls,
+        },
+        script_policy,
+        minimum_release_age_secs,
+        sandbox_mode,
+        sandbox_allow_degraded,
+        sigstore_verify,
+    }))
 }
 
 fn signing_secret() -> Result<Vec<u8>, LpmError> {
@@ -285,6 +534,50 @@ pub fn load_authorized_posture() -> Result<AuthorizedPosture, LpmError> {
     Ok(read_signed_json(&approved_posture_path()?)?.unwrap_or_default())
 }
 
+pub fn load_effective_authorized_posture() -> Result<EffectiveAuthorizedPosture, LpmError> {
+    let approved_path = approved_posture_path()?;
+    let approved_posture_source = if approved_path.exists() {
+        PostureSourceKind::ApprovedStore
+    } else {
+        PostureSourceKind::BuiltinDefault
+    };
+    let mut posture = load_authorized_posture()?;
+    let mut sources = EffectivePostureSources::new(approved_posture_source);
+    let managed_policy = load_managed_policy()?;
+
+    if let Some(policy) = managed_policy.as_ref() {
+        if let Some(script_policy) = policy.script_policy {
+            posture.script_policy = script_policy.as_str().to_string();
+            sources.script_policy = PostureSourceKind::ManagedPolicy;
+        }
+        if let Some(minimum_release_age_secs) = policy.minimum_release_age_secs {
+            posture.minimum_release_age_secs = minimum_release_age_secs;
+            sources.minimum_release_age_secs = PostureSourceKind::ManagedPolicy;
+        }
+        if let Some(sandbox_mode) = policy.sandbox_mode {
+            posture.sandbox_mode = sandbox_mode.as_str().to_string();
+            sources.sandbox_mode = PostureSourceKind::ManagedPolicy;
+        }
+        if let Some(sandbox_allow_degraded) = policy.sandbox_allow_degraded {
+            posture.sandbox_allow_degraded = sandbox_allow_degraded;
+            sources.sandbox_allow_degraded = PostureSourceKind::ManagedPolicy;
+        }
+        if let Some(sigstore_verify) = policy.sigstore_verify {
+            posture.sigstore_verify =
+                crate::security_floor::sigstore_mode_name(sigstore_verify).to_string();
+            sources.sigstore_verify = PostureSourceKind::ManagedPolicy;
+        }
+    }
+
+    Ok(EffectiveAuthorizedPosture {
+        posture,
+        sources,
+        approved_posture_path: approved_path.display().to_string(),
+        approved_posture_source,
+        managed_policy: managed_policy.map(|policy| policy.status),
+    })
+}
+
 pub fn persist_authorized_posture(posture: &AuthorizedPosture) -> Result<(), LpmError> {
     let mut normalized = posture.clone();
     normalized.schema_version = APPROVED_POSTURE_SCHEMA_VERSION;
@@ -314,6 +607,20 @@ fn suggested_unlock_command(scope: ApprovalScope) -> String {
         "lpm security unlock {} --project . --ttl 10m",
         scope.as_str()
     )
+}
+
+fn managed_policy_write_error(
+    managed_policy: &ManagedPolicyStatus,
+    knob: &str,
+    requested: impl AsRef<str>,
+    enforced: impl AsRef<str>,
+) -> LpmError {
+    LpmError::SecurityFloor(format!(
+        "managed security policy `{}` keeps `{knob}` at `{}`. Update that higher-authority policy before setting `{knob}` to `{}` here.",
+        managed_policy.path,
+        enforced.as_ref(),
+        requested.as_ref(),
+    ))
 }
 
 pub fn approval_required_error(
@@ -381,6 +688,43 @@ fn read_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
         }
     }
     Ok(grants)
+}
+
+pub fn list_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
+    let mut grants = read_active_unlocks()?;
+    grants.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
+    Ok(grants)
+}
+
+pub fn list_active_project_unlocks(project_dir: &Path) -> Result<Vec<UnlockGrant>, LpmError> {
+    let root = canonical_project_root(project_dir);
+    let mut grants: Vec<_> = read_active_unlocks()?
+        .into_iter()
+        .filter(|grant| grant.project_root.as_deref() == Some(root.as_str()))
+        .collect();
+    grants.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
+    Ok(grants)
+}
+
+pub fn load_security_status(project_dir: Option<&Path>) -> Result<SecurityStatus, LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let (project_root, active_unlocks) = match project_dir {
+        Some(dir) => (
+            Some(canonical_project_root(dir)),
+            list_active_project_unlocks(dir)?,
+        ),
+        None => (None, list_active_unlocks()?),
+    };
+
+    Ok(SecurityStatus {
+        project_root,
+        effective_floor: effective.posture.to_view(),
+        floor_sources: effective.sources,
+        approved_posture_path: effective.approved_posture_path,
+        approved_posture_source: effective.approved_posture_source,
+        managed_policy: effective.managed_policy,
+        active_unlocks,
+    })
 }
 
 pub fn has_active_project_unlock(
@@ -511,8 +855,27 @@ pub fn authorize_persistent_script_policy(
     json_output: bool,
     command_hint: &str,
 ) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let current = effective.posture.script_policy();
+    if requested.loosens(current)
+        && matches!(
+            effective.sources.script_policy,
+            PostureSourceKind::ManagedPolicy
+        )
+    {
+        let managed_policy = effective
+            .managed_policy
+            .as_ref()
+            .expect("managed policy source must include status metadata");
+        return Err(managed_policy_write_error(
+            managed_policy,
+            "script-policy",
+            requested.as_str(),
+            current.as_str(),
+        ));
+    }
+
     let mut posture = load_authorized_posture()?;
-    let current = posture.script_policy();
     if requested.loosens(current) {
         confirm_persistent_weakening(
             match requested {
@@ -537,8 +900,27 @@ pub fn authorize_persistent_release_age(
     json_output: bool,
     command_hint: &str,
 ) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let current = effective.posture.minimum_release_age_secs();
+    if requested_secs < current
+        && matches!(
+            effective.sources.minimum_release_age_secs,
+            PostureSourceKind::ManagedPolicy
+        )
+    {
+        let managed_policy = effective
+            .managed_policy
+            .as_ref()
+            .expect("managed policy source must include status metadata");
+        return Err(managed_policy_write_error(
+            managed_policy,
+            "minimum-release-age-secs",
+            requested_secs.to_string(),
+            current.to_string(),
+        ));
+    }
+
     let mut posture = load_authorized_posture()?;
-    let current = posture.minimum_release_age_secs();
     if requested_secs < current {
         confirm_persistent_weakening(
             ApprovalScope::CooldownBypass,
@@ -558,8 +940,27 @@ pub fn authorize_persistent_sandbox_mode(
     json_output: bool,
     command_hint: &str,
 ) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let current = effective.posture.sandbox_mode();
+    if requested.loosens(current)
+        && matches!(
+            effective.sources.sandbox_mode,
+            PostureSourceKind::ManagedPolicy
+        )
+    {
+        let managed_policy = effective
+            .managed_policy
+            .as_ref()
+            .expect("managed policy source must include status metadata");
+        return Err(managed_policy_write_error(
+            managed_policy,
+            "[sandbox].mode",
+            requested.as_str(),
+            current.as_str(),
+        ));
+    }
+
     let mut posture = load_authorized_posture()?;
-    let current = posture.sandbox_mode();
     if requested.loosens(current) {
         confirm_persistent_weakening(
             match requested {
@@ -584,8 +985,27 @@ pub fn authorize_persistent_sigstore(
     json_output: bool,
     command_hint: &str,
 ) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let current = effective.posture.sigstore_verify();
+    if crate::security_floor::sigstore_loosens(requested, current)
+        && matches!(
+            effective.sources.sigstore_verify,
+            PostureSourceKind::ManagedPolicy
+        )
+    {
+        let managed_policy = effective
+            .managed_policy
+            .as_ref()
+            .expect("managed policy source must include status metadata");
+        return Err(managed_policy_write_error(
+            managed_policy,
+            "[sigstore].verify",
+            crate::security_floor::sigstore_mode_name(requested),
+            crate::security_floor::sigstore_mode_name(current),
+        ));
+    }
+
     let mut posture = load_authorized_posture()?;
-    let current = posture.sigstore_verify();
     if crate::security_floor::sigstore_loosens(requested, current) {
         confirm_persistent_weakening(
             ApprovalScope::ProvenanceUnverified,
@@ -615,7 +1035,10 @@ pub fn unlock_scope_command(
     }
     if is_automation(json_output) {
         return Err(approval_required_error(
-            format!("{} requires an interactive approval terminal", scope.as_str()),
+            format!(
+                "{} requires an interactive approval terminal",
+                scope.as_str()
+            ),
             vec![scope.as_str().to_string()],
             Some(canonical_project_root(project_dir)),
             Some(suggested_unlock_command(scope)),
@@ -648,8 +1071,8 @@ pub fn unlock_scope_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
 
     fn with_test_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -658,11 +1081,14 @@ mod tests {
             .lock()
             .expect("security approval test env mutex poisoned");
         let original_dir = std::env::var_os(SECURITY_DIR_ENV);
+        let original_policy = std::env::var_os(SECURITY_POLICY_PATH_ENV);
         let original_secret = std::env::var_os(TEST_SECRET_ENV);
+        let policy_path = dir.join("managed-security-policy.toml");
         // Test-only env mutation is isolated to this helper and
         // restored before returning.
         unsafe {
             std::env::set_var(SECURITY_DIR_ENV, dir);
+            std::env::set_var(SECURITY_POLICY_PATH_ENV, &policy_path);
             std::env::set_var(
                 TEST_SECRET_ENV,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -673,11 +1099,20 @@ mod tests {
             Some(value) => unsafe { std::env::set_var(SECURITY_DIR_ENV, value) },
             None => unsafe { std::env::remove_var(SECURITY_DIR_ENV) },
         }
+        match original_policy {
+            Some(value) => unsafe { std::env::set_var(SECURITY_POLICY_PATH_ENV, value) },
+            None => unsafe { std::env::remove_var(SECURITY_POLICY_PATH_ENV) },
+        }
         match original_secret {
             Some(value) => unsafe { std::env::set_var(TEST_SECRET_ENV, value) },
             None => unsafe { std::env::remove_var(TEST_SECRET_ENV) },
         }
         out
+    }
+
+    fn write_managed_policy(dir: &Path, body: &str) {
+        let policy_path = dir.join("managed-security-policy.toml");
+        std::fs::write(policy_path, body).unwrap();
     }
 
     #[test]
@@ -711,12 +1146,113 @@ mod tests {
                 None,
             );
             persist_unlock_grant(&grant).unwrap();
-            assert!(has_active_project_unlock(
-                ApprovalScope::SandboxNone,
-                &project,
-                None
+            assert!(has_active_project_unlock(ApprovalScope::SandboxNone, &project, None).unwrap());
+        });
+    }
+
+    #[test]
+    fn managed_policy_overrides_selected_floor_controls() {
+        let temp = tempdir().unwrap();
+        with_test_env(temp.path(), || {
+            let posture = AuthorizedPosture {
+                script_policy: "deny".into(),
+                minimum_release_age_secs: DEFAULT_MIN_RELEASE_AGE_SECS,
+                sandbox_mode: "default".into(),
+                sandbox_allow_degraded: false,
+                sigstore_verify: "deny".into(),
+                ..AuthorizedPosture::default()
+            };
+            persist_authorized_posture(&posture).unwrap();
+            write_managed_policy(
+                temp.path(),
+                r#"
+script-policy = "allow"
+minimum-release-age-secs = "0"
+
+[policy]
+name = "ci"
+source = "test"
+"#,
+            );
+
+            let effective = load_effective_authorized_posture().unwrap();
+            assert_eq!(effective.posture.script_policy(), ScriptPolicy::Allow);
+            assert_eq!(effective.posture.minimum_release_age_secs(), 0);
+            assert_eq!(
+                effective.sources.script_policy,
+                PostureSourceKind::ManagedPolicy
+            );
+            assert_eq!(
+                effective.sources.minimum_release_age_secs,
+                PostureSourceKind::ManagedPolicy
+            );
+            assert_eq!(
+                effective.sources.sandbox_mode,
+                PostureSourceKind::ApprovedStore
+            );
+            assert_eq!(
+                effective
+                    .managed_policy
+                    .as_ref()
+                    .and_then(|policy| policy.name.as_deref()),
+                Some("ci")
+            );
+        });
+    }
+
+    #[test]
+    fn persistent_weakening_rejects_when_managed_policy_owns_that_floor() {
+        let temp = tempdir().unwrap();
+        with_test_env(temp.path(), || {
+            write_managed_policy(
+                temp.path(),
+                r#"
+script-policy = "deny"
+"#,
+            );
+
+            let err = authorize_persistent_script_policy(
+                ScriptPolicy::Allow,
+                true,
+                "lpm config scripts --set allow",
             )
-            .unwrap());
+            .unwrap_err();
+            assert_eq!(err.error_code(), "security_floor");
+            assert!(err.to_string().contains("managed security policy"));
+        });
+    }
+
+    #[test]
+    fn security_status_filters_unlocks_to_the_requested_project() {
+        let temp = tempdir().unwrap();
+        let project_a = temp.path().join("project-a");
+        let project_b = temp.path().join("project-b");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+        with_test_env(temp.path(), || {
+            persist_unlock_grant(&create_unlock_grant(
+                ApprovalScope::SandboxNone,
+                &project_a,
+                DEFAULT_UNLOCK_TTL_SECS,
+                None,
+            ))
+            .unwrap();
+            persist_unlock_grant(&create_unlock_grant(
+                ApprovalScope::CooldownBypass,
+                &project_b,
+                DEFAULT_UNLOCK_TTL_SECS,
+                Some(0),
+            ))
+            .unwrap();
+
+            let status = load_security_status(Some(&project_a)).unwrap();
+            let expected_root = canonical_project_root(&project_a);
+            assert_eq!(status.project_root.as_deref(), Some(expected_root.as_str()));
+            assert_eq!(status.active_unlocks.len(), 1);
+            assert_eq!(
+                status.active_unlocks[0].scopes,
+                vec![ApprovalScope::SandboxNone]
+            );
         });
     }
 

@@ -341,7 +341,7 @@ pub fn resolve_script_policy_with_security(
     let user = global
         .get_str("script-policy")
         .and_then(|s| ScriptPolicy::parse(s).ok());
-    let authorized = crate::security_approval::load_authorized_posture()?;
+    let authorized = crate::security_approval::load_effective_authorized_posture()?.posture;
     let authorized_floor = authorized.script_policy();
 
     if let Some(requested) = cli_override

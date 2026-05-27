@@ -238,7 +238,8 @@ fn guard_generic_set_against_force_floor(
             }
         }
         RELEASE_AGE_KEY => {
-            if let Some(requested_secs) = crate::release_age_config::parse_strict_u64_string(value) {
+            if let Some(requested_secs) = crate::release_age_config::parse_strict_u64_string(value)
+            {
                 crate::security_floor::reject_looser_release_age_write(&global, requested_secs)?;
             }
         }
@@ -247,7 +248,10 @@ fn guard_generic_set_against_force_floor(
     Ok(())
 }
 
-fn guard_generic_delete_against_force_floor(config: &toml::Value, key: &str) -> Result<(), LpmError> {
+fn guard_generic_delete_against_force_floor(
+    config: &toml::Value,
+    key: &str,
+) -> Result<(), LpmError> {
     let global = global_config_view_from_value(config);
     match key {
         RELEASE_AGE_KEY => crate::security_floor::reject_looser_release_age_write(
@@ -363,7 +367,9 @@ impl GlobalConfig {
             .get("verify")?
             .as_str()
             .map(String::from)?;
-        let authorized = crate::security_approval::load_authorized_posture().ok()?;
+        let authorized = crate::security_approval::load_effective_authorized_posture()
+            .ok()?
+            .posture;
         let requested = match raw.as_str() {
             "deny" => EnforceMode::Deny,
             "warn" => EnforceMode::Warn,
@@ -526,7 +532,10 @@ async fn run_release_age_wizard(
         ReleaseAgeSelection::Default => "lpm config release-age --set default".to_string(),
         ReleaseAgeSelection::Seconds(0) => "lpm config release-age --set 0".to_string(),
         ReleaseAgeSelection::Seconds(secs) => {
-            format!("lpm config release-age --set {}", format_release_age_cli_value(secs))
+            format!(
+                "lpm config release-age --set {}",
+                format_release_age_cli_value(secs)
+            )
         }
     };
     crate::security_approval::authorize_persistent_release_age(
@@ -1298,10 +1307,7 @@ mod wizard_tests {
         let dir = TempDir::new().expect("tempdir");
         let security_dir = dir.path().join("security");
         let env = crate::test_env::ScopedEnv::set([
-            (
-                "LPM_SECURITY_DIR",
-                security_dir.as_os_str().to_owned(),
-            ),
+            ("LPM_SECURITY_DIR", security_dir.as_os_str().to_owned()),
             (
                 "LPM_TEST_SECURITY_SECRET_HEX",
                 std::ffi::OsString::from(
@@ -1630,10 +1636,7 @@ mod wizard_tests {
         run_sandbox_wizard(&path, Some("strict"), true)
             .await
             .unwrap();
-        assert_eq!(
-            read_sandbox_mode(&path).unwrap().as_deref(),
-            Some("strict")
-        );
+        assert_eq!(read_sandbox_mode(&path).unwrap().as_deref(), Some("strict"));
     }
 
     // ── GlobalConfig::get_sigstore_verify ──────────────────────
@@ -1757,10 +1760,9 @@ mod wizard_tests {
 
     #[test]
     fn guard_generic_delete_rejects_lowering_release_age_to_default() {
-        let config: toml::Value = toml::from_str(
-            "force-security-floor = true\nminimum-release-age-secs = \"259200\"\n",
-        )
-        .unwrap();
+        let config: toml::Value =
+            toml::from_str("force-security-floor = true\nminimum-release-age-secs = \"259200\"\n")
+                .unwrap();
         let err = guard_generic_delete_against_force_floor(&config, RELEASE_AGE_KEY).unwrap_err();
         assert_eq!(err.error_code(), "security_floor");
     }
