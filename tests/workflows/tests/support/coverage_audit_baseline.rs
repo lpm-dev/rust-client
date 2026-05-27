@@ -82,6 +82,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Tunnel",
     "Migrate",
     "Vault",
+    "Security",
     "SelfUpdate",
     "InternalUpdateCheck",
     "Completions",

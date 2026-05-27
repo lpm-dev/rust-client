@@ -42,6 +42,7 @@
 mod support;
 
 use std::io::Write;
+use support::assertions;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 
@@ -187,112 +188,30 @@ async fn offline_install_capability_round_trip_end_to_end() {
     }
 
     // ── OFFLINE install ── (exercises `run_link_and_finish`)
-    lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--offline",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
-        .assert()
-        .success();
-
-    // ── 1) Capture-side: blocked set must include the widened
-    //       package even though the script hash matches strict ──
-    let bs: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&bs_path).expect("build-state.json after offline install"),
-    )
-    .expect("build-state.json parses");
-    let blocked = bs["blocked_packages"]
-        .as_array()
-        .expect("blocked_packages array");
-    assert_eq!(
-        blocked.len(),
-        1,
-        "capability-widening package MUST land in blocked_packages despite strict match — \
-         reviewer's High finding. Before the offline-path fix, `run_link_and_finish` \
-         hardcoded baseline capability defaults and the row was silently dropped. \
-         Full build-state: {bs:#}"
-    );
-    assert_eq!(blocked[0]["name"], "offline-capability-pkg");
-    assert_eq!(
-        blocked[0]["binding_drift"], true,
-        "capture flags this as drift so approve-scripts renders 'previously approved, please re-review'"
-    );
-
-    // ── 2) Discovery-side: approve-scripts --list --json shows
-    //       the package ──
-    let out = lpm_with_registry(&project, &mock.url())
-        .args(["approve-scripts", "--list", "--json"])
-        .output()
-        .expect("approve-scripts --list run");
-    assert!(
-        out.status.success(),
-        "approve-scripts --list failed: stdout={:?}, stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let listing: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("approve-scripts --list --json output");
-    // The --list --json envelope uses "blocked" for the listing
-    // (see approve_scripts.rs:1127). Older shapes also existed —
-    // we match the current wire contract.
-    let listed = listing["blocked"]
-        .as_array()
-        .expect("`blocked` array in --list --json output");
-    assert!(
-        listed.iter().any(|p| p["name"] == "offline-capability-pkg"),
-        "approve-scripts --list must surface the capability-widened package — \
-         reviewer's Medium finding (the discovery filter needed to consult \
-         the capability gate, not just the strict match). Full listing: {listing:#}"
-    );
-
-    // ── 3) Write-path: approve-scripts --yes persists capabilityHash ──
-    lpm_with_registry(&project, &mock.url())
-        .args(["approve-scripts", "--yes"])
-        .assert()
-        .success();
-    let pkg_json: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(project.path().join("package.json")).unwrap(),
-    )
-    .unwrap();
-    let binding = &pkg_json["lpm"]["trustedDependencies"]["offline-capability-pkg@1.0.0"];
-    let cap_hash = binding["capabilityHash"]
-        .as_str()
-        .expect("approve-scripts MUST persist capabilityHash for a widening approval");
-    assert!(
-        cap_hash.starts_with("sha256-"),
-        "capabilityHash must be sha256-<hex> SRI form; got {cap_hash:?}"
-    );
-
-    // ── 4) Round-trip: third install must produce an empty
-    //       blocked set — the persisted hash satisfies the
-    //       enforcement layer ──
     //
-    // This is the load-bearing invariant for the whole lane:
-    // hash written by approve-scripts == hash enforced by
-    // evaluate_trust. If the install flow parses / hashes /
-    // persists differently than enforcement does, this
-    // assertion fires as a mismatch.
-    lpm_with_registry(&project, &mock.url())
+    // The test now stops at the security approval boundary: both
+    // hand-authored rich trust and the passEnv widening are guarded
+    // against same-user agents. The approved capability round-trip is
+    // covered at lower levels where authority can be modeled without
+    // spoofing a native prompt.
+    let out = lpm_with_registry(&project, &mock.url())
         .args([
+            "--json",
             "install",
             "--offline",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
         ])
-        .assert()
-        .success();
-    let bs: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&bs_path).unwrap()).unwrap();
-    assert_eq!(
-        bs["blocked_packages"].as_array().map_or(0, |a| a.len()),
-        0,
-        "after approve-scripts persisted the capabilityHash, the next \
-         offline install's blocked set must be empty — proves the \
-         written hash matches the enforced hash byte-for-byte. \
-         Full build-state: {bs:#}"
+        .output()
+        .expect("offline install run");
+    let envelope = assertions::assert_security_approval_required(&out);
+    let scopes = envelope["error"]["requested_scopes"]
+        .as_array()
+        .expect("security approval envelope must include scopes");
+    assert!(
+        scopes.iter().any(|scope| scope == "trust-bulk-approve")
+            || scopes.iter().any(|scope| scope == "capability-widen"),
+        "offline install must request trust/capability approval before using hand-authored state; got {envelope}",
     );
 }

@@ -1,8 +1,8 @@
 //! Cli-binary tier — TTY/stdin interactive behaviour for the
 //! `lpm config sigstore` wizard. Inline tests in `commands/config.rs`
-//! cover the non-interactive `--set` paths and the read/persist/announce
-//! seams; this file pins the cliclack-walk guards that fire when
-//! stdin is not a TTY.
+//! cover the authorized `--set` persistence paths and the
+//! read/persist/announce seams; this file pins the cliclack-walk guards
+//! and unauthenticated weakening guards that fire when stdin is not a TTY.
 
 use assert_cmd::Command;
 use tempfile::TempDir;
@@ -37,15 +37,11 @@ fn read_config_toml(home: &TempDir) -> String {
         .unwrap_or_else(|e| panic!("config.toml at {} not readable: {e}", path.display(),))
 }
 
-/// `--set off` is the persistent fleet-wide opt-out path. It must
-/// succeed without a TTY (CI pipelines, automation, ansible-style
-/// provisioning) and write the `[sigstore].verify` table key. If this
-/// regresses, an operator-machine deploy script that flipped the knob
-/// to `off` would silently fail and leave the operator in the default
-/// `deny` posture — possibly the right thing, but not what they asked
-/// for, and silent.
+/// `--set off` is a persistent provenance downgrade. Without a prior
+/// native approval-backed posture, non-TTY automation must get a
+/// deterministic refusal and must not persist the weaker value.
 #[test]
-fn sigstore_wizard_set_off_succeeds_without_tty_and_persists_to_config_toml() {
+fn sigstore_wizard_set_off_without_tty_requires_security_approval_and_does_not_persist() {
     let (mut cmd, _project, home) = lpm_isolated();
 
     let output = cmd
@@ -54,26 +50,24 @@ fn sigstore_wizard_set_off_succeeds_without_tty_and_persists_to_config_toml() {
         .expect("failed to run lpm config sigstore --set off");
 
     assert!(
-        output.status.success(),
-        "lpm config sigstore --set off must succeed without a TTY;\n\
+        !output.status.success(),
+        "lpm config sigstore --set off must require approval without a TTY;\n\
          stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let cfg = read_config_toml(&home);
-    assert!(
-        cfg.contains("[sigstore]"),
-        "[sigstore] table must be present after --set off; got config.toml:\n{cfg}",
-    );
-    assert!(
-        cfg.contains("verify = \"off\""),
-        "verify = \"off\" must be persisted under [sigstore]; got config.toml:\n{cfg}",
-    );
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("security approval required"),
+        "--set off must fail through the security approval guard; got:\n{combined}",
+    );
+    assert!(
+        !home.path().join(".lpm").join("config.toml").exists(),
+        "refused --set off must not persist config.toml",
+    );
     assert!(
         !combined.contains("Are you sure"),
         "--set off path MUST NOT prompt — the wizard's stern confirm \
@@ -120,22 +114,22 @@ fn sigstore_wizard_without_set_and_without_tty_errors_with_actionable_diagnostic
 /// `--json` is the machine-readable announce path. Wizards in the
 /// security-posture family (`scripts`, `triage`, `sandbox`, and now
 /// `sigstore`) all emit `{"success": true, "<topic>": {...}}` after a
-/// successful `--set`. Pin the sigstore wizard's announce shape so a
+/// successful allowed `--set`. Pin the sigstore wizard's announce shape so a
 /// future refactor doesn't accidentally break the
 /// `{"success": true, "sigstore": {"verify": "<v>"}}` contract that
 /// downstream automation reads.
 #[test]
-fn sigstore_wizard_set_warn_with_json_announces_success_envelope() {
-    let (mut cmd, _project, _home) = lpm_isolated();
+fn sigstore_wizard_set_deny_with_json_announces_success_envelope() {
+    let (mut cmd, _project, home) = lpm_isolated();
 
     let output = cmd
-        .args(["config", "--json", "sigstore", "--set", "warn"])
+        .args(["config", "--json", "sigstore", "--set", "deny"])
         .output()
-        .expect("failed to run lpm config --json sigstore --set warn");
+        .expect("failed to run lpm config --json sigstore --set deny");
 
     assert!(
         output.status.success(),
-        "lpm config --json sigstore --set warn must succeed;\n\
+        "lpm config --json sigstore --set deny must succeed;\n\
          stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -152,9 +146,56 @@ fn sigstore_wizard_set_warn_with_json_announces_success_envelope() {
     );
     assert_eq!(
         envelope["sigstore"]["verify"],
-        serde_json::json!("warn"),
+        serde_json::json!("deny"),
         "envelope must carry the persisted verify value under `sigstore.verify`; \
          got: {envelope}",
+    );
+
+    let cfg = read_config_toml(&home);
+    assert!(
+        cfg.contains("verify = \"deny\""),
+        "verify = \"deny\" must be persisted under [sigstore]; got config.toml:\n{cfg}",
+    );
+}
+
+/// JSON mode must remain deterministic for guarded provenance
+/// downgrades: no native prompt, no persistence, and a stable
+/// SECURITY_APPROVAL_REQUIRED envelope on stdout.
+#[test]
+fn sigstore_wizard_set_warn_with_json_emits_security_approval_required() {
+    let (mut cmd, _project, home) = lpm_isolated();
+
+    let output = cmd
+        .args(["config", "--json", "sigstore", "--set", "warn"])
+        .output()
+        .expect("failed to run lpm config --json sigstore --set warn");
+
+    assert!(
+        !output.status.success(),
+        "lpm config --json sigstore --set warn must require approval;\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json stdout must parse as JSON: {e}\nraw stdout: {stdout}"));
+
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(
+        envelope["error"]["code"],
+        serde_json::json!("SECURITY_APPROVAL_REQUIRED"),
+        "guarded weakening must use the nested security approval error code; got: {envelope}",
+    );
+    assert_eq!(
+        envelope["error_code"],
+        serde_json::json!("security_approval_required"),
+        "legacy top-level error_code must stay present for existing JSON clients; got: {envelope}",
+    );
+    assert!(
+        !home.path().join(".lpm").join("config.toml").exists(),
+        "refused --set warn must not persist config.toml",
     );
 }
 

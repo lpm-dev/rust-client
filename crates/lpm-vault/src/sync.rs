@@ -2226,6 +2226,8 @@ mod tests {
 
     #[tokio::test]
     async fn push_raw_returns_plain_text_conflict_body_on_non_json_error() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -2336,6 +2338,8 @@ mod tests {
     /// requires a signature on every response.
     #[tokio::test]
     async fn push_does_not_require_signature_on_error_responses() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
 
         // 409 conflict body, no X-LPM-Signature — origin sends this shape
@@ -2372,6 +2376,8 @@ mod tests {
     /// PushResponse. Mirror of the pull test on the response-write surface.
     #[tokio::test]
     async fn push_rejects_unsigned_success_response() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))

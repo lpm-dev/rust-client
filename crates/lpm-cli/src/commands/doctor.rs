@@ -2860,6 +2860,12 @@ fn probe_sandbox_backend() -> Check {
             match crate::sandbox_config::resolve_sandbox_mode_from_chain(&cwd, false, false, true) {
                 Ok(pair) => pair,
                 Err(e) => {
+                    if e.error_code() == "security_approval_required" {
+                        return Check::fail(
+                            &doctor_catalog::SANDBOX_CONFIG_APPROVAL_REQUIRED,
+                            &format!("sandbox config requires security approval: {e}"),
+                        );
+                    }
                     return Check::fail(
                         &doctor_catalog::SANDBOX_PROBE_FAILED,
                         &format!(
@@ -3071,6 +3077,24 @@ fn probe_sandbox_backend() -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    const TEST_SECURITY_SECRET_HEX: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn isolated_security_env_vars(root: &Path) -> Vec<(&'static str, OsString)> {
+        vec![
+            (
+                "LPM_SECURITY_DIR",
+                root.join("security").as_os_str().to_owned(),
+            ),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                OsString::from(TEST_SECURITY_SECRET_HEX),
+            ),
+        ]
+    }
 
     #[test]
     fn check_pass_sets_passed_true() {
@@ -3112,6 +3136,8 @@ mod tests {
 
     #[test]
     fn sandbox_probe_emits_known_code() {
+        let security = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set(isolated_security_env_vars(security.path()));
         // Pin the codes the sandbox probe is allowed to emit so the
         // automation contract for this check stays stable across
         // platforms / refactors. adds `sandbox_degraded`
@@ -3126,6 +3152,7 @@ mod tests {
             "sandbox_helper_missing",
             "sandbox_degraded",
             "sandbox_disabled_by_user",
+            "sandbox_config_approval_required",
             "sandbox_unsupported_platform",
             "sandbox_kernel_too_old",
             "sandbox_probe_failed",
@@ -3150,6 +3177,8 @@ mod tests {
     /// floor.
     #[test]
     fn sandbox_probe_always_returns_a_check() {
+        let security = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set(isolated_security_env_vars(security.path()));
         let c = probe_sandbox_backend();
         assert_eq!(c.name(), "Sandbox");
         // Severity ∈ {Pass, Warn, Fail}. All three are acceptable
@@ -3167,6 +3196,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_probe_on_macos_passes_with_seatbelt_backend() {
+        let security = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set(isolated_security_env_vars(security.path()));
         let c = probe_sandbox_backend();
         assert!(
             matches!(c.severity, Severity::Pass),
@@ -3188,6 +3219,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_probe_on_linux_passes_or_warns_never_fails() {
+        let security = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set(isolated_security_env_vars(security.path()));
         let c = probe_sandbox_backend();
         assert!(
             !matches!(c.severity, Severity::Fail),
@@ -3224,6 +3257,8 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn sandbox_probe_on_windows_passes_or_warns_with_known_backend_name() {
+        let security = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set(isolated_security_env_vars(security.path()));
         let c = probe_sandbox_backend();
         assert!(
             !matches!(c.severity, Severity::Fail),
@@ -3274,8 +3309,9 @@ commands = []
 "#,
         )
         .unwrap();
-        let _env =
-            crate::test_env::ScopedEnv::set([("LPM_HOME", tmp.path().as_os_str().to_owned())]);
+        let mut env = isolated_security_env_vars(tmp.path());
+        env.push(("LPM_HOME", tmp.path().as_os_str().to_owned()));
+        let _env = crate::test_env::ScopedEnv::set(env);
         let out = check_script_policy_surface();
         for c in &out {
             assert_ne!(
@@ -3292,6 +3328,8 @@ commands = []
     /// gated the sandbox probe behind some condition would be caught here.
     #[test]
     fn check_script_policy_surface_always_includes_sandbox_probe() {
+        let security = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set(isolated_security_env_vars(security.path()));
         let out = check_script_policy_surface();
         assert!(!out.is_empty(), "must emit at least the sandbox probe");
         assert_eq!(
@@ -3302,14 +3340,10 @@ commands = []
         );
     }
 
-    /// follow-up : when the user has set
-    /// `[sandbox] mode = "none"` in `~/.lpm/config.toml` (via
-    /// `lpm config sandbox --set none` or by hand), the doctor probe
-    /// MUST report the disabled posture instead of probing
-    /// `SandboxMode::Enforce` and reporting whatever the backend
-    /// happens to support. Pre-fix, doctor lied about that state —
-    /// it said "default mode: filesystem-write containment …" while
-    /// the install pipeline was running unsandboxed.
+    /// Raw `[sandbox] mode = "none"` in `~/.lpm/config.toml` is a guarded
+    /// posture downgrade. Doctor should not treat a hand edit as an approved
+    /// disabled posture; it should surface the same approval boundary the
+    /// install pipeline will enforce.
     ///
     /// Test isolates the global config by overriding `HOME` to a
     /// tempdir and writing the wizard's on-disk shape directly. The
@@ -3326,7 +3360,7 @@ commands = []
     /// resolver against the real per-platform config home.
     #[cfg(unix)]
     #[test]
-    fn sandbox_probe_honors_persistent_mode_none_from_global_config() {
+    fn sandbox_probe_requires_approval_for_raw_persistent_mode_none_from_global_config() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         std::fs::create_dir_all(home.join(".lpm")).unwrap();
@@ -3339,22 +3373,75 @@ commands = []
         // resolver's `dirs::home_dir()` consults HOME on Unix; the
         // ScopedEnv mutex serialises with other tests that touch
         // process-wide env vars.
-        let _env = crate::test_env::ScopedEnv::set([("HOME", home.as_os_str().to_owned())]);
+        let mut env = isolated_security_env_vars(tmp.path());
+        env.push(("HOME", home.as_os_str().to_owned()));
+        let _env = crate::test_env::ScopedEnv::set(env);
+
+        let c = probe_sandbox_backend();
+
+        assert_eq!(
+            c.code(),
+            "sandbox_config_approval_required",
+            "doctor must report the security approval boundary for an unapproved \
+             persistent sandbox downgrade. got: code={} detail={}",
+            c.code(),
+            c.detail,
+        );
+        assert!(
+            matches!(c.severity, Severity::Fail),
+            "unapproved `mode = \"none\"` should fail doctor because install will \
+             also refuse it. got severity={:?}, detail={}",
+            c.severity,
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("security approval"),
+            "detail must name the approval boundary. got: {}",
+            c.detail,
+        );
+        assert!(
+            !c.detail.contains("default mode:"),
+            "pre-fix detail leaked under raw `mode = \"none\"` — doctor must NOT \
+             claim default-mode containment when config asked for none. got: {}",
+            c.detail,
+        );
+    }
+
+    /// Once the disabled sandbox posture has been approved, doctor reports it
+    /// as the active user-chosen state instead of probing `SandboxMode::Enforce`.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_probe_honors_approved_persistent_mode_none_from_global_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".lpm")).unwrap();
+        std::fs::write(
+            home.join(".lpm").join("config.toml"),
+            "[sandbox]\nmode = \"none\"\n",
+        )
+        .unwrap();
+        let mut env = isolated_security_env_vars(tmp.path());
+        env.push(("HOME", home.as_os_str().to_owned()));
+        let _env = crate::test_env::ScopedEnv::set(env);
+        let posture = crate::security_approval::AuthorizedPosture {
+            sandbox_mode: "none".to_string(),
+            ..crate::security_approval::AuthorizedPosture::default()
+        };
+        crate::security_approval::persist_authorized_posture(&posture).unwrap();
 
         let c = probe_sandbox_backend();
 
         assert_eq!(
             c.code(),
             "sandbox_disabled_by_user",
-            "doctor must emit the dedicated `sandbox_disabled_by_user` code so JSON \
-             consumers can tell the persistent-off-mode apart from `sandbox_available` \
-             / `sandbox_degraded`. got: code={} detail={}",
+            "doctor must emit the dedicated `sandbox_disabled_by_user` code for an \
+             approved persistent-off posture. got: code={} detail={}",
             c.code(),
             c.detail,
         );
         assert!(
             matches!(c.severity, Severity::Warn),
-            "persistent `mode = \"none\"` is a chosen-state warning, not a pass. \
+            "approved persistent `mode = \"none\"` is a chosen-state warning, not a pass. \
              got severity={:?}, detail={}",
             c.severity,
             c.detail,

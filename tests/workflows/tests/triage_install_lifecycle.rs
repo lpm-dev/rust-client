@@ -58,6 +58,7 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
+use support::assertions;
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
 use support::{TempProject, lpm_with_registry};
 
@@ -280,57 +281,15 @@ fn lpm_built_marker(project: &TempProject) -> PathBuf {
         .join(".lpm-built")
 }
 
-/// Parse `<project>/.lpm/build-state.json` and check whether the
-/// synthetic dep is listed in `blocked_packages`. `None` when the
-/// build-state file is missing (install never reached the capture
-/// step — assertion failure should distinguish that from "in" /
-/// "not in").
-fn amber_dep_in_blocked_set(project: &TempProject) -> Option<bool> {
-    let path = project.path().join(".lpm").join("build-state.json");
-    if !path.exists() {
-        return None;
-    }
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let arr = v.get("blocked_packages")?.as_array()?;
-    Some(
-        arr.iter()
-            .any(|p| p.get("name").and_then(|n| n.as_str()) == Some(AMBER_DEP_NAME)),
-    )
-}
-
-/// `true` if `node` is on PATH. Tests that assert on `.lpm-built`
-/// (which requires a real script spawn) skip the spawn-side check
-/// when node is unavailable, matching the `rebuild.rs` precedent —
-/// CI containers without node still gate the install / blocked-set
-/// contracts, just not the "did the script actually run" half.
-fn node_available() -> bool {
-    std::process::Command::new("node")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Strip ANSI color codes so stderr assertions don't fight terminal
-/// styling. Same helper shape as `rebuild.rs`.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' && chars.peek() == Some(&'[') {
-            chars.next();
-            for cc in chars.by_ref() {
-                let cb = cc as u32;
-                if (0x40..=0x7e).contains(&cb) {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &str) {
+    let envelope = assertions::assert_security_approval_required(out);
+    let scopes = envelope["error"]["requested_scopes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("security approval envelope must include scopes: {envelope}"));
+    assert!(
+        scopes.iter().any(|scope| scope == expected_scope),
+        "security approval envelope must include scope `{expected_scope}`; got {envelope}",
+    );
 }
 
 // ─── Contract 1 — no advisor, auto-build on, amber stays blocked ──────
@@ -354,24 +313,10 @@ async fn triage_no_advisor_with_auto_build_keeps_amber_blocked_and_unbuilt() {
     let project = TempProject::empty(&triage_project_manifest());
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--triage", "--auto-build"])
+        .args(["--json", "install", "--triage", "--auto-build"])
         .output()
         .expect("spawn lpm install");
-    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    assert!(
-        out.status.success(),
-        "install must succeed even when amber packages stay blocked; stderr:\n{stderr}"
-    );
-
-    // Blocked-set contract: the amber dep MUST persist in
-    // `.lpm/build-state.json` so `lpm approve-scripts` can review it.
-    let in_blocked =
-        amber_dep_in_blocked_set(&project).expect("build-state.json must exist after install");
-    assert!(
-        in_blocked,
-        "amber dep MUST remain in the blocked set when no advisor approves it; \
-         stderr:\n{stderr}"
-    );
+    assert_security_approval_scope(&out, "scripts-triage");
 
     // Execution contract: the `.lpm-built` marker MUST NOT exist —
     // the trust evaluator returned `Untrusted` for the amber path
@@ -407,6 +352,7 @@ async fn triage_advisor_approve_with_auto_build_runs_amber_and_drops_from_blocke
     let path_var = prepend_to_path(&claude_bin_dir);
     let out = lpm_with_registry(&project, &mock.url())
         .args([
+            "--json",
             "install",
             "--triage",
             "--auto-build",
@@ -415,38 +361,18 @@ async fn triage_advisor_approve_with_auto_build_runs_amber_and_drops_from_blocke
         .env("PATH", &path_var)
         .output()
         .expect("spawn lpm install");
-    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    assert!(
-        out.status.success(),
-        "install must succeed under advisor-approve + auto-build; stderr:\n{stderr}"
-    );
-
-    // Blocked-set contract: advisor approved AND auto-build fired,
-    // so the package's scripts executed via `AdvisorApprovedThisRun`
-    // and the package is excluded from `.lpm/build-state.json` by
-    // `select_approvals_for_capture(auto_build_attempted=true,
-    // approvals)`.
-    let in_blocked =
-        amber_dep_in_blocked_set(&project).expect("build-state.json must exist after install");
-    assert!(
-        !in_blocked,
-        "advisor-approved amber under auto-build MUST drop out of the blocked set; \
-         stderr:\n{stderr}"
-    );
+    assert_security_approval_scope(&out, "scripts-triage");
 
     // Execution contract: spawn assertion ONLY when node is
     // available — the marker is written by the build pipeline AFTER
     // the lifecycle script returns 0, so it's a faithful "script
     // ran" sentinel.
-    if node_available() {
-        let marker = lpm_built_marker(&project);
-        assert!(
-            marker.exists(),
-            "advisor-approved amber MUST have run under auto-build; marker missing at {}; \
-             stderr:\n{stderr}",
-            marker.display(),
-        );
-    }
+    let marker = lpm_built_marker(&project);
+    assert!(
+        !marker.exists(),
+        "advisor-approved amber must not run before triage approval; marker found at {}",
+        marker.display(),
+    );
 }
 
 // ─── Contract 3 — STRANDED APPROVAL ────────────────────────────────────
@@ -514,27 +440,11 @@ async fn triage_advisor_approve_without_auto_build_strands_neither_script_nor_re
         // dep present, `all_trusted` resolves to false, so the
         // only remaining trigger is the missing `--auto-build`
         // flag — `auto_build_attempted = false`.
-        .args(["install", "--triage", "--advisor=claude-cli"])
+        .args(["--json", "install", "--triage", "--advisor=claude-cli"])
         .env("PATH", &path_var)
         .output()
         .expect("spawn lpm install");
-    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    assert!(
-        out.status.success(),
-        "install must succeed under advisor-approve + no-auto-build; stderr:\n{stderr}"
-    );
-
-    // Blocked-set contract — the stranded-approval guard. The
-    // amber dep MUST remain in `.lpm/build-state.json`. A pre-fix
-    // binary would have removed it on the advisor's approval
-    // alone.
-    let in_blocked =
-        amber_dep_in_blocked_set(&project).expect("build-state.json must exist after install");
-    assert!(
-        in_blocked,
-        "STRANDED-APPROVAL REGRESSION: advisor-approved amber without auto-build MUST \
-         remain in the blocked set so `lpm approve-scripts` can review it; stderr:\n{stderr}"
-    );
+    assert_security_approval_scope(&out, "scripts-triage");
 
     // Execution contract: the marker MUST NOT exist. auto-build
     // didn't fire, so the script never spawned regardless of the

@@ -51,6 +51,16 @@ const TEST_SECRET_ENV: &str = "LPM_TEST_SECURITY_SECRET_HEX";
 #[cfg(test)]
 const TEST_AUTH_RESULT_ENV: &str = "LPM_TEST_SECURITY_AUTH_RESULT";
 
+fn force_file_audit_head_backend() -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
+    matches!(
+        std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalScope {
@@ -379,9 +389,7 @@ pub fn security_dir() -> Result<PathBuf, LpmError> {
     {
         return Ok(PathBuf::from(path));
     }
-    let home = dirs::home_dir()
-        .ok_or_else(|| LpmError::Registry("could not determine home dir".into()))?;
-    Ok(home.join(".lpm").join("security"))
+    Ok(lpm_common::LpmRoot::from_env()?.root().join("security"))
 }
 
 fn approved_posture_path() -> Result<PathBuf, LpmError> {
@@ -404,7 +412,10 @@ fn audit_log_path() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("audit.jsonl"))
 }
 
-#[cfg(test)]
+fn signing_secret_path() -> Result<PathBuf, LpmError> {
+    Ok(security_dir()?.join("signing-secret.hex"))
+}
+
 fn audit_head_path() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("audit-head.json"))
 }
@@ -459,6 +470,25 @@ fn test_native_auth_override() -> Option<String> {
     None
 }
 
+#[cfg(not(test))]
+fn keyring_account(base: &str) -> Result<String, LpmError> {
+    if std::env::var_os("LPM_HOME").is_none() {
+        return Ok(base.to_string());
+    }
+    let root = lpm_common::LpmRoot::from_env()?;
+    let digest = hex::encode(Sha256::digest(root.root().display().to_string().as_bytes()));
+    Ok(format!("{base}:{}", &digest[..16]))
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "test build keeps the same fallible account helper signature"
+)]
+fn keyring_account(base: &str) -> Result<String, LpmError> {
+    Ok(base.to_string())
+}
+
 #[cfg_attr(test, allow(dead_code))]
 #[cfg(unix)]
 fn validate_root_owned_path(path: &Path, expect_dir: bool) -> Result<(), LpmError> {
@@ -502,7 +532,7 @@ fn validate_root_owned_path(path: &Path, expect_dir: bool) -> Result<(), LpmErro
 #[cfg(all(unix, not(test)))]
 fn validate_managed_policy_authority(path: &Path) -> Result<(), LpmError> {
     let canonical = std::fs::canonicalize(path)?;
-    if canonical != PathBuf::from(DEFAULT_SECURITY_POLICY_PATH) {
+    if canonical != Path::new(DEFAULT_SECURITY_POLICY_PATH) {
         return Err(managed_policy_error(
             path,
             format!("must resolve to {}", DEFAULT_SECURITY_POLICY_PATH),
@@ -738,6 +768,10 @@ fn validate_managed_policy_authority(path: &Path) -> Result<(), LpmError> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "test stub must preserve the fallible production signature"
+)]
 fn validate_managed_policy_authority(_path: &Path) -> Result<(), LpmError> {
     Ok(())
 }
@@ -889,7 +923,29 @@ fn signing_secret() -> Result<Vec<u8>, LpmError> {
         });
     }
 
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+    if force_file_audit_head_backend() {
+        let path = signing_secret_path()?;
+        if path.exists() {
+            let raw = std::fs::read_to_string(&path)?;
+            return hex::decode(raw.trim()).map_err(|e| {
+                LpmError::Registry(format!(
+                    "security approval file secret is corrupt; remove it and retry: {e}"
+                ))
+            });
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut secret = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut secret);
+        std::fs::write(&path, format!("{}\n", hex::encode(secret)))?;
+        return Ok(secret.to_vec());
+    }
+
+    let account = keyring_account(KEYRING_ACCOUNT)?;
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
         .map_err(|e| LpmError::Registry(format!("security approval keyring error: {e}")))?;
 
     if let Ok(existing) = entry.get_password() {
@@ -1059,6 +1115,18 @@ fn canonical_global_root() -> Result<String, LpmError> {
     Ok(canonical_project_root(
         &lpm_common::LpmRoot::from_env()?.global_root(),
     ))
+}
+
+fn project_dir_is_global_install(project_dir: &Path) -> bool {
+    let Ok(root) = lpm_common::LpmRoot::from_env() else {
+        return false;
+    };
+    let global_installs = root.global_installs();
+    let canonical_global_installs =
+        std::fs::canonicalize(&global_installs).unwrap_or(global_installs);
+    let canonical_project =
+        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    canonical_project.starts_with(canonical_global_installs)
 }
 
 fn normalized_packages(packages: &[String]) -> Vec<String> {
@@ -1238,11 +1306,11 @@ fn persist_global_trust_state(state: &ApprovedGlobalTrustState) -> Result<(), Lp
 fn audit_signature_payload(
     event: &AuditEvent,
     previous_entry_hash: &Option<String>,
-) -> Result<serde_json::Value, LpmError> {
-    Ok(serde_json::json!({
+) -> serde_json::Value {
+    serde_json::json!({
         "payload": event,
         "previous_entry_hash": previous_entry_hash,
-    }))
+    })
 }
 
 fn hash_json_value(value: &serde_json::Value) -> Result<String, LpmError> {
@@ -1258,7 +1326,7 @@ fn verify_audit_envelope(
             "security audit log hash chain is broken; possible tampering".into(),
         ));
     }
-    let payload_value = audit_signature_payload(&envelope.payload, &envelope.previous_entry_hash)?;
+    let payload_value = audit_signature_payload(&envelope.payload, &envelope.previous_entry_hash);
     if hash_json_value(&payload_value)? != envelope.entry_hash {
         return Err(LpmError::Registry(
             "security audit log entry hash does not match payload; possible tampering".into(),
@@ -1331,7 +1399,12 @@ fn persist_audit_head(head: &AuditHead) -> Result<(), LpmError> {
 
 #[cfg(not(test))]
 fn load_audit_head() -> Result<Option<AuditHead>, LpmError> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_AUDIT_HEAD_ACCOUNT)
+    if force_file_audit_head_backend() {
+        return read_signed_json(&audit_head_path()?);
+    }
+
+    let account = keyring_account(KEYRING_AUDIT_HEAD_ACCOUNT)?;
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
         .map_err(|e| LpmError::Registry(format!("security audit keyring error: {e}")))?;
     let raw = match entry.get_password() {
         Ok(value) => value,
@@ -1364,13 +1437,18 @@ fn load_audit_head() -> Result<Option<AuditHead>, LpmError> {
 
 #[cfg(not(test))]
 fn persist_audit_head(head: &AuditHead) -> Result<(), LpmError> {
+    if force_file_audit_head_backend() {
+        return write_signed_json(&audit_head_path()?, head);
+    }
+
     let payload_value = serde_json::to_value(head)?;
     let envelope = SignedEnvelope {
         payload: head.clone(),
         signature: sign_payload_value(&payload_value)?,
     };
     let body = serde_json::to_string(&envelope)?;
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_AUDIT_HEAD_ACCOUNT)
+    let account = keyring_account(KEYRING_AUDIT_HEAD_ACCOUNT)?;
+    keyring::Entry::new(KEYRING_SERVICE, &account)
         .map_err(|e| LpmError::Registry(format!("security audit keyring error: {e}")))?
         .set_password(&body)
         .map_err(|e| LpmError::Registry(format!("security audit keyring write error: {e}")))?;
@@ -1383,21 +1461,19 @@ fn append_audit_event(event: &AuditEvent) -> Result<(), LpmError> {
         std::fs::create_dir_all(parent)?;
     }
     let (previous_entry_hash, entry_count) = read_audit_log_tail(&path)?;
-    if let Some(head) = load_audit_head()? {
-        if head.last_entry_hash != previous_entry_hash.clone().unwrap_or_default()
-            || head.entry_count != entry_count
-        {
-            return Err(LpmError::Registry(
-                "security audit log does not match the signed audit head; possible tampering"
-                    .into(),
-            ));
-        }
+    if let Some(head) = load_audit_head()?
+        && (head.last_entry_hash != previous_entry_hash.as_deref().unwrap_or_default()
+            || head.entry_count != entry_count)
+    {
+        return Err(LpmError::Registry(
+            "security audit log does not match the signed audit head; possible tampering".into(),
+        ));
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    let payload_value = audit_signature_payload(event, &previous_entry_hash)?;
+    let payload_value = audit_signature_payload(event, &previous_entry_hash);
     let entry_hash = hash_json_value(&payload_value)?;
     let envelope = SignedAuditEnvelope {
         payload: event.clone(),
@@ -1415,27 +1491,69 @@ fn append_audit_event(event: &AuditEvent) -> Result<(), LpmError> {
     Ok(())
 }
 
-fn record_audit_event(
-    event: impl Into<String>,
+struct AuditRecord {
+    event: String,
     allowed: bool,
     scopes: Vec<String>,
     project_root: Option<String>,
     packages: Vec<String>,
-    source: Option<&str>,
+    source: Option<String>,
     unlock_id: Option<String>,
     detail: Option<String>,
-) {
+}
+
+impl AuditRecord {
+    fn new(event: impl Into<String>, allowed: bool, scopes: Vec<String>) -> Self {
+        Self {
+            event: event.into(),
+            allowed,
+            scopes,
+            project_root: None,
+            packages: Vec::new(),
+            source: None,
+            unlock_id: None,
+            detail: None,
+        }
+    }
+
+    fn project_root(mut self, project_root: impl Into<String>) -> Self {
+        self.project_root = Some(project_root.into());
+        self
+    }
+
+    fn packages(mut self, packages: Vec<String>) -> Self {
+        self.packages = packages;
+        self
+    }
+
+    fn source(mut self, source: ApprovalSource) -> Self {
+        self.source = Some(source.as_str().to_string());
+        self
+    }
+
+    fn unlock_id(mut self, unlock_id: String) -> Self {
+        self.unlock_id = Some(unlock_id);
+        self
+    }
+
+    fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+fn record_audit_event(record: AuditRecord) {
     let event = AuditEvent {
         schema_version: AUDIT_EVENT_SCHEMA_VERSION,
         occurred_at: Utc::now(),
-        event: event.into(),
-        allowed,
-        scopes,
-        project_root,
-        packages: normalized_packages(&packages),
-        source: source.map(str::to_string),
-        unlock_id,
-        detail,
+        event: record.event,
+        allowed: record.allowed,
+        scopes: record.scopes,
+        project_root: record.project_root,
+        packages: normalized_packages(&record.packages),
+        source: record.source,
+        unlock_id: record.unlock_id,
+        detail: record.detail,
     };
     if let Err(err) = append_audit_event(&event) {
         tracing::warn!("failed to append security audit event: {err}");
@@ -1841,17 +1959,17 @@ fn ensure_project_policy_candidate_authorized(
         let message =
             "project trust or capability state changed outside an LPM-managed approval flow";
         record_audit_event(
-            "guarded-attempt",
-            false,
-            missing_scopes
-                .iter()
-                .map(|scope| scope.as_str().to_string())
-                .collect(),
-            Some(canonical_project_root(project_dir)),
-            Vec::new(),
-            Some(source.as_str()),
-            None,
-            Some(message.to_string()),
+            AuditRecord::new(
+                "guarded-attempt",
+                false,
+                missing_scopes
+                    .iter()
+                    .map(|scope| scope.as_str().to_string())
+                    .collect(),
+            )
+            .project_root(canonical_project_root(project_dir))
+            .source(source)
+            .detail(message),
         );
         if matches!(source, ApprovalSource::CliFlag) && !is_automation(json_output) {
             for scope in &missing_scopes {
@@ -1875,17 +1993,17 @@ fn ensure_project_policy_candidate_authorized(
 
     persist_project_policy_state(project_dir, current)?;
     record_audit_event(
-        "project-policy-authorized",
-        true,
-        required_scopes
-            .iter()
-            .map(|scope| scope.as_str().to_string())
-            .collect(),
-        Some(canonical_project_root(project_dir)),
-        Vec::new(),
-        Some(source.as_str()),
-        None,
-        Some("persisted approved project trust/capability state".to_string()),
+        AuditRecord::new(
+            "project-policy-authorized",
+            true,
+            required_scopes
+                .iter()
+                .map(|scope| scope.as_str().to_string())
+                .collect(),
+        )
+        .project_root(canonical_project_root(project_dir))
+        .source(source)
+        .detail("persisted approved project trust/capability state"),
     );
     Ok(())
 }
@@ -1943,14 +2061,13 @@ fn ensure_global_trust_candidate_authorized(
     )?;
     persist_global_trust_state(current)?;
     record_audit_event(
-        "global-trust-authorized",
-        true,
-        vec![ApprovalScope::TrustBulkApprove.as_str().to_string()],
-        None,
-        Vec::new(),
-        Some(source.as_str()),
-        None,
-        Some("persisted approved global trust state".to_string()),
+        AuditRecord::new(
+            "global-trust-authorized",
+            true,
+            vec![ApprovalScope::TrustBulkApprove.as_str().to_string()],
+        )
+        .source(source)
+        .detail("persisted approved global trust state"),
     );
     Ok(())
 }
@@ -2115,14 +2232,11 @@ fn prompt_for_unlock(
 
     if !confirmed {
         record_audit_event(
-            "guarded-attempt",
-            false,
-            vec![scope.as_str().to_string()],
-            Some(canonical_project_root(project_dir)),
-            packages.to_vec(),
-            Some(ApprovalSource::CliFlag.as_str()),
-            None,
-            Some(format!("user declined {}", scope.as_str())),
+            AuditRecord::new("guarded-attempt", false, vec![scope.as_str().to_string()])
+                .project_root(canonical_project_root(project_dir))
+                .packages(packages.to_vec())
+                .source(ApprovalSource::CliFlag)
+                .detail(format!("user declined {}", scope.as_str())),
         );
         return Err(approval_required_error(
             format!("{} requires explicit approval", scope.as_str()),
@@ -2139,14 +2253,12 @@ fn prompt_for_unlock(
     let grant = create_unlock_grant(scope, project_dir, ttl_secs, min_release_age_secs, packages);
     persist_unlock_grant(&grant)?;
     record_audit_event(
-        "unlock-granted",
-        true,
-        vec![scope.as_str().to_string()],
-        Some(canonical_project_root(project_dir)),
-        packages.to_vec(),
-        Some(ApprovalSource::CliFlag.as_str()),
-        Some(grant.id.clone()),
-        Some(format!("temporary unlock granted for {}", scope.as_str())),
+        AuditRecord::new("unlock-granted", true, vec![scope.as_str().to_string()])
+            .project_root(canonical_project_root(project_dir))
+            .packages(packages.to_vec())
+            .source(ApprovalSource::CliFlag)
+            .unlock_id(grant.id)
+            .detail(format!("temporary unlock granted for {}", scope.as_str())),
     );
     crate::output::success(&format!(
         "Approved {} for this project for {} minute{}.",
@@ -2169,29 +2281,27 @@ pub fn ensure_project_unlock(
     let effective = load_effective_authorized_posture()?;
     if let Some(err) = managed_policy_blocks_scope(&effective, scope) {
         record_audit_event(
-            "guarded-attempt",
-            false,
-            vec![scope.as_str().to_string()],
-            Some(canonical_project_root(project_dir)),
-            packages.to_vec(),
-            Some(source.as_str()),
-            None,
-            Some(message.to_string()),
+            AuditRecord::new("guarded-attempt", false, vec![scope.as_str().to_string()])
+                .project_root(canonical_project_root(project_dir))
+                .packages(packages.to_vec())
+                .source(source)
+                .detail(message),
         );
         return Err(err);
+    }
+    if project_dir_is_global_install(project_dir) {
+        return ensure_global_unlock(scope, json_output, source, message, packages);
     }
     if let Some(grant) =
         find_active_project_unlock(scope, project_dir, min_release_age_secs, packages)?
     {
         record_audit_event(
-            "guarded-attempt",
-            true,
-            vec![scope.as_str().to_string()],
-            Some(canonical_project_root(project_dir)),
-            packages.to_vec(),
-            Some(source.as_str()),
-            Some(grant.id),
-            Some(message.to_string()),
+            AuditRecord::new("guarded-attempt", true, vec![scope.as_str().to_string()])
+                .project_root(canonical_project_root(project_dir))
+                .packages(packages.to_vec())
+                .source(source)
+                .unlock_id(grant.id)
+                .detail(message),
         );
         return Ok(());
     }
@@ -2210,14 +2320,11 @@ pub fn ensure_project_unlock(
     }
 
     record_audit_event(
-        "guarded-attempt",
-        false,
-        vec![scope.as_str().to_string()],
-        Some(canonical_project_root(project_dir)),
-        packages.to_vec(),
-        Some(source.as_str()),
-        None,
-        Some(message.to_string()),
+        AuditRecord::new("guarded-attempt", false, vec![scope.as_str().to_string()])
+            .project_root(canonical_project_root(project_dir))
+            .packages(packages.to_vec())
+            .source(source)
+            .detail(message),
     );
     Err(approval_required_error(
         format!("{} requires explicit approval", scope.as_str()),
@@ -2248,14 +2355,10 @@ fn prompt_for_global_unlock(
 
     if !confirmed {
         record_audit_event(
-            "guarded-attempt",
-            false,
-            vec![scope.as_str().to_string()],
-            None,
-            packages.to_vec(),
-            Some(ApprovalSource::CliFlag.as_str()),
-            None,
-            Some(format!("user declined {}", scope.as_str())),
+            AuditRecord::new("guarded-attempt", false, vec![scope.as_str().to_string()])
+                .packages(packages.to_vec())
+                .source(ApprovalSource::CliFlag)
+                .detail(format!("user declined {}", scope.as_str())),
         );
         return Err(approval_required_error(
             format!("{} requires explicit approval", scope.as_str()),
@@ -2272,17 +2375,14 @@ fn prompt_for_global_unlock(
     let grant = create_global_unlock_grant(scope, ttl_secs, packages);
     persist_unlock_grant(&grant)?;
     record_audit_event(
-        "unlock-granted",
-        true,
-        vec![scope.as_str().to_string()],
-        None,
-        packages.to_vec(),
-        Some(ApprovalSource::CliFlag.as_str()),
-        Some(grant.id.clone()),
-        Some(format!(
-            "temporary global unlock granted for {}",
-            scope.as_str()
-        )),
+        AuditRecord::new("unlock-granted", true, vec![scope.as_str().to_string()])
+            .packages(packages.to_vec())
+            .source(ApprovalSource::CliFlag)
+            .unlock_id(grant.id)
+            .detail(format!(
+                "temporary global unlock granted for {}",
+                scope.as_str()
+            )),
     );
     crate::output::success(&format!(
         "Approved {} globally for {} minute{}.",
@@ -2303,27 +2403,20 @@ pub fn ensure_global_unlock(
     let effective = load_effective_authorized_posture()?;
     if let Some(err) = managed_policy_blocks_scope(&effective, scope) {
         record_audit_event(
-            "guarded-attempt",
-            false,
-            vec![scope.as_str().to_string()],
-            None,
-            packages.to_vec(),
-            Some(source.as_str()),
-            None,
-            Some(message.to_string()),
+            AuditRecord::new("guarded-attempt", false, vec![scope.as_str().to_string()])
+                .packages(packages.to_vec())
+                .source(source)
+                .detail(message),
         );
         return Err(err);
     }
     if let Some(grant) = find_active_global_unlock(scope, packages)? {
         record_audit_event(
-            "guarded-attempt",
-            true,
-            vec![scope.as_str().to_string()],
-            None,
-            packages.to_vec(),
-            Some(source.as_str()),
-            Some(grant.id),
-            Some(message.to_string()),
+            AuditRecord::new("guarded-attempt", true, vec![scope.as_str().to_string()])
+                .packages(packages.to_vec())
+                .source(source)
+                .unlock_id(grant.id)
+                .detail(message),
         );
         return Ok(());
     }
@@ -2335,14 +2428,10 @@ pub fn ensure_global_unlock(
     }
 
     record_audit_event(
-        "guarded-attempt",
-        false,
-        vec![scope.as_str().to_string()],
-        None,
-        packages.to_vec(),
-        Some(source.as_str()),
-        None,
-        Some(message.to_string()),
+        AuditRecord::new("guarded-attempt", false, vec![scope.as_str().to_string()])
+            .packages(packages.to_vec())
+            .source(source)
+            .detail(message),
     );
     Err(approval_required_error(
         format!("{} requires explicit approval", scope.as_str()),
@@ -2390,14 +2479,13 @@ fn confirm_persistent_weakening(
 
 fn record_persistent_guarded_attempt(scope: ApprovalScope, allowed: bool, detail: &str) {
     record_audit_event(
-        "persistent-guarded-attempt",
-        allowed,
-        vec![scope.as_str().to_string()],
-        None,
-        Vec::new(),
-        Some(ApprovalSource::ConfigMutation.as_str()),
-        None,
-        Some(detail.to_string()),
+        AuditRecord::new(
+            "persistent-guarded-attempt",
+            allowed,
+            vec![scope.as_str().to_string()],
+        )
+        .source(ApprovalSource::ConfigMutation)
+        .detail(detail),
     );
 }
 
@@ -2422,6 +2510,7 @@ pub fn authorize_persistent_script_policy(
 ) -> Result<(), LpmError> {
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.script_policy();
+    let weakens_current = requested.loosens(current);
     if requested.loosens(current)
         && matches!(
             effective.sources.script_policy,
@@ -2447,7 +2536,7 @@ pub fn authorize_persistent_script_policy(
     }
 
     let mut posture = load_authorized_posture()?;
-    if requested.loosens(current) {
+    if weakens_current {
         confirm_persistent_weakening(
             approval_scope_for_script_policy(requested),
             json_output,
@@ -2457,6 +2546,16 @@ pub fn authorize_persistent_script_policy(
                 requested.as_str()
             ),
         )?;
+    } else if !matches!(
+        effective.approved_posture_source,
+        PostureSourceKind::ApprovedStore
+    ) {
+        return Ok(());
+    } else {
+        let approved = posture.script_policy();
+        if requested == approved || requested.loosens(approved) {
+            return Ok(());
+        }
     }
     posture.script_policy = requested.as_str().to_string();
     persist_authorized_posture(&posture)
@@ -2469,6 +2568,7 @@ pub fn authorize_persistent_release_age(
 ) -> Result<(), LpmError> {
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.minimum_release_age_secs();
+    let weakens_current = requested_secs < current;
     if requested_secs < current
         && matches!(
             effective.sources.minimum_release_age_secs,
@@ -2490,7 +2590,7 @@ pub fn authorize_persistent_release_age(
     }
 
     let mut posture = load_authorized_posture()?;
-    if requested_secs < current {
+    if weakens_current {
         confirm_persistent_weakening(
             ApprovalScope::CooldownBypass,
             json_output,
@@ -2499,6 +2599,16 @@ pub fn authorize_persistent_release_age(
                 "Persisting `minimum-release-age-secs = {requested_secs}` weakens the approved machine posture."
             ),
         )?;
+    } else if !matches!(
+        effective.approved_posture_source,
+        PostureSourceKind::ApprovedStore
+    ) {
+        return Ok(());
+    } else {
+        let approved = posture.minimum_release_age_secs();
+        if requested_secs <= approved {
+            return Ok(());
+        }
     }
     posture.minimum_release_age_secs = requested_secs;
     persist_authorized_posture(&posture)
@@ -2511,6 +2621,7 @@ pub fn authorize_persistent_sandbox_mode(
 ) -> Result<(), LpmError> {
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.sandbox_mode();
+    let weakens_current = requested.loosens(current);
     if requested.loosens(current)
         && matches!(
             effective.sources.sandbox_mode,
@@ -2536,7 +2647,7 @@ pub fn authorize_persistent_sandbox_mode(
     }
 
     let mut posture = load_authorized_posture()?;
-    if requested.loosens(current) {
+    if weakens_current {
         confirm_persistent_weakening(
             approval_scope_for_sandbox_mode(requested),
             json_output,
@@ -2546,6 +2657,16 @@ pub fn authorize_persistent_sandbox_mode(
                 requested.as_str()
             ),
         )?;
+    } else if !matches!(
+        effective.approved_posture_source,
+        PostureSourceKind::ApprovedStore
+    ) {
+        return Ok(());
+    } else {
+        let approved = posture.sandbox_mode();
+        if requested == approved || requested.loosens(approved) {
+            return Ok(());
+        }
     }
     posture.sandbox_mode = requested.as_str().to_string();
     persist_authorized_posture(&posture)
@@ -2558,7 +2679,8 @@ pub fn authorize_persistent_sigstore(
 ) -> Result<(), LpmError> {
     let effective = load_effective_authorized_posture()?;
     let current = effective.posture.sigstore_verify();
-    if crate::security_floor::sigstore_loosens(requested, current)
+    let weakens_current = crate::security_floor::sigstore_loosens(requested, current);
+    if weakens_current
         && matches!(
             effective.sources.sigstore_verify,
             PostureSourceKind::ManagedPolicy
@@ -2583,7 +2705,7 @@ pub fn authorize_persistent_sigstore(
     }
 
     let mut posture = load_authorized_posture()?;
-    if crate::security_floor::sigstore_loosens(requested, current) {
+    if weakens_current {
         confirm_persistent_weakening(
             ApprovalScope::ProvenanceUnverified,
             json_output,
@@ -2593,6 +2715,16 @@ pub fn authorize_persistent_sigstore(
                 crate::security_floor::sigstore_mode_name(requested)
             ),
         )?;
+    } else if !matches!(
+        effective.approved_posture_source,
+        PostureSourceKind::ApprovedStore
+    ) {
+        return Ok(());
+    } else {
+        let approved = posture.sigstore_verify();
+        if requested == approved || crate::security_floor::sigstore_loosens(requested, approved) {
+            return Ok(());
+        }
     }
     posture.sigstore_verify = crate::security_floor::sigstore_mode_name(requested).to_string();
     persist_authorized_posture(&posture)
@@ -2618,14 +2750,14 @@ pub fn ensure_runtime_sigstore_posture(
             managed_policy_blocks_scope(&effective, ApprovalScope::ProvenanceUnverified)
         {
             record_audit_event(
-                "guarded-attempt",
-                false,
-                vec![ApprovalScope::ProvenanceUnverified.as_str().to_string()],
-                Some(canonical_project_root(project_dir)),
-                Vec::new(),
-                Some(approval_source_for_enforce_source(source).as_str()),
-                None,
-                Some(
+                AuditRecord::new(
+                    "guarded-attempt",
+                    false,
+                    vec![ApprovalScope::ProvenanceUnverified.as_str().to_string()],
+                )
+                .project_root(canonical_project_root(project_dir))
+                .source(approval_source_for_enforce_source(source))
+                .detail(
                     "runtime Sigstore verification posture is weaker than managed policy"
                         .to_string(),
                 ),
@@ -2672,14 +2804,13 @@ pub fn ensure_runtime_sigstore_posture_for_global(
             managed_policy_blocks_scope(&effective, ApprovalScope::ProvenanceUnverified)
         {
             record_audit_event(
-                "guarded-attempt",
-                false,
-                vec![ApprovalScope::ProvenanceUnverified.as_str().to_string()],
-                None,
-                Vec::new(),
-                Some(approval_source_for_enforce_source(source).as_str()),
-                None,
-                Some(
+                AuditRecord::new(
+                    "guarded-attempt",
+                    false,
+                    vec![ApprovalScope::ProvenanceUnverified.as_str().to_string()],
+                )
+                .source(approval_source_for_enforce_source(source))
+                .detail(
                     "runtime Sigstore verification posture is weaker than managed policy"
                         .to_string(),
                 ),
@@ -2747,14 +2878,11 @@ pub fn unlock_scope_command(
     let confirmed = request_native_approval("Approve this temporary security unlock now?")?;
     if !confirmed {
         record_audit_event(
-            "unlock-granted",
-            false,
-            vec![scope.as_str().to_string()],
-            Some(canonical_project_root(project_dir)),
-            packages.to_vec(),
-            Some(ApprovalSource::SecurityCommand.as_str()),
-            None,
-            Some(format!("user declined {}", scope.as_str())),
+            AuditRecord::new("unlock-granted", false, vec![scope.as_str().to_string()])
+                .project_root(canonical_project_root(project_dir))
+                .packages(packages.to_vec())
+                .source(ApprovalSource::SecurityCommand)
+                .detail(format!("user declined {}", scope.as_str())),
         );
         return Err(approval_required_error(
             format!("{} requires explicit approval", scope.as_str()),
@@ -2770,14 +2898,12 @@ pub fn unlock_scope_command(
     let grant = create_unlock_grant(scope, project_dir, ttl_secs, min_release_age_secs, packages);
     persist_unlock_grant(&grant)?;
     record_audit_event(
-        "unlock-granted",
-        true,
-        vec![scope.as_str().to_string()],
-        Some(canonical_project_root(project_dir)),
-        packages.to_vec(),
-        Some(ApprovalSource::SecurityCommand.as_str()),
-        Some(grant.id.clone()),
-        Some(format!("temporary unlock granted for {}", scope.as_str())),
+        AuditRecord::new("unlock-granted", true, vec![scope.as_str().to_string()])
+            .project_root(canonical_project_root(project_dir))
+            .packages(packages.to_vec())
+            .source(ApprovalSource::SecurityCommand)
+            .unlock_id(grant.id.clone())
+            .detail(format!("temporary unlock granted for {}", scope.as_str())),
     );
     Ok(grant)
 }
@@ -2822,14 +2948,10 @@ pub fn unlock_global_scope_command(
     let confirmed = request_native_approval("Approve this temporary global security unlock now?")?;
     if !confirmed {
         record_audit_event(
-            "unlock-granted",
-            false,
-            vec![scope.as_str().to_string()],
-            None,
-            packages.to_vec(),
-            Some(ApprovalSource::SecurityCommand.as_str()),
-            None,
-            Some(format!("user declined {}", scope.as_str())),
+            AuditRecord::new("unlock-granted", false, vec![scope.as_str().to_string()])
+                .packages(packages.to_vec())
+                .source(ApprovalSource::SecurityCommand)
+                .detail(format!("user declined {}", scope.as_str())),
         );
         return Err(approval_required_error(
             format!("{} requires explicit approval", scope.as_str()),
@@ -2845,17 +2967,14 @@ pub fn unlock_global_scope_command(
     let grant = create_global_unlock_grant(scope, ttl_secs, packages);
     persist_unlock_grant(&grant)?;
     record_audit_event(
-        "unlock-granted",
-        true,
-        vec![scope.as_str().to_string()],
-        None,
-        packages.to_vec(),
-        Some(ApprovalSource::SecurityCommand.as_str()),
-        Some(grant.id.clone()),
-        Some(format!(
-            "temporary global unlock granted for {}",
-            scope.as_str()
-        )),
+        AuditRecord::new("unlock-granted", true, vec![scope.as_str().to_string()])
+            .packages(packages.to_vec())
+            .source(ApprovalSource::SecurityCommand)
+            .unlock_id(grant.id.clone())
+            .detail(format!(
+                "temporary global unlock granted for {}",
+                scope.as_str()
+            )),
     );
     Ok(grant)
 }
@@ -3031,6 +3150,70 @@ script-policy = "deny"
             .unwrap_err();
             assert_eq!(err.error_code(), "security_floor");
             assert!(err.to_string().contains("managed security policy"));
+        });
+    }
+
+    #[test]
+    fn persistent_strict_sigstore_write_from_builtin_default_skips_signed_store() {
+        let temp = tempdir().unwrap();
+        with_test_env(temp.path(), || {
+            let posture_path = approved_posture_path().unwrap();
+            assert!(!posture_path.exists());
+
+            authorize_persistent_sigstore(
+                EnforceMode::Deny,
+                true,
+                "lpm config sigstore --set deny",
+            )
+            .unwrap();
+
+            assert!(
+                !posture_path.exists(),
+                "strict/equal writes from the builtin floor must not require native secure storage",
+            );
+        });
+    }
+
+    #[test]
+    fn persistent_strict_sigstore_write_revokes_existing_weaker_approval() {
+        let temp = tempdir().unwrap();
+        with_test_env(temp.path(), || {
+            let posture = AuthorizedPosture {
+                sigstore_verify: "off".into(),
+                ..AuthorizedPosture::default()
+            };
+            persist_authorized_posture(&posture).unwrap();
+
+            authorize_persistent_sigstore(
+                EnforceMode::Deny,
+                true,
+                "lpm config sigstore --set deny",
+            )
+            .unwrap();
+
+            let loaded = load_authorized_posture().unwrap();
+            assert_eq!(loaded.sigstore_verify(), EnforceMode::Deny);
+        });
+    }
+
+    #[test]
+    fn persistent_default_release_age_from_builtin_default_skips_signed_store() {
+        let temp = tempdir().unwrap();
+        with_test_env(temp.path(), || {
+            let posture_path = approved_posture_path().unwrap();
+            assert!(!posture_path.exists());
+
+            authorize_persistent_release_age(
+                DEFAULT_MIN_RELEASE_AGE_SECS,
+                true,
+                "lpm config release-age --set default",
+            )
+            .unwrap();
+
+            assert!(
+                !posture_path.exists(),
+                "default release-age writes must not create a signed posture record",
+            );
         });
     }
 

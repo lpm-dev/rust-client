@@ -68,7 +68,7 @@ const GLOBAL_KEY: &str = "minimum-release-age-secs";
 pub fn parse_duration(input: &str) -> Result<u64, LpmError> {
     if input.is_empty() {
         return Err(LpmError::Registry(
-            "release-age duration must not be empty (expected `<N>h`, `<N>d`, or `<N>` seconds)"
+            "release-age duration must not be empty (expected `<N>m`, `<N>h`, `<N>d`, or `<N>` seconds)"
                 .into(),
         ));
     }
@@ -78,7 +78,12 @@ pub fn parse_duration(input: &str) -> Result<u64, LpmError> {
         )));
     }
 
-    if let Some(hours_str) = input.strip_suffix('h') {
+    if let Some(minutes_str) = input.strip_suffix('m') {
+        let minutes = parse_scalar(minutes_str, input)?;
+        minutes
+            .checked_mul(60)
+            .ok_or_else(|| overflow_err(input, "minutes"))
+    } else if let Some(hours_str) = input.strip_suffix('h') {
         let hours = parse_scalar(hours_str, input)?;
         hours
             .checked_mul(3600)
@@ -93,7 +98,7 @@ pub fn parse_duration(input: &str) -> Result<u64, LpmError> {
         .is_some_and(|c| c.is_ascii_alphabetic())
     {
         Err(LpmError::Registry(format!(
-            "release-age duration `{input}` has an unsupported unit (expected `h`, `d`, or plain seconds)"
+            "release-age duration `{input}` has an unsupported unit (expected `m`, `h`, `d`, or plain seconds)"
         )))
     } else {
         parse_scalar(input, input)
@@ -103,7 +108,7 @@ pub fn parse_duration(input: &str) -> Result<u64, LpmError> {
 fn parse_scalar(scalar: &str, original: &str) -> Result<u64, LpmError> {
     if scalar.is_empty() {
         return Err(LpmError::Registry(format!(
-            "release-age duration `{original}` has no numeric value (expected `<N>h`, `<N>d`, or `<N>` seconds)"
+            "release-age duration `{original}` has no numeric value (expected `<N>m`, `<N>h`, `<N>d`, or `<N>` seconds)"
         )));
     }
     if scalar.starts_with('-') {
@@ -351,6 +356,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_minutes_suffix() {
+        assert_eq!(parse_duration("10m").unwrap(), 600);
+    }
+
+    #[test]
+    fn parse_zero_minutes() {
+        assert_eq!(parse_duration("0m").unwrap(), 0);
+    }
+
+    #[test]
     fn parse_days_suffix() {
         assert_eq!(parse_duration("3d").unwrap(), 3 * 86400);
     }
@@ -404,12 +419,6 @@ mod tests {
     fn reject_lone_days_suffix() {
         let err = parse_duration("d").unwrap_err().to_string();
         assert!(err.contains("no numeric value"), "got: {err}");
-    }
-
-    #[test]
-    fn reject_minutes_suffix() {
-        let err = parse_duration("72m").unwrap_err().to_string();
-        assert!(err.contains("unsupported unit"), "got: {err}");
     }
 
     #[test]

@@ -34,6 +34,7 @@
 
 mod support;
 
+use support::assertions;
 use support::build_state::seed_global_install_blocked_state_with_tier;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_with_registry};
@@ -175,17 +176,6 @@ async fn mount_global_scripted_tool_version(
     .await;
 }
 
-/// The allow-policy test proves real lifecycle execution by checking for this
-/// marker in the v1 store entry. Workflow tests pin `LPM_STORE_VERSION=v1` in
-/// `support::lpm()`, so this path is deterministic.
-fn global_store_pkg_dir(project: &TempProject, version: &str) -> std::path::PathBuf {
-    let safe = GLOBAL_E2E_PKG.replace(['/', '\\'], "+");
-    project
-        .store_dir()
-        .join("v1")
-        .join(format!("{safe}@{version}"))
-}
-
 /// Tests that require actual lifecycle spawn skip if `node` is absent rather
 /// than failing in stripped-down environments.
 fn node_available() -> bool {
@@ -244,81 +234,25 @@ fn assert_cooldown_blocked(out: &std::process::Output) {
     );
 }
 
-fn assert_cooldown_not_blocked(out: &std::process::Output) {
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !combined.contains("blocked by minimumReleaseAge")
-            && !combined.contains("published too recently"),
-        "cooldown must not fire but the block message appeared; got:\n{combined}"
-    );
-}
-
-fn drift_block_message_present(out: &std::process::Output) -> bool {
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    combined.contains("blocked by provenance drift")
-        || combined.contains("package(s) blocked by provenance drift")
-}
-
-fn assert_drift_blocked(out: &std::process::Output) {
-    assert!(
-        !out.status.success(),
-        "global install must fail with a drift block; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        drift_block_message_present(out),
-        "output must name the drift block; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn assert_global_install_json_success(
-    project: &TempProject,
-    out: &std::process::Output,
-    expected_version: &str,
-) {
-    assert!(
-        out.status.success(),
-        "global install must exit 0; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "stdout must be valid JSON: {e}\nstdout:\n{}",
-            String::from_utf8_lossy(&out.stdout)
-        )
-    });
-    assert_eq!(parsed["success"], serde_json::json!(true));
-    assert_eq!(parsed["package"], serde_json::json!(GLOBAL_E2E_PKG));
-    assert_eq!(parsed["version"], serde_json::json!(expected_version));
-    let commands = parsed["commands"]
+fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &str) {
+    let envelope = assertions::assert_security_approval_required(out);
+    let scopes = envelope["error"]["requested_scopes"]
         .as_array()
-        .expect("commands must be an array in the global install JSON envelope");
+        .unwrap_or_else(|| panic!("security approval envelope must include scopes: {envelope}"));
     assert!(
-        commands
-            .iter()
-            .any(|value| value.as_str() == Some(GLOBAL_E2E_COMMAND)),
-        "commands must include the discovered bin `{GLOBAL_E2E_COMMAND}`; envelope={parsed}"
+        scopes.iter().any(|scope| scope == expected_scope),
+        "security approval envelope must include scope `{expected_scope}`; got {envelope}",
+    );
+    assert_eq!(
+        envelope["error"]["project_root"],
+        serde_json::Value::Null,
+        "global approval requirements must not masquerade as project-scoped; got {envelope}",
     );
     assert!(
-        project
-            .home()
-            .join(".lpm")
-            .join("global")
-            .join("manifest.toml")
-            .exists(),
-        "successful global install must write ~/.lpm/global/manifest.toml"
+        envelope["error"]["suggested_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--global")),
+        "global approval envelope must suggest a --global unlock; got {envelope}",
     );
 }
 
@@ -540,10 +474,10 @@ async fn install_global_min_release_age_cli_override_blocks_fresh_package() {
     );
 }
 
-/// Real `install -g` success path: `--allow-new` must bypass the cooldown and
-/// let the executable package fully commit into `~/.lpm/global`.
+/// `install -g --allow-new` is a guarded global cooldown bypass. The
+/// workflow tier asserts the non-interactive JSON approval boundary.
 #[tokio::test]
-async fn install_global_allow_new_bypasses_min_release_age_end_to_end() {
+async fn install_global_allow_new_requires_security_approval() {
     let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     let mock = MockRegistry::start().await;
     mount_global_tool_version(
@@ -565,16 +499,13 @@ async fn install_global_allow_new_bypasses_min_release_age_end_to_end() {
         .output()
         .expect("spawn lpm install -g with allow-new");
 
-    assert_cooldown_not_blocked(&out);
-    assert_global_install_json_success(&project, &out, GLOBAL_E2E_CANDIDATE_VERSION);
+    assert_security_approval_scope(&out, "cooldown-bypass");
 }
 
-/// Real `install -g` drift block: the global trust file records an approved
-/// provenance snapshot for v1.0.0, while the candidate v1.0.1 has no
-/// attestation field at all. The install must stop on the "provenance dropped"
-/// path just like the project-scope workflow does.
+/// A hand-edited global trust file is guarded before `install -g` can
+/// use it as a provenance reference.
 #[tokio::test]
-async fn install_global_drift_blocks_when_approved_attestation_dropped() {
+async fn install_global_direct_trust_requires_security_approval_before_drift_gate() {
     let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     write_global_trust_with_approval(&project);
     let mock = MockRegistry::start().await;
@@ -586,29 +517,18 @@ async fn install_global_drift_blocks_when_approved_attestation_dropped() {
     .await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install", "-g", GLOBAL_E2E_PKG])
+        .args(["--json", "install", "-g", GLOBAL_E2E_PKG])
         .output()
         .expect("spawn lpm install -g with approved provenance reference");
 
-    assert_drift_blocked(&out);
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        combined.contains("provenance dropped"),
-        "block message must name the 'provenance dropped' verdict; got:\n{combined}"
-    );
+    assert_security_approval_scope(&out, "trust-bulk-approve");
 }
 
-/// Real `install -g` drift-waive path: the same approved-present ->
-/// candidate-absent scenario must succeed when the package is explicitly
-/// listed in `--ignore-provenance-drift`.
+/// `install -g --ignore-provenance-drift <pkg>` is a guarded global
+/// provenance bypass.
 #[tokio::test]
-async fn install_global_ignore_provenance_drift_per_package_unblocks() {
+async fn install_global_ignore_provenance_drift_per_package_requires_security_approval() {
     let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
-    write_global_trust_with_approval(&project);
     let mock = MockRegistry::start().await;
     mount_global_tool_version(
         &mock,
@@ -629,22 +549,14 @@ async fn install_global_ignore_provenance_drift_per_package_unblocks() {
         .output()
         .expect("spawn lpm install -g with provenance-drift waiver");
 
-    assert!(
-        !drift_block_message_present(&out),
-        "drift block message must not appear once the package is waived; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_global_install_json_success(&project, &out, GLOBAL_E2E_CANDIDATE_VERSION);
+    assert_security_approval_scope(&out, "provenance-ignore-drift");
 }
 
-/// Blanket waiver end-to-end: `--ignore-provenance-drift-all` must bypass the
-/// same approved-present -> candidate-absent block and surface the explicit
-/// blanket-waive advisory.
+/// `install -g --ignore-provenance-drift-all` is guarded separately
+/// from the per-package form.
 #[tokio::test]
-async fn install_global_ignore_provenance_drift_all_unblocks() {
+async fn install_global_ignore_provenance_drift_all_requires_security_approval() {
     let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
-    write_global_trust_with_approval(&project);
     let mock = MockRegistry::start().await;
     mount_global_tool_version(
         &mock,
@@ -664,33 +576,16 @@ async fn install_global_ignore_provenance_drift_all_unblocks() {
         .output()
         .expect("spawn lpm install -g with blanket provenance waiver");
 
-    assert!(
-        !drift_block_message_present(&out),
-        "drift block message must not appear once all drift checks are waived; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        combined.contains("waived for this install by --ignore-provenance-drift-all"),
-        "blanket-waive advisory must be visible to the user; got:\n{combined}"
-    );
-    assert_global_install_json_success(&project, &out, GLOBAL_E2E_CANDIDATE_VERSION);
+    assert_security_approval_scope(&out, "provenance-ignore-drift");
 }
 
-/// Real policy/auto-build path: `install -g --policy=allow` must not just wire
-/// the flag through `run_with_options` — it must actually execute the package's
-/// lifecycle-script pipeline during install. The rebuild layer's canonical
-/// success proof is the `.lpm-built` marker under the store entry.
+/// `install -g --policy=allow` is a guarded global script execution
+/// request. Without approval, JSON mode must stop deterministically.
 #[tokio::test]
-async fn install_global_policy_allow_runs_postinstall_end_to_end() {
+async fn install_global_policy_allow_requires_security_approval() {
     if !node_available() {
         eprintln!(
-            "skipping install_global_policy_allow_runs_postinstall_end_to_end: node not available"
+            "skipping install_global_policy_allow_requires_security_approval: node not available"
         );
         return;
     }
@@ -709,13 +604,7 @@ async fn install_global_policy_allow_runs_postinstall_end_to_end() {
         .output()
         .expect("spawn lpm install -g with --policy=allow");
 
-    assert_global_install_json_success(&project, &out, GLOBAL_E2E_CANDIDATE_VERSION);
-
-    let store_dir = global_store_pkg_dir(&project, GLOBAL_E2E_CANDIDATE_VERSION);
-    assert!(
-        store_dir.join(".lpm-built").exists(),
-        "allow-policy install must mark the package as built under the global store entry, proving the auto-build pipeline ran successfully"
-    );
+    assert_security_approval_scope(&out, "scripts-allow");
 }
 
 /// `approve-scripts --global --yes --dry-run --json` must NOT emit a
@@ -756,12 +645,11 @@ fn approve_scripts_global_yes_dry_run_json_omits_next_step() {
     );
 }
 
-/// `approve-scripts --global --yes --json` (live, no `--dry-run`)
-/// carries the structured `next_step.origins` field. Pinned by
-/// round-3 finding (h): banners must enumerate the top-level
-/// globally-installed origins, not the approved row's own name.
+/// `approve-scripts --global --yes --json` is a live global trust
+/// mutation. Without native approval it should return the global unlock
+/// remediation rather than writing trust state.
 #[test]
-fn approve_scripts_global_yes_live_json_carries_next_step_origins() {
+fn approve_scripts_global_yes_live_json_requires_security_approval() {
     let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     seed_global_manifest_and_blocked_state(&project, "eslint", "9.24.0", "esbuild", "0.25.1");
 
@@ -769,42 +657,7 @@ fn approve_scripts_global_yes_live_json_carries_next_step_origins() {
         .args(["--json", "approve-scripts", "--global", "--yes"])
         .output()
         .expect("spawn lpm approve-scripts --global --yes");
-    assert!(
-        out.status.success(),
-        "approve-scripts --global --yes --json must exit 0; \
-         stderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let parsed: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("valid JSON envelope on stdout");
-    assert_eq!(parsed.get("dry_run").and_then(|v| v.as_bool()), Some(false));
-
-    let next_step = parsed
-        .get("next_step")
-        .expect("live envelope must carry `next_step` (Phase 68)");
-    assert_eq!(
-        next_step.get("kind").and_then(|v| v.as_str()),
-        Some("reinstall_globals"),
-        "next_step.kind must be `reinstall_globals`",
-    );
-    let origins = next_step
-        .get("origins")
-        .and_then(|v| v.as_array())
-        .expect("next_step.origins must be an array");
-    let names: Vec<&str> = origins.iter().filter_map(|v| v.as_str()).collect();
-    // The top-level global is `eslint` (NOT the blocked transitive
-    // `esbuild`). Banner contract: enumerate origins, not
-    // row names.
-    assert!(
-        names.contains(&"eslint"),
-        "origins must include the top-level global `eslint`. names={names:?}"
-    );
-    assert!(
-        !names.contains(&"esbuild"),
-        "origins must NOT include the approved row's name (`esbuild`) — \
-         it's a transitive blocked package, not a top-level global. names={names:?}"
-    );
+    assert_security_approval_scope(&out, "trust-bulk-approve");
 }
 
 // ── M75: tier gate parity for global bulk approval ──────────────────
@@ -876,11 +729,10 @@ fn approve_scripts_global_yes_refuses_amber_tier() {
     );
 }
 
-/// `--global --yes` MUST allow bulk-approval when every aggregate row
-/// is green-tier. Verifies the gate isn't over-eager: green is the
-/// happy path.
+/// `--global --yes` with all-green rows is still a live trust write and
+/// therefore requires global approval.
 #[test]
-fn approve_scripts_global_yes_allows_green_tier() {
+fn approve_scripts_global_yes_green_tier_requires_security_approval() {
     let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     seed_global_manifest_and_blocked_state_with_tier(
         &project,
@@ -895,28 +747,15 @@ fn approve_scripts_global_yes_allows_green_tier() {
         .args(["--json", "approve-scripts", "--global", "--yes"])
         .output()
         .expect("spawn lpm approve-scripts --global --yes");
-    assert!(
-        out.status.success(),
-        "approve-scripts --global --yes must succeed for an all-green aggregate; \
-         stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let parsed: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("valid JSON envelope on stdout");
-    assert_eq!(
-        parsed.get("approved_count").and_then(|v| v.as_u64()),
-        Some(1)
-    );
+    assert_security_approval_scope(&out, "trust-bulk-approve");
     let trust_path = project
         .home()
         .join(".lpm")
         .join("global")
         .join("trusted-dependencies.json");
     assert!(
-        trust_path.exists(),
-        "trust file must be written on successful bulk approval; expected {}",
+        !trust_path.exists(),
+        "trust file must not be written without approval; found {}",
         trust_path.display()
     );
 }
@@ -1148,13 +987,10 @@ fn uninstall_fail_safe_when_other_install_lockfile_missing() {
     );
 }
 
-/// Pre-classification legacy state — build-state.json rows without the
-/// `static_tier` field — MUST pass through the global tier gate so
-/// older clients' captured state remains approvable via `--yes` after a
-/// binary upgrade. Parity with the project gate's
-/// `yes_gate_allows_none_tiered_legacy_state` contract.
+/// Pre-classification legacy state still attempts a live global trust
+/// write, so workflow coverage stops at the approval boundary.
 #[test]
-fn approve_scripts_global_yes_passes_through_none_tier_legacy_state() {
+fn approve_scripts_global_yes_none_tier_legacy_state_requires_security_approval() {
     let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     seed_global_manifest_and_blocked_state_with_tier(
         &project, "eslint", "9.24.0", "esbuild", "0.25.1",
@@ -1165,11 +1001,5 @@ fn approve_scripts_global_yes_passes_through_none_tier_legacy_state() {
         .args(["--json", "approve-scripts", "--global", "--yes"])
         .output()
         .expect("spawn lpm approve-scripts --global --yes");
-    assert!(
-        out.status.success(),
-        "approve-scripts --global --yes must succeed for legacy None-tier state; \
-         stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
+    assert_security_approval_scope(&out, "trust-bulk-approve");
 }

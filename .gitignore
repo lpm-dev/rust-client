@@ -3,6 +3,8 @@ Cargo.lock
 .npmrc
 .lpm/certs/
 
+AGENTS.md
+
 CLAUDE.md
 AGENTS
 .claude/
