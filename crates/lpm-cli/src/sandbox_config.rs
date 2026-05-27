@@ -142,6 +142,7 @@ pub fn resolve_sandbox_mode_from_chain(
                 crate::security_approval::ApprovalSource::CliFlag,
                 "This install request disables the sandbox for this project.",
                 None,
+                &[],
             )?;
             true
         } else {
@@ -158,6 +159,7 @@ pub fn resolve_sandbox_mode_from_chain(
             crate::security_approval::ApprovalSource::ProjectConfig,
             "lpm.toml requests a weaker sandbox mode than this machine has approved.",
             None,
+            &[],
         )?;
         true
     } else {
@@ -202,6 +204,7 @@ pub fn resolve_sandbox_mode_from_chain(
                 crate::security_approval::ApprovalSource::ProjectConfig,
                 "lpm.toml enables sandbox.allow-degraded beyond this machine's approved posture.",
                 None,
+                &[],
             )?;
             true
         } else {

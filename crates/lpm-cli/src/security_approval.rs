@@ -17,9 +17,11 @@ use hmac::{Hmac, Mac};
 use lpm_common::LpmError;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use std::io::IsTerminal;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -32,7 +34,11 @@ const KEYRING_ACCOUNT: &str = "signing-secret-v1";
 const SECURITY_DIR_ENV: &str = "LPM_SECURITY_DIR";
 const SECURITY_POLICY_PATH_ENV: &str = "LPM_SECURITY_POLICY_PATH";
 const TEST_SECRET_ENV: &str = "LPM_TEST_SECURITY_SECRET_HEX";
+const TEST_AUTH_RESULT_ENV: &str = "LPM_TEST_SECURITY_AUTH_RESULT";
 const DEFAULT_SECURITY_POLICY_PATH: &str = "/etc/lpm/security-policy.toml";
+const APPROVED_PROJECT_STATE_SCHEMA_VERSION: u32 = 1;
+const APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION: u32 = 1;
+const AUDIT_EVENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -80,6 +86,18 @@ pub enum ApprovalSource {
     GlobalConfig,
     ConfigMutation,
     SecurityCommand,
+}
+
+impl ApprovalSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CliFlag => "cli-flag",
+            Self::ProjectConfig => "project-config",
+            Self::GlobalConfig => "global-config",
+            Self::ConfigMutation => "config-mutation",
+            Self::SecurityCommand => "security-command",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,6 +267,47 @@ pub struct UnlockGrant {
     pub issuer: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ApprovedProjectPolicyState {
+    pub schema_version: u32,
+    pub updated_at: DateTime<Utc>,
+    pub project_root: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trusted_dependencies: BTreeMap<String, crate::trust_snapshot::SnapshotEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_scopes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_request_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ApprovedGlobalTrustState {
+    pub schema_version: u32,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trusted_dependencies: BTreeMap<String, lpm_global::TrustedDependencyBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AuditEvent {
+    pub schema_version: u32,
+    pub occurred_at: DateTime<Utc>,
+    pub event: String,
+    pub allowed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlock_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SignedEnvelope<T> {
     payload: T,
@@ -272,6 +331,18 @@ fn approved_posture_path() -> Result<PathBuf, LpmError> {
 
 fn unlocks_dir() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("unlocks"))
+}
+
+fn approved_projects_dir() -> Result<PathBuf, LpmError> {
+    Ok(security_dir()?.join("projects"))
+}
+
+fn approved_global_trust_path() -> Result<PathBuf, LpmError> {
+    Ok(security_dir()?.join("approved-global-trust.json"))
+}
+
+fn audit_log_path() -> Result<PathBuf, LpmError> {
+    Ok(security_dir()?.join("audit.jsonl"))
 }
 
 fn managed_policy_path() -> PathBuf {
@@ -586,6 +657,9 @@ pub fn persist_authorized_posture(posture: &AuthorizedPosture) -> Result<(), Lpm
 }
 
 pub fn is_automation(json_output: bool) -> bool {
+    if std::env::var_os(TEST_AUTH_RESULT_ENV).is_some() {
+        return false;
+    }
     json_output
         || !std::io::stdin().is_terminal()
         || !std::io::stdout().is_terminal()
@@ -602,11 +676,201 @@ fn canonical_project_root(project_dir: &Path) -> String {
         .to_string()
 }
 
-fn suggested_unlock_command(scope: ApprovalScope) -> String {
-    format!(
+fn normalized_packages(packages: &[String]) -> Vec<String> {
+    let mut values: Vec<_> = packages
+        .iter()
+        .map(|pkg| pkg.trim())
+        .filter(|pkg| !pkg.is_empty())
+        .map(str::to_string)
+        .collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn suggested_unlock_command(scope: ApprovalScope, packages: &[String]) -> String {
+    let mut command = format!(
         "lpm security unlock {} --project . --ttl 10m",
         scope.as_str()
+    );
+    for package in normalized_packages(packages) {
+        command.push_str(&format!(" --package {package}"));
+    }
+    command
+}
+
+fn project_policy_state_path(project_dir: &Path) -> Result<PathBuf, LpmError> {
+    let root = canonical_project_root(project_dir);
+    let id = hex::encode(Sha256::digest(root.as_bytes()));
+    Ok(approved_projects_dir()?.join(format!("{id}.json")))
+}
+
+fn read_project_trusted_dependencies(
+    project_dir: &Path,
+) -> Result<lpm_workspace::TrustedDependencies, LpmError> {
+    let pkg_json_path = project_dir.join("package.json");
+    if !pkg_json_path.exists() {
+        return Ok(lpm_workspace::TrustedDependencies::default());
+    }
+    let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+        .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
+    Ok(pkg
+        .lpm
+        .map(|lpm| lpm.trusted_dependencies)
+        .unwrap_or_default())
+}
+
+fn trusted_dependencies_snapshot(
+    trusted: &lpm_workspace::TrustedDependencies,
+) -> BTreeMap<String, crate::trust_snapshot::SnapshotEntry> {
+    crate::trust_snapshot::TrustSnapshot::capture_current(trusted).bindings
+}
+
+fn current_trusted_scopes(project_dir: &Path) -> BTreeSet<String> {
+    crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir)
+        .trusted_scopes
+        .into_iter()
+        .collect()
+}
+
+fn current_capability_request_hash(project_dir: &Path) -> Result<Option<String>, LpmError> {
+    let global = crate::commands::config::GlobalConfig::load();
+    let user_bound = crate::capability::UserBound::from_global_config(&global);
+    let capability_set =
+        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    Ok(if capability_set.loosens_beyond(&user_bound) {
+        Some(capability_set.canonical_hash())
+    } else {
+        None
+    })
+}
+
+fn current_project_policy_state(
+    project_dir: &Path,
+) -> Result<ApprovedProjectPolicyState, LpmError> {
+    let trusted = read_project_trusted_dependencies(project_dir)?;
+    candidate_project_policy_state(project_dir, &trusted)
+}
+
+fn candidate_project_policy_state(
+    project_dir: &Path,
+    trusted: &lpm_workspace::TrustedDependencies,
+) -> Result<ApprovedProjectPolicyState, LpmError> {
+    let mut trusted_scopes: Vec<_> = current_trusted_scopes(project_dir).into_iter().collect();
+    trusted_scopes.sort();
+    Ok(ApprovedProjectPolicyState {
+        schema_version: APPROVED_PROJECT_STATE_SCHEMA_VERSION,
+        updated_at: Utc::now(),
+        project_root: canonical_project_root(project_dir),
+        trusted_dependencies: trusted_dependencies_snapshot(trusted),
+        trusted_scopes,
+        capability_request_hash: current_capability_request_hash(project_dir)?,
+    })
+}
+
+fn load_approved_project_policy_state(
+    project_dir: &Path,
+) -> Result<ApprovedProjectPolicyState, LpmError> {
+    Ok(
+        read_signed_json(&project_policy_state_path(project_dir)?)?.unwrap_or_else(|| {
+            ApprovedProjectPolicyState {
+                schema_version: APPROVED_PROJECT_STATE_SCHEMA_VERSION,
+                updated_at: Utc::now(),
+                project_root: canonical_project_root(project_dir),
+                trusted_dependencies: BTreeMap::new(),
+                trusted_scopes: Vec::new(),
+                capability_request_hash: None,
+            }
+        }),
     )
+}
+
+fn persist_project_policy_state(
+    project_dir: &Path,
+    state: &ApprovedProjectPolicyState,
+) -> Result<(), LpmError> {
+    let mut normalized = state.clone();
+    normalized.schema_version = APPROVED_PROJECT_STATE_SCHEMA_VERSION;
+    normalized.updated_at = Utc::now();
+    normalized.project_root = canonical_project_root(project_dir);
+    normalized.trusted_scopes.sort();
+    normalized.trusted_scopes.dedup();
+    write_signed_json(&project_policy_state_path(project_dir)?, &normalized)
+}
+
+fn current_global_trust_state(
+    root: &lpm_common::LpmRoot,
+) -> Result<ApprovedGlobalTrustState, LpmError> {
+    let trust = lpm_global::trusted_deps::read_for(root)?;
+    Ok(candidate_global_trust_state(&trust))
+}
+
+fn candidate_global_trust_state(
+    trust: &lpm_global::GlobalTrustedDependencies,
+) -> ApprovedGlobalTrustState {
+    ApprovedGlobalTrustState {
+        schema_version: APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION,
+        updated_at: Utc::now(),
+        trusted_dependencies: trust.trusted.clone(),
+    }
+}
+
+fn load_approved_global_trust_state() -> Result<ApprovedGlobalTrustState, LpmError> {
+    Ok(
+        read_signed_json(&approved_global_trust_path()?)?.unwrap_or(ApprovedGlobalTrustState {
+            schema_version: APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION,
+            updated_at: Utc::now(),
+            trusted_dependencies: BTreeMap::new(),
+        }),
+    )
+}
+
+fn persist_global_trust_state(state: &ApprovedGlobalTrustState) -> Result<(), LpmError> {
+    let mut normalized = state.clone();
+    normalized.schema_version = APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION;
+    normalized.updated_at = Utc::now();
+    write_signed_json(&approved_global_trust_path()?, &normalized)
+}
+
+fn append_audit_event(event: &AuditEvent) -> Result<(), LpmError> {
+    let path = audit_log_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{}", serde_json::to_string(event)?)?;
+    Ok(())
+}
+
+fn record_audit_event(
+    event: impl Into<String>,
+    allowed: bool,
+    scopes: Vec<String>,
+    project_root: Option<String>,
+    packages: Vec<String>,
+    source: Option<&str>,
+    unlock_id: Option<String>,
+    detail: Option<String>,
+) {
+    let event = AuditEvent {
+        schema_version: AUDIT_EVENT_SCHEMA_VERSION,
+        occurred_at: Utc::now(),
+        event: event.into(),
+        allowed,
+        scopes,
+        project_root,
+        packages: normalized_packages(&packages),
+        source: source.map(str::to_string),
+        unlock_id,
+        detail,
+    };
+    if let Err(err) = append_audit_event(&event) {
+        tracing::warn!("failed to append security audit event: {err}");
+    }
 }
 
 fn managed_policy_write_error(
@@ -642,6 +906,7 @@ fn create_unlock_grant(
     project_dir: &Path,
     ttl_secs: u64,
     min_release_age_secs: Option<u64>,
+    packages: &[String],
 ) -> UnlockGrant {
     let now = Utc::now();
     UnlockGrant {
@@ -649,13 +914,13 @@ fn create_unlock_grant(
         id: format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
         project_root: Some(canonical_project_root(project_dir)),
         scopes: vec![scope],
-        packages: Vec::new(),
+        packages: normalized_packages(packages),
         limits: UnlockLimits {
             min_release_age_secs,
         },
         issued_at: now,
         expires_at: now + chrono::Duration::seconds(ttl_secs as i64),
-        issuer: "interactive-confirmation".to_string(),
+        issuer: "user-presence".to_string(),
     }
 }
 
@@ -727,12 +992,254 @@ pub fn load_security_status(project_dir: Option<&Path>) -> Result<SecurityStatus
     })
 }
 
+fn trusted_dependencies_widened(
+    current: &BTreeMap<String, crate::trust_snapshot::SnapshotEntry>,
+    approved: &BTreeMap<String, crate::trust_snapshot::SnapshotEntry>,
+) -> bool {
+    current
+        .iter()
+        .any(|(key, value)| approved.get(key) != Some(value))
+}
+
+fn trusted_scopes_widened(current: &[String], approved: &[String]) -> bool {
+    let approved_set: BTreeSet<_> = approved.iter().map(String::as_str).collect();
+    current
+        .iter()
+        .any(|scope| !approved_set.contains(scope.as_str()))
+}
+
+fn capability_request_widened(current: Option<&String>, approved: Option<&String>) -> bool {
+    match current {
+        Some(hash) => approved != Some(hash),
+        None => false,
+    }
+}
+
+fn project_policy_required_scopes(
+    current: &ApprovedProjectPolicyState,
+    approved: &ApprovedProjectPolicyState,
+) -> Vec<ApprovalScope> {
+    let mut scopes = Vec::new();
+    if trusted_dependencies_widened(
+        &current.trusted_dependencies,
+        &approved.trusted_dependencies,
+    ) {
+        scopes.push(ApprovalScope::TrustBulkApprove);
+    }
+    if trusted_scopes_widened(&current.trusted_scopes, &approved.trusted_scopes) {
+        scopes.push(ApprovalScope::TrustScopeWiden);
+    }
+    if capability_request_widened(
+        current.capability_request_hash.as_ref(),
+        approved.capability_request_hash.as_ref(),
+    ) {
+        scopes.push(ApprovalScope::CapabilityWiden);
+    }
+    scopes
+}
+
+fn same_project_policy_shape(
+    current: &ApprovedProjectPolicyState,
+    approved: &ApprovedProjectPolicyState,
+) -> bool {
+    current.project_root == approved.project_root
+        && current.trusted_dependencies == approved.trusted_dependencies
+        && current.trusted_scopes == approved.trusted_scopes
+        && current.capability_request_hash == approved.capability_request_hash
+}
+
+fn global_trust_widened(
+    current: &BTreeMap<String, lpm_global::TrustedDependencyBinding>,
+    approved: &BTreeMap<String, lpm_global::TrustedDependencyBinding>,
+) -> bool {
+    current
+        .iter()
+        .any(|(key, value)| approved.get(key) != Some(value))
+}
+
+fn same_global_trust_shape(
+    current: &ApprovedGlobalTrustState,
+    approved: &ApprovedGlobalTrustState,
+) -> bool {
+    current.trusted_dependencies == approved.trusted_dependencies
+}
+
+fn approval_required_for_scopes(
+    message: impl Into<String>,
+    scopes: &[ApprovalScope],
+    project_root: Option<String>,
+) -> LpmError {
+    let requested_scopes: Vec<_> = scopes
+        .iter()
+        .map(|scope| scope.as_str().to_string())
+        .collect();
+    let suggested_command = scopes
+        .first()
+        .map(|scope| suggested_unlock_command(*scope, &[]));
+    approval_required_error(message, requested_scopes, project_root, suggested_command)
+}
+
+fn ensure_project_policy_candidate_authorized(
+    project_dir: &Path,
+    current: &ApprovedProjectPolicyState,
+    json_output: bool,
+    source: ApprovalSource,
+) -> Result<(), LpmError> {
+    let approved = load_approved_project_policy_state(project_dir)?;
+    let required_scopes = project_policy_required_scopes(current, &approved);
+    if required_scopes.is_empty() {
+        if !same_project_policy_shape(current, &approved) {
+            persist_project_policy_state(project_dir, current)?;
+        }
+        return Ok(());
+    }
+
+    let mut missing_scopes = Vec::new();
+    for scope in &required_scopes {
+        if !has_active_project_unlock(*scope, project_dir, None, &[])? {
+            missing_scopes.push(*scope);
+        }
+    }
+    if !missing_scopes.is_empty() {
+        let message =
+            "project trust or capability state changed outside an LPM-managed approval flow";
+        record_audit_event(
+            "guarded-attempt",
+            false,
+            missing_scopes
+                .iter()
+                .map(|scope| scope.as_str().to_string())
+                .collect(),
+            Some(canonical_project_root(project_dir)),
+            Vec::new(),
+            Some(source.as_str()),
+            None,
+            Some(message.to_string()),
+        );
+        if matches!(source, ApprovalSource::CliFlag) && !is_automation(json_output) {
+            for scope in &missing_scopes {
+                prompt_for_unlock(
+                    *scope,
+                    project_dir,
+                    DEFAULT_UNLOCK_TTL_SECS,
+                    None,
+                    &[],
+                    message,
+                )?;
+            }
+        } else {
+            return Err(approval_required_for_scopes(
+                message,
+                &missing_scopes,
+                Some(canonical_project_root(project_dir)),
+            ));
+        }
+    }
+
+    persist_project_policy_state(project_dir, current)?;
+    record_audit_event(
+        "project-policy-authorized",
+        true,
+        required_scopes
+            .iter()
+            .map(|scope| scope.as_str().to_string())
+            .collect(),
+        Some(canonical_project_root(project_dir)),
+        Vec::new(),
+        Some(source.as_str()),
+        None,
+        Some("persisted approved project trust/capability state".to_string()),
+    );
+    Ok(())
+}
+
+pub fn ensure_project_policy_authorized(
+    project_dir: &Path,
+    json_output: bool,
+    source: ApprovalSource,
+) -> Result<(), LpmError> {
+    let current = current_project_policy_state(project_dir)?;
+    ensure_project_policy_candidate_authorized(project_dir, &current, json_output, source)
+}
+
+pub fn ensure_project_trust_candidate_authorized(
+    project_dir: &Path,
+    trusted: &lpm_workspace::TrustedDependencies,
+    json_output: bool,
+    source: ApprovalSource,
+) -> Result<(), LpmError> {
+    let current = candidate_project_policy_state(project_dir, trusted)?;
+    ensure_project_policy_candidate_authorized(project_dir, &current, json_output, source)
+}
+
+pub fn ensure_global_trust_authorized(
+    root: &lpm_common::LpmRoot,
+    json_output: bool,
+    source: ApprovalSource,
+) -> Result<(), LpmError> {
+    let current = current_global_trust_state(root)?;
+    ensure_global_trust_candidate_authorized(root, &current, json_output, source)
+}
+
+fn ensure_global_trust_candidate_authorized(
+    root: &lpm_common::LpmRoot,
+    current: &ApprovedGlobalTrustState,
+    json_output: bool,
+    source: ApprovalSource,
+) -> Result<(), LpmError> {
+    let approved = load_approved_global_trust_state()?;
+    if !global_trust_widened(
+        &current.trusted_dependencies,
+        &approved.trusted_dependencies,
+    ) {
+        if !same_global_trust_shape(current, &approved) {
+            persist_global_trust_state(current)?;
+        }
+        return Ok(());
+    }
+
+    let global_root = root.global_root();
+    ensure_project_unlock(
+        ApprovalScope::TrustBulkApprove,
+        &global_root,
+        json_output,
+        source,
+        "global trust approvals changed outside an LPM-managed approval flow",
+        None,
+        &[],
+    )?;
+    persist_global_trust_state(current)?;
+    record_audit_event(
+        "global-trust-authorized",
+        true,
+        vec![ApprovalScope::TrustBulkApprove.as_str().to_string()],
+        Some(canonical_project_root(&global_root)),
+        Vec::new(),
+        Some(source.as_str()),
+        None,
+        Some("persisted approved global trust state".to_string()),
+    );
+    Ok(())
+}
+
+pub fn ensure_global_trust_candidate_authorized_from_trust(
+    root: &lpm_common::LpmRoot,
+    trust: &lpm_global::GlobalTrustedDependencies,
+    json_output: bool,
+    source: ApprovalSource,
+) -> Result<(), LpmError> {
+    let current = candidate_global_trust_state(trust);
+    ensure_global_trust_candidate_authorized(root, &current, json_output, source)
+}
+
 pub fn has_active_project_unlock(
     scope: ApprovalScope,
     project_dir: &Path,
     min_release_age_secs: Option<u64>,
+    packages: &[String],
 ) -> Result<bool, LpmError> {
     let root = canonical_project_root(project_dir);
+    let requested_packages = normalized_packages(packages);
     for grant in read_active_unlocks()? {
         if grant.project_root.as_deref() != Some(root.as_str()) {
             continue;
@@ -746,9 +1253,89 @@ pub fn has_active_project_unlock(
         {
             continue;
         }
+        if !grant.packages.is_empty() {
+            let grant_packages: BTreeSet<_> = grant.packages.iter().map(String::as_str).collect();
+            if requested_packages
+                .iter()
+                .any(|package| !grant_packages.contains(package.as_str()))
+            {
+                continue;
+            }
+        }
         return Ok(true);
     }
     Ok(false)
+}
+
+fn run_native_auth_command(mut command: Command) -> Result<bool, LpmError> {
+    match command.status() {
+        Ok(status) => Ok(status.success()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(LpmError::Registry(
+            "native security approval is unavailable on this machine; use managed policy or install a supported desktop auth backend".into(),
+        )),
+        Err(err) => Err(LpmError::Registry(format!(
+            "native security approval failed to launch: {err}"
+        ))),
+    }
+}
+
+fn request_native_approval(prompt: &str) -> Result<bool, LpmError> {
+    if let Ok(result) = std::env::var(TEST_AUTH_RESULT_ENV) {
+        return match result.as_str() {
+            "approve" => Ok(true),
+            "deny" => Ok(false),
+            "error" => Err(LpmError::Registry(
+                "test native security approval backend forced an error".into(),
+            )),
+            other => Err(LpmError::Registry(format!(
+                "{TEST_AUTH_RESULT_ENV} must be one of: approve | deny | error (got `{other}`)"
+            ))),
+        };
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        fn escape_applescript(value: &str) -> String {
+            value.replace('\\', "\\\\").replace('"', "\\\"")
+        }
+
+        let script = format!(
+            "do shell script \"/usr/bin/true\" with administrator privileges with prompt \"{}\"",
+            escape_applescript(prompt)
+        );
+        return run_native_auth_command({
+            let mut command = Command::new("osascript");
+            command.arg("-e").arg(script);
+            command
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return run_native_auth_command({
+            let mut command = Command::new("pkexec");
+            command.arg("/bin/true");
+            command
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return run_native_auth_command({
+            let mut command = Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-Command",
+                "Start-Process -FilePath powershell -ArgumentList '-NoProfile -Command exit 0' -Verb RunAs -Wait",
+            ]);
+            command
+        });
+    }
+
+    #[allow(unreachable_code)]
+    Err(LpmError::Registry(format!(
+        "native security approval is not implemented for this platform; prompt was: {prompt}"
+    )))
 }
 
 fn prompt_for_unlock(
@@ -756,30 +1343,49 @@ fn prompt_for_unlock(
     project_dir: &Path,
     ttl_secs: u64,
     min_release_age_secs: Option<u64>,
+    packages: &[String],
     message: &str,
 ) -> Result<(), LpmError> {
     crate::output::warn(message);
-    let confirmed = cliclack::confirm(format!(
+    let prompt = format!(
         "Approve {} for this project for {} minute{}?",
         scope.as_str(),
         ttl_secs / 60,
         if ttl_secs / 60 == 1 { "" } else { "s" }
-    ))
-    .initial_value(false)
-    .interact()
-    .map_err(|e| LpmError::Registry(format!("security approval prompt failed: {e}")))?;
+    );
+    let confirmed = request_native_approval(&prompt)?;
 
     if !confirmed {
+        record_audit_event(
+            "guarded-attempt",
+            false,
+            vec![scope.as_str().to_string()],
+            Some(canonical_project_root(project_dir)),
+            packages.to_vec(),
+            Some(ApprovalSource::CliFlag.as_str()),
+            None,
+            Some(format!("user declined {}", scope.as_str())),
+        );
         return Err(approval_required_error(
             format!("{} requires explicit approval", scope.as_str()),
             vec![scope.as_str().to_string()],
             Some(canonical_project_root(project_dir)),
-            Some(suggested_unlock_command(scope)),
+            Some(suggested_unlock_command(scope, packages)),
         ));
     }
 
-    let grant = create_unlock_grant(scope, project_dir, ttl_secs, min_release_age_secs);
+    let grant = create_unlock_grant(scope, project_dir, ttl_secs, min_release_age_secs, packages);
     persist_unlock_grant(&grant)?;
+    record_audit_event(
+        "unlock-granted",
+        true,
+        vec![scope.as_str().to_string()],
+        Some(canonical_project_root(project_dir)),
+        packages.to_vec(),
+        Some(ApprovalSource::CliFlag.as_str()),
+        Some(grant.id.clone()),
+        Some(format!("temporary unlock granted for {}", scope.as_str())),
+    );
     crate::output::success(&format!(
         "Approved {} for this project for {} minute{}.",
         scope.as_str(),
@@ -796,8 +1402,9 @@ pub fn ensure_project_unlock(
     source: ApprovalSource,
     message: &str,
     min_release_age_secs: Option<u64>,
+    packages: &[String],
 ) -> Result<(), LpmError> {
-    if has_active_project_unlock(scope, project_dir, min_release_age_secs)? {
+    if has_active_project_unlock(scope, project_dir, min_release_age_secs, packages)? {
         return Ok(());
     }
 
@@ -807,15 +1414,26 @@ pub fn ensure_project_unlock(
             project_dir,
             DEFAULT_UNLOCK_TTL_SECS,
             min_release_age_secs,
+            packages,
             message,
         );
     }
 
+    record_audit_event(
+        "guarded-attempt",
+        false,
+        vec![scope.as_str().to_string()],
+        Some(canonical_project_root(project_dir)),
+        packages.to_vec(),
+        Some(source.as_str()),
+        None,
+        Some(message.to_string()),
+    );
     Err(approval_required_error(
         format!("{} requires explicit approval", scope.as_str()),
         vec![scope.as_str().to_string()],
         Some(canonical_project_root(project_dir)),
-        Some(suggested_unlock_command(scope)),
+        Some(suggested_unlock_command(scope, packages)),
     ))
 }
 
@@ -835,11 +1453,19 @@ fn confirm_persistent_weakening(
     }
 
     crate::output::warn(message);
-    let confirmed = cliclack::confirm("Approve this persistent machine-level security change now?")
-        .initial_value(false)
-        .interact()
-        .map_err(|e| LpmError::Registry(format!("security approval prompt failed: {e}")))?;
+    let confirmed =
+        request_native_approval("Approve this persistent machine-level security change now?")?;
     if !confirmed {
+        record_audit_event(
+            "persistent-guarded-attempt",
+            false,
+            vec![scope.as_str().to_string()],
+            None,
+            Vec::new(),
+            Some(ApprovalSource::ConfigMutation.as_str()),
+            None,
+            Some(message.to_string()),
+        );
         return Err(approval_required_error(
             message,
             vec![scope.as_str().to_string()],
@@ -847,6 +1473,16 @@ fn confirm_persistent_weakening(
             Some(command_hint.to_string()),
         ));
     }
+    record_audit_event(
+        "persistent-guarded-attempt",
+        true,
+        vec![scope.as_str().to_string()],
+        None,
+        Vec::new(),
+        Some(ApprovalSource::ConfigMutation.as_str()),
+        None,
+        Some(message.to_string()),
+    );
     Ok(())
 }
 
@@ -1027,6 +1663,7 @@ pub fn unlock_scope_command(
     ttl_secs: u64,
     json_output: bool,
     min_release_age_secs: Option<u64>,
+    packages: &[String],
 ) -> Result<UnlockGrant, LpmError> {
     if !(1..=MAX_UNLOCK_TTL_SECS).contains(&ttl_secs) {
         return Err(LpmError::Registry(format!(
@@ -1041,7 +1678,7 @@ pub fn unlock_scope_command(
             ),
             vec![scope.as_str().to_string()],
             Some(canonical_project_root(project_dir)),
-            Some(suggested_unlock_command(scope)),
+            Some(suggested_unlock_command(scope, packages)),
         ));
     }
 
@@ -1051,20 +1688,37 @@ pub fn unlock_scope_command(
         ttl_secs / 60,
         if ttl_secs / 60 == 1 { "" } else { "s" }
     ));
-    let confirmed = cliclack::confirm("Approve this temporary security unlock now?")
-        .initial_value(false)
-        .interact()
-        .map_err(|e| LpmError::Registry(format!("security approval prompt failed: {e}")))?;
+    let confirmed = request_native_approval("Approve this temporary security unlock now?")?;
     if !confirmed {
+        record_audit_event(
+            "unlock-granted",
+            false,
+            vec![scope.as_str().to_string()],
+            Some(canonical_project_root(project_dir)),
+            packages.to_vec(),
+            Some(ApprovalSource::SecurityCommand.as_str()),
+            None,
+            Some(format!("user declined {}", scope.as_str())),
+        );
         return Err(approval_required_error(
             format!("{} requires explicit approval", scope.as_str()),
             vec![scope.as_str().to_string()],
             Some(canonical_project_root(project_dir)),
-            Some(suggested_unlock_command(scope)),
+            Some(suggested_unlock_command(scope, packages)),
         ));
     }
-    let grant = create_unlock_grant(scope, project_dir, ttl_secs, min_release_age_secs);
+    let grant = create_unlock_grant(scope, project_dir, ttl_secs, min_release_age_secs, packages);
     persist_unlock_grant(&grant)?;
+    record_audit_event(
+        "unlock-granted",
+        true,
+        vec![scope.as_str().to_string()],
+        Some(canonical_project_root(project_dir)),
+        packages.to_vec(),
+        Some(ApprovalSource::SecurityCommand.as_str()),
+        Some(grant.id.clone()),
+        Some(format!("temporary unlock granted for {}", scope.as_str())),
+    );
     Ok(grant)
 }
 
@@ -1083,6 +1737,7 @@ mod tests {
         let original_dir = std::env::var_os(SECURITY_DIR_ENV);
         let original_policy = std::env::var_os(SECURITY_POLICY_PATH_ENV);
         let original_secret = std::env::var_os(TEST_SECRET_ENV);
+        let original_auth = std::env::var_os(TEST_AUTH_RESULT_ENV);
         let policy_path = dir.join("managed-security-policy.toml");
         // Test-only env mutation is isolated to this helper and
         // restored before returning.
@@ -1093,6 +1748,7 @@ mod tests {
                 TEST_SECRET_ENV,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             );
+            std::env::set_var(TEST_AUTH_RESULT_ENV, "approve");
         }
         let out = f();
         match original_dir {
@@ -1106,6 +1762,10 @@ mod tests {
         match original_secret {
             Some(value) => unsafe { std::env::set_var(TEST_SECRET_ENV, value) },
             None => unsafe { std::env::remove_var(TEST_SECRET_ENV) },
+        }
+        match original_auth {
+            Some(value) => unsafe { std::env::set_var(TEST_AUTH_RESULT_ENV, value) },
+            None => unsafe { std::env::remove_var(TEST_AUTH_RESULT_ENV) },
         }
         out
     }
@@ -1144,9 +1804,12 @@ mod tests {
                 &project,
                 DEFAULT_UNLOCK_TTL_SECS,
                 None,
+                &[],
             );
             persist_unlock_grant(&grant).unwrap();
-            assert!(has_active_project_unlock(ApprovalScope::SandboxNone, &project, None).unwrap());
+            assert!(
+                has_active_project_unlock(ApprovalScope::SandboxNone, &project, None, &[]).unwrap()
+            );
         });
     }
 
@@ -1235,6 +1898,7 @@ script-policy = "deny"
                 &project_a,
                 DEFAULT_UNLOCK_TTL_SECS,
                 None,
+                &[],
             ))
             .unwrap();
             persist_unlock_grant(&create_unlock_grant(
@@ -1242,6 +1906,7 @@ script-policy = "deny"
                 &project_b,
                 DEFAULT_UNLOCK_TTL_SECS,
                 Some(0),
+                &[],
             ))
             .unwrap();
 
@@ -1259,5 +1924,206 @@ script-policy = "deny"
     #[test]
     fn automation_mode_includes_json() {
         assert!(is_automation(true));
+    }
+
+    #[test]
+    fn project_trust_widening_requires_approval_at_runtime() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{
+  "name": "demo",
+  "version": "1.0.0",
+  "lpm": {
+    "trustedDependencies": {
+      "esbuild@0.25.1": {
+        "integrity": "sha512-demo",
+        "scriptHash": "sha256-demo"
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        with_test_env(temp.path(), || {
+            let err =
+                ensure_project_policy_authorized(&project, true, ApprovalSource::ProjectConfig)
+                    .unwrap_err();
+            assert_eq!(err.error_code(), "security_approval_required");
+            assert!(
+                err.to_string()
+                    .contains("project trust or capability state changed")
+            );
+        });
+    }
+
+    #[test]
+    fn project_trusted_scope_widening_requires_approval_at_runtime() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{
+  "name": "demo",
+  "version": "1.0.0",
+  "lpm": {
+    "scripts": {
+      "trustedScopes": ["@myorg/*"]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        with_test_env(temp.path(), || {
+            let err =
+                ensure_project_policy_authorized(&project, true, ApprovalSource::ProjectConfig)
+                    .unwrap_err();
+            assert_eq!(err.error_code(), "security_approval_required");
+            assert!(
+                err.to_string()
+                    .contains("project trust or capability state changed")
+            );
+        });
+    }
+
+    #[test]
+    fn project_capability_widening_requires_approval_at_runtime() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{
+  "name": "demo",
+  "version": "1.0.0",
+  "lpm": {
+    "scripts": {
+      "readProject": "full",
+      "passEnv": ["SSH_AUTH_SOCK"]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        with_test_env(temp.path(), || {
+            let err =
+                ensure_project_policy_authorized(&project, true, ApprovalSource::ProjectConfig)
+                    .unwrap_err();
+            assert_eq!(err.error_code(), "security_approval_required");
+            assert!(
+                err.to_string()
+                    .contains("project trust or capability state changed")
+            );
+        });
+    }
+
+    #[test]
+    fn blocked_runtime_attempt_is_written_to_audit_log() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{
+  "name": "demo",
+  "version": "1.0.0",
+  "lpm": {
+    "scripts": {
+      "trustedScopes": ["@myorg/*"]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        with_test_env(temp.path(), || {
+            let err =
+                ensure_project_policy_authorized(&project, true, ApprovalSource::ProjectConfig)
+                    .unwrap_err();
+            assert_eq!(err.error_code(), "security_approval_required");
+
+            let audit_path = audit_log_path().unwrap();
+            let content = std::fs::read_to_string(audit_path).unwrap();
+            assert!(content.contains("\"event\":\"guarded-attempt\""));
+            assert!(content.contains("trust-scope-widen"));
+            assert!(content.contains(&canonical_project_root(&project)));
+        });
+    }
+
+    #[test]
+    fn cli_trust_authorization_persists_candidate_state() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        with_test_env(temp.path(), || {
+            let mut bindings = std::collections::HashMap::new();
+            bindings.insert(
+                "esbuild@0.25.1".to_string(),
+                lpm_workspace::TrustedDependencyBinding {
+                    integrity: Some("sha512-demo".to_string()),
+                    script_hash: Some("sha256-demo".to_string()),
+                    ..Default::default()
+                },
+            );
+            let trusted = lpm_workspace::TrustedDependencies::Rich(bindings);
+            ensure_project_trust_candidate_authorized(
+                &project,
+                &trusted,
+                false,
+                ApprovalSource::CliFlag,
+            )
+            .unwrap();
+
+            let approved = load_approved_project_policy_state(&project).unwrap();
+            assert!(approved.trusted_dependencies.contains_key("esbuild@0.25.1"));
+        });
+    }
+
+    #[test]
+    fn package_scoped_unlock_only_matches_granted_packages() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        with_test_env(temp.path(), || {
+            let grant = create_unlock_grant(
+                ApprovalScope::ProvenanceUnverified,
+                &project,
+                DEFAULT_UNLOCK_TTL_SECS,
+                None,
+                &["esbuild".to_string()],
+            );
+            persist_unlock_grant(&grant).unwrap();
+            assert!(
+                has_active_project_unlock(
+                    ApprovalScope::ProvenanceUnverified,
+                    &project,
+                    None,
+                    &["esbuild".to_string()],
+                )
+                .unwrap()
+            );
+            assert!(
+                !has_active_project_unlock(
+                    ApprovalScope::ProvenanceUnverified,
+                    &project,
+                    None,
+                    &["sharp".to_string()],
+                )
+                .unwrap()
+            );
+        });
     }
 }

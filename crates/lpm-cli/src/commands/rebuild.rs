@@ -300,6 +300,12 @@ async fn run_under_store_lock(
         .get_bool("force-security-floor")
         .unwrap_or(false);
 
+    crate::security_approval::ensure_project_policy_authorized(
+        project_dir,
+        json_output,
+        crate::security_approval::ApprovalSource::ProjectConfig,
+    )?;
+
     // Parse the project's capability
     // request and read the user's configured bounds. Both values
     // flow into every `evaluate_trust` call below; baseline

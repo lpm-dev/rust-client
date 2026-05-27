@@ -341,7 +341,10 @@ mod tests {
     #[test]
     fn release_age_floor_defaults_to_builtin_when_absent() {
         let cfg = global_cfg(None, None, false);
-        assert_eq!(current_release_age_floor_secs(&cfg), DEFAULT_MIN_RELEASE_AGE_SECS);
+        assert_eq!(
+            current_release_age_floor_secs(&cfg),
+            DEFAULT_MIN_RELEASE_AGE_SECS
+        );
     }
 
     #[test]

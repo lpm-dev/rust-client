@@ -2856,21 +2856,21 @@ fn probe_sandbox_backend() -> Check {
         // route through the precedence chain so
         // `LPM_STRICT_SANDBOX=1` and `[sandbox] mode` flow through
         // the doctor probe identically to the install pipeline.
-        Ok(cwd) => match crate::sandbox_config::resolve_sandbox_mode_from_chain(
-            &cwd, false, false, true,
-        ) {
-            Ok(pair) => pair,
-            Err(e) => {
-                return Check::fail(
-                    &doctor_catalog::SANDBOX_PROBE_FAILED,
-                    &format!(
-                        "could not load sandbox config: {e}. Doctor refuses to default \
+        Ok(cwd) => {
+            match crate::sandbox_config::resolve_sandbox_mode_from_chain(&cwd, false, false, true) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return Check::fail(
+                        &doctor_catalog::SANDBOX_PROBE_FAILED,
+                        &format!(
+                            "could not load sandbox config: {e}. Doctor refuses to default \
                          this to strict — the same broken config will fail your next \
                          `lpm install`. Fix `lpm.toml` / `~/.lpm/config.toml` and re-run."
-                    ),
-                );
+                        ),
+                    );
+                }
             }
-        },
+        }
         Err(_) => (
             lpm_sandbox::SandboxOptions::default(),
             crate::sandbox_config::ResolvedSandboxMode::Default,

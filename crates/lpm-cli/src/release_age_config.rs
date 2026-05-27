@@ -192,6 +192,7 @@ impl ReleaseAgeResolver {
                         "This install request lowers minimum release age to {secs}s for this project."
                     ),
                     Some(secs),
+                    &[],
                 )?;
                 return Ok(secs);
             }
@@ -218,6 +219,7 @@ impl ReleaseAgeResolver {
                     crate::security_approval::ApprovalSource::ProjectConfig,
                     "package.json requests a lower minimum release age than this machine has approved.",
                     Some(secs),
+                    &[],
                 )?;
                 return Ok(secs);
             }

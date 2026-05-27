@@ -3579,6 +3579,12 @@ async fn run_with_options_under_store_lock(
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
+    crate::security_approval::ensure_project_policy_authorized(
+        project_dir,
+        json_output,
+        crate::security_approval::ApprovalSource::ProjectConfig,
+    )?;
+
     //  Hoisted
     // here (above the empty-deps short-circuit, the lockfile fast
     // path, and the freshness check) so the v1-lockfile gate AND
@@ -5591,6 +5597,7 @@ async fn run_with_options_under_store_lock(
             crate::security_approval::ApprovalSource::CliFlag,
             "This install bypasses the minimum release age for this project.",
             Some(0),
+            &[],
         )?;
         true
     } else {
@@ -5612,11 +5619,37 @@ async fn run_with_options_under_store_lock(
         );
         allow_new = false;
     }
+    let drift_ignore_packages: Vec<String> = match &drift_ignore_policy {
+        crate::provenance_fetch::DriftIgnorePolicy::IgnoreNames(names) => {
+            let mut values: Vec<_> = names.iter().cloned().collect();
+            values.sort();
+            values
+        }
+        _ => Vec::new(),
+    };
+    let drift_ignore_unlock_authorized = if !matches!(
+        drift_ignore_policy,
+        crate::provenance_fetch::DriftIgnorePolicy::EnforceAll
+    ) {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::ProvenanceIgnoreDrift,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            "This install waives provenance drift checks for this project.",
+            None,
+            &drift_ignore_packages,
+        )?;
+        true
+    } else {
+        false
+    };
     if force_security_floor
         && !matches!(
             drift_ignore_policy,
             crate::provenance_fetch::DriftIgnorePolicy::EnforceAll
         )
+        && !drift_ignore_unlock_authorized
     {
         let requested = match &drift_ignore_policy {
             crate::provenance_fetch::DriftIgnorePolicy::EnforceAll => "enforce-all".to_string(),
@@ -5638,6 +5671,34 @@ async fn run_with_options_under_store_lock(
         );
         drift_ignore_policy = crate::provenance_fetch::DriftIgnorePolicy::EnforceAll;
     }
+    let unverified_provenance_packages: Vec<String> = match &verify_policy.skip {
+        crate::provenance_fetch::SkipPolicy::Names(names) => {
+            let mut values: Vec<_> = names.iter().cloned().collect();
+            values.sort();
+            values
+        }
+        _ => Vec::new(),
+    };
+    let unverified_provenance_unlock_authorized = if !matches!(
+        verify_policy.skip,
+        crate::provenance_fetch::SkipPolicy::None
+    ) && !matches!(
+        verify_policy.enforce,
+        crate::provenance_fetch::EnforceMode::Off
+    ) {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::ProvenanceUnverified,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            "This install skips Sigstore verification for one or more packages in this project.",
+            None,
+            &unverified_provenance_packages,
+        )?;
+        true
+    } else {
+        false
+    };
     if force_security_floor
         && !matches!(
             verify_policy.skip,
@@ -5647,6 +5708,7 @@ async fn run_with_options_under_store_lock(
             verify_policy.enforce,
             crate::provenance_fetch::EnforceMode::Off
         )
+        && !unverified_provenance_unlock_authorized
     {
         let requested = match &verify_policy.skip {
             crate::provenance_fetch::SkipPolicy::None => "none".to_string(),
