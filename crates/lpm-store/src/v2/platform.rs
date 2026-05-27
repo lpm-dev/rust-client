@@ -4,15 +4,11 @@
 //! ship distinct glibc vs musl binaries, so collapsing this dimension
 //! would let an Alpine wrapper materialize a glibc-built binary.
 //!
-//! Linux libc detection probes the host filesystem (`/lib/ld-musl-*`)
-//! rather than `cfg!(target_env = "musl")`, which reflects how lpm
-//! itself was built — a glibc-built lpm on Alpine would mis-detect.
-//! The probe result is cached in a `OnceLock` per process.
-
-#[cfg(target_os = "linux")]
-use std::path::Path;
-#[cfg(target_os = "linux")]
-use std::sync::OnceLock;
+//! libc detection is delegated to [`lpm_common::platform::detect_libc`]
+//! so the resolver's optional-dep filter and the store's graph keys
+//! agree on what "this host's libc" means — divergence here would let
+//! the resolver select a glibc-built version and the store key it
+//! under musl (or vice versa).
 
 /// Concrete platform identity used as one component of a [`GraphKey`].
 ///
@@ -35,14 +31,13 @@ pub struct PlatformTuple {
 impl PlatformTuple {
     /// Detect the running host's platform tuple.
     ///
-    /// On non-Linux hosts this is a pure-cfg lookup. On Linux the libc
-    /// flavor is detected at runtime (cached) because the lpm binary's
-    /// own `target_env` doesn't necessarily match the host's libc.
+    /// On non-Linux hosts the libc slot is `None`. On Linux it's the
+    /// runtime-probed flavor from [`lpm_common::platform::detect_libc`].
     pub fn current() -> Self {
         Self {
             os: detect_os().to_string(),
             cpu: detect_cpu().to_string(),
-            libc: detect_libc(),
+            libc: lpm_common::platform::detect_libc().map(str::to_string),
         }
     }
 
@@ -86,67 +81,6 @@ fn detect_cpu() -> &'static str {
     } else {
         std::env::consts::ARCH
     }
-}
-
-#[cfg(target_os = "linux")]
-fn detect_libc() -> Option<String> {
-    static CACHED: OnceLock<Option<String>> = OnceLock::new();
-    CACHED
-        .get_or_init(|| {
-            // Probe the host filesystem first — `cfg!(target_env)` only
-            // tells us how the lpm binary was built, not what's on the
-            // host. The `/lib/ld-musl-*` loader is the canonical musl
-            // marker (Alpine, Void, etc.).
-            if has_musl_loader() {
-                return Some("musl".to_string());
-            }
-            // glibc systems ship `/lib*/libc.so.6` (or its symlinks).
-            // We don't strictly need the negative test, but it makes
-            // the result self-describing on weird minimal images
-            // (distroless, etc.) — better to return the cfg fallback
-            // than to assert glibc when we can't see either loader.
-            if has_glibc_loader() {
-                return Some("glibc".to_string());
-            }
-            // Fall back to cfg-time detection. This is what the lpm
-            // binary was BUILT against; it's the best signal we have
-            // when the filesystem doesn't expose either loader.
-            if cfg!(target_env = "musl") {
-                Some("musl".to_string())
-            } else if cfg!(target_env = "gnu") {
-                Some("glibc".to_string())
-            } else {
-                None
-            }
-        })
-        .clone()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn detect_libc() -> Option<String> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn has_musl_loader() -> bool {
-    const CANDIDATES: &[&str] = &[
-        "/lib/ld-musl-x86_64.so.1",
-        "/lib/ld-musl-aarch64.so.1",
-        "/lib/ld-musl-armhf.so.1",
-        "/lib/ld-musl-i386.so.1",
-    ];
-    CANDIDATES.iter().any(|p| Path::new(p).exists())
-}
-
-#[cfg(target_os = "linux")]
-fn has_glibc_loader() -> bool {
-    const CANDIDATES: &[&str] = &[
-        "/lib/x86_64-linux-gnu/libc.so.6",
-        "/lib64/libc.so.6",
-        "/lib/aarch64-linux-gnu/libc.so.6",
-        "/lib/libc.so.6",
-    ];
-    CANDIDATES.iter().any(|p| Path::new(p).exists())
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ pub mod integrity;
 pub mod known_projects;
 pub mod package_name;
 pub mod paths;
+pub mod platform;
 pub mod provenance;
 pub mod symlink;
 

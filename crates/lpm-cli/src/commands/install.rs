@@ -13305,6 +13305,7 @@ mod tests {
                     optional_dependencies: Default::default(),
                     os: vec![],
                     cpu: vec![],
+                    libc: vec![],
                     dist: None,
                     readme: None,
                     lpm_config: None,
