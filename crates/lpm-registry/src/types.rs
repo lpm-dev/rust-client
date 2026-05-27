@@ -107,6 +107,15 @@ pub struct VersionMetadata {
     #[serde(default)]
     pub cpu: Vec<String>,
 
+    /// Linux libc flavor restrictions: ["glibc"], ["musl"], or
+    /// exclusion form like ["!glibc"]. Documented at
+    /// <https://docs.npmjs.com/cli/v9/configuring-npm/package-json#libc>.
+    /// Native modules (sharp, esbuild, `@next/swc-*`) ship distinct
+    /// binaries per libc; the resolver's platform filter consumes this
+    /// field alongside `os`/`cpu`.
+    #[serde(default)]
+    pub libc: Vec<String>,
+
     #[serde(default)]
     pub dist: Option<DistInfo>,
 
