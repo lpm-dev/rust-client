@@ -375,11 +375,11 @@ echo "==================================="
 echo " $PROJECT_NAME — overall summary"
 echo "==================================="
 for mode in isolated hoisted; do
-    latest=$(ls -t "$RESULTS_DIR/$PROJECT_NAME-$mode-"*.json 2>/dev/null | head -1)
-    if [[ -n "$latest" ]]; then
-        verdict=$(python3 -c "import json;print(json.load(open('$latest'))['verdict'])")
-        classification=$(python3 -c "import json;print(json.load(open('$latest')).get('classification','unclassified-failure'))")
-        reason=$(python3 -c "import json;print(json.load(open('$latest')).get('fail_reason','') or '-')")
+    current_result="$RESULTS_DIR/$PROJECT_NAME-$mode-$TS.json"
+    if [[ -f "$current_result" ]]; then
+        verdict=$(python3 -c "import json;print(json.load(open('$current_result'))['verdict'])")
+        classification=$(python3 -c "import json;print(json.load(open('$current_result')).get('classification','unclassified-failure'))")
+        reason=$(python3 -c "import json;print(json.load(open('$current_result')).get('fail_reason','') or '-')")
         printf "  %-10s %-5s %-22s %s\n" "$mode" "$verdict" "$classification" "$reason"
     fi
 done
