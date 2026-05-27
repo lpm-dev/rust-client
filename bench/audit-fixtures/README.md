@@ -24,6 +24,11 @@ real-world failure mode. Three risk buckets:
 
 Outputs land in `results/<fixture>-<mode>-<timestamp>.json`.
 
+Each result JSON also carries a typed `classification` for non-pass
+outcomes so suite summaries can distinguish runtime mismatches,
+fixture limitations, package-surface mismatches, and genuine
+unclassified failures without changing the hoisted-vs-isolated gate.
+
 ## Pass criteria (per fixture × linker mode)
 
 1. `lpm install` exits 0
@@ -33,4 +38,6 @@ Outputs land in `results/<fixture>-<mode>-<timestamp>.json`.
 5. Postinstall hooks completed (relevant for `native/`)
 
 A fixture passes a linker mode iff all five hold. Any single failure logs
-the specific criterion + reason; the fixture is in the fail bucket overall.
+the specific criterion + reason, and the summary groups symmetric
+non-pass outcomes by typed category while still failing CI only for
+mode-asymmetric regressions.

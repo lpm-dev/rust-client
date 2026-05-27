@@ -54,21 +54,56 @@ echo
 echo "############################################"
 echo "##  REAL-WORLD AUDIT SUMMARY"
 echo "############################################"
-printf "%-32s %-20s\n" "PROJECT" "ISOLATED/HOISTED"
+printf "%-32s %-20s %s\n" "PROJECT" "ISOLATED/HOISTED" "CATEGORY"
 echo "------------------------------------------------------------------"
-pass=0; fail=0; mixed=0
+pass=0; symmetric_non_pass=0; mixed=0
+symmetric_issue_rows=()
 for i in "${!NAMES[@]}"; do
-    printf "%-32s %-20s\n" "${NAMES[$i]}" "${RESULTS[$i]}"
+    iso="$HERE/results/${NAMES[$i]}-isolated-*.json"
+    hst="$HERE/results/${NAMES[$i]}-hoisted-*.json"
+    iso_file=$(ls -t $iso 2>/dev/null | head -1)
+    hst_file=$(ls -t $hst 2>/dev/null | head -1)
+    iso_c=$([[ -f "$iso_file" ]] && python3 -c "import json;print(json.load(open('$iso_file')).get('classification','unclassified-failure'))" || echo "?")
+    hst_c=$([[ -f "$hst_file" ]] && python3 -c "import json;print(json.load(open('$hst_file')).get('classification','unclassified-failure'))" || echo "?")
+    if [[ "$iso_c" == "$hst_c" ]]; then
+        category_summary="$iso_c"
+    else
+        category_summary="$iso_c/$hst_c"
+    fi
+    printf "%-32s %-20s %s\n" "${NAMES[$i]}" "${RESULTS[$i]}" "$category_summary"
     case "${RESULTS[$i]}" in
         "PASS/PASS") pass=$((pass+1)) ;;
         "PASS/FAIL"|"FAIL/PASS") mixed=$((mixed+1)) ;;
-        *)           fail=$((fail+1)) ;;
+        *)
+            symmetric_non_pass=$((symmetric_non_pass+1))
+            symmetric_issue_rows+=("${NAMES[$i]}|$category_summary|${RESULTS[$i]}")
+            ;;
     esac
 done
 echo "------------------------------------------------------------------"
-printf "PASS both: %d   ASYMMETRIC: %d   FAIL both / unknown: %d   total: %d\n" \
-    "$pass" "$mixed" "$fail" "${#NAMES[@]}"
+printf "PASS both: %d   ASYMMETRIC: %d   SYMMETRIC NON-PASS: %d   total: %d\n" \
+    "$pass" "$mixed" "$symmetric_non_pass" "${#NAMES[@]}"
 echo
+
+if [[ ${#symmetric_issue_rows[@]} -gt 0 ]]; then
+    echo "Symmetric non-pass buckets:"
+    python3 -c '
+import collections
+import sys
+
+rows = [row.split("|", 2) for row in sys.argv[1:] if row]
+by_category = collections.defaultdict(list)
+for project, category, verdicts in rows:
+    by_category[category].append((project, verdicts))
+
+for category in sorted(by_category):
+    entries = sorted(by_category[category])
+    print(f"  {category}: {len(entries)}")
+    for project, verdicts in entries:
+        print(f"    {project} ({verdicts})")
+' "${symmetric_issue_rows[@]}"
+    echo
+fi
 
 date
 

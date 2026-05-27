@@ -107,6 +107,10 @@ for k in (pkg.get("dependencies") or {}).keys():
 EOF
 }
 
+json_string() {
+    printf '%s' "$1" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()))'
+}
+
 run_mode() {
     local mode="$1"   # "isolated" | "hoisted"
     local work="$WORK_BASE/$FIXTURE_NAME-$mode"
@@ -166,6 +170,8 @@ run_mode() {
     local require_results=""
     local require_pass=0
     local require_fail=0
+    local require_failures_file="$work/require-failures.tsv"
+    : > "$require_failures_file"
     while IFS= read -r dep; do
         [[ -z "$dep" ]] && continue
         set +e
@@ -180,6 +186,7 @@ run_mode() {
             require_fail=$((require_fail+1))
             local err_first_line=$(echo "$req_stderr" | head -1 | tr -d '"' | tr '\n' ' ')
             require_results+="  ✗ $dep: $err_first_line\n"
+            printf '%s\t%s\n' "$dep" "$err_first_line" >> "$require_failures_file"
         fi
     done < <(direct_deps)
 
@@ -198,6 +205,94 @@ run_mode() {
         require_fail_overridden=1
     fi
 
+    local require_failures_json
+    require_failures_json=$(python3 - <<EOF
+import csv
+import json
+from pathlib import Path
+
+rows = []
+path = Path("$require_failures_file")
+if path.exists():
+    with path.open(newline="") as handle:
+        reader = csv.reader(handle, delimiter="\t")
+        for dep, error in reader:
+            rows.append({"dep": dep, "error": error})
+
+print(json.dumps(rows))
+EOF
+)
+
+    local package_surfaces_json
+    package_surfaces_json=$(python3 - <<EOF
+import json
+import os
+
+
+def has_root_runtime_entry(exports_value):
+    if isinstance(exports_value, str):
+        return True
+    if isinstance(exports_value, list):
+        return True
+    if not isinstance(exports_value, dict):
+        return False
+    if "." in exports_value:
+        return True
+    return any(not str(key).startswith(".") for key in exports_value)
+
+
+with open("$FIXTURE_DIR/package.json") as fixture_handle:
+    fixture_package = json.load(fixture_handle)
+
+rows = []
+for dep in (fixture_package.get("dependencies") or {}).keys():
+    manifest_path = os.path.join("$work", "node_modules", *dep.split("/"), "package.json")
+    surface = {
+        "dep": dep,
+        "manifest_found": os.path.exists(manifest_path),
+        "surface_kind": "missing-manifest",
+        "peer_dependencies": [],
+    }
+    if not os.path.exists(manifest_path):
+        rows.append(surface)
+        continue
+
+    with open(manifest_path) as manifest_handle:
+        package_manifest = json.load(manifest_handle)
+
+    exports_value = package_manifest.get("exports")
+    has_runtime_entry = bool(
+        package_manifest.get("main")
+        or package_manifest.get("module")
+        or has_root_runtime_entry(exports_value)
+    )
+    has_types = bool(package_manifest.get("types") or package_manifest.get("typings"))
+    has_bin = bool(package_manifest.get("bin"))
+
+    if not has_runtime_entry and has_types and not has_bin:
+        surface_kind = "types-only"
+    elif not has_runtime_entry and has_bin and not has_types:
+        surface_kind = "bin-only"
+    elif not has_runtime_entry:
+        surface_kind = "non-runtime"
+    else:
+        surface_kind = "runtime"
+
+    surface.update(
+        {
+            "surface_kind": surface_kind,
+            "peer_dependencies": sorted((package_manifest.get("peerDependencies") or {}).keys()),
+            "has_runtime_entry": has_runtime_entry,
+            "has_bin": has_bin,
+            "has_types": has_types,
+        }
+    )
+    rows.append(surface)
+
+print(json.dumps(rows))
+EOF
+)
+
     # Verdict.
     local verdict="PASS"
     local fail_reason=""
@@ -208,6 +303,50 @@ run_mode() {
     elif [[ $smoke_exit -ne 0 ]]; then
         verdict="FAIL"; fail_reason="smoke exit $smoke_exit"
     fi
+
+    local install_log_snip='""'
+    if [[ -f "$install_log" ]]; then
+        install_log_snip=$(tail -20 "$install_log" | tr -d '\r' | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read()))')
+    fi
+
+    local install_json_snip='""'
+    if [[ -f "$install_json" ]]; then
+        install_json_snip=$(tail -20 "$install_json" | tr -d '\r' | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read()))')
+    fi
+
+    local smoke_log_snip='""'
+    if [[ -n "$smoke_log" ]]; then
+        smoke_log_snip=$(printf '%s' "$smoke_log" | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read()))')
+    fi
+
+    local fail_reason_json
+    fail_reason_json=$(json_string "$fail_reason")
+
+    local classification_json
+    classification_json=$(python3 "$HERE/classify_result.py" <<EOF
+{
+  "fixture": "$FIXTURE_REL",
+  "mode": "$mode",
+  "verdict": "$verdict",
+  "fail_reason": $fail_reason_json,
+  "install_exit": $install_exit,
+  "require_pass": $require_pass,
+  "require_fail": $require_fail,
+  "smoke_exit": $smoke_exit,
+    "install_json_tail": $install_json_snip,
+  "install_log_tail": $install_log_snip,
+  "smoke_log_tail": $smoke_log_snip,
+  "require_failures": $require_failures_json,
+  "package_surfaces": $package_surfaces_json
+}
+EOF
+)
+    local classification
+    classification=$(printf '%s' "$classification_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["classification"])')
+    local classification_detail
+    classification_detail=$(printf '%s' "$classification_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["classification_detail"])')
+    local classification_detail_json
+    classification_detail_json=$(json_string "$classification_detail")
 
     # Write detailed result JSON.
     python3 - <<EOF > "$result"
@@ -223,7 +362,14 @@ print(json.dumps({
     "require_fail": $require_fail,
     "smoke_exit": $smoke_exit,
     "verdict": "$verdict",
-    "fail_reason": "$fail_reason",
+    "fail_reason": $fail_reason_json,
+    "classification": "$classification",
+    "classification_detail": $classification_detail_json,
+    "require_failures": json.loads('''$require_failures_json'''),
+    "package_surfaces": json.loads('''$package_surfaces_json'''),
+    "install_json_tail": $install_json_snip,
+    "install_log_tail": $install_log_snip,
+    "smoke_log_tail": $smoke_log_snip,
 }, indent=2))
 EOF
 
@@ -244,8 +390,12 @@ EOF
             echo "$smoke_log" | sed 's/^/    /' | head -10
         fi
     fi
-    printf "  verdict: %s%s\n\n" "$verdict" \
-        "$([[ -n "$fail_reason" ]] && echo " ($fail_reason)" || true)"
+    local verdict_suffix=""
+    if [[ "$classification" != "pass" ]]; then
+        verdict_suffix=" [$classification]"
+    fi
+    printf "  verdict: %s%s%s\n\n" "$verdict" "$verdict_suffix" \
+        "$( [[ -n "$fail_reason" ]] && echo " ($fail_reason)" || true )"
 }
 
 echo "[audit] $FIXTURE_REL — HEAD $(cd "$REPO_ROOT" && git rev-parse --short HEAD)"
@@ -262,7 +412,8 @@ for mode in isolated hoisted; do
     latest=$(ls -t "$RESULTS_DIR/$FIXTURE_NAME-$mode-"*.json 2>/dev/null | head -1)
     if [[ -n "$latest" ]]; then
         verdict=$(python3 -c "import json;print(json.load(open('$latest'))['verdict'])")
+        classification=$(python3 -c "import json;print(json.load(open('$latest')).get('classification','unclassified-failure'))")
         reason=$(python3 -c "import json;print(json.load(open('$latest')).get('fail_reason','') or '-')")
-        printf "  %-10s %-5s  %s\n" "$mode" "$verdict" "$reason"
+        printf "  %-10s %-5s %-22s %s\n" "$mode" "$verdict" "$classification" "$reason"
     fi
 done
