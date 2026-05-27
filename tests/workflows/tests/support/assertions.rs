@@ -127,6 +127,33 @@ pub fn assert_json_field(json: &serde_json::Value, field: &str, expected_type: J
     );
 }
 
+/// Assert that a `--json` command was stopped by the security approval
+/// boundary. Returns the parsed envelope so callers can inspect scopes or
+/// suggested remediation when that is the behavior under test.
+pub fn assert_security_approval_required(output: &std::process::Output) -> serde_json::Value {
+    assert!(
+        !output.status.success(),
+        "command must fail with SECURITY_APPROVAL_REQUIRED; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let parsed = parse_json_output(&output.stdout);
+    assert_eq!(
+        parsed.get("success").and_then(|value| value.as_bool()),
+        Some(false),
+        "security approval envelope must set success=false; got {parsed}",
+    );
+    assert_eq!(
+        parsed
+            .get("error")
+            .and_then(|value| value.get("code"))
+            .and_then(|value| value.as_str()),
+        Some("SECURITY_APPROVAL_REQUIRED"),
+        "security approval envelope must use nested error.code=SECURITY_APPROVAL_REQUIRED; got {parsed}",
+    );
+    parsed
+}
+
 /// Expected JSON value type for assertions.
 #[derive(Debug)]
 pub enum JsonType {

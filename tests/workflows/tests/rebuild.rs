@@ -20,6 +20,7 @@
 
 mod support;
 
+use support::assertions;
 use support::{TempProject, lpm};
 
 // ─── Reference postinstall bodies ───────────────────────────────────────
@@ -118,6 +119,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
 /// spawn (not just tier classification / dry-run) skip the spawn-side
 /// assertion when Node is missing rather than failing — the suite must
 /// still run in minimal containers.
+#[cfg(target_os = "macos")]
 fn node_available() -> bool {
     std::process::Command::new("node")
         .arg("--version")
@@ -175,14 +177,23 @@ fn write_policy_manifest(
     );
 }
 
+fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &str) {
+    let envelope = assertions::assert_security_approval_required(out);
+    let scopes = envelope["error"]["requested_scopes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("security approval envelope must include scopes: {envelope}"));
+    assert!(
+        scopes.iter().any(|scope| scope == expected_scope),
+        "security approval envelope must include scope `{expected_scope}`; got {envelope}",
+    );
+}
+
 // ─── deny policy: default selector filters to trusted packages ──────────
 
-/// Under `--policy=deny` (the default), `lpm rebuild --dry-run` filters
-/// to packages listed in `trustedDependencies` only. JSON envelope
-/// shape is locked via insta against a 2-package fixture (one trusted,
-/// one untrusted) so a future schema widening fails this test.
+/// Hand-authored `trustedDependencies` are guarded before rebuild can
+/// use them for selection.
 #[tokio::test]
-async fn rebuild_deny_policy_dry_run_json_envelope_matches_snapshot() {
+async fn rebuild_deny_policy_with_direct_trust_requires_security_approval() {
     let project = TempProject::empty("");
     write_policy_manifest(
         &project,
@@ -201,25 +212,12 @@ async fn rebuild_deny_policy_dry_run_json_envelope_matches_snapshot() {
         .args(["--json", "rebuild", "--dry-run", "--policy=deny"])
         .output()
         .expect("spawn lpm rebuild --json");
-    assert!(
-        out.status.success(),
-        "rebuild --dry-run --policy=deny --json must exit 0; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let envelope: serde_json::Value =
-        serde_json::from_str(strip_ansi(&String::from_utf8_lossy(&out.stdout)).trim())
-            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}"));
-
-    insta::assert_json_snapshot!("rebuild_deny_policy_dry_run_envelope", envelope);
+    assert_security_approval_scope(&out, "trust-bulk-approve");
 }
 
-/// JSON envelope shape sanity: `dry_run = true`, exactly one entry in
-/// `packages[]` (the trusted one), trust flag set. Pairs with the
-/// snapshot above.
+/// The non-snapshot companion also stops at the same trust boundary.
 #[tokio::test]
-async fn rebuild_deny_policy_dry_run_filters_to_trusted_only() {
+async fn rebuild_deny_policy_direct_trust_filter_requires_security_approval() {
     let project = TempProject::empty("");
     write_policy_manifest(&project, "rebuild-deny-filter", None, &["trusted-pkg"]);
     seed_scripted_package(&project, "trusted-pkg", "1.0.0", "echo hi");
@@ -233,34 +231,14 @@ async fn rebuild_deny_policy_dry_run_filters_to_trusted_only() {
         .args(["--json", "rebuild", "--dry-run", "--policy=deny"])
         .output()
         .expect("spawn lpm rebuild --json");
-    assert!(out.status.success());
-
-    let parsed: serde_json::Value =
-        serde_json::from_str(strip_ansi(&String::from_utf8_lossy(&out.stdout)).trim())
-            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}"));
-    assert_eq!(parsed["dry_run"].as_bool(), Some(true));
-    let packages = parsed["packages"]
-        .as_array()
-        .expect("packages array must be present");
-    assert_eq!(
-        packages.len(),
-        1,
-        "deny filter must include only the trusted package; got: {parsed}"
-    );
-    assert_eq!(packages[0]["name"].as_str(), Some("trusted-pkg"));
-    assert_eq!(packages[0]["trusted"].as_bool(), Some(true));
+    assert_security_approval_scope(&out, "trust-bulk-approve");
 }
 
 // ─── allow policy: selector widens to every scripted package ────────────
 
-/// Under `lpm.scriptPolicy = "allow"` in package.json, the default
-/// `lpm rebuild --dry-run` (no `--all`, no named packages, no manifest
-/// `trustedDependencies`) must include every scripted package — green,
-/// amber, AND red — because allow runs every lifecycle script without
-/// the triage gate. Pre-Chunk-2 the selection step filtered to trusted-
-/// only, so allow behaved identically to deny at the CLI boundary.
+/// `lpm.scriptPolicy = "allow"` is a guarded script execution widening.
 #[test]
-fn rebuild_allow_policy_widens_to_every_scripted_package() {
+fn rebuild_allow_policy_manifest_requires_security_approval() {
     let project = TempProject::empty("");
     write_policy_manifest(&project, "rebuild-allow-manifest", Some("allow"), &[]);
     seed_scripted_package(&project, "green-native", "1.0.0", GREEN_POSTINSTALL);
@@ -276,47 +254,15 @@ fn rebuild_allow_policy_widens_to_every_scripted_package() {
     );
 
     let out = lpm(&project)
-        .args(["rebuild", "--dry-run"])
+        .args(["--json", "rebuild", "--dry-run"])
         .output()
         .expect("spawn lpm rebuild");
-    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
-    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    assert!(
-        out.status.success(),
-        "rebuild --dry-run must exit 0 under allow; stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-
-    // All three scripted packages must appear — allow widening is
-    // tier-agnostic.
-    assert!(
-        stdout.contains("green-native"),
-        "green-native must appear under allow; stdout:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("amber-playwright"),
-        "amber-playwright must appear under allow (tier-agnostic widening); stdout:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("red-curlpipe"),
-        "red-curlpipe must appear under allow (red tier is a label, not a gate); stdout:\n{stdout}"
-    );
-
-    // The "N packages are not in trustedDependencies and will be
-    // skipped" warning must NOT fire under allow — every scripted
-    // package is in the build set.
-    assert!(
-        !stderr.contains("are not in trustedDependencies and will be skipped"),
-        "the skipped-count warning must not fire under allow; stderr:\n{stderr}"
-    );
+    assert_security_approval_scope(&out, "scripts-allow");
 }
 
-/// Snapshot the `--policy=allow --json --dry-run` envelope so a future
-/// shape drift (renamed field, new top-level key) fails this test.
-/// Separate from the deny-policy snapshot above — same JSON schema,
-/// different selection semantics, but the envelope's keys must stay
-/// stable across both policy modes.
+/// JSON mode must report the same approval boundary for manifest allow.
 #[test]
-fn rebuild_allow_policy_dry_run_json_envelope_matches_snapshot() {
+fn rebuild_allow_policy_manifest_json_requires_security_approval() {
     let project = TempProject::empty("");
     write_policy_manifest(&project, "rebuild-allow-snap", Some("allow"), &[]);
     seed_scripted_package(&project, "green-native", "1.0.0", GREEN_POSTINSTALL);
@@ -330,27 +276,12 @@ fn rebuild_allow_policy_dry_run_json_envelope_matches_snapshot() {
         .args(["--json", "rebuild", "--dry-run"])
         .output()
         .expect("spawn lpm rebuild --json --dry-run --policy=allow");
-    assert!(out.status.success(), "rebuild --dry-run --json must exit 0");
-
-    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
-    let envelope: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("rebuild --json must be valid JSON: {e}\n---\n{stdout}"));
-
-    insta::with_settings!({ filters => vec![
-        // Redact store dir + integrity hashes that vary across runs.
-        (r#""/[^"]+/store/[^"]+""#, r#""[STORE_DIR]""#),
-        (r#"sha512-[A-Za-z0-9+/=]+"#, "sha512-[REDACTED]"),
-    ]}, {
-        insta::assert_json_snapshot!("rebuild_allow_policy_dry_run_envelope", envelope);
-    });
+    assert_security_approval_scope(&out, "scripts-allow");
 }
 
-/// Same widening behavior must reach the selection step from the CLI
-/// override path (`--policy=allow` AND its `--yolo` alias) — proves
-/// the resolved policy from main.rs's precedence chain reaches
-/// `build::run`.
+/// CLI allow and its `--yolo` alias are guarded too.
 #[test]
-fn rebuild_allow_policy_via_cli_override_or_yolo_alias_also_widens() {
+fn rebuild_allow_policy_cli_override_or_yolo_requires_security_approval() {
     let project = TempProject::empty("");
     // No scriptPolicy in manifest — allow signal comes purely from CLI.
     write_policy_manifest(&project, "rebuild-allow-cli", None, &[]);
@@ -363,32 +294,26 @@ fn rebuild_allow_policy_via_cli_override_or_yolo_alias_also_widens() {
 
     // --policy=allow path
     let out_policy = lpm(&project)
-        .args(["rebuild", "--dry-run", "--policy=allow"])
+        .args(["--json", "rebuild", "--dry-run", "--policy=allow"])
         .output()
         .expect("spawn lpm rebuild --policy=allow");
     let stdout_policy = strip_ansi(&String::from_utf8_lossy(&out_policy.stdout));
+    assert_security_approval_scope(&out_policy, "scripts-allow");
     assert!(
-        out_policy.status.success(),
-        "exit 0 expected; stdout:\n{stdout_policy}"
-    );
-    assert!(
-        stdout_policy.contains("green-native") && stdout_policy.contains("amber-playwright"),
-        "--policy=allow must widen at the selection step; stdout:\n{stdout_policy}"
+        !stdout_policy.contains("green-native") && !stdout_policy.contains("amber-playwright"),
+        "approval error must not include dry-run package selection; stdout:\n{stdout_policy}",
     );
 
     // --yolo alias path
     let out_yolo = lpm(&project)
-        .args(["rebuild", "--dry-run", "--yolo"])
+        .args(["--json", "rebuild", "--dry-run", "--yolo"])
         .output()
         .expect("spawn lpm rebuild --yolo");
     let stdout_yolo = strip_ansi(&String::from_utf8_lossy(&out_yolo.stdout));
+    assert_security_approval_scope(&out_yolo, "scripts-allow");
     assert!(
-        out_yolo.status.success(),
-        "exit 0 expected; stdout:\n{stdout_yolo}"
-    );
-    assert!(
-        stdout_yolo.contains("green-native") && stdout_yolo.contains("amber-playwright"),
-        "--yolo (alias for --policy=allow) must widen too; stdout:\n{stdout_yolo}"
+        !stdout_yolo.contains("green-native") && !stdout_yolo.contains("amber-playwright"),
+        "approval error must not include dry-run package selection; stdout:\n{stdout_yolo}",
     );
 }
 
@@ -441,13 +366,10 @@ fn rebuild_deny_policy_keeps_trusted_only_filter() {
 
 // ─── triage policy control: green-only promotion, amber/red blocked ─────
 
-/// Triage promotes greens at the helper level only; the selection step
-/// still filters to trusted-only. With amber + red and no green, the
-/// dry-run set is empty AND users get pointed at `lpm approve-scripts`.
-/// Pins that the allow fix is allow-scoped — triage isn't accidentally
-/// widened too.
+/// `lpm.scriptPolicy = "triage"` is also a guarded script-policy
+/// weakening.
 #[test]
-fn rebuild_triage_policy_does_not_widen_beyond_greens() {
+fn rebuild_triage_policy_requires_security_approval() {
     let project = TempProject::empty("");
     write_policy_manifest(&project, "rebuild-triage-control", Some("triage"), &[]);
     seed_scripted_package(&project, "amber-playwright", "1.0.0", AMBER_POSTINSTALL);
@@ -458,21 +380,10 @@ fn rebuild_triage_policy_does_not_widen_beyond_greens() {
     );
 
     let out = lpm(&project)
-        .args(["rebuild", "--dry-run"])
+        .args(["--json", "rebuild", "--dry-run"])
         .output()
         .expect("spawn lpm rebuild");
-    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
-    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success(), "exit 0 expected; stdout:\n{stdout}");
-
-    assert!(
-        !stdout.contains("amber-playwright") && !stdout.contains("red-curlpipe"),
-        "triage must NOT widen amber/red at the selection step (green-only promotion); stdout:\n{stdout}"
-    );
-    assert!(
-        stderr.contains("lpm approve-scripts"),
-        "triage with amber+red must point users at approve-scripts; stderr:\n{stderr}"
-    );
+    assert_security_approval_scope(&out, "scripts-triage");
 }
 
 // ─── triage policy: green auto-promotion + amber/red blocked ────────────
@@ -491,12 +402,9 @@ fn rebuild_triage_policy_does_not_widen_beyond_greens() {
 //  5. `--json` envelope is parseable and stream-separated (no human
 //     pointer text bleeds onto stdout)
 
-/// Default filter under triage (`lpm rebuild --dry-run`, no `--all`,
-/// no named packages) keeps ONLY the green-promoted package in the
-/// build set — pre-Chunk-2 the renderer might have labeled greens as
-/// "trusted" but the selection step still excluded them.
+/// Default filter under triage stops at the approval boundary.
 #[test]
-fn rebuild_triage_default_dryrun_filter_keeps_only_green_promoted() {
+fn rebuild_triage_default_dryrun_requires_security_approval() {
     let project = TempProject::empty("");
     write_policy_manifest(&project, "rebuild-triage-default", Some("triage"), &[]);
     seed_scripted_package(&project, "green-native", "1.0.0", GREEN_POSTINSTALL);
@@ -512,40 +420,15 @@ fn rebuild_triage_default_dryrun_filter_keeps_only_green_promoted() {
     );
 
     let out = lpm(&project)
-        .args(["rebuild", "--dry-run"])
+        .args(["--json", "rebuild", "--dry-run"])
         .output()
         .expect("spawn lpm rebuild");
-    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
-    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    assert!(
-        out.status.success(),
-        "rebuild --dry-run must exit 0 under triage; stdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-
-    assert!(
-        stdout.contains("green-native"),
-        "green-native must appear in default-filter dry-run; stdout:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("green-tier auto-approval"),
-        "green-tier suffix must render when the promoted package passes the filter; stdout:\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("amber-playwright"),
-        "amber-playwright must NOT appear (Promotion from triage is green-only); stdout:\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("red-curlpipe"),
-        "red-curlpipe must NOT appear in default-filter dry-run; stdout:\n{stdout}"
-    );
+    assert_security_approval_scope(&out, "scripts-triage");
 }
 
-/// `--all` widens to every scriptable package regardless of trust.
-/// Greens render with the "(green-tier auto-approval)" suffix; amber
-/// and red show as "not trusted" — proves tier-promotion labelling is
-/// green-only even when the filter is bypassed.
+/// `--all` cannot bypass the guarded triage policy.
 #[test]
-fn rebuild_triage_dry_run_all_labels_green_with_promotion_suffix() {
+fn rebuild_triage_dry_run_all_requires_security_approval() {
     let project = TempProject::empty("");
     write_policy_manifest(&project, "rebuild-triage-all", Some("triage"), &[]);
     seed_scripted_package(&project, "green-native", "1.0.0", GREEN_POSTINSTALL);
@@ -561,40 +444,16 @@ fn rebuild_triage_dry_run_all_labels_green_with_promotion_suffix() {
     );
 
     let out = lpm(&project)
-        .args(["rebuild", "--dry-run", "--all"])
+        .args(["--json", "rebuild", "--dry-run", "--all"])
         .output()
         .expect("spawn lpm rebuild");
-    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
-    assert!(
-        out.status.success(),
-        "rebuild --dry-run --all must exit 0; stdout:\n{stdout}"
-    );
-
-    // All three present (--all bypasses trust filter at selection time).
-    assert!(stdout.contains("green-native"), "stdout:\n{stdout}");
-    assert!(stdout.contains("amber-playwright"), "stdout:\n{stdout}");
-    assert!(stdout.contains("red-curlpipe"), "stdout:\n{stdout}");
-
-    // Green carries the promotion suffix.
-    assert!(
-        stdout.contains("green-tier auto-approval"),
-        "green-native must carry the green-tier promotion suffix; stdout:\n{stdout}"
-    );
-
-    // Amber + red render as "not trusted" — promotion is green-only.
-    let not_trusted_count = stdout.matches("not trusted").count();
-    assert!(
-        not_trusted_count >= 2,
-        "amber + red must both render as 'not trusted' (promotion is green-only); stdout:\n{stdout}"
-    );
+    assert_security_approval_scope(&out, "scripts-triage");
 }
 
-/// Real `lpm rebuild` (no dry-run) auto-builds green packages under
-/// triage and points users at `lpm approve-scripts` for the amber/red
-/// remainder. Green-spawn assertion is gated on `node` availability so
-/// the suite still runs in minimal containers.
+/// Real `lpm rebuild` under triage also requires approval before any
+/// lifecycle script can be selected or run.
 #[test]
-fn rebuild_triage_default_build_points_at_approve_scripts_for_blocked() {
+fn rebuild_triage_default_build_requires_security_approval() {
     let project = TempProject::empty("");
     write_policy_manifest(&project, "rebuild-triage-build", Some("triage"), &[]);
     let green_dir = seed_scripted_package(&project, "green-native", "1.0.0", GREEN_POSTINSTALL);
@@ -615,10 +474,10 @@ fn rebuild_triage_default_build_points_at_approve_scripts_for_blocked() {
     );
 
     let out = lpm(&project)
-        .args(["rebuild"])
+        .args(["--json", "rebuild"])
         .output()
         .expect("spawn lpm rebuild");
-    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert_security_approval_scope(&out, "scripts-triage");
 
     // Amber + red must NOT auto-build under triage.
     assert!(
@@ -629,24 +488,10 @@ fn rebuild_triage_default_build_points_at_approve_scripts_for_blocked() {
         !red_dir.join(".lpm-built").exists(),
         "red package must never auto-build"
     );
-
-    // Pointer surfaces with the skipped count.
     assert!(
-        stderr.contains("lpm approve-scripts"),
-        "Triage pointer must appear when amber/red remain; stderr:\n{stderr}"
+        !green_dir.join(".lpm-built").exists(),
+        "green package must not build before triage approval",
     );
-    assert!(
-        stderr.contains("2 package(s) are not in trustedDependencies"),
-        "skipped-count line must name 2 (amber + red); stderr:\n{stderr}"
-    );
-
-    // Green-spawn assertion only when node is available.
-    if node_available() {
-        assert!(
-            green_dir.join(".lpm-built").exists(),
-            "with node available, green-tier postinstall must complete under triage + sandbox; stderr:\n{stderr}"
-        );
-    }
 }
 
 /// Control: under deny, the same fixture produces no tier promotion.
@@ -683,12 +528,10 @@ fn rebuild_deny_skips_all_packages_and_keeps_legacy_pointer() {
     );
 }
 
-/// `--json` envelope is valid JSON on stdout; no human pointer text
-/// bleeds onto stdout (stream-separation contract). A regression
-/// that emitted the approve-scripts pointer to stdout under `--json`
-/// would break `JSON.parse` for every CI consumer.
+/// `--json` triage errors are still valid JSON and carry the security
+/// approval code instead of human pointer text.
 #[test]
-fn rebuild_triage_json_separates_streams() {
+fn rebuild_triage_json_security_error_separates_streams() {
     let project = TempProject::empty("");
     write_policy_manifest(&project, "rebuild-triage-json", Some("triage"), &[]);
     seed_scripted_package(&project, "green-native", "1.0.0", GREEN_POSTINSTALL);
@@ -706,14 +549,12 @@ fn rebuild_triage_json_separates_streams() {
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("rebuild --json --dry-run stdout must be parseable JSON. Parse error: {e}\nstdout:\n{stdout}"));
-    let packages = parsed["packages"]
-        .as_array()
-        .expect("rebuild --json --dry-run must expose `packages` array");
+    assert_eq!(parsed["success"].as_bool(), Some(false));
     assert_eq!(
-        packages.len(),
-        2,
-        "both fixture packages must appear in the JSON dry-run output; got: {parsed}"
+        parsed["error"]["code"].as_str(),
+        Some("SECURITY_APPROVAL_REQUIRED")
     );
+    assert_security_approval_scope(&out, "scripts-triage");
 }
 
 // ─── strict + sandbox-log coverage ──────────────────────────────────────
@@ -761,38 +602,8 @@ fn rebuild_strict_plus_sandbox_log_suppresses_strict_banner_under_logonly() {
     write_lockfile_for_packages(&project, &[("green-pkg", "1.0.0")]);
 
     let out = lpm(&project)
-        .args(["rebuild", "--strict-sandbox", "--sandbox-log"])
+        .args(["--json", "rebuild", "--strict-sandbox", "--sandbox-log"])
         .output()
         .expect("spawn lpm rebuild --strict-sandbox --sandbox-log");
-
-    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
-
-    // The pair must parse (clap deliberately allows both — the
-    // mutex would prevent legitimate env/config strict + CLI
-    // sandbox-log combinations from being expressible).
-    assert!(
-        out.status.success() || stderr.contains("rebuild"),
-        "rebuild --strict-sandbox --sandbox-log must reach the rebuild pipeline (success or \
-         normal rebuild output). exit={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        out.status,
-    );
-
-    // The sandbox-log banner MUST appear — LogOnly is the actual
-    // runtime mode, and users need to know rules are observed not
-    // enforced.
-    assert!(
-        stderr.contains("--sandbox-log: diagnostic mode only"),
-        "sandbox-log banner must fire under --sandbox-log (LogOnly is the active mode). \
-         stderr:\n{stderr}",
-    );
-
-    // The strict-sandbox banner MUST NOT appear — saying "outbound \
-    // network will be denied" alongside the sandbox-log "logged but \
-    // NOT enforced" line is contradictory and the bug GPT-5 caught.
-    assert!(
-        !stderr.contains("strict-sandbox: outbound network will be denied"),
-        "strict-sandbox banner MUST suppress itself under LogOnly — pre-fix it lied about \
-         enforcement. GPT-5 audit round 2 finding. stderr:\n{stderr}",
-    );
+    assert_security_approval_scope(&out, "trust-bulk-approve");
 }

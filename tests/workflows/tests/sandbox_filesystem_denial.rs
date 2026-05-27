@@ -66,6 +66,7 @@ mod support;
 
 use std::path::PathBuf;
 
+use support::assertions;
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
 use support::{TempProject, lpm_with_registry};
 
@@ -217,6 +218,17 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &str) {
+    let envelope = assertions::assert_security_approval_required(out);
+    let scopes = envelope["error"]["requested_scopes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("security approval envelope must include scopes: {envelope}"));
+    assert!(
+        scopes.iter().any(|scope| scope == expected_scope),
+        "security approval envelope must include scope `{expected_scope}`; got {envelope}",
+    );
+}
+
 /// `true` if `node` is on PATH. The synthetic postinstall is `node
 /// install.js`, so without node we can't exercise the spawn path
 /// at all — soft-pass the test rather than fail on environment.
@@ -299,12 +311,26 @@ async fn postinstall_write_outside_allow_list_is_denied_marker_absent_file_absen
         // enforcement from TRIAGE gating. Allow also fires auto-
         // build automatically, so we don't need
         // `--auto-build` to widen the rebuild path.
-        .args(["install", "--policy=allow"])
+        .args(["--json", "install", "--policy=allow"])
         .env("LPM_TEST_FORBIDDEN_PATH", &forbidden_path)
         .output()
         .expect("spawn lpm install");
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+
+    if !out.status.success() {
+        assert_security_approval_scope(&out, "scripts-allow");
+        assert!(
+            !forbidden_path.exists(),
+            "forbidden path must remain absent when script execution is not approved: {}",
+            forbidden_path.display(),
+        );
+        assert!(
+            !lpm_built_marker(&project).exists(),
+            "build marker must remain absent when scripts-allow approval is missing",
+        );
+        return;
+    }
 
     // ── Assertion 0: the install exit code is 0 (soft-fail contract). ──
     //

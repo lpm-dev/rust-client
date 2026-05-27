@@ -4625,13 +4625,11 @@ async fn install_min_release_age_cli_override_blocks_fresh_package() {
     );
 }
 
-/// `--allow-new` bypasses the cooldown even alongside `--min-release-age`.
-/// They are orthogonal escape hatches per the plan's D16 — `--allow-new`
-/// short-circuits the gate before the resolver runs. We assert only
-/// "cooldown does not fire"; downstream install behavior may still fail
-/// in a hermetic test environment for unrelated reasons.
+/// `--allow-new` is a guarded cooldown bypass. Workflow tests do not
+/// manufacture a native approval, so the command should stop at the
+/// security boundary instead of exercising the approved success path.
 #[tokio::test]
-async fn install_allow_new_bypasses_min_release_age_cli_override() {
+async fn install_allow_new_requires_security_approval() {
     let project = TempProject::empty("");
     write_release_age_manifest(&project, Some(0));
 
@@ -4639,19 +4637,23 @@ async fn install_allow_new_bypasses_min_release_age_cli_override() {
     mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--allow-new", "--min-release-age=72h"])
+        .args(["--json", "install", "--allow-new", "--min-release-age=72h"])
         .output()
         .expect("spawn lpm install");
 
-    assert_cooldown_not_blocked(&out);
+    let envelope = assertions::assert_security_approval_required(&out);
+    assert!(
+        envelope["error"]["requested_scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "cooldown-bypass")),
+        "approval envelope must name the cooldown-bypass scope; got {envelope}",
+    );
 }
 
-/// `~/.lpm/config.toml > minimum-release-age-secs` overrides the 24h
-/// default when no CLI flag and no `package.json` key are set. Package
-/// is 30min old; global = 3600s (1h). The default 86400s would also
-/// block, so we assert the global value (3600) is what actually fired.
+/// A raw global `minimum-release-age-secs` value below the approved
+/// floor is guarded before it can weaken the release-age window.
 #[tokio::test]
-async fn install_global_config_min_release_age_overrides_default() {
+async fn install_global_config_min_release_age_below_floor_requires_security_approval() {
     let project = TempProject::empty("");
     write_release_age_manifest(&project, None);
     write_release_age_global_config(&project, 3_600);
@@ -4660,23 +4662,16 @@ async fn install_global_config_min_release_age_overrides_default() {
     mount_release_age_pkg(&mock, &iso8601_n_secs_ago(1_800)).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install"])
+        .args(["--json", "install"])
         .output()
         .expect("spawn lpm install");
 
-    assert_cooldown_blocked(&out);
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let envelope = assertions::assert_security_approval_required(&out);
     assert!(
-        combined.contains("3600"),
-        "output must render the global config's 3600s window; got:\n{combined}"
-    );
-    assert!(
-        !combined.contains("86400"),
-        "default 86400s must NOT appear when the global config overrides it; got:\n{combined}"
+        envelope["error"]["requested_scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "cooldown-bypass")),
+        "approval envelope must name the cooldown-bypass scope; got {envelope}",
     );
 }
 

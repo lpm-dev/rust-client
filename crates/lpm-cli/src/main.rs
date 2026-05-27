@@ -41,7 +41,9 @@ mod sandbox_config;
 mod save_config;
 mod save_spec;
 mod script_policy_config;
+mod security_approval;
 pub mod security_check;
+mod security_floor;
 mod sigstore;
 mod sigstore_verify;
 mod step_up;
@@ -938,6 +940,12 @@ enum Commands {
         ///   `lpm config release-age --set 3d`
         #[arg(long = "set", value_name = "VALUE")]
         set: Option<String>,
+    },
+
+    /// Manage temporary approvals for guarded security weakeners.
+    Security {
+        #[command(subcommand)]
+        action: commands::security::SecurityCmd,
     },
 
     /// Manage ephemeral caches under ~/.lpm/cache/ (metadata, tasks, dlx)
@@ -3335,10 +3343,13 @@ async fn async_main() -> Result<()> {
             let cli_script_policy_override =
                 script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
                     .map_err(lpm_common::LpmError::Script)?;
-            let effective_script_policy = script_policy_config::resolve_script_policy(
-                cli_script_policy_override,
-                &script_policy_cfg,
-            );
+            let effective_script_policy =
+                script_policy_config::resolve_script_policy_with_security(
+                    &cwd,
+                    cli_script_policy_override,
+                    &script_policy_cfg,
+                    cli.json,
+                )?;
             tracing::debug!(
                 "lpm install: effective script-policy = {}",
                 effective_script_policy.as_str()
@@ -3924,6 +3935,7 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
+        Commands::Security { action } => commands::security::run(&action, cli.json).await,
         Commands::Cache {
             action,
             subcategory,
@@ -4041,8 +4053,12 @@ async fn async_main() -> Result<()> {
             let cli_override =
                 script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
                     .map_err(lpm_common::LpmError::Script)?;
-            let effective =
-                script_policy_config::resolve_script_policy(cli_override, &script_policy_cfg);
+            let effective = script_policy_config::resolve_script_policy_with_security(
+                &cwd,
+                cli_override,
+                &script_policy_cfg,
+                cli.json,
+            )?;
             tracing::debug!(
                 "lpm rebuild: effective script-policy = {}",
                 effective.as_str()
@@ -4831,11 +4847,29 @@ async fn async_main() -> Result<()> {
         // have already emitted their own structured JSON output. Printing a second
         // generic error JSON would break the "single JSON result" contract.
         if cli.json && !matches!(e, lpm_common::LpmError::ExitCode(_)) {
-            let json = serde_json::json!({
-                "success": false,
-                "error": format!("{e}"),
-                "error_code": e.error_code(),
-            });
+            let json = match e {
+                lpm_common::LpmError::SecurityApprovalRequired {
+                    message,
+                    requested_scopes,
+                    project_root,
+                    suggested_command,
+                } => serde_json::json!({
+                    "success": false,
+                    "error_code": "security_approval_required",
+                    "error": {
+                        "code": "SECURITY_APPROVAL_REQUIRED",
+                        "message": message,
+                        "requested_scopes": requested_scopes,
+                        "project_root": project_root,
+                        "suggested_command": suggested_command,
+                    }
+                }),
+                _ => serde_json::json!({
+                    "success": false,
+                    "error": format!("{e}"),
+                    "error_code": e.error_code(),
+                }),
+            };
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         }
 

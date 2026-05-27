@@ -18,7 +18,7 @@
 //!
 //! - [`RejectionReason::ForceFlagSuppressesCli`] → "you typed a
 //!   loosening CLI flag, the user-global force flag suppressed it."
-//!   Remediation: `lpm config unset force-security-floor`.
+//!   Remediation: lower or remove the floor in `~/.lpm/config.toml`.
 //! - [`RejectionReason::ForceFlagRejectsProject`] → "the project's
 //!   `package.json` requested a looser policy, the user-global force
 //!   flag rejected it at load time." Remediation: same as above.
@@ -63,17 +63,16 @@ pub fn rejection_message<T: PurePolicyKnob>(r: &Rejection<T>) -> String {
         RejectionReason::ForceFlagSuppressesCli => format!(
             "warning: CLI loosening flag for `{name}` ignored — \
              `force-security-floor = true` in ~/.lpm/config.toml \
-             locks the machine to the user floor. \
-             Run `lpm config unset force-security-floor` to loosen \
-             intentionally for this session.",
+             locks the machine to the user floor. Lower or remove \
+             that floor in ~/.lpm/config.toml to loosen it intentionally.",
             name = T::NAME,
         ),
         RejectionReason::ForceFlagRejectsProject => format!(
             "warning: project `{name}` in package.json ignored — \
              `force-security-floor = true` in ~/.lpm/config.toml \
-             makes user settings the floor for all policies. \
-             Run `lpm config unset force-security-floor` to let \
-             project configs override.",
+             makes user settings the floor for all policies. Lower \
+             or remove that floor in ~/.lpm/config.toml to let the \
+             project widen it intentionally.",
             name = T::NAME,
         ),
         RejectionReason::NewKnobProjectLoosens => format!(
@@ -179,8 +178,8 @@ mod tests {
             "wording must name the config file so the user can find it: {msg}"
         );
         assert!(
-            msg.contains("lpm config unset force-security-floor"),
-            "wording must include the remediation command verbatim: {msg}"
+            msg.contains("Lower or remove"),
+            "wording must include the remediation guidance: {msg}"
         );
         assert!(
             msg.contains("CLI"),
@@ -201,8 +200,8 @@ mod tests {
             "names the flag: {msg}"
         );
         assert!(
-            msg.contains("lpm config unset force-security-floor"),
-            "remediation command verbatim: {msg}"
+            msg.contains("Lower or remove"),
+            "remediation guidance must stay explicit: {msg}"
         );
     }
 

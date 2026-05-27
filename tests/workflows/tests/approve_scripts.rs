@@ -20,6 +20,7 @@
 mod support;
 
 use std::path::PathBuf;
+use support::assertions;
 use support::build_state::{
     seed_blocked_build_state_with_real_hash, seed_global_install_blocked_state_with_real_hash,
 };
@@ -939,11 +940,6 @@ fn approve_scripts_first_time_review_emits_null_version_diff_and_no_card() {
 //  - **JSON stream purity:** every `--json` invocation produces exactly ONE
 //    valid JSON object on stdout (no tracing/WARN bleed).
 
-/// Read + parse `<project>/package.json` as a JSON value.
-fn read_manifest(project: &TempProject) -> serde_json::Value {
-    serde_json::from_str(&project.read_file("package.json")).unwrap()
-}
-
 /// Synthesize `.lpm/build-state.json` with the supplied
 /// `(name, version, integrity, script_hash)` entries. Uses the
 /// post-P7 shape (`static_tier: "green"`, `published_at`) so the
@@ -977,6 +973,17 @@ fn write_build_state_audit(project: &TempProject, entries: &[(&str, &str, &str, 
     );
 }
 
+fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &str) {
+    let envelope = assertions::assert_security_approval_required(out);
+    let scopes = envelope["error"]["requested_scopes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("security approval envelope must include scopes: {envelope}"));
+    assert!(
+        scopes.iter().any(|scope| scope == expected_scope),
+        "security approval envelope must include scope `{expected_scope}`; got {envelope}",
+    );
+}
+
 /// A legacy `trustedDependencies: ["esbuild"]` that gets upgraded
 /// to the rich `esbuild@*` sentinel during `--yes` approval MUST
 /// NOT clear esbuild from the blocked set on a subsequent install
@@ -988,7 +995,7 @@ fn write_build_state_audit(project: &TempProject, entries: &[(&str, &str, &str, 
 /// would auto-trust every future version under the inherited
 /// name-only approval (cross-version trust laundering).
 #[test]
-fn approve_scripts_at_star_sentinel_still_blocks_unknown_versions_after_install() {
+fn approve_scripts_at_star_sentinel_upgrade_requires_security_approval() {
     let project = TempProject::empty(
         r#"{
   "name": "approve-scripts-at-star-sentinel-fixture",
@@ -1001,67 +1008,17 @@ fn approve_scripts_at_star_sentinel_still_blocks_unknown_versions_after_install(
         &[("sharp", "0.32.1", "sha512-sharp-int", "sha256-sharp-h")],
     );
 
-    // Step 1: --yes approves sharp + upgrades esbuild legacy → @* sentinel.
-    let out1 = lpm(&project)
-        .args(["approve-scripts", "--yes"])
+    let before = project.read_file("package.json");
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--yes"])
         .output()
         .expect("spawn lpm approve-scripts --yes");
-    assert!(out1.status.success(), "first --yes must succeed");
-
-    let manifest = read_manifest(&project);
-    let td = &manifest["lpm"]["trustedDependencies"];
-    assert!(
-        td.is_object(),
-        "trustedDependencies must upgrade to Rich form"
-    );
-    let map = td.as_object().unwrap();
-    assert!(
-        map.contains_key("esbuild@*"),
-        "esbuild legacy entry must be preserved as the @* sentinel; got: {td}"
-    );
-    assert!(
-        map.contains_key("sharp@0.32.1"),
-        "sharp must be in the rich form; got: {td}"
-    );
-
-    // Step 2: simulate a new install capturing esbuild in build-state.
-    write_build_state_audit(
-        &project,
-        &[
-            (
-                "esbuild",
-                "0.25.1",
-                "sha512-esbuild-int",
-                "sha256-esbuild-h",
-            ),
-            ("sharp", "0.32.1", "sha512-sharp-int", "sha256-sharp-h"),
-        ],
-    );
-
-    // Step 3: --list --json must show esbuild still blocked. Sharp's
-    // concrete @0.32.1 entry continues to clear sharp; the @* sentinel
-    // for esbuild does NOT auto-trust @0.25.1.
-    let out2 = lpm(&project)
-        .args(["--json", "approve-scripts", "--list"])
-        .output()
-        .expect("spawn lpm approve-scripts --list --json");
-    assert!(
-        out2.status.success(),
-        "approve-scripts --list --json must succeed"
-    );
-    let parsed: serde_json::Value =
-        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out2.stdout))).unwrap();
+    assert_security_approval_scope(&out, "trust-bulk-approve");
     assert_eq!(
-        parsed["blocked_count"].as_u64(),
-        Some(1),
-        "@* sentinel must NOT clear esbuild from the blocked set; \
-         user must re-approve the concrete version via approve-scripts. \
-         Envelope: {parsed:#}"
+        project.read_file("package.json"),
+        before,
+        "legacy trustedDependencies must not be upgraded without approval",
     );
-    let blocked = parsed["blocked"].as_array().unwrap();
-    assert_eq!(blocked.len(), 1);
-    assert_eq!(blocked[0]["name"], "esbuild");
-    assert_eq!(blocked[0]["version"], "0.25.1");
 }
 
 /// **Filter-by-current-state regression.** `approve-scripts --list` filters persisted
@@ -1069,7 +1026,7 @@ fn approve_scripts_at_star_sentinel_still_blocks_unknown_versions_after_install(
 /// next `--list` call must NOT report it as blocked even if the state
 /// file still records it.
 #[test]
-fn approve_scripts_list_filters_already_approved_packages_after_yes() {
+fn approve_scripts_yes_requires_security_approval_and_list_remains_blocked() {
     let project = TempProject::empty(r#"{"name":"audit-d-impl-2-list","version":"0.0.0"}"#);
     write_build_state_audit(
         &project,
@@ -1081,15 +1038,16 @@ fn approve_scripts_list_filters_already_approved_packages_after_yes() {
         )],
     );
 
-    // Approve esbuild via --yes.
+    // Attempt to approve esbuild via --yes. Workflow tests do not mint
+    // native approval, so the write must be refused.
     let out1 = lpm(&project)
-        .args(["approve-scripts", "--yes"])
+        .args(["--json", "approve-scripts", "--yes"])
         .output()
         .expect("spawn lpm approve-scripts --yes");
-    assert!(out1.status.success(), "yes must succeed");
+    assert_security_approval_scope(&out1, "trust-bulk-approve");
 
     // --list --json: the persisted state still records esbuild as
-    // blocked, but the manifest covers it now → blocked_count: 0.
+    // blocked because no manifest trust write occurred.
     let out2 = lpm(&project)
         .args(["--json", "approve-scripts", "--list"])
         .output()
@@ -1099,13 +1057,13 @@ fn approve_scripts_list_filters_already_approved_packages_after_yes() {
         serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out2.stdout))).unwrap();
     assert_eq!(
         parsed["blocked_count"].as_u64(),
-        Some(0),
-        "esbuild must be filtered out by current trust; envelope: {parsed:#}"
+        Some(1),
+        "esbuild must remain blocked after refused approval; envelope: {parsed:#}"
     );
     assert_eq!(
         parsed["blocked"].as_array().map(|a| a.len()),
-        Some(0),
-        "blocked array must be empty"
+        Some(1),
+        "blocked array must still contain esbuild"
     );
 }
 
@@ -1159,13 +1117,11 @@ fn approve_scripts_specific_pkg_arg_for_already_approved_emits_friendly_error() 
     );
 }
 
-/// **Stream-purity regression — `--yes --json`.** This is the
-/// audit's most important regression: a WARN line bled onto stdout
-/// before the fix that routed tracing to stderr. Stdout under
-/// `--json` MUST be exactly one valid JSON object — no WARN, no
-/// "blanket-approves" prose.
+/// **Stream-purity regression — guarded `--yes --json`.** The live
+/// `--yes` path now stops at the security approval boundary, but stdout
+/// still must be exactly one valid JSON error object.
 #[test]
-fn approve_scripts_yes_json_emits_exactly_one_valid_json_payload_on_stdout() {
+fn approve_scripts_yes_json_security_error_is_exactly_one_valid_json_payload_on_stdout() {
     let project = TempProject::empty(r#"{"name":"audit-d-impl-3-yes","version":"0.0.0"}"#);
     write_build_state_audit(&project, &[("esbuild", "0.25.1", "sha512-int", "sha256-h")]);
 
@@ -1173,7 +1129,6 @@ fn approve_scripts_yes_json_emits_exactly_one_valid_json_payload_on_stdout() {
         .args(["--json", "approve-scripts", "--yes"])
         .output()
         .expect("spawn lpm approve-scripts --json --yes");
-    assert!(out.status.success(), "yes --json must succeed");
 
     let stdout_clean = strip_ansi(&String::from_utf8_lossy(&out.stdout));
     let parsed: serde_json::Value = serde_json::from_str(&stdout_clean).unwrap_or_else(|e| {
@@ -1184,26 +1139,10 @@ fn approve_scripts_yes_json_emits_exactly_one_valid_json_payload_on_stdout() {
         )
     });
 
-    assert_eq!(parsed["schema_version"].as_u64(), Some(3));
-    assert_eq!(parsed["command"].as_str(), Some("approve-scripts"));
-    assert_eq!(parsed["mode"].as_str(), Some("yes"));
-    assert_eq!(parsed["approved_count"].as_u64(), Some(1));
-
-    // The structured warning is in the JSON payload (triple-emission
-    // contract — JSON `warnings` field is one of the three).
-    let warnings = parsed["warnings"].as_array().expect("warnings array");
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w["code"].as_str() == Some("yes_blanket_approve")),
-        "warnings must include yes_blanket_approve; got: {warnings:#?}"
-    );
-
-    // Stderr carries the WARN line (post-fix tracing goes to stderr).
-    let stderr_clean = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    assert!(
-        stderr_clean.contains("blanket-approves"),
-        "stderr must contain the WARN line; got:\n{stderr_clean}"
+    assert_eq!(parsed["success"].as_bool(), Some(false));
+    assert_eq!(
+        parsed["error"]["code"].as_str(),
+        Some("SECURITY_APPROVAL_REQUIRED")
     );
 
     // CRITICAL: stdout must NOT contain the WARN text.

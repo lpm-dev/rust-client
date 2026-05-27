@@ -90,23 +90,73 @@ echo
 echo "############################################"
 echo "##  CONSOLIDATED AUDIT SUMMARY"
 echo "############################################"
-printf "%-44s %-20s\n" "FIXTURE" "ISOLATED/HOISTED"
+printf "%-44s %-20s %s\n" "FIXTURE" "ISOLATED/HOISTED" "CATEGORY"
 echo "------------------------------------------------------------------"
 pass_count=0
-fail_count=0
 skip_count=0
+symmetric_non_pass=0
+asymmetric_count=0
+symmetric_issue_rows=()
+asymmetric_rows=()
 for i in "${!FIXTURE_NAMES[@]}"; do
-    printf "%-44s %-20s\n" "${FIXTURE_NAMES[$i]}" "${RESULTS[$i]}"
+    fixture_name="$(echo "${FIXTURE_NAMES[$i]}" | tr '/' '-')"
+    iso_file=$(ls -t "$HERE/results/$fixture_name-isolated-"*.json 2>/dev/null | head -1)
+    hst_file=$(ls -t "$HERE/results/$fixture_name-hoisted-"*.json 2>/dev/null | head -1)
+    iso_c=$([[ -f "$iso_file" ]] && python3 -c "import json;print(json.load(open('$iso_file')).get('classification','unclassified-failure'))" || echo "?")
+    hst_c=$([[ -f "$hst_file" ]] && python3 -c "import json;print(json.load(open('$hst_file')).get('classification','unclassified-failure'))" || echo "?")
+    if [[ "$iso_c" == "$hst_c" ]]; then
+        category_summary="$iso_c"
+    else
+        category_summary="$iso_c/$hst_c"
+    fi
+    printf "%-44s %-20s %s\n" "${FIXTURE_NAMES[$i]}" "${RESULTS[$i]}" "$category_summary"
     case "${RESULTS[$i]}" in
         "PASS/PASS") pass_count=$((pass_count+1)) ;;
         "SKIP/SKIP") skip_count=$((skip_count+1)) ;;
-        *)           fail_count=$((fail_count+1)) ;;
+        PASS/FAIL|FAIL/PASS|PASS/SKIP|SKIP/PASS|FAIL/SKIP|SKIP/FAIL)
+            asymmetric_count=$((asymmetric_count+1))
+            asymmetric_rows+=("${FIXTURE_NAMES[$i]}|${RESULTS[$i]}")
+            ;;
+        *)
+            symmetric_non_pass=$((symmetric_non_pass+1))
+            symmetric_issue_rows+=("${FIXTURE_NAMES[$i]}|$category_summary|${RESULTS[$i]}")
+            ;;
     esac
 done
 echo "------------------------------------------------------------------"
-printf "PASS both: %d   SKIP: %d   FAIL or mixed: %d   total: %d\n" \
-    "$pass_count" "$skip_count" "$fail_count" "${#FIXTURE_NAMES[@]}"
+printf "PASS both: %d   SKIP: %d   ASYMMETRIC: %d   SYMMETRIC NON-PASS: %d   total: %d\n" \
+    "$pass_count" "$skip_count" "$asymmetric_count" "$symmetric_non_pass" "${#FIXTURE_NAMES[@]}"
 echo
+
+if [[ ${#symmetric_issue_rows[@]} -gt 0 ]]; then
+    echo "Symmetric non-pass buckets:"
+    python3 -c '
+import collections
+import sys
+
+rows = [row.split("|", 2) for row in sys.argv[1:] if row]
+by_category = collections.defaultdict(list)
+for fixture, category, verdicts in rows:
+    by_category[category].append((fixture, verdicts))
+
+for category in sorted(by_category):
+    entries = sorted(by_category[category])
+    print(f"  {category}: {len(entries)}")
+    for fixture, verdicts in entries:
+        print(f"    {fixture} ({verdicts})")
+' "${symmetric_issue_rows[@]}"
+    echo
+fi
+
+if [[ ${#asymmetric_rows[@]} -gt 0 ]]; then
+    echo "Asymmetric outcomes (mode regressions):"
+    for row in "${asymmetric_rows[@]}"; do
+        fixture="${row%%|*}"
+        verdicts="${row#*|}"
+        echo "  $fixture ($verdicts)"
+    done
+    echo
+fi
 
 # CI exit semantics: asymmetric outcomes (PASS/FAIL or FAIL/PASS) ARE
 # regressions and exit non-zero. Symmetric outcomes (both PASS or both

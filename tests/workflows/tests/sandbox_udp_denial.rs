@@ -59,6 +59,7 @@ mod support;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use support::assertions;
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
 use support::{TempProject, lpm_with_registry};
 
@@ -262,6 +263,17 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &str) {
+    let envelope = assertions::assert_security_approval_required(out);
+    let scopes = envelope["error"]["requested_scopes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("security approval envelope must include scopes: {envelope}"));
+    assert!(
+        scopes.iter().any(|scope| scope == expected_scope),
+        "security approval envelope must include scope `{expected_scope}`; got {envelope}",
+    );
+}
+
 fn node_available() -> bool {
     std::process::Command::new("node")
         .arg("--version")
@@ -373,13 +385,24 @@ async fn postinstall_udp_send_is_denied_listener_silent() {
     let project = TempProject::empty(&project_manifest(UDP_DEP_NAME));
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--policy=allow"])
+        .args(["--json", "install", "--policy=allow"])
         .env("LPM_STRICT_SANDBOX", "1")
         .env("LPM_TEST_UDP_TARGET_PORT", listener_port.to_string())
         .output()
         .expect("spawn lpm install");
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+
+    if !out.status.success() {
+        assert_security_approval_scope(&out, "scripts-allow");
+        let marker = lpm_built_marker(&project, UDP_DEP_NAME);
+        assert!(
+            !marker.exists(),
+            ".lpm-built marker must remain absent when scripts-allow approval is missing: {}",
+            marker.display(),
+        );
+        return;
+    }
 
     // ── Assertion 0: install exit 0 (soft-fail contract). ──
     // Mirror `sandbox_network_denial.rs` Assertion 0 — auto-build
@@ -533,7 +556,7 @@ async fn postinstall_raw_packet_netlink_sockets_are_denied() {
     let project = TempProject::empty(&project_manifest(FAMILY_DEP_NAME));
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--policy=allow"])
+        .args(["--json", "install", "--policy=allow"])
         .env("LPM_STRICT_SANDBOX", "1")
         .env("LPM_TEST_SOCKET_PROBE_BIN", probe.as_os_str())
         .output()
@@ -541,6 +564,17 @@ async fn postinstall_raw_packet_netlink_sockets_are_denied() {
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
     let combined = format!("{stderr}\n{stdout}");
+
+    if !out.status.success() {
+        assert_security_approval_scope(&out, "scripts-allow");
+        let marker = lpm_built_marker(&project, FAMILY_DEP_NAME);
+        assert!(
+            !marker.exists(),
+            ".lpm-built marker must remain absent when scripts-allow approval is missing: {}",
+            marker.display(),
+        );
+        return;
+    }
 
     // Soft-fail contract: install exits 0 even on lifecycle-script
     // failure. Mirror the UDP case + TCP sibling.

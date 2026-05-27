@@ -1,5 +1,5 @@
 #!/bin/bash
-# Real-world project audit harness — confidence-followup 
+# Real-world project audit harness — confidence-followup
 #
 # Clones a project pinned in projects.json, replaces its install with
 # `lpm install --linker <mode>` for both isolated and hoisted, and runs
@@ -71,6 +71,10 @@ TS="$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RESULTS_DIR" "$CACHE_DIR"
 
 now_ms() { python3 -c 'import time;print(int(time.perf_counter_ns()))'; }
+
+json_string() {
+    printf '%s' "$1" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()))'
+}
 
 # Portable timeout wrapper. GNU `timeout` isn't on macOS by default
 # (renames to `gtimeout` via coreutils); Windows Git Bash also lacks
@@ -174,6 +178,7 @@ run_mode() {
     local mode="$1"
     local work="$WORK_BASE/$PROJECT_NAME-$mode"
     local result="$RESULTS_DIR/$PROJECT_NAME-$mode-$TS.json"
+    local effective_lpm_home="${LPM_HOME:-$WORK_BASE/$PROJECT_NAME-$mode-home}"
 
     echo "--- $PROJECT_NAME [$mode] ---"
 
@@ -181,9 +186,12 @@ run_mode() {
     # the audit-fixtures runner — see that file for the full
     # rationale). Without this, callers that set LPM_HOME for
     # parallelism leak state from one mode to the next.
-    local lpm_root="${LPM_HOME:-$HOME/.lpm}"
-    rm -rf "$work" "$lpm_root/cache" "$lpm_root/store"
-    mkdir -p "$work"
+    if [[ -n "${LPM_HOME:-}" ]]; then
+        rm -rf "$work" "$effective_lpm_home/cache" "$effective_lpm_home/store"
+    else
+        rm -rf "$work" "$effective_lpm_home"
+    fi
+    mkdir -p "$work" "$effective_lpm_home"
 
     if [[ "$FROM_SCRATCH" == "true" ]]; then
         # No clone — pre_install authors the project from scratch.
@@ -220,7 +228,7 @@ run_mode() {
     local install_json="$work/.lpm-install.json"
     local s=$(now_ms)
     set +e
-    (cd "$work" && "$BIN" install --allow-new --linker "$mode" --json > "$install_json") 2> "$install_log"
+    (cd "$work" && env LPM_HOME="$effective_lpm_home" "$BIN" install --allow-new --linker "$mode" --json > "$install_json") 2> "$install_log"
     local install_exit=$?
     set -e
     local e=$(now_ms)
@@ -276,12 +284,42 @@ run_mode() {
     else
         install_log_snip='""'
     fi
+    local install_json_snip=""
+    if [[ -f "$install_json" ]]; then
+        install_json_snip=$(tail -20 "$install_json" | tr -d '\r' | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read()))')
+    else
+        install_json_snip='""'
+    fi
     local smoke_log_snip=""
     if [[ -f "$smoke_log" ]]; then
         smoke_log_snip=$(tail -20 "$smoke_log" | tr -d '\r' | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read()))')
     else
         smoke_log_snip='""'
     fi
+
+    local fail_reason_json
+    fail_reason_json=$(json_string "$fail_reason")
+    local classification_json
+    classification_json=$(python3 "$REPO_ROOT/bench/audit-fixtures/classify_result.py" <<EOF
+{
+  "project": "$PROJECT_NAME",
+  "mode": "$mode",
+  "verdict": "$verdict",
+  "fail_reason": $fail_reason_json,
+  "install_exit": $install_exit,
+  "smoke_exit": $smoke_exit,
+    "install_json_tail": $install_json_snip,
+  "install_log_tail": $install_log_snip,
+  "smoke_log_tail": $smoke_log_snip
+}
+EOF
+)
+    local classification
+    classification=$(printf '%s' "$classification_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["classification"])')
+    local classification_detail
+    classification_detail=$(printf '%s' "$classification_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["classification_detail"])')
+    local classification_detail_json
+    classification_detail_json=$(json_string "$classification_detail")
 
     python3 - <<EOF > "$result"
 import json
@@ -297,7 +335,10 @@ print(json.dumps({
     "smoke_exit": $smoke_exit,
     "smoke_ms": $smoke_ms,
     "verdict": "$verdict",
-    "fail_reason": "$fail_reason",
+    "fail_reason": $fail_reason_json,
+    "classification": "$classification",
+    "classification_detail": $classification_detail_json,
+    "install_json_tail": $install_json_snip,
     "install_log_tail": $install_log_snip,
     "smoke_log_tail": $smoke_log_snip,
 }, indent=2))
@@ -307,7 +348,7 @@ EOF
         "$install_exit" "$install_ms" "$top_count"
     printf "  smoke:   exit=%d, %dms\n" "$smoke_exit" "$smoke_ms"
     if [[ "$verdict" != "PASS" ]]; then
-        printf "  verdict: FAIL (%s)\n" "$fail_reason"
+        printf "  verdict: FAIL [%s] (%s)\n" "$classification" "$fail_reason"
         if [[ $install_exit -ne 0 ]]; then
             tail -10 "$install_log" 2>/dev/null | sed 's/^/    /'
         elif [[ $smoke_exit -ne 0 ]]; then
@@ -334,10 +375,11 @@ echo "==================================="
 echo " $PROJECT_NAME — overall summary"
 echo "==================================="
 for mode in isolated hoisted; do
-    latest=$(ls -t "$RESULTS_DIR/$PROJECT_NAME-$mode-"*.json 2>/dev/null | head -1)
-    if [[ -n "$latest" ]]; then
-        verdict=$(python3 -c "import json;print(json.load(open('$latest'))['verdict'])")
-        reason=$(python3 -c "import json;print(json.load(open('$latest')).get('fail_reason','') or '-')")
-        printf "  %-10s %-5s  %s\n" "$mode" "$verdict" "$reason"
+    current_result="$RESULTS_DIR/$PROJECT_NAME-$mode-$TS.json"
+    if [[ -f "$current_result" ]]; then
+        verdict=$(python3 -c "import json;print(json.load(open('$current_result'))['verdict'])")
+        classification=$(python3 -c "import json;print(json.load(open('$current_result')).get('classification','unclassified-failure'))")
+        reason=$(python3 -c "import json;print(json.load(open('$current_result')).get('fail_reason','') or '-')")
+        printf "  %-10s %-5s %-22s %s\n" "$mode" "$verdict" "$classification" "$reason"
     fi
 done

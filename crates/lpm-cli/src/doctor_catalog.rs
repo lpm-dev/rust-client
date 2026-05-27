@@ -1491,6 +1491,18 @@ pub static SANDBOX_DISABLED_BY_USER: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static SANDBOX_CONFIG_APPROVAL_REQUIRED: CheckEntry = CheckEntry {
+    code: "sandbox_config_approval_required",
+    name: "Sandbox",
+    category: Category::Sandbox,
+    tier: Tier::Extended,
+    description: "Sandbox config requests a weaker posture than this machine has approved.",
+    when_fires: "A project or user sandbox setting such as `[sandbox] mode = \"none\"` is present, but no matching security approval or unlock is active.",
+    remediation: "Approve the change through the suggested `lpm security unlock ...` or `lpm config sandbox --set ...` flow, or restore `[sandbox] mode = \"default\"` / `\"strict\"`.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
+};
+
 pub static SANDBOX_KERNEL_TOO_OLD: CheckEntry = CheckEntry {
     code: "sandbox_kernel_too_old",
     name: "Sandbox",
@@ -1840,6 +1852,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &SANDBOX_HELPER_MISSING,
     &SANDBOX_DEGRADED,
     &SANDBOX_DISABLED_BY_USER,
+    &SANDBOX_CONFIG_APPROVAL_REQUIRED,
     &SANDBOX_KERNEL_TOO_OLD,
     &SANDBOX_UNSUPPORTED_PLATFORM,
     &SANDBOX_PROBE_FAILED,

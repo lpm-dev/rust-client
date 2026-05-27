@@ -49,6 +49,7 @@ pub mod resolve;
 pub mod run;
 pub mod schema;
 pub mod search;
+pub mod security;
 pub mod self_update;
 pub mod setup;
 pub mod skills;

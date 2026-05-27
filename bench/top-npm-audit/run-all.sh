@@ -106,27 +106,58 @@ echo
 echo "############################################"
 echo "##  TOP-N NPM AUDIT SUMMARY"
 echo "############################################"
-printf "%-40s %s\n" "FIXTURE" "ISOLATED/HOISTED"
+printf "%-40s %-20s %s\n" "FIXTURE" "ISOLATED/HOISTED" "CATEGORY"
 echo "------------------------------------------------------------------"
-pass=0; mixed=0; sym_fail=0; unknown=0
+pass=0; mixed=0; symmetric_non_pass=0; unknown=0
 asymmetric_list=()
+symmetric_issue_rows=()
 for f in "${FIXTURES[@]}"; do
     fname="$(echo "$f" | tr '/' '-')"
     iso=$(ls -t "$RESULTS_DIR/$fname-isolated-"*.json 2>/dev/null | head -1)
     hst=$(ls -t "$RESULTS_DIR/$fname-hoisted-"*.json 2>/dev/null | head -1)
     iv=$([[ -f "$iso" ]] && python3 -c "import json;print(json.load(open('$iso'))['verdict'])" || echo "?")
     hv=$([[ -f "$hst" ]] && python3 -c "import json;print(json.load(open('$hst'))['verdict'])" || echo "?")
-    printf "%-40s %s/%s\n" "$f" "$iv" "$hv"
+    ic=$([[ -f "$iso" ]] && python3 -c "import json;print(json.load(open('$iso')).get('classification','unclassified-failure'))" || echo "?")
+    hc=$([[ -f "$hst" ]] && python3 -c "import json;print(json.load(open('$hst')).get('classification','unclassified-failure'))" || echo "?")
+    if [[ "$ic" == "$hc" ]]; then
+        category_summary="$ic"
+    else
+        category_summary="$ic/$hc"
+    fi
+    printf "%-40s %-20s %s\n" "$f" "$iv/$hv" "$category_summary"
     case "${iv}/${hv}" in
         "PASS/PASS") pass=$((pass+1)) ;;
-        "FAIL/FAIL") sym_fail=$((sym_fail+1)) ;;
+        "FAIL/FAIL")
+            symmetric_non_pass=$((symmetric_non_pass+1))
+            symmetric_issue_rows+=("$f|$category_summary|$iv/$hv")
+            ;;
         "PASS/FAIL"|"FAIL/PASS") mixed=$((mixed+1)); asymmetric_list+=("$f: $iv/$hv") ;;
         *) unknown=$((unknown+1)) ;;
     esac
 done
 echo "------------------------------------------------------------------"
-printf "PASS both: %d   ASYMMETRIC: %d   FAIL both: %d   unknown: %d   total: %d\n" \
-    "$pass" "$mixed" "$sym_fail" "$unknown" "${#FIXTURES[@]}"
+printf "PASS both: %d   ASYMMETRIC: %d   SYMMETRIC NON-PASS: %d   unknown: %d   total: %d\n" \
+    "$pass" "$mixed" "$symmetric_non_pass" "$unknown" "${#FIXTURES[@]}"
+
+if [[ ${#symmetric_issue_rows[@]} -gt 0 ]]; then
+    echo
+    echo "Symmetric non-pass buckets:"
+    python3 -c '
+import collections
+import sys
+
+rows = [row.split("|", 2) for row in sys.argv[1:] if row]
+by_category = collections.defaultdict(list)
+for fixture, category, verdicts in rows:
+    by_category[category].append((fixture, verdicts))
+
+for category in sorted(by_category):
+    entries = sorted(by_category[category])
+    print(f"  {category}: {len(entries)}")
+    for fixture, verdicts in entries:
+        print(f"    {fixture} ({verdicts})")
+' "${symmetric_issue_rows[@]}"
+fi
 
 if [[ ${#asymmetric_list[@]} -gt 0 ]]; then
     echo

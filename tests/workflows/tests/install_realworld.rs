@@ -118,7 +118,6 @@ fn run_install(project: &TempProject) -> Output {
         .env_remove("LPM_TOKEN")
         .args([
             "install",
-            "--allow-new",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -152,7 +151,6 @@ fn run_install_under_time(project: &TempProject) -> (Output, Option<u64>) {
 
     cmd.arg(&bin);
     cmd.arg("install")
-        .arg("--allow-new")
         .arg("--no-security-summary")
         .arg("--no-skills")
         .arg("--no-editor-setup");
