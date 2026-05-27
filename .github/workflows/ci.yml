@@ -63,6 +63,9 @@ jobs:
           key: ${{ runner.os }}-cargo-lint-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-lint-${{ env.RUST_TOOLCHAIN }}-
 
+      - name: Install Linux keyring build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+
       # --all-targets covers library, binary, test, example, and bench
       # targets. The bare `--workspace` variant misses lints in test
       # modules (Chunk 4 caught two pre-existing `assert_eq!(x, false)`
@@ -108,6 +111,9 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install Linux keyring build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
 
       - name: Install nextest
         uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
@@ -206,6 +212,10 @@ jobs:
           key: ${{ runner.os }}-cargo-audit-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-audit-${{ env.RUST_TOOLCHAIN }}-
 
+      - name: Install Linux keyring build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+
       - name: Install Node 22
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -269,6 +279,9 @@ jobs:
           key: ${{ runner.os }}-cargo-realworld-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-realworld-${{ env.RUST_TOOLCHAIN }}-
 
+      - name: Install Linux keyring build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+
       - name: Install Node 22
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -324,6 +337,9 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-topnpm-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-topnpm-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install Linux keyring build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
 
       - name: Install Node 22
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
