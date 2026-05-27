@@ -150,13 +150,26 @@ fn approval_metadata_preserving_existing_provenance(
 /// a layer of evidence the install path already captured.
 async fn fetch_provenance_for_effective_set(
     packages: &[BlockedPackage],
+    policy: &crate::provenance_fetch::VerifyPolicy,
 ) -> HashMap<(String, String), ProvenanceStatus> {
     let pkgs: Vec<(String, String)> = packages
         .iter()
         .map(|p| (p.name.clone(), p.version.clone()))
         .collect();
-    let policy = crate::provenance_fetch::VerifyPolicy::resolve_no_cli();
-    crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs, &policy).await
+    crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs, policy).await
+}
+
+fn runtime_verify_policy_with_source() -> (
+    crate::provenance_fetch::VerifyPolicy,
+    crate::provenance_fetch::EnforceModeSource,
+) {
+    let cfg = crate::commands::config::GlobalConfig::load();
+    crate::provenance_fetch::VerifyPolicy::resolve_from_chain(
+        Vec::new(),
+        false,
+        std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref(),
+        || cfg.get_sigstore_verify(),
+    )
 }
 
 /// Resolve the `provenance_at_approval` value for one `(name, version)`
@@ -190,13 +203,9 @@ fn snapshot_for_binding(
     provenance_by_pkg: &HashMap<(String, String), ProvenanceStatus>,
     name: &str,
     version: &str,
+    mode: crate::provenance_fetch::EnforceMode,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
-    snapshot_for_binding_with_mode(
-        provenance_by_pkg,
-        name,
-        version,
-        crate::provenance_fetch::EnforceMode::from_env(),
-    )
+    snapshot_for_binding_with_mode(provenance_by_pkg, name, version, mode)
 }
 
 /// Pure variant of [`snapshot_for_binding`] that takes the
@@ -542,12 +551,23 @@ async fn run_under_store_lock(
     // `--list` is read-only — skip the fetch entirely; the listing
     // doesn't materialize any binding so `provenance_at_approval` is
     // never consulted. Empty effective set: skip too (no-op).
-    let provenance_by_pkg: HashMap<(String, String), ProvenanceStatus> =
-        if list || effective_state.blocked_packages.is_empty() {
-            HashMap::new()
-        } else {
-            fetch_provenance_for_effective_set(&effective_state.blocked_packages).await
-        };
+    let (verify_policy, runtime_sigstore_source) = runtime_verify_policy_with_source();
+    let runtime_enforce = verify_policy.enforce;
+    if !list && !dry_run && !effective_state.blocked_packages.is_empty() {
+        crate::security_approval::ensure_runtime_sigstore_posture(
+            project_dir,
+            json_output,
+            runtime_enforce,
+            runtime_sigstore_source,
+        )?;
+    }
+    let provenance_by_pkg: HashMap<(String, String), ProvenanceStatus> = if list
+        || effective_state.blocked_packages.is_empty()
+    {
+        HashMap::new()
+    } else {
+        fetch_provenance_for_effective_set(&effective_state.blocked_packages, &verify_policy).await
+    };
 
     // ── <pkg> argument: handled BEFORE the empty-effective short-circuit ──
     //
@@ -615,7 +635,12 @@ async fn run_under_store_lock(
             // `Err(LpmError::ProvenanceVerification(_))` when the
             // verifier rejected the bundle, refusing the approval
             // rather than blanking `provenance_at_approval`.
-            let snap = snapshot_for_binding(&provenance_by_pkg, &target.name, &target.version)?;
+            let snap = snapshot_for_binding(
+                &provenance_by_pkg,
+                &target.name,
+                &target.version,
+                runtime_enforce,
+            )?;
             let meta = approval_metadata_preserving_existing_provenance(
                 &trusted,
                 target,
@@ -737,7 +762,12 @@ async fn run_under_store_lock(
             // rejection so the trust binding is NOT overwritten with
             // `None` (which would silently disarm drift detection on
             // every subsequent install).
-            let snap = snapshot_for_binding(&provenance_by_pkg, &blocked.name, &blocked.version)?;
+            let snap = snapshot_for_binding(
+                &provenance_by_pkg,
+                &blocked.name,
+                &blocked.version,
+                runtime_enforce,
+            )?;
             let meta = approval_metadata_preserving_existing_provenance(
                 &trusted,
                 blocked,
@@ -926,7 +956,12 @@ async fn run_under_store_lock(
         // preserve it rather than overwriting with `None` —
         // otherwise a re-approval under Warn would silently clear
         // the prior reference and disarm drift detection.
-        let snap = snapshot_for_binding(&provenance_by_pkg, &blocked.name, &blocked.version)?;
+        let snap = snapshot_for_binding(
+            &provenance_by_pkg,
+            &blocked.name,
+            &blocked.version,
+            runtime_enforce,
+        )?;
         let meta = approval_metadata_preserving_existing_provenance(
             &trusted,
             blocked,
@@ -1800,14 +1835,41 @@ async fn run_global_under_store_lock(
         return Ok(());
     }
 
+    let (verify_policy, runtime_sigstore_source) = runtime_verify_policy_with_source();
+    let runtime_enforce = verify_policy.enforce;
+    if !dry_run {
+        crate::security_approval::ensure_runtime_sigstore_posture_for_global(
+            json_output,
+            runtime_enforce,
+            runtime_sigstore_source,
+        )?;
+    }
+
     // ── Named-package approval path ───────────────────────────────
     if let Some(arg) = package {
-        return run_global_named(&root, &aggregate, arg, dry_run, json_output).await;
+        return run_global_named(
+            &root,
+            &aggregate,
+            arg,
+            dry_run,
+            json_output,
+            &verify_policy,
+            runtime_enforce,
+        )
+        .await;
     }
 
     // ── Bulk-approve mode ─────────────────────────────────────────
     if yes {
-        return run_global_bulk_yes(&root, &aggregate, dry_run, json_output).await;
+        return run_global_bulk_yes(
+            &root,
+            &aggregate,
+            dry_run,
+            json_output,
+            &verify_policy,
+            runtime_enforce,
+        )
+        .await;
     }
 
     // ── Interactive walk ──────────────────────────────────────────
@@ -1824,7 +1886,16 @@ async fn run_global_under_store_lock(
             aggregate.rows.len(),
         )));
     }
-    run_global_interactive(&root, &aggregate, effective_group, dry_run, json_output).await
+    run_global_interactive(
+        &root,
+        &aggregate,
+        effective_group,
+        dry_run,
+        json_output,
+        &verify_policy,
+        runtime_enforce,
+    )
+    .await
 }
 
 /// `--list` implementation: print the aggregate read-only. `--group`
@@ -2023,6 +2094,8 @@ async fn run_global_bulk_yes(
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     dry_run: bool,
     json_output: bool,
+    verify_policy: &crate::provenance_fetch::VerifyPolicy,
+    runtime_enforce: crate::provenance_fetch::EnforceMode,
 ) -> Result<(), LpmError> {
     // Refuse global `--yes` for any aggregate row classified outside
     // the green tier — parity with the project `--yes` gate. The gate
@@ -2048,11 +2121,8 @@ async fn run_global_bulk_yes(
         .iter()
         .map(|r| (r.name.clone(), r.version.clone()))
         .collect();
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
-        &pairs,
-        &crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
-    )
-    .await;
+    let provenance =
+        crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs, verify_policy).await;
 
     // Resolve each row's binding snapshot BEFORE entering the tx lock
     // so a verifier rejection (which returns
@@ -2065,7 +2135,7 @@ async fn run_global_bulk_yes(
     let mut row_snapshots: Vec<(usize, Option<ProvenanceSnapshot>)> =
         Vec::with_capacity(aggregate.rows.len());
     for (idx, row) in aggregate.rows.iter().enumerate() {
-        let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
+        let snap = snapshot_for_binding(&provenance, &row.name, &row.version, runtime_enforce)?;
         row_snapshots.push((idx, snap));
     }
 
@@ -2200,6 +2270,8 @@ async fn run_global_named(
     arg: &str,
     dry_run: bool,
     json_output: bool,
+    verify_policy: &crate::provenance_fetch::VerifyPolicy,
+    runtime_enforce: crate::provenance_fetch::EnforceMode,
 ) -> Result<(), LpmError> {
     // Audit: (GPT finding 1): bare-name lookup must refuse silently-
     // picking-first when multiple rows match. Aggregate rows are deduped
@@ -2241,12 +2313,9 @@ async fn run_global_named(
     // SILENT-DROP fix: `?` propagates a verifier rejection
     // BEFORE acquiring the lock, leaving any prior binding intact.
     let pairs = vec![(row.name.clone(), row.version.clone())];
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
-        &pairs,
-        &crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
-    )
-    .await;
-    let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
+    let provenance =
+        crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs, verify_policy).await;
+    let snap = snapshot_for_binding(&provenance, &row.name, &row.version, runtime_enforce)?;
 
     let lock_path = root.global_tx_lock();
     let root_for_body = root;
@@ -2529,6 +2598,8 @@ async fn run_global_interactive(
     group: bool,
     dry_run: bool,
     _json_output: bool,
+    verify_policy: &crate::provenance_fetch::VerifyPolicy,
+    runtime_enforce: crate::provenance_fetch::EnforceMode,
 ) -> Result<(), LpmError> {
     use crate::prompt::prompt_err;
 
@@ -2541,11 +2612,8 @@ async fn run_global_interactive(
         .iter()
         .map(|r| (r.name.clone(), r.version.clone()))
         .collect();
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
-        &pairs,
-        &crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
-    )
-    .await;
+    let provenance =
+        crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs, verify_policy).await;
 
     let mut approved: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
     let mut skipped: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
@@ -2613,7 +2681,12 @@ async fn run_global_interactive(
                         // the entire `approve_all` action with a clear
                         // error, leaving any prior bindings for the
                         // remaining rows untouched.
-                        let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
+                        let snap = snapshot_for_binding(
+                            &provenance,
+                            &row.name,
+                            &row.version,
+                            runtime_enforce,
+                        )?;
                         commit_global_approval(root, row, snap, dry_run).await?;
                         approved.push(*row);
                         decided.insert(AggregateRowKey::from_row(row));
@@ -2645,8 +2718,12 @@ async fn run_global_interactive(
                         match row_choice {
                             "approve" => {
                                 // SILENT-DROP fix.
-                                let snap =
-                                    snapshot_for_binding(&provenance, &row.name, &row.version)?;
+                                let snap = snapshot_for_binding(
+                                    &provenance,
+                                    &row.name,
+                                    &row.version,
+                                    runtime_enforce,
+                                )?;
                                 commit_global_approval(root, row, snap, dry_run).await?;
                                 approved.push(row);
                                 decided.insert(key);
@@ -2727,7 +2804,8 @@ async fn run_global_interactive(
         match choice {
             "approve" => {
                 // SILENT-DROP fix.
-                let snap = snapshot_for_binding(&provenance, &row.name, &row.version)?;
+                let snap =
+                    snapshot_for_binding(&provenance, &row.name, &row.version, runtime_enforce)?;
                 // per-row write goes through `commit_global_approval`,
                 // which acquires the global tx lock and re-reads trust
                 // from disk so the commit is race-safe against parallel
@@ -2800,7 +2878,7 @@ fn print_aggregate_card(row: &crate::global_blocked_set::AggregateBlockedRow) {
 mod tests {
     use super::*;
     use crate::build_state::{BUILD_STATE_VERSION, BlockedPackage, BuildState};
-    use crate::provenance_fetch::EnforceMode;
+    use crate::provenance_fetch::{EnforceMode, SkipPolicy, VerifyPolicy};
     use lpm_workspace::TrustedDependencyBinding;
     use std::fs;
     use std::path::PathBuf;
@@ -4752,6 +4830,13 @@ mod tests {
         }
     }
 
+    fn deny_verify_policy() -> VerifyPolicy {
+        VerifyPolicy {
+            enforce: EnforceMode::Deny,
+            skip: SkipPolicy::None,
+        }
+    }
+
     fn seed_global_manifest_with_blocked(
         root: &lpm_common::LpmRoot,
         top_level: &str,
@@ -4918,9 +5003,18 @@ mod tests {
             ],
             unreadable_origins: vec![],
         };
-        let err = run_global_named(&root, &agg, "esbuild", false, true)
-            .await
-            .unwrap_err();
+        let policy = deny_verify_policy();
+        let err = run_global_named(
+            &root,
+            &agg,
+            "esbuild",
+            false,
+            true,
+            &policy,
+            EnforceMode::Deny,
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ambiguous"), "error must say ambiguous: {msg}");
         assert!(
@@ -4964,7 +5058,10 @@ mod tests {
             unreadable_origins: vec![],
         };
         // JSON mode so no interactive prompts and output goes to stdout.
-        run_global_bulk_yes(&root, &agg, false, true).await.unwrap();
+        let policy = deny_verify_policy();
+        run_global_bulk_yes(&root, &agg, false, true, &policy, EnforceMode::Deny)
+            .await
+            .unwrap();
         let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
         assert!(trust.trusted.contains_key("esbuild@0.25.1"));
         assert!(trust.trusted.contains_key("sharp@0.33.0"));
@@ -4983,9 +5080,18 @@ mod tests {
             ],
             unreadable_origins: vec![],
         };
-        run_global_named(&root, &agg, "sharp", false, true)
-            .await
-            .unwrap();
+        let policy = deny_verify_policy();
+        run_global_named(
+            &root,
+            &agg,
+            "sharp",
+            false,
+            true,
+            &policy,
+            EnforceMode::Deny,
+        )
+        .await
+        .unwrap();
         let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
         assert!(trust.trusted.contains_key("sharp@0.33.0"));
         assert!(!trust.trusted.contains_key("esbuild@0.25.1"));
@@ -5001,9 +5107,18 @@ mod tests {
             rows: vec![row("esbuild", "0.25.1", &["eslint"])],
             unreadable_origins: vec![],
         };
-        let err = run_global_named(&root, &agg, "ghost", false, true)
-            .await
-            .unwrap_err();
+        let policy = deny_verify_policy();
+        let err = run_global_named(
+            &root,
+            &agg,
+            "ghost",
+            false,
+            true,
+            &policy,
+            EnforceMode::Deny,
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not in the global blocked set"));
         assert!(msg.contains("--global --list"));
@@ -5237,11 +5352,31 @@ mod tests {
         let root_b = root_path.clone();
         let task_a = tokio::spawn(async move {
             let root = lpm_common::LpmRoot::from_dir(&root_a);
-            run_global_named(&root, &agg_a, "esbuild@0.25.1", false, true).await
+            let policy = deny_verify_policy();
+            run_global_named(
+                &root,
+                &agg_a,
+                "esbuild@0.25.1",
+                false,
+                true,
+                &policy,
+                EnforceMode::Deny,
+            )
+            .await
         });
         let task_b = tokio::spawn(async move {
             let root = lpm_common::LpmRoot::from_dir(&root_b);
-            run_global_named(&root, &agg_b, "sharp@0.33.0", false, true).await
+            let policy = deny_verify_policy();
+            run_global_named(
+                &root,
+                &agg_b,
+                "sharp@0.33.0",
+                false,
+                true,
+                &policy,
+                EnforceMode::Deny,
+            )
+            .await
         });
         task_a.await.unwrap().unwrap();
         task_b.await.unwrap().unwrap();
