@@ -477,9 +477,7 @@ async fn run_under_store_lock(
     // 6c hash-equality rule.
     let capability_set = crate::capability::CapabilitySet::from_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    let user_bound = crate::capability::UserBound::from_global_config(
-        &crate::commands::config::GlobalConfig::load(),
-    );
+    let user_bound = crate::security_approval::authorized_capability_user_bound();
     // Only persist the hash when the request actually widens —
     // baseline or tighter-than-bound requests never hit the
     // capability gate at enforcement time, so storing a hash for

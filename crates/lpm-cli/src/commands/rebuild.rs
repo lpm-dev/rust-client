@@ -315,7 +315,7 @@ async fn run_under_store_lock(
     let requested_capabilities =
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    let user_bound = crate::capability::UserBound::from_global_config(&global_config);
+    let user_bound = crate::security_approval::authorized_capability_user_bound();
 
     // Build the
     // v2 link-entry index ONCE before the per-package loop, scoped to

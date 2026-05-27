@@ -32,13 +32,17 @@ pub const MAX_UNLOCK_TTL_SECS: u64 = 30 * 60;
 const KEYRING_SERVICE: &str = "dev.lpm.security-approval";
 const KEYRING_ACCOUNT: &str = "signing-secret-v1";
 const SECURITY_DIR_ENV: &str = "LPM_SECURITY_DIR";
-const SECURITY_POLICY_PATH_ENV: &str = "LPM_SECURITY_POLICY_PATH";
-const TEST_SECRET_ENV: &str = "LPM_TEST_SECURITY_SECRET_HEX";
-const TEST_AUTH_RESULT_ENV: &str = "LPM_TEST_SECURITY_AUTH_RESULT";
 const DEFAULT_SECURITY_POLICY_PATH: &str = "/etc/lpm/security-policy.toml";
 const APPROVED_PROJECT_STATE_SCHEMA_VERSION: u32 = 1;
 const APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION: u32 = 1;
 const AUDIT_EVENT_SCHEMA_VERSION: u32 = 1;
+
+#[cfg(test)]
+const SECURITY_POLICY_PATH_ENV: &str = "LPM_SECURITY_POLICY_PATH";
+#[cfg(test)]
+const TEST_SECRET_ENV: &str = "LPM_TEST_SECURITY_SECRET_HEX";
+#[cfg(test)]
+const TEST_AUTH_RESULT_ENV: &str = "LPM_TEST_SECURITY_AUTH_RESULT";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -82,6 +86,7 @@ impl ApprovalScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalSource {
     CliFlag,
+    EnvVar,
     ProjectConfig,
     GlobalConfig,
     ConfigMutation,
@@ -92,6 +97,7 @@ impl ApprovalSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::CliFlag => "cli-flag",
+            Self::EnvVar => "env-var",
             Self::ProjectConfig => "project-config",
             Self::GlobalConfig => "global-config",
             Self::ConfigMutation => "config-mutation",
@@ -223,6 +229,7 @@ pub struct EffectiveAuthorizedPosture {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SecurityStatus {
+    pub target: UnlockTargetKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_root: Option<String>,
     pub effective_floor: AuthorizedPostureView,
@@ -231,6 +238,8 @@ pub struct SecurityStatus {
     pub approved_posture_source: PostureSourceKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_policy: Option<ManagedPolicyStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_runtime_overrides: Vec<RuntimeOverride>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_unlocks: Vec<UnlockGrant>,
 }
@@ -251,10 +260,29 @@ pub struct UnlockLimits {
     pub min_release_age_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnlockTargetKind {
+    #[default]
+    Project,
+    Global,
+}
+
+impl UnlockTargetKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Global => "global",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UnlockGrant {
     pub schema_version: u32,
     pub id: String,
+    #[serde(default)]
+    pub target: UnlockTargetKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_root: Option<String>,
     pub scopes: Vec<ApprovalScope>,
@@ -265,6 +293,13 @@ pub struct UnlockGrant {
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub issuer: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RuntimeOverride {
+    pub control: String,
+    pub value: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -345,11 +380,22 @@ fn audit_log_path() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("audit.jsonl"))
 }
 
+#[cfg(test)]
+fn managed_policy_path_override() -> Option<PathBuf> {
+    std::env::var(SECURITY_POLICY_PATH_ENV)
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(not(test))]
+fn managed_policy_path_override() -> Option<PathBuf> {
+    None
+}
+
 fn managed_policy_path() -> PathBuf {
-    if let Ok(path) = std::env::var(SECURITY_POLICY_PATH_ENV)
-        && !path.trim().is_empty()
-    {
-        return PathBuf::from(path);
+    if let Some(path) = managed_policy_path_override() {
+        return path;
     }
     PathBuf::from(DEFAULT_SECURITY_POLICY_PATH)
 }
@@ -360,6 +406,95 @@ fn managed_policy_error(path: &Path, message: impl Into<String>) -> LpmError {
         path.display(),
         message.into()
     ))
+}
+
+#[cfg(test)]
+fn test_secret_override() -> Option<String> {
+    std::env::var(TEST_SECRET_ENV)
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+}
+
+#[cfg(not(test))]
+fn test_secret_override() -> Option<String> {
+    None
+}
+
+#[cfg(test)]
+fn test_native_auth_override() -> Option<String> {
+    std::env::var(TEST_AUTH_RESULT_ENV).ok()
+}
+
+#[cfg(not(test))]
+fn test_native_auth_override() -> Option<String> {
+    None
+}
+
+#[cfg_attr(test, allow(dead_code))]
+#[cfg(unix)]
+fn validate_root_owned_path(path: &Path, expect_dir: bool) -> Result<(), LpmError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(managed_policy_error(
+            path,
+            "must not be a symlink-backed path",
+        ));
+    }
+    if expect_dir && !metadata.is_dir() {
+        return Err(managed_policy_error(path, "must be a directory"));
+    }
+    if !expect_dir && !metadata.is_file() {
+        return Err(managed_policy_error(path, "must be a regular file"));
+    }
+    if metadata.uid() != 0 {
+        return Err(managed_policy_error(path, "must be owned by root"));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(managed_policy_error(
+            path,
+            "must not be group- or world-writable",
+        ));
+    }
+    if metadata.file_type().is_socket()
+        || metadata.file_type().is_fifo()
+        || metadata.file_type().is_block_device()
+        || metadata.file_type().is_char_device()
+    {
+        return Err(managed_policy_error(
+            path,
+            "must not be a special device path",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(test)))]
+fn validate_managed_policy_authority(path: &Path) -> Result<(), LpmError> {
+    let canonical = std::fs::canonicalize(path)?;
+    if canonical != PathBuf::from(DEFAULT_SECURITY_POLICY_PATH) {
+        return Err(managed_policy_error(
+            path,
+            format!("must resolve to {}", DEFAULT_SECURITY_POLICY_PATH),
+        ));
+    }
+
+    validate_root_owned_path(path, false)?;
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        validate_root_owned_path(dir, true)?;
+        if dir == Path::new("/etc") {
+            break;
+        }
+        current = dir.parent();
+    }
+    Ok(())
+}
+
+#[cfg(any(test, not(unix)))]
+fn validate_managed_policy_authority(_path: &Path) -> Result<(), LpmError> {
+    Ok(())
 }
 
 fn parse_policy_u64(path: &Path, key: &str, value: &toml::Value) -> Result<Option<u64>, LpmError> {
@@ -396,6 +531,7 @@ fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     if !path.exists() {
         return Ok(None);
     }
+    validate_managed_policy_authority(&path)?;
 
     let content = std::fs::read_to_string(&path)?;
     let parsed: toml::Value = toml::from_str(&content)
@@ -500,12 +636,10 @@ fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
 }
 
 fn signing_secret() -> Result<Vec<u8>, LpmError> {
-    if let Ok(raw) = std::env::var(TEST_SECRET_ENV)
-        && !raw.trim().is_empty()
-    {
+    if let Some(raw) = test_secret_override() {
         return hex::decode(raw.trim()).map_err(|e| {
             LpmError::Registry(format!(
-                "{TEST_SECRET_ENV} must be valid hex-encoded bytes: {e}"
+                "test security secret override must be valid hex: {e}"
             ))
         });
     }
@@ -657,7 +791,7 @@ pub fn persist_authorized_posture(posture: &AuthorizedPosture) -> Result<(), Lpm
 }
 
 pub fn is_automation(json_output: bool) -> bool {
-    if std::env::var_os(TEST_AUTH_RESULT_ENV).is_some() {
+    if test_native_auth_override().is_some() {
         return false;
     }
     json_output
@@ -676,6 +810,12 @@ fn canonical_project_root(project_dir: &Path) -> String {
         .to_string()
 }
 
+fn canonical_global_root() -> Result<String, LpmError> {
+    Ok(canonical_project_root(
+        &lpm_common::LpmRoot::from_env()?.global_root(),
+    ))
+}
+
 fn normalized_packages(packages: &[String]) -> Vec<String> {
     let mut values: Vec<_> = packages
         .iter()
@@ -688,11 +828,22 @@ fn normalized_packages(packages: &[String]) -> Vec<String> {
     values
 }
 
-fn suggested_unlock_command(scope: ApprovalScope, packages: &[String]) -> String {
-    let mut command = format!(
-        "lpm security unlock {} --project . --ttl 10m",
-        scope.as_str()
-    );
+fn suggested_unlock_command(
+    scope: ApprovalScope,
+    target: UnlockTargetKind,
+    packages: &[String],
+) -> String {
+    let mut command = match target {
+        UnlockTargetKind::Project => {
+            format!(
+                "lpm security unlock {} --project . --ttl 10m",
+                scope.as_str()
+            )
+        }
+        UnlockTargetKind::Global => {
+            format!("lpm security unlock {} --global --ttl 10m", scope.as_str())
+        }
+    };
     for package in normalized_packages(packages) {
         command.push_str(&format!(" --package {package}"));
     }
@@ -733,9 +884,15 @@ fn current_trusted_scopes(project_dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+pub fn authorized_capability_user_bound() -> crate::capability::UserBound {
+    // Raw `[sandbox.limits]` in `~/.lpm/config.toml` is only a proposal layer.
+    // Until LPM has an authenticated write path for capability ceilings, runtime
+    // capability enforcement must fail closed rather than trust hand-edited user config.
+    crate::capability::UserBound::default()
+}
+
 fn current_capability_request_hash(project_dir: &Path) -> Result<Option<String>, LpmError> {
-    let global = crate::commands::config::GlobalConfig::load();
-    let user_bound = crate::capability::UserBound::from_global_config(&global);
+    let user_bound = authorized_capability_user_bound();
     let capability_set =
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
@@ -842,7 +999,12 @@ fn append_audit_event(event: &AuditEvent) -> Result<(), LpmError> {
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(file, "{}", serde_json::to_string(event)?)?;
+    let payload_value = serde_json::to_value(event)?;
+    let envelope = SignedEnvelope {
+        payload: event.clone(),
+        signature: sign_payload_value(&payload_value)?,
+    };
+    writeln!(file, "{}", serde_json::to_string(&envelope)?)?;
     Ok(())
 }
 
@@ -912,12 +1074,33 @@ fn create_unlock_grant(
     UnlockGrant {
         schema_version: UNLOCK_SCHEMA_VERSION,
         id: format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
+        target: UnlockTargetKind::Project,
         project_root: Some(canonical_project_root(project_dir)),
         scopes: vec![scope],
         packages: normalized_packages(packages),
         limits: UnlockLimits {
             min_release_age_secs,
         },
+        issued_at: now,
+        expires_at: now + chrono::Duration::seconds(ttl_secs as i64),
+        issuer: "user-presence".to_string(),
+    }
+}
+
+fn create_global_unlock_grant(
+    scope: ApprovalScope,
+    ttl_secs: u64,
+    packages: &[String],
+) -> UnlockGrant {
+    let now = Utc::now();
+    UnlockGrant {
+        schema_version: UNLOCK_SCHEMA_VERSION,
+        id: format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
+        target: UnlockTargetKind::Global,
+        project_root: None,
+        scopes: vec![scope],
+        packages: normalized_packages(packages),
+        limits: UnlockLimits::default(),
         issued_at: now,
         expires_at: now + chrono::Duration::seconds(ttl_secs as i64),
         issuer: "user-presence".to_string(),
@@ -961,33 +1144,74 @@ pub fn list_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
     Ok(grants)
 }
 
-pub fn list_active_project_unlocks(project_dir: &Path) -> Result<Vec<UnlockGrant>, LpmError> {
-    let root = canonical_project_root(project_dir);
+pub fn list_active_global_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
     let mut grants: Vec<_> = read_active_unlocks()?
         .into_iter()
-        .filter(|grant| grant.project_root.as_deref() == Some(root.as_str()))
+        .filter(|grant| grant.target == UnlockTargetKind::Global)
         .collect();
     grants.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
     Ok(grants)
 }
 
-pub fn load_security_status(project_dir: Option<&Path>) -> Result<SecurityStatus, LpmError> {
+pub fn list_active_project_unlocks(project_dir: &Path) -> Result<Vec<UnlockGrant>, LpmError> {
+    let root = canonical_project_root(project_dir);
+    let mut grants: Vec<_> = read_active_unlocks()?
+        .into_iter()
+        .filter(|grant| {
+            grant.target == UnlockTargetKind::Project
+                && grant.project_root.as_deref() == Some(root.as_str())
+        })
+        .collect();
+    grants.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
+    Ok(grants)
+}
+
+fn active_runtime_overrides(effective: &EffectiveAuthorizedPosture) -> Vec<RuntimeOverride> {
+    let env_value = std::env::var("LPM_PROVENANCE_ENFORCE").ok();
+    let (mode, source) = EnforceMode::resolve_from_chain(env_value.as_deref(), || None::<String>);
+    let effective_mode = effective.posture.sigstore_verify();
+    if source == crate::provenance_fetch::EnforceModeSource::Env && mode != effective_mode {
+        return vec![RuntimeOverride {
+            control: "sigstore.verify".to_string(),
+            value: crate::security_floor::sigstore_mode_name(mode).to_string(),
+            source: "LPM_PROVENANCE_ENFORCE".to_string(),
+        }];
+    }
+    Vec::new()
+}
+
+pub fn load_security_status(
+    project_dir: Option<&Path>,
+    global: bool,
+) -> Result<SecurityStatus, LpmError> {
     let effective = load_effective_authorized_posture()?;
-    let (project_root, active_unlocks) = match project_dir {
-        Some(dir) => (
-            Some(canonical_project_root(dir)),
-            list_active_project_unlocks(dir)?,
-        ),
-        None => (None, list_active_unlocks()?),
+    let active_runtime_overrides = active_runtime_overrides(&effective);
+    let (target, project_root, active_unlocks) = if global {
+        (
+            UnlockTargetKind::Global,
+            Some(canonical_global_root()?),
+            list_active_global_unlocks()?,
+        )
+    } else {
+        match project_dir {
+            Some(dir) => (
+                UnlockTargetKind::Project,
+                Some(canonical_project_root(dir)),
+                list_active_project_unlocks(dir)?,
+            ),
+            None => (UnlockTargetKind::Project, None, list_active_unlocks()?),
+        }
     };
 
     Ok(SecurityStatus {
+        target,
         project_root,
         effective_floor: effective.posture.to_view(),
         floor_sources: effective.sources,
         approved_posture_path: effective.approved_posture_path,
         approved_posture_source: effective.approved_posture_source,
         managed_policy: effective.managed_policy,
+        active_runtime_overrides,
         active_unlocks,
     })
 }
@@ -1057,6 +1281,20 @@ fn global_trust_widened(
         .any(|(key, value)| approved.get(key) != Some(value))
 }
 
+fn unlock_grant_covers_packages(grant: &UnlockGrant, packages: &[String]) -> bool {
+    let requested_packages = normalized_packages(packages);
+    match (grant.packages.is_empty(), requested_packages.is_empty()) {
+        (true, _) => true,
+        (false, true) => false,
+        (false, false) => {
+            let granted: BTreeSet<_> = grant.packages.iter().map(String::as_str).collect();
+            requested_packages
+                .iter()
+                .all(|package| granted.contains(package.as_str()))
+        }
+    }
+}
+
 fn same_global_trust_shape(
     current: &ApprovedGlobalTrustState,
     approved: &ApprovedGlobalTrustState,
@@ -1075,7 +1313,7 @@ fn approval_required_for_scopes(
         .collect();
     let suggested_command = scopes
         .first()
-        .map(|scope| suggested_unlock_command(*scope, &[]));
+        .map(|scope| suggested_unlock_command(*scope, UnlockTargetKind::Project, &[]));
     approval_required_error(message, requested_scopes, project_root, suggested_command)
 }
 
@@ -1178,11 +1416,10 @@ pub fn ensure_global_trust_authorized(
     source: ApprovalSource,
 ) -> Result<(), LpmError> {
     let current = current_global_trust_state(root)?;
-    ensure_global_trust_candidate_authorized(root, &current, json_output, source)
+    ensure_global_trust_candidate_authorized(&current, json_output, source)
 }
 
 fn ensure_global_trust_candidate_authorized(
-    root: &lpm_common::LpmRoot,
     current: &ApprovedGlobalTrustState,
     json_output: bool,
     source: ApprovalSource,
@@ -1198,14 +1435,11 @@ fn ensure_global_trust_candidate_authorized(
         return Ok(());
     }
 
-    let global_root = root.global_root();
-    ensure_project_unlock(
+    ensure_global_unlock(
         ApprovalScope::TrustBulkApprove,
-        &global_root,
         json_output,
         source,
         "global trust approvals changed outside an LPM-managed approval flow",
-        None,
         &[],
     )?;
     persist_global_trust_state(current)?;
@@ -1213,7 +1447,7 @@ fn ensure_global_trust_candidate_authorized(
         "global-trust-authorized",
         true,
         vec![ApprovalScope::TrustBulkApprove.as_str().to_string()],
-        Some(canonical_project_root(&global_root)),
+        None,
         Vec::new(),
         Some(source.as_str()),
         None,
@@ -1229,18 +1463,21 @@ pub fn ensure_global_trust_candidate_authorized_from_trust(
     source: ApprovalSource,
 ) -> Result<(), LpmError> {
     let current = candidate_global_trust_state(trust);
-    ensure_global_trust_candidate_authorized(root, &current, json_output, source)
+    let _ = root;
+    ensure_global_trust_candidate_authorized(&current, json_output, source)
 }
 
-pub fn has_active_project_unlock(
+fn find_active_project_unlock(
     scope: ApprovalScope,
     project_dir: &Path,
     min_release_age_secs: Option<u64>,
     packages: &[String],
-) -> Result<bool, LpmError> {
+) -> Result<Option<UnlockGrant>, LpmError> {
     let root = canonical_project_root(project_dir);
-    let requested_packages = normalized_packages(packages);
     for grant in read_active_unlocks()? {
+        if grant.target != UnlockTargetKind::Project {
+            continue;
+        }
         if grant.project_root.as_deref() != Some(root.as_str()) {
             continue;
         }
@@ -1253,18 +1490,40 @@ pub fn has_active_project_unlock(
         {
             continue;
         }
-        if !grant.packages.is_empty() {
-            let grant_packages: BTreeSet<_> = grant.packages.iter().map(String::as_str).collect();
-            if requested_packages
-                .iter()
-                .any(|package| !grant_packages.contains(package.as_str()))
-            {
-                continue;
-            }
+        if !unlock_grant_covers_packages(&grant, packages) {
+            continue;
         }
-        return Ok(true);
+        return Ok(Some(grant));
     }
-    Ok(false)
+    Ok(None)
+}
+
+pub fn has_active_project_unlock(
+    scope: ApprovalScope,
+    project_dir: &Path,
+    min_release_age_secs: Option<u64>,
+    packages: &[String],
+) -> Result<bool, LpmError> {
+    Ok(find_active_project_unlock(scope, project_dir, min_release_age_secs, packages)?.is_some())
+}
+
+fn find_active_global_unlock(
+    scope: ApprovalScope,
+    packages: &[String],
+) -> Result<Option<UnlockGrant>, LpmError> {
+    for grant in read_active_unlocks()? {
+        if grant.target != UnlockTargetKind::Global {
+            continue;
+        }
+        if !grant.scopes.contains(&scope) {
+            continue;
+        }
+        if !unlock_grant_covers_packages(&grant, packages) {
+            continue;
+        }
+        return Ok(Some(grant));
+    }
+    Ok(None)
 }
 
 fn run_native_auth_command(mut command: Command) -> Result<bool, LpmError> {
@@ -1280,7 +1539,7 @@ fn run_native_auth_command(mut command: Command) -> Result<bool, LpmError> {
 }
 
 fn request_native_approval(prompt: &str) -> Result<bool, LpmError> {
-    if let Ok(result) = std::env::var(TEST_AUTH_RESULT_ENV) {
+    if let Some(result) = test_native_auth_override() {
         return match result.as_str() {
             "approve" => Ok(true),
             "deny" => Ok(false),
@@ -1288,7 +1547,7 @@ fn request_native_approval(prompt: &str) -> Result<bool, LpmError> {
                 "test native security approval backend forced an error".into(),
             )),
             other => Err(LpmError::Registry(format!(
-                "{TEST_AUTH_RESULT_ENV} must be one of: approve | deny | error (got `{other}`)"
+                "test native security approval override must be one of: approve | deny | error (got `{other}`)"
             ))),
         };
     }
@@ -1370,7 +1629,11 @@ fn prompt_for_unlock(
             format!("{} requires explicit approval", scope.as_str()),
             vec![scope.as_str().to_string()],
             Some(canonical_project_root(project_dir)),
-            Some(suggested_unlock_command(scope, packages)),
+            Some(suggested_unlock_command(
+                scope,
+                UnlockTargetKind::Project,
+                packages,
+            )),
         ));
     }
 
@@ -1404,11 +1667,25 @@ pub fn ensure_project_unlock(
     min_release_age_secs: Option<u64>,
     packages: &[String],
 ) -> Result<(), LpmError> {
-    if has_active_project_unlock(scope, project_dir, min_release_age_secs, packages)? {
+    if let Some(grant) =
+        find_active_project_unlock(scope, project_dir, min_release_age_secs, packages)?
+    {
+        record_audit_event(
+            "guarded-attempt",
+            true,
+            vec![scope.as_str().to_string()],
+            Some(canonical_project_root(project_dir)),
+            packages.to_vec(),
+            Some(source.as_str()),
+            Some(grant.id),
+            Some(message.to_string()),
+        );
         return Ok(());
     }
 
-    if matches!(source, ApprovalSource::CliFlag) && !is_automation(json_output) {
+    if matches!(source, ApprovalSource::CliFlag | ApprovalSource::EnvVar)
+        && !is_automation(json_output)
+    {
         return prompt_for_unlock(
             scope,
             project_dir,
@@ -1433,7 +1710,122 @@ pub fn ensure_project_unlock(
         format!("{} requires explicit approval", scope.as_str()),
         vec![scope.as_str().to_string()],
         Some(canonical_project_root(project_dir)),
-        Some(suggested_unlock_command(scope, packages)),
+        Some(suggested_unlock_command(
+            scope,
+            UnlockTargetKind::Project,
+            packages,
+        )),
+    ))
+}
+
+fn prompt_for_global_unlock(
+    scope: ApprovalScope,
+    ttl_secs: u64,
+    packages: &[String],
+    message: &str,
+) -> Result<(), LpmError> {
+    crate::output::warn(message);
+    let prompt = format!(
+        "Approve {} globally for {} minute{}?",
+        scope.as_str(),
+        ttl_secs / 60,
+        if ttl_secs / 60 == 1 { "" } else { "s" }
+    );
+    let confirmed = request_native_approval(&prompt)?;
+
+    if !confirmed {
+        record_audit_event(
+            "guarded-attempt",
+            false,
+            vec![scope.as_str().to_string()],
+            None,
+            packages.to_vec(),
+            Some(ApprovalSource::CliFlag.as_str()),
+            None,
+            Some(format!("user declined {}", scope.as_str())),
+        );
+        return Err(approval_required_error(
+            format!("{} requires explicit approval", scope.as_str()),
+            vec![scope.as_str().to_string()],
+            None,
+            Some(suggested_unlock_command(
+                scope,
+                UnlockTargetKind::Global,
+                packages,
+            )),
+        ));
+    }
+
+    let grant = create_global_unlock_grant(scope, ttl_secs, packages);
+    persist_unlock_grant(&grant)?;
+    record_audit_event(
+        "unlock-granted",
+        true,
+        vec![scope.as_str().to_string()],
+        None,
+        packages.to_vec(),
+        Some(ApprovalSource::CliFlag.as_str()),
+        Some(grant.id.clone()),
+        Some(format!(
+            "temporary global unlock granted for {}",
+            scope.as_str()
+        )),
+    );
+    crate::output::success(&format!(
+        "Approved {} globally for {} minute{}.",
+        scope.as_str(),
+        ttl_secs / 60,
+        if ttl_secs / 60 == 1 { "" } else { "s" }
+    ));
+    Ok(())
+}
+
+pub fn ensure_global_unlock(
+    scope: ApprovalScope,
+    json_output: bool,
+    source: ApprovalSource,
+    message: &str,
+    packages: &[String],
+) -> Result<(), LpmError> {
+    if let Some(grant) = find_active_global_unlock(scope, packages)? {
+        record_audit_event(
+            "guarded-attempt",
+            true,
+            vec![scope.as_str().to_string()],
+            None,
+            packages.to_vec(),
+            Some(source.as_str()),
+            Some(grant.id),
+            Some(message.to_string()),
+        );
+        return Ok(());
+    }
+
+    if matches!(source, ApprovalSource::CliFlag | ApprovalSource::EnvVar)
+        && !is_automation(json_output)
+    {
+        return prompt_for_global_unlock(scope, DEFAULT_UNLOCK_TTL_SECS, packages, message);
+    }
+
+    record_audit_event(
+        "guarded-attempt",
+        false,
+        vec![scope.as_str().to_string()],
+        None,
+        packages.to_vec(),
+        Some(source.as_str()),
+        None,
+        Some(message.to_string()),
+    );
+    Err(approval_required_error(
+        format!("{} requires explicit approval", scope.as_str()),
+        vec![scope.as_str().to_string()],
+        None,
+        Some(suggested_unlock_command(
+            scope,
+            UnlockTargetKind::Global,
+            packages,
+        )),
     ))
 }
 
@@ -1657,6 +2049,30 @@ pub fn authorize_persistent_sigstore(
     persist_authorized_posture(&posture)
 }
 
+pub fn ensure_runtime_sigstore_posture(
+    project_dir: &Path,
+    json_output: bool,
+    requested: EnforceMode,
+    source: crate::provenance_fetch::EnforceModeSource,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let approved = effective.posture.sigstore_verify();
+    if source == crate::provenance_fetch::EnforceModeSource::Env
+        && crate::security_floor::sigstore_loosens(requested, approved)
+    {
+        ensure_project_unlock(
+            ApprovalScope::ProvenanceUnverified,
+            project_dir,
+            json_output,
+            ApprovalSource::EnvVar,
+            "This install weakens Sigstore verification via LPM_PROVENANCE_ENFORCE for this project.",
+            None,
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn unlock_scope_command(
     scope: ApprovalScope,
     project_dir: &Path,
@@ -1678,7 +2094,11 @@ pub fn unlock_scope_command(
             ),
             vec![scope.as_str().to_string()],
             Some(canonical_project_root(project_dir)),
-            Some(suggested_unlock_command(scope, packages)),
+            Some(suggested_unlock_command(
+                scope,
+                UnlockTargetKind::Project,
+                packages,
+            )),
         ));
     }
 
@@ -1704,7 +2124,11 @@ pub fn unlock_scope_command(
             format!("{} requires explicit approval", scope.as_str()),
             vec![scope.as_str().to_string()],
             Some(canonical_project_root(project_dir)),
-            Some(suggested_unlock_command(scope, packages)),
+            Some(suggested_unlock_command(
+                scope,
+                UnlockTargetKind::Project,
+                packages,
+            )),
         ));
     }
     let grant = create_unlock_grant(scope, project_dir, ttl_secs, min_release_age_secs, packages);
@@ -1718,6 +2142,80 @@ pub fn unlock_scope_command(
         Some(ApprovalSource::SecurityCommand.as_str()),
         Some(grant.id.clone()),
         Some(format!("temporary unlock granted for {}", scope.as_str())),
+    );
+    Ok(grant)
+}
+
+pub fn unlock_global_scope_command(
+    scope: ApprovalScope,
+    ttl_secs: u64,
+    json_output: bool,
+    packages: &[String],
+) -> Result<UnlockGrant, LpmError> {
+    if !(1..=MAX_UNLOCK_TTL_SECS).contains(&ttl_secs) {
+        return Err(LpmError::Registry(format!(
+            "unlock ttl must be between 1 and {MAX_UNLOCK_TTL_SECS} seconds"
+        )));
+    }
+    if is_automation(json_output) {
+        return Err(approval_required_error(
+            format!(
+                "{} requires an interactive approval terminal",
+                scope.as_str()
+            ),
+            vec![scope.as_str().to_string()],
+            None,
+            Some(suggested_unlock_command(
+                scope,
+                UnlockTargetKind::Global,
+                packages,
+            )),
+        ));
+    }
+
+    crate::output::warn(&format!(
+        "{} will be allowed globally for {} minute{} if you approve.",
+        scope.as_str(),
+        ttl_secs / 60,
+        if ttl_secs / 60 == 1 { "" } else { "s" }
+    ));
+    let confirmed = request_native_approval("Approve this temporary global security unlock now?")?;
+    if !confirmed {
+        record_audit_event(
+            "unlock-granted",
+            false,
+            vec![scope.as_str().to_string()],
+            None,
+            packages.to_vec(),
+            Some(ApprovalSource::SecurityCommand.as_str()),
+            None,
+            Some(format!("user declined {}", scope.as_str())),
+        );
+        return Err(approval_required_error(
+            format!("{} requires explicit approval", scope.as_str()),
+            vec![scope.as_str().to_string()],
+            None,
+            Some(suggested_unlock_command(
+                scope,
+                UnlockTargetKind::Global,
+                packages,
+            )),
+        ));
+    }
+    let grant = create_global_unlock_grant(scope, ttl_secs, packages);
+    persist_unlock_grant(&grant)?;
+    record_audit_event(
+        "unlock-granted",
+        true,
+        vec![scope.as_str().to_string()],
+        None,
+        packages.to_vec(),
+        Some(ApprovalSource::SecurityCommand.as_str()),
+        Some(grant.id.clone()),
+        Some(format!(
+            "temporary global unlock granted for {}",
+            scope.as_str()
+        )),
     );
     Ok(grant)
 }
@@ -1910,8 +2408,9 @@ script-policy = "deny"
             ))
             .unwrap();
 
-            let status = load_security_status(Some(&project_a)).unwrap();
+            let status = load_security_status(Some(&project_a), false).unwrap();
             let expected_root = canonical_project_root(&project_a);
+            assert_eq!(status.target, UnlockTargetKind::Project);
             assert_eq!(status.project_root.as_deref(), Some(expected_root.as_str()));
             assert_eq!(status.active_unlocks.len(), 1);
             assert_eq!(
@@ -2124,6 +2623,69 @@ script-policy = "deny"
                 )
                 .unwrap()
             );
+            assert!(
+                !has_active_project_unlock(
+                    ApprovalScope::ProvenanceUnverified,
+                    &project,
+                    None,
+                    &[],
+                )
+                .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn security_status_reports_runtime_sigstore_env_override() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        with_test_env(temp.path(), || {
+            let original = std::env::var_os("LPM_PROVENANCE_ENFORCE");
+            unsafe {
+                std::env::set_var("LPM_PROVENANCE_ENFORCE", "warn");
+            }
+            let status = load_security_status(Some(&project), false).unwrap();
+            assert_eq!(status.active_runtime_overrides.len(), 1);
+            assert_eq!(
+                status.active_runtime_overrides[0].control,
+                "sigstore.verify"
+            );
+            assert_eq!(status.active_runtime_overrides[0].value, "warn");
+            match original {
+                Some(value) => unsafe { std::env::set_var("LPM_PROVENANCE_ENFORCE", value) },
+                None => unsafe { std::env::remove_var("LPM_PROVENANCE_ENFORCE") },
+            }
+        });
+    }
+
+    #[test]
+    fn global_status_only_lists_global_unlocks() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        with_test_env(temp.path(), || {
+            persist_unlock_grant(&create_unlock_grant(
+                ApprovalScope::SandboxNone,
+                &project,
+                DEFAULT_UNLOCK_TTL_SECS,
+                None,
+                &[],
+            ))
+            .unwrap();
+            persist_unlock_grant(&create_global_unlock_grant(
+                ApprovalScope::TrustBulkApprove,
+                DEFAULT_UNLOCK_TTL_SECS,
+                &[],
+            ))
+            .unwrap();
+
+            let status = load_security_status(None, true).unwrap();
+            assert_eq!(status.target, UnlockTargetKind::Global);
+            assert_eq!(status.active_unlocks.len(), 1);
+            assert_eq!(status.active_unlocks[0].target, UnlockTargetKind::Global);
         });
     }
 }

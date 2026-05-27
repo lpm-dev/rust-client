@@ -4855,6 +4855,7 @@ async fn async_main() -> Result<()> {
                     suggested_command,
                 } => serde_json::json!({
                     "success": false,
+                    "error_code": "security_approval_required",
                     "error": {
                         "code": "SECURITY_APPROVAL_REQUIRED",
                         "message": message,

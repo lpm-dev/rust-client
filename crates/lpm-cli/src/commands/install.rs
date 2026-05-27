@@ -5671,6 +5671,17 @@ async fn run_with_options_under_store_lock(
         );
         drift_ignore_policy = crate::provenance_fetch::DriftIgnorePolicy::EnforceAll;
     }
+    let (_resolved_runtime_sigstore, runtime_sigstore_source) =
+        crate::provenance_fetch::EnforceMode::resolve_from_chain(
+            std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref(),
+            || global_config.get_sigstore_verify(),
+        );
+    crate::security_approval::ensure_runtime_sigstore_posture(
+        project_dir,
+        json_output,
+        verify_policy.enforce,
+        runtime_sigstore_source,
+    )?;
     let unverified_provenance_packages: Vec<String> = match &verify_policy.skip {
         crate::provenance_fetch::SkipPolicy::Names(names) => {
             let mut values: Vec<_> = names.iter().cloned().collect();
@@ -6977,8 +6988,7 @@ async fn run_with_options_under_store_lock(
     let install_requested_capabilities =
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    let install_user_bound =
-        crate::capability::UserBound::from_global_config(&install_capability_cfg);
+    let install_user_bound = crate::security_approval::authorized_capability_user_bound();
 
     // **Resolve script-policy + preflight advisor BEFORE the blocked-set capture.**
     //
@@ -9836,12 +9846,10 @@ async fn run_link_and_finish(
     // without this, the shared `run_link_and_finish` path would
     // silently omit capability-widened packages from build-state.json
     // and leave approve-scripts with nothing actionable.
-    let offline_capability_cfg = crate::commands::config::GlobalConfig::load();
     let offline_requested_capabilities =
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    let offline_user_bound =
-        crate::capability::UserBound::from_global_config(&offline_capability_cfg);
+    let offline_user_bound = crate::security_approval::authorized_capability_user_bound();
     // the fast-path / offline install does NOT
     // run the L4 advisor (scope was tightened to the online install
     // path). `None` passes through `compute_blocked_packages_with_metadata`
