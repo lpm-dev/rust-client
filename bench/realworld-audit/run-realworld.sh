@@ -72,6 +72,10 @@ mkdir -p "$RESULTS_DIR" "$CACHE_DIR"
 
 now_ms() { python3 -c 'import time;print(int(time.perf_counter_ns()))'; }
 
+json_string() {
+    printf '%s' "$1" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()))'
+}
+
 # Portable timeout wrapper. GNU `timeout` isn't on macOS by default
 # (renames to `gtimeout` via coreutils); Windows Git Bash also lacks
 # it. Perl is preinstalled on macOS, every CI Linux image, and Git
@@ -280,12 +284,42 @@ run_mode() {
     else
         install_log_snip='""'
     fi
+    local install_json_snip=""
+    if [[ -f "$install_json" ]]; then
+        install_json_snip=$(tail -20 "$install_json" | tr -d '\r' | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read()))')
+    else
+        install_json_snip='""'
+    fi
     local smoke_log_snip=""
     if [[ -f "$smoke_log" ]]; then
         smoke_log_snip=$(tail -20 "$smoke_log" | tr -d '\r' | python3 -c 'import sys,json;print(json.dumps(sys.stdin.read()))')
     else
         smoke_log_snip='""'
     fi
+
+    local fail_reason_json
+    fail_reason_json=$(json_string "$fail_reason")
+    local classification_json
+    classification_json=$(python3 "$REPO_ROOT/bench/audit-fixtures/classify_result.py" <<EOF
+{
+  "project": "$PROJECT_NAME",
+  "mode": "$mode",
+  "verdict": "$verdict",
+  "fail_reason": $fail_reason_json,
+  "install_exit": $install_exit,
+  "smoke_exit": $smoke_exit,
+    "install_json_tail": $install_json_snip,
+  "install_log_tail": $install_log_snip,
+  "smoke_log_tail": $smoke_log_snip
+}
+EOF
+)
+    local classification
+    classification=$(printf '%s' "$classification_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["classification"])')
+    local classification_detail
+    classification_detail=$(printf '%s' "$classification_json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["classification_detail"])')
+    local classification_detail_json
+    classification_detail_json=$(json_string "$classification_detail")
 
     python3 - <<EOF > "$result"
 import json
@@ -301,7 +335,10 @@ print(json.dumps({
     "smoke_exit": $smoke_exit,
     "smoke_ms": $smoke_ms,
     "verdict": "$verdict",
-    "fail_reason": "$fail_reason",
+    "fail_reason": $fail_reason_json,
+    "classification": "$classification",
+    "classification_detail": $classification_detail_json,
+    "install_json_tail": $install_json_snip,
     "install_log_tail": $install_log_snip,
     "smoke_log_tail": $smoke_log_snip,
 }, indent=2))
@@ -311,7 +348,7 @@ EOF
         "$install_exit" "$install_ms" "$top_count"
     printf "  smoke:   exit=%d, %dms\n" "$smoke_exit" "$smoke_ms"
     if [[ "$verdict" != "PASS" ]]; then
-        printf "  verdict: FAIL (%s)\n" "$fail_reason"
+        printf "  verdict: FAIL [%s] (%s)\n" "$classification" "$fail_reason"
         if [[ $install_exit -ne 0 ]]; then
             tail -10 "$install_log" 2>/dev/null | sed 's/^/    /'
         elif [[ $smoke_exit -ne 0 ]]; then
@@ -341,7 +378,8 @@ for mode in isolated hoisted; do
     latest=$(ls -t "$RESULTS_DIR/$PROJECT_NAME-$mode-"*.json 2>/dev/null | head -1)
     if [[ -n "$latest" ]]; then
         verdict=$(python3 -c "import json;print(json.load(open('$latest'))['verdict'])")
+        classification=$(python3 -c "import json;print(json.load(open('$latest')).get('classification','unclassified-failure'))")
         reason=$(python3 -c "import json;print(json.load(open('$latest')).get('fail_reason','') or '-')")
-        printf "  %-10s %-5s  %s\n" "$mode" "$verdict" "$reason"
+        printf "  %-10s %-5s %-22s %s\n" "$mode" "$verdict" "$classification" "$reason"
     fi
 done

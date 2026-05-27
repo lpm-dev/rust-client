@@ -74,11 +74,11 @@ EOF
 # the require failure is genuinely ESM-specific. Ordinary require
 # failures still fail the smoke so we don't hide real CJS / loader bugs.
 #
-# Bin-only packages (no main + no exports."."/import — e.g.
-# dotenv-cli) genuinely have no programmatic entry point: both
-# require AND import fail. Those still surface as FAIL/FAIL — that's
-# the correct signal ("this top-N package has no API to smoke
-# against") and remains symmetric across linker modes.
+    # Bin-only packages (no main + no exports."."/import — e.g.
+    # dotenv-cli) genuinely have no programmatic entry point: both
+    # require AND import fail. Those still surface as FAIL/FAIL, but the
+    # summary now marks them as non-runtime-package instead of lumping
+    # them into an anonymous symmetric-failure bucket.
 set -e
 set +e
 node -e "
