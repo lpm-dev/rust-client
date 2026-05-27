@@ -385,7 +385,7 @@ async fn postinstall_udp_send_is_denied_listener_silent() {
     let project = TempProject::empty(&project_manifest(UDP_DEP_NAME));
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--policy=allow"])
+        .args(["--json", "install", "--policy=allow"])
         .env("LPM_STRICT_SANDBOX", "1")
         .env("LPM_TEST_UDP_TARGET_PORT", listener_port.to_string())
         .output()
@@ -556,7 +556,7 @@ async fn postinstall_raw_packet_netlink_sockets_are_denied() {
     let project = TempProject::empty(&project_manifest(FAMILY_DEP_NAME));
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--policy=allow"])
+        .args(["--json", "install", "--policy=allow"])
         .env("LPM_STRICT_SANDBOX", "1")
         .env("LPM_TEST_SOCKET_PROBE_BIN", probe.as_os_str())
         .output()
