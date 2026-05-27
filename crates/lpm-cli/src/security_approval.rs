@@ -2154,6 +2154,7 @@ fn run_native_auth_command(mut command: Command) -> Result<bool, LpmError> {
     }
 }
 
+#[allow(unused_variables)]
 fn request_native_approval(prompt: &str) -> Result<bool, LpmError> {
     if let Some(result) = test_native_auth_override() {
         return match result.as_str() {

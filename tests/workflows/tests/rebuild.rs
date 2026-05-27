@@ -119,6 +119,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
 /// spawn (not just tier classification / dry-run) skip the spawn-side
 /// assertion when Node is missing rather than failing — the suite must
 /// still run in minimal containers.
+#[cfg(target_os = "macos")]
 fn node_available() -> bool {
     std::process::Command::new("node")
         .arg("--version")
