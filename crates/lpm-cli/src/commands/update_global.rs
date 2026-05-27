@@ -729,16 +729,16 @@ async fn do_install_upgrade(
     crate::commands::install::run_with_options(
         registry,
         &staged.install_root,
-        false, // json_output
-        false, // offline
-        false, // force
-        false, // allow_new
-        false, // strict_integrity
-        None,  // linker_override
-        true,  // no_skills
-        true,  // no_editor_setup
-        true,  // no_security_summary
-        false, // auto_build
+        suppress_nested_output, // preserve automation semantics; stdout is already suppressed above
+        false,                  // offline
+        false,                  // force
+        false,                  // allow_new
+        false,                  // strict_integrity
+        None,                   // linker_override
+        true,                   // no_skills
+        true,                   // no_editor_setup
+        true,                   // no_security_summary
+        false,                  // auto_build
         None,
         None,
         None,

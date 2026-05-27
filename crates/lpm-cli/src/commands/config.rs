@@ -367,19 +367,10 @@ impl GlobalConfig {
             .get("verify")?
             .as_str()
             .map(String::from)?;
-        let authorized = crate::security_approval::load_effective_authorized_posture()
-            .ok()?
-            .posture;
-        let requested = match raw.as_str() {
-            "deny" => EnforceMode::Deny,
-            "warn" => EnforceMode::Warn,
-            "off" => EnforceMode::Off,
-            _ => return None,
-        };
-        if crate::security_floor::sigstore_loosens(requested, authorized.sigstore_verify()) {
-            return None;
+        match raw.as_str() {
+            "deny" | "warn" | "off" => Some(raw),
+            _ => None,
         }
-        Some(raw)
     }
 
     /// Get a value that should be an array of strings, returning the

@@ -31,11 +31,18 @@ pub const DEFAULT_UNLOCK_TTL_SECS: u64 = 10 * 60;
 pub const MAX_UNLOCK_TTL_SECS: u64 = 30 * 60;
 const KEYRING_SERVICE: &str = "dev.lpm.security-approval";
 const KEYRING_ACCOUNT: &str = "signing-secret-v1";
+#[cfg(not(test))]
+const KEYRING_AUDIT_HEAD_ACCOUNT: &str = "audit-head-v1";
+#[cfg(test)]
 const SECURITY_DIR_ENV: &str = "LPM_SECURITY_DIR";
+#[cfg(not(windows))]
 const DEFAULT_SECURITY_POLICY_PATH: &str = "/etc/lpm/security-policy.toml";
+#[cfg(windows)]
+const DEFAULT_SECURITY_POLICY_PATH: &str = r"C:\ProgramData\lpm\security-policy.toml";
 const APPROVED_PROJECT_STATE_SCHEMA_VERSION: u32 = 1;
 const APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION: u32 = 1;
 const AUDIT_EVENT_SCHEMA_VERSION: u32 = 1;
+const AUDIT_HEAD_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 const SECURITY_POLICY_PATH_ENV: &str = "LPM_SECURITY_POLICY_PATH";
@@ -343,6 +350,22 @@ struct AuditEvent {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AuditHead {
+    pub schema_version: u32,
+    pub updated_at: DateTime<Utc>,
+    pub last_entry_hash: String,
+    pub entry_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SignedAuditEnvelope {
+    payload: AuditEvent,
+    previous_entry_hash: Option<String>,
+    entry_hash: String,
+    signature: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SignedEnvelope<T> {
     payload: T,
@@ -350,6 +373,7 @@ struct SignedEnvelope<T> {
 }
 
 pub fn security_dir() -> Result<PathBuf, LpmError> {
+    #[cfg(test)]
     if let Ok(path) = std::env::var(SECURITY_DIR_ENV)
         && !path.trim().is_empty()
     {
@@ -378,6 +402,11 @@ fn approved_global_trust_path() -> Result<PathBuf, LpmError> {
 
 fn audit_log_path() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("audit.jsonl"))
+}
+
+#[cfg(test)]
+fn audit_head_path() -> Result<PathBuf, LpmError> {
+    Ok(security_dir()?.join("audit-head.json"))
 }
 
 #[cfg(test)]
@@ -492,7 +521,223 @@ fn validate_managed_policy_authority(path: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
-#[cfg(any(test, not(unix)))]
+#[cfg(all(windows, not(test)))]
+fn validate_windows_admin_owned_path(path: &Path, expect_dir: bool) -> Result<(), LpmError> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const WRITE_MASK: u32 = 0x1000_0000 // GENERIC_ALL
+        | 0x4000_0000 // GENERIC_WRITE
+        | 0x0001_0000 // DELETE
+        | 0x0004_0000 // WRITE_DAC
+        | 0x0008_0000 // WRITE_OWNER
+        | 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+        | 0x0000_0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+        | 0x0000_0010 // FILE_WRITE_EA
+        | 0x0000_0100; // FILE_WRITE_ATTRIBUTES
+
+    struct LocalAlloc(*mut c_void);
+    impl Drop for LocalAlloc {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    fn wide_null(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    fn sid_from_sddl(sddl: &[u16]) -> Result<LocalAlloc, LpmError> {
+        let mut sid: PSID = std::ptr::null_mut();
+        let ok = unsafe { ConvertStringSidToSidW(sddl.as_ptr(), &mut sid) };
+        if ok == 0 || sid.is_null() {
+            return Err(LpmError::Registry(
+                "failed to initialize Windows managed-policy authority SID".into(),
+            ));
+        }
+        Ok(LocalAlloc(sid.cast()))
+    }
+
+    fn sid_matches(sid: PSID, trusted: &[LocalAlloc]) -> bool {
+        trusted
+            .iter()
+            .any(|trusted_sid| unsafe { EqualSid(sid, trusted_sid.0.cast()) != 0 })
+    }
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(managed_policy_error(
+            path,
+            "must not be a reparse-point-backed path",
+        ));
+    }
+    if expect_dir && !metadata.is_dir() {
+        return Err(managed_policy_error(path, "must be a directory"));
+    }
+    if !expect_dir && !metadata.is_file() {
+        return Err(managed_policy_error(path, "must be a regular file"));
+    }
+
+    let system_sid = sid_from_sddl(&[
+        b'S' as u16,
+        b'-' as u16,
+        b'1' as u16,
+        b'-' as u16,
+        b'5' as u16,
+        b'-' as u16,
+        b'1' as u16,
+        b'8' as u16,
+        0,
+    ])?;
+    let admins_sid = sid_from_sddl(&[
+        b'S' as u16,
+        b'-' as u16,
+        b'1' as u16,
+        b'-' as u16,
+        b'5' as u16,
+        b'-' as u16,
+        b'3' as u16,
+        b'2' as u16,
+        b'-' as u16,
+        b'5' as u16,
+        b'4' as u16,
+        b'4' as u16,
+        0,
+    ])?;
+    let trusted_sids = [system_sid, admins_sid];
+
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let path_wide = wide_null(path);
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(managed_policy_error(
+            path,
+            format!("could not read Windows security descriptor: error {status}"),
+        ));
+    }
+    let _descriptor_guard = LocalAlloc(descriptor.cast());
+
+    if owner.is_null() || !sid_matches(owner, &trusted_sids) {
+        return Err(managed_policy_error(
+            path,
+            "must be owned by SYSTEM or Administrators",
+        ));
+    }
+
+    let mut owner_from_descriptor: PSID = std::ptr::null_mut();
+    let mut owner_defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorOwner(descriptor, &mut owner_from_descriptor, &mut owner_defaulted)
+    } == 0
+        || owner_from_descriptor.is_null()
+        || !sid_matches(owner_from_descriptor, &trusted_sids)
+    {
+        return Err(managed_policy_error(
+            path,
+            "must have a valid SYSTEM or Administrators owner",
+        ));
+    }
+
+    let mut dacl_present = 0;
+    let mut dacl_defaulted = 0;
+    let mut dacl = std::ptr::null_mut();
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    } == 0
+    {
+        return Err(managed_policy_error(path, "must have a readable DACL"));
+    }
+    if dacl_present == 0 || dacl.is_null() {
+        return Err(managed_policy_error(path, "must not have a null DACL"));
+    }
+
+    let ace_count = unsafe { (*dacl).AceCount };
+    for index in 0..ace_count {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, u32::from(index), &mut ace) } == 0 || ace.is_null() {
+            return Err(managed_policy_error(path, "has an unreadable DACL entry"));
+        }
+        let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
+        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
+            continue;
+        }
+        let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+        if allowed.Mask & WRITE_MASK == 0 {
+            continue;
+        }
+        let sid = std::ptr::addr_of!(allowed.SidStart).cast::<c_void>() as PSID;
+        if !sid_matches(sid, &trusted_sids) {
+            return Err(managed_policy_error(
+                path,
+                "must not grant write access to non-administrator principals",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(all(windows, not(test)))]
+fn validate_managed_policy_authority(path: &Path) -> Result<(), LpmError> {
+    let canonical = std::fs::canonicalize(path)?;
+    let default_path = PathBuf::from(DEFAULT_SECURITY_POLICY_PATH);
+    let canonical_default = std::fs::canonicalize(&default_path)?;
+    if !canonical
+        .as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(canonical_default.as_os_str().to_string_lossy().as_ref())
+    {
+        return Err(managed_policy_error(
+            path,
+            format!("must resolve to {}", DEFAULT_SECURITY_POLICY_PATH),
+        ));
+    }
+
+    validate_windows_admin_owned_path(path, false)?;
+    let Some(parent) = path.parent() else {
+        return Err(managed_policy_error(
+            path,
+            "must have a managed parent directory",
+        ));
+    };
+    validate_windows_admin_owned_path(parent, true)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn validate_managed_policy_authority(_path: &Path) -> Result<(), LpmError> {
     Ok(())
 }
@@ -990,21 +1235,183 @@ fn persist_global_trust_state(state: &ApprovedGlobalTrustState) -> Result<(), Lp
     write_signed_json(&approved_global_trust_path()?, &normalized)
 }
 
+fn audit_signature_payload(
+    event: &AuditEvent,
+    previous_entry_hash: &Option<String>,
+) -> Result<serde_json::Value, LpmError> {
+    Ok(serde_json::json!({
+        "payload": event,
+        "previous_entry_hash": previous_entry_hash,
+    }))
+}
+
+fn hash_json_value(value: &serde_json::Value) -> Result<String, LpmError> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
+}
+
+fn verify_audit_envelope(
+    envelope: &SignedAuditEnvelope,
+    expected_previous: &Option<String>,
+) -> Result<(), LpmError> {
+    if &envelope.previous_entry_hash != expected_previous {
+        return Err(LpmError::Registry(
+            "security audit log hash chain is broken; possible tampering".into(),
+        ));
+    }
+    let payload_value = audit_signature_payload(&envelope.payload, &envelope.previous_entry_hash)?;
+    if hash_json_value(&payload_value)? != envelope.entry_hash {
+        return Err(LpmError::Registry(
+            "security audit log entry hash does not match payload; possible tampering".into(),
+        ));
+    }
+    if !verify_payload_value(&payload_value, &envelope.signature)? {
+        return Err(LpmError::Registry(
+            "security audit log entry failed signature verification; possible tampering".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_audit_entry_hash(parsed: &serde_json::Value) -> Result<String, LpmError> {
+    let signature = parsed
+        .get("signature")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            LpmError::Registry("legacy security audit log entry is missing a signature".into())
+        })?;
+    let payload = parsed.get("payload").cloned().ok_or_else(|| {
+        LpmError::Registry("legacy security audit log entry is missing a payload".into())
+    })?;
+    if !verify_payload_value(&payload, signature)? {
+        return Err(LpmError::Registry(
+            "legacy security audit log entry failed signature verification; possible tampering"
+                .into(),
+        ));
+    }
+    let _: SignedEnvelope<AuditEvent> = serde_json::from_value(parsed.clone()).map_err(|e| {
+        LpmError::Registry(format!("legacy security audit log entry parse error: {e}"))
+    })?;
+    hash_json_value(parsed)
+}
+
+fn read_audit_log_tail(path: &Path) -> Result<(Option<String>, u64), LpmError> {
+    if !path.exists() {
+        return Ok((None, 0));
+    }
+    let body = std::fs::read_to_string(path)?;
+    let mut previous = None;
+    let mut count = 0;
+    for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        let parsed: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+            LpmError::Registry(format!("security audit log entry parse error: {e}"))
+        })?;
+        if parsed.get("entry_hash").is_some() || parsed.get("previous_entry_hash").is_some() {
+            let envelope: SignedAuditEnvelope = serde_json::from_value(parsed).map_err(|e| {
+                LpmError::Registry(format!("security audit log entry parse error: {e}"))
+            })?;
+            verify_audit_envelope(&envelope, &previous)?;
+            previous = Some(envelope.entry_hash);
+        } else {
+            previous = Some(legacy_audit_entry_hash(&parsed)?);
+        }
+        count += 1;
+    }
+    Ok((previous, count))
+}
+
+#[cfg(test)]
+fn load_audit_head() -> Result<Option<AuditHead>, LpmError> {
+    read_signed_json(&audit_head_path()?)
+}
+
+#[cfg(test)]
+fn persist_audit_head(head: &AuditHead) -> Result<(), LpmError> {
+    write_signed_json(&audit_head_path()?, head)
+}
+
+#[cfg(not(test))]
+fn load_audit_head() -> Result<Option<AuditHead>, LpmError> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_AUDIT_HEAD_ACCOUNT)
+        .map_err(|e| LpmError::Registry(format!("security audit keyring error: {e}")))?;
+    let raw = match entry.get_password() {
+        Ok(value) => value,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(e) => {
+            return Err(LpmError::Registry(format!(
+                "security audit keyring read error: {e}"
+            )));
+        }
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| LpmError::Registry(format!("security audit head parse error: {e}")))?;
+    let signature = parsed
+        .get("signature")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| LpmError::Registry("security audit head is missing a signature".into()))?;
+    let payload = parsed
+        .get("payload")
+        .cloned()
+        .ok_or_else(|| LpmError::Registry("security audit head is missing a payload".into()))?;
+    if !verify_payload_value(&payload, signature)? {
+        return Err(LpmError::Registry(
+            "security audit head failed signature verification; possible tampering".into(),
+        ));
+    }
+    let envelope: SignedEnvelope<AuditHead> = serde_json::from_value(parsed)
+        .map_err(|e| LpmError::Registry(format!("security audit head parse error: {e}")))?;
+    Ok(Some(envelope.payload))
+}
+
+#[cfg(not(test))]
+fn persist_audit_head(head: &AuditHead) -> Result<(), LpmError> {
+    let payload_value = serde_json::to_value(head)?;
+    let envelope = SignedEnvelope {
+        payload: head.clone(),
+        signature: sign_payload_value(&payload_value)?,
+    };
+    let body = serde_json::to_string(&envelope)?;
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_AUDIT_HEAD_ACCOUNT)
+        .map_err(|e| LpmError::Registry(format!("security audit keyring error: {e}")))?
+        .set_password(&body)
+        .map_err(|e| LpmError::Registry(format!("security audit keyring write error: {e}")))?;
+    Ok(())
+}
+
 fn append_audit_event(event: &AuditEvent) -> Result<(), LpmError> {
     let path = audit_log_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let (previous_entry_hash, entry_count) = read_audit_log_tail(&path)?;
+    if let Some(head) = load_audit_head()? {
+        if head.last_entry_hash != previous_entry_hash.clone().unwrap_or_default()
+            || head.entry_count != entry_count
+        {
+            return Err(LpmError::Registry(
+                "security audit log does not match the signed audit head; possible tampering"
+                    .into(),
+            ));
+        }
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    let payload_value = serde_json::to_value(event)?;
-    let envelope = SignedEnvelope {
+    let payload_value = audit_signature_payload(event, &previous_entry_hash)?;
+    let entry_hash = hash_json_value(&payload_value)?;
+    let envelope = SignedAuditEnvelope {
         payload: event.clone(),
+        previous_entry_hash,
+        entry_hash: entry_hash.clone(),
         signature: sign_payload_value(&payload_value)?,
     };
     writeln!(file, "{}", serde_json::to_string(&envelope)?)?;
+    persist_audit_head(&AuditHead {
+        schema_version: AUDIT_HEAD_SCHEMA_VERSION,
+        updated_at: Utc::now(),
+        last_entry_hash: entry_hash,
+        entry_count: entry_count + 1,
+    })?;
     Ok(())
 }
 
@@ -1047,6 +1454,83 @@ fn managed_policy_write_error(
         enforced.as_ref(),
         requested.as_ref(),
     ))
+}
+
+fn managed_policy_scope_error(
+    managed_policy: &ManagedPolicyStatus,
+    scope: ApprovalScope,
+    control: &str,
+) -> LpmError {
+    LpmError::SecurityFloor(format!(
+        "managed security policy `{}` owns `{control}`, so `{}` cannot be unlocked here. Update that higher-authority policy before weakening this control.",
+        managed_policy.path,
+        scope.as_str(),
+    ))
+}
+
+fn managed_policy_blocks_scope(
+    effective: &EffectiveAuthorizedPosture,
+    scope: ApprovalScope,
+) -> Option<LpmError> {
+    let managed_policy = effective.managed_policy.as_ref()?;
+    let blocked_control = match scope {
+        ApprovalScope::ScriptsAllow | ApprovalScope::ScriptsTriage
+            if matches!(
+                effective.sources.script_policy,
+                PostureSourceKind::ManagedPolicy
+            ) =>
+        {
+            Some("script-policy")
+        }
+        ApprovalScope::CooldownBypass | ApprovalScope::CooldownWindow
+            if matches!(
+                effective.sources.minimum_release_age_secs,
+                PostureSourceKind::ManagedPolicy
+            ) =>
+        {
+            Some("minimum-release-age-secs")
+        }
+        ApprovalScope::SandboxDefault | ApprovalScope::SandboxNone
+            if matches!(
+                effective.sources.sandbox_mode,
+                PostureSourceKind::ManagedPolicy
+            ) =>
+        {
+            Some("sandbox.mode")
+        }
+        ApprovalScope::SandboxAllowDegraded
+            if matches!(
+                effective.sources.sandbox_allow_degraded,
+                PostureSourceKind::ManagedPolicy
+            ) =>
+        {
+            Some("sandbox.allow-degraded")
+        }
+        ApprovalScope::ProvenanceUnverified | ApprovalScope::ProvenanceIgnoreDrift
+            if matches!(
+                effective.sources.sigstore_verify,
+                PostureSourceKind::ManagedPolicy
+            ) =>
+        {
+            Some("sigstore.verify")
+        }
+        _ => None,
+    }?;
+    Some(managed_policy_scope_error(
+        managed_policy,
+        scope,
+        blocked_control,
+    ))
+}
+
+fn approval_source_for_enforce_source(
+    source: crate::provenance_fetch::EnforceModeSource,
+) -> ApprovalSource {
+    match source {
+        crate::provenance_fetch::EnforceModeSource::Env => ApprovalSource::EnvVar,
+        crate::provenance_fetch::EnforceModeSource::Config => ApprovalSource::GlobalConfig,
+        crate::provenance_fetch::EnforceModeSource::Default => ApprovalSource::SecurityCommand,
+    }
 }
 
 pub fn approval_required_error(
@@ -1168,13 +1652,28 @@ pub fn list_active_project_unlocks(project_dir: &Path) -> Result<Vec<UnlockGrant
 
 fn active_runtime_overrides(effective: &EffectiveAuthorizedPosture) -> Vec<RuntimeOverride> {
     let env_value = std::env::var("LPM_PROVENANCE_ENFORCE").ok();
-    let (mode, source) = EnforceMode::resolve_from_chain(env_value.as_deref(), || None::<String>);
+    let global = crate::commands::config::GlobalConfig::load();
+    let (mode, source) =
+        EnforceMode::resolve_from_chain(env_value.as_deref(), || global.get_sigstore_verify());
     let effective_mode = effective.posture.sigstore_verify();
-    if source == crate::provenance_fetch::EnforceModeSource::Env && mode != effective_mode {
+    if matches!(
+        source,
+        crate::provenance_fetch::EnforceModeSource::Env
+            | crate::provenance_fetch::EnforceModeSource::Config
+    ) && mode != effective_mode
+    {
         return vec![RuntimeOverride {
             control: "sigstore.verify".to_string(),
             value: crate::security_floor::sigstore_mode_name(mode).to_string(),
-            source: "LPM_PROVENANCE_ENFORCE".to_string(),
+            source: match source {
+                crate::provenance_fetch::EnforceModeSource::Env => {
+                    "LPM_PROVENANCE_ENFORCE".to_string()
+                }
+                crate::provenance_fetch::EnforceModeSource::Config => {
+                    "~/.lpm/config.toml [sigstore].verify".to_string()
+                }
+                crate::provenance_fetch::EnforceModeSource::Default => unreachable!(),
+            },
         }];
     }
     Vec::new()
@@ -1667,6 +2166,20 @@ pub fn ensure_project_unlock(
     min_release_age_secs: Option<u64>,
     packages: &[String],
 ) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    if let Some(err) = managed_policy_blocks_scope(&effective, scope) {
+        record_audit_event(
+            "guarded-attempt",
+            false,
+            vec![scope.as_str().to_string()],
+            Some(canonical_project_root(project_dir)),
+            packages.to_vec(),
+            Some(source.as_str()),
+            None,
+            Some(message.to_string()),
+        );
+        return Err(err);
+    }
     if let Some(grant) =
         find_active_project_unlock(scope, project_dir, min_release_age_secs, packages)?
     {
@@ -1787,6 +2300,20 @@ pub fn ensure_global_unlock(
     message: &str,
     packages: &[String],
 ) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    if let Some(err) = managed_policy_blocks_scope(&effective, scope) {
+        record_audit_event(
+            "guarded-attempt",
+            false,
+            vec![scope.as_str().to_string()],
+            None,
+            packages.to_vec(),
+            Some(source.as_str()),
+            None,
+            Some(message.to_string()),
+        );
+        return Err(err);
+    }
     if let Some(grant) = find_active_global_unlock(scope, packages)? {
         record_audit_event(
             "guarded-attempt",
@@ -1836,6 +2363,7 @@ fn confirm_persistent_weakening(
     message: &str,
 ) -> Result<(), LpmError> {
     if is_automation(json_output) {
+        record_persistent_guarded_attempt(scope, false, message);
         return Err(approval_required_error(
             message,
             vec![scope.as_str().to_string()],
@@ -1848,16 +2376,7 @@ fn confirm_persistent_weakening(
     let confirmed =
         request_native_approval("Approve this persistent machine-level security change now?")?;
     if !confirmed {
-        record_audit_event(
-            "persistent-guarded-attempt",
-            false,
-            vec![scope.as_str().to_string()],
-            None,
-            Vec::new(),
-            Some(ApprovalSource::ConfigMutation.as_str()),
-            None,
-            Some(message.to_string()),
-        );
+        record_persistent_guarded_attempt(scope, false, message);
         return Err(approval_required_error(
             message,
             vec![scope.as_str().to_string()],
@@ -1865,17 +2384,35 @@ fn confirm_persistent_weakening(
             Some(command_hint.to_string()),
         ));
     }
+    record_persistent_guarded_attempt(scope, true, message);
+    Ok(())
+}
+
+fn record_persistent_guarded_attempt(scope: ApprovalScope, allowed: bool, detail: &str) {
     record_audit_event(
         "persistent-guarded-attempt",
-        true,
+        allowed,
         vec![scope.as_str().to_string()],
         None,
         Vec::new(),
         Some(ApprovalSource::ConfigMutation.as_str()),
         None,
-        Some(message.to_string()),
+        Some(detail.to_string()),
     );
-    Ok(())
+}
+
+fn approval_scope_for_script_policy(requested: ScriptPolicy) -> ApprovalScope {
+    match requested {
+        ScriptPolicy::Allow => ApprovalScope::ScriptsAllow,
+        ScriptPolicy::Triage | ScriptPolicy::Deny => ApprovalScope::ScriptsTriage,
+    }
+}
+
+fn approval_scope_for_sandbox_mode(requested: ResolvedSandboxMode) -> ApprovalScope {
+    match requested {
+        ResolvedSandboxMode::None => ApprovalScope::SandboxNone,
+        ResolvedSandboxMode::Default | ResolvedSandboxMode::Strict => ApprovalScope::SandboxDefault,
+    }
 }
 
 pub fn authorize_persistent_script_policy(
@@ -1895,22 +2432,24 @@ pub fn authorize_persistent_script_policy(
             .managed_policy
             .as_ref()
             .expect("managed policy source must include status metadata");
-        return Err(managed_policy_write_error(
+        let err = managed_policy_write_error(
             managed_policy,
             "script-policy",
             requested.as_str(),
             current.as_str(),
-        ));
+        );
+        record_persistent_guarded_attempt(
+            approval_scope_for_script_policy(requested),
+            false,
+            &err.to_string(),
+        );
+        return Err(err);
     }
 
     let mut posture = load_authorized_posture()?;
     if requested.loosens(current) {
         confirm_persistent_weakening(
-            match requested {
-                ScriptPolicy::Allow => ApprovalScope::ScriptsAllow,
-                ScriptPolicy::Triage => ApprovalScope::ScriptsTriage,
-                ScriptPolicy::Deny => ApprovalScope::ScriptsTriage,
-            },
+            approval_scope_for_script_policy(requested),
             json_output,
             command_hint,
             &format!(
@@ -1940,12 +2479,14 @@ pub fn authorize_persistent_release_age(
             .managed_policy
             .as_ref()
             .expect("managed policy source must include status metadata");
-        return Err(managed_policy_write_error(
+        let err = managed_policy_write_error(
             managed_policy,
             "minimum-release-age-secs",
             requested_secs.to_string(),
             current.to_string(),
-        ));
+        );
+        record_persistent_guarded_attempt(ApprovalScope::CooldownBypass, false, &err.to_string());
+        return Err(err);
     }
 
     let mut posture = load_authorized_posture()?;
@@ -1980,22 +2521,24 @@ pub fn authorize_persistent_sandbox_mode(
             .managed_policy
             .as_ref()
             .expect("managed policy source must include status metadata");
-        return Err(managed_policy_write_error(
+        let err = managed_policy_write_error(
             managed_policy,
             "[sandbox].mode",
             requested.as_str(),
             current.as_str(),
-        ));
+        );
+        record_persistent_guarded_attempt(
+            approval_scope_for_sandbox_mode(requested),
+            false,
+            &err.to_string(),
+        );
+        return Err(err);
     }
 
     let mut posture = load_authorized_posture()?;
     if requested.loosens(current) {
         confirm_persistent_weakening(
-            match requested {
-                ResolvedSandboxMode::None => ApprovalScope::SandboxNone,
-                ResolvedSandboxMode::Default => ApprovalScope::SandboxDefault,
-                ResolvedSandboxMode::Strict => ApprovalScope::SandboxDefault,
-            },
+            approval_scope_for_sandbox_mode(requested),
             json_output,
             command_hint,
             &format!(
@@ -2025,12 +2568,18 @@ pub fn authorize_persistent_sigstore(
             .managed_policy
             .as_ref()
             .expect("managed policy source must include status metadata");
-        return Err(managed_policy_write_error(
+        let err = managed_policy_write_error(
             managed_policy,
             "[sigstore].verify",
             crate::security_floor::sigstore_mode_name(requested),
             crate::security_floor::sigstore_mode_name(current),
-        ));
+        );
+        record_persistent_guarded_attempt(
+            ApprovalScope::ProvenanceUnverified,
+            false,
+            &err.to_string(),
+        );
+        return Err(err);
     }
 
     let mut posture = load_authorized_posture()?;
@@ -2057,16 +2606,99 @@ pub fn ensure_runtime_sigstore_posture(
 ) -> Result<(), LpmError> {
     let effective = load_effective_authorized_posture()?;
     let approved = effective.posture.sigstore_verify();
-    if source == crate::provenance_fetch::EnforceModeSource::Env
-        && crate::security_floor::sigstore_loosens(requested, approved)
-    {
+    if !crate::security_floor::sigstore_loosens(requested, approved) {
+        return Ok(());
+    }
+    if matches!(
+        source,
+        crate::provenance_fetch::EnforceModeSource::Env
+            | crate::provenance_fetch::EnforceModeSource::Config
+    ) {
+        if let Some(err) =
+            managed_policy_blocks_scope(&effective, ApprovalScope::ProvenanceUnverified)
+        {
+            record_audit_event(
+                "guarded-attempt",
+                false,
+                vec![ApprovalScope::ProvenanceUnverified.as_str().to_string()],
+                Some(canonical_project_root(project_dir)),
+                Vec::new(),
+                Some(approval_source_for_enforce_source(source).as_str()),
+                None,
+                Some(
+                    "runtime Sigstore verification posture is weaker than managed policy"
+                        .to_string(),
+                ),
+            );
+            return Err(err);
+        }
         ensure_project_unlock(
             ApprovalScope::ProvenanceUnverified,
             project_dir,
             json_output,
-            ApprovalSource::EnvVar,
-            "This install weakens Sigstore verification via LPM_PROVENANCE_ENFORCE for this project.",
+            approval_source_for_enforce_source(source),
+            match source {
+                crate::provenance_fetch::EnforceModeSource::Env => {
+                    "This command weakens Sigstore verification via LPM_PROVENANCE_ENFORCE for this project."
+                }
+                crate::provenance_fetch::EnforceModeSource::Config => {
+                    "The persisted global [sigstore].verify setting weakens Sigstore verification for this project."
+                }
+                crate::provenance_fetch::EnforceModeSource::Default => unreachable!(),
+            },
             None,
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn ensure_runtime_sigstore_posture_for_global(
+    json_output: bool,
+    requested: EnforceMode,
+    source: crate::provenance_fetch::EnforceModeSource,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let approved = effective.posture.sigstore_verify();
+    if !crate::security_floor::sigstore_loosens(requested, approved) {
+        return Ok(());
+    }
+    if matches!(
+        source,
+        crate::provenance_fetch::EnforceModeSource::Env
+            | crate::provenance_fetch::EnforceModeSource::Config
+    ) {
+        if let Some(err) =
+            managed_policy_blocks_scope(&effective, ApprovalScope::ProvenanceUnverified)
+        {
+            record_audit_event(
+                "guarded-attempt",
+                false,
+                vec![ApprovalScope::ProvenanceUnverified.as_str().to_string()],
+                None,
+                Vec::new(),
+                Some(approval_source_for_enforce_source(source).as_str()),
+                None,
+                Some(
+                    "runtime Sigstore verification posture is weaker than managed policy"
+                        .to_string(),
+                ),
+            );
+            return Err(err);
+        }
+        ensure_global_unlock(
+            ApprovalScope::ProvenanceUnverified,
+            json_output,
+            approval_source_for_enforce_source(source),
+            match source {
+                crate::provenance_fetch::EnforceModeSource::Env => {
+                    "This command weakens Sigstore verification via LPM_PROVENANCE_ENFORCE globally."
+                }
+                crate::provenance_fetch::EnforceModeSource::Config => {
+                    "The persisted global [sigstore].verify setting weakens Sigstore verification globally."
+                }
+                crate::provenance_fetch::EnforceModeSource::Default => unreachable!(),
+            },
             &[],
         )?;
     }
@@ -2085,6 +2717,10 @@ pub fn unlock_scope_command(
         return Err(LpmError::Registry(format!(
             "unlock ttl must be between 1 and {MAX_UNLOCK_TTL_SECS} seconds"
         )));
+    }
+    let effective = load_effective_authorized_posture()?;
+    if let Some(err) = managed_policy_blocks_scope(&effective, scope) {
+        return Err(err);
     }
     if is_automation(json_output) {
         return Err(approval_required_error(
@@ -2156,6 +2792,10 @@ pub fn unlock_global_scope_command(
         return Err(LpmError::Registry(format!(
             "unlock ttl must be between 1 and {MAX_UNLOCK_TTL_SECS} seconds"
         )));
+    }
+    let effective = load_effective_authorized_posture()?;
+    if let Some(err) = managed_policy_blocks_scope(&effective, scope) {
+        return Err(err);
     }
     if is_automation(json_output) {
         return Err(approval_required_error(
@@ -2231,11 +2871,39 @@ mod tests {
         let _guard = ENV_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .expect("security approval test env mutex poisoned");
-        let original_dir = std::env::var_os(SECURITY_DIR_ENV);
-        let original_policy = std::env::var_os(SECURITY_POLICY_PATH_ENV);
-        let original_secret = std::env::var_os(TEST_SECRET_ENV);
-        let original_auth = std::env::var_os(TEST_AUTH_RESULT_ENV);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        struct EnvRestore {
+            original_dir: Option<std::ffi::OsString>,
+            original_policy: Option<std::ffi::OsString>,
+            original_secret: Option<std::ffi::OsString>,
+            original_auth: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match self.original_dir.take() {
+                    Some(value) => unsafe { std::env::set_var(SECURITY_DIR_ENV, value) },
+                    None => unsafe { std::env::remove_var(SECURITY_DIR_ENV) },
+                }
+                match self.original_policy.take() {
+                    Some(value) => unsafe { std::env::set_var(SECURITY_POLICY_PATH_ENV, value) },
+                    None => unsafe { std::env::remove_var(SECURITY_POLICY_PATH_ENV) },
+                }
+                match self.original_secret.take() {
+                    Some(value) => unsafe { std::env::set_var(TEST_SECRET_ENV, value) },
+                    None => unsafe { std::env::remove_var(TEST_SECRET_ENV) },
+                }
+                match self.original_auth.take() {
+                    Some(value) => unsafe { std::env::set_var(TEST_AUTH_RESULT_ENV, value) },
+                    None => unsafe { std::env::remove_var(TEST_AUTH_RESULT_ENV) },
+                }
+            }
+        }
+        let _restore = EnvRestore {
+            original_dir: std::env::var_os(SECURITY_DIR_ENV),
+            original_policy: std::env::var_os(SECURITY_POLICY_PATH_ENV),
+            original_secret: std::env::var_os(TEST_SECRET_ENV),
+            original_auth: std::env::var_os(TEST_AUTH_RESULT_ENV),
+        };
         let policy_path = dir.join("managed-security-policy.toml");
         // Test-only env mutation is isolated to this helper and
         // restored before returning.
@@ -2248,24 +2916,7 @@ mod tests {
             );
             std::env::set_var(TEST_AUTH_RESULT_ENV, "approve");
         }
-        let out = f();
-        match original_dir {
-            Some(value) => unsafe { std::env::set_var(SECURITY_DIR_ENV, value) },
-            None => unsafe { std::env::remove_var(SECURITY_DIR_ENV) },
-        }
-        match original_policy {
-            Some(value) => unsafe { std::env::set_var(SECURITY_POLICY_PATH_ENV, value) },
-            None => unsafe { std::env::remove_var(SECURITY_POLICY_PATH_ENV) },
-        }
-        match original_secret {
-            Some(value) => unsafe { std::env::set_var(TEST_SECRET_ENV, value) },
-            None => unsafe { std::env::remove_var(TEST_SECRET_ENV) },
-        }
-        match original_auth {
-            Some(value) => unsafe { std::env::set_var(TEST_AUTH_RESULT_ENV, value) },
-            None => unsafe { std::env::remove_var(TEST_AUTH_RESULT_ENV) },
-        }
-        out
+        f()
     }
 
     fn write_managed_policy(dir: &Path, body: &str) {
@@ -2686,6 +3337,144 @@ script-policy = "deny"
             assert_eq!(status.target, UnlockTargetKind::Global);
             assert_eq!(status.active_unlocks.len(), 1);
             assert_eq!(status.active_unlocks[0].target, UnlockTargetKind::Global);
+        });
+    }
+
+    #[test]
+    fn runtime_sigstore_config_downgrade_requires_project_unlock() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        with_test_env(temp.path(), || {
+            let err = ensure_runtime_sigstore_posture(
+                &project,
+                true,
+                EnforceMode::Warn,
+                crate::provenance_fetch::EnforceModeSource::Config,
+            )
+            .unwrap_err();
+            assert_eq!(err.error_code(), "security_approval_required");
+            assert!(err.to_string().contains("provenance-unverified"));
+        });
+    }
+
+    #[test]
+    fn runtime_sigstore_config_downgrade_uses_active_project_unlock() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        with_test_env(temp.path(), || {
+            let grant = create_unlock_grant(
+                ApprovalScope::ProvenanceUnverified,
+                &project,
+                DEFAULT_UNLOCK_TTL_SECS,
+                None,
+                &[],
+            );
+            persist_unlock_grant(&grant).unwrap();
+            ensure_runtime_sigstore_posture(
+                &project,
+                true,
+                EnforceMode::Warn,
+                crate::provenance_fetch::EnforceModeSource::Config,
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn persistent_automation_refusal_is_written_to_audit_log() {
+        let temp = tempdir().unwrap();
+
+        with_test_env(temp.path(), || {
+            let original_auth = std::env::var_os(TEST_AUTH_RESULT_ENV);
+            unsafe {
+                std::env::remove_var(TEST_AUTH_RESULT_ENV);
+            }
+            let err = authorize_persistent_script_policy(
+                ScriptPolicy::Allow,
+                true,
+                "lpm config scripts --set allow",
+            )
+            .unwrap_err();
+            match original_auth {
+                Some(value) => unsafe { std::env::set_var(TEST_AUTH_RESULT_ENV, value) },
+                None => unsafe { std::env::remove_var(TEST_AUTH_RESULT_ENV) },
+            }
+            assert_eq!(err.error_code(), "security_approval_required");
+
+            let content = std::fs::read_to_string(audit_log_path().unwrap()).unwrap();
+            assert!(content.contains("\"event\":\"persistent-guarded-attempt\""));
+            assert!(content.contains("\"allowed\":false"));
+            assert!(content.contains("scripts-allow"));
+        });
+    }
+
+    #[test]
+    fn audit_log_truncation_is_detected_by_signed_head() {
+        let temp = tempdir().unwrap();
+
+        with_test_env(temp.path(), || {
+            let event = AuditEvent {
+                schema_version: AUDIT_EVENT_SCHEMA_VERSION,
+                occurred_at: Utc::now(),
+                event: "guarded-attempt".into(),
+                allowed: false,
+                scopes: vec![ApprovalScope::SandboxNone.as_str().to_string()],
+                project_root: None,
+                packages: Vec::new(),
+                source: Some(ApprovalSource::CliFlag.as_str().to_string()),
+                unlock_id: None,
+                detail: Some("test".into()),
+            };
+            append_audit_event(&event).unwrap();
+            std::fs::write(audit_log_path().unwrap(), "").unwrap();
+
+            let err = append_audit_event(&event).unwrap_err();
+            assert!(err.to_string().contains("signed audit head"));
+        });
+    }
+
+    #[test]
+    fn audit_log_appends_after_legacy_signed_entries() {
+        let temp = tempdir().unwrap();
+
+        with_test_env(temp.path(), || {
+            let event = AuditEvent {
+                schema_version: AUDIT_EVENT_SCHEMA_VERSION,
+                occurred_at: Utc::now(),
+                event: "guarded-attempt".into(),
+                allowed: false,
+                scopes: vec![ApprovalScope::SandboxNone.as_str().to_string()],
+                project_root: None,
+                packages: Vec::new(),
+                source: Some(ApprovalSource::CliFlag.as_str().to_string()),
+                unlock_id: None,
+                detail: Some("legacy".into()),
+            };
+            let payload = serde_json::to_value(&event).unwrap();
+            let legacy = SignedEnvelope {
+                payload: event.clone(),
+                signature: sign_payload_value(&payload).unwrap(),
+            };
+            let legacy_value = serde_json::to_value(&legacy).unwrap();
+            let legacy_hash = hash_json_value(&legacy_value).unwrap();
+            let log_path = audit_log_path().unwrap();
+            std::fs::write(
+                &log_path,
+                format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+            )
+            .unwrap();
+
+            append_audit_event(&event).unwrap();
+
+            let (tail, count) = read_audit_log_tail(&log_path).unwrap();
+            assert!(tail.is_some());
+            assert_eq!(count, 2);
+            let content = std::fs::read_to_string(&log_path).unwrap();
+            assert!(content.contains(&legacy_hash));
         });
     }
 }

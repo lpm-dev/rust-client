@@ -127,8 +127,15 @@ thiserror = { workspace = true }
 # Unix process group management (build.rs timeout kill)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
 mimalloc = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_SystemServices",
+] }
 
 [features]
 # Build with `--features dhat-heap` to instrument heap allocations.
