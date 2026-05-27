@@ -1,5 +1,5 @@
 #!/bin/bash
-# Real-world project audit harness — confidence-followup 
+# Real-world project audit harness — confidence-followup
 #
 # Clones a project pinned in projects.json, replaces its install with
 # `lpm install --linker <mode>` for both isolated and hoisted, and runs
@@ -174,6 +174,7 @@ run_mode() {
     local mode="$1"
     local work="$WORK_BASE/$PROJECT_NAME-$mode"
     local result="$RESULTS_DIR/$PROJECT_NAME-$mode-$TS.json"
+    local effective_lpm_home="${LPM_HOME:-$WORK_BASE/$PROJECT_NAME-$mode-home}"
 
     echo "--- $PROJECT_NAME [$mode] ---"
 
@@ -181,9 +182,12 @@ run_mode() {
     # the audit-fixtures runner — see that file for the full
     # rationale). Without this, callers that set LPM_HOME for
     # parallelism leak state from one mode to the next.
-    local lpm_root="${LPM_HOME:-$HOME/.lpm}"
-    rm -rf "$work" "$lpm_root/cache" "$lpm_root/store"
-    mkdir -p "$work"
+    if [[ -n "${LPM_HOME:-}" ]]; then
+        rm -rf "$work" "$effective_lpm_home/cache" "$effective_lpm_home/store"
+    else
+        rm -rf "$work" "$effective_lpm_home"
+    fi
+    mkdir -p "$work" "$effective_lpm_home"
 
     if [[ "$FROM_SCRATCH" == "true" ]]; then
         # No clone — pre_install authors the project from scratch.
@@ -220,7 +224,7 @@ run_mode() {
     local install_json="$work/.lpm-install.json"
     local s=$(now_ms)
     set +e
-    (cd "$work" && "$BIN" install --allow-new --linker "$mode" --json > "$install_json") 2> "$install_log"
+    (cd "$work" && env LPM_HOME="$effective_lpm_home" "$BIN" install --allow-new --linker "$mode" --json > "$install_json") 2> "$install_log"
     local install_exit=$?
     set -e
     local e=$(now_ms)

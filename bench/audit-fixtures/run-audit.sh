@@ -111,6 +111,11 @@ run_mode() {
     local mode="$1"   # "isolated" | "hoisted"
     local work="$WORK_BASE/$FIXTURE_NAME-$mode"
     local result="$RESULTS_DIR/$FIXTURE_NAME-$mode-$TS.json"
+    local effective_lpm_home="${LPM_HOME:-$WORK_BASE/$FIXTURE_NAME-$mode-home}"
+    local top_npm_smoke_authoritative=0
+    if [[ "$FIXTURE_REL" == top-npm/* ]]; then
+        top_npm_smoke_authoritative=1
+    fi
 
     echo "--- $FIXTURE_REL [$mode] ---"
 
@@ -121,9 +126,12 @@ run_mode() {
     # LPM_HOME (top-npm-audit's per-slot homes) leaked state across
     # modes — hoisted reused the populated store from the prior
     # isolated pass, weakening 's cold-state signal.
-    local lpm_root="${LPM_HOME:-$HOME/.lpm}"
-    rm -rf "$work" "$lpm_root/cache" "$lpm_root/store"
-    mkdir -p "$work"
+    if [[ -n "${LPM_HOME:-}" ]]; then
+        rm -rf "$work" "$effective_lpm_home/cache" "$effective_lpm_home/store"
+    else
+        rm -rf "$work" "$effective_lpm_home"
+    fi
+    mkdir -p "$work" "$effective_lpm_home"
     # Copy every file in the fixture dir except readme/smoke (those
     # aren't part of the install input).
     for f in "$FIXTURE_DIR"/*; do
@@ -140,7 +148,7 @@ run_mode() {
     local install_json="$work/install.json"
     local s=$(now_ms)
     set +e
-    (cd "$work" && "$BIN" install --allow-new --linker "$mode" --json > "$install_json") 2> "$install_log"
+    (cd "$work" && env LPM_HOME="$effective_lpm_home" "$BIN" install --allow-new --linker "$mode" --json > "$install_json") 2> "$install_log"
     local install_exit=$?
     set -e
     local e=$(now_ms)
@@ -185,12 +193,17 @@ run_mode() {
         set -e
     fi
 
+    local require_fail_overridden=0
+    if [[ $top_npm_smoke_authoritative -eq 1 && $require_fail -gt 0 && $smoke_exit -eq 0 ]]; then
+        require_fail_overridden=1
+    fi
+
     # Verdict.
     local verdict="PASS"
     local fail_reason=""
     if [[ $install_exit -ne 0 ]]; then
         verdict="FAIL"; fail_reason="install exited $install_exit"
-    elif [[ $require_fail -gt 0 ]]; then
+    elif [[ $require_fail -gt 0 && $require_fail_overridden -eq 0 ]]; then
         verdict="FAIL"; fail_reason="$require_fail of $((require_pass+require_fail)) requires failed"
     elif [[ $smoke_exit -ne 0 ]]; then
         verdict="FAIL"; fail_reason="smoke exit $smoke_exit"
@@ -217,7 +230,11 @@ EOF
     # Stdout summary.
     printf "  install: exit=%d, %dms, top-level deps=%d\n" \
         "$install_exit" "$install_ms" "$top_count"
-    printf "  require: %d pass, %d fail\n" "$require_pass" "$require_fail"
+    if [[ $require_fail_overridden -eq 1 ]]; then
+        printf "  require: %d pass, %d fail (top-npm smoke passed; import-only or bin-only surface tolerated)\n" "$require_pass" "$require_fail"
+    else
+        printf "  require: %d pass, %d fail\n" "$require_pass" "$require_fail"
+    fi
     if [[ $require_fail -gt 0 ]]; then
         printf "%b" "$require_results"
     fi

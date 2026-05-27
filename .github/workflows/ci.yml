@@ -230,6 +230,10 @@ jobs:
       - name: Build lpm-rs (release)
         run: cargo build --release -p lpm-cli
 
+      - name: Install audit security policy
+        if: runner.os == 'Linux'
+        run: sudo ./bench/install-audit-security-policy.sh
+
       # §3b: drive the bash harness from Git Bash on Windows. The
       # `windows-latest` runner has Git Bash preinstalled at
       # `C:\Program Files\Git\bin\bash.exe`; `shell: bash` resolves to
@@ -293,6 +297,9 @@ jobs:
       - name: Build lpm-rs (release)
         run: cargo build --release -p lpm-cli
 
+      - name: Install audit security policy
+        run: sudo ./bench/install-audit-security-policy.sh
+
       - name: Run real-world audit suite
         run: ./bench/realworld-audit/run-all.sh
         env:
@@ -351,6 +358,9 @@ jobs:
 
       - name: Build lpm-rs (release)
         run: cargo build --release -p lpm-cli
+
+      - name: Install audit security policy
+        run: sudo ./bench/install-audit-security-policy.sh
 
       - name: Run top-N npm audit
         run: ./bench/top-npm-audit/run-all.sh
