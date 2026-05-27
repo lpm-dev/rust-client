@@ -193,6 +193,11 @@ pub async fn run(
     overrides: InstallGlobalOverrides,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
+    crate::security_approval::ensure_global_trust_authorized(
+        &root,
+        json_output,
+        crate::security_approval::ApprovalSource::GlobalConfig,
+    )?;
     // Step 6 fix: use the injected client (carries
     // `--registry` + SessionManager). The local `build_registry()`
     // helper is removed.

@@ -17,6 +17,10 @@ pub enum SecurityCmd {
         /// Time to keep the unlock active (`10m`, `5m`, `30m`).
         #[arg(long, default_value = "10m")]
         ttl: String,
+
+        /// Restrict the unlock to one or more package names.
+        #[arg(long = "package", value_name = "PKG")]
+        packages: Vec<String>,
     },
 
     /// Show the effective security floor, unlock state, and policy source.
@@ -33,6 +37,7 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
             scope,
             project,
             ttl,
+            packages,
         } => {
             let ttl_secs = crate::release_age_config::parse_duration(ttl)?;
             let project_dir = match project {
@@ -45,6 +50,7 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 ttl_secs,
                 json_output,
                 None,
+                packages,
             )?;
 
             if json_output {
@@ -54,6 +60,7 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                         "success": true,
                         "scope": scope.as_str(),
                         "ttl_secs": ttl_secs,
+                        "packages": packages,
                         "project_root": grant.project_root,
                         "issued_at": grant.issued_at,
                         "expires_at": grant.expires_at,

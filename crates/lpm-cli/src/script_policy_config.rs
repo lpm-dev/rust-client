@@ -357,6 +357,7 @@ pub fn resolve_script_policy_with_security(
                 requested.as_str()
             ),
             None,
+            &[],
         )?;
     } else if cli_override.is_none()
         && let Some(requested) = project_config.policy
@@ -369,6 +370,7 @@ pub fn resolve_script_policy_with_security(
             crate::security_approval::ApprovalSource::ProjectConfig,
             "package.json requests a weaker script-policy than this machine has approved.",
             None,
+            &[],
         )?;
     }
 

@@ -632,6 +632,12 @@ async fn run_under_store_lock(
             // sees "would approve X" with the same JSON envelope
             // shape as a live run.
             if !dry_run {
+                crate::security_approval::ensure_project_trust_candidate_authorized(
+                    project_dir,
+                    &trusted,
+                    json_output,
+                    crate::security_approval::ApprovalSource::CliFlag,
+                )?;
                 write_back(&pkg_json_path, &mut manifest, &trusted)?;
             }
         } else {
@@ -745,6 +751,12 @@ async fn run_under_store_lock(
         }
         // close-out short-circuit under `--dry-run`.
         if !dry_run {
+            crate::security_approval::ensure_project_trust_candidate_authorized(
+                project_dir,
+                &trusted,
+                json_output,
+                crate::security_approval::ApprovalSource::CliFlag,
+            )?;
             write_back(&pkg_json_path, &mut manifest, &trusted)?;
         }
         print_summary(
@@ -929,6 +941,12 @@ async fn run_under_store_lock(
     // write; `approved` / `skipped` still fed into `print_summary`
     // so the agent sees the would-approve count.
     if !approved.is_empty() && !dry_run {
+        crate::security_approval::ensure_project_trust_candidate_authorized(
+            project_dir,
+            &trusted,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+        )?;
         write_back(&pkg_json_path, &mut manifest, &trusted)?;
     }
 
@@ -2073,6 +2091,12 @@ async fn run_global_bulk_yes(
             );
         }
         if !dry_run {
+            crate::security_approval::ensure_global_trust_candidate_authorized_from_trust(
+                root_for_body,
+                &trust,
+                json_output,
+                crate::security_approval::ApprovalSource::CliFlag,
+            )?;
             lpm_global::trusted_deps::write_for(root_for_body, &trust)?;
         }
         Ok(())
@@ -2242,6 +2266,12 @@ async fn run_global_named(
             },
         );
         if !dry_run {
+            crate::security_approval::ensure_global_trust_candidate_authorized_from_trust(
+                root_for_body,
+                &trust,
+                json_output,
+                crate::security_approval::ApprovalSource::CliFlag,
+            )?;
             lpm_global::trusted_deps::write_for(root_for_body, &trust)?;
         }
         Ok(())
@@ -2473,6 +2503,12 @@ async fn commit_global_approval(
             },
         );
         if !dry_run {
+            crate::security_approval::ensure_global_trust_candidate_authorized_from_trust(
+                root,
+                &trust,
+                false,
+                crate::security_approval::ApprovalSource::CliFlag,
+            )?;
             lpm_global::trusted_deps::write_for(root, &trust)?;
         }
         Ok(())
@@ -2769,9 +2805,30 @@ mod tests {
     use crate::provenance_fetch::EnforceMode;
     use lpm_workspace::TrustedDependencyBinding;
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
     use tempfile::tempdir;
 
     // ── snapshot_for_binding_with_mode (rollout knob) ───
+
+    fn ensure_security_test_backend() {
+        static SECURITY_DIR: OnceLock<PathBuf> = OnceLock::new();
+        let dir = SECURITY_DIR.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("security backend tempdir");
+            let path = dir.path().to_path_buf();
+            std::mem::forget(dir);
+            unsafe {
+                std::env::set_var("LPM_SECURITY_DIR", &path);
+                std::env::set_var(
+                    "LPM_TEST_SECURITY_SECRET_HEX",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                );
+                std::env::set_var("LPM_TEST_SECURITY_AUTH_RESULT", "approve");
+            }
+            path
+        });
+        let _ = dir;
+    }
 
     fn verified_status() -> ProvenanceStatus {
         ProvenanceStatus::Verified(ProvenanceSnapshot {
@@ -3036,6 +3093,7 @@ mod tests {
     }
 
     fn write_state(project_dir: &Path, blocked: Vec<BlockedPackage>) {
+        ensure_security_test_backend();
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: "sha256-test".to_string(),
@@ -3047,6 +3105,7 @@ mod tests {
     }
 
     fn write_default_manifest(dir: &Path) {
+        ensure_security_test_backend();
         write_manifest(
             &dir.join("package.json"),
             &serde_json::json!({"name": "test", "version": "0.0.0"}),
@@ -4701,6 +4760,7 @@ mod tests {
         top_level_version: &str,
         blocked_rows: Vec<AggregateBlockedRow>,
     ) {
+        ensure_security_test_backend();
         let rel_root = format!("installs/{}@{}", top_level, top_level_version);
         let install_root = root.global_root().join(&rel_root);
         std::fs::create_dir_all(&install_root).unwrap();
