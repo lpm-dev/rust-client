@@ -174,7 +174,8 @@ fn resolve_strict_peer_dependencies(
 #[derive(Debug, Clone)]
 struct CatalogSavePolicy {
     mode: lpm_workspace::CatalogMode,
-    default_catalog: HashMap<String, String>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    forced_catalog: Option<String>,
 }
 
 impl CatalogSavePolicy {
@@ -182,33 +183,79 @@ impl CatalogSavePolicy {
     fn manual() -> Self {
         Self {
             mode: lpm_workspace::CatalogMode::Manual,
-            default_catalog: HashMap::new(),
+            catalogs: HashMap::new(),
+            forced_catalog: None,
         }
     }
 
-    fn from_package(pkg: &lpm_workspace::PackageJson) -> Self {
+    fn from_package(pkg: &lpm_workspace::PackageJson, forced_catalog: Option<&str>) -> Self {
         let mode = pkg
             .lpm
             .as_ref()
             .and_then(|lpm| lpm.catalog_mode)
             .unwrap_or(lpm_workspace::CatalogMode::Manual);
-        let default_catalog = pkg.catalogs.get("default").cloned().unwrap_or_default();
+        let forced_catalog = forced_catalog.map(normalize_catalog_name);
+        let mut catalogs = HashMap::with_capacity(1);
+        if let Some(catalog_name) = forced_catalog.as_deref() {
+            if let Some(catalog) = pkg.catalogs.get(catalog_name) {
+                catalogs.insert(catalog_name.to_string(), catalog.clone());
+            }
+        } else if !matches!(mode, lpm_workspace::CatalogMode::Manual)
+            && let Some(default_catalog) = pkg.catalogs.get("default")
+        {
+            catalogs.insert("default".to_string(), default_catalog.clone());
+        }
         Self {
             mode,
-            default_catalog,
+            catalogs,
+            forced_catalog,
         }
     }
 
-    fn is_manual(&self) -> bool {
-        matches!(self.mode, lpm_workspace::CatalogMode::Manual)
+    fn can_rewrite_manifest(&self) -> bool {
+        self.forced_catalog.is_some() || !matches!(self.mode, lpm_workspace::CatalogMode::Manual)
+    }
+
+    fn optional_catalog_entry(&self, catalog_name: &str, package: &str) -> Option<&String> {
+        let Some(catalog) = self.catalogs.get(catalog_name) else {
+            return None;
+        };
+        catalog.get(package)
+    }
+
+    fn catalog_entry(&self, catalog_name: &str, package: &str) -> Result<&String, LpmError> {
+        let catalog = self.catalogs.get(catalog_name).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{} rejected {package}: catalog `{catalog_name}` does not exist",
+                forced_catalog_flag(catalog_name)
+            ))
+        })?;
+        catalog.get(package).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{} rejected {package}: no catalog entry exists in catalog `{catalog_name}` for this package",
+                forced_catalog_flag(catalog_name)
+            ))
+        })
     }
 }
 
-fn catalog_save_policy_for_project(project_dir: &Path) -> Result<CatalogSavePolicy, LpmError> {
+fn normalize_catalog_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == "default" {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn catalog_save_policy_for_project(
+    project_dir: &Path,
+    forced_catalog: Option<&str>,
+) -> Result<CatalogSavePolicy, LpmError> {
     let pkg_json_path = project_dir.join("package.json");
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
-    Ok(CatalogSavePolicy::from_package(&pkg))
+    Ok(CatalogSavePolicy::from_package(&pkg, forced_catalog))
 }
 
 fn strict_peer_dependency_error(
@@ -11801,7 +11848,7 @@ fn finalize_packages_in_manifest_with_catalog_policy(
     config: crate::save_spec::SaveConfig,
     catalog_policy: &CatalogSavePolicy,
 ) -> Result<(), LpmError> {
-    if !staged.needs_finalize() && catalog_policy.is_manual() {
+    if !staged.needs_finalize() && !catalog_policy.can_rewrite_manifest() {
         return Ok(());
     }
 
@@ -11819,8 +11866,37 @@ fn finalize_packages_in_manifest_with_catalog_policy(
     for entry in &staged.entries {
         let resolved = resolved_versions.get(&entry.name);
 
-        if !catalog_policy.is_manual() {
-            if let Some(catalog_range) = catalog_policy.default_catalog.get(&entry.name) {
+        if let Some(catalog_name) = catalog_policy.forced_catalog.as_deref() {
+            let catalog_range = catalog_policy.catalog_entry(catalog_name, &entry.name)?;
+            let resolved = resolved.ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "{}: resolver did not report a concrete version for `{}`",
+                    forced_catalog_flag(catalog_name),
+                    entry.name
+                ))
+            })?;
+            if catalog_range_matches_resolved(&entry.name, catalog_range, resolved)? {
+                let catalog_ref = catalog_reference(catalog_name);
+                if doc[dep_key][&entry.name].as_str() != Some(catalog_ref.as_str()) {
+                    doc[dep_key][&entry.name] = serde_json::Value::String(catalog_ref);
+                    doc_mutated = true;
+                }
+                continue;
+            }
+
+            let requested_spec = catalog_mode_requested_spec(&entry.intent, resolved);
+            return Err(forced_catalog_mismatch_error(
+                catalog_name,
+                &entry.name,
+                &requested_spec,
+                catalog_range,
+            ));
+        }
+
+        if !matches!(catalog_policy.mode, lpm_workspace::CatalogMode::Manual) {
+            if let Some(catalog_range) =
+                catalog_policy.optional_catalog_entry("default", &entry.name)
+            {
                 let resolved = resolved.ok_or_else(|| {
                     LpmError::Registry(format!(
                         "catalogMode: resolver did not report a concrete version for `{}`",
@@ -11913,6 +11989,22 @@ fn catalog_range_matches_resolved(
     Ok(range.matches(resolved))
 }
 
+fn catalog_reference(catalog_name: &str) -> String {
+    if catalog_name == "default" {
+        "catalog:".to_string()
+    } else {
+        format!("catalog:{catalog_name}")
+    }
+}
+
+fn forced_catalog_flag(catalog_name: &str) -> String {
+    if catalog_name == "default" {
+        "--catalog".to_string()
+    } else {
+        format!("--catalog={catalog_name}")
+    }
+}
+
 fn catalog_mode_requested_spec(
     intent: &crate::save_spec::UserSaveIntent,
     resolved: &lpm_semver::Version,
@@ -11930,6 +12022,18 @@ fn catalog_mode_mismatch_error(
 ) -> LpmError {
     LpmError::Registry(format!(
         "catalogMode strict rejected {package}@{requested_spec}: default catalog has catalog:{catalog_range}"
+    ))
+}
+
+fn forced_catalog_mismatch_error(
+    catalog_name: &str,
+    package: &str,
+    requested_spec: &str,
+    catalog_range: &str,
+) -> LpmError {
+    LpmError::Registry(format!(
+        "{} rejected {package}@{requested_spec}: catalog `{catalog_name}` has catalog:{catalog_range}",
+        forced_catalog_flag(catalog_name)
     ))
 }
 
@@ -12025,6 +12129,7 @@ pub async fn run_add_packages(
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
+    catalog_name_override: Option<&str>,
     // forwarded CLI-side policy override. See
     // [`run_with_options`] for the resolution precedence and the
     // current consumer (triage-mode install summary line).
@@ -12146,7 +12251,7 @@ pub async fn run_add_packages(
         //    `~/.lpm/config.toml` (global) for the persistent save-policy
         //    keys. CLI flags still beat config inside `decide_saved_dependency_spec`.
         let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
-        let catalog_policy = catalog_save_policy_for_project(project_dir)?;
+        let catalog_policy = catalog_save_policy_for_project(project_dir, catalog_name_override)?;
         let staged =
             stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
         pin_staged_dist_tags_for_resolution(client, project_dir, &staged).await?;
@@ -12241,6 +12346,7 @@ pub async fn run_install_filtered_add(
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
+    catalog_name_override: Option<&str>,
     // forwarded CLI-side policy override.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     // forwarded `--advisor` override. Opaque
@@ -12426,7 +12532,8 @@ pub async fn run_install_filtered_add(
         .map_or_else(|| cwd.to_path_buf(), |ws| ws.root);
     let save_config =
         crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
-    let catalog_policy = catalog_save_policy_for_project(&workspace_root_for_config)?;
+    let catalog_policy =
+        catalog_save_policy_for_project(&workspace_root_for_config, catalog_name_override)?;
 
     // ** fix.** Wrap the workspace-install snapshot → loop
     // → commit in an exclusive per-WORKSPACE lock. Two concurrent
@@ -14619,7 +14726,11 @@ mod tests {
         let resolved = make_resolved(&[("is-positive", "2.0.0")]);
         let policy = CatalogSavePolicy {
             mode: lpm_workspace::CatalogMode::Prefer,
-            default_catalog: HashMap::from([("is-positive".to_string(), "^2.0.0".to_string())]),
+            catalogs: HashMap::from([(
+                "default".to_string(),
+                HashMap::from([("is-positive".to_string(), "^2.0.0".to_string())]),
+            )]),
+            forced_catalog: None,
         };
 
         finalize_packages_in_manifest_with_catalog_policy(
@@ -14633,6 +14744,42 @@ mod tests {
 
         let after = read_manifest(&pkg_path);
         assert_eq!(after["dependencies"]["is-positive"], "catalog:");
+    }
+
+    #[test]
+    fn finalize_forced_named_catalog_policy_rewrites_matching_dep_to_named_catalog_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
+
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["is-positive@2.0.0".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+        )
+        .unwrap();
+        let resolved = make_resolved(&[("is-positive", "2.0.0")]);
+        let policy = CatalogSavePolicy {
+            mode: lpm_workspace::CatalogMode::Manual,
+            catalogs: HashMap::from([(
+                "testing".to_string(),
+                HashMap::from([("is-positive".to_string(), "^2.0.0".to_string())]),
+            )]),
+            forced_catalog: Some("testing".to_string()),
+        };
+
+        finalize_packages_in_manifest_with_catalog_policy(
+            &staged,
+            &resolved,
+            crate::save_spec::SaveFlags::default(),
+            crate::save_spec::SaveConfig::default(),
+            &policy,
+        )
+        .unwrap();
+
+        let after = read_manifest(&pkg_path);
+        assert_eq!(after["dependencies"]["is-positive"], "catalog:testing");
     }
 
     #[test]
@@ -14651,7 +14798,11 @@ mod tests {
         let resolved = make_resolved(&[("is-positive", "2.0.0")]);
         let policy = CatalogSavePolicy {
             mode: lpm_workspace::CatalogMode::Strict,
-            default_catalog: HashMap::from([("is-positive".to_string(), "^1.0.0".to_string())]),
+            catalogs: HashMap::from([(
+                "default".to_string(),
+                HashMap::from([("is-positive".to_string(), "^1.0.0".to_string())]),
+            )]),
+            forced_catalog: None,
         };
 
         let err = finalize_packages_in_manifest_with_catalog_policy(
@@ -14935,6 +15086,7 @@ mod tests {
             false,                // allow_new
             false,                // force
             crate::save_spec::SaveFlags::default(),
+            None,                                                  // catalog_name_override
             None,                                                  // script_policy_override
             None,                                                  // advisor_override
             None,                                                  // min_release_age_override
@@ -14980,6 +15132,7 @@ mod tests {
             false,
             false,
             crate::save_spec::SaveFlags::default(),
+            None,                                                  // catalog_name_override
             None,                                                  // script_policy_override
             None,                                                  // advisor_override
             None,                                                  // min_release_age_override

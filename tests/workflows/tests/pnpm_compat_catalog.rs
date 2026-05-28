@@ -98,6 +98,48 @@ async fn strict_catalog_mode_saves_catalog_reference_when_catalog_range_matches(
 }
 
 #[tokio::test]
+async fn install_catalog_flag_saves_default_catalog_reference_when_catalog_range_matches() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = catalog_project_without_mode("^2.0.0");
+
+    let output = run_install(&project, &mock, &["--catalog", "is-positive"]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install --catalog must succeed when the default catalog entry matches\n{text}"
+    );
+    assert_eq!(
+        dependency_spec(&project, "is-positive"),
+        "catalog:",
+        "--catalog must force a default catalog reference independent of catalogMode"
+    );
+}
+
+#[tokio::test]
+async fn install_named_catalog_flag_saves_named_catalog_reference_when_catalog_range_matches() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = named_catalog_project("testing", "^2.0.0");
+
+    let output = run_install(&project, &mock, &["--catalog=testing", "is-positive"]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install --catalog=<name> must succeed when the named catalog entry matches\n{text}"
+    );
+    assert_eq!(
+        dependency_spec(&project, "is-positive"),
+        "catalog:testing",
+        "--catalog=<name> must force a named catalog reference"
+    );
+}
+
+#[tokio::test]
 async fn strict_catalog_mode_rejects_direct_range_outside_catalog() {
     let mock = MockRegistry::start().await;
     mount_is_positive_versions(&mock).await;
@@ -120,6 +162,66 @@ async fn strict_catalog_mode_rejects_direct_range_outside_catalog() {
     assert!(
         dependency_spec_optional(&project, "is-positive").is_none(),
         "failed strict install must roll package.json back"
+    );
+}
+
+#[tokio::test]
+async fn install_catalog_flag_rejects_direct_range_outside_catalog() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = catalog_project_without_mode("^1.0.0");
+
+    let output = run_install(&project, &mock, &["--catalog", "is-positive@2.0.0"]);
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "install --catalog must reject a request outside the default catalog range\n{text}"
+    );
+    assert!(
+        text.contains("--catalog")
+            && text.contains("is-positive@2.0.0")
+            && text.contains("catalog:^1.0.0"),
+        "forced catalog mismatch error must name the requested and catalog specs\n{text}"
+    );
+    assert!(
+        dependency_spec_optional(&project, "is-positive").is_none(),
+        "failed forced catalog install must roll package.json back"
+    );
+}
+
+#[tokio::test]
+async fn install_named_catalog_flag_rejects_missing_entry_before_manifest_commit() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "catalogs": {
+                "testing": {}
+            }
+        }"#,
+    );
+
+    let output = run_install(&project, &mock, &["--catalog=testing", "is-positive"]);
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "install --catalog=<name> must reject packages absent from that catalog\n{text}"
+    );
+    assert!(
+        text.contains("--catalog=testing")
+            && text.contains("is-positive")
+            && text.contains("catalog entry"),
+        "forced catalog missing-entry error must name the flag, package, and missing entry\n{text}"
+    );
+    assert!(
+        dependency_spec_optional(&project, "is-positive").is_none(),
+        "failed forced catalog install must roll package.json back"
     );
 }
 
@@ -234,6 +336,20 @@ fn catalog_project_with_mode(mode: &str, catalog_range: &str) -> TempProject {
             }},
             "lpm": {{
                 "catalogMode": "{mode}"
+            }}
+        }}"#
+    ))
+}
+
+fn named_catalog_project(catalog_name: &str, catalog_range: &str) -> TempProject {
+    TempProject::empty(&format!(
+        r#"{{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "catalogs": {{
+                "{catalog_name}": {{
+                    "is-positive": "{catalog_range}"
+                }}
             }}
         }}"#
     ))

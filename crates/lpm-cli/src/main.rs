@@ -617,6 +617,21 @@ enum Commands {
         #[arg(long, value_name = "PREFIX", conflicts_with_all = ["exact", "tilde"])]
         save_prefix: Option<String>,
 
+        /// Save matching package specs through the root catalog instead of
+        /// writing a direct range. `--catalog` uses the default catalog and
+        /// writes `"catalog:"`; `--catalog=<name>` uses a named catalog and
+        /// writes `"catalog:<name>"`. The package must already exist in that
+        /// catalog and the resolved version must satisfy the catalog range.
+        #[arg(
+            long,
+            value_name = "NAME",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "default",
+            conflicts_with_all = ["exact", "tilde", "save_prefix"],
+        )]
+        catalog: Option<String>,
+
         /// Install the package globally into `~/.lpm/global/` instead of
         /// into a project's `node_modules/`. Exposes the package's bin
         /// entries on PATH via `~/.lpm/bin/`.
@@ -2489,6 +2504,7 @@ fn validate_global_install_project_scoped_flags(
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
+    catalog: bool,
 ) -> Result<(), lpm_common::LpmError> {
     // `--allow-new`, `--min-release-age`, and
     // `--ignore-provenance-drift[-all]` are now forwarded into the
@@ -2496,10 +2512,10 @@ fn validate_global_install_project_scoped_flags(
     // synthetic project's package.json), so they are no longer rejected
     // here. The flags below remain genuinely project-scoped and have no
     // meaningful semantics on `-g`.
-    if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match || yes {
+    if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match || yes || catalog {
         return Err(lpm_common::LpmError::Script(
             "`-g` is mutually exclusive with `-D` / `--filter` / `-w` / \
-             `--fail-if-no-match` / `-y` (those are project-scoped)."
+             `--fail-if-no-match` / `-y` / `--catalog` (those are project-scoped)."
                 .into(),
         ));
     }
@@ -3101,6 +3117,7 @@ async fn async_main() -> Result<()> {
             exact,
             tilde,
             save_prefix,
+            catalog,
             global,
             replace_bin,
             alias,
@@ -3149,6 +3166,7 @@ async fn async_main() -> Result<()> {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    catalog.is_some(),
                 )?;
                 // parse collision-resolution flags. Syntactic
                 // validation only (no lookup against marker commands —
@@ -3168,6 +3186,7 @@ async fn async_main() -> Result<()> {
                     exact,
                     tilde,
                     save_prefix,
+                    catalog,
                 ); // not wired for global install; ignored for now.
 
                 let mut overrides = build_install_global_overrides(
@@ -3412,6 +3431,14 @@ async fn async_main() -> Result<()> {
                 // apply when adding packages. Bare `lpm install` is the
                 // refresh-from-package.json operation and ignores them
                 // (or hard-errors if the user mistakenly passed them).
+                if catalog.is_some() {
+                    return Err(lpm_common::LpmError::Script(
+                        "`--catalog` only applies when adding packages. Pass package specs \
+                         (e.g., `lpm install --catalog react`) or run `lpm install` alone \
+                         to refresh from package.json."
+                            .into(),
+                    ));
+                }
                 if !filter.is_empty() || workspace_root || fail_if_no_match {
                     Err(lpm_common::LpmError::Script(
                         "`--filter`, `-w`, and `--fail-if-no-match` only apply when adding packages. \
@@ -3485,6 +3512,7 @@ async fn async_main() -> Result<()> {
                     eff_allow_new,
                     force,
                     save_flags,
+                    catalog.as_deref(),
                     cli_script_policy_override,
                     advisor.clone(),
                     min_release_age_override,
@@ -3519,6 +3547,7 @@ async fn async_main() -> Result<()> {
                         eff_allow_new,
                         force,
                         save_flags,
+                        catalog.as_deref(),
                         cli_script_policy_override,
                         advisor.clone(),
                         min_release_age_override,
@@ -3541,6 +3570,7 @@ async fn async_main() -> Result<()> {
                         eff_allow_new,
                         force,
                         save_flags,
+                        catalog.as_deref(),
                         cli_script_policy_override,
                         advisor.clone(),
                         min_release_age_override,
@@ -5519,6 +5549,44 @@ mod tests {
     }
 
     #[test]
+    fn install_catalog_flag_parses_without_consuming_package() {
+        let cli = Cli::try_parse_from(["lpm", "install", "--catalog", "react"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                packages, catalog, ..
+            } => {
+                assert_eq!(packages, vec!["react".to_string()]);
+                assert_eq!(catalog.as_deref(), Some("default"));
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_named_catalog_flag_parses_with_equals() {
+        let cli = Cli::try_parse_from(["lpm", "install", "--catalog=testing", "react"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                packages, catalog, ..
+            } => {
+                assert_eq!(packages, vec!["react".to_string()]);
+                assert_eq!(catalog.as_deref(), Some("testing"));
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_catalog_flag_conflicts_with_direct_save_policy_flags() {
+        assert!(Cli::try_parse_from(["lpm", "install", "--catalog", "--exact", "react"]).is_err());
+        assert!(Cli::try_parse_from(["lpm", "install", "--catalog", "--tilde", "react"]).is_err());
+        assert!(
+            Cli::try_parse_from(["lpm", "install", "--catalog", "--save-prefix", "~", "react"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn install_save_dev_with_filter_composes() {
         let cli = Cli::try_parse_from(["lpm", "install", "-D", "vitest", "--filter", "./apps/*"])
             .unwrap();
@@ -5642,6 +5710,7 @@ mod tests {
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    false,
                 )
                 .unwrap_err();
 
@@ -5672,8 +5741,9 @@ mod tests {
     #[test]
     fn install_global_validator_only_rejects_project_scoped_grouping_flags() {
         // Genuine project-only flag: still rejected.
-        let err = validate_global_install_project_scoped_flags(true, &[], false, false, false)
-            .unwrap_err();
+        let err =
+            validate_global_install_project_scoped_flags(true, &[], false, false, false, false)
+                .unwrap_err();
         match err {
             lpm_common::LpmError::Script(message) => {
                 assert!(message.contains("project-scoped"));
@@ -5681,8 +5751,20 @@ mod tests {
             other => panic!("expected Script error, got {other:?}"),
         }
 
+        let err =
+            validate_global_install_project_scoped_flags(false, &[], false, false, false, true)
+                .unwrap_err();
+        match err {
+            lpm_common::LpmError::Script(message) => {
+                assert!(message.contains("`--catalog`"));
+                assert!(message.contains("project-scoped"));
+            }
+            other => panic!("expected Script error, got {other:?}"),
+        }
+
         // No project-only flags set → accept.
-        validate_global_install_project_scoped_flags(false, &[], false, false, false).unwrap();
+        validate_global_install_project_scoped_flags(false, &[], false, false, false, false)
+            .unwrap();
     }
 
     // ── forwarding regression tests ─────────────────────────
