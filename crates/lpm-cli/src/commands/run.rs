@@ -1565,9 +1565,10 @@ pub async fn dlx(
             false,                                                   // force
             false,                                                   // allow_new
             false,                                                   // strict_integrity
-            None,                                                    // linker_override
-            false,                                                   // no_skills
-            false,                                                   // no_editor_setup
+            None,  // strict_peer_dependencies_override
+            None,  // linker_override
+            false, // no_skills
+            false, // no_editor_setup
             true,  // no_security_summary (dlx doesn't need it)
             false, // auto_build
             None,  // target_set: dlx is single-project

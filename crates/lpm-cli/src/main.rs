@@ -305,6 +305,22 @@ enum Commands {
         #[arg(long)]
         strict_integrity: bool,
 
+        /// Fail install when peer-dependency warnings or best-effort
+        /// peer conflicts are detected. Default is warn-only, matching
+        /// pnpm's current `strict-peer-dependencies=false` default.
+        ///
+        /// Precedence: this flag / `--no-strict-peer-dependencies` >
+        /// `package.json > lpm > strictPeerDependencies` >
+        /// `~/.lpm/config.toml > strict-peer-dependencies` > default
+        /// (false).
+        #[arg(long, conflicts_with = "no_strict_peer_dependencies")]
+        strict_peer_dependencies: bool,
+
+        /// Disable strict peer-dependency failures for this install,
+        /// overriding project or user config.
+        #[arg(long, conflicts_with = "strict_peer_dependencies")]
+        no_strict_peer_dependencies: bool,
+
         /// Override the minimumReleaseAge cooldown for this install only.
         /// Accepts `<N>h` (hours), `<N>d` (days), or plain `<N>` seconds.
         /// Use `0` to disable the cooldown for this invocation; any other
@@ -2455,6 +2471,7 @@ fn build_install_global_overrides(
     );
     Ok(commands::install_global::InstallGlobalOverrides {
         allow_new,
+        strict_peer_dependencies_override: None,
         min_release_age_override,
         drift_ignore_policy,
         verify_policy,
@@ -3062,6 +3079,8 @@ async fn async_main() -> Result<()> {
             force,
             allow_new,
             strict_integrity,
+            strict_peer_dependencies,
+            no_strict_peer_dependencies,
             min_release_age,
             ignore_provenance_drift,
             ignore_provenance_drift_all,
@@ -3093,6 +3112,13 @@ async fn async_main() -> Result<()> {
             paranoid,
             no_sandbox,
         } => {
+            let cli_strict_peer_dependencies =
+                match (strict_peer_dependencies, no_strict_peer_dependencies) {
+                    (true, false) => Some(true),
+                    (false, true) => Some(false),
+                    _ => None,
+                };
+
             // Route `lpm install --global` / `-g` to the persistent
             // IsolatedInstall pipeline. Supports fresh install, upgrade,
             // and collision resolution. The pipeline takes care of the
@@ -3144,7 +3170,7 @@ async fn async_main() -> Result<()> {
                     save_prefix,
                 ); // not wired for global install; ignored for now.
 
-                let overrides = build_install_global_overrides(
+                let mut overrides = build_install_global_overrides(
                     allow_new,
                     auto_build,
                     policy.as_deref(),
@@ -3156,6 +3182,7 @@ async fn async_main() -> Result<()> {
                     unverified_provenance,
                     unverified_provenance_all,
                 )?;
+                overrides.strict_peer_dependencies_override = cli_strict_peer_dependencies;
 
                 return commands::install_global::run(
                     &client,
@@ -3417,6 +3444,7 @@ async fn async_main() -> Result<()> {
                         force,
                         eff_allow_new,
                         strict_integrity,
+                        cli_strict_peer_dependencies,
                         cli_linker,
                         eff_no_skills,
                         eff_no_editor,
@@ -3462,6 +3490,7 @@ async fn async_main() -> Result<()> {
                     min_release_age_override,
                     drift_ignore_policy,
                     verify_policy,
+                    cli_strict_peer_dependencies,
                     strict_sandbox || paranoid,
                     no_sandbox,
                     cli.verbose,
@@ -3495,6 +3524,7 @@ async fn async_main() -> Result<()> {
                         min_release_age_override,
                         drift_ignore_policy,
                         verify_policy,
+                        cli_strict_peer_dependencies,
                         strict_sandbox || paranoid,
                         no_sandbox,
                         cli.verbose,
@@ -3516,6 +3546,7 @@ async fn async_main() -> Result<()> {
                         min_release_age_override,
                         drift_ignore_policy,
                         verify_policy,
+                        cli_strict_peer_dependencies,
                         strict_sandbox || paranoid,
                         no_sandbox,
                         cli.verbose,
@@ -5528,6 +5559,68 @@ mod tests {
     }
 
     #[test]
+    fn install_strict_peer_dependencies_flags_parse_and_conflict() {
+        let cli = Cli::try_parse_from(["lpm", "install", "--strict-peer-dependencies"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                ..
+            } => {
+                assert!(strict_peer_dependencies);
+                assert!(!no_strict_peer_dependencies);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        let cli = Cli::try_parse_from(["lpm", "install", "--no-strict-peer-dependencies"])
+            .expect("`lpm install --no-strict-peer-dependencies` should parse");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                ..
+            } => {
+                assert!(!strict_peer_dependencies);
+                assert!(no_strict_peer_dependencies);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "-g",
+            "eslint",
+            "--strict-peer-dependencies",
+        ])
+        .expect("`lpm install -g --strict-peer-dependencies` should parse");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                global,
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                ..
+            } => {
+                assert!(global);
+                assert!(strict_peer_dependencies);
+                assert!(!no_strict_peer_dependencies);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "lpm",
+                "install",
+                "--strict-peer-dependencies",
+                "--no-strict-peer-dependencies",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn install_global_rejects_project_scoped_yes_flag() {
         let cli = Cli::try_parse_from(["lpm", "install", "-g", "eslint", "-y"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
@@ -5595,8 +5688,8 @@ mod tests {
     // ── forwarding regression tests ─────────────────────────
     //
     // These tests pin the wiring between CLI args and
-    // `InstallGlobalOverrides`. A regression that drops any of the
-    // five overrides on the way to `install_global::run` is caught
+    // `InstallGlobalOverrides`. A regression that drops these
+    // overrides on the way to `install_global::run` is caught
     // here. Validator acceptance (above) is necessary but not
     // sufficient — without these, a future refactor that silently
     // hardcoded e.g. `allow_new: false` inside the bundle constructor

@@ -79,6 +79,7 @@ mod tests {
                 patched_dependencies: Default::default(),
                 peer_dependency_rules: Default::default(),
                 auto_install_peers: None,
+                strict_peer_dependencies: None,
             }),
             ..Default::default()
         }

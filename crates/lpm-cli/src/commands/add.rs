@@ -2505,6 +2505,7 @@ async fn handle_dependencies(
                 false,                                                 // force
                 false,                                                 // allow_new
                 false, // strict_integrity
+                None,  // strict_peer_dependencies_override
                 None,  // linker_override
                 false, // no_skills
                 false, // no_editor_setup

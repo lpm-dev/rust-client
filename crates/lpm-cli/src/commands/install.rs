@@ -9,7 +9,8 @@ use lpm_common::color::Painted;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::{GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url};
 use lpm_resolver::{
-    CompiledPeerRules, OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers,
+    CompiledPeerRules, OverrideHit, OverrideSet, PeerConflictReport, PeerWarning, ResolvedPackage,
+    check_unmet_peers,
 };
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
@@ -153,6 +154,54 @@ fn install_pkg_key(p: &InstallPackage) -> String {
     k.push('\x00');
     k.push_str(&p.source);
     k
+}
+
+fn resolve_strict_peer_dependencies(
+    cli_override: Option<bool>,
+    pkg: &lpm_workspace::PackageJson,
+    global_config: &crate::commands::config::GlobalConfig,
+) -> bool {
+    cli_override
+        .or_else(|| {
+            pkg.lpm
+                .as_ref()
+                .and_then(|lpm| lpm.strict_peer_dependencies)
+        })
+        .or_else(|| global_config.get_bool("strict-peer-dependencies"))
+        .unwrap_or(false)
+}
+
+fn strict_peer_dependency_error(
+    peer_warnings: &[PeerWarning],
+    peer_conflicts: &[PeerConflictReport],
+) -> Option<LpmError> {
+    if peer_warnings.is_empty() && peer_conflicts.is_empty() {
+        return None;
+    }
+
+    let issue_count = peer_warnings.len() + peer_conflicts.len();
+    let mut details = Vec::with_capacity(issue_count + 1);
+    details.push(format!(
+        "strict-peer-dependencies failed with {issue_count} issue(s)"
+    ));
+    details.extend(peer_warnings.iter().map(|warning| format!("- {warning}")));
+    details.extend(peer_conflicts.iter().map(|conflict| {
+        let unsatisfied = conflict
+            .unsatisfied_consumers
+            .iter()
+            .map(|(consumer, range)| format!("{consumer} wants {range}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "- peer conflict: {} pinned to {} but {} unsatisfied consumer(s): {}",
+            conflict.canonical,
+            conflict.chosen_version,
+            conflict.unsatisfied_consumers.len(),
+            unsatisfied
+        )
+    }));
+
+    Some(LpmError::PeerDependency(details.join("\n")))
 }
 
 /// Default concurrent-tarball-download pool size. Overridable per-invocation
@@ -3372,6 +3421,9 @@ pub async fn run_with_options(
     // trusted; only the manifest-boundary trust-on-first-use is
     // disabled.
     strict_integrity: bool,
+    // CLI-level override for strict peer-dependency handling. `None`
+    // falls through to package.json / global config / default.
+    strict_peer_dependencies_override: Option<bool>,
     // Already-resolved linker override from CLI / `~/.lpm/config.toml` / env.
     // `None` means fall through to `package.json > lpm > linker` (which is
     // validated against `lpm_linker::LinkerMode::parse_str` inside the
@@ -3496,6 +3548,7 @@ pub async fn run_with_options(
             force,
             allow_new,
             strict_integrity,
+            strict_peer_dependencies_override,
             linker_override,
             no_skills,
             no_editor_setup,
@@ -3530,6 +3583,7 @@ async fn run_with_options_under_store_lock(
     force: bool,
     allow_new: bool,
     strict_integrity: bool,
+    strict_peer_dependencies_override: Option<bool>,
     linker_override: Option<lpm_linker::LinkerMode>,
     no_skills: bool,
     no_editor_setup: bool,
@@ -3600,6 +3654,8 @@ async fn run_with_options_under_store_lock(
         .and_then(|l| l.auto_install_peers)
         .or_else(|| global_config.get_bool("auto-install-peers"))
         .unwrap_or(true);
+    let strict_peer_dependencies =
+        resolve_strict_peer_dependencies(strict_peer_dependencies_override, &pkg, &global_config);
     let pubgrub_opt_out = std::env::var("LPM_RESOLVER").as_deref() == Ok("pubgrub");
 
     // pubgrub-mismatch warning.
@@ -3673,13 +3729,15 @@ async fn run_with_options_under_store_lock(
     // `~/.lpm/config.toml > linker` invalidates the cache. The mtime
     // fast path also reads the `l:<mode>` line written by
     // `write_install_hash` to detect the same flip without re-hashing.
+    // Strict peer mode runs a fresh peer check because the fast path
+    // does not have the resolver metadata needed to prove the tree is clean.
     let pkg_content_for_state = std::fs::read_to_string(&pkg_json_path).unwrap_or_default();
     let install_state = crate::install_state::check_install_state_with_linker(
         project_dir,
         &pkg_content_for_state,
         linker_mode,
     );
-    if !force && !offline && install_state.up_to_date {
+    if !force && !offline && !strict_peer_dependencies && install_state.up_to_date {
         let elapsed = start.elapsed();
         let total_ms = elapsed.as_millis();
         if json_output {
@@ -5078,6 +5136,12 @@ async fn run_with_options_under_store_lock(
                 // `resolve_result` is consumed by `resolved_to_install_packages`
                 // a few lines down.
                 peer_conflicts = resolve_result.peer_conflicts.clone();
+
+                if strict_peer_dependencies
+                    && let Some(err) = strict_peer_dependency_error(&peer_warnings, &peer_conflicts)
+                {
+                    return Err(err);
+                }
 
                 // — capture the platform-filtered optional
                 // skip count. Surfaced as `timing.resolve.platform_skipped`
@@ -11740,6 +11804,8 @@ pub async fn run_add_packages(
     // forwarded composed Sigstore verifier policy. Opaque
     // pass-through — see [`run_with_options`].
     verify_policy: crate::provenance_fetch::VerifyPolicy,
+    // forwarded strict peer-dependency override — see [`run_with_options`].
+    strict_peer_dependencies_override: Option<bool>,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -11865,6 +11931,7 @@ pub async fn run_add_packages(
             force,
             allow_new,
             false, // strict_integrity — internal call, no flag
+            strict_peer_dependencies_override,
             None,  // linker_override
             false, // no_skills
             false, // no_editor_setup
@@ -11944,6 +12011,8 @@ pub async fn run_install_filtered_add(
     // forwarded composed Sigstore verifier policy. Opaque
     // pass-through — see [`run_with_options`].
     verify_policy: crate::provenance_fetch::VerifyPolicy,
+    // forwarded strict peer-dependency override — see [`run_with_options`].
+    strict_peer_dependencies_override: Option<bool>,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -12170,6 +12239,7 @@ pub async fn run_install_filtered_add(
                 force,
                 allow_new,
                 false, // strict_integrity — workspace-add path, no flag
+                strict_peer_dependencies_override,
                 None,  // linker_override
                 false, // no_skills
                 false, // no_editor_setup
@@ -14554,10 +14624,11 @@ mod tests {
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
             crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
-            false,                                                 // strict_sandbox
-            false,                                                 // no_sandbox
-            false,                                                 // verbose
-            false,                                                 // audit_after_install
+            None,  // strict_peer_dependencies_override
+            false, // strict_sandbox
+            false, // no_sandbox
+            false, // verbose
+            false, // audit_after_install
         )
         .await;
 
@@ -14598,10 +14669,11 @@ mod tests {
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
             crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
-            false,                                                 // strict_sandbox
-            false,                                                 // no_sandbox
-            false,                                                 // verbose
-            false,                                                 // audit_after_install
+            None,  // strict_peer_dependencies_override
+            false, // strict_sandbox
+            false, // no_sandbox
+            false, // verbose
+            false, // audit_after_install
         )
         .await;
 

@@ -919,6 +919,22 @@ pub struct LpmConfig {
     /// author opted out of the dependency entirely.
     #[serde(default, rename = "autoInstallPeers")]
     pub auto_install_peers: Option<bool>,
+
+    /// Fail installs when peer-dependency warnings or best-effort peer
+    /// conflicts are detected.
+    ///
+    /// Default is `false`, matching pnpm's current default and LPM's
+    /// existing warn-only behavior. Set `true` for CI or strict
+    /// compatibility runs that should reject missing peers, incompatible
+    /// resolved peer versions, and peer-conflict fallback selections.
+    ///
+    /// Precedence (resolved in `install.rs`):
+    ///   CLI `--strict-peer-dependencies` / `--no-strict-peer-dependencies`
+    ///   → `package.json > lpm > strictPeerDependencies`
+    ///   → `~/.lpm/config.toml > strict-peer-dependencies`
+    ///   → default (`false`).
+    #[serde(default, rename = "strictPeerDependencies")]
+    pub strict_peer_dependencies: Option<bool>,
 }
 
 /// `package.json :: lpm.peerDependencyRules` — peer-dep behavior

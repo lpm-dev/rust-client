@@ -734,6 +734,7 @@ async fn do_install_upgrade(
         false,                  // force
         false,                  // allow_new
         false,                  // strict_integrity
+        None,                   // strict_peer_dependencies_override
         None,                   // linker_override
         true,                   // no_skills
         true,                   // no_editor_setup
