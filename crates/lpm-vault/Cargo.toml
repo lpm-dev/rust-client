@@ -36,6 +36,9 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 urlencoding = "2"
 
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+keyring = { workspace = true, features = ["vendored"] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
