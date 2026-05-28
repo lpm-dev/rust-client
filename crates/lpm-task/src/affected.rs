@@ -163,7 +163,7 @@ fn git_diff_files(repo_dir: &Path, base_ref: &str) -> Result<Vec<String>, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{GraphNode, WorkspaceGraph};
+    use crate::graph::{DependencyEdge, DependencyKind, GraphNode, WorkspaceGraph};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -178,9 +178,19 @@ mod tests {
 
         let n = nodes.len();
         let mut reverse_edges = vec![vec![]; n];
+        let mut dependency_edges = vec![vec![]; n];
+        let mut reverse_dependency_edges = vec![vec![]; n];
         for (i, deps) in edges.iter().enumerate() {
             for &dep in deps {
                 reverse_edges[dep].push(i);
+                dependency_edges[i].push(DependencyEdge {
+                    target: dep,
+                    kind: DependencyKind::Dependency,
+                });
+                reverse_dependency_edges[dep].push(DependencyEdge {
+                    target: i,
+                    kind: DependencyKind::Dependency,
+                });
             }
         }
 
@@ -193,6 +203,8 @@ mod tests {
             members: nodes,
             edges,
             reverse_edges,
+            dependency_edges,
+            reverse_dependency_edges,
             name_to_idx,
         }
     }

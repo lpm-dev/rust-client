@@ -298,7 +298,12 @@ impl<'a> FilterEngine<'a> {
     fn closure_with_deps(&self, base: &PackageBits) -> PackageBits {
         let mut result = base.clone();
         for idx in base.iter_ids() {
-            for dep_idx in self.graph.transitive_dependencies(idx) {
+            let dependencies = if self.options.follow_prod_deps_only {
+                self.graph.transitive_prod_dependencies(idx)
+            } else {
+                self.graph.transitive_dependencies(idx)
+            };
+            for dep_idx in dependencies {
                 result.set(dep_idx);
             }
         }
@@ -310,7 +315,12 @@ impl<'a> FilterEngine<'a> {
     fn closure_with_dependents(&self, base: &PackageBits) -> PackageBits {
         let mut result = base.clone();
         for idx in base.iter_ids() {
-            for dep_idx in self.graph.transitive_dependents(idx) {
+            let dependents = if self.options.follow_prod_deps_only {
+                self.graph.transitive_prod_dependents(idx)
+            } else {
+                self.graph.transitive_dependents(idx)
+            };
+            for dep_idx in dependents {
                 result.set(dep_idx);
             }
         }
@@ -493,11 +503,12 @@ fn trace_origin_dep(
     let base = base_bits?;
     let mut matches: Vec<PackageId> = Vec::new();
     for base_id in base.iter_ids() {
-        if engine
-            .graph
-            .transitive_dependencies(base_id)
-            .contains(&package)
-        {
+        let dependencies = if engine.options.follow_prod_deps_only {
+            engine.graph.transitive_prod_dependencies(base_id)
+        } else {
+            engine.graph.transitive_dependencies(base_id)
+        };
+        if dependencies.contains(&package) {
             matches.push(base_id);
             if matches.len() > 1 {
                 return None;
@@ -516,11 +527,12 @@ fn trace_origin_dependent(
     let base = base_bits?;
     let mut matches: Vec<PackageId> = Vec::new();
     for base_id in base.iter_ids() {
-        if engine
-            .graph
-            .transitive_dependents(base_id)
-            .contains(&package)
-        {
+        let dependents = if engine.options.follow_prod_deps_only {
+            engine.graph.transitive_prod_dependents(base_id)
+        } else {
+            engine.graph.transitive_dependents(base_id)
+        };
+        if dependents.contains(&package) {
             matches.push(base_id);
             if matches.len() > 1 {
                 return None;
@@ -778,15 +790,32 @@ mod tests {
 
     /// Build a synthetic workspace member with explicit deps.
     fn member(name: &str, deps: &[&str]) -> WorkspaceMember {
+        member_with_sections(name, deps, &[], &[], &[])
+    }
+
+    fn dep_map(deps: &[&str]) -> HashMap<String, String> {
+        deps.iter()
+            .map(|d| ((*d).to_string(), "*".to_string()))
+            .collect()
+    }
+
+    fn member_with_sections(
+        name: &str,
+        deps: &[&str],
+        dev_deps: &[&str],
+        optional_deps: &[&str],
+        peer_deps: &[&str],
+    ) -> WorkspaceMember {
         let mut dependencies = HashMap::new();
-        for d in deps {
-            dependencies.insert((*d).to_string(), "*".to_string());
-        }
+        dependencies.extend(dep_map(deps));
         WorkspaceMember {
             path: PathBuf::from(format!("/workspace/packages/{name}")),
             package: PackageJson {
                 name: Some(name.to_string()),
                 dependencies,
+                dev_dependencies: dep_map(dev_deps),
+                optional_dependencies: dep_map(optional_deps),
+                peer_dependencies: dep_map(peer_deps),
                 ..Default::default()
             },
         }
@@ -1135,6 +1164,38 @@ mod tests {
             let again = engine.evaluate(&exprs).unwrap();
             assert_eq!(again, first, "evaluator must be deterministic");
         }
+    }
+
+    #[test]
+    fn evaluator_prod_only_dependent_closure_omits_dev_dependency_dependents() {
+        let ws = Workspace {
+            root: PathBuf::from("/workspace"),
+            root_package: PackageJson::default(),
+            members: vec![
+                member("project-2", &[]),
+                member("project-3", &["project-2"]),
+                member("project-1", &["project-3"]),
+                member_with_sections("project-4", &[], &["project-3"], &[], &[]),
+            ],
+        };
+        let graph = WorkspaceGraph::from_workspace(&ws);
+        let engine = FilterEngine::with_options(
+            &graph,
+            &ws.root,
+            crate::filter::FilterOptions {
+                follow_prod_deps_only: true,
+            },
+        );
+        let exprs = vec![FilterExpr::WithDependents(Box::new(FilterExpr::ExactName(
+            "project-3".into(),
+        )))];
+
+        let result = engine.evaluate(&exprs).unwrap();
+
+        assert_eq!(
+            result,
+            vec![idx(&graph, "project-3"), idx(&graph, "project-1")]
+        );
     }
 
     // ── Helpers (split_glob_pattern, lexical_normalize) ────────────────────

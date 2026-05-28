@@ -1089,6 +1089,7 @@ pub async fn run_workspace(
     extra_args: &[String],
     env_mode: Option<&str>,
     filters: &[String],
+    filter_prod: &[String],
     affected: bool,
     base_ref: &str,
     fail_if_no_match: bool,
@@ -1128,6 +1129,7 @@ pub async fn run_workspace(
         &ws_graph,
         &workspace.root,
         filters,
+        filter_prod,
         affected,
         base_ref,
     )?;
@@ -1136,7 +1138,7 @@ pub async fn run_workspace(
         // D2 follow-through: surface the substring → glob migration
         // hint when any filter looks like a bare name that would have
         // substring-matched by earlier filter behavior.
-        let hint = crate::commands::filter::format_no_match_hint(filters);
+        let hint = crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
 
         if fail_if_no_match {
             let base_msg = "no workspace packages matched the filter (--fail-if-no-match)";

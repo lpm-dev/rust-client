@@ -112,6 +112,68 @@ fn seed_workspace_with_no_bail_scripts(project: &TempProject) {
     }
 }
 
+fn seed_workspace_with_filter_prod_scripts(project: &TempProject) {
+    let members = [
+        (
+            "project-1",
+            serde_json::json!({
+                "name": "project-1",
+                "version": "1.0.0",
+                "dependencies": {
+                    "project-2": "workspace:*",
+                    "project-3": "workspace:*"
+                },
+                "scripts": {
+                    "check": "node -e \"require('fs').writeFileSync('ran-project-1.txt','ok')\""
+                }
+            }),
+        ),
+        (
+            "project-2",
+            serde_json::json!({
+                "name": "project-2",
+                "version": "1.0.0",
+                "scripts": {
+                    "check": "node -e \"require('fs').writeFileSync('ran-project-2.txt','ok')\""
+                }
+            }),
+        ),
+        (
+            "project-3",
+            serde_json::json!({
+                "name": "project-3",
+                "version": "1.0.0",
+                "dependencies": {
+                    "project-2": "workspace:*"
+                },
+                "scripts": {
+                    "check": "node -e \"require('fs').writeFileSync('ran-project-3.txt','ok')\""
+                }
+            }),
+        ),
+        (
+            "project-4",
+            serde_json::json!({
+                "name": "project-4",
+                "version": "1.0.0",
+                "devDependencies": {
+                    "project-3": "workspace:*"
+                },
+                "scripts": {
+                    "check": "node -e \"require('fs').writeFileSync('ran-project-4.txt','ok')\""
+                }
+            }),
+        ),
+    ];
+
+    for (member, manifest) in members {
+        project.write_file(
+            &format!("packages/{member}/package.json"),
+            &serde_json::to_string_pretty(&manifest).unwrap(),
+        );
+    }
+}
+
 fn member_ran(project: &TempProject, member: &str) -> bool {
     project.file_exists(&format!("packages/{member}/ran-{member}.txt"))
 }
@@ -240,4 +302,33 @@ fn run_filter_no_bail_continues_after_failed_workspace_member() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+}
+
+#[test]
+fn run_filter_prod_omits_dev_dependency_dependents() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "filter-prod-test",
+        "version": "1.0.0",
+        "private": true,
+        "workspaces": ["packages/*"]
+    }"#,
+    );
+    seed_workspace_with_filter_prod_scripts(&project);
+
+    let output = lpm(&project)
+        .args(["run", "check", "--filter-prod", "...project-3"])
+        .output()
+        .expect("failed to run lpm run --filter-prod");
+
+    assert!(
+        output.status.success(),
+        "filter-prod run should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(member_ran(&project, "project-1"));
+    assert!(member_ran(&project, "project-3"));
+    assert!(!member_ran(&project, "project-2"));
+    assert!(!member_ran(&project, "project-4"));
 }

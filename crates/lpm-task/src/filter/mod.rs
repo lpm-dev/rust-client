@@ -91,7 +91,14 @@ pub enum FilterError {
 pub struct FilterEngine<'a> {
     pub(crate) graph: &'a WorkspaceGraph,
     pub(crate) workspace_root: &'a Path,
+    pub(crate) options: FilterOptions,
     pub(crate) glob_cache: RefCell<HashMap<String, GlobMatcher>>,
+}
+
+/// Evaluation options for workspace filters.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FilterOptions {
+    pub follow_prod_deps_only: bool,
 }
 
 impl<'a> FilterEngine<'a> {
@@ -100,9 +107,19 @@ impl<'a> FilterEngine<'a> {
     /// O(1) — just holds references. The graph is expected to already be
     /// built; the engine does not own or rebuild it.
     pub fn new(graph: &'a WorkspaceGraph, workspace_root: &'a Path) -> Self {
+        Self::with_options(graph, workspace_root, FilterOptions::default())
+    }
+
+    /// Construct a filter engine with explicit evaluation options.
+    pub fn with_options(
+        graph: &'a WorkspaceGraph,
+        workspace_root: &'a Path,
+        options: FilterOptions,
+    ) -> Self {
         FilterEngine {
             graph,
             workspace_root,
+            options,
             glob_cache: RefCell::new(HashMap::new()),
         }
     }

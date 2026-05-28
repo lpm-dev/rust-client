@@ -573,6 +573,12 @@ enum Commands {
         #[arg(long)]
         filter: Vec<String>,
 
+        /// Filter workspace members with production dependency closures.
+        /// Same grammar as `--filter`, but `...` and `^...` do not walk
+        /// `devDependencies` edges.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
+
         /// Target the workspace root `package.json` instead of the
         /// current member. Mutually exclusive with `--filter`. Use when
         /// adding tooling packages that belong at the root rather than
@@ -719,6 +725,12 @@ enum Commands {
         /// `packages/web/package.json` only.
         #[arg(long)]
         filter: Vec<String>,
+
+        /// Filter workspace members with production dependency closures.
+        /// Same grammar as `--filter`, but `...` and `^...` do not walk
+        /// `devDependencies` edges.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
 
         /// target the workspace root `package.json` instead
         /// of the current member.
@@ -1399,8 +1411,8 @@ enum Commands {
         stream: bool,
 
         /// Run in all workspace packages (topological order). Mutually
-        /// exclusive with `--filter` and `--affected`.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        /// exclusive with filters and `--affected`.
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
 
         /// Filter workspace packages with the grammar. Can be passed
@@ -1416,6 +1428,12 @@ enum Commands {
         /// write `--filter '*/core'` for that.
         #[arg(long)]
         filter: Vec<String>,
+
+        /// Filter workspace packages with production dependency closures.
+        /// Same grammar as `--filter`, but `...` and `^...` do not walk
+        /// `devDependencies` edges.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
 
         /// Exit with a non-zero status if no workspace package matches the
         /// filter set. Recommended in CI to catch typo'd filters early.
@@ -1504,8 +1522,14 @@ enum Commands {
 
         /// Filter expression identifying the member to deploy. Must match
         /// exactly one workspace member. Same grammar as `lpm run --filter`.
-        #[arg(long, required = true)]
+        #[arg(long)]
         filter: Vec<String>,
+
+        /// Filter expression using production dependency closures. May be
+        /// used instead of or alongside `--filter`; the combined result must
+        /// still match exactly one workspace member.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
 
         /// Overwrite the output directory if it is non-empty. Without this
         /// flag, deploy refuses to write into a non-empty directory.
@@ -1625,8 +1649,11 @@ enum Commands {
     Filter {
         /// Filter expressions. Multiple expressions union; use `!expr` to
         /// exclude. Same grammar as `lpm run --filter`.
-        #[arg(required = true)]
         exprs: Vec<String>,
+
+        /// Filter expressions evaluated with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
 
         /// Show the full structured selection trace (which filter matched
         /// each package and how). Without this flag, output is a terse name
@@ -1649,9 +1676,9 @@ enum Commands {
 
     /// Lint source files (powered by Oxlint, lazy-downloaded on first use).
     Lint {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
@@ -1662,6 +1689,9 @@ enum Commands {
         /// reverse closure (`...foo`, `...^foo`), exclusion (`!foo`).
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long, conflicts_with = "all")]
         affected: bool,
@@ -1682,14 +1712,17 @@ enum Commands {
         /// Check formatting without writing (CI mode, exits non-zero if unformatted).
         #[arg(long)]
         check: bool,
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
@@ -1706,14 +1739,17 @@ enum Commands {
 
     /// Type-check the project (runs tsc --noEmit by default).
     Check {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
@@ -1733,14 +1769,17 @@ enum Commands {
 
     /// Bundle the project with Rolldown through an LPM-owned command surface.
     Bundle {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
@@ -1778,14 +1817,17 @@ enum Commands {
 
     /// Build package-oriented library output through a stable LPM command surface.
     Pack {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
@@ -1838,14 +1880,17 @@ enum Commands {
     /// to the runner itself (e.g. bun's `--filter`), prefix with `--`:
     /// `lpm test -- --filter pattern`.
     Test {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
@@ -1868,14 +1913,17 @@ enum Commands {
     /// Workspace flags behave the same as `lpm test`. To forward `--all`
     /// / `--filter` etc. to the bench runner itself, prefix with `--`.
     Bench {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
@@ -2523,6 +2571,7 @@ fn build_install_global_overrides(
 fn validate_global_install_project_scoped_flags(
     save_dev: bool,
     filter: &[String],
+    filter_prod: &[String],
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
@@ -2534,9 +2583,16 @@ fn validate_global_install_project_scoped_flags(
     // synthetic project's package.json), so they are no longer rejected
     // here. The flags below remain genuinely project-scoped and have no
     // meaningful semantics on `-g`.
-    if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match || yes || catalog {
+    if save_dev
+        || !filter.is_empty()
+        || !filter_prod.is_empty()
+        || workspace_root
+        || fail_if_no_match
+        || yes
+        || catalog
+    {
         return Err(lpm_common::LpmError::Script(
-            "`-g` is mutually exclusive with `-D` / `--filter` / `-w` / \
+            "`-g` is mutually exclusive with `-D` / `--filter` / `--filter-prod` / `-w` / \
              `--fail-if-no-match` / `-y` / `--catalog` (those are project-scoped)."
                 .into(),
         ));
@@ -2546,13 +2602,14 @@ fn validate_global_install_project_scoped_flags(
 
 fn validate_global_uninstall_project_scoped_flags(
     filter: &[String],
+    filter_prod: &[String],
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
 ) -> Result<(), lpm_common::LpmError> {
-    if !filter.is_empty() || workspace_root || fail_if_no_match || yes {
+    if !filter.is_empty() || !filter_prod.is_empty() || workspace_root || fail_if_no_match || yes {
         return Err(lpm_common::LpmError::Script(
-            "`-g` is mutually exclusive with `--filter` / `-w` / \
+            "`-g` is mutually exclusive with `--filter` / `--filter-prod` / `-w` / \
              `--fail-if-no-match` / `-y` (those are project-scoped)."
                 .into(),
         ));
@@ -3133,6 +3190,7 @@ async fn async_main() -> Result<()> {
             audit_after_install,
             no_audit_after_install,
             filter,
+            filter_prod,
             workspace_root,
             fail_if_no_match,
             yes,
@@ -3185,6 +3243,7 @@ async fn async_main() -> Result<()> {
                 validate_global_install_project_scoped_flags(
                     save_dev,
                     &filter,
+                    &filter_prod,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -3461,9 +3520,13 @@ async fn async_main() -> Result<()> {
                             .into(),
                     ));
                 }
-                if !filter.is_empty() || workspace_root || fail_if_no_match {
+                if !filter.is_empty()
+                    || !filter_prod.is_empty()
+                    || workspace_root
+                    || fail_if_no_match
+                {
                     Err(lpm_common::LpmError::Script(
-                        "`--filter`, `-w`, and `--fail-if-no-match` only apply when adding packages. \
+                        "`--filter`, `--filter-prod`, `-w`, and `--fail-if-no-match` only apply when adding packages. \
                          Pass package specs (e.g., `lpm install react --filter web`) or run `lpm install` \
                          alone to refresh from package.json."
                             .into(),
@@ -3519,7 +3582,7 @@ async fn async_main() -> Result<()> {
                     )
                     .await
                 }
-            } else if !filter.is_empty() || workspace_root {
+            } else if !filter.is_empty() || !filter_prod.is_empty() || workspace_root {
                 // explicit filter or -w flag → workspace-aware path.
                 commands::install::run_install_filtered_add(
                     &client,
@@ -3527,6 +3590,7 @@ async fn async_main() -> Result<()> {
                     &packages,
                     save_dev,
                     &filter,
+                    &filter_prod,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -3562,6 +3626,7 @@ async fn async_main() -> Result<()> {
                         &packages,
                         save_dev,
                         &filter,
+                        &filter_prod,
                         workspace_root,
                         fail_if_no_match,
                         yes,
@@ -3611,6 +3676,7 @@ async fn async_main() -> Result<()> {
         Commands::Uninstall {
             packages,
             filter,
+            filter_prod,
             workspace_root,
             fail_if_no_match,
             yes,
@@ -3637,6 +3703,7 @@ async fn async_main() -> Result<()> {
                     )))
                 } else if let Err(error) = validate_global_uninstall_project_scoped_flags(
                     &filter,
+                    &filter_prod,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -3652,6 +3719,7 @@ async fn async_main() -> Result<()> {
                     &cwd,
                     &packages,
                     &filter,
+                    &filter_prod,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -4243,6 +4311,7 @@ async fn async_main() -> Result<()> {
             stream,
             all,
             filter,
+            filter_prod,
             fail_if_no_match,
             affected,
             base,
@@ -4253,10 +4322,11 @@ async fn async_main() -> Result<()> {
         } => {
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            let workspace_mode = all || !filter.is_empty() || affected;
+            let workspace_mode = all || !filter.is_empty() || !filter_prod.is_empty() || affected;
             if workspace_concurrency.is_some() && !workspace_mode {
                 return Err(lpm_common::LpmError::Script(
-                    "--workspace-concurrency requires --all, --filter, or --affected".into(),
+                    "--workspace-concurrency requires --all, --filter, --filter-prod, or --affected"
+                        .into(),
                 ));
             }
             if watch {
@@ -4265,9 +4335,9 @@ async fn async_main() -> Result<()> {
                         "--watch supports exactly one script".into(),
                     ));
                 }
-                if all || !filter.is_empty() || affected {
+                if all || !filter.is_empty() || !filter_prod.is_empty() || affected {
                     return Err(lpm_common::LpmError::Script(
-                        "--watch does not support --all/--filter/--affected; run the watcher inside a single package instead"
+                        "--watch does not support --all/--filter/--filter-prod/--affected; run the watcher inside a single package instead"
                             .into(),
                     ));
                 }
@@ -4281,6 +4351,7 @@ async fn async_main() -> Result<()> {
                     &args,
                     env.as_deref(),
                     &filter,
+                    &filter_prod,
                     affected,
                     &base,
                     fail_if_no_match,
@@ -4327,15 +4398,18 @@ async fn async_main() -> Result<()> {
         }
         Commands::Filter {
             exprs,
+            filter_prod,
             explain,
             fail_if_no_match,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::filter::run(&cwd, &exprs, explain, fail_if_no_match, cli.json).await
+            commands::filter::run(&cwd, &exprs, &filter_prod, explain, fail_if_no_match, cli.json)
+                .await
         }
         Commands::Deploy {
             output,
             filter,
+            filter_prod,
             force,
             dry_run,
         } => {
@@ -4346,6 +4420,7 @@ async fn async_main() -> Result<()> {
                 &cwd,
                 &output_path,
                 &filter,
+                &filter_prod,
                 force,
                 dry_run,
                 cli.json,
@@ -4413,6 +4488,7 @@ async fn async_main() -> Result<()> {
         Commands::Lint {
             all,
             filter,
+            filter_prod,
             affected,
             base,
             fail_if_no_match,
@@ -4420,7 +4496,7 @@ async fn async_main() -> Result<()> {
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
-            if all || affected || !filter.is_empty() {
+            if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
                 commands::tools::tool_workspace(
                     &cwd,
@@ -4429,6 +4505,7 @@ async fn async_main() -> Result<()> {
                     false,
                     None,
                     &filter,
+                    &filter_prod,
                     affected_ref,
                     fail_if_no_match,
                     commands::tools::WorkspaceConcurrency::HostDefault,
@@ -4443,6 +4520,7 @@ async fn async_main() -> Result<()> {
             check,
             all,
             filter,
+            filter_prod,
             affected,
             base,
             fail_if_no_match,
@@ -4450,7 +4528,7 @@ async fn async_main() -> Result<()> {
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
-            if all || affected || !filter.is_empty() {
+            if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
                 commands::tools::tool_workspace(
                     &cwd,
@@ -4459,6 +4537,7 @@ async fn async_main() -> Result<()> {
                     check,
                     None,
                     &filter,
+                    &filter_prod,
                     affected_ref,
                     fail_if_no_match,
                     commands::tools::WorkspaceConcurrency::HostDefault,
@@ -4472,6 +4551,7 @@ async fn async_main() -> Result<()> {
         Commands::Check {
             all,
             filter,
+            filter_prod,
             affected,
             base,
             fail_if_no_match,
@@ -4480,7 +4560,7 @@ async fn async_main() -> Result<()> {
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
-            if all || affected || !filter.is_empty() {
+            if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
                 commands::tools::tool_workspace(
                     &cwd,
@@ -4489,6 +4569,7 @@ async fn async_main() -> Result<()> {
                     false,
                     Some(engine),
                     &filter,
+                    &filter_prod,
                     affected_ref,
                     fail_if_no_match,
                     commands::tools::WorkspaceConcurrency::HostDefault,
@@ -4502,6 +4583,7 @@ async fn async_main() -> Result<()> {
         Commands::Bundle {
             all,
             filter,
+            filter_prod,
             affected,
             base,
             fail_if_no_match,
@@ -4530,6 +4612,7 @@ async fn async_main() -> Result<()> {
                 &options,
                 all,
                 &filter,
+                &filter_prod,
                 affected,
                 &base,
                 fail_if_no_match,
@@ -4540,6 +4623,7 @@ async fn async_main() -> Result<()> {
         Commands::Pack {
             all,
             filter,
+            filter_prod,
             affected,
             base,
             fail_if_no_match,
@@ -4574,6 +4658,7 @@ async fn async_main() -> Result<()> {
                 &options,
                 all,
                 &filter,
+                &filter_prod,
                 affected,
                 &base,
                 fail_if_no_match,
@@ -4584,6 +4669,7 @@ async fn async_main() -> Result<()> {
         Commands::Test {
             all,
             filter,
+            filter_prod,
             affected,
             base,
             fail_if_no_match,
@@ -4598,6 +4684,7 @@ async fn async_main() -> Result<()> {
                 &args,
                 all,
                 &filter,
+                &filter_prod,
                 affected,
                 &base,
                 fail_if_no_match,
@@ -4609,6 +4696,7 @@ async fn async_main() -> Result<()> {
         Commands::Bench {
             all,
             filter,
+            filter_prod,
             affected,
             base,
             fail_if_no_match,
@@ -4623,6 +4711,7 @@ async fn async_main() -> Result<()> {
                 &args,
                 all,
                 &filter,
+                &filter_prod,
                 affected,
                 &base,
                 fail_if_no_match,
@@ -5408,6 +5497,29 @@ mod tests {
     }
 
     #[test]
+    fn run_filter_prod_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "run",
+            "build",
+            "--filter-prod",
+            "...app",
+            "--filter-prod",
+            "core...",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Run { filter_prod, .. } => {
+                assert_eq!(
+                    filter_prod,
+                    vec!["...app".to_string(), "core...".to_string()]
+                );
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
     fn run_fail_if_no_match_flag_parses() {
         let cli = Cli::try_parse_from([
             "lpm",
@@ -5554,10 +5666,12 @@ mod tests {
         match cli.command.expect("test parse missing subcommand") {
             Commands::Filter {
                 exprs,
+                filter_prod,
                 explain,
                 fail_if_no_match,
             } => {
                 assert_eq!(exprs, vec!["@ui/*".to_string(), "core".to_string()]);
+                assert!(filter_prod.is_empty());
                 assert!(!explain, "default mode is terse, not explain");
                 assert!(!fail_if_no_match);
             }
@@ -5586,6 +5700,7 @@ mod tests {
         match cli.command.expect("test parse missing subcommand") {
             Commands::Filter {
                 exprs,
+                filter_prod: _,
                 explain,
                 fail_if_no_match,
             } => {
@@ -5598,10 +5713,17 @@ mod tests {
     }
 
     #[test]
-    fn filter_command_requires_at_least_one_expr() {
-        // exprs is `#[arg(required = true)]` so empty args is a parse error
-        let result = Cli::try_parse_from(["lpm", "filter"]);
-        assert!(result.is_err(), "empty exprs must be rejected");
+    fn filter_command_allows_filter_prod_without_positional_exprs() {
+        let cli = Cli::try_parse_from(["lpm", "filter", "--filter-prod", "...app"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Filter {
+                exprs, filter_prod, ..
+            } => {
+                assert!(exprs.is_empty());
+                assert_eq!(filter_prod, vec!["...app".to_string()]);
+            }
+            _ => panic!("expected Filter command"),
+        }
     }
 
     // ── install --filter / -w / --fail-if-no-match ──
@@ -5851,6 +5973,7 @@ mod tests {
                 let err = validate_global_install_project_scoped_flags(
                     save_dev,
                     &filter,
+                    &[],
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -5885,9 +6008,16 @@ mod tests {
     #[test]
     fn install_global_validator_only_rejects_project_scoped_grouping_flags() {
         // Genuine project-only flag: still rejected.
-        let err =
-            validate_global_install_project_scoped_flags(true, &[], false, false, false, false)
-                .unwrap_err();
+        let err = validate_global_install_project_scoped_flags(
+            true,
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
         match err {
             lpm_common::LpmError::Script(message) => {
                 assert!(message.contains("project-scoped"));
@@ -5895,9 +6025,16 @@ mod tests {
             other => panic!("expected Script error, got {other:?}"),
         }
 
-        let err =
-            validate_global_install_project_scoped_flags(false, &[], false, false, false, true)
-                .unwrap_err();
+        let err = validate_global_install_project_scoped_flags(
+            false,
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap_err();
         match err {
             lpm_common::LpmError::Script(message) => {
                 assert!(message.contains("`--catalog`"));
@@ -5907,7 +6044,7 @@ mod tests {
         }
 
         // No project-only flags set → accept.
-        validate_global_install_project_scoped_flags(false, &[], false, false, false, false)
+        validate_global_install_project_scoped_flags(false, &[], &[], false, false, false, false)
             .unwrap();
     }
 
@@ -6367,6 +6504,7 @@ mod tests {
 
                 let err = validate_global_uninstall_project_scoped_flags(
                     &filter,
+                    &[],
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -6414,6 +6552,7 @@ mod tests {
                 filter,
                 force,
                 dry_run,
+                ..
             } => {
                 assert_eq!(output, "/prod/api");
                 assert_eq!(filter, vec!["api".to_string()]);
@@ -6459,16 +6598,31 @@ mod tests {
     }
 
     #[test]
-    fn deploy_command_requires_filter() {
-        // The Deploy command marks --filter as required = true. Missing it
-        // is a parse error, NOT a runtime error. This guards against the
-        // case where someone runs `lpm deploy /prod/api` and expects it to
-        // somehow figure out which member to deploy.
-        let result = Cli::try_parse_from(["lpm", "deploy", "/prod/api"]);
-        assert!(
-            result.is_err(),
-            "deploy without --filter must be a parse error"
-        );
+    fn deploy_command_without_filter_parses_for_runtime_validation() {
+        let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Deploy {
+                filter,
+                filter_prod,
+                ..
+            } => {
+                assert!(filter.is_empty());
+                assert!(filter_prod.is_empty());
+            }
+            _ => panic!("expected Deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_command_filter_prod_flag_parses() {
+        let cli =
+            Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter-prod", "...api"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Deploy { filter_prod, .. } => {
+                assert_eq!(filter_prod, vec!["...api".to_string()]);
+            }
+            _ => panic!("expected Deploy command"),
+        }
     }
 
     #[test]

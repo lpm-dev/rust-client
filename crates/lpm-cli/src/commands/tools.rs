@@ -585,6 +585,7 @@ pub async fn tool_workspace(
     check: bool,
     check_engine: Option<CheckEngine>,
     filters: &[String],
+    filter_prod: &[String],
     affected_base: Option<&str>,
     fail_if_no_match: bool,
     workspace_concurrency: WorkspaceConcurrency,
@@ -608,6 +609,7 @@ pub async fn tool_workspace(
         &ws_graph,
         &workspace.root,
         filters,
+        filter_prod,
         affected_base.is_some(),
         affected_base.unwrap_or("main"),
     )?;
@@ -618,7 +620,7 @@ pub async fn tool_workspace(
         // filter typo. With explicit `--filter` (with or without `--affected`)
         // we fall into the filter-miss path so the D2 hint can fire on bare
         // names that would have substring-matched in earlier filter behavior.
-        let affected_only = filters.is_empty() && affected_base.is_some();
+        let affected_only = filters.is_empty() && filter_prod.is_empty() && affected_base.is_some();
 
         if fail_if_no_match {
             let msg = if affected_only {
@@ -627,7 +629,8 @@ pub async fn tool_workspace(
                     affected_base.unwrap_or("main"),
                 )
             } else {
-                let hint = crate::commands::filter::format_no_match_hint(filters);
+                let hint =
+                    crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
                 let base = "no workspace packages matched the filter (--fail-if-no-match)";
                 match hint {
                     Some(h) => format!("{base}\n\n{h}"),
@@ -653,7 +656,7 @@ pub async fn tool_workspace(
                 affected_base.unwrap_or("main"),
             ));
         } else {
-            let hint = crate::commands::filter::format_no_match_hint(filters);
+            let hint = crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
             output::warn("No packages matched");
             if let Some(h) = hint {
                 eprintln!();
@@ -1085,16 +1088,17 @@ pub async fn dispatch_test_or_bench(
     args: &[String],
     all: bool,
     filters: &[String],
+    filter_prod: &[String],
     affected: bool,
     base_ref: &str,
     fail_if_no_match: bool,
     workspace_concurrency: Option<NonZeroUsize>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let workspace_mode = all || affected || !filters.is_empty();
+    let workspace_mode = all || affected || !filters.is_empty() || !filter_prod.is_empty();
     if workspace_concurrency.is_some() && !workspace_mode {
         return Err(LpmError::Script(format!(
-            "--workspace-concurrency requires --all, --filter, or --affected for `lpm {tool}`"
+            "--workspace-concurrency requires --all, --filter, --filter-prod, or --affected for `lpm {tool}`"
         )));
     }
 
@@ -1115,6 +1119,7 @@ pub async fn dispatch_test_or_bench(
             &ws_graph,
             &workspace.root,
             filters,
+            filter_prod,
             affected,
             affected_ref_for_select.unwrap_or("main"),
         )?;
@@ -1154,6 +1159,7 @@ pub async fn dispatch_test_or_bench(
             false,
             None,
             filters,
+            filter_prod,
             affected_ref,
             fail_if_no_match,
             WorkspaceConcurrency::Configured {
@@ -1796,6 +1802,7 @@ mod tests {
                 args,
                 filter,
                 fail_if_no_match,
+                ..
             } => {
                 assert!(!all);
                 assert!(affected);
@@ -2061,6 +2068,8 @@ mod tests {
             members,
             edges: vec![vec![], vec![], vec![]],
             reverse_edges: vec![vec![], vec![], vec![]],
+            dependency_edges: vec![vec![], vec![], vec![]],
+            reverse_dependency_edges: vec![vec![], vec![], vec![]],
             name_to_idx: HashMap::from([
                 ("pkg-a".to_string(), 0usize),
                 ("pkg-b".to_string(), 1usize),
@@ -2112,6 +2121,8 @@ mod tests {
             members,
             edges: vec![vec![], vec![]],
             reverse_edges: vec![vec![], vec![]],
+            dependency_edges: vec![vec![], vec![]],
+            reverse_dependency_edges: vec![vec![], vec![]],
             name_to_idx: HashMap::from([
                 ("pkg-a".to_string(), 0usize),
                 ("pkg-b".to_string(), 1usize),
