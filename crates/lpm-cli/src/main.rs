@@ -2,6 +2,7 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use lpm_common::color::Painted;
 use miette::{IntoDiagnostic, Result};
+use std::num::NonZeroUsize;
 
 mod added_sources_state;
 mod auth;
@@ -57,6 +58,7 @@ mod tsc_status;
 mod update_check;
 pub mod upgrade_engine;
 pub mod version_diff;
+mod workspace_concurrency_config;
 pub mod workspace_select;
 mod xcode_project;
 
@@ -1388,6 +1390,10 @@ enum Commands {
         #[arg(long = "no-bail")]
         continue_on_error: bool,
 
+        /// Limit concurrently running workspace packages.
+        #[arg(long = "workspace-concurrency", value_name = "N", value_parser = parse_workspace_concurrency)]
+        workspace_concurrency: Option<NonZeroUsize>,
+
         /// Stream output with task prefixes instead of buffering.
         #[arg(long)]
         stream: bool,
@@ -1849,6 +1855,9 @@ enum Commands {
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
+        /// Limit concurrently running workspace packages.
+        #[arg(long = "workspace-concurrency", value_name = "N", value_parser = parse_workspace_concurrency)]
+        workspace_concurrency: Option<NonZeroUsize>,
         /// Extra arguments passed to the test runner.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -1876,6 +1885,9 @@ enum Commands {
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
+        /// Limit concurrently running workspace packages.
+        #[arg(long = "workspace-concurrency", value_name = "N", value_parser = parse_workspace_concurrency)]
+        workspace_concurrency: Option<NonZeroUsize>,
         /// Extra arguments passed to the bench runner.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -2457,6 +2469,10 @@ fn parse_advisor_slug(s: &str) -> Result<String, String> {
             "invalid --advisor '{s}'; must be one of: none, claude-cli, codex, ollama"
         ))
     }
+}
+
+fn parse_workspace_concurrency(s: &str) -> Result<NonZeroUsize, String> {
+    workspace_concurrency_config::parse_workspace_concurrency(s)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4223,6 +4239,7 @@ async fn async_main() -> Result<()> {
             env,
             parallel,
             continue_on_error,
+            workspace_concurrency,
             stream,
             all,
             filter,
@@ -4236,6 +4253,12 @@ async fn async_main() -> Result<()> {
         } => {
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let workspace_mode = all || !filter.is_empty() || affected;
+            if workspace_concurrency.is_some() && !workspace_mode {
+                return Err(lpm_common::LpmError::Script(
+                    "--workspace-concurrency requires --all, --filter, or --affected".into(),
+                ));
+            }
             if watch {
                 if scripts.len() != 1 {
                     return Err(lpm_common::LpmError::Script(
@@ -4250,7 +4273,7 @@ async fn async_main() -> Result<()> {
                 }
                 let bin_hint = commands::run::ensure_runtime(&cwd).await;
                 commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), bin_hint)
-            } else if all || !filter.is_empty() || affected {
+            } else if workspace_mode {
                 // Workspace mode: run scripts across packages with task graph
                 commands::run::run_workspace(
                     &cwd,
@@ -4264,6 +4287,7 @@ async fn async_main() -> Result<()> {
                     no_cache,
                     parallel,
                     continue_on_error,
+                    workspace_concurrency,
                     stream,
                     cli.json,
                 )
@@ -4407,6 +4431,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     affected_ref,
                     fail_if_no_match,
+                    commands::tools::WorkspaceConcurrency::HostDefault,
                     cli.json,
                 )
                 .await
@@ -4436,6 +4461,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     affected_ref,
                     fail_if_no_match,
+                    commands::tools::WorkspaceConcurrency::HostDefault,
                     cli.json,
                 )
                 .await
@@ -4465,6 +4491,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     affected_ref,
                     fail_if_no_match,
+                    commands::tools::WorkspaceConcurrency::HostDefault,
                     cli.json,
                 )
                 .await
@@ -4560,6 +4587,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             fail_if_no_match,
+            workspace_concurrency,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -4573,6 +4601,7 @@ async fn async_main() -> Result<()> {
                 affected,
                 &base,
                 fail_if_no_match,
+                workspace_concurrency,
                 cli.json,
             )
             .await
@@ -4583,6 +4612,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             fail_if_no_match,
+            workspace_concurrency,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -4596,6 +4626,7 @@ async fn async_main() -> Result<()> {
                 affected,
                 &base,
                 fail_if_no_match,
+                workspace_concurrency,
                 cli.json,
             )
             .await
@@ -5420,6 +5451,87 @@ mod tests {
             result.is_err(),
             "--continue-on-error must not remain as a legacy alias for --no-bail"
         );
+    }
+
+    #[test]
+    fn run_workspace_concurrency_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "run",
+            "build",
+            "--filter",
+            "@test/*",
+            "--workspace-concurrency",
+            "2",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Run {
+                workspace_concurrency,
+                ..
+            } => {
+                assert_eq!(workspace_concurrency.map(NonZeroUsize::get), Some(2));
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_workspace_concurrency_rejects_zero() {
+        let result = Cli::try_parse_from([
+            "lpm",
+            "run",
+            "build",
+            "--filter",
+            "@test/*",
+            "--workspace-concurrency",
+            "0",
+        ]);
+        assert!(result.is_err(), "--workspace-concurrency must reject zero");
+    }
+
+    #[test]
+    fn test_workspace_concurrency_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "test",
+            "--filter",
+            "@test/*",
+            "--workspace-concurrency",
+            "3",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Test {
+                workspace_concurrency,
+                ..
+            } => {
+                assert_eq!(workspace_concurrency.map(NonZeroUsize::get), Some(3));
+            }
+            _ => panic!("expected Test command"),
+        }
+    }
+
+    #[test]
+    fn bench_workspace_concurrency_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "bench",
+            "--filter",
+            "@test/*",
+            "--workspace-concurrency",
+            "4",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Bench {
+                workspace_concurrency,
+                ..
+            } => {
+                assert_eq!(workspace_concurrency.map(NonZeroUsize::get), Some(4));
+            }
+            _ => panic!("expected Bench command"),
+        }
     }
 
     #[test]

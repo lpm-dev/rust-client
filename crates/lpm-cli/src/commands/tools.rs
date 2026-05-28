@@ -1,6 +1,7 @@
 use crate::{CheckEngine, output};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -38,6 +39,29 @@ fn truncate_output(text: &str) -> String {
 pub enum StdioMode {
     Inherit,
     Capture,
+}
+
+#[derive(Clone, Copy)]
+pub enum WorkspaceConcurrency {
+    HostDefault,
+    Configured { cli_value: Option<NonZeroUsize> },
+}
+
+impl WorkspaceConcurrency {
+    fn resolve(self, workspace_root: &Path) -> Result<usize, LpmError> {
+        let value = match self {
+            Self::HostDefault => {
+                crate::workspace_concurrency_config::default_workspace_concurrency()
+            }
+            Self::Configured { cli_value } => {
+                crate::workspace_concurrency_config::resolve_workspace_concurrency(
+                    workspace_root,
+                    cli_value,
+                )?
+            }
+        };
+        Ok(value.get())
+    }
 }
 
 /// Captured stdio from a single tool invocation.
@@ -563,6 +587,7 @@ pub async fn tool_workspace(
     filters: &[String],
     affected_base: Option<&str>,
     fail_if_no_match: bool,
+    workspace_concurrency: WorkspaceConcurrency,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let workspace = lpm_workspace::discover_workspace(project_dir)
@@ -577,6 +602,7 @@ pub async fn tool_workspace(
     let levels = ws_graph
         .topological_levels()
         .map_err(|e| LpmError::Script(e.to_string()))?;
+    let workspace_concurrency = workspace_concurrency.resolve(&workspace.root)?;
 
     let target_set = crate::workspace_select::select_workspace_target_set(
         &ws_graph,
@@ -711,6 +737,7 @@ pub async fn tool_workspace(
             check_engine,
             stdio,
             &root_pin,
+            workspace_concurrency,
         )
         .await;
         member_results.extend(level_outcomes);
@@ -789,7 +816,7 @@ struct MemberResult {
 }
 
 /// Run all members in a single topological level. Within a level, members are
-/// independent; we fan out across `available_parallelism()` threads.
+/// independent; callers decide the workspace concurrency cap.
 #[allow(clippy::too_many_arguments)]
 async fn run_level(
     ws_graph: &lpm_task::graph::WorkspaceGraph,
@@ -800,6 +827,7 @@ async fn run_level(
     check_engine: Option<CheckEngine>,
     stdio: StdioMode,
     root_pin: &Option<(String, Option<String>, PathBuf)>,
+    workspace_concurrency: usize,
 ) -> Vec<MemberResult> {
     if level_targets.len() == 1 {
         let idx = level_targets[0];
@@ -817,11 +845,9 @@ async fn run_level(
         return vec![result];
     }
 
-    let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-
     let mut all_results: Vec<MemberResult> = Vec::with_capacity(level_targets.len());
 
-    for chunk in level_targets.chunks(max_threads) {
+    for chunk in level_targets.chunks(workspace_concurrency) {
         let mut chunk_futs = Vec::with_capacity(chunk.len());
         for &idx in chunk {
             let member_dir = ws_graph.members[idx].path.clone();
@@ -1062,9 +1088,15 @@ pub async fn dispatch_test_or_bench(
     affected: bool,
     base_ref: &str,
     fail_if_no_match: bool,
+    workspace_concurrency: Option<NonZeroUsize>,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let workspace_mode = all || affected || !filters.is_empty();
+    if workspace_concurrency.is_some() && !workspace_mode {
+        return Err(LpmError::Script(format!(
+            "--workspace-concurrency requires --all, --filter, or --affected for `lpm {tool}`"
+        )));
+    }
 
     // Resolve workspace target selection up-front when watch is requested,
     // so we can hand off to single-package mode for the one-member case
@@ -1124,6 +1156,9 @@ pub async fn dispatch_test_or_bench(
             filters,
             affected_ref,
             fail_if_no_match,
+            WorkspaceConcurrency::Configured {
+                cli_value: workspace_concurrency,
+            },
             json_output,
         )
         .await

@@ -3,6 +3,7 @@ use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_runner::bin_path::ManagedRuntimeHint;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 /// Maximum size for captured task output before truncation ().
@@ -1094,6 +1095,7 @@ pub async fn run_workspace(
     no_cache: bool,
     parallel: bool,
     continue_on_error: bool,
+    workspace_concurrency: Option<NonZeroUsize>,
     stream: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
@@ -1116,6 +1118,11 @@ pub async fn run_workspace(
     let levels = ws_graph
         .topological_levels()
         .map_err(|e| LpmError::Script(e.to_string()))?;
+    let workspace_concurrency = crate::workspace_concurrency_config::resolve_workspace_concurrency(
+        &workspace.root,
+        workspace_concurrency,
+    )?
+    .get();
 
     let target_set = crate::workspace_select::select_workspace_target_set(
         &ws_graph,
@@ -1198,9 +1205,7 @@ pub async fn run_workspace(
             }
         } else {
             // Multiple packages in this level — run in parallel
-            let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-
-            for chunk in level_targets.chunks(max_threads) {
+            for chunk in level_targets.chunks(workspace_concurrency) {
                 let handles: Vec<_> = chunk
                     .iter()
                     .map(|&idx| {
