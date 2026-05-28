@@ -323,6 +323,219 @@ async fn catalog_entry_recursive_definition_fails_with_clear_error() {
     );
 }
 
+#[tokio::test]
+async fn pnpm_workspace_default_catalog_resolves_catalog_dependency() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = pnpm_workspace_catalog_project(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            }
+        }"#,
+        r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^2.0.0
+"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install must resolve catalog: from pnpm-workspace.yaml catalog\n{text}"
+    );
+    assert_eq!(
+        resolved_version(&project, "is-positive"),
+        "2.0.0",
+        "default pnpm workspace catalog should feed catalog: resolution"
+    );
+}
+
+#[tokio::test]
+async fn pnpm_workspace_named_catalog_resolves_catalog_dependency() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = pnpm_workspace_catalog_project(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:testing"
+            }
+        }"#,
+        r#"packages:
+  - "packages/*"
+catalogs:
+  testing:
+    is-positive: ^2.0.0
+"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install must resolve catalog:<name> from pnpm-workspace.yaml catalogs\n{text}"
+    );
+    assert_eq!(
+        resolved_version(&project, "is-positive"),
+        "2.0.0",
+        "named pnpm workspace catalog should feed catalog:<name> resolution"
+    );
+}
+
+#[tokio::test]
+async fn package_json_catalog_entry_overrides_pnpm_workspace_catalog_entry() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = pnpm_workspace_catalog_project(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^2.0.0"
+                }
+            }
+        }"#,
+        r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^1.0.0
+"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "package.json catalog must win when pnpm-workspace.yaml defines the same entry\n{text}"
+    );
+    assert_eq!(
+        resolved_version(&project, "is-positive"),
+        "2.0.0",
+        "package.json catalog entry should take precedence over pnpm-workspace.yaml"
+    );
+}
+
+#[tokio::test]
+async fn install_catalog_flag_saves_reference_from_pnpm_workspace_default_catalog() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = pnpm_workspace_catalog_project(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0"
+        }"#,
+        r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^2.0.0
+"#,
+    );
+
+    let output = run_install(
+        &project,
+        &mock,
+        &["is-positive", "--workspace-root", "--catalog"],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install --catalog must see pnpm-workspace.yaml default catalog entries\n{text}"
+    );
+    assert_eq!(
+        dependency_spec(&project, "is-positive"),
+        "catalog:",
+        "--catalog should save catalog: when pnpm-workspace.yaml default catalog matches"
+    );
+}
+
+#[tokio::test]
+async fn install_named_catalog_flag_saves_reference_from_pnpm_workspace_named_catalog() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = pnpm_workspace_catalog_project(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0"
+        }"#,
+        r#"packages:
+  - "packages/*"
+catalogs:
+  testing:
+    is-positive: ^2.0.0
+"#,
+    );
+
+    let output = run_install(
+        &project,
+        &mock,
+        &["is-positive", "--workspace-root", "--catalog=testing"],
+    );
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install --catalog=<name> must see pnpm-workspace.yaml named catalog entries\n{text}"
+    );
+    assert_eq!(
+        dependency_spec(&project, "is-positive"),
+        "catalog:testing",
+        "--catalog=<name> should save catalog:<name> when pnpm-workspace.yaml named catalog matches"
+    );
+}
+
+#[tokio::test]
+async fn prefer_catalog_mode_saves_reference_from_pnpm_workspace_default_catalog() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = pnpm_workspace_catalog_project(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "lpm": {
+                "catalogMode": "prefer"
+            }
+        }"#,
+        r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^2.0.0
+"#,
+    );
+
+    let output = run_install(&project, &mock, &["is-positive", "--workspace-root"]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "catalogMode prefer must see pnpm-workspace.yaml default catalog entries\n{text}"
+    );
+    assert_eq!(
+        dependency_spec(&project, "is-positive"),
+        "catalog:",
+        "prefer mode should save catalog: when pnpm-workspace.yaml default catalog matches"
+    );
+}
+
 async fn mount_is_positive_versions(mock: &MockRegistry) {
     mock.with_full_package_metadata(
         "is-positive",
@@ -388,11 +601,36 @@ fn named_catalog_project(catalog_name: &str, catalog_range: &str) -> TempProject
     ))
 }
 
+fn pnpm_workspace_catalog_project(package_json: &str, pnpm_workspace_yaml: &str) -> TempProject {
+    let project = TempProject::empty(package_json);
+    project.write_file("pnpm-workspace.yaml", pnpm_workspace_yaml);
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "app",
+            "version": "1.0.0"
+        }"#,
+    );
+    project
+}
+
 fn run_install(project: &TempProject, mock: &MockRegistry, packages: &[&str]) -> Output {
     let mut cmd = lpm_with_registry(project, &mock.url());
     cmd.args(INSTALL_ARGS);
     cmd.args(packages);
     cmd.output().expect("failed to run lpm install")
+}
+
+fn resolved_version(project: &TempProject, package: &str) -> String {
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("lpm.lock parses");
+    lockfile
+        .packages
+        .iter()
+        .find(|pkg| pkg.name == package)
+        .unwrap_or_else(|| panic!("expected `{package}` in lpm.lock"))
+        .version
+        .clone()
 }
 
 fn dependency_spec(project: &TempProject, package: &str) -> String {

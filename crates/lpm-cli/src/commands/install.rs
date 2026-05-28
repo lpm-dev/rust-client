@@ -252,6 +252,15 @@ fn catalog_save_policy_for_project(
     project_dir: &Path,
     forced_catalog: Option<&str>,
 ) -> Result<CatalogSavePolicy, LpmError> {
+    if let Some(workspace) = lpm_workspace::discover_workspace(project_dir)
+        .map_err(|e| LpmError::Registry(format!("failed to discover workspace catalogs: {e}")))?
+    {
+        return Ok(CatalogSavePolicy::from_package(
+            &workspace.root_package,
+            forced_catalog,
+        ));
+    }
+
     let pkg_json_path = project_dir.join("package.json");
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;

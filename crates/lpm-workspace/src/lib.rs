@@ -1705,7 +1705,7 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
     loop {
         let pkg_json_path = current.join("package.json");
         if pkg_json_path.exists() {
-            let root_package = read_package_json(&pkg_json_path)?;
+            let mut root_package = read_package_json(&pkg_json_path)?;
 
             // Check for workspace globs in package.json
             let workspace_globs = match &root_package.workspaces {
@@ -1716,13 +1716,25 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
 
             // Also check for pnpm-workspace.yaml
             let pnpm_workspace_path = current.join("pnpm-workspace.yaml");
-            let pnpm_globs = if pnpm_workspace_path.exists() {
-                read_pnpm_workspace(&pnpm_workspace_path)?
+            let pnpm_workspace = if pnpm_workspace_path.exists() {
+                Some(read_pnpm_workspace(&pnpm_workspace_path)?)
             } else {
                 None
             };
 
-            let globs = workspace_globs.or(pnpm_globs);
+            if let Some(config) = pnpm_workspace.as_ref() {
+                merge_pnpm_workspace_catalogs(&mut root_package, &config.catalogs);
+            }
+
+            let globs = workspace_globs.or_else(|| {
+                pnpm_workspace.as_ref().and_then(|config| {
+                    if config.packages.is_empty() {
+                        None
+                    } else {
+                        Some(config.packages.clone())
+                    }
+                })
+            });
 
             if let Some(globs) = globs {
                 let members = discover_members(&current, &globs)?;
@@ -1853,40 +1865,78 @@ pub fn parse_bin_field(content: &[u8]) -> Result<Option<BinConfig>, WorkspaceErr
     Ok(parsed.bin)
 }
 
-/// Read pnpm-workspace.yaml and extract package globs.
-fn read_pnpm_workspace(path: &Path) -> Result<Option<Vec<String>>, WorkspaceError> {
+#[derive(Debug, Default, Deserialize)]
+struct PnpmWorkspaceManifest {
+    #[serde(default)]
+    packages: Vec<String>,
+    #[serde(default)]
+    catalog: HashMap<String, String>,
+    #[serde(default)]
+    catalogs: HashMap<String, HashMap<String, String>>,
+}
+
+#[derive(Debug, Default)]
+struct PnpmWorkspaceConfig {
+    packages: Vec<String>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+}
+
+impl PnpmWorkspaceManifest {
+    fn into_config(self) -> PnpmWorkspaceConfig {
+        let mut catalogs = self.catalogs;
+        if !self.catalog.is_empty() {
+            let default_catalog = catalogs.entry("default".to_string()).or_default();
+            for (package, range) in self.catalog {
+                default_catalog.entry(package).or_insert(range);
+            }
+        }
+
+        PnpmWorkspaceConfig {
+            packages: self.packages,
+            catalogs,
+        }
+    }
+}
+
+/// Read pnpm-workspace.yaml and extract package globs plus root catalogs.
+fn read_pnpm_workspace(path: &Path) -> Result<PnpmWorkspaceConfig, WorkspaceError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
 
-    // pnpm-workspace.yaml is simple enough to parse with basic string matching
-    // rather than pulling in a full YAML parser.
-    // Format: packages:\n  - "glob1"\n  - "glob2"
-    let mut packages = Vec::new();
-    let mut in_packages = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed == "packages:" {
-            in_packages = true;
-            continue;
-        }
-        if in_packages {
-            if let Some(rest) = trimmed.strip_prefix("- ") {
-                let glob = rest.trim().trim_matches('"').trim_matches('\'').to_string();
-                if !glob.is_empty() {
-                    packages.push(glob);
-                }
-            } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                // New top-level key, stop parsing packages
-                break;
-            }
-        }
+    if content.trim().is_empty() {
+        return Ok(PnpmWorkspaceConfig::default());
     }
 
-    if packages.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(packages))
+    let manifest: Option<PnpmWorkspaceManifest> = serde_yaml::from_str(&content).map_err(|e| {
+        WorkspaceError::Parse(format!(
+            "failed to parse pnpm workspace manifest {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    Ok(manifest.unwrap_or_default().into_config())
+}
+
+fn merge_pnpm_workspace_catalogs(
+    root_package: &mut PackageJson,
+    pnpm_catalogs: &HashMap<String, HashMap<String, String>>,
+) {
+    for (catalog_name, catalog) in pnpm_catalogs {
+        let target = root_package
+            .catalogs
+            .entry(catalog_name.clone())
+            .or_insert_with(|| HashMap::with_capacity(catalog.len()));
+        for (package, range) in catalog {
+            if target.contains_key(package) {
+                tracing::warn!(
+                    catalog = %catalog_name,
+                    package = %package,
+                    "package.json catalog entry overrides pnpm-workspace.yaml catalog entry",
+                );
+            } else {
+                target.insert(package.clone(), range.clone());
+            }
+        }
     }
 }
 
@@ -3343,6 +3393,100 @@ mod tests {
             ws.members[0].package.catalogs.len(),
             1,
             "the member's catalogs field is still loaded into the struct (the warn surfaces the ignored-by-resolver posture, it does not strip the data)"
+        );
+    }
+
+    #[test]
+    fn discover_workspace_reads_default_and_named_catalogs_from_pnpm_workspace_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "root-with-pnpm-catalogs"
+            }"#,
+        );
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            r#"packages:
+  - "packages/*"
+catalog:
+  react: ^18.2.0
+catalogs:
+  testing:
+    vitest: ^1.0.0
+"#,
+        )
+        .unwrap();
+        let member_dir = dir.path().join("packages/app");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(
+            &member_dir,
+            r#"{
+                "name": "app",
+                "version": "1.0.0"
+            }"#,
+        );
+
+        let ws = discover_workspace(dir.path())
+            .expect("discovery must read pnpm-workspace.yaml")
+            .expect("pnpm-workspace.yaml packages should create a workspace");
+
+        assert_eq!(
+            ws.root_package.catalogs["default"]["react"], "^18.2.0",
+            "pnpm-workspace.yaml catalog should become the default catalog"
+        );
+        assert_eq!(
+            ws.root_package.catalogs["testing"]["vitest"], "^1.0.0",
+            "pnpm-workspace.yaml catalogs should become named catalogs"
+        );
+    }
+
+    #[test]
+    fn package_json_catalogs_override_pnpm_workspace_yaml_catalogs() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "root-with-catalog-precedence",
+                "workspaces": ["packages/*"],
+                "catalogs": {
+                    "default": {
+                        "react": "^19.0.0"
+                    }
+                }
+            }"#,
+        );
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            r#"packages:
+  - "packages/*"
+catalog:
+  react: ^18.2.0
+  react-dom: ^18.2.0
+"#,
+        )
+        .unwrap();
+        let member_dir = dir.path().join("packages/app");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(
+            &member_dir,
+            r#"{
+                "name": "app",
+                "version": "1.0.0"
+            }"#,
+        );
+
+        let ws = discover_workspace(dir.path())
+            .expect("discovery must merge pnpm-workspace.yaml catalogs")
+            .expect("workspace must be discovered");
+
+        assert_eq!(
+            ws.root_package.catalogs["default"]["react"], "^19.0.0",
+            "package.json should win when both files define the same catalog entry"
+        );
+        assert_eq!(
+            ws.root_package.catalogs["default"]["react-dom"], "^18.2.0",
+            "non-conflicting pnpm-workspace.yaml catalog entries should still be imported"
         );
     }
 }
