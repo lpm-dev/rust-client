@@ -4,7 +4,7 @@ mod support;
 
 use std::process::Output;
 use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry};
 
 const INSTALL_ARGS: &[&str] = &[
     "install",
@@ -1003,6 +1003,117 @@ async fn cleanup_unused_catalogs_preserves_catalog_entries_used_by_overrides() {
         catalog_entry_optional(&project, "default", "is-negative").is_none(),
         "cleanupUnusedCatalogs should still prune entries unused by deps or overrides"
     );
+}
+
+#[test]
+fn catalog_list_unused_json_reports_unreferenced_catalog_entries() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^2.0.0",
+                    "is-negative": "^1.0.0"
+                },
+                "testing": {
+                    "is-odd": "^3.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "catalog", "list", "--unused"])
+        .output()
+        .expect("failed to run lpm catalog list --unused --json");
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "catalog list --unused --json must succeed\n{text}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("catalog list output is valid JSON");
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["mode"], serde_json::json!("unused"));
+    assert_eq!(envelope["count"], serde_json::json!(2));
+    assert!(
+        envelope["entries"]
+            .as_array()
+            .expect("entries is an array")
+            .iter()
+            .any(|entry| entry["catalog"] == "default" && entry["package"] == "is-negative"),
+        "unused default catalog entry must be reported\n{envelope:#}"
+    );
+    assert!(
+        envelope["entries"]
+            .as_array()
+            .expect("entries is an array")
+            .iter()
+            .any(|entry| entry["catalog"] == "testing" && entry["package"] == "is-odd"),
+        "unused named catalog entry must be reported\n{envelope:#}"
+    );
+
+    insta::assert_json_snapshot!("catalog_list_unused_json_envelope", envelope);
+}
+
+#[tokio::test]
+async fn catalog_show_resolved_json_reports_lockfile_catalog_snapshot() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^2.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let install_output = run_install(&project, &mock, &[]);
+    let install_text = output_text(&install_output);
+    assert!(
+        install_output.status.success(),
+        "install with catalog dependency must succeed before catalog show\n{install_text}"
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "catalog", "show", "--resolved"])
+        .output()
+        .expect("failed to run lpm catalog show --resolved --json");
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "catalog show --resolved --json must succeed\n{text}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("catalog show output is valid JSON");
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["count"], serde_json::json!(1));
+    let entry = envelope["entries"]
+        .as_array()
+        .expect("entries is an array")
+        .first()
+        .expect("resolved catalog entry is present");
+    assert_eq!(entry["catalog"], serde_json::json!("default"));
+    assert_eq!(entry["package"], serde_json::json!("is-positive"));
+    assert_eq!(entry["specifier"], serde_json::json!("^2.0.0"));
+    assert_eq!(entry["version"], serde_json::json!("2.0.0"));
+    assert_eq!(entry["reference"], serde_json::json!("catalog:"));
+
+    insta::assert_json_snapshot!("catalog_show_resolved_json_envelope", envelope);
 }
 
 async fn mount_is_positive_versions(mock: &MockRegistry) {

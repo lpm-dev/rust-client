@@ -1030,6 +1030,12 @@ enum Commands {
         fix: bool,
     },
 
+    /// Inspect workspace catalog usage and resolved catalog provenance.
+    Catalog {
+        #[command(subcommand)]
+        action: commands::catalog::CatalogCmd,
+    },
+
     /// Manage globally-installed CLI packages under ~/.lpm/global/.
     ///
     /// Subcommands: `list` (with `--outdated`/`--verbose`), `bin`,
@@ -4018,6 +4024,10 @@ async fn async_main() -> Result<()> {
         }
         Commands::Store { action, deep, fix } => {
             commands::store::run(&action, deep, fix, cli.json).await
+        }
+        Commands::Catalog { action } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::catalog::run(&cwd, action, cli.json)
         }
         Commands::Global { action } => commands::global::run(&client, action, cli.json).await,
         Commands::Trust { action } => {
