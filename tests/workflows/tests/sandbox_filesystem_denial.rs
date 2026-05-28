@@ -62,6 +62,8 @@
 //! this path either. The tempdir cleans up on drop, leaving no
 //! breadcrumbs in the developer's HOME.
 
+#![cfg(unix)]
+
 mod support;
 
 use std::path::PathBuf;

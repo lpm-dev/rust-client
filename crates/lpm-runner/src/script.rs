@@ -610,8 +610,12 @@ fn resolve_and_load_env(
 
     // Count vault secrets for this environment
     let vault_count = match &env_name {
-        Some(name) => lpm_vault::get_all_env(project_dir, name).len(),
-        None => lpm_vault::get_all(project_dir).len(),
+        Some(name) => lpm_vault::try_get_all_env(project_dir, name)
+            .map_err(LpmError::EnvValidation)?
+            .len(),
+        None => lpm_vault::try_get_all(project_dir)
+            .map_err(LpmError::EnvValidation)?
+            .len(),
     };
 
     // Delegate to the unified loader (handles inheritance, vault, schema validation)

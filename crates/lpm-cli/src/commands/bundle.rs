@@ -473,9 +473,7 @@ async fn run_level(
         ];
     }
 
-    let max_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut all_results = Vec::with_capacity(level_targets.len());
 
     for chunk in level_targets.chunks(max_threads) {

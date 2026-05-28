@@ -812,10 +812,10 @@ pub fn as_extended_path(path: &Path) -> PathBuf {
             return path.to_path_buf();
         }
         // UNC paths use \\?\UNC\server\share form
-        if s.starts_with(r"\\") {
-            return PathBuf::from(format!(r"\\?\UNC\{}", &s[2..]));
+        if let Some(stripped) = s.strip_prefix(r"\\") {
+            return PathBuf::from(format!(r"\\?\UNC\{stripped}"));
         }
-        return PathBuf::from(format!(r"\\?\{s}"));
+        PathBuf::from(format!(r"\\?\{s}"))
     }
     #[cfg(not(windows))]
     {

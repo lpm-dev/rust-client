@@ -317,6 +317,21 @@ pub static VAULT_STORAGE_KEYCHAIN: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static VAULT_STORAGE_NATIVE: CheckEntry = CheckEntry {
+    code: "vault_storage_native",
+    name: "Vault storage backend",
+    category: Category::Auth,
+    tier: Tier::Fast,
+    description: "Vault blobs are encrypted on disk, and the local vault data key is protected \
+         by the OS secure store: Secret Service-compatible storage on Linux or Credential \
+         Manager on Windows.",
+    when_fires: "Running on Linux or Windows with no active encrypted-file fallback key, or with \
+         a native vault data key already present.",
+    remediation: "No action — native-protected storage is the recommended backend on this platform.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
 pub static VAULT_STORAGE_FALLBACK: CheckEntry = CheckEntry {
     code: "vault_storage_fallback",
     name: "Vault storage backend",
@@ -327,14 +342,28 @@ pub static VAULT_STORAGE_FALLBACK: CheckEntry = CheckEntry {
          but any process running as your user can read the key file and decrypt the vault — \
          there is no per-app ACL the way macOS Keychain provides. This is a documented \
          platform limitation, not a bug.",
-    when_fires: "Running on Linux or Windows. The keyring crate is bypassed because the vault \
-         layer is conditionally compiled to use the encrypted-file backend on non-macOS \
-         platforms (see crates/lpm-vault/src/fallback.rs).",
+    when_fires: "Running on Linux or Windows with an active encrypted-file fallback key because \
+         native secure storage was unavailable before the vault was promoted.",
     remediation: "Treat the host as the trust boundary: assume any same-UID code-execution \
          primitive on this machine can read vault secrets. Do not run untrusted lifecycle \
-         scripts in unsandboxed mode. The Phase 46 sandbox + script-policy gates are the \
-         primary mitigation. macOS users get the stronger keychain-backed path automatically.",
+         scripts in unsandboxed mode. Keep lifecycle scripts sandboxed and unlock or repair the \
+         OS secure store so LPM can promote the data key.",
     possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
+pub static VAULT_STORAGE_UNAVAILABLE: CheckEntry = CheckEntry {
+    code: "vault_storage_unavailable",
+    name: "Vault storage backend",
+    category: Category::Auth,
+    tier: Tier::Fast,
+    description: "Encrypted vault files exist locally, but LPM cannot access either the OS-protected \
+         vault data key or the legacy encrypted-file fallback key.",
+    when_fires: "Running on Linux or Windows with local vault blobs present and no usable local \
+         data-key source.",
+    remediation: "Unlock Secret Service/Credential Manager, repair the OS secure store, or restore \
+         ~/.lpm/.vault-fallback-key from backup if this machine has not been promoted yet.",
+    possible_severities: &[Severity::Fail],
     auto_fix: None,
 };
 
@@ -1752,7 +1781,9 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &AUTH_INVALID,
     &AUTH_MISSING,
     &VAULT_STORAGE_KEYCHAIN,
+    &VAULT_STORAGE_NATIVE,
     &VAULT_STORAGE_FALLBACK,
+    &VAULT_STORAGE_UNAVAILABLE,
     // Project state
     &PACKAGE_JSON_PRESENT,
     &PACKAGE_JSON_MISSING,

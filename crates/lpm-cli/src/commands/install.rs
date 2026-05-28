@@ -5237,9 +5237,7 @@ async fn run_with_options_under_store_lock(
     // single-shot `link_packages` path. Hoisted linker always uses
     // the serial path — it has a different layout model and isn't the
     // hot path for the default `lpm install`.
-    let serial_link = std::env::var("LPM_SERIAL_LINK")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    let serial_link = std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
     // — under v2 mode, link_packages_v2 needs the
     // full LinkTarget set in one batch so the GraphKey pre-pass can
     // resolve cross-references. Per-package event-driven linking
@@ -6264,9 +6262,7 @@ async fn run_with_options_under_store_lock(
     //; set `LPM_STREAM_FETCH=0` to fall back to the legacy
     // temp-file spool (kept as an escape hatch for debugging fetch
     // regressions or non-sha512 integrity edge cases).
-    let streaming_fetch = std::env::var("LPM_STREAM_FETCH")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+    let streaming_fetch = std::env::var("LPM_STREAM_FETCH").map_or(true, |v| v != "0");
     if !to_download.is_empty() {
         let overall = ProgressBar::new(to_download.len() as u64);
         overall.set_style(
@@ -8296,10 +8292,9 @@ async fn run_with_options_under_store_lock(
                 format!("resolve: {resolve_ms}ms  fetch: {fetch_ms}ms  link: {link_ms}ms").dimmed()
             );
             let lockb_path = lockfile_path.with_extension("lockb");
-            let lockb_size = std::fs::metadata(&lockb_path).map(|m| m.len()).unwrap_or(0);
+            let lockb_size = std::fs::metadata(&lockb_path).map_or(0, |m| m.len());
             let lockfile_pkg_count = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
-                .map(|lf| lf.packages.len())
-                .unwrap_or(packages.len());
+                .map_or(packages.len(), |lf| lf.packages.len());
             eprintln!(
                 "  {}",
                 format!(

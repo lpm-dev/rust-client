@@ -164,6 +164,8 @@ fn find_port_owner(port: u16) -> (Option<u32>, Option<String>) {
             }
         }
     }
+    #[cfg(not(unix))]
+    let _ = port;
 
     (None, None)
 }

@@ -41,8 +41,7 @@ fn audit_cache_max_age_secs() -> u64 {
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Project audit cache, stored at `.lpm/audit-cache.json`.

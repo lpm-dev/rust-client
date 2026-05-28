@@ -214,7 +214,7 @@ fn copy_member_source_recursive(
             // Regular file: hardlink first, fall back to copy.
             // Hardlinks are zero-cost on the same filesystem and preserve
             // the source bytes exactly. Cross-device falls through to copy.
-            let bytes = std::fs::metadata(&src_path).map(|m| m.len()).unwrap_or(0);
+            let bytes = std::fs::metadata(&src_path).map_or(0, |m| m.len());
             if std::fs::hard_link(&src_path, &dst_path).is_err() {
                 std::fs::copy(&src_path, &dst_path).map_err(|e| {
                     LpmError::Script(format!("failed to copy {src_path:?} to {dst_path:?}: {e}"))
@@ -345,9 +345,8 @@ fn validate_output_dir(cwd: &Path, output_dir: &Path, force: bool) -> Result<Pat
     // and we deliberately never remove anything until the gate has passed.
     // audit fix Medium  wired the cleanup in `run`.
     if normalized.exists() {
-        let is_empty = std::fs::read_dir(&normalized)
-            .map(|mut iter| iter.next().is_none())
-            .unwrap_or(true);
+        let is_empty =
+            std::fs::read_dir(&normalized).map_or(true, |mut iter| iter.next().is_none());
         if !is_empty && !force {
             return Err(LpmError::Script(format!(
                 "lpm deploy: output directory {output_dir:?} is not empty. \
@@ -2514,11 +2513,11 @@ mod tests {
         // naturally when source and output live on the same filesystem.
         std::fs::hard_link(&source_manifest, &output_manifest).unwrap();
 
-        let source_inode_before = source_manifest.metadata().unwrap();
-        let output_inode_before = output_manifest.metadata().unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let source_inode_before = source_manifest.metadata().unwrap();
+            let output_inode_before = output_manifest.metadata().unwrap();
             assert_eq!(
                 source_inode_before.ino(),
                 output_inode_before.ino(),

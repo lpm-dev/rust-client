@@ -316,8 +316,7 @@ fn load_or_default(path: &Path) -> CacheFile {
 fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn is_expired(cached_at_unix: u64, ttl: Duration) -> bool {

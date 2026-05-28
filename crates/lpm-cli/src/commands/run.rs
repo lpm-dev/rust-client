@@ -798,9 +798,7 @@ async fn run_tasks_parallel(
             }
         } else {
             // Multi-task level: spawn threads with correct output mode
-            let max_threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
+            let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
 
             for chunk in runnable.chunks(max_threads) {
                 let chunk_names: Vec<String> = chunk.iter().map(|t| (*t).clone()).collect();
@@ -1200,9 +1198,7 @@ pub async fn run_workspace(
             }
         } else {
             // Multiple packages in this level — run in parallel
-            let max_threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
+            let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
 
             for chunk in level_targets.chunks(max_threads) {
                 let handles: Vec<_> = chunk

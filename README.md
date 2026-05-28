@@ -15,7 +15,7 @@ curl -fsSL https://lpm.dev/install.sh | sh       # Standalone
 cargo install --git https://github.com/lpm-dev/rust-client lpm-cli  # Source
 ```
 
-LPM verifies its own download integrity on every install. Releases predating the integrity gate require a manual install; the installer prints the link if you hit one. See [AGENTS/security.md](AGENTS/security.md) for the full trust model.
+LPM verifies its own download integrity on every install.
 
 </details>
 

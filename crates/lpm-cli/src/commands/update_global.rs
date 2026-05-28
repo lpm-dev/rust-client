@@ -1460,8 +1460,7 @@ fn active_matches_planned_snapshot(
 fn mk_tx_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     format!("{nanos}-{}", std::process::id())
 }
 
@@ -1830,6 +1829,7 @@ mod tests {
 
     /// Build a complete install root the upgrade commit will accept:
     /// a `node_modules/.bin/<cmd>` for every command and a valid marker.
+    #[cfg(unix)]
     fn make_complete_install_root(install_root: &std::path::Path, commands: &[&str]) {
         let bin = install_root.join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -1854,6 +1854,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     fn pre_upgrade_manifest_with_alias(
         root_dir: &str,
         commands: &[&str],

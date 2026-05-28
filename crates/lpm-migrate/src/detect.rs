@@ -47,7 +47,7 @@ pub fn detect_source(project_dir: &Path) -> Result<DetectedSource, LpmError> {
     // Sort by mtime descending (most recent first). On ties, the earlier
     // position in LOCKFILE_CANDIDATES wins because sort is stable and we
     // iterate candidates in priority order.
-    found.sort_by(|a, b| b.2.cmp(&a.2));
+    found.sort_by_key(|candidate| std::cmp::Reverse(candidate.2));
 
     let (chosen_path, chosen_kind, _) = &found[0];
 

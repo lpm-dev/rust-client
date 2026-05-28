@@ -208,6 +208,13 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.set_env("LPM_STORE_DIR", project.store_dir().as_os_str());
     cmd.set_env("LPM_CACHE_DIR", project.cache_dir().as_os_str());
 
+    // Debug/test binaries allow this override so workflow tests don't
+    // inherit a host-wide `/etc/lpm/security-policy.toml`.
+    cmd.set_env(
+        "LPM_SECURITY_POLICY_PATH",
+        project.home().join(".lpm/security-policy.toml").as_os_str(),
+    );
+
     // Clear auth tokens to prevent accidental network calls with real creds
     cmd.remove_env("LPM_TOKEN");
     cmd.remove_env("NPM_TOKEN");

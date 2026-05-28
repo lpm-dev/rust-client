@@ -779,10 +779,8 @@ async fn run_under_store_lock(
             "sandbox disabled — credential env vars will NOT be stripped and scripts run \
              WITHOUT filesystem / network containment."
         );
-        let in_ci = std::env::var("CI").map(|v| !v.is_empty()).unwrap_or(false)
-            || std::env::var("GITHUB_ACTIONS")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false);
+        let in_ci = std::env::var("CI").is_ok_and(|v| !v.is_empty())
+            || std::env::var("GITHUB_ACTIONS").is_ok_and(|v| !v.is_empty());
         if in_ci {
             tracing::warn!(
                 target: "lpm_cli::sandbox",
@@ -3452,7 +3450,7 @@ mod tests {
     fn sanitized_env_keeps_path() {
         // PATH and HOME are always present in the test environment
         let env = build_sanitized_env();
-        assert!(env.contains_key("PATH"));
+        assert!(env.keys().any(|key| key.eq_ignore_ascii_case("PATH")));
     }
 
     /// H13: lifecycle scripts must NOT inherit any of the

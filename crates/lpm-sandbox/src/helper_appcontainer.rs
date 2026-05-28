@@ -499,7 +499,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     if ok == 0 {
         let last = unsafe { GetLastError() };
         return Err(AppContainerError::CreateProcess {
-            program: args.program.clone(),
+            program: args.program,
             last_error: last,
         });
     }

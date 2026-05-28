@@ -25,12 +25,12 @@ fn isolated_project() -> (TempDir, TempDir) {
     (project, lpm_home)
 }
 
-fn project_config_path(project: &TempDir) -> std::path::PathBuf {
-    project.path().join(".lpm").join("config.toml")
+fn lpm_config_path(lpm_home: &TempDir) -> std::path::PathBuf {
+    lpm_home.path().join("config.toml")
 }
 
-fn read_project_config(project: &TempDir) -> String {
-    let path = project_config_path(project);
+fn read_lpm_config(lpm_home: &TempDir) -> String {
+    let path = lpm_config_path(lpm_home);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("config.toml at {} not readable: {e}", path.display()))
 }
@@ -67,7 +67,7 @@ fn release_age_wizard_set_duration_with_json_announces_canonical_seconds() {
         "envelope must announce canonical seconds, not the raw duration; got: {envelope}",
     );
 
-    let cfg = read_project_config(&project);
+    let cfg = read_lpm_config(&lpm_home);
     assert!(
         cfg.contains("minimum-release-age-secs = \"259200\""),
         "config.toml must persist canonical seconds after --set 3d; got:\n{cfg}",
@@ -80,8 +80,9 @@ fn release_age_wizard_set_duration_with_json_announces_canonical_seconds() {
 #[test]
 fn release_age_wizard_set_default_with_json_deletes_override_and_announces_null() {
     let (project, lpm_home) = isolated_project();
-    let config_path = project_config_path(&project);
-    std::fs::create_dir_all(config_path.parent().expect("config dir")).expect("create .lpm dir");
+    let config_path = lpm_config_path(&lpm_home);
+    std::fs::create_dir_all(config_path.parent().expect("config dir"))
+        .expect("create LPM_HOME dir");
     std::fs::write(&config_path, "minimum-release-age-secs = \"259200\"\n")
         .expect("seed release-age override");
 
@@ -109,7 +110,7 @@ fn release_age_wizard_set_default_with_json_deletes_override_and_announces_null(
         "default must announce that the override is absent; got: {envelope}",
     );
 
-    let cfg = read_project_config(&project);
+    let cfg = read_lpm_config(&lpm_home);
     assert!(
         !cfg.contains("minimum-release-age-secs"),
         "default must delete the explicit override from config.toml; got:\n{cfg}",

@@ -3,7 +3,9 @@
 //! Detects Claude Code, Cursor, Windsurf, GitHub Copilot, Augment, and Cline.
 //! Symlinks or appends skill references into editor config files.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 /// Supported AI code editors.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -259,6 +261,7 @@ pub fn remove_editor_skills(project_dir: &Path, package_short_name: &str) {
 ///
 /// Minimal implementation that avoids an external dependency for a single function.
 /// Both paths must be absolute or both relative for correct results.
+#[cfg(unix)]
 fn diff_paths(target: &Path, base: &Path) -> Option<PathBuf> {
     let target = normalize_path(target);
     let base = normalize_path(base);
@@ -294,6 +297,7 @@ fn diff_paths(target: &Path, base: &Path) -> Option<PathBuf> {
 }
 
 /// Normalize a path by resolving `.` and `..` without touching the filesystem.
+#[cfg(unix)]
 fn normalize_path(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut components = Vec::new();
@@ -387,6 +391,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn diff_paths_basic() {
         let result = diff_paths(Path::new("/a/b/c/d.md"), Path::new("/a/b/e"));
         assert_eq!(result, Some(PathBuf::from("../c/d.md")));

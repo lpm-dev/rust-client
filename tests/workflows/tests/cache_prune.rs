@@ -96,8 +96,7 @@ fn prune_dry_run_with_no_registry_succeeds_without_mutation() {
                 .join("store")
                 .join("v2")
                 .read_dir()
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(true),
+                .map_or(true, |mut d| d.next().is_none()),
         "dry-run must not create or populate the store"
     );
 }

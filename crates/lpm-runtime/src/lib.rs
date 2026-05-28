@@ -94,9 +94,8 @@ pub async fn ensure_runtime(project_dir: &std::path::Path) -> RuntimeStatus {
     }
 
     // Not installed -- check if auto-install is disabled
-    let no_auto_install = std::env::var("LPM_NO_AUTO_INSTALL")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    let no_auto_install =
+        std::env::var("LPM_NO_AUTO_INSTALL").is_ok_and(|v| v == "true" || v == "1");
 
     if no_auto_install {
         return RuntimeStatus::NotInstalled {

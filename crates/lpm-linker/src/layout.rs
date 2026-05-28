@@ -1082,6 +1082,7 @@ mod tests {
     /// `node_modules/<dep>` symlinks resolve into the v2 links root
     /// must register as `Healthy { Virtual }`, not the
     /// `NodeModulesPresentButNoStore` fall-through.
+    #[cfg(unix)]
     #[test]
     fn install_appears_healthy_virtual_store() {
         let dir = tmp_project();

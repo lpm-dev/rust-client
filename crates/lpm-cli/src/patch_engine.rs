@@ -1200,7 +1200,7 @@ fn write_breaking_hardlink(dest: &Path, bytes: &[u8]) -> Result<(), LpmError> {
 /// Idempotency check: compares destination bytes against the expected
 /// post-patch bytes byte-for-byte.
 fn file_already_has_bytes(dest: &Path, expected: &[u8]) -> bool {
-    std::fs::read(dest).map(|b| b == expected).unwrap_or(false)
+    std::fs::read(dest).is_ok_and(|b| b == expected)
 }
 
 #[cfg(test)]

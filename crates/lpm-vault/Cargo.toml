@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Keychain-backed secret storage for LPM projects"
+description = "Secure local secret storage for LPM projects"
 
 [dependencies]
 serde = { workspace = true }
@@ -36,8 +36,14 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 urlencoding = "2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["linux-native-sync-persistent", "crypto-rust"] }
+
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
 keyring = { workspace = true, features = ["vendored"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -86,7 +86,7 @@ pub fn render_qr_code(url: &str) -> Result<String, String> {
 
 /// Get the terminal width, defaulting to 80 if detection fails.
 fn terminal_width() -> u16 {
-    crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80)
+    crossterm::terminal::size().map_or(80, |(w, _)| w)
 }
 
 /// Detect if the terminal has a dark background.

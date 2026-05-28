@@ -1615,9 +1615,8 @@ mod tests {
         assert!(final_manifest.packages.contains_key("pkg"));
 
         // Shim emitted into ~/.lpm/bin/.
-        let bin_path = root.bin_dir().join("pkg");
         #[cfg(unix)]
-        assert!(std::fs::symlink_metadata(&bin_path).is_ok());
+        assert!(std::fs::symlink_metadata(root.bin_dir().join("pkg")).is_ok());
     }
 
     // ─── Idempotence ───────────────────────────────────────────────

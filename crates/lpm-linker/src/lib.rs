@@ -820,8 +820,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
                         let scoped_name = format!("{name}/{}", se.file_name().to_string_lossy());
                         let is_symlink = se_path
                             .symlink_metadata()
-                            .map(|m| m.file_type().is_symlink())
-                            .unwrap_or(false);
+                            .is_ok_and(|m| m.file_type().is_symlink());
                         if !is_symlink {
                             continue;
                         }
@@ -847,8 +846,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
             let entry_path = entry.path();
             let is_symlink = entry_path
                 .symlink_metadata()
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false);
+                .is_ok_and(|m| m.file_type().is_symlink());
             if !is_symlink {
                 continue;
             }
@@ -900,8 +898,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
             let path = entry.path();
             let is_symlink = path
                 .symlink_metadata()
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false);
+                .is_ok_and(|m| m.file_type().is_symlink());
             if is_symlink || !path.is_dir() {
                 continue;
             }
@@ -912,8 +909,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
                         let se_path = se.path();
                         let se_is_symlink = se_path
                             .symlink_metadata()
-                            .map(|m| m.file_type().is_symlink())
-                            .unwrap_or(false);
+                            .is_ok_and(|m| m.file_type().is_symlink());
                         if se_is_symlink || !se_path.is_dir() {
                             continue;
                         }
@@ -1675,8 +1671,7 @@ pub fn link_packages_hoisted(
             let path = entry.path();
             let is_symlink = path
                 .symlink_metadata()
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false);
+                .is_ok_and(|m| m.file_type().is_symlink());
             if is_symlink {
                 let _ = std::fs::remove_file(&path);
                 tracing::debug!(
@@ -1693,8 +1688,7 @@ pub fn link_packages_hoisted(
                     let se_path = se.path();
                     let se_is_symlink = se_path
                         .symlink_metadata()
-                        .map(|m| m.file_type().is_symlink())
-                        .unwrap_or(false);
+                        .is_ok_and(|m| m.file_type().is_symlink());
                     if se_is_symlink {
                         let _ = std::fs::remove_file(&se_path);
                         tracing::debug!(
@@ -5197,6 +5191,7 @@ mod tests {
     /// re-running install in the other mode). Hoisted's own pre-link
     /// sweep must remove the broken symlink so `link_dir_recursive`'s
     /// `create_dir_all(dst)` doesn't error on macOS.
+    #[cfg(unix)]
     #[test]
     fn mode_switch_isolated_to_hoisted_handles_broken_leftover_symlink() {
         let store_dir = tempfile::tempdir().unwrap();

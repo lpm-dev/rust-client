@@ -1302,8 +1302,7 @@ fn parse_log_index(s: &str) -> Result<i64, VerifyError> {
 
 fn integrated_time_secs(t: &SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Decode a TlogEntry `logId.keyId` field into raw SHA-256 bytes.

@@ -94,7 +94,7 @@ pub fn detect_patterns(webhooks: &[CapturedWebhook]) -> Vec<FailurePattern> {
         .collect();
 
     // Sort by count descending (most frequent failures first)
-    patterns.sort_by(|a, b| b.count.cmp(&a.count));
+    patterns.sort_by_key(|pattern| std::cmp::Reverse(pattern.count));
     patterns
 }
 

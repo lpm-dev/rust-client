@@ -1401,7 +1401,7 @@ fn validate_skills_for_publish(
             .display()
             .to_string();
 
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let size = std::fs::metadata(path).map_or(0, |m| m.len());
         total_size += size;
 
         if size > 15 * 1024 {

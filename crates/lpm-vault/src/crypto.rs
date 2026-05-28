@@ -59,7 +59,7 @@ pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
     // Try keyring first
     if let Some(key) = read_wrapping_key_from_keyring() {
         // Clean up stale file-based key if keyring is the source of truth
-        if let Some(path) = dirs::home_dir().map(|h| h.join(".lpm").join(".vault-key"))
+        if let Some(path) = crate::lpm_home_dir().map(|h| h.join(".lpm").join(".vault-key"))
             && path.exists()
         {
             let _ = std::fs::remove_file(&path);
@@ -126,7 +126,7 @@ fn store_wrapping_key_in_keyring(key: &[u8; 32]) -> Result<(), String> {
 /// fresh key by removing the file), rather than silently using a
 /// key any local UID could exfiltrate.
 fn read_wrapping_key_from_file() -> Option<[u8; 32]> {
-    let key_path = dirs::home_dir()?.join(".lpm").join(".vault-key");
+    let key_path = crate::lpm_home_dir()?.join(".lpm").join(".vault-key");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -156,7 +156,7 @@ fn read_wrapping_key_from_file() -> Option<[u8; 32]> {
 
 /// Store the wrapping key in the file fallback with restricted permissions.
 fn store_wrapping_key_in_file(key: &[u8; 32]) -> Result<(), String> {
-    let home = dirs::home_dir().ok_or("no home directory")?;
+    let home = crate::lpm_home_dir().ok_or("no home directory")?;
     let lpm_dir = home.join(".lpm");
     std::fs::create_dir_all(&lpm_dir).map_err(|e| format!("failed to create ~/.lpm: {e}"))?;
 
@@ -571,7 +571,7 @@ mod tests {
     struct IsolatedVaultEnv {
         _tmp: tempfile::TempDir,
         _guard: std::sync::MutexGuard<'static, ()>,
-        prior_home: Option<std::ffi::OsString>,
+        prior_home: Option<crate::test_env_lock::HomeEnvSnapshot>,
         prior_force_file: Option<std::ffi::OsString>,
     }
 
@@ -579,12 +579,11 @@ mod tests {
         fn new() -> Self {
             let guard = crate::test_env_lock::acquire_env_lock();
             let tmp = tempfile::tempdir().expect("tempdir for isolated vault env");
-            let prior_home = std::env::var_os("HOME");
+            let prior_home = Some(crate::test_env_lock::HomeEnvSnapshot::set(tmp.path()));
             let prior_force_file = std::env::var_os("LPM_FORCE_FILE_VAULT");
             // SAFETY: the shared env-lock guard ensures we are the only
             // thread mutating these env vars while this struct is alive.
             unsafe {
-                std::env::set_var("HOME", tmp.path());
                 std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
             }
             IsolatedVaultEnv {
@@ -600,14 +599,13 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: still holding the shared env-lock via `_guard`.
             unsafe {
-                match &self.prior_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
                 match &self.prior_force_file {
                     Some(v) => std::env::set_var("LPM_FORCE_FILE_VAULT", v),
                     None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
                 }
+            }
+            if let Some(prior_home) = self.prior_home.take() {
+                prior_home.restore();
             }
         }
     }
