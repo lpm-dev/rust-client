@@ -204,6 +204,73 @@ fn strict_peer_dependency_error(
     Some(LpmError::PeerDependency(details.join("\n")))
 }
 
+fn peer_warning_json_value(warning: &PeerWarning) -> serde_json::Value {
+    let issue_type = if warning.resolved_version.is_some() {
+        "bad"
+    } else {
+        "missing"
+    };
+    serde_json::json!({
+        "type": issue_type,
+        "package": warning.package.as_str(),
+        "version": warning.version.as_str(),
+        "peer": warning.peer.as_str(),
+        "required_range": warning.required_range.as_str(),
+        "resolved_version": warning.resolved_version.as_deref(),
+    })
+}
+
+fn peer_conflict_json_value(report: &PeerConflictReport) -> serde_json::Value {
+    serde_json::json!({
+        "canonical": report.canonical.as_str(),
+        "chosen_version": report.chosen_version.as_str(),
+        "unsatisfied_consumers": report
+            .unsatisfied_consumers
+            .iter()
+            .map(|(consumer, range)| serde_json::json!({
+                "consumer": consumer.as_str(),
+                "range": range.as_str(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn peer_issues_json_value(
+    peer_warnings: &[PeerWarning],
+    peer_conflicts: &[PeerConflictReport],
+) -> serde_json::Value {
+    let mut missing = Vec::new();
+    let mut bad = Vec::new();
+    for warning in peer_warnings {
+        let entry = peer_warning_json_value(warning);
+        if warning.resolved_version.is_some() {
+            bad.push(entry);
+        } else {
+            missing.push(entry);
+        }
+    }
+    let conflicts: Vec<serde_json::Value> = peer_conflicts
+        .iter()
+        .map(peer_conflict_json_value)
+        .collect();
+    let missing_count = missing.len();
+    let bad_count = bad.len();
+    let conflicts_count = conflicts.len();
+    let total_count = missing_count + bad_count + conflicts_count;
+
+    serde_json::json!({
+        "missing": missing,
+        "bad": bad,
+        "conflicts": conflicts,
+        "intersections": [],
+        "missing_count": missing_count,
+        "bad_count": bad_count,
+        "conflicts_count": conflicts_count,
+        "intersections_count": 0,
+        "total_count": total_count,
+    })
+}
+
 fn lockfile_has_auto_isolated_peer_conflicts(lockfile_path: &Path) -> bool {
     const NEEDLE: &[u8] = b"auto-isolated-peer-conflicts = true";
     let Ok(content) = std::fs::read(lockfile_path) else {
@@ -3779,6 +3846,7 @@ async fn run_with_options_under_store_lock(
                 //always-present empty array: up-to-date fast
                 // path runs no resolve, so no fresh conflict trace.
                 "peer_conflicts": [],
+                "peer_issues": peer_issues_json_value(&[], &[]),
             });
             // surface workspace target set for agents.
             if let Some(targets) = target_set {
@@ -4182,6 +4250,7 @@ async fn run_with_options_under_store_lock(
                 //always-present empty array: zero deps means
                 // zero peer requirements means zero conflicts.
                 "peer_conflicts": [],
+                "peer_issues": peer_issues_json_value(&[], &[]),
             });
             if let Some(targets) = target_set {
                 json["target_set"] = serde_json::Value::Array(
@@ -4580,6 +4649,7 @@ async fn run_with_options_under_store_lock(
     // empty — to match the `applied_patches` shape contract that
     // tooling already depends on.
     let mut peer_conflicts: Vec<lpm_resolver::PeerConflictReport> = Vec::new();
+    let mut peer_warnings: Vec<PeerWarning> = Vec::new();
 
     // ambient peer installs synthesized by the resolver,
     // captured here so the cold-resolve lockfile-write site below
@@ -5132,7 +5202,7 @@ async fn run_with_options_under_store_lock(
                     })?,
                     None => CompiledPeerRules::default(),
                 };
-                let peer_warnings = check_unmet_peers(
+                peer_warnings = check_unmet_peers(
                     &resolve_result.packages,
                     &resolve_result.cache,
                     &compiled_peer_rules,
@@ -8073,6 +8143,8 @@ async fn run_with_options_under_store_lock(
             },
             "warnings": [],
             "errors": [],
+            "peer_conflicts": [],
+            "peer_issues": peer_issues_json_value(&[], &[]),
         });
         // surface workspace target set for agents.
         // None for legacy/standalone callers; Some(...) for the filtered path.
@@ -8130,22 +8202,10 @@ async fn run_with_options_under_store_lock(
         json["peer_conflicts"] = serde_json::Value::Array(
             peer_conflicts
                 .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "canonical": r.canonical,
-                        "chosen_version": r.chosen_version,
-                        "unsatisfied_consumers": r
-                            .unsatisfied_consumers
-                            .iter()
-                            .map(|(consumer, range)| serde_json::json!({
-                                "consumer": consumer,
-                                "range": range,
-                            }))
-                            .collect::<Vec<_>>(),
-                    })
-                })
+                .map(peer_conflict_json_value)
                 .collect(),
         );
+        json["peer_issues"] = peer_issues_json_value(&peer_warnings, &peer_conflicts);
 
         // surface the patch apply trace + counts.
         // Audit fix : filter to entries that ACTUALLY did

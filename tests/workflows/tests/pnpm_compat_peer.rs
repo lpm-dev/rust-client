@@ -109,6 +109,108 @@ async fn required_peer_dependency_missing_warns_and_succeeds_without_strict_mode
 }
 
 #[tokio::test]
+async fn install_json_reports_missing_peer_issue() {
+    let mock = MockRegistry::start().await;
+    mount_required_peer_host(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0",
+            "dependencies": {
+                "required-peer-host": "^1.0.0"
+            },
+            "lpm": {
+                "autoInstallPeers": false
+            }
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("--json")
+        .args(INSTALL_ARGS)
+        .output()
+        .expect("failed to run lpm install --json");
+    let json = json_output(&output, "missing peer install --json");
+
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["peer_issues"]["total_count"], serde_json::json!(1));
+    assert_eq!(json["peer_issues"]["missing_count"], serde_json::json!(1));
+    assert_eq!(json["peer_issues"]["bad_count"], serde_json::json!(0));
+    assert_eq!(json["peer_issues"]["conflicts_count"], serde_json::json!(0));
+    assert_eq!(
+        json["peer_issues"]["missing"][0],
+        serde_json::json!({
+            "type": "missing",
+            "package": "required-peer-host",
+            "version": "1.0.0",
+            "peer": "missing-peer",
+            "required_range": "^1.0.0",
+            "resolved_version": null,
+        })
+    );
+}
+
+#[tokio::test]
+async fn install_json_reports_peer_conflict_issue() {
+    let mock = MockRegistry::start().await;
+    mount_conflicting_peer_graph(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0",
+            "dependencies": {
+                "peer-consumer-a": "^1.0.0",
+                "peer-consumer-b": "^1.0.0"
+            }
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("--json")
+        .args(INSTALL_ARGS)
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .expect("failed to run lpm install --json");
+    let json = json_output(&output, "peer conflict install --json");
+
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["peer_issues"]["total_count"], serde_json::json!(2));
+    assert_eq!(json["peer_issues"]["missing_count"], serde_json::json!(0));
+    assert_eq!(json["peer_issues"]["bad_count"], serde_json::json!(1));
+    assert_eq!(json["peer_issues"]["conflicts_count"], serde_json::json!(1));
+    assert_eq!(
+        json["peer_issues"]["bad"][0],
+        serde_json::json!({
+            "type": "bad",
+            "package": "peer-consumer-a",
+            "version": "1.0.0",
+            "peer": "shared-peer",
+            "required_range": "^1.0.0",
+            "resolved_version": "2.0.0",
+        })
+    );
+    assert_eq!(
+        json["peer_issues"]["conflicts"][0],
+        serde_json::json!({
+            "canonical": "shared-peer",
+            "chosen_version": "2.0.0",
+            "unsatisfied_consumers": [
+                {
+                    "consumer": "peer-consumer-a",
+                    "range": "^1.0.0"
+                }
+            ],
+        })
+    );
+    assert_eq!(
+        json["peer_conflicts"], json["peer_issues"]["conflicts"],
+        "legacy peer_conflicts array must stay in sync with structured peer_issues.conflicts"
+    );
+}
+
+#[tokio::test]
 async fn strict_peer_dependencies_cli_fails_when_required_peer_is_missing() {
     let mock = MockRegistry::start().await;
     mount_required_peer_host(&mock).await;
@@ -379,6 +481,14 @@ fn output_text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn json_output(output: &Output, context: &str) -> serde_json::Value {
+    let text = output_text(output);
+    assert!(output.status.success(), "{context} must succeed\n{text}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|err| panic!("{context} must emit valid JSON: {err}\n{text}"))
 }
 
 fn assert_install_hash_linker(project_dir: &std::path::Path, expected: &str) {
