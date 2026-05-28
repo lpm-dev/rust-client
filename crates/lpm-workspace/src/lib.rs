@@ -3938,6 +3938,62 @@ catalog:
             "non-conflicting pnpm-workspace.yaml catalog entries should still be imported"
         );
     }
+
+    #[test]
+    fn discover_workspace_from_nested_member_uses_nearest_workspace_root_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "outer-workspace"
+            }"#,
+        );
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^1.0.0
+"#,
+        )
+        .unwrap();
+
+        let inner_root = dir.path().join("packages/app");
+        fs::create_dir_all(&inner_root).unwrap();
+        create_package_json(
+            &inner_root,
+            r#"{
+                "name": "inner-workspace"
+            }"#,
+        );
+        fs::write(
+            inner_root.join("pnpm-workspace.yaml"),
+            r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^2.0.0
+"#,
+        )
+        .unwrap();
+
+        let leaf_dir = inner_root.join("packages/leaf");
+        fs::create_dir_all(&leaf_dir).unwrap();
+        create_package_json(
+            &leaf_dir,
+            r#"{
+                "name": "leaf"
+            }"#,
+        );
+
+        let ws = discover_workspace(&leaf_dir)
+            .expect("nested workspace discovery must succeed")
+            .expect("nested member must resolve to its nearest workspace root");
+
+        assert_eq!(ws.root, inner_root);
+        assert_eq!(ws.root_package.catalogs["default"]["is-positive"], "^2.0.0");
+        assert_eq!(ws.members.len(), 1);
+        assert_eq!(ws.members[0].package.name.as_deref(), Some("leaf"));
+    }
 }
 
 #[cfg(test)]

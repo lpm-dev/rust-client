@@ -582,6 +582,36 @@ catalog:
 }
 
 #[tokio::test]
+async fn nested_workspace_member_uses_nearest_workspace_catalog() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = nested_pnpm_workspace_catalog_project();
+
+    let output = run_install_in_dir(&project, &mock, "packages/app/packages/leaf", &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install from a nested workspace member must succeed\n{text}"
+    );
+    assert_eq!(
+        resolved_version_at(&project, "packages/app/packages/leaf", "is-positive"),
+        "2.0.0",
+        "nested workspace members must resolve catalog: from the nearest workspace root, not an outer workspace root"
+    );
+    let entry = catalog_snapshot_entry_at(
+        &project,
+        "packages/app/packages/leaf",
+        "default",
+        "is-positive",
+    );
+    assert_eq!(entry.specifier, "^2.0.0");
+    assert_eq!(entry.version, "2.0.0");
+    assert_eq!(entry.reference, "catalog:");
+}
+
+#[tokio::test]
 async fn cleanup_unused_catalogs_defaults_to_preserving_package_json_entries() {
     let mock = MockRegistry::start().await;
     mount_is_positive_versions(&mock).await;
@@ -1209,8 +1239,64 @@ fn pnpm_workspace_catalog_project(package_json: &str, pnpm_workspace_yaml: &str)
     project
 }
 
+fn nested_pnpm_workspace_catalog_project() -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+            "name": "outer-workspace",
+            "version": "1.0.0"
+        }"#,
+    );
+    project.write_file(
+        "pnpm-workspace.yaml",
+        r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^1.0.0
+"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "inner-workspace",
+            "version": "1.0.0"
+        }"#,
+    );
+    project.write_file(
+        "packages/app/pnpm-workspace.yaml",
+        r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^2.0.0
+"#,
+    );
+    project.write_file(
+        "packages/app/packages/leaf/package.json",
+        r#"{
+            "name": "leaf",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            }
+        }"#,
+    );
+    project
+}
+
 fn run_install(project: &TempProject, mock: &MockRegistry, packages: &[&str]) -> Output {
     let mut cmd = lpm_with_registry(project, &mock.url());
+    cmd.args(INSTALL_ARGS);
+    cmd.args(packages);
+    cmd.output().expect("failed to run lpm install")
+}
+
+fn run_install_in_dir(
+    project: &TempProject,
+    mock: &MockRegistry,
+    rel_dir: &str,
+    packages: &[&str],
+) -> Output {
+    let mut cmd = lpm_with_registry(project, &mock.url());
+    cmd.current_dir(project.path().join(rel_dir));
     cmd.args(INSTALL_ARGS);
     cmd.args(packages);
     cmd.output().expect("failed to run lpm install")
@@ -1227,6 +1313,19 @@ fn run_install_json(project: &TempProject, mock: &MockRegistry, packages: &[&str
 fn resolved_version(project: &TempProject, package: &str) -> String {
     let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
         .expect("lpm.lock parses");
+    lockfile
+        .packages
+        .iter()
+        .find(|pkg| pkg.name == package)
+        .unwrap_or_else(|| panic!("expected `{package}` in lpm.lock"))
+        .version
+        .clone()
+}
+
+fn resolved_version_at(project: &TempProject, rel_dir: &str, package: &str) -> String {
+    let lockfile =
+        lpm_lockfile::Lockfile::read_fast(&project.path().join(rel_dir).join("lpm.lock"))
+            .expect("lpm.lock parses");
     lockfile
         .packages
         .iter()
@@ -1282,6 +1381,28 @@ fn catalog_snapshot_entry(
             panic!(
                 "expected lockfile catalog snapshot `{catalog}` entry for `{package}`\n{}",
                 project.read_file("lpm.lock")
+            )
+        })
+        .clone()
+}
+
+fn catalog_snapshot_entry_at(
+    project: &TempProject,
+    rel_dir: &str,
+    catalog: &str,
+    package: &str,
+) -> lpm_lockfile::CatalogSnapshotEntry {
+    let lockfile =
+        lpm_lockfile::Lockfile::read_fast(&project.path().join(rel_dir).join("lpm.lock"))
+            .expect("lpm.lock parses");
+    lockfile
+        .catalogs
+        .get(catalog)
+        .and_then(|entries| entries.get(package))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected lockfile catalog snapshot `{catalog}` entry for `{package}`\n{}",
+                project.read_file(&format!("{rel_dir}/lpm.lock"))
             )
         })
         .clone()
