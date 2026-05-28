@@ -112,6 +112,7 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
         metadata: LockfileMetadata {
             lockfile_version: LOCKFILE_VERSION,
             resolved_with: Some("migrate".to_string()),
+            auto_isolated_peer_conflicts: false,
         },
         packages: locked_packages,
         root_aliases: std::collections::BTreeMap::new(),

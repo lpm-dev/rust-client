@@ -204,6 +204,14 @@ fn strict_peer_dependency_error(
     Some(LpmError::PeerDependency(details.join("\n")))
 }
 
+fn lockfile_has_auto_isolated_peer_conflicts(lockfile_path: &Path) -> bool {
+    const NEEDLE: &[u8] = b"auto-isolated-peer-conflicts = true";
+    let Ok(content) = std::fs::read(lockfile_path) else {
+        return false;
+    };
+    content.windows(NEEDLE.len()).any(|window| window == NEEDLE)
+}
+
 /// Default concurrent-tarball-download pool size. Overridable per-invocation
 /// via `LPM_CONCURRENT_DOWNLOADS=N` for future network-condition A/B.
 ///
@@ -3622,6 +3630,7 @@ async fn run_with_options_under_store_lock(
 
     // Step 1: Read package.json
     let pkg_json_path = project_dir.join("package.json");
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     if !pkg_json_path.exists() {
         return Err(LpmError::NotFound(
             "no package.json found in current directory or any parent. \
@@ -3699,24 +3708,36 @@ async fn run_with_options_under_store_lock(
     //      `LPM_LINKER` or `~/.lpm/config.toml > linker` invalidates the
     //      "up to date" cache and triggers a re-link.
     // Precedence: caller-supplied CLI override > config.toml > env >
-    // `package.json > lpm > linker` > default isolated. Lives in the
-    // shared `linker_config::resolve_effective_linker` so every install
-    // entry point (top-level + the 9 internal callers) honors the same
-    // chain.
+    // `package.json > lpm > linker` > workspace auto-detection > default
+    // hoisted. A persisted peer-conflict auto-isolation flag can override
+    // that final default on warm installs without taking over explicit
+    // linker choices.
     let global_cfg = crate::commands::config::GlobalConfig::load();
-    let linker_mode = crate::linker_config::resolve_effective_linker(
-        linker_override,
-        &pkg,
-        &global_cfg,
-        project_dir,
-    )
-    .map_err(|e| {
-        LpmError::Script(format!(
-            "{e} \
+    let (configured_linker_mode, linker_source) =
+        crate::linker_config::resolve_effective_linker_with_source(
+            linker_override,
+            &pkg,
+            &global_cfg,
+            project_dir,
+        )
+        .map_err(|e| {
+            LpmError::Script(format!(
+                "{e} \
              Update the offending surface or override with \
              `--linker=<isolated|hoisted>`."
-        ))
-    })?;
+            ))
+        })?;
+    let peer_conflict_auto_isolation_allowed = matches!(
+        linker_source,
+        crate::linker_config::LinkerModeSource::Default
+    );
+    let mut auto_isolated_peer_conflicts = peer_conflict_auto_isolation_allowed
+        && lockfile_has_auto_isolated_peer_conflicts(&lockfile_path);
+    let mut linker_mode = if auto_isolated_peer_conflicts {
+        lpm_linker::LinkerMode::Isolated
+    } else {
+        configured_linker_mode
+    };
 
     // Fast-exit: if package.json + lockfile haven't changed AND the
     // resolved linker matches the one used for the prior install, skip
@@ -4257,8 +4278,6 @@ async fn run_with_options_under_store_lock(
     }
 
     // Step 2: Try lockfile fast path, else resolve
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-
     // Capture pre-install direct-dep versions BEFORE the resolver writes
     // a fresh lockfile. The Done block compares against this snapshot to
     // print the `+ pkg@version` diff list — only direct deps that
@@ -5141,6 +5160,22 @@ async fn run_with_options_under_store_lock(
                     && let Some(err) = strict_peer_dependency_error(&peer_warnings, &peer_conflicts)
                 {
                     return Err(err);
+                }
+
+                if peer_conflict_auto_isolation_allowed {
+                    auto_isolated_peer_conflicts = !peer_conflicts.is_empty();
+                    linker_mode = if auto_isolated_peer_conflicts {
+                        if matches!(configured_linker_mode, lpm_linker::LinkerMode::Hoisted)
+                            && !json_output
+                        {
+                            output::info(
+                                "Peer conflicts detected; using isolated linker for this install.",
+                            );
+                        }
+                        lpm_linker::LinkerMode::Isolated
+                    } else {
+                        configured_linker_mode
+                    };
                 }
 
                 // — capture the platform-filtered optional
@@ -7465,6 +7500,7 @@ async fn run_with_options_under_store_lock(
     // Step 9: Write lockfile (only if we resolved fresh)
     if !used_lockfile {
         let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver(resolved_with);
+        lockfile.metadata.auto_isolated_peer_conflicts = auto_isolated_peer_conflicts;
         for p in &packages {
             let dep_strings: Vec<String> = p
                 .dependencies

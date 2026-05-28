@@ -128,6 +128,9 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
     if !lockfile.ambient_peer_installs.is_empty() {
         return false;
     }
+    if lockfile.metadata.auto_isolated_peer_conflicts {
+        return false;
+    }
     lockfile
         .packages
         .iter()
@@ -624,6 +627,7 @@ impl BinaryLockfileReader {
             metadata: crate::LockfileMetadata {
                 lockfile_version: crate::LOCKFILE_VERSION,
                 resolved_with: Some(crate::DEFAULT_RESOLVED_WITH.to_string()),
+                auto_isolated_peer_conflicts: false,
             },
             packages,
             // The binary format cannot represent alias metadata; any

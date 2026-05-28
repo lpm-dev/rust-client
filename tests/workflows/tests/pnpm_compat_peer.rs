@@ -223,6 +223,100 @@ async fn strict_peer_dependencies_config_fails_when_peer_ranges_conflict() {
     );
 }
 
+#[tokio::test]
+async fn peer_conflict_auto_isolates_default_linker_and_stays_up_to_date() {
+    let mock = MockRegistry::start().await;
+    mount_conflicting_peer_graph(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0",
+            "dependencies": {
+                "peer-consumer-a": "^1.0.0",
+                "peer-consumer-b": "^1.0.0"
+            }
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL_ARGS)
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .expect("failed to run lpm install");
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "peer conflict must stay warn-only by default while auto-isolating the layout\n{text}"
+    );
+    assert!(
+        text.contains("peer shared-peer pinned to"),
+        "peer conflict must still warn in default mode\n{text}"
+    );
+    assert_install_hash_linker(project.path(), "isolated");
+    let lockfile = std::fs::read_to_string(project.path().join("lpm.lock"))
+        .expect("failed to read generated lockfile");
+    assert!(
+        lockfile.contains("auto-isolated-peer-conflicts = true"),
+        "lockfile must persist the peer-conflict auto-isolated layout decision\n{lockfile}"
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL_ARGS)
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .expect("failed to rerun lpm install");
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "warm install after peer-conflict auto-isolation must succeed\n{text}"
+    );
+    assert!(
+        text.contains("Up to date"),
+        "persisted auto-isolated linker mode should keep the second install on the fast path\n{text}"
+    );
+    assert_install_hash_linker(project.path(), "isolated");
+}
+
+#[tokio::test]
+async fn peer_conflict_respects_explicit_hoisted_linker() {
+    let mock = MockRegistry::start().await;
+    mount_conflicting_peer_graph(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0",
+            "dependencies": {
+                "peer-consumer-a": "^1.0.0",
+                "peer-consumer-b": "^1.0.0"
+            }
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL_ARGS)
+        .args(["--linker", "hoisted"])
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .expect("failed to run lpm install");
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "explicit hoisted linker must remain an opt-out from peer-conflict auto-isolation\n{text}"
+    );
+    assert_install_hash_linker(project.path(), "hoisted");
+    let lockfile = std::fs::read_to_string(project.path().join("lpm.lock"))
+        .expect("failed to read generated lockfile");
+    assert!(
+        !lockfile.contains("auto-isolated-peer-conflicts = true"),
+        "explicit hoisted linker must not persist auto-isolation metadata\n{lockfile}"
+    );
+}
+
 async fn mount_required_peer_host(mock: &MockRegistry) {
     mock.with_manifest_package(
         serde_json::json!({
@@ -285,4 +379,15 @@ fn output_text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn assert_install_hash_linker(project_dir: &std::path::Path, expected: &str) {
+    let install_hash = std::fs::read_to_string(project_dir.join(".lpm").join("install-hash"))
+        .expect("failed to read .lpm/install-hash");
+    assert!(
+        install_hash
+            .lines()
+            .any(|line| line == format!("l:{expected}")),
+        "expected install hash to record linker {expected:?}\n{install_hash}"
+    );
 }

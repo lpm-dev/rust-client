@@ -147,6 +147,23 @@ pub struct LockfileMetadata {
     /// Which resolver produced this lockfile.
     #[serde(default, rename = "resolved-with")]
     pub resolved_with: Option<String>,
+    /// True when a default-hoisted install detected peer conflicts and
+    /// materialized the project with the isolated linker instead.
+    ///
+    /// This is install-orchestration metadata, not resolver identity:
+    /// warm installs need it before fresh resolution so they can keep
+    /// using the peer-preserving layout while the manifest and lockfile
+    /// are unchanged.
+    #[serde(
+        default,
+        rename = "auto-isolated-peer-conflicts",
+        skip_serializing_if = "is_false"
+    )]
+    pub auto_isolated_peer_conflicts: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A single resolved package in the lockfile.
@@ -362,6 +379,7 @@ impl Lockfile {
             metadata: LockfileMetadata {
                 lockfile_version: LOCKFILE_VERSION,
                 resolved_with: Some(resolver.to_string()),
+                auto_isolated_peer_conflicts: false,
             },
             packages: Vec::new(),
             root_aliases: std::collections::BTreeMap::new(),
@@ -532,14 +550,11 @@ impl Lockfile {
     /// Write both TOML and binary lockfiles atomically.
     /// The binary file is written alongside the TOML file as `lpm.lockb`.
     ///
-    /// The v1 binary format has no section for npm-alias metadata,
+    /// The v1 binary format has no section for some TOML metadata,
     /// so we gate the binary write on [`binary::binary_format_supports`].
-    /// When the lockfile declares any alias (root or transitive), the
-    /// binary file is skipped — and any stale binary file from a prior
-    /// non-aliased install is removed so `read_fast` doesn't silently
-    /// pick it over the authoritative TOML. Aliased projects take the
-    /// ~10ms TOML parse cost on warm install until binary v2 gains an
-    /// alias section.
+    /// When the lockfile uses TOML-only fields, the binary file is skipped
+    /// and any stale binary file from a prior install is removed so
+    /// `read_fast` doesn't silently pick it over the authoritative TOML.
     pub fn write_all(&self, toml_path: &Path) -> Result<(), LockfileError> {
         self.write_to_file(toml_path)?;
         let binary_path = toml_path.with_extension("lockb");
@@ -548,7 +563,7 @@ impl Lockfile {
         } else if binary_path.exists() {
             let _ = std::fs::remove_file(&binary_path);
             tracing::debug!(
-                "removed stale binary lockfile ({}): project has npm-alias metadata not expressible in v1 binary format",
+                "removed stale binary lockfile ({}): lockfile has TOML-only metadata not expressible in v1 binary format",
                 binary_path.display()
             );
         }
@@ -859,6 +874,42 @@ mod tests {
             Some(DEFAULT_RESOLVED_WITH),
         );
         assert_eq!(DEFAULT_RESOLVED_WITH, "greedy-fusion");
+    }
+
+    #[test]
+    fn auto_isolated_peer_conflicts_metadata_round_trips_when_true() {
+        let mut lf = Lockfile::new();
+        lf.metadata.auto_isolated_peer_conflicts = true;
+
+        let toml = lf.to_toml().unwrap();
+        assert!(
+            toml.contains("auto-isolated-peer-conflicts = true"),
+            "true auto-isolated metadata must serialize: {toml}"
+        );
+
+        let parsed = Lockfile::from_toml(&toml).unwrap();
+        assert!(parsed.metadata.auto_isolated_peer_conflicts);
+    }
+
+    #[test]
+    fn auto_isolated_peer_conflicts_metadata_defaults_false_and_is_skipped() {
+        let lf = Lockfile::new();
+
+        let toml = lf.to_toml().unwrap();
+        assert!(
+            !toml.contains("auto-isolated-peer-conflicts"),
+            "false auto-isolated metadata must stay out of ordinary lockfiles: {toml}"
+        );
+
+        let parsed = Lockfile::from_toml(
+            r#"
+[metadata]
+lockfile-version = 2
+resolved-with = "greedy-fusion"
+"#,
+        )
+        .unwrap();
+        assert!(!parsed.metadata.auto_isolated_peer_conflicts);
     }
 
     #[test]
@@ -1284,6 +1335,34 @@ version = "1.0.0"
         assert!(
             !binary_path.exists(),
             "alias-bearing lockfile must not leave a stale binary behind"
+        );
+    }
+
+    #[test]
+    fn write_all_skips_binary_when_auto_isolated_peer_conflicts_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = toml_path.with_extension("lockb");
+
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            source: None,
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        });
+        lf.write_all(&toml_path).unwrap();
+        assert!(binary_path.exists(), "plain lockfile must write binary");
+
+        lf.metadata.auto_isolated_peer_conflicts = true;
+        lf.write_all(&toml_path).unwrap();
+        assert!(
+            !binary_path.exists(),
+            "auto-isolated peer-conflict metadata must not leave a stale binary behind"
         );
     }
 
@@ -2631,6 +2710,18 @@ dependencies = []
         assert!(
             !crate::binary::binary_format_supports(&lf),
             "per-package peers must trigger binary fallback to TOML"
+        );
+    }
+
+    #[test]
+    fn auto_isolated_peer_conflicts_metadata_triggers_binary_fallback() {
+        let mut lf = Lockfile::new();
+        assert!(crate::binary::binary_format_supports(&lf));
+
+        lf.metadata.auto_isolated_peer_conflicts = true;
+        assert!(
+            !crate::binary::binary_format_supports(&lf),
+            "auto-isolated peer-conflict metadata must stay in reviewer-visible TOML"
         );
     }
 

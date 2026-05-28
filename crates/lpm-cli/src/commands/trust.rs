@@ -784,6 +784,7 @@ mod tests {
             metadata: lpm_lockfile::LockfileMetadata {
                 lockfile_version: 1,
                 resolved_with: Some("test".into()),
+                auto_isolated_peer_conflicts: false,
             },
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
@@ -914,6 +915,7 @@ mod tests {
             metadata: lpm_lockfile::LockfileMetadata {
                 lockfile_version: 1,
                 resolved_with: Some("test".into()),
+                auto_isolated_peer_conflicts: false,
             },
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
@@ -952,6 +954,7 @@ mod tests {
             metadata: lpm_lockfile::LockfileMetadata {
                 lockfile_version: 1,
                 resolved_with: Some("test".into()),
+                auto_isolated_peer_conflicts: false,
             },
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
@@ -987,6 +990,7 @@ mod tests {
             metadata: lpm_lockfile::LockfileMetadata {
                 lockfile_version: 1,
                 resolved_with: Some("test".into()),
+                auto_isolated_peer_conflicts: false,
             },
             packages: vec![],
             root_aliases: Default::default(),
