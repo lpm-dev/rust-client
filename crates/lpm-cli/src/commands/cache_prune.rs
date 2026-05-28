@@ -774,7 +774,12 @@ mod tests {
     use chrono::DateTime;
 
     #[cfg(unix)]
-    use lpm_store::v2::{GraphKey, GraphKeyInputs, LinkMetaPlatform, LinkerModeTag, PlatformTuple};
+    use lpm_common::known_projects::{Entry, Registry};
+    #[cfg(unix)]
+    use lpm_store::v2::{
+        DepLink, GraphKey, GraphKeyInputs, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag,
+        PlatformTuple,
+    };
     use std::collections::HashMap;
     #[cfg(unix)]
     use std::sync::Arc;

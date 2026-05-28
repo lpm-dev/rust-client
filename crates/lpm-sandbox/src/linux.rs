@@ -1077,17 +1077,19 @@ mod tests {
         // probes here would test the sandbox's CORRECT /tmp
         // permission rather than its deny-default — the
         // Linux CI surfaced exactly this false-failure.
-        // Use `/var/tmp/lpm-probe-<pid>/` instead: `/var/tmp` is a
-        // real POSIX scratch directory (persistent across reboots,
-        // always writable by the test user) that is NOT in any
-        // sandbox rule, and is guaranteed disjoint from the
-        // tempfile default root.
+        // Use `/var/tmp/lpm-probe-<pid>/` instead, and pin this test's
+        // sandbox tmpdir to `/tmp` even when the outer test runner
+        // exports `TMPDIR=/var/tmp`. That keeps the probe outside the
+        // generated rule set while still using a normal writable
+        // POSIX scratch directory.
         let probe_dir = PathBuf::from("/var/tmp")
             .join(format!("lpm-sandbox-read-probe-{}", std::process::id()));
         std::fs::create_dir_all(&probe_dir).unwrap();
         let secret = probe_dir.join("secret.txt");
         std::fs::write(&secret, b"TOP SECRET").unwrap();
-        let sb = match new_for_platform(realistic_spec(), SandboxMode::Enforce) {
+        let mut spec = realistic_spec();
+        spec.tmpdir = PathBuf::from("/tmp");
+        let sb = match new_for_platform(spec, SandboxMode::Enforce) {
             Ok(sb) => sb,
             Err(SandboxError::KernelTooOld { .. }) => {
                 let _ = std::fs::remove_dir_all(&probe_dir);

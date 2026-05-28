@@ -60,6 +60,7 @@
 
 mod support;
 
+use std::path::Path;
 use std::process::Output;
 use std::time::{Duration, Instant};
 
@@ -142,7 +143,13 @@ fn run_install(project: &TempProject) -> Output {
 fn run_install_under_time(project: &TempProject) -> (Output, Option<u64>) {
     use std::process::{Command, Stdio};
     let bin = assert_cmd::cargo::cargo_bin("lpm-rs");
-    let mut cmd = Command::new("/usr/bin/time");
+    let time_path = Path::new("/usr/bin/time")
+        .exists()
+        .then_some("/usr/bin/time");
+    let Some(time_path) = time_path else {
+        return (run_install(project), None);
+    };
+    let mut cmd = Command::new(time_path);
 
     #[cfg(target_os = "macos")]
     cmd.arg("-l");

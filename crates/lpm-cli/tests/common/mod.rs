@@ -93,6 +93,10 @@ pub fn run_lpm_with_env(
         .env("NO_COLOR", "1")
         .env("LPM_NO_UPDATE_CHECK", "1")
         .env("LPM_DISABLE_TELEMETRY", "1")
+        .env(
+            "LPM_SECURITY_POLICY_PATH",
+            lpm_home.join("security-policy.toml"),
+        )
         .env_remove("RUST_LOG");
     match registry_url {
         Some(url) => {
