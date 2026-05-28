@@ -962,8 +962,7 @@ fn cache_path(cache_root: &Path, name: &str, version: &str) -> PathBuf {
 fn current_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Read a cache entry if it exists AND is fresh AND has the expected

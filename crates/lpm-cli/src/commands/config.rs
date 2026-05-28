@@ -2,8 +2,8 @@ use crate::output;
 use crate::prompt::prompt_err;
 use crate::provenance_fetch::EnforceMode;
 use crate::sandbox_config::ResolvedSandboxMode;
-use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use lpm_common::{LpmError, LpmRoot};
 use std::io::IsTerminal;
 
 /// CLI configuration management.
@@ -29,10 +29,7 @@ pub async fn run(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let config_path = dirs::home_dir()
-        .ok_or_else(|| LpmError::Registry("could not determine home dir".into()))?
-        .join(".lpm")
-        .join("config.toml");
+    let config_path = LpmRoot::from_env()?.root().join("config.toml");
 
     if action == "scripts" {
         return run_scripts_wizard(&config_path, set, json_output).await;
@@ -221,16 +218,15 @@ fn guard_generic_set_against_force_floor(
 ) -> Result<(), LpmError> {
     let global = global_config_view_from_value(config);
     match key {
-        "force-security-floor" => {
+        "force-security-floor"
             if crate::security_floor::force_security_floor_enabled(&global)
-                && !matches!(value, "true" | "1" | "yes")
-            {
-                return Err(crate::security_floor::security_floor_write_error(
-                    "force-security-floor",
-                    value,
-                    "true",
-                ));
-            }
+                && !matches!(value, "true" | "1" | "yes") =>
+        {
+            return Err(crate::security_floor::security_floor_write_error(
+                "force-security-floor",
+                value,
+                "true",
+            ));
         }
         SCRIPT_POLICY_KEY => {
             if let Ok(requested) = crate::script_policy_config::ScriptPolicy::parse(value) {
@@ -262,14 +258,12 @@ fn guard_generic_delete_against_force_floor(
             &global,
             ResolvedSandboxMode::Default,
         )?,
-        "force-security-floor" => {
-            if crate::security_floor::force_security_floor_enabled(&global) {
-                return Err(crate::security_floor::security_floor_write_error(
-                    "force-security-floor",
-                    "unset",
-                    "true",
-                ));
-            }
+        "force-security-floor" if crate::security_floor::force_security_floor_enabled(&global) => {
+            return Err(crate::security_floor::security_floor_write_error(
+                "force-security-floor",
+                "unset",
+                "true",
+            ));
         }
         _ => {}
     }

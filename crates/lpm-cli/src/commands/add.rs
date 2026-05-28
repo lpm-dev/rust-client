@@ -1912,15 +1912,13 @@ fn resolve_target_dir(
 
     match ecosystem {
         "swift" => {
-            let xcode_exists = std::fs::read_dir(project_dir)
-                .map(|entries| {
-                    entries.flatten().any(|e| {
-                        e.path()
-                            .extension()
-                            .is_some_and(|ext| ext == "xcodeproj" || ext == "xcworkspace")
-                    })
+            let xcode_exists = std::fs::read_dir(project_dir).is_ok_and(|entries| {
+                entries.flatten().any(|e| {
+                    e.path()
+                        .extension()
+                        .is_some_and(|ext| ext == "xcodeproj" || ext == "xcworkspace")
                 })
-                .unwrap_or(false);
+            });
 
             if xcode_exists {
                 // Swift Xcode: Packages/LPMComponents/Sources/{target}
@@ -2752,8 +2750,7 @@ fn should_warn_typosquatting(pkg_ref: &str, project_dir: &Path) -> Option<Typosq
     // If the name is in the lockfile, the user has already accepted it — skip the warning.
     let in_lockfile =
         lpm_lockfile::Lockfile::read_fast(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
-            .map(|lf| lf.packages.iter().any(|p| p.name == pkg_ref))
-            .unwrap_or(false);
+            .is_ok_and(|lf| lf.packages.iter().any(|p| p.name == pkg_ref));
 
     if in_lockfile {
         return None;

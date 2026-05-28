@@ -38,3 +38,56 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 pub(crate) fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
+
+/// Snapshot and redirect the process home env vars for tests.
+///
+/// `dirs::home_dir()` can use the Windows known-folder API, so tests
+/// that only set `HOME` are not isolated from the real user profile
+/// there. `LPM_TEST_HOME` gives crate path helpers a deterministic
+/// test-only override.
+pub(crate) struct HomeEnvSnapshot {
+    prior_home: Option<std::ffi::OsString>,
+    prior_lpm_test_home: Option<std::ffi::OsString>,
+    #[cfg(windows)]
+    prior_userprofile: Option<std::ffi::OsString>,
+}
+
+impl HomeEnvSnapshot {
+    pub(crate) fn set(path: &std::path::Path) -> Self {
+        let snapshot = Self {
+            prior_home: std::env::var_os("HOME"),
+            prior_lpm_test_home: std::env::var_os("LPM_TEST_HOME"),
+            #[cfg(windows)]
+            prior_userprofile: std::env::var_os("USERPROFILE"),
+        };
+
+        // SAFETY: callers hold `ENV_LOCK`, serialising process-wide env mutation.
+        unsafe {
+            std::env::set_var("HOME", path);
+            std::env::set_var("LPM_TEST_HOME", path);
+            #[cfg(windows)]
+            std::env::set_var("USERPROFILE", path);
+        }
+
+        snapshot
+    }
+
+    pub(crate) fn restore(self) {
+        // SAFETY: callers hold `ENV_LOCK`, serialising process-wide env mutation.
+        unsafe {
+            match self.prior_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prior_lpm_test_home {
+                Some(value) => std::env::set_var("LPM_TEST_HOME", value),
+                None => std::env::remove_var("LPM_TEST_HOME"),
+            }
+            #[cfg(windows)]
+            match self.prior_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+}

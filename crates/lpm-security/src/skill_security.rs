@@ -186,15 +186,11 @@ pub fn parse_skill_frontmatter(content: &str) -> (SkillMeta, String, Vec<String>
             let key = key.trim();
             let value = value.trim().trim_matches('"').trim_matches('\'');
 
-            match key {
-                "name" => meta.name = Some(value.to_string()),
-                "description" => meta.description = Some(value.to_string()),
-                "version" => meta.version = Some(value.to_string()),
-                "globs" => {
-                    if value.is_empty() {
-                        in_globs = true;
-                    }
-                }
+            match (key, value) {
+                ("name", value) => meta.name = Some(value.to_string()),
+                ("description", value) => meta.description = Some(value.to_string()),
+                ("version", value) => meta.version = Some(value.to_string()),
+                ("globs", "") => in_globs = true,
                 _ => {} // ignore unknown fields
             }
         }

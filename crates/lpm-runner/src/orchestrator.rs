@@ -1195,9 +1195,14 @@ fn ctrlc_handler(shutdown_state: Arc<AtomicU8>, children: Arc<Mutex<Vec<(String,
             });
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = (shutdown_state, children);
+    }
 }
 
 /// Immediately SIGKILL all children (used for double Ctrl+C escalation).
+#[cfg(unix)]
 fn force_kill_children(children: &Arc<Mutex<Vec<(String, Child)>>>) {
     let mut locked = children.lock();
     for (name, child) in locked.iter_mut() {

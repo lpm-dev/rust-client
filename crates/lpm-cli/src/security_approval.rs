@@ -44,7 +44,7 @@ const APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION: u32 = 1;
 const AUDIT_EVENT_SCHEMA_VERSION: u32 = 1;
 const AUDIT_HEAD_SCHEMA_VERSION: u32 = 1;
 
-#[cfg(test)]
+#[cfg(debug_assertions)]
 const SECURITY_POLICY_PATH_ENV: &str = "LPM_SECURITY_POLICY_PATH";
 #[cfg(test)]
 const TEST_SECRET_ENV: &str = "LPM_TEST_SECURITY_SECRET_HEX";
@@ -477,7 +477,7 @@ fn audit_head_path() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("audit-head.json"))
 }
 
-#[cfg(test)]
+#[cfg(debug_assertions)]
 fn managed_policy_path_override() -> Option<PathBuf> {
     std::env::var(SECURITY_POLICY_PATH_ENV)
         .ok()
@@ -485,7 +485,7 @@ fn managed_policy_path_override() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-#[cfg(not(test))]
+#[cfg(not(debug_assertions))]
 fn managed_policy_path_override() -> Option<PathBuf> {
     None
 }
@@ -1863,7 +1863,7 @@ fn read_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
 
 pub fn list_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
     let mut grants = read_active_unlocks()?;
-    grants.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
+    grants.sort_by_key(|left| left.expires_at);
     Ok(grants)
 }
 
@@ -1872,7 +1872,7 @@ pub fn list_active_global_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
         .into_iter()
         .filter(|grant| grant.target == UnlockTargetKind::Global)
         .collect();
-    grants.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
+    grants.sort_by_key(|left| left.expires_at);
     Ok(grants)
 }
 
@@ -1885,7 +1885,7 @@ pub fn list_active_project_unlocks(project_dir: &Path) -> Result<Vec<UnlockGrant
                 && grant.project_root.as_deref() == Some(root.as_str())
         })
         .collect();
-    grants.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
+    grants.sort_by_key(|left| left.expires_at);
     Ok(grants)
 }
 

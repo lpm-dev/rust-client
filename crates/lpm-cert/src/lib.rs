@@ -125,6 +125,9 @@ impl PermissionDrift {
 /// drift on Unix. Returns one entry per drifted artifact; empty `Vec` if clean.
 /// On non-Unix, always returns `Ok(vec![])` (modes don't apply).
 pub fn audit_cert_permissions() -> Result<Vec<PermissionDrift>, LpmError> {
+    #[cfg(not(unix))]
+    let out: Vec<PermissionDrift> = Vec::new();
+    #[cfg(unix)]
     let mut out: Vec<PermissionDrift> = Vec::new();
     #[cfg(unix)]
     {

@@ -172,9 +172,7 @@ pub fn finalize_legacy_cleanup(name: &str, version: &str, binary_name: &str) {
 
 /// Check if a plugin version is installed on the current platform.
 pub fn is_installed(name: &str, version: &str, platform: &str, binary_name: &str) -> bool {
-    plugin_binary_path(name, version, platform, binary_name)
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    plugin_binary_path(name, version, platform, binary_name).is_ok_and(|p| p.exists())
 }
 
 /// List installed versions of a plugin (across all platforms — the

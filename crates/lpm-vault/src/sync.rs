@@ -96,8 +96,7 @@ fn sync_request_timeout(default: std::time::Duration) -> std::time::Duration {
     match std::env::var("LPM_TEST_SYNC_TIMEOUT_MS") {
         Ok(value) => value
             .parse::<u64>()
-            .map(std::time::Duration::from_millis)
-            .unwrap_or(default),
+            .map_or(default, std::time::Duration::from_millis),
         Err(_) => default,
     }
 }
@@ -976,14 +975,14 @@ pub struct PendingPublicKey {
 }
 
 fn pending_x25519_key_path() -> Result<std::path::PathBuf, String> {
-    Ok(dirs::home_dir()
+    Ok(crate::lpm_home_dir()
         .ok_or("no home directory")?
         .join(".lpm")
         .join(".x25519_key.pending"))
 }
 
 fn live_x25519_key_path() -> Result<std::path::PathBuf, String> {
-    Ok(dirs::home_dir()
+    Ok(crate::lpm_home_dir()
         .ok_or("no home directory")?
         .join(".lpm")
         .join(".x25519_key"))
@@ -1161,7 +1160,7 @@ fn should_use_file_backed_x25519_keypair(force_file: bool, live_key_exists: bool
 }
 
 fn get_or_create_file_backed_x25519_keypair() -> Result<([u8; 32], [u8; 32]), String> {
-    let key_path = dirs::home_dir()
+    let key_path = crate::lpm_home_dir()
         .ok_or("no home directory")?
         .join(".lpm")
         .join(".x25519_key");
@@ -1821,19 +1820,18 @@ mod tests {
     /// immediately and the lock guard outlives this struct.
     struct IsolatedVaultKeyEnv {
         _tmp: tempfile::TempDir,
-        prior_home: Option<std::ffi::OsString>,
+        prior_home: Option<crate::test_env_lock::HomeEnvSnapshot>,
         prior_force_file: Option<std::ffi::OsString>,
     }
 
     impl IsolatedVaultKeyEnv {
         fn new() -> Self {
             let tmp = tempfile::tempdir().expect("tempdir for vault key isolation");
-            let prior_home = std::env::var_os("HOME");
+            let prior_home = Some(crate::test_env_lock::HomeEnvSnapshot::set(tmp.path()));
             let prior_force_file = std::env::var_os("LPM_FORCE_FILE_VAULT");
             // SAFETY: caller holds env_lock_guard(), serialising env mutation
             // across all of this crate's tests (shared lock).
             unsafe {
-                std::env::set_var("HOME", tmp.path());
                 std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
             }
             IsolatedVaultKeyEnv {
@@ -1848,14 +1846,13 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: still inside the env_lock-protected section.
             unsafe {
-                match &self.prior_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
                 match &self.prior_force_file {
                     Some(v) => std::env::set_var("LPM_FORCE_FILE_VAULT", v),
                     None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
                 }
+            }
+            if let Some(prior_home) = self.prior_home.take() {
+                prior_home.restore();
             }
         }
     }
@@ -2524,11 +2521,10 @@ mod tests {
     fn push_org_with_keys_regenerates_corrupted_forced_file_key_and_skips_members_without_keys() {
         let _guard = env_lock_guard();
         let temp = tempfile::tempdir().expect("failed to create temp home for forced vault test");
-        let original_home = std::env::var_os("HOME");
+        let original_home = crate::test_env_lock::HomeEnvSnapshot::set(temp.path());
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
 
         unsafe {
-            std::env::set_var("HOME", temp.path());
             std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
         }
 
@@ -2663,10 +2659,7 @@ mod tests {
             assert!(push_body.contains("\"wrappedKeys\":["));
         });
 
-        match original_home {
-            Some(value) => unsafe { std::env::set_var("HOME", value) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        original_home.restore();
         match original_force_file_vault {
             Some(value) => unsafe { std::env::set_var("LPM_FORCE_FILE_VAULT", value) },
             None => unsafe { std::env::remove_var("LPM_FORCE_FILE_VAULT") },
@@ -2682,11 +2675,10 @@ mod tests {
         // land on the wire alongside the encrypted blob and wrapped keys.
         let _guard = env_lock_guard();
         let temp = tempfile::tempdir().expect("tempdir for metadata round-trip test");
-        let original_home = std::env::var_os("HOME");
+        let original_home = crate::test_env_lock::HomeEnvSnapshot::set(temp.path());
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
 
         unsafe {
-            std::env::set_var("HOME", temp.path());
             std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
         }
 
@@ -2827,10 +2819,7 @@ mod tests {
             );
         });
 
-        match original_home {
-            Some(value) => unsafe { std::env::set_var("HOME", value) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        original_home.restore();
         match original_force_file_vault {
             Some(value) => unsafe { std::env::set_var("LPM_FORCE_FILE_VAULT", value) },
             None => unsafe { std::env::remove_var("LPM_FORCE_FILE_VAULT") },
@@ -2845,11 +2834,10 @@ mod tests {
         // metadata" contract — server keeps last-known-good schema/name.
         let _guard = env_lock_guard();
         let temp = tempfile::tempdir().expect("tempdir for None-metadata test");
-        let original_home = std::env::var_os("HOME");
+        let original_home = crate::test_env_lock::HomeEnvSnapshot::set(temp.path());
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
 
         unsafe {
-            std::env::set_var("HOME", temp.path());
             std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
         }
 
@@ -2953,10 +2941,7 @@ mod tests {
             );
         });
 
-        match original_home {
-            Some(value) => unsafe { std::env::set_var("HOME", value) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        original_home.restore();
         match original_force_file_vault {
             Some(value) => unsafe { std::env::set_var("LPM_FORCE_FILE_VAULT", value) },
             None => unsafe { std::env::remove_var("LPM_FORCE_FILE_VAULT") },

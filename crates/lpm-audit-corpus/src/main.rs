@@ -2698,7 +2698,7 @@ fn section_prompt_shape_breakdown(out: &mut String, audits: &[PackageAudit]) {
         }
     }
     let mut sorted: Vec<(ScriptShape, ShapeBucket)> = buckets.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.count));
     out.push_str("## Prompt-shape breakdown\n\n");
     out.push_str(
         "Each prompted script categorised by normalised shape. The \

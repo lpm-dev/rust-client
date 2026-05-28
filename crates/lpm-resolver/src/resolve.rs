@@ -698,7 +698,7 @@ fn format_solution(
             }
         })
         .collect();
-    resolved.sort_by(|a, b| a.package.to_string().cmp(&b.package.to_string()));
+    resolved.sort_by_key(|a| a.package.to_string());
     resolved
 }
 

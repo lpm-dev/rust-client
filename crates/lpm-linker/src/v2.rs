@@ -1103,6 +1103,7 @@ fn create_bin_links_v2(
             if link_path.symlink_metadata().is_ok() {
                 let _ = std::fs::remove_file(&link_path);
             }
+            #[cfg(unix)]
             let relative =
                 pathdiff::diff_paths(&bin_target, &bin_dir).unwrap_or_else(|| bin_target.clone());
             #[cfg(unix)]

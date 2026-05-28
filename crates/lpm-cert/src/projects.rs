@@ -91,9 +91,7 @@ fn canonicalize_or_keep(p: &Path) -> String {
 
 /// True iff a project's local CA-issued leaf currently exists on disk.
 pub fn project_has_leaf(project_dir: &Path) -> bool {
-    paths::project_cert_dir(project_dir)
-        .map(|d| d.join("cert.pem").exists())
-        .unwrap_or(false)
+    paths::project_cert_dir(project_dir).is_ok_and(|d| d.join("cert.pem").exists())
 }
 
 #[cfg(test)]

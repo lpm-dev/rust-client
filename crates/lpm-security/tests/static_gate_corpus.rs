@@ -224,11 +224,9 @@ fn corpus_matches_expectations_and_has_no_fp_reds() {
     }
 
     let total = entries.len();
-    let green_rate_real = if green_real + amber_real > 0 {
-        (green_real * 100) / (green_real + amber_real)
-    } else {
-        0
-    };
+    let green_rate_real = (green_real * 100)
+        .checked_div(green_real + amber_real)
+        .unwrap_or(0);
 
     /// Green-rate floor over the non-adversarial subset. Flipped from
     /// printed telemetry to a hard assertion once the corpus grew past

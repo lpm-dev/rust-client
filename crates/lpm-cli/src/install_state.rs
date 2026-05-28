@@ -759,9 +759,10 @@ pub fn write_install_hash(
     // negatives are impossible for the file: / link: case: every
     // such spec is `"<key>": "file:..."` / `"<key>": "link:..."`.
     let sentinel = hash_dir.join("has-local-sources");
-    let needs_slow_path = std::fs::read_to_string(project_dir.join("package.json"))
-        .map(|s| s.contains("\"file:") || s.contains("\"link:") || s.contains("\"workspaces\""))
-        .unwrap_or(false);
+    let needs_slow_path =
+        std::fs::read_to_string(project_dir.join("package.json")).is_ok_and(|s| {
+            s.contains("\"file:") || s.contains("\"link:") || s.contains("\"workspaces\"")
+        });
     if needs_slow_path {
         write_state_file_owner_only(&sentinel, b"")?;
     } else if sentinel.exists() {

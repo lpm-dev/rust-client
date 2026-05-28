@@ -136,7 +136,7 @@ pub fn create_tarball(
             // the 500 MB ceiling. Pre-fix the check ran only after
             // `create_tarball` returned, by which time the bytes were
             // already in memory.
-            let file_size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
+            let file_size = std::fs::metadata(&full_path).map_or(0, |m| m.len());
             if file_size > MAX_TARBALL_FILE_BYTES {
                 return Err(LpmError::Registry(format!(
                     "file `{}` size {} exceeds per-file cap of {} bytes — \

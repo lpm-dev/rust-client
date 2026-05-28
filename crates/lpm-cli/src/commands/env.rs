@@ -467,7 +467,7 @@ pub async fn run(
 
     if args.is_empty() {
         // Default: list keys
-        vars_list(project_dir, None, false, json_output);
+        vars_list(project_dir, None, false, json_output)?;
         return Ok(());
     }
 
@@ -523,9 +523,10 @@ pub async fn run(
             let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
 
             let value = match &resolved_env {
-                Some(env) => lpm_vault::get_env(project_dir, env, key),
-                None => lpm_vault::get(project_dir, key),
+                Some(env) => lpm_vault::try_get_env(project_dir, env, key),
+                None => lpm_vault::try_get(project_dir, key),
             };
+            let value = value.map_err(LpmError::Script)?;
 
             match value {
                 Some(value) => {
@@ -551,7 +552,7 @@ pub async fn run(
             let (env_input, remaining) = parse_env_flag(&args[1..])?;
             let reveal = remaining.contains(&"--reveal");
             let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
-            vars_list(project_dir, resolved_env.as_deref(), reveal, json_output);
+            vars_list(project_dir, resolved_env.as_deref(), reveal, json_output)?;
         }
 
         "delete" => {
@@ -671,7 +672,8 @@ pub async fn run(
                 LpmError::Script("no vault configured. Run `lpm env set` first".into())
             })?;
 
-            let all_envs = lpm_vault::get_all_environments(project_dir);
+            let all_envs =
+                lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)?;
             let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
             if total_keys == 0 {
                 return Err(LpmError::Script("vault is empty, nothing to push".into()));
@@ -820,7 +822,8 @@ pub async fn run(
                     if let Some(remote_envs) = wrapper.get("environments") {
                         let mut total = 0;
                         for (env_name, remote_secrets) in remote_envs {
-                            let mut env = lpm_vault::get_all_env(project_dir, env_name);
+                            let mut env = lpm_vault::try_get_all_env(project_dir, env_name)
+                                .map_err(LpmError::Script)?;
                             env.extend(remote_secrets.clone());
                             total += env.len();
                             let pairs: Vec<(&str, &str)> =
@@ -835,7 +838,8 @@ pub async fn run(
                 } else if let Ok(remote_secrets) =
                     serde_json::from_str::<std::collections::HashMap<String, String>>(&raw_json)
                 {
-                    let mut merged = lpm_vault::get_all(project_dir);
+                    let mut merged =
+                        lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
                     merged.extend(remote_secrets);
                     total_keys = merged.len();
                     let pairs: Vec<(&str, &str)> = merged
@@ -868,7 +872,7 @@ pub async fn run(
             }
 
             let project_name = lpm_vault::vault_id::read_project_name(project_dir);
-            let local_secrets = lpm_vault::get_all(project_dir);
+            let local_secrets = lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
 
             // Confirmation prompt
             if !yes && !json_output {
@@ -983,7 +987,8 @@ pub async fn run(
                 LpmError::Script("no vault configured. Run `lpm env set` first".into())
             })?;
 
-            let all_envs = lpm_vault::get_all_environments(project_dir);
+            let all_envs =
+                lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)?;
             let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
             if total_keys == 0 {
                 return Err(LpmError::Script("vault is empty, nothing to share".into()));
@@ -1066,7 +1071,7 @@ pub async fn run(
             let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url).await?;
 
-            let secrets = lpm_vault::get_all(project_dir);
+            let secrets = lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
             if secrets.is_empty() {
                 return Err(LpmError::Script("vault is empty, nothing to rotate".into()));
             }
@@ -1299,8 +1304,7 @@ pub async fn run(
         }
 
         "ls" => {
-            vars_ls(project_dir, json_output);
-            return Ok(());
+            return vars_ls(project_dir, json_output);
         }
 
         "copy" | "cp" => {
@@ -1421,7 +1425,7 @@ fn vars_init(
     let empty_env_map = HashMap::new();
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());
-    let vault_envs = lpm_vault::get_all_environments(project_dir);
+    let vault_envs = lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)?;
 
     // Build the list of environments to process
     let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
@@ -1639,7 +1643,7 @@ fn vars_init(
 /// `lpm env ls` — environment overview table.
 ///
 /// Shows all environments with variable counts, schema status, and aliases.
-fn vars_ls(project_dir: &std::path::Path, json_output: bool) {
+fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
     let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
         .ok()
         .flatten();
@@ -1648,7 +1652,7 @@ fn vars_ls(project_dir: &std::path::Path, json_output: bool) {
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());
     let schema = config.as_ref().and_then(|c| c.env_schema.as_ref());
-    let vault_envs = lpm_vault::get_all_environments(project_dir);
+    let vault_envs = lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)?;
     let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
 
     if all_envs.is_empty() {
@@ -1661,7 +1665,7 @@ fn vars_ls(project_dir: &std::path::Path, json_output: bool) {
             output::info("no environments found");
             println!("  Run {} to set up", "lpm env init".cyan());
         }
-        return;
+        return Ok(());
     }
 
     // Build rows
@@ -1731,7 +1735,7 @@ fn vars_ls(project_dir: &std::path::Path, json_output: bool) {
             "{}",
             serde_json::json!({"success": true, "environments": json_rows})
         );
-        return;
+        return Ok(());
     }
 
     // Calculate column widths
@@ -1791,6 +1795,7 @@ fn vars_ls(project_dir: &std::path::Path, json_output: bool) {
         );
     }
     println!();
+    Ok(())
 }
 
 /// `lpm env copy <src> <dst>` — copy all secrets from one environment to another.
@@ -1819,7 +1824,8 @@ fn vars_copy(
         ));
     }
 
-    let src_secrets = lpm_vault::get_all_env(project_dir, &resolved_src.storage_key);
+    let src_secrets = lpm_vault::try_get_all_env(project_dir, &resolved_src.storage_key)
+        .map_err(LpmError::Script)?;
     if src_secrets.is_empty() {
         return Err(LpmError::Script(format!(
             "no secrets in source environment \"{}\"",
@@ -1827,7 +1833,8 @@ fn vars_copy(
         )));
     }
 
-    let dst_secrets = lpm_vault::get_all_env(project_dir, &resolved_dst.storage_key);
+    let dst_secrets = lpm_vault::try_get_all_env(project_dir, &resolved_dst.storage_key)
+        .map_err(LpmError::Script)?;
 
     // Compute what will be copied
     let mut to_copy = Vec::new();
@@ -1996,7 +2003,7 @@ fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Result<(), Lp
     // Discover all environments via the canonical resolver.
     // This produces a consistent, deduplicated list from config + vault,
     // with legacy vault keys surfaced separately (never collapsed).
-    let vault_envs = lpm_vault::get_all_environments(project_dir);
+    let vault_envs = lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)?;
     let empty_env_map = std::collections::HashMap::new();
     let all_envs = lpm_env::resolver::list_all(
         lpm_config.as_ref().map_or(&empty_env_map, |c| &c.env),
@@ -2508,7 +2515,7 @@ async fn vars_platform_status(
     let empty_env_map = HashMap::new();
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());
-    let vault_envs = lpm_vault::get_all_environments(project_dir);
+    let vault_envs = lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)?;
     let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
 
     // Collect all known environment names from config + vault
@@ -3461,11 +3468,12 @@ fn vars_list(
     env_name: Option<&str>,
     reveal: bool,
     json_output: bool,
-) {
+) -> Result<(), LpmError> {
     let secrets = match env_name {
-        Some(env) => lpm_vault::get_all_env(project_dir, env),
-        None => lpm_vault::get_all(project_dir),
+        Some(env) => lpm_vault::try_get_all_env(project_dir, env),
+        None => lpm_vault::try_get_all(project_dir),
     };
+    let secrets = secrets.map_err(LpmError::Script)?;
     let env_label = env_name.unwrap_or("default");
 
     if json_output {
@@ -3491,6 +3499,7 @@ fn vars_list(
             }
         }
     }
+    Ok(())
 }
 
 /// List cloud vaults — personal or org.
@@ -3621,8 +3630,10 @@ async fn vars_diff(
         // Compare two local environments — resolve aliases to canonical names
         let resolved_a = lpm_env::resolver::resolve(args[0], env_map, environments);
         let resolved_b = lpm_env::resolver::resolve(args[1], env_map, environments);
-        let a = lpm_vault::get_all_env(project_dir, &resolved_a.storage_key);
-        let b = lpm_vault::get_all_env(project_dir, &resolved_b.storage_key);
+        let a = lpm_vault::try_get_all_env(project_dir, &resolved_a.storage_key)
+            .map_err(LpmError::Script)?;
+        let b = lpm_vault::try_get_all_env(project_dir, &resolved_b.storage_key)
+            .map_err(LpmError::Script)?;
         (
             format!("{} (local)", resolved_a.canonical),
             a,
@@ -3632,7 +3643,8 @@ async fn vars_diff(
     } else if args.len() == 1 {
         // Compare specific env local vs cloud — fetch the same env from cloud, not "default"
         let resolved = lpm_env::resolver::resolve(args[0], env_map, environments);
-        let local = lpm_vault::get_all_env(project_dir, &resolved.storage_key);
+        let local = lpm_vault::try_get_all_env(project_dir, &resolved.storage_key)
+            .map_err(LpmError::Script)?;
 
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
@@ -3652,7 +3664,7 @@ async fn vars_diff(
         )
     } else {
         // Default: local default vs cloud
-        let local = lpm_vault::get_all(project_dir);
+        let local = lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
 
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
@@ -4036,7 +4048,7 @@ fn vars_validate(
         })
         .collect();
 
-    let secrets = lpm_vault::get_all(project_dir);
+    let secrets = lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
 
     let mut present = Vec::new();
     let mut missing = Vec::new();

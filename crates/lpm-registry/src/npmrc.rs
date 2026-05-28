@@ -1190,11 +1190,9 @@ const PROJECT_MARKERS: &[&str] = &["package.json"];
 /// symlinks — `mkdir /tmp/package.json` must not qualify `/tmp` as a
 /// project root.
 fn dir_has_regular_marker(dir: &Path) -> bool {
-    PROJECT_MARKERS.iter().any(|m| {
-        std::fs::metadata(dir.join(m))
-            .map(|meta| meta.is_file())
-            .unwrap_or(false)
-    })
+    PROJECT_MARKERS
+        .iter()
+        .any(|m| std::fs::metadata(dir.join(m)).is_ok_and(|meta| meta.is_file()))
 }
 
 /// Disposition of an `.npmrc` candidate path.

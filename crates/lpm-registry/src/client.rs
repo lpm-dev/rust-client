@@ -4174,8 +4174,7 @@ pub fn is_localhost_url(url: &str) -> bool {
     let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
     normalized_host
         .parse::<std::net::IpAddr>()
-        .map(is_loopback_ip)
-        .unwrap_or(false)
+        .is_ok_and(is_loopback_ip)
 }
 
 /// Loopback check that handles both native loopback (`127.0.0.0/8`,
@@ -4194,9 +4193,7 @@ fn is_loopback_ip(addr: std::net::IpAddr) -> bool {
 
 /// Check if a URL uses the HTTPS scheme.
 pub fn is_https_url(url: &str) -> bool {
-    reqwest::Url::parse(url)
-        .map(|parsed| parsed.scheme() == "https")
-        .unwrap_or(false)
+    reqwest::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "https")
 }
 
 /// Pre-validate a PEM root before handing it to
@@ -4278,9 +4275,7 @@ fn validate_pem_root(pem_bytes: &[u8], source: &str, line: usize) -> Result<(), 
 /// other non-HTTPS scheme. See
 /// [`RegistryClient::check_tarball_url_scheme`] for the enforcement site.
 pub fn is_http_url(url: &str) -> bool {
-    reqwest::Url::parse(url)
-        .map(|parsed| parsed.scheme() == "http")
-        .unwrap_or(false)
+    reqwest::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "http")
 }
 
 /// Outcome of [`evaluate_cached_url`] — gate on lockfile-stored tarball

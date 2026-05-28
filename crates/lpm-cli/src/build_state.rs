@@ -263,8 +263,7 @@ pub fn write_build_state(project_dir: &Path, state: &BuildState) -> Result<(), L
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let tmp = lpm_dir.join(format!(".{BUILD_STATE_FILENAME}.{pid}.{nanos}.tmp"));
 
     let json = serde_json::to_string_pretty(state)

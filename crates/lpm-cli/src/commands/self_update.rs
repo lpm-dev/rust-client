@@ -951,8 +951,7 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
             "current_exe": current_exe.display().to_string(),
             "updated_at_unix_secs": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+                .map_or(0, |d| d.as_secs()),
             "previous_binary_version": env!("CARGO_PKG_VERSION"),
         });
         if let Err(e) = std::fs::write(
@@ -1010,7 +1009,7 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
         // `.old` file when this process exits; the next run of the new
         // binary can sweep it.
         let _ = std::fs::remove_file(&old_path);
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(unix)]

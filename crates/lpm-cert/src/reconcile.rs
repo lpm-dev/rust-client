@@ -201,9 +201,7 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
     // at the previous-root is gone, the .previous files are safe to delete in this run.
     let prev_safe_to_remove = unresolved_old_fps.is_empty()
         && !rotate::read_grace_entries()?.iter().any(|e| {
-            paths::ca_dir()
-                .map(|d| d.join("rootCA.pem.previous").exists())
-                .unwrap_or(false)
+            paths::ca_dir().is_ok_and(|d| d.join("rootCA.pem.previous").exists())
                 && grace_entry_points_at_previous(e)
         });
 
@@ -304,9 +302,7 @@ pub fn scan_unresolved_reconcile_required() -> Result<BTreeSet<String>, LpmError
 }
 
 fn grace_entry_points_at_previous(_e: &rotate::GraceEntry) -> bool {
-    paths::ca_dir()
-        .map(|d| d.join("rootCA.pem.previous").exists())
-        .unwrap_or(false)
+    paths::ca_dir().is_ok_and(|d| d.join("rootCA.pem.previous").exists())
 }
 
 pub fn audit_log_lines() -> Result<Vec<String>, LpmError> {
