@@ -11,7 +11,8 @@
 #
 # Two modes per run:
 #   - clean   (cold install, equal footing — wipes OUTSIDE timer)
-#   - full    (cold install, full wipe loop — wipes INSIDE timer)
+#   - full    (cold install, reset-each-iter — lpm rotates old state
+#              OUTSIDE timer; npm/pnpm/bun wipe INSIDE timer)
 #
 # Each tool wipes its own lockfile + cache per iter. CRITICAL: bun's
 # wipe must include BOTH `bun.lock` (modern text format) and `bun.lockb`
@@ -30,34 +31,95 @@ TAG="${2:-readme}"
 
 BIN="${LPM_BIN:-$(cd "$(dirname "$0")/../.." && pwd)/target/release/lpm-rs}"
 FIXTURE="${BENCH_PROJECT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)/bench/fixture-large}"
+BENCH_BASE="/tmp/lpm-bench-readme-roundrobin"
+WORK="${BENCH_WORK_DIR:-$BENCH_BASE/work}"
 RESULTS="/tmp/lpm-bench-readme-roundrobin/${TAG}-results"
-mkdir -p "$RESULTS"
+EFFECTIVE_LPM_HOME="${LPM_HOME:-$HOME/.lpm}"
+TRASH_DIR="$BENCH_BASE/${TAG}-trash"
+BUN_CACHE_DIR="${BENCH_BUN_CACHE_DIR:-$HOME/.bun/install/cache}"
+NPM_CACHE_DIR="${BENCH_NPM_CACHE_DIR:-$HOME/.npm}"
+DEFAULT_PNPM_STORE_DIR="$(pnpm store path 2>/dev/null || true)"
+PNPM_STORE_DIR="${BENCH_PNPM_STORE_DIR:-$DEFAULT_PNPM_STORE_DIR}"
+ROTATE_SEQ=0
+DEFERRED_DELETE=()
+
+mkdir -p "$RESULTS" "$TRASH_DIR"
 
 if [[ ! -x "$BIN" ]]; then echo "ERROR: missing $BIN — build with cargo build --release"; exit 1; fi
 if ! command -v bun &>/dev/null; then echo "ERROR: bun not on PATH"; exit 1; fi
 
 # Use a fresh work dir, not the in-tree fixture itself, so the `node_modules`
 # / lockfile churn doesn't pollute the committed fixture state.
-WORK="/tmp/lpm-bench-readme-roundrobin/work"
 rm -rf "$WORK" && mkdir -p "$WORK"
 cp "$FIXTURE/package.json" "$WORK/"
 
+cleanup_deferred_delete() {
+    if (( ${#DEFERRED_DELETE[@]} == 0 )); then
+        return
+    fi
+    rm -rf "${DEFERRED_DELETE[@]}" 2>/dev/null || true
+}
+
+rotate_out_of_band() {
+    local path=$1
+    local label=$2
+    if [[ ! -e "$path" ]]; then
+        return
+    fi
+    ROTATE_SEQ=$((ROTATE_SEQ + 1))
+    local rotated="$TRASH_DIR/${label}-iter-${i}-${ROTATE_SEQ}"
+    mv "$path" "$rotated"
+    DEFERRED_DELETE+=("$rotated")
+}
+
+prepare_full_lpm_reset() {
+    # Rotate old state out of band so full/lpm still starts from a cold home
+    # without timing recursive deletion.
+    mkdir -p "$EFFECTIVE_LPM_HOME"
+    rotate_out_of_band "$EFFECTIVE_LPM_HOME/cache" "lpm-cache"
+    rotate_out_of_band "$EFFECTIVE_LPM_HOME/store" "lpm-store"
+    rotate_out_of_band "$WORK/node_modules" "work-node_modules"
+    rotate_out_of_band "$WORK/.lpm" "work-lpm"
+    rm -f "$WORK/lpm.lock" "$WORK/lpm.lockb"
+}
+
+run_lpm_install() {
+    (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" "$BIN" install --allow-new --json) > /dev/null 2>&1
+}
+
+run_bun_install() {
+    (cd "$WORK" && bun install --ignore-scripts --cache-dir "$BUN_CACHE_DIR") > /dev/null 2>&1
+}
+
+run_npm_install() {
+    (cd "$WORK" && env npm_config_cache="$NPM_CACHE_DIR" npm install --ignore-scripts) > /dev/null 2>&1
+}
+
+run_pnpm_install() {
+    if [[ -n "$PNPM_STORE_DIR" ]]; then
+        (cd "$WORK" && pnpm install --ignore-scripts --store-dir "$PNPM_STORE_DIR") > /dev/null 2>&1
+    else
+        (cd "$WORK" && pnpm install --ignore-scripts) > /dev/null 2>&1
+    fi
+}
+
+trap cleanup_deferred_delete EXIT
+
 clean_lpm() {
-    rm -rf "${HOME}/.lpm/cache" "${HOME}/.lpm/store"
+    rm -rf "${EFFECTIVE_LPM_HOME}/cache" "${EFFECTIVE_LPM_HOME}/store"
     rm -rf "${WORK}/node_modules" "${WORK}/.lpm" \
            "${WORK}/lpm.lock" "${WORK}/lpm.lockb"
 }
 clean_bun() {
-    rm -rf "${HOME}/.bun/install/cache"
+    rm -rf "$BUN_CACHE_DIR"
     rm -rf "${WORK}/node_modules" "${WORK}/bun.lock" "${WORK}/bun.lockb"
 }
 clean_npm() {
-    npm cache clean --force > /dev/null 2>&1 || true
+    env npm_config_cache="$NPM_CACHE_DIR" npm cache clean --force > /dev/null 2>&1 || true
     rm -rf "${WORK}/node_modules" "${WORK}/package-lock.json"
 }
 clean_pnpm() {
-    pnpm store prune > /dev/null 2>&1 || true
-    rm -rf "$(pnpm store path 2>/dev/null)" 2>/dev/null || true
+    rm -rf "$PNPM_STORE_DIR" 2>/dev/null || true
     rm -rf "${WORK}/node_modules" "${WORK}/pnpm-lock.yaml"
 }
 
@@ -67,14 +129,14 @@ now_ms() { python3 -c 'import time;print(int(time.perf_counter_ns()))'; }
 run_arm() {
     local mode=$1 arm=$2
     case "$mode/$arm" in
-        clean/lpm) clean_lpm; local s=$(now_ms); (cd "$WORK" && "$BIN" install --allow-new --json) > /dev/null 2>&1; local e=$(now_ms);;
-        clean/bun) clean_bun; local s=$(now_ms); (cd "$WORK" && bun install --ignore-scripts) > /dev/null 2>&1; local e=$(now_ms);;
-        clean/npm) clean_npm; local s=$(now_ms); (cd "$WORK" && npm install --ignore-scripts) > /dev/null 2>&1; local e=$(now_ms);;
-        clean/pnpm) clean_pnpm; local s=$(now_ms); (cd "$WORK" && pnpm install --ignore-scripts) > /dev/null 2>&1; local e=$(now_ms);;
-        full/lpm) local s=$(now_ms); (rm -rf "${HOME}/.lpm/cache" "${HOME}/.lpm/store" "${WORK}/node_modules" "${WORK}/.lpm" "${WORK}/lpm.lock" "${WORK}/lpm.lockb" 2>/dev/null; cd "$WORK" && "$BIN" install --allow-new --json) > /dev/null 2>&1; local e=$(now_ms);;
-        full/bun) local s=$(now_ms); (rm -rf "${HOME}/.bun/install/cache" "${WORK}/node_modules" "${WORK}/bun.lock" "${WORK}/bun.lockb" 2>/dev/null; cd "$WORK" && bun install --ignore-scripts) > /dev/null 2>&1; local e=$(now_ms);;
-        full/npm) local s=$(now_ms); (npm cache clean --force > /dev/null 2>&1 || true; rm -rf "${WORK}/node_modules" "${WORK}/package-lock.json" 2>/dev/null; cd "$WORK" && npm install --ignore-scripts) > /dev/null 2>&1; local e=$(now_ms);;
-        full/pnpm) local s=$(now_ms); (pnpm store prune > /dev/null 2>&1 || true; rm -rf "$(pnpm store path 2>/dev/null)" 2>/dev/null; rm -rf "${WORK}/node_modules" "${WORK}/pnpm-lock.yaml" 2>/dev/null; cd "$WORK" && pnpm install --ignore-scripts) > /dev/null 2>&1; local e=$(now_ms);;
+        clean/lpm) clean_lpm; local s=$(now_ms); run_lpm_install; local e=$(now_ms);;
+        clean/bun) clean_bun; local s=$(now_ms); run_bun_install; local e=$(now_ms);;
+        clean/npm) clean_npm; local s=$(now_ms); run_npm_install; local e=$(now_ms);;
+        clean/pnpm) clean_pnpm; local s=$(now_ms); run_pnpm_install; local e=$(now_ms);;
+        full/lpm) prepare_full_lpm_reset; local s=$(now_ms); run_lpm_install; local e=$(now_ms);;
+        full/bun) local s=$(now_ms); (rm -rf "$BUN_CACHE_DIR" "${WORK}/node_modules" "${WORK}/bun.lock" "${WORK}/bun.lockb" 2>/dev/null; cd "$WORK" && bun install --ignore-scripts --cache-dir "$BUN_CACHE_DIR") > /dev/null 2>&1; local e=$(now_ms);;
+        full/npm) local s=$(now_ms); (env npm_config_cache="$NPM_CACHE_DIR" npm cache clean --force > /dev/null 2>&1 || true; rm -rf "${WORK}/node_modules" "${WORK}/package-lock.json" 2>/dev/null; cd "$WORK" && env npm_config_cache="$NPM_CACHE_DIR" npm install --ignore-scripts) > /dev/null 2>&1; local e=$(now_ms);;
+        full/pnpm) local s=$(now_ms); (rm -rf "$PNPM_STORE_DIR" 2>/dev/null; rm -rf "${WORK}/node_modules" "${WORK}/pnpm-lock.yaml" 2>/dev/null; cd "$WORK" && if [[ -n "$PNPM_STORE_DIR" ]]; then pnpm install --ignore-scripts --store-dir "$PNPM_STORE_DIR"; else pnpm install --ignore-scripts; fi) > /dev/null 2>&1; local e=$(now_ms);;
     esac
     local wall=$(( (e-s) / 1000000 ))
     echo "$wall" > "$RESULTS/${mode}-iter-${i}-${arm}.wall_ms"
@@ -83,6 +145,7 @@ run_arm() {
 
 echo "[bench] readme round-robin — n=${N} per arm, fixture: $(basename "$FIXTURE")"
 echo "[bench] HEAD: $(cd "$(dirname "$0")/../.." && git rev-parse --short HEAD) ($(cd "$(dirname "$0")/../.." && git branch --show-current))"
+echo "[bench] full/lpm reset: out-of-band rotate"
 date
 
 # Methodology:
@@ -119,8 +182,8 @@ done
 for i in $(seq 1 "$N"); do run_arm clean npm; done
 for i in $(seq 1 "$N"); do run_arm clean pnpm; done
 
-# ── Cold install, full wipe loop (wipes INSIDE timer) ──────────────
-echo "[full] cold install, full wipe loop — wipes INSIDE timer"
+# ── Cold install, reset-each-iter (lpm rotates old state) ──────────
+echo "[full] cold install, reset-each-iter — lpm rotates old state outside timer"
 
 for i in $(seq 1 "$N"); do
     if (( i % 2 == 1 )); then arm_order=(lpm bun); else arm_order=(bun lpm); fi
