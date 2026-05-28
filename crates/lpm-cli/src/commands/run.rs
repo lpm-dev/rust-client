@@ -176,8 +176,8 @@ pub async fn run(
 /// prerequisites even for single-script invocations. When `parallel` is true,
 /// independent tasks run concurrently; otherwise they run in topological order.
 ///
-/// Supports `--continue-on-error` to keep running after failures,
-/// `--stream` for interleaved output with task prefixes, and
+/// Supports `--no-bail` to keep running after failures, `--stream` for
+/// interleaved output with task prefixes, and
 /// `--no-cache` to skip task caching.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_multi(

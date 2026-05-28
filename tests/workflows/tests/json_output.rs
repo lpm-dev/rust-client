@@ -438,9 +438,9 @@ fn run_failing_task_json_reports_failure() {
     }"#,
     );
 
-    // Use --continue-on-error so both tasks run
+    // Use --no-bail so both tasks run
     let output = lpm(&project)
-        .args(["run", "good", "bad", "--json", "--continue-on-error"])
+        .args(["run", "good", "bad", "--json", "--no-bail"])
         .output()
         .expect("failed to run lpm run --json");
 

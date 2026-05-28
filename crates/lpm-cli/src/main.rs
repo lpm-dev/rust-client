@@ -1384,8 +1384,8 @@ enum Commands {
         #[arg(long, short = 'p')]
         parallel: bool,
 
-        /// Continue running remaining tasks even if one fails.
-        #[arg(long)]
+        /// Do not bail after a task or selected workspace package fails.
+        #[arg(long = "no-bail")]
         continue_on_error: bool,
 
         /// Stream output with task prefixes instead of buffering.
@@ -5398,6 +5398,28 @@ mod tests {
             }
             _ => panic!("expected Run command"),
         }
+    }
+
+    #[test]
+    fn run_no_bail_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "run", "build", "--no-bail"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Run {
+                continue_on_error, ..
+            } => {
+                assert!(continue_on_error);
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_continue_on_error_flag_is_not_accepted() {
+        let result = Cli::try_parse_from(["lpm", "run", "build", "--continue-on-error"]);
+        assert!(
+            result.is_err(),
+            "--continue-on-error must not remain as a legacy alias for --no-bail"
+        );
     }
 
     #[test]

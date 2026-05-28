@@ -683,6 +683,56 @@ fn run_filter_executes_only_matched_members() {
     );
 }
 
+fn seed_workspace_with_failing_leaf_script(project: &TempProject) {
+    for member in ["app", "core", "utils"] {
+        let pkg_path = format!("packages/{member}/package.json");
+        let pkg_content = project.read_file(&pkg_path);
+        let mut pkg: serde_json::Value =
+            serde_json::from_str(&pkg_content).expect("parse member package.json");
+
+        let command = if member == "utils" {
+            format!(
+                "node -e \"require('fs').writeFileSync('ran-{member}.txt','failed'); process.exit(1)\""
+            )
+        } else {
+            format!("node -e \"require('fs').writeFileSync('ran-{member}.txt','ok')\"")
+        };
+
+        pkg["scripts"] = serde_json::json!({
+            "check": command,
+        });
+        project.write_file(&pkg_path, &serde_json::to_string_pretty(&pkg).unwrap());
+    }
+}
+
+#[test]
+fn run_filter_bails_after_first_failed_workspace_member_by_default() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_failing_leaf_script(&project);
+
+    let output = lpm(&project)
+        .args(["run", "check", "--filter", "@test/*"])
+        .output()
+        .expect("failed to run lpm run --filter");
+
+    assert!(
+        !output.status.success(),
+        "filtered workspace run must fail when a selected member script fails"
+    );
+    assert!(
+        member_ran(&project, "utils"),
+        "utils must run before the filtered batch bails"
+    );
+    assert!(
+        !member_ran(&project, "core"),
+        "core must not run after an earlier selected package fails by default"
+    );
+    assert!(
+        !member_ran(&project, "app"),
+        "app must not run after an earlier selected package fails by default"
+    );
+}
+
 #[test]
 fn run_all_executes_in_every_member() {
     let project = TempProject::from_fixture("workspace-monorepo");
