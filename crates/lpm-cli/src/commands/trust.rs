@@ -791,6 +791,7 @@ mod tests {
                 version: "1.0.0".into(),
                 ..Default::default()
             }],
+            catalogs: Default::default(),
             root_aliases: Default::default(),
             ambient_peer_installs: Vec::new(),
         };
@@ -922,6 +923,7 @@ mod tests {
                 version: "1.0.0".into(),
                 ..Default::default()
             }],
+            catalogs: Default::default(),
             root_aliases: Default::default(),
             ambient_peer_installs: Vec::new(),
         };
@@ -961,6 +963,7 @@ mod tests {
                 version: "1.0.0".into(),
                 ..Default::default()
             }],
+            catalogs: Default::default(),
             root_aliases: Default::default(),
             ambient_peer_installs: Vec::new(),
         };
@@ -993,6 +996,7 @@ mod tests {
                 auto_isolated_peer_conflicts: false,
             },
             packages: vec![],
+            catalogs: Default::default(),
             root_aliases: Default::default(),
             ambient_peer_installs: Vec::new(),
         };

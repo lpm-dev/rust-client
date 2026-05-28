@@ -14,7 +14,7 @@ use lpm_resolver::{
 };
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -4139,7 +4139,10 @@ async fn run_with_options_under_store_lock(
         .ok()
         .flatten();
 
-    let mut workspace_member_deps: Vec<WorkspaceMemberLink> = if let Some(ref ws) = workspace {
+    let (mut workspace_member_deps, catalog_resolutions): (
+        Vec<WorkspaceMemberLink>,
+        Vec<lpm_workspace::CatalogProtocolResolution>,
+    ) = if let Some(ref ws) = workspace {
         // workspace:* extraction (NEW: replaces resolve_workspace_protocol)
         let extracted = extract_workspace_protocol_deps(&mut deps, ws)?;
         if !extracted.is_empty() && !json_output {
@@ -4154,14 +4157,21 @@ async fn run_with_options_under_store_lock(
         }
 
         // catalog: protocol — resolve from workspace root catalogs
+        let mut catalog_resolutions: Vec<lpm_workspace::CatalogProtocolResolution> = Vec::new();
+
         if !ws.root_package.catalogs.is_empty() {
             match lpm_workspace::resolve_catalog_protocol(&mut deps, &ws.root_package.catalogs) {
                 Ok(resolved) => {
                     if !resolved.is_empty() && !json_output {
-                        for (name, _orig, ver) in &resolved {
-                            tracing::debug!("catalog: {name} → {ver}");
+                        for entry in &resolved {
+                            tracing::debug!(
+                                "catalog: {} → {}",
+                                entry.package_name,
+                                entry.specifier
+                            );
                         }
                     }
+                    catalog_resolutions = resolved;
                 }
                 Err(e) => {
                     return Err(LpmError::Registry(format!(
@@ -4170,18 +4180,24 @@ async fn run_with_options_under_store_lock(
                 }
             }
         }
-        extracted
+        (extracted, catalog_resolutions)
     } else {
         // Standalone project (no workspace): no workspace member deps possible.
         // Local catalogs are still resolved if present.
+        let mut catalog_resolutions = Vec::new();
         if !pkg.catalogs.is_empty() {
             match lpm_workspace::resolve_catalog_protocol(&mut deps, &pkg.catalogs) {
                 Ok(resolved) => {
                     if !resolved.is_empty() && !json_output {
-                        for (name, _orig, ver) in &resolved {
-                            tracing::debug!("catalog: {name} → {ver}");
+                        for entry in &resolved {
+                            tracing::debug!(
+                                "catalog: {} → {}",
+                                entry.package_name,
+                                entry.specifier
+                            );
                         }
                     }
+                    catalog_resolutions = resolved;
                 }
                 Err(e) => {
                     return Err(LpmError::Registry(format!(
@@ -4190,7 +4206,7 @@ async fn run_with_options_under_store_lock(
                 }
             }
         }
-        Vec::new()
+        (Vec::new(), catalog_resolutions)
     };
 
     //
@@ -4630,17 +4646,24 @@ async fn run_with_options_under_store_lock(
         // strict (`false`) — they have the fresh-resolve fallback for
         // any non-admissible lockfile shape, and skipping the fresh-
         // resolve re-checks would be a real correctness regression.
-        let fast = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, true)
-            .ok_or_else(|| {
-                LpmError::Registry(
-                    "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
+        let fast = try_lockfile_fast_path(
+            &lockfile_path,
+            &deps,
+            &catalog_resolutions,
+            client,
+            &gate_stats,
+            true,
+        )
+        .ok_or_else(|| {
+            LpmError::Registry(
+                "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
                          missing — run `lpm install` online first; (2) lpm.lock is corrupted — \
                          delete it and re-run online; (3) a root dependency in package.json is \
                          absent from the lockfile (e.g., declared but never installed online). \
                          Run `lpm install` online to reconcile."
-                        .into(),
-                )
-            })?;
+                    .into(),
+            )
+        })?;
         //  Same repair-gate semantic as
         // the online path, but `--offline` can't re-resolve to
         // re-derive the missing. The choice is between
@@ -4795,7 +4818,14 @@ async fn run_with_options_under_store_lock(
         // fresh resolve. The offline arm at line 3395 passes `true`
         // and trusts the lockfile because fresh-resolve isn't
         // available offline.
-        let candidate = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, false);
+        let candidate = try_lockfile_fast_path(
+            &lockfile_path,
+            &deps,
+            &catalog_resolutions,
+            client,
+            &gate_stats,
+            false,
+        );
         match candidate {
             Some(fast) if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) => {
                 if !json_output {
@@ -7818,6 +7848,8 @@ async fn run_with_options_under_store_lock(
         // would skip the auto-installed peer (it isn't in
         // `pkg.dependencies`) and produce a broken tree.
         lockfile.ambient_peer_installs = ambient_peer_installs_for_lockfile.clone();
+        lockfile.catalogs =
+            catalog_snapshot_from_install_packages(&catalog_resolutions, &packages)?;
 
         lockfile
             .write_all(&lockfile_path)
@@ -9421,6 +9453,95 @@ fn lockfile_needs_r25_repair(lockfile: &lpm_lockfile::Lockfile, auto_install_pee
     auto_install_peers && lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION
 }
 
+fn catalog_snapshot_from_install_packages(
+    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    packages: &[InstallPackage],
+) -> Result<lpm_lockfile::CatalogSnapshots, LpmError> {
+    if catalog_resolutions.is_empty() {
+        return Ok(lpm_lockfile::CatalogSnapshots::new());
+    }
+
+    let mut root_versions = HashMap::with_capacity(catalog_resolutions.len());
+    for package in packages {
+        let Some(root_link_names) = package.root_link_names.as_ref() else {
+            continue;
+        };
+        for root_name in root_link_names {
+            root_versions
+                .entry(root_name.clone())
+                .or_insert_with(|| package.version.clone());
+        }
+    }
+
+    let mut snapshots = lpm_lockfile::CatalogSnapshots::new();
+    for resolution in catalog_resolutions {
+        let resolved_version = root_versions.get(&resolution.package_name).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "catalog snapshot: resolver did not report a concrete version for `{}`",
+                resolution.package_name
+            ))
+        })?;
+        snapshots
+            .entry(resolution.catalog_name.clone())
+            .or_default()
+            .insert(
+                resolution.package_name.clone(),
+                lpm_lockfile::CatalogSnapshotEntry {
+                    specifier: resolution.specifier.clone(),
+                    version: resolved_version.clone(),
+                    reference: resolution.reference.clone(),
+                },
+            );
+    }
+
+    Ok(snapshots)
+}
+
+fn catalog_snapshot_entry_count(snapshots: &lpm_lockfile::CatalogSnapshots) -> usize {
+    snapshots.values().map(BTreeMap::len).sum()
+}
+
+fn lockfile_catalog_snapshots_match_current(
+    lockfile: &lpm_lockfile::Lockfile,
+    deps: &HashMap<String, String>,
+    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+) -> bool {
+    if catalog_snapshot_entry_count(&lockfile.catalogs) != catalog_resolutions.len() {
+        return false;
+    }
+
+    for resolution in catalog_resolutions {
+        let Some(entry) = lockfile
+            .catalogs
+            .get(&resolution.catalog_name)
+            .and_then(|catalog| catalog.get(&resolution.package_name))
+        else {
+            return false;
+        };
+        if entry.specifier != resolution.specifier || entry.reference != resolution.reference {
+            return false;
+        }
+
+        let Some(requested_spec) = deps.get(&resolution.package_name) else {
+            return false;
+        };
+        let target = lockfile
+            .root_aliases
+            .get(&resolution.package_name)
+            .map_or(resolution.package_name.as_str(), String::as_str);
+        let Some(locked_package) =
+            select_locked_package_for_requested_spec(lockfile, target, requested_spec)
+        else {
+            return false;
+        };
+        if locked_package.version != entry.version {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn requested_range_for_locked_lookup(requested_spec: &str) -> Option<String> {
     match lpm_resolver::Specifier::parse(requested_spec).ok()? {
         lpm_resolver::Specifier::SemverRange(range) => Some(range),
@@ -9507,6 +9628,7 @@ fn install_package_is_direct(
 fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
+    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     // — the URL-reuse gate needs the client to check
     // origin (`is_configured_origin`) and the shared `GateStats`
     // to bump mismatch counters. Both passed by ref; the fast
@@ -9531,21 +9653,22 @@ fn try_lockfile_fast_path(
         return None;
     }
 
-    // — probe the binary lockfile state so the driver can
-    // decide whether to trigger a writeback for migration purposes
-    // even when no URL diverged. `lpm.lockb` missing OR opened with
-    // `UnsupportedVersion` → needs rewrite. Other errors (structural
-    // corruption) leave the file alone so users can forensically
-    // inspect; `read_fast` will still fall back to TOML below.
-    let binary_path = lockfile_path.with_extension("lockb");
-    let needs_binary_upgrade = match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
-        Ok(Some(_)) => false,
-        Ok(None) => true,
-        Err(lpm_lockfile::LockfileError::UnsupportedVersion { .. }) => true,
-        Err(_) => false,
-    };
-
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
+
+    // Probe binary state only when this lockfile can be represented by
+    // the binary format. TOML-only metadata intentionally skips `lpm.lockb`;
+    // treating a missing binary as an upgrade need would rewrite forever.
+    let binary_path = lockfile_path.with_extension("lockb");
+    let needs_binary_upgrade = if lpm_lockfile::binary::binary_format_supports(&lockfile) {
+        match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            Err(lpm_lockfile::LockfileError::UnsupportedVersion { .. }) => true,
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
 
     // L19: scan the lockfile for entries with `http://` sources and
     // emit a single aggregate warn so re-installs against a lockfile
@@ -9601,6 +9724,11 @@ fn try_lockfile_fast_path(
             );
             return None; // Force re-resolution from trusted registries
         }
+    }
+
+    if !lockfile_catalog_snapshots_match_current(&lockfile, deps, catalog_resolutions) {
+        tracing::debug!("catalog snapshot drift detected — invalidating lockfile fast path");
+        return None;
     }
 
     // — verify every declared root dep has a lockfile
@@ -16418,16 +16546,16 @@ mod tests {
         // might have been deleted already. Either way,
         // `needs_binary_upgrade` should be true (missing or stale).
         //
-        // Actually the order is: `try_lockfile_fast_path` probes the
-        // binary FIRST (to check `needs_binary_upgrade`), THEN calls
-        // `read_fast`. So at probe time, the v1 binary is still on
-        // disk and `open` returns `UnsupportedVersion`.
+        // `try_lockfile_fast_path` loads the lockfile, then probes the
+        // binary to decide whether a representable lockfile should be
+        // rewritten. The stale v1 file must still trigger the writeback.
 
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed via TOML fallback");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed via TOML fallback");
 
         assert!(
             result.needs_binary_upgrade,
@@ -16465,8 +16593,9 @@ mod tests {
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed with only TOML");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed with only TOML");
 
         assert!(
             result.needs_binary_upgrade,
@@ -16501,8 +16630,9 @@ mod tests {
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed with both TOML + v2 binary");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed with both TOML + v2 binary");
 
         assert!(
             !result.needs_binary_upgrade,
@@ -16547,8 +16677,9 @@ mod tests {
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed on valid lockfile");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed on valid lockfile");
 
         assert_eq!(result.packages.len(), 1);
         assert_eq!(
@@ -16595,8 +16726,9 @@ mod tests {
             let deps: HashMap<String, String> =
                 [("victim".to_string(), "^1.0.0".to_string())].into();
             let gate_stats = GateStats::default();
-            let result = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, false)
-                .expect("fast path should succeed even with a gate-rejected URL");
+            let result =
+                try_lockfile_fast_path(&lockfile_path, &deps, &[], client, &gate_stats, false)
+                    .expect("fast path should succeed even with a gate-rejected URL");
             (result, gate_stats, dir)
         };
 
@@ -16659,8 +16791,9 @@ mod tests {
             [("old-entry".to_string(), "^1.0.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed on pre-existing lockfile");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed on pre-existing lockfile");
 
         assert_eq!(result.packages[0].tarball_url, None);
 

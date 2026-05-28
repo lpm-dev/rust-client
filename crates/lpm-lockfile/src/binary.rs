@@ -131,6 +131,9 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
     if lockfile.metadata.auto_isolated_peer_conflicts {
         return false;
     }
+    if !lockfile.catalogs.is_empty() {
+        return false;
+    }
     lockfile
         .packages
         .iter()
@@ -629,6 +632,7 @@ impl BinaryLockfileReader {
                 resolved_with: Some(crate::DEFAULT_RESOLVED_WITH.to_string()),
                 auto_isolated_peer_conflicts: false,
             },
+            catalogs: crate::CatalogSnapshots::new(),
             packages,
             // The binary format cannot represent alias metadata; any
             // project with aliases skips the binary write (see

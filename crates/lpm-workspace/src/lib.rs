@@ -2188,6 +2188,19 @@ pub fn resolve_workspace_protocol(
     Ok(resolved)
 }
 
+/// One dependency rewritten from a catalog protocol reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogProtocolResolution {
+    /// Catalog name used for lookup. Bare `catalog:` resolves through `default`.
+    pub catalog_name: String,
+    /// Dependency package name from the consumer manifest.
+    pub package_name: String,
+    /// Consumer-side protocol reference, e.g. `catalog:` or `catalog:testing`.
+    pub reference: String,
+    /// Range/specifier stored in the catalog entry.
+    pub specifier: String,
+}
+
 /// Resolve `catalog:` and `catalog:{name}` protocol references in dependencies.
 ///
 /// - `"catalog:"` resolves from `catalogs["default"]`
@@ -2195,11 +2208,11 @@ pub fn resolve_workspace_protocol(
 ///
 /// Must be called before passing dependencies to the resolver.
 ///
-/// Returns a list of `(package_name, original_protocol, resolved_version)` for logging.
+/// Returns a list of catalog resolution records for logging and lockfile provenance.
 pub fn resolve_catalog_protocol(
     deps: &mut HashMap<String, String>,
     catalogs: &HashMap<String, HashMap<String, String>>,
-) -> Result<Vec<(String, String, String)>, String> {
+) -> Result<Vec<CatalogProtocolResolution>, String> {
     let mut resolved = Vec::new();
 
     for (name, range) in deps.iter_mut() {
@@ -2209,12 +2222,12 @@ pub fn resolve_catalog_protocol(
 
         let catalog_ref = &range["catalog:".len()..];
         let catalog_name = if catalog_ref.is_empty() {
-            "default"
+            "default".to_string()
         } else {
-            catalog_ref
+            catalog_ref.to_string()
         };
 
-        let catalog = catalogs.get(catalog_name).ok_or_else(|| {
+        let catalog = catalogs.get(catalog_name.as_str()).ok_or_else(|| {
             let available = if catalogs.is_empty() {
                 "(none)".to_string()
             } else {
@@ -2251,7 +2264,12 @@ pub fn resolve_catalog_protocol(
 
         let original = range.clone();
         *range = version.clone();
-        resolved.push((name.clone(), original, range.clone()));
+        resolved.push(CatalogProtocolResolution {
+            catalog_name: catalog_name.to_string(),
+            package_name: name.clone(),
+            reference: original,
+            specifier: version.clone(),
+        });
     }
 
     Ok(resolved)

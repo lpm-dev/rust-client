@@ -114,6 +114,7 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             resolved_with: Some("migrate".to_string()),
             auto_isolated_peer_conflicts: false,
         },
+        catalogs: lpm_lockfile::CatalogSnapshots::new(),
         packages: locked_packages,
         root_aliases: std::collections::BTreeMap::new(),
         // `lpm migrate` translates yarn/pnpm/npm lockfiles into the

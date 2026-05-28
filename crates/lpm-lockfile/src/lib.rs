@@ -17,6 +17,7 @@ pub mod binary;
 pub mod source;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
@@ -94,10 +95,27 @@ pub const LOCKFILE_VERSION: u32 = 2;
 /// Default lockfile filename.
 pub const LOCKFILE_NAME: &str = "lpm.lock";
 
+/// Catalog resolutions used by this install, grouped by catalog name and package name.
+pub type CatalogSnapshots = BTreeMap<String, BTreeMap<String, CatalogSnapshotEntry>>;
+
+/// One lockfile-recorded catalog resolution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CatalogSnapshotEntry {
+    /// Range/specifier stored in the catalog entry at resolve time.
+    pub specifier: String,
+    /// Concrete package version selected by the resolver.
+    pub version: String,
+    /// Consumer-side catalog protocol reference, e.g. `catalog:` or `catalog:testing`.
+    pub reference: String,
+}
+
 /// The full lockfile structure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Lockfile {
     pub metadata: LockfileMetadata,
+    /// Catalog protocol resolutions used by direct dependencies in this lockfile.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub catalogs: CatalogSnapshots,
     /// Resolved packages, sorted by name for deterministic output.
     #[serde(default)]
     pub packages: Vec<LockedPackage>,
@@ -381,8 +399,9 @@ impl Lockfile {
                 resolved_with: Some(resolver.to_string()),
                 auto_isolated_peer_conflicts: false,
             },
+            catalogs: CatalogSnapshots::new(),
             packages: Vec::new(),
-            root_aliases: std::collections::BTreeMap::new(),
+            root_aliases: BTreeMap::new(),
             // Populated by `install.rs` from
             // `ResolveResult.ambient_peer_installs` on cold-resolve
             // lockfile writes; empty on warm/lockfile-fast-path
@@ -910,6 +929,73 @@ resolved-with = "greedy-fusion"
         )
         .unwrap();
         assert!(!parsed.metadata.auto_isolated_peer_conflicts);
+    }
+
+    #[test]
+    fn catalog_snapshots_roundtrip_when_present() {
+        let mut lf = Lockfile::new();
+        lf.catalogs.insert(
+            "default".to_string(),
+            BTreeMap::from([(
+                "react".to_string(),
+                CatalogSnapshotEntry {
+                    specifier: "^18.2.0".to_string(),
+                    version: "18.3.1".to_string(),
+                    reference: "catalog:".to_string(),
+                },
+            )]),
+        );
+
+        let toml = lf.to_toml().unwrap();
+        assert!(
+            toml.contains("[catalogs.default.react]"),
+            "catalog snapshot must serialize as a top-level catalogs table: {toml}"
+        );
+
+        let parsed = Lockfile::from_toml(&toml).unwrap();
+        assert_eq!(parsed.catalogs, lf.catalogs);
+    }
+
+    #[test]
+    fn catalog_snapshots_are_additive_and_skipped_when_empty() {
+        let lf = Lockfile::new();
+
+        let toml = lf.to_toml().unwrap();
+        assert!(
+            !toml.contains("[catalogs"),
+            "ordinary lockfiles should not serialize an empty catalog snapshot: {toml}"
+        );
+
+        let parsed = Lockfile::from_toml(
+            r#"
+[metadata]
+lockfile-version = 2
+resolved-with = "greedy-fusion"
+"#,
+        )
+        .unwrap();
+        assert!(parsed.catalogs.is_empty());
+    }
+
+    #[test]
+    fn binary_format_does_not_claim_support_for_catalog_snapshots() {
+        let mut lf = Lockfile::new();
+        lf.catalogs.insert(
+            "default".to_string(),
+            BTreeMap::from([(
+                "react".to_string(),
+                CatalogSnapshotEntry {
+                    specifier: "^18.2.0".to_string(),
+                    version: "18.3.1".to_string(),
+                    reference: "catalog:".to_string(),
+                },
+            )]),
+        );
+
+        assert!(
+            !binary::binary_format_supports(&lf),
+            "binary lockfile format must be skipped when TOML-only catalog snapshots are present"
+        );
     }
 
     #[test]

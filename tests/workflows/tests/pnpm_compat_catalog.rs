@@ -702,6 +702,134 @@ catalog:
     );
 }
 
+#[tokio::test]
+async fn lockfile_catalog_snapshot_records_default_catalog_resolution() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^2.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install with default catalog dependency must succeed\n{text}"
+    );
+    let entry = catalog_snapshot_entry(&project, "default", "is-positive");
+    assert_eq!(entry.specifier, "^2.0.0");
+    assert_eq!(entry.version, "2.0.0");
+    assert_eq!(entry.reference, "catalog:");
+}
+
+#[tokio::test]
+async fn lockfile_catalog_snapshot_records_named_catalog_resolution() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:testing"
+            },
+            "catalogs": {
+                "testing": {
+                    "is-positive": "^2.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install with named catalog dependency must succeed\n{text}"
+    );
+    let entry = catalog_snapshot_entry(&project, "testing", "is-positive");
+    assert_eq!(entry.specifier, "^2.0.0");
+    assert_eq!(entry.version, "2.0.0");
+    assert_eq!(entry.reference, "catalog:testing");
+}
+
+#[tokio::test]
+async fn warm_install_updates_catalog_snapshot_when_catalog_specifier_drifts() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^2.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let first_output = run_install(&project, &mock, &[]);
+    let first_text = output_text(&first_output);
+    assert!(
+        first_output.status.success(),
+        "initial catalog install must succeed\n{first_text}"
+    );
+    assert_eq!(
+        catalog_snapshot_entry(&project, "default", "is-positive").specifier,
+        "^2.0.0"
+    );
+
+    project.write_file(
+        "package.json",
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": ">=1.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let second_output = run_install(&project, &mock, &[]);
+    let second_text = output_text(&second_output);
+    assert!(
+        second_output.status.success(),
+        "warm install after catalog drift must succeed\n{second_text}"
+    );
+    let entry = catalog_snapshot_entry(&project, "default", "is-positive");
+    assert_eq!(
+        entry.specifier, ">=1.0.0",
+        "warm install must refresh lockfile catalog provenance when the catalog range changes"
+    );
+    assert_eq!(entry.version, "2.0.0");
+    assert_eq!(entry.reference, "catalog:");
+}
+
 async fn mount_is_positive_versions(mock: &MockRegistry) {
     mock.with_full_package_metadata(
         "is-positive",
@@ -828,6 +956,26 @@ fn catalog_entry_optional(project: &TempProject, catalog: &str, package: &str) -
         .and_then(|entries| entries.get(package))
         .and_then(|value| value.as_str())
         .map(str::to_string)
+}
+
+fn catalog_snapshot_entry(
+    project: &TempProject,
+    catalog: &str,
+    package: &str,
+) -> lpm_lockfile::CatalogSnapshotEntry {
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("lpm.lock parses");
+    lockfile
+        .catalogs
+        .get(catalog)
+        .and_then(|entries| entries.get(package))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected lockfile catalog snapshot `{catalog}` entry for `{package}`\n{}",
+                project.read_file("lpm.lock")
+            )
+        })
+        .clone()
 }
 
 fn output_text(output: &Output) -> String {

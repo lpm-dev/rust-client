@@ -472,6 +472,7 @@ mod tests {
                 resolved_with: Some("test".to_string()),
                 auto_isolated_peer_conflicts: false,
             },
+            catalogs: lpm_lockfile::CatalogSnapshots::new(),
             packages: packages
                 .iter()
                 .map(|(n, v, integ)| LockedPackage {
