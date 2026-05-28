@@ -32,12 +32,12 @@ LPM_TOP_NPM_PARALLEL=8 ./bench/top-npm-audit/run-all.sh
 ## How it works
 
 1. **Generate** — `generate.sh` produces a `package.json` + `smoke.sh`
-  per package under `bench/audit-fixtures/top-npm/<safe-name>/`.
-  Most fixtures keep the default root-load smoke (`require` first,
-  `import` fallback only for genuine ESM-only surfaces), but packages
-  with a different consumer contract get a matching fixture class:
-  CLI bin invocation, type-check smoke, runner smoke, or peer-aware
-  companion deps.
+   per package under `bench/audit-fixtures/top-npm/<safe-name>/`.
+   Most fixtures keep the default root-load smoke (`require` first,
+   `import` fallback only for genuine ESM-only surfaces), but packages
+   with a different consumer contract get a matching fixture class:
+   CLI bin invocation, type-check smoke, runner smoke, or peer-aware
+   companion deps.
 2. **Run** — `run-all.sh` invokes the existing
    `bench/audit-fixtures/run-audit.sh` for each generated fixture in
    parallel, with per-slot `LPM_HOME` so concurrent installs don't
