@@ -118,7 +118,7 @@ fn resolve_status_target(
     }
     Ok(ResolvedSecurityTarget {
         kind: UnlockTargetKind::Project,
-        project_dir: Some(project.map(PathBuf::from).unwrap_or(cwd)),
+        project_dir: Some(project.map_or(cwd, PathBuf::from)),
     })
 }
 
@@ -314,10 +314,7 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
             let status = if target.kind == UnlockTargetKind::Global {
                 security_approval::load_security_status(None, true)?
             } else {
-                security_approval::load_security_status(
-                    target.project_dir.as_deref(),
-                    false,
-                )?
+                security_approval::load_security_status(target.project_dir.as_deref(), false)?
             };
 
             if json_output {
@@ -514,11 +511,9 @@ mod tests {
 
     #[test]
     fn bundle_selectors_reject_package_filters() {
-        let err = ensure_supported_package_filters(
-            SecurityScopeSelector::All,
-            &["esbuild".to_string()],
-        )
-        .unwrap_err();
+        let err =
+            ensure_supported_package_filters(SecurityScopeSelector::All, &["esbuild".to_string()])
+                .unwrap_err();
         assert!(err.to_string().contains("`--package`"));
     }
 }

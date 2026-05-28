@@ -1236,11 +1236,7 @@ pub fn format_unlock_duration(ttl_secs: u64) -> String {
     format!("{ttl_secs}s")
 }
 
-fn suggested_unlock_command(
-    scope: &str,
-    target: UnlockTargetKind,
-    packages: &[String],
-) -> String {
+fn suggested_unlock_command(scope: &str, target: UnlockTargetKind, packages: &[String]) -> String {
     let mut command = match target {
         UnlockTargetKind::Project => {
             format!("lpm security unlock {scope} --project . --ttl 10m")
@@ -1788,7 +1784,13 @@ fn create_unlock_grant(
     min_release_age_secs: Option<u64>,
     packages: &[String],
 ) -> UnlockGrant {
-    create_unlock_grant_for_scopes(&[scope], project_dir, ttl_secs, min_release_age_secs, packages)
+    create_unlock_grant_for_scopes(
+        &[scope],
+        project_dir,
+        ttl_secs,
+        min_release_age_secs,
+        packages,
+    )
 }
 
 fn create_global_unlock_grant_for_scopes(
@@ -1980,7 +1982,9 @@ fn revoke_unlocks(
 ) -> Result<Vec<UnlockRevocation>, LpmError> {
     let requested_scopes = normalized_scopes(scopes);
     if requested_scopes.is_empty() {
-        return Err(LpmError::Registry("at least one unlock scope is required".into()));
+        return Err(LpmError::Registry(
+            "at least one unlock scope is required".into(),
+        ));
     }
 
     let requested_packages = normalized_packages(packages);
@@ -3088,7 +3092,9 @@ pub fn unlock_scopes_command(
 ) -> Result<UnlockGrant, LpmError> {
     let requested_scopes = normalized_scopes(scopes);
     if requested_scopes.is_empty() {
-        return Err(LpmError::Registry("at least one unlock scope is required".into()));
+        return Err(LpmError::Registry(
+            "at least one unlock scope is required".into(),
+        ));
     }
     if !(1..=MAX_UNLOCK_TTL_SECS).contains(&ttl_secs) {
         return Err(LpmError::Registry(format!(
@@ -3166,7 +3172,9 @@ pub fn unlock_global_scopes_command(
 ) -> Result<UnlockGrant, LpmError> {
     let requested_scopes = normalized_scopes(scopes);
     if requested_scopes.is_empty() {
-        return Err(LpmError::Registry("at least one unlock scope is required".into()));
+        return Err(LpmError::Registry(
+            "at least one unlock scope is required".into(),
+        ));
     }
     if !(1..=MAX_UNLOCK_TTL_SECS).contains(&ttl_secs) {
         return Err(LpmError::Registry(format!(
@@ -3389,12 +3397,9 @@ mod tests {
             );
             persist_unlock_grant(&grant).unwrap();
 
-            let revocations = lock_global_scopes_command(
-                "default",
-                ApprovalScope::default_unlock_scopes(),
-                &[],
-            )
-            .unwrap();
+            let revocations =
+                lock_global_scopes_command("default", ApprovalScope::default_unlock_scopes(), &[])
+                    .unwrap();
 
             assert_eq!(revocations.len(), 1);
             assert_eq!(
@@ -3438,13 +3443,15 @@ mod tests {
             .unwrap();
 
             assert!(revocations.is_empty());
-            assert!(has_active_project_unlock(
-                ApprovalScope::ProvenanceUnverified,
-                &project,
-                None,
-                &["esbuild".to_string(), "sharp".to_string()],
-            )
-            .unwrap());
+            assert!(
+                has_active_project_unlock(
+                    ApprovalScope::ProvenanceUnverified,
+                    &project,
+                    None,
+                    &["esbuild".to_string(), "sharp".to_string()],
+                )
+                .unwrap()
+            );
         });
     }
 
