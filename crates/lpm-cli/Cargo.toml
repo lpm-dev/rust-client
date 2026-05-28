@@ -131,6 +131,9 @@ mimalloc = "0.1"
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = ["linux-native-sync-persistent", "crypto-rust"] }
 
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+keyring = { workspace = true, features = ["vendored"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
 
