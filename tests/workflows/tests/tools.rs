@@ -406,6 +406,7 @@ fn check_workspace_json_emits_valid_envelope_per_member() {
 }
 
 #[test]
+#[cfg(unix)]
 fn check_workspace_json_uses_selected_tsgo_engine_per_member() {
     let project = TempProject::from_fixture("workspace-monorepo");
     let marker = project.path().join(".tsgo-workspace-members.txt");

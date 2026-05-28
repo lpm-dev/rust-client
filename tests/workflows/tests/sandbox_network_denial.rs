@@ -285,8 +285,7 @@ fn node_available() -> bool {
     std::process::Command::new("node")
         .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Shared assertions block. Pins three
@@ -625,12 +624,10 @@ async fn postinstall_loopback_connect_is_denied_no_loopback_exemption() {
 /// developer host (system-installed node, no separately-built
 /// helper) keeps soft-skipping. CI hosts that provision the helper
 /// + AppContainer-accessible node should set the env var so the
-/// gate is observable.
+///   gate is observable.
 #[cfg(target_os = "windows")]
 fn require_appcontainer_coverage() -> bool {
-    std::env::var("LPM_TEST_REQUIRE_APPCONTAINER")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    std::env::var("LPM_TEST_REQUIRE_APPCONTAINER").is_ok_and(|v| v == "1")
 }
 
 /// `true` when `lpm-sandbox-helper.exe` is reachable via the same

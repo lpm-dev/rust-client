@@ -182,8 +182,7 @@ fn node_available() -> bool {
     std::process::Command::new("node")
         .arg("--version")
         .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|out| out.status.success())
 }
 
 /// Seed `~/.lpm/global/trusted-dependencies.json` with an approval snapshot for

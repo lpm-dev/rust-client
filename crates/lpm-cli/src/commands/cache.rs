@@ -249,11 +249,7 @@ fn store_has_recent_children(dir: &Path, max_age: Duration) -> bool {
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
-        if now
-            .duration_since(mtime)
-            .map(|age| age < max_age)
-            .unwrap_or(false)
-        {
+        if now.duration_since(mtime).is_ok_and(|age| age < max_age) {
             return true;
         }
     }

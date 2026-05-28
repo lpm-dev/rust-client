@@ -305,8 +305,7 @@ fn generate_nonce() -> String {
         use std::time::SystemTime;
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(1);
+            .map_or(1, |d| d.as_nanos() as u64);
         let pid = std::process::id() as u64;
         let mix = nanos ^ pid.rotate_left(32);
         bytes = mix.to_le_bytes();

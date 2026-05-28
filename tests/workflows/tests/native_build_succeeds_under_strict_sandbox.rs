@@ -92,14 +92,11 @@ fn node_available() -> bool {
     std::process::Command::new("node")
         .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn toolchain_explicitly_enabled() -> bool {
-    std::env::var("LPM_TEST_WINDOWS_TOOLCHAIN_AVAILABLE")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    std::env::var("LPM_TEST_WINDOWS_TOOLCHAIN_AVAILABLE").is_ok_and(|v| v == "1")
 }
 
 /// `true` when the test runner opted in to hard-fail-on-skip for
@@ -107,9 +104,7 @@ fn toolchain_explicitly_enabled() -> bool {
 /// `LPM_TEST_REQUIRE_APPCONTAINER=1`. Same shape + intent as the
 /// sibling helper in `sandbox_network_denial.rs`.
 fn require_appcontainer_coverage() -> bool {
-    std::env::var("LPM_TEST_REQUIRE_APPCONTAINER")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    std::env::var("LPM_TEST_REQUIRE_APPCONTAINER").is_ok_and(|v| v == "1")
 }
 
 fn project_manifest() -> String {
@@ -266,15 +261,13 @@ async fn native_rebuild_succeeds_under_appcontainer_strict_with_vcvarsall_captur
         .join(format!("{safe}@{NATIVE_DEP_VERSION}"))
         .join("build")
         .join("Release");
-    let any_node = std::fs::read_dir(&build_release)
-        .map(|it| {
-            it.flatten().any(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("node"))
-            })
+    let any_node = std::fs::read_dir(&build_release).is_ok_and(|it| {
+        it.flatten().any(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("node"))
         })
-        .unwrap_or(false);
+    });
     assert!(
         any_node,
         "expected a `.node` artifact under {} after a successful node-gyp rebuild; \

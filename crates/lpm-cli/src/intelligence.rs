@@ -646,7 +646,7 @@ pub fn detect_phantom_deps(
         });
     }
 
-    phantoms.sort_by(|a, b| b.import_count.cmp(&a.import_count));
+    phantoms.sort_by_key(|phantom| std::cmp::Reverse(phantom.import_count));
 
     PhantomDepResult {
         phantom_imports: phantoms,

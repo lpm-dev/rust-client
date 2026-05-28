@@ -90,7 +90,7 @@ impl AppContainerSandbox {
                 let posture = decide_appcontainer_posture(
                     options.deny_outbound_network,
                     options.allow_degraded,
-                )?;
+                );
                 Ok(Self {
                     spec,
                     mode,
@@ -138,11 +138,11 @@ impl AppContainerSandbox {
 pub(crate) fn decide_appcontainer_posture(
     deny_outbound_network: bool,
     _allow_degraded: bool,
-) -> Result<BackendPosture, SandboxError> {
+) -> BackendPosture {
     if deny_outbound_network {
-        Ok(BackendPosture::Strict)
+        BackendPosture::Strict
     } else {
-        Ok(BackendPosture::Default)
+        BackendPosture::Default
     }
 }
 
@@ -378,9 +378,8 @@ fn tool_dirs_needing_explicit_grant(cmd: &SandboxedCommand) -> Vec<PathBuf> {
         return Vec::new();
     };
 
-    let system_root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let system_root =
+        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
 
     let mut out: Vec<PathBuf> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -705,13 +704,13 @@ mod tests {
 
     #[test]
     fn decide_appcontainer_posture_strict_when_deny_outbound_set() {
-        let p = decide_appcontainer_posture(true, false).expect("strict");
+        let p = decide_appcontainer_posture(true, false);
         assert_eq!(p, BackendPosture::Strict);
     }
 
     #[test]
     fn decide_appcontainer_posture_default_when_deny_outbound_unset() {
-        let p = decide_appcontainer_posture(false, false).expect("default");
+        let p = decide_appcontainer_posture(false, false);
         assert_eq!(p, BackendPosture::Default);
     }
 
@@ -722,7 +721,7 @@ mod tests {
         // fallback path.
         for ag in [false, true] {
             assert_eq!(
-                decide_appcontainer_posture(true, ag).expect("strict"),
+                decide_appcontainer_posture(true, ag),
                 BackendPosture::Strict,
                 "allow_degraded={ag} should not affect AppContainer posture",
             );

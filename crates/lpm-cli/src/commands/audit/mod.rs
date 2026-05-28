@@ -1319,7 +1319,7 @@ fn print_behavioral_results(results: &[AuditResult], lpm_packages: &[(String, St
         println!("  {}", "Behavioral flags".bold());
         // Sort by count descending
         let mut sorted: Vec<(&String, &Vec<String>)> = moderate_tags.iter().collect();
-        sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.len()));
         for (message, packages) in &sorted {
             let count = packages.len();
             let preview: Vec<&str> = packages.iter().take(3).map(|s| s.as_str()).collect();

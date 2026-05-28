@@ -1863,7 +1863,7 @@ fn read_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
 
 pub fn list_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
     let mut grants = read_active_unlocks()?;
-    grants.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
+    grants.sort_by_key(|left| left.expires_at);
     Ok(grants)
 }
 
@@ -1872,7 +1872,7 @@ pub fn list_active_global_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
         .into_iter()
         .filter(|grant| grant.target == UnlockTargetKind::Global)
         .collect();
-    grants.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
+    grants.sort_by_key(|left| left.expires_at);
     Ok(grants)
 }
 
@@ -1885,7 +1885,7 @@ pub fn list_active_project_unlocks(project_dir: &Path) -> Result<Vec<UnlockGrant
                 && grant.project_root.as_deref() == Some(root.as_str())
         })
         .collect();
-    grants.sort_by(|left, right| left.expires_at.cmp(&right.expires_at));
+    grants.sort_by_key(|left| left.expires_at);
     Ok(grants)
 }
 

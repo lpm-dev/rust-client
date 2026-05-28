@@ -3295,6 +3295,7 @@ mod tests {
     /// Without project-scoping, `lpm rebuild` in project A could
     /// read scripts / trust state from the WRONG link entry and
     /// stamp the build marker into a sibling project's store dir.
+    #[cfg(unix)]
     #[test]
     fn f1f2_for_project_resolves_to_the_link_entry_this_project_uses() {
         use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};
@@ -3395,6 +3396,7 @@ mod tests {
     /// Without this, `live_package_dir_with_v2`'s transitive fallback
     /// (which today routes through `Store::find_link_package_dir`'s
     /// global first-match) would still be ambiguous post-F1.
+    #[cfg(unix)]
     #[test]
     fn f1f2_for_project_reaches_transitive_via_link_meta_deps() {
         use crate::v2::link_meta::{LinkMeta, LinkMetaDep, LinkMetaPlatform};
@@ -3509,6 +3511,7 @@ mod tests {
     /// package symlink is nested one level deeper. `for_project` must
     /// seed from that nested symlink too, otherwise rebuild / install-
     /// hint silently skip the entire scoped direct-dependency surface.
+    #[cfg(unix)]
     #[test]
     fn f1f2_for_project_includes_scoped_direct_dependencies() {
         use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};

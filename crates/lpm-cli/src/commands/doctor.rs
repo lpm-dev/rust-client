@@ -678,18 +678,18 @@ pub async fn run(
                 "node_modules_missing"
                 | "node_modules_no_store"
                 | "node_modules_legacy_layout"
-                | "node_modules_mixed_layout" => {
-                    if !install_ran {
-                        if !json_output {
-                            output::info("fixing: lpm install");
+                | "node_modules_mixed_layout"
+                    if !install_ran =>
+                {
+                    if !json_output {
+                        output::info("fixing: lpm install");
+                    }
+                    match run_doctor_install(client, project_dir).await {
+                        Ok(()) => {
+                            fixes_applied.push("lpm install".into());
+                            install_ran = true;
                         }
-                        match run_doctor_install(client, project_dir).await {
-                            Ok(()) => {
-                                fixes_applied.push("lpm install".into());
-                                install_ran = true;
-                            }
-                            Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
-                        }
+                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
                     }
                 }
                 "node_pinned_unmet" | "node_missing_pinned" | "node_missing_unpinned" => {
@@ -730,32 +730,28 @@ pub async fn run(
                         Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm fmt failed: {e}"),
                     }
                 }
-                "lockfile_missing" => {
-                    if !install_ran {
-                        if !json_output {
-                            output::info("fixing: lpm install (generates lockfile)");
+                "lockfile_missing" if !install_ran => {
+                    if !json_output {
+                        output::info("fixing: lpm install (generates lockfile)");
+                    }
+                    match run_doctor_install(client, project_dir).await {
+                        Ok(()) => {
+                            fixes_applied.push("lpm install (lockfile)".into());
+                            install_ran = true;
                         }
-                        match run_doctor_install(client, project_dir).await {
-                            Ok(()) => {
-                                fixes_applied.push("lpm install (lockfile)".into());
-                                install_ran = true;
-                            }
-                            Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
-                        }
+                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
                     }
                 }
-                "deps_sync_drift" => {
-                    if !install_ran {
-                        if !json_output {
-                            output::info("fixing: lpm install (sync lockfile)");
+                "deps_sync_drift" if !install_ran => {
+                    if !json_output {
+                        output::info("fixing: lpm install (sync lockfile)");
+                    }
+                    match run_doctor_install(client, project_dir).await {
+                        Ok(()) => {
+                            fixes_applied.push("lpm install (deps sync)".into());
+                            install_ran = true;
                         }
-                        match run_doctor_install(client, project_dir).await {
-                            Ok(()) => {
-                                fixes_applied.push("lpm install (deps sync)".into());
-                                install_ran = true;
-                            }
-                            Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
-                        }
+                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
                     }
                 }
                 "lockfile_binary_stale" | "lockfile_binary_corrupt" | "lockfile_binary_missing" => {

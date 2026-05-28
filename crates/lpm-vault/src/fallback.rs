@@ -114,7 +114,7 @@ fn force_file_data_key() -> bool {
 }
 
 fn lpm_dir_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("could not determine home directory")?;
+    let home = crate::lpm_home_dir().ok_or("could not determine home directory")?;
     Ok(home.join(".lpm"))
 }
 
@@ -665,7 +665,7 @@ mod tests {
     fn with_temp_vault_home<T>(test: impl FnOnce(&Path) -> T) -> T {
         let _lock = crate::test_env_lock::acquire_env_lock();
         let temp_home = tempfile::tempdir().expect("create temp HOME");
-        let original_home = std::env::var_os("HOME");
+        let original_home = crate::test_env_lock::HomeEnvSnapshot::set(temp_home.path());
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
         let original_fast_scrypt = std::env::var_os("LPM_TEST_FAST_SCRYPT");
         let original_native_read_error = std::env::var_os("LPM_TEST_VAULT_NATIVE_KEY_READ_ERROR");
@@ -674,7 +674,6 @@ mod tests {
         let original_native_write_error = std::env::var_os("LPM_TEST_VAULT_NATIVE_KEY_WRITE_ERROR");
 
         unsafe {
-            std::env::set_var("HOME", temp_home.path());
             std::env::remove_var("LPM_FORCE_FILE_VAULT");
             std::env::set_var("LPM_TEST_FAST_SCRYPT", "1");
             std::env::remove_var("LPM_TEST_VAULT_NATIVE_KEY_READ_ERROR");
@@ -687,10 +686,6 @@ mod tests {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(temp_home.path())));
 
         unsafe {
-            match original_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
             match original_force_file_vault {
                 Some(value) => std::env::set_var("LPM_FORCE_FILE_VAULT", value),
                 None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
@@ -716,6 +711,7 @@ mod tests {
                 None => std::env::remove_var("LPM_TEST_VAULT_NATIVE_KEY_WRITE_ERROR"),
             }
         }
+        original_home.restore();
 
         match result {
             Ok(value) => value,
@@ -886,7 +882,10 @@ mod tests {
         assert!(key.chars().all(|c| c.is_alphanumeric()));
 
         // The key must NOT look like the old predictable format
-        let home = dirs::home_dir().unwrap_or_default().display().to_string();
+        let home = crate::lpm_home_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
         let user = std::env::var("USER").unwrap_or_default();
         let old_predictable = format!("{home}-{user}-vault");
         assert_ne!(key, old_predictable);

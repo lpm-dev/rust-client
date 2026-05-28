@@ -1053,8 +1053,7 @@ async fn try_connect(
                                                         &base64::engine::general_purpose::STANDARD,
                                                         &data,
                                                     )
-                                                    .map(|b| b.len())
-                                                    .unwrap_or(0);
+                                                    .map_or(0, |b| b.len());
                                                     let _ = ws_tx.send(WsEvent::Frame {
                                                         connection_id: id_clone.clone(),
                                                         direction: FrameDirection::Outbound,

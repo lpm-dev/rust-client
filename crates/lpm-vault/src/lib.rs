@@ -35,7 +35,7 @@ pub mod keychain;
 pub(crate) mod test_env_lock;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultStorageBackend {
@@ -57,6 +57,15 @@ fn force_file_vault_backend() -> bool {
         std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
     )
+}
+
+pub(crate) fn lpm_home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("LPM_TEST_HOME") {
+        return Some(PathBuf::from(path));
+    }
+
+    dirs::home_dir()
 }
 
 pub fn storage_backend() -> VaultStorageBackend {
@@ -769,13 +778,12 @@ mod tests {
     fn with_forced_file_vault_backend<T>(test: impl FnOnce() -> T) -> T {
         let _lock = crate::test_env_lock::acquire_env_lock();
         let temp_home = tempfile::tempdir().expect("create temp HOME");
-        let original_home = std::env::var_os("HOME");
+        let original_home = crate::test_env_lock::HomeEnvSnapshot::set(temp_home.path());
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
         let original_fast_scrypt = std::env::var_os("LPM_TEST_FAST_SCRYPT");
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             unsafe {
-                std::env::set_var("HOME", temp_home.path());
                 std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
                 std::env::set_var("LPM_TEST_FAST_SCRYPT", "1");
             }
@@ -783,10 +791,6 @@ mod tests {
         }));
 
         unsafe {
-            match original_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
             match original_force_file_vault {
                 Some(value) => std::env::set_var("LPM_FORCE_FILE_VAULT", value),
                 None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
@@ -796,6 +800,7 @@ mod tests {
                 None => std::env::remove_var("LPM_TEST_FAST_SCRYPT"),
             }
         }
+        original_home.restore();
 
         match result {
             Ok(value) => value,
@@ -1169,12 +1174,11 @@ KEY3=no-quotes"#;
         let _lock = crate::test_env_lock::acquire_env_lock();
 
         let temp_home = tempfile::tempdir().expect("create temp HOME");
-        let original_home = std::env::var_os("HOME");
+        let original_home = crate::test_env_lock::HomeEnvSnapshot::set(temp_home.path());
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
         let original_fast_scrypt = std::env::var_os("LPM_TEST_FAST_SCRYPT");
 
         unsafe {
-            std::env::set_var("HOME", temp_home.path());
             std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
             std::env::set_var("LPM_TEST_FAST_SCRYPT", "1");
         }
@@ -1280,10 +1284,6 @@ KEY3=no-quotes"#;
         }));
 
         unsafe {
-            match original_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
             match original_force_file_vault {
                 Some(value) => std::env::set_var("LPM_FORCE_FILE_VAULT", value),
                 None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
@@ -1293,6 +1293,7 @@ KEY3=no-quotes"#;
                 None => std::env::remove_var("LPM_TEST_FAST_SCRYPT"),
             }
         }
+        original_home.restore();
 
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);

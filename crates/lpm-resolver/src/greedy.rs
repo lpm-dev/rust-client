@@ -966,7 +966,7 @@ impl ResolveState {
         // `self.root_aliases` so the install pipeline can build
         // `node_modules/<local>/` from the target's content.
         let mut entries: Vec<_> = self.root_deps.iter().collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries.sort_by_key(|(name, _)| *name);
         for (name, range_str) in entries {
             let (canonical_name, effective_range) = match crate::ranges::parse_npm_alias(range_str)
             {
@@ -1517,7 +1517,7 @@ fn enqueue_child_deps(
     // Sort for deterministic edge ordering — keeps test diffs stable
     // and the resolved tree reproducible across runs.
     let mut entries: Vec<(&String, &String)> = deps.iter().collect();
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_by_key(|(name, _)| *name);
 
     for (local_name, range_str) in entries {
         // Bundled deps are vendored inside the parent's tarball
@@ -1603,7 +1603,7 @@ fn enqueue_child_deps(
         let optional_peers = info.optional_peer_names.get(&ver_str);
         let peer_aliases = info.aliases.get(&ver_str);
         let mut peer_entries: Vec<(&String, &String)> = peer_deps.iter().collect();
-        peer_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        peer_entries.sort_by_key(|(name, _)| *name);
 
         for (peer_name, peer_range_str) in peer_entries {
             // `workspace:` peers from a registry-published package

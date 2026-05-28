@@ -63,9 +63,7 @@ pub const ALLOW_UNVERIFIED_ENV: &str = "LPM_ALLOW_UNVERIFIED_PLUGINS";
 /// Read [`ALLOW_UNVERIFIED_ENV`] and return whether the user has
 /// opted into unverified installs in the current process.
 pub fn allow_unverified_override() -> bool {
-    std::env::var(ALLOW_UNVERIFIED_ENV)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    std::env::var(ALLOW_UNVERIFIED_ENV).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 /// Download and install a plugin binary into the platform-scoped

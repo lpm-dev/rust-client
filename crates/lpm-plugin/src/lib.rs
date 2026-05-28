@@ -84,9 +84,7 @@ pub async fn ensure_plugin(
     let platform = lpm_runtime::platform::Platform::current()?;
     let platform_str = platform.to_string();
 
-    let force = std::env::var("LPM_FORCE_TOOL_INSTALL")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    let force = std::env::var("LPM_FORCE_TOOL_INSTALL").is_ok_and(|v| v == "true" || v == "1");
 
     let bin_path = store::plugin_binary_path(def.name, &version, &platform_str, def.binary_name)?;
     let sidecar_path = store::plugin_sidecar_path(def.name, &version, &platform_str)?;
@@ -201,9 +199,7 @@ async fn run_install_locked_body(
     // progress messaging (e.g. `lpm plugin update`, JSON-output flows)
     // can avoid double-printing. CI / scripted callers that want a
     // clean stderr capture also set the env var.
-    let env_quiet = std::env::var("LPM_PLUGIN_QUIET")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    let env_quiet = std::env::var("LPM_PLUGIN_QUIET").is_ok_and(|v| v == "true" || v == "1");
 
     if !quiet && !env_quiet {
         eprintln!(

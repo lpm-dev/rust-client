@@ -405,8 +405,7 @@ fn atomic_replace_file_windows(path: &Path, contents: &[u8]) -> Result<(), ShimE
         ".{}.{}.tmp",
         path_ext
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "shim".to_string()),
+            .map_or_else(|| "shim".to_string(), |n| n.to_string_lossy().into_owned()),
         std::process::id()
     );
     let tmp_path = parent.join(tmp_name);

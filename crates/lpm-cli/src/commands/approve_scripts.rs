@@ -1203,8 +1203,7 @@ fn write_back(
     let pid = std::process::id();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let tmp = parent.join(format!(".package.json.{pid}.{nanos}.tmp"));
     std::fs::write(&tmp, format!("{updated}\n")).map_err(LpmError::Io)?;
     std::fs::rename(&tmp, pkg_json_path).map_err(|e| {

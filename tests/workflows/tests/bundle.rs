@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(unix)]
 use support::assertions::parse_json_output;
 use support::{TempProject, lpm};
 

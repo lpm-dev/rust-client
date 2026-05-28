@@ -817,9 +817,7 @@ async fn run_level(
         return vec![result];
     }
 
-    let max_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
 
     let mut all_results: Vec<MemberResult> = Vec::with_capacity(level_targets.len());
 

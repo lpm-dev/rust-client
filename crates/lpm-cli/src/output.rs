@@ -64,7 +64,7 @@ pub fn tier_colored(tier: &str) -> String {
 
 /// Format a quality score with color based on value.
 pub fn score_colored(score: u32, max: u32) -> String {
-    let pct = if max > 0 { score * 100 / max } else { 0 };
+    let pct = (score * 100).checked_div(max).unwrap_or(0);
     let text = format!("{score}/{max}");
     if pct >= 80 {
         text.green()

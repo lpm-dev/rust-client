@@ -108,9 +108,7 @@ pub fn node_bin_dir(version: &str) -> Result<PathBuf, LpmError> {
 
 /// Check if a Node.js version is installed.
 pub fn is_installed(version: &str) -> bool {
-    node_binary_path(version)
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    node_binary_path(version).is_ok_and(|p| p.exists())
 }
 
 /// List all installed Node.js versions.

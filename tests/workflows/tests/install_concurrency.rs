@@ -2070,7 +2070,7 @@ async fn lpm_command_after_torn_wal_tail_recovers_silently() {
     // must be gone. Either the WAL file no longer exists (truncated
     // away entirely), or it's 0 bytes, or it's a different non-zero
     // size — never STILL the original 3 garbage bytes.
-    let post_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    let post_size = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
     assert_ne!(
         post_size, 3,
         "WAL still has the seeded torn-tail bytes after recovery hook \
@@ -2188,7 +2188,7 @@ async fn lpm_command_skips_recovery_when_another_lpm_holds_global_tx_lock() {
     // did not run. If they're gone, the dispatcher proceeded with
     // recovery despite the lock being held — a correctness bug in
     // the `try_with_exclusive_lock` arm.
-    let mid_wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    let mid_wal_size = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
     assert_eq!(
         mid_wal_size, 3,
         "WAL was modified while another lpm held global_tx_lock — \
@@ -2214,7 +2214,7 @@ async fn lpm_command_skips_recovery_when_another_lpm_holds_global_tx_lock() {
         "post-release global list failed: stderr={}",
         String::from_utf8_lossy(&after_release.stderr)
     );
-    let post_wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    let post_wal_size = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
     assert_ne!(
         post_wal_size, 3,
         "after the lock-holder released, recovery still didn't run — \

@@ -56,7 +56,7 @@ fn list_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                let size = skill_entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let size = skill_entry.metadata().map_or(0, |m| m.len());
                 skills.push((name, size));
             }
         }
@@ -209,7 +209,7 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
                 .to_string_lossy()
                 .to_string();
             let display_name = format!("{pkg_name}/{name}");
-            let size = skill_entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let size = skill_entry.metadata().map_or(0, |m| m.len());
             total_size += size;
 
             if size > 15 * 1024 {

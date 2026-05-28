@@ -37,9 +37,7 @@ pub fn cache_entry_dir(key: &str) -> Result<PathBuf, LpmError> {
 
 /// Check if a cache entry exists for the given key.
 pub fn has_cache_hit(key: &str) -> bool {
-    cache_entry_dir(key)
-        .map(|d| d.join("meta.json").exists())
-        .unwrap_or(false)
+    cache_entry_dir(key).is_ok_and(|d| d.join("meta.json").exists())
 }
 
 /// Restore cached outputs to the project directory.
@@ -381,6 +379,7 @@ fn set_dir_permissions_restricted(path: &Path) -> Result<(), LpmError> {
 
 /// No-op on non-Unix platforms.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_dir_permissions_restricted(_path: &Path) -> Result<(), LpmError> {
     Ok(())
 }

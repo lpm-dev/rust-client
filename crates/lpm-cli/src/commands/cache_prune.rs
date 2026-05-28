@@ -772,18 +772,19 @@ fn emit_json(summary: &PruneSummary) {
 mod tests {
     use super::*;
     use chrono::DateTime;
-    use lpm_common::known_projects::{Entry, Registry};
-    use lpm_store::v2::{
-        DepLink, GraphKey, GraphKeyInputs, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag,
-        PlatformTuple,
-    };
+
+    #[cfg(unix)]
+    use lpm_store::v2::{GraphKey, GraphKeyInputs, LinkMetaPlatform, LinkerModeTag, PlatformTuple};
     use std::collections::HashMap;
+    #[cfg(unix)]
     use std::sync::Arc;
 
+    #[cfg(unix)]
     fn synthetic_sri(seed: &[u8]) -> String {
         lpm_store::compute_sri_hash(seed)
     }
 
+    #[cfg(unix)]
     fn write_object(store: &V2Store, sri: &str) {
         let dir = store.paths().object_dir(sri).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -795,6 +796,7 @@ mod tests {
         std::fs::write(dir.join(".integrity"), sri).unwrap();
     }
 
+    #[cfg(unix)]
     fn sample_meta_platform() -> LinkMetaPlatform {
         LinkMetaPlatform {
             os: "darwin".into(),
@@ -803,6 +805,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn key_for(name: &str, version: &str) -> Arc<GraphKey> {
         let inputs = GraphKeyInputs::new(
             name,
@@ -815,18 +818,13 @@ mod tests {
 
     /// Helper: synthesize a project whose `node_modules/<dep>` symlinks
     /// point at `links/<key>/node_modules/<dep>/` for each given key.
+    #[cfg(unix)]
     fn synthesize_project(project: &Path, store: &V2Store, keys: &[(&str, Arc<GraphKey>)]) {
         let nm = project.join("node_modules");
         std::fs::create_dir_all(&nm).unwrap();
         for (name, key) in keys {
             let target = store.paths().link_package_dir(key);
-            #[cfg(unix)]
             std::os::unix::fs::symlink(&target, nm.join(name)).unwrap();
-            #[cfg(windows)]
-            {
-                let _ = (target, name);
-                unimplemented!("test only runs on unix");
-            }
         }
     }
 
