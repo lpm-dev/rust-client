@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Catalog references grouped by catalog name, then package name.
@@ -2201,6 +2202,59 @@ pub struct CatalogProtocolResolution {
     pub specifier: String,
 }
 
+/// Error raised while resolving a dependency's catalog protocol reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogProtocolError {
+    CatalogNotFound {
+        dependency: String,
+        catalog: String,
+        available: String,
+    },
+    EntryNotFound {
+        dependency: String,
+        catalog: String,
+        available: String,
+    },
+    RecursiveDefinition {
+        dependency: String,
+        catalog: String,
+        specifier: String,
+    },
+}
+
+impl fmt::Display for CatalogProtocolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CatalogProtocolError::CatalogNotFound {
+                dependency,
+                catalog,
+                available,
+            } => write!(
+                f,
+                "catalog '{catalog}' not found for dependency '{dependency}'. Available catalogs: {available}"
+            ),
+            CatalogProtocolError::EntryNotFound {
+                dependency,
+                catalog,
+                available,
+            } => write!(
+                f,
+                "dependency '{dependency}' not found in catalog '{catalog}'. Available: {available}"
+            ),
+            CatalogProtocolError::RecursiveDefinition {
+                dependency,
+                catalog,
+                specifier,
+            } => write!(
+                f,
+                "invalid recursive catalog entry for dependency '{dependency}' in catalog '{catalog}': catalog entry value '{specifier}' cannot use the catalog protocol recursively"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CatalogProtocolError {}
+
 /// Resolve `catalog:` and `catalog:{name}` protocol references in dependencies.
 ///
 /// - `"catalog:"` resolves from `catalogs["default"]`
@@ -2212,7 +2266,7 @@ pub struct CatalogProtocolResolution {
 pub fn resolve_catalog_protocol(
     deps: &mut HashMap<String, String>,
     catalogs: &HashMap<String, HashMap<String, String>>,
-) -> Result<Vec<CatalogProtocolResolution>, String> {
+) -> Result<Vec<CatalogProtocolResolution>, CatalogProtocolError> {
     let mut resolved = Vec::new();
 
     for (name, range) in deps.iter_mut() {
@@ -2228,38 +2282,28 @@ pub fn resolve_catalog_protocol(
         };
 
         let catalog = catalogs.get(catalog_name.as_str()).ok_or_else(|| {
-            let available = if catalogs.is_empty() {
-                "(none)".to_string()
-            } else {
-                let mut keys: Vec<&str> = catalogs.keys().map(|s| s.as_str()).collect();
-                keys.sort();
-                keys.join(", ")
-            };
-            format!(
-                "catalog '{}' not found for dependency '{}'. Available catalogs: {}",
-                catalog_name, name, available
-            )
+            CatalogProtocolError::CatalogNotFound {
+                dependency: name.clone(),
+                catalog: catalog_name.clone(),
+                available: format_catalog_keys(catalogs.keys()),
+            }
         })?;
 
-        let version = catalog.get(name.as_str()).ok_or_else(|| {
-            let available = if catalog.is_empty() {
-                "(none)".to_string()
-            } else {
-                let mut keys: Vec<&str> = catalog.keys().map(|s| s.as_str()).collect();
-                keys.sort();
-                keys.join(", ")
-            };
-            format!(
-                "dependency '{}' not found in catalog '{}'. Available: {}",
-                name, catalog_name, available
-            )
-        })?;
+        let version =
+            catalog
+                .get(name.as_str())
+                .ok_or_else(|| CatalogProtocolError::EntryNotFound {
+                    dependency: name.clone(),
+                    catalog: catalog_name.clone(),
+                    available: format_catalog_keys(catalog.keys()),
+                })?;
 
         if version.starts_with("catalog:") {
-            return Err(format!(
-                "invalid recursive catalog entry for dependency '{}' in catalog '{}': catalog entries cannot use the catalog protocol recursively",
-                name, catalog_name
-            ));
+            return Err(CatalogProtocolError::RecursiveDefinition {
+                dependency: name.clone(),
+                catalog: catalog_name,
+                specifier: version.clone(),
+            });
         }
 
         let original = range.clone();
@@ -2273,6 +2317,16 @@ pub fn resolve_catalog_protocol(
     }
 
     Ok(resolved)
+}
+
+fn format_catalog_keys<'a>(keys: impl Iterator<Item = &'a String>) -> String {
+    let mut keys: Vec<&str> = keys.map(String::as_str).collect();
+    if keys.is_empty() {
+        "(none)".to_string()
+    } else {
+        keys.sort_unstable();
+        keys.join(", ")
+    }
 }
 
 /// Add every dependency-field `catalog:` reference from `package_json`.
@@ -4060,11 +4114,8 @@ mod catalog_protocol_tests {
         let catalogs = HashMap::new();
         let result = resolve_catalog_protocol(&mut deps, &catalogs);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("catalog 'nonexistent' not found")
-        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("catalog 'nonexistent' not found"));
     }
 
     #[test]
@@ -4076,11 +4127,8 @@ mod catalog_protocol_tests {
         )]);
         let result = resolve_catalog_protocol(&mut deps, &catalogs);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("dependency 'vue' not found in catalog")
-        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("dependency 'vue' not found in catalog"));
     }
 
     #[test]
@@ -4093,10 +4141,25 @@ mod catalog_protocol_tests {
 
         let result = resolve_catalog_protocol(&mut deps, &catalogs);
         let err = result.expect_err("recursive catalog value must error");
+        let message = err.to_string();
 
         assert!(
-            err.contains("recursive") && err.contains("react") && err.contains("catalog 'default'"),
-            "error should identify recursive catalog entry, got: {err}"
+            matches!(
+                err,
+                CatalogProtocolError::RecursiveDefinition {
+                    dependency,
+                    catalog,
+                    specifier,
+                } if dependency == "react" && catalog == "default" && specifier == "catalog:shared"
+            ),
+            "error should preserve typed recursive catalog context, got: {message}"
+        );
+        assert!(
+            message.contains("recursive")
+                && message.contains("react")
+                && message.contains("catalog 'default'")
+                && message.contains("catalog:shared"),
+            "error should identify recursive catalog entry, got: {message}"
         );
         assert_eq!(
             deps["react"], "catalog:",

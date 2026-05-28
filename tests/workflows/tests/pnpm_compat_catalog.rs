@@ -318,8 +318,53 @@ async fn catalog_entry_recursive_definition_fails_with_clear_error() {
     assert!(
         text.contains("recursive")
             && text.contains("is-positive")
-            && text.contains("catalog 'default'"),
+            && text.contains("catalog")
+            && text.contains("'default'"),
         "recursive catalog error must name the package and catalog\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn recursive_catalog_definition_json_uses_catalog_error_code() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "catalog:loop"
+                }
+            }
+        }"#,
+    );
+
+    let output = run_install_json(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "recursive catalog entries must fail install\n{text}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!("recursive catalog JSON error must be valid JSON: {error}\n{text}")
+        });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(
+        envelope["error_code"],
+        serde_json::json!("catalog_entry_invalid_recursive_definition")
+    );
+    assert!(
+        envelope["error"].as_str().is_some_and(|error| {
+            error.contains("is-positive")
+                && error.contains("catalog 'default'")
+                && error.contains("catalog:loop")
+        }),
+        "recursive catalog JSON error must name the package, catalog, and recursive spec\n{text}"
     );
 }
 
@@ -913,6 +958,14 @@ fn run_install(project: &TempProject, mock: &MockRegistry, packages: &[&str]) ->
     cmd.args(INSTALL_ARGS);
     cmd.args(packages);
     cmd.output().expect("failed to run lpm install")
+}
+
+fn run_install_json(project: &TempProject, mock: &MockRegistry, packages: &[&str]) -> Output {
+    let mut cmd = lpm_with_registry(project, &mock.url());
+    cmd.arg("--json");
+    cmd.args(INSTALL_ARGS);
+    cmd.args(packages);
+    cmd.output().expect("failed to run lpm install --json")
 }
 
 fn resolved_version(project: &TempProject, package: &str) -> String {

@@ -183,6 +183,19 @@ pub enum LpmError {
     )]
     Workspace(String),
 
+    #[error(
+        "invalid recursive catalog entry for dependency '{dependency}' in catalog '{catalog}': catalog entry value '{specifier}' cannot use the catalog protocol recursively"
+    )]
+    #[diagnostic(
+        code(lpm::catalog_entry_invalid_recursive_definition),
+        help("Replace the catalog entry with a concrete version range.")
+    )]
+    CatalogEntryInvalidRecursiveDefinition {
+        dependency: String,
+        catalog: String,
+        specifier: String,
+    },
+
     #[error("environment validation failed:\n{0}")]
     #[diagnostic(
         code(lpm::env_validation),
@@ -320,6 +333,9 @@ impl LpmError {
             LpmError::Plugin(_) => "plugin",
             LpmError::Engine(_) => "engine",
             LpmError::Workspace(_) => "workspace",
+            LpmError::CatalogEntryInvalidRecursiveDefinition { .. } => {
+                "catalog_entry_invalid_recursive_definition"
+            }
             LpmError::EnvValidation(_) => "env_validation",
             LpmError::EngineMismatch { .. } => "engine_mismatch",
             LpmError::SelfUpdatePaused(_) => "self_update_paused",
@@ -468,6 +484,11 @@ mod tests {
             LpmError::Plugin("x".into()),
             LpmError::Engine("x".into()),
             LpmError::Workspace("x".into()),
+            LpmError::CatalogEntryInvalidRecursiveDefinition {
+                dependency: "react".into(),
+                catalog: "default".into(),
+                specifier: "catalog:shared".into(),
+            },
             LpmError::EnvValidation("x".into()),
             LpmError::EngineMismatch {
                 engine: "lpm".into(),
@@ -572,6 +593,15 @@ mod tests {
         assert_eq!(LpmError::Plugin("x".into()).error_code(), "plugin");
         assert_eq!(LpmError::Engine("x".into()).error_code(), "engine");
         assert_eq!(LpmError::Workspace("x".into()).error_code(), "workspace");
+        assert_eq!(
+            LpmError::CatalogEntryInvalidRecursiveDefinition {
+                dependency: "react".into(),
+                catalog: "default".into(),
+                specifier: "catalog:shared".into(),
+            }
+            .error_code(),
+            "catalog_entry_invalid_recursive_definition"
+        );
         assert_eq!(
             LpmError::EnvValidation("x".into()).error_code(),
             "env_validation"

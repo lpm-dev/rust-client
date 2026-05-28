@@ -4174,9 +4174,7 @@ async fn run_with_options_under_store_lock(
                     catalog_resolutions = resolved;
                 }
                 Err(e) => {
-                    return Err(LpmError::Registry(format!(
-                        "catalog resolution failed: {e}"
-                    )));
+                    return Err(catalog_protocol_error_to_lpm(e));
                 }
             }
         }
@@ -4200,9 +4198,7 @@ async fn run_with_options_under_store_lock(
                     catalog_resolutions = resolved;
                 }
                 Err(e) => {
-                    return Err(LpmError::Registry(format!(
-                        "catalog resolution failed: {e}"
-                    )));
+                    return Err(catalog_protocol_error_to_lpm(e));
                 }
             }
         }
@@ -9451,6 +9447,21 @@ struct LockfileFastPath {
 ///   is correct as-is.
 fn lockfile_needs_r25_repair(lockfile: &lpm_lockfile::Lockfile, auto_install_peers: bool) -> bool {
     auto_install_peers && lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION
+}
+
+fn catalog_protocol_error_to_lpm(error: lpm_workspace::CatalogProtocolError) -> LpmError {
+    match error {
+        lpm_workspace::CatalogProtocolError::RecursiveDefinition {
+            dependency,
+            catalog,
+            specifier,
+        } => LpmError::CatalogEntryInvalidRecursiveDefinition {
+            dependency,
+            catalog,
+            specifier,
+        },
+        other => LpmError::Registry(format!("catalog resolution failed: {other}")),
+    }
 }
 
 fn catalog_snapshot_from_install_packages(
