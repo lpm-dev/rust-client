@@ -267,6 +267,78 @@ fn catalog_save_policy_for_project(
     Ok(CatalogSavePolicy::from_package(&pkg, forced_catalog))
 }
 
+fn cleanup_unused_catalogs_after_install(project_dir: &Path) -> Result<bool, LpmError> {
+    let workspace = lpm_workspace::discover_workspace(project_dir)
+        .map_err(|e| LpmError::Registry(format!("failed to discover workspace catalogs: {e}")))?;
+
+    let (root_dir, cleanup_enabled, member_dirs) = if let Some(workspace) = workspace {
+        let cleanup_enabled = cleanup_unused_catalogs_enabled(&workspace.root_package);
+        let member_dirs = workspace
+            .members
+            .into_iter()
+            .map(|member| member.path)
+            .collect();
+        (workspace.root, cleanup_enabled, member_dirs)
+    } else {
+        let pkg_json_path = project_dir.join("package.json");
+        let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+            .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
+        (
+            project_dir.to_path_buf(),
+            cleanup_unused_catalogs_enabled(&pkg),
+            Vec::new(),
+        )
+    };
+
+    if !cleanup_enabled {
+        return Ok(false);
+    }
+
+    let mut references = lpm_workspace::CatalogReferences::new();
+    let root_pkg_path = root_dir.join("package.json");
+    let root_pkg = lpm_workspace::read_package_json(&root_pkg_path)
+        .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
+    lpm_workspace::collect_catalog_references(&root_pkg, &mut references);
+
+    for member_dir in member_dirs {
+        let member_pkg_path = member_dir.join("package.json");
+        let member_pkg = lpm_workspace::read_package_json(&member_pkg_path).map_err(|e| {
+            LpmError::Registry(format!(
+                "failed to read workspace member package.json {}: {e}",
+                member_pkg_path.display()
+            ))
+        })?;
+        lpm_workspace::collect_catalog_references(&member_pkg, &mut references);
+    }
+
+    let package_json_changed =
+        lpm_workspace::prune_unused_package_json_catalogs(&root_pkg_path, &references).map_err(
+            |e| {
+                LpmError::Registry(format!(
+                    "failed to cleanup unused package.json catalog entries: {e}"
+                ))
+            },
+        )?;
+    let pnpm_workspace_changed = lpm_workspace::prune_unused_pnpm_workspace_catalogs(
+        &root_dir.join("pnpm-workspace.yaml"),
+        &references,
+    )
+    .map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to cleanup unused pnpm-workspace.yaml catalog entries: {e}"
+        ))
+    })?;
+
+    Ok(package_json_changed || pnpm_workspace_changed)
+}
+
+fn cleanup_unused_catalogs_enabled(pkg: &lpm_workspace::PackageJson) -> bool {
+    pkg.lpm
+        .as_ref()
+        .and_then(|lpm| lpm.cleanup_unused_catalogs)
+        .unwrap_or(false)
+}
+
 fn strict_peer_dependency_error(
     peer_warnings: &[PeerWarning],
     peer_conflicts: &[PeerConflictReport],
@@ -3921,7 +3993,16 @@ async fn run_with_options_under_store_lock(
         &pkg_content_for_state,
         linker_mode,
     );
+    let cleanup_catalogs_in_pipeline = requested_add_count.is_none();
     if !force && !offline && !strict_peer_dependencies && install_state.up_to_date {
+        let catalogs_cleaned = if cleanup_catalogs_in_pipeline {
+            cleanup_unused_catalogs_after_install(project_dir)?
+        } else {
+            false
+        };
+        if catalogs_cleaned {
+            write_post_install_v6_hash(project_dir, linker_mode);
+        }
         let elapsed = start.elapsed();
         let total_ms = elapsed.as_millis();
         if json_output {
@@ -4325,6 +4406,9 @@ async fn run_with_options_under_store_lock(
     // No re-resolution here.
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
+        if cleanup_catalogs_in_pipeline {
+            cleanup_unused_catalogs_after_install(project_dir)?;
+        }
         // audit fix: emit a proper JSON object even on the
         // empty-deps short-circuit so agents driving install always get a
         // parseable result. Pre-fix this branch returned silently in JSON
@@ -7967,6 +8051,10 @@ async fn run_with_options_under_store_lock(
         &prior_patch_state,
         &applied_patches,
     );
+
+    if cleanup_catalogs_in_pipeline {
+        cleanup_unused_catalogs_after_install(project_dir)?;
+    }
 
     // Audit-after-install: run a silent audit pass and stash the
     // resulting counts. Both the JSON envelope and the human Done
@@ -12223,6 +12311,7 @@ pub async fn run_add_packages(
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     let lockfile_bin_path = lockfile_path.with_extension("lockb");
     let install_hash_path = project_dir.join(".lpm").join("install-hash");
+    let pnpm_workspace_path = project_dir.join("pnpm-workspace.yaml");
 
     // ** fix.** Wrap the entire snapshot → stage → install
     // → finalize → commit window in a per-project exclusive lock so
@@ -12245,9 +12334,14 @@ pub async fn run_add_packages(
         //    exist by precondition); lockfile + binary lockfile are optional
         //    (absent on a fresh project); install-hash is invalidate-only
         //    (cache file, deleted on rollback regardless of pre-state).
+        let optional_refs = [
+            lockfile_path.as_path(),
+            lockfile_bin_path.as_path(),
+            pnpm_workspace_path.as_path(),
+        ];
         let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
             &[&pkg_json_path],
-            &[&lockfile_path, &lockfile_bin_path],
+            &optional_refs,
             &[&install_hash_path],
         )?;
         maybe_test_panic("after-snapshot");
@@ -12316,6 +12410,8 @@ pub async fn run_add_packages(
             &catalog_policy,
         )?;
         maybe_test_panic("after-finalize");
+
+        cleanup_unused_catalogs_after_install(project_dir)?;
 
         // 6. All steps succeeded — commit the transaction so the manifest
         //    edits persist.
@@ -12497,22 +12593,36 @@ pub async fn run_install_filtered_add(
         .map(|r| r.join(".lpm").join("install-hash"))
         .collect();
 
+    // Workspace-aware config resolution reads from the workspace root, and
+    // catalog cleanup can mutate the root package even when only a member was
+    // targeted.
+    let workspace_root_for_config: PathBuf = lpm_workspace::discover_workspace(cwd)
+        .ok()
+        .flatten()
+        .map_or_else(|| cwd.to_path_buf(), |ws| ws.root);
+    let root_package_json_path = workspace_root_for_config.join("package.json");
+    let pnpm_workspace_path = workspace_root_for_config.join("pnpm-workspace.yaml");
+
     // Build the (required, optional, invalidate) reference slices the
     // transaction expects. `required` = manifests; `optional` = lockfile
     // + lockfile.b for every member; `invalidate` = install-hash for
     // every member.
-    let required_refs: Vec<&Path> = targets
-        .member_manifests
+    let mut required_paths = targets.member_manifests.clone();
+    if !required_paths
         .iter()
-        .map(|p| p.as_path())
-        .collect();
-    let mut optional_refs: Vec<&Path> = Vec::with_capacity(lockfile_paths.len() * 2);
+        .any(|path| path == &root_package_json_path)
+    {
+        required_paths.push(root_package_json_path);
+    }
+    let required_refs: Vec<&Path> = required_paths.iter().map(|p| p.as_path()).collect();
+    let mut optional_refs: Vec<&Path> = Vec::with_capacity(lockfile_paths.len() * 2 + 1);
     for p in &lockfile_paths {
         optional_refs.push(p.as_path());
     }
     for p in &lockfile_bin_paths {
         optional_refs.push(p.as_path());
     }
+    optional_refs.push(pnpm_workspace_path.as_path());
     let invalidate_refs: Vec<&Path> = install_hash_paths.iter().map(|p| p.as_path()).collect();
 
     // per-command save flags from the CLI flow into stage and
@@ -12535,10 +12645,6 @@ pub async fn run_install_filtered_add(
     // reachable from a workspace context, but the fallback keeps the
     // loader call infallible if `discover_workspace` ever returns None
     // through some future code change).
-    let workspace_root_for_config: PathBuf = lpm_workspace::discover_workspace(cwd)
-        .ok()
-        .flatten()
-        .map_or_else(|| cwd.to_path_buf(), |ws| ws.root);
     let save_config =
         crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
     let catalog_policy =
@@ -12663,6 +12769,8 @@ pub async fn run_install_filtered_add(
             // is restored to its pre-stage bytes.
             return Err(e);
         }
+
+        cleanup_unused_catalogs_after_install(&workspace_root_for_config)?;
 
         // All members succeeded — persist every staged + finalized manifest.
         tx.commit();

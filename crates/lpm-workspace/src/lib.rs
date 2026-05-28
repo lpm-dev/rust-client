@@ -10,8 +10,11 @@
 //! `--filter` and workspace-aware `run` are supported.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+
+/// Catalog references grouped by catalog name, then package name.
+pub type CatalogReferences = BTreeMap<String, BTreeSet<String>>;
 
 /// A discovered workspace root with its member packages.
 #[derive(Debug, Clone)]
@@ -784,7 +787,7 @@ pub enum WorkspacesConfig {
 }
 
 /// LPM-specific config in package.json `"lpm"` key.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LpmConfig {
     /// Dependency isolation strictness: "strict", "warn", or "loose".
     #[serde(default, rename = "strictDeps")]
@@ -940,6 +943,10 @@ pub struct LpmConfig {
     /// through the root default catalog.
     #[serde(default, rename = "catalogMode")]
     pub catalog_mode: Option<CatalogMode>,
+
+    /// Removes catalog entries no root/member manifest references after install.
+    #[serde(default, rename = "cleanupUnusedCatalogs")]
+    pub cleanup_unused_catalogs: Option<bool>,
 }
 
 /// Save policy for dependencies that have a matching default catalog entry.
@@ -1723,7 +1730,7 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
             };
 
             if let Some(config) = pnpm_workspace.as_ref() {
-                merge_pnpm_workspace_catalogs(&mut root_package, &config.catalogs);
+                merge_pnpm_workspace_config(&mut root_package, config);
             }
 
             let globs = workspace_globs.or_else(|| {
@@ -1873,12 +1880,15 @@ struct PnpmWorkspaceManifest {
     catalog: HashMap<String, String>,
     #[serde(default)]
     catalogs: HashMap<String, HashMap<String, String>>,
+    #[serde(default, rename = "cleanupUnusedCatalogs")]
+    cleanup_unused_catalogs: Option<bool>,
 }
 
 #[derive(Debug, Default)]
 struct PnpmWorkspaceConfig {
     packages: Vec<String>,
     catalogs: HashMap<String, HashMap<String, String>>,
+    cleanup_unused_catalogs: Option<bool>,
 }
 
 impl PnpmWorkspaceManifest {
@@ -1894,6 +1904,7 @@ impl PnpmWorkspaceManifest {
         PnpmWorkspaceConfig {
             packages: self.packages,
             catalogs,
+            cleanup_unused_catalogs: self.cleanup_unused_catalogs,
         }
     }
 }
@@ -1917,11 +1928,8 @@ fn read_pnpm_workspace(path: &Path) -> Result<PnpmWorkspaceConfig, WorkspaceErro
     Ok(manifest.unwrap_or_default().into_config())
 }
 
-fn merge_pnpm_workspace_catalogs(
-    root_package: &mut PackageJson,
-    pnpm_catalogs: &HashMap<String, HashMap<String, String>>,
-) {
-    for (catalog_name, catalog) in pnpm_catalogs {
+fn merge_pnpm_workspace_config(root_package: &mut PackageJson, config: &PnpmWorkspaceConfig) {
+    for (catalog_name, catalog) in &config.catalogs {
         let target = root_package
             .catalogs
             .entry(catalog_name.clone())
@@ -1936,6 +1944,13 @@ fn merge_pnpm_workspace_catalogs(
             } else {
                 target.insert(package.clone(), range.clone());
             }
+        }
+    }
+
+    if let Some(cleanup_unused_catalogs) = config.cleanup_unused_catalogs {
+        let lpm = root_package.lpm.get_or_insert_with(LpmConfig::default);
+        if lpm.cleanup_unused_catalogs.is_none() {
+            lpm.cleanup_unused_catalogs = Some(cleanup_unused_catalogs);
         }
     }
 }
@@ -2240,6 +2255,244 @@ pub fn resolve_catalog_protocol(
     }
 
     Ok(resolved)
+}
+
+/// Add every dependency-field `catalog:` reference from `package_json`.
+pub fn collect_catalog_references(package_json: &PackageJson, references: &mut CatalogReferences) {
+    collect_catalog_references_from_deps(&package_json.dependencies, references);
+    collect_catalog_references_from_deps(&package_json.dev_dependencies, references);
+    collect_catalog_references_from_deps(&package_json.optional_dependencies, references);
+    collect_catalog_references_from_deps(&package_json.peer_dependencies, references);
+}
+
+fn collect_catalog_references_from_deps(
+    deps: &HashMap<String, String>,
+    references: &mut CatalogReferences,
+) {
+    for (package, range) in deps {
+        let Some(catalog_name) = catalog_name_from_reference(range) else {
+            continue;
+        };
+        references
+            .entry(catalog_name.to_string())
+            .or_default()
+            .insert(package.clone());
+    }
+}
+
+fn catalog_name_from_reference(reference: &str) -> Option<&str> {
+    let catalog_name = reference.strip_prefix("catalog:")?;
+    if catalog_name.is_empty() {
+        Some("default")
+    } else {
+        Some(catalog_name)
+    }
+}
+
+/// Prune unreferenced `package.json > catalogs` entries.
+pub fn prune_unused_package_json_catalogs(
+    path: &Path,
+    references: &CatalogReferences,
+) -> Result<bool, WorkspaceError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+    let mut doc: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        WorkspaceError::Parse(format!(
+            "failed to parse package manifest {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    if !prune_json_catalogs(&mut doc, references) {
+        return Ok(false);
+    }
+
+    let updated = serde_json::to_string_pretty(&doc).map_err(|e| {
+        WorkspaceError::Parse(format!(
+            "failed to serialize package manifest {}: {e}",
+            path.display()
+        ))
+    })?;
+    std::fs::write(path, format!("{updated}\n"))
+        .map_err(|e| WorkspaceError::Io(format!("failed to write {}: {e}", path.display())))?;
+    Ok(true)
+}
+
+fn prune_json_catalogs(doc: &mut serde_json::Value, references: &CatalogReferences) -> bool {
+    let Some(root) = doc.as_object_mut() else {
+        return false;
+    };
+    let Some(catalogs) = root
+        .get_mut("catalogs")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    let catalog_names: Vec<String> = catalogs.keys().cloned().collect();
+    for catalog_name in catalog_names {
+        let Some(entries) = catalogs
+            .get_mut(&catalog_name)
+            .and_then(|value| value.as_object_mut())
+        else {
+            continue;
+        };
+        let package_names: Vec<String> = entries.keys().cloned().collect();
+        for package_name in package_names {
+            if !catalog_reference_exists(references, &catalog_name, &package_name) {
+                entries.remove(&package_name);
+                changed = true;
+            }
+        }
+        if entries.is_empty() {
+            catalogs.remove(&catalog_name);
+            changed = true;
+        }
+    }
+
+    if catalogs.is_empty() {
+        root.remove("catalogs");
+        changed = true;
+    }
+
+    changed
+}
+
+/// Prune unreferenced `pnpm-workspace.yaml` `catalog`/`catalogs` entries.
+pub fn prune_unused_pnpm_workspace_catalogs(
+    path: &Path,
+    references: &CatalogReferences,
+) -> Result<bool, WorkspaceError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
+    if content.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|e| {
+        WorkspaceError::Parse(format!(
+            "failed to parse pnpm workspace manifest {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    if !prune_yaml_catalogs(&mut doc, references) {
+        return Ok(false);
+    }
+
+    let updated = serde_yaml::to_string(&doc).map_err(|e| {
+        WorkspaceError::Parse(format!(
+            "failed to serialize pnpm workspace manifest {}: {e}",
+            path.display()
+        ))
+    })?;
+    std::fs::write(path, updated)
+        .map_err(|e| WorkspaceError::Io(format!("failed to write {}: {e}", path.display())))?;
+    Ok(true)
+}
+
+fn prune_yaml_catalogs(doc: &mut serde_yaml::Value, references: &CatalogReferences) -> bool {
+    let Some(root) = doc.as_mapping_mut() else {
+        return false;
+    };
+
+    let mut changed = false;
+    changed |= prune_yaml_default_catalog(root, references);
+    changed |= prune_yaml_named_catalogs(root, references);
+    changed
+}
+
+fn prune_yaml_default_catalog(
+    root: &mut serde_yaml::Mapping,
+    references: &CatalogReferences,
+) -> bool {
+    let key = serde_yaml::Value::String("catalog".to_string());
+    let mut remove_catalog = false;
+    let mut changed = false;
+
+    if let Some(entries) = root.get_mut(&key).and_then(|value| value.as_mapping_mut()) {
+        changed |= prune_yaml_catalog_entries(entries, "default", references);
+        remove_catalog = entries.is_empty();
+    }
+
+    if remove_catalog {
+        root.remove(&key);
+        changed = true;
+    }
+
+    changed
+}
+
+fn prune_yaml_named_catalogs(
+    root: &mut serde_yaml::Mapping,
+    references: &CatalogReferences,
+) -> bool {
+    let key = serde_yaml::Value::String("catalogs".to_string());
+    let mut remove_catalogs = false;
+    let mut changed = false;
+
+    if let Some(catalogs) = root.get_mut(&key).and_then(|value| value.as_mapping_mut()) {
+        let catalog_names: Vec<serde_yaml::Value> = catalogs.keys().cloned().collect();
+        for catalog_key in catalog_names {
+            let Some(catalog_name) = catalog_key.as_str().map(str::to_string) else {
+                continue;
+            };
+            let mut remove_catalog = false;
+            if let Some(entries) = catalogs
+                .get_mut(&catalog_key)
+                .and_then(|value| value.as_mapping_mut())
+            {
+                changed |= prune_yaml_catalog_entries(entries, &catalog_name, references);
+                remove_catalog = entries.is_empty();
+            }
+            if remove_catalog {
+                catalogs.remove(&catalog_key);
+                changed = true;
+            }
+        }
+        remove_catalogs = catalogs.is_empty();
+    }
+
+    if remove_catalogs {
+        root.remove(&key);
+        changed = true;
+    }
+
+    changed
+}
+
+fn prune_yaml_catalog_entries(
+    entries: &mut serde_yaml::Mapping,
+    catalog_name: &str,
+    references: &CatalogReferences,
+) -> bool {
+    let mut changed = false;
+    let package_keys: Vec<serde_yaml::Value> = entries.keys().cloned().collect();
+    for package_key in package_keys {
+        let Some(package_name) = package_key.as_str() else {
+            continue;
+        };
+        if !catalog_reference_exists(references, catalog_name, package_name) {
+            entries.remove(&package_key);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn catalog_reference_exists(
+    references: &CatalogReferences,
+    catalog_name: &str,
+    package_name: &str,
+) -> bool {
+    references
+        .get(catalog_name)
+        .is_some_and(|packages| packages.contains(package_name))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3442,6 +3695,92 @@ catalogs:
     }
 
     #[test]
+    fn discover_workspace_reads_cleanup_unused_catalogs_from_pnpm_workspace_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "root-with-pnpm-cleanup"
+            }"#,
+        );
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            r#"packages:
+  - "packages/*"
+cleanupUnusedCatalogs: true
+"#,
+        )
+        .unwrap();
+        let member_dir = dir.path().join("packages/app");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(
+            &member_dir,
+            r#"{
+                "name": "app",
+                "version": "1.0.0"
+            }"#,
+        );
+
+        let ws = discover_workspace(dir.path())
+            .expect("discovery must read pnpm cleanup config")
+            .expect("pnpm-workspace.yaml packages should create a workspace");
+
+        assert_eq!(
+            ws.root_package
+                .lpm
+                .as_ref()
+                .and_then(|lpm| lpm.cleanup_unused_catalogs),
+            Some(true),
+            "pnpm-workspace.yaml cleanupUnusedCatalogs should feed root lpm config"
+        );
+    }
+
+    #[test]
+    fn package_json_cleanup_unused_catalogs_overrides_pnpm_workspace_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "root-with-cleanup-precedence",
+                "workspaces": ["packages/*"],
+                "lpm": {
+                    "cleanupUnusedCatalogs": false
+                }
+            }"#,
+        );
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            r#"packages:
+  - "packages/*"
+cleanupUnusedCatalogs: true
+"#,
+        )
+        .unwrap();
+        let member_dir = dir.path().join("packages/app");
+        fs::create_dir_all(&member_dir).unwrap();
+        create_package_json(
+            &member_dir,
+            r#"{
+                "name": "app",
+                "version": "1.0.0"
+            }"#,
+        );
+
+        let ws = discover_workspace(dir.path())
+            .expect("discovery must read pnpm cleanup config")
+            .expect("workspace must be discovered");
+
+        assert_eq!(
+            ws.root_package
+                .lpm
+                .as_ref()
+                .and_then(|lpm| lpm.cleanup_unused_catalogs),
+            Some(false),
+            "package.json lpm.cleanupUnusedCatalogs should win over pnpm-workspace.yaml"
+        );
+    }
+
+    #[test]
     fn package_json_catalogs_override_pnpm_workspace_yaml_catalogs() {
         let dir = tempfile::tempdir().unwrap();
         create_package_json(
@@ -3913,6 +4252,7 @@ mod package_json_field_tests {
 #[cfg(test)]
 mod trusted_dependencies_tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn legacy_array_form_deserializes_to_legacy_variant() {
@@ -4016,6 +4356,114 @@ mod trusted_dependencies_tests {
             err.to_string().contains("unknown variant"),
             "unknown catalogMode must fail manifest parsing, got: {err}"
         );
+    }
+
+    #[test]
+    fn cleanup_unused_catalogs_deserializes_lpm_config() {
+        let pkg: PackageJson =
+            serde_json::from_str(r#"{"lpm": {"cleanupUnusedCatalogs": true}}"#).unwrap();
+        assert_eq!(
+            pkg.lpm.unwrap().cleanup_unused_catalogs,
+            Some(true),
+            "lpm.cleanupUnusedCatalogs should parse as an optional boolean"
+        );
+    }
+
+    #[test]
+    fn collect_catalog_references_reads_dependency_fields() {
+        let pkg: PackageJson = serde_json::from_str(
+            r#"{
+                "dependencies": {"react": "catalog:"},
+                "devDependencies": {"vitest": "catalog:testing"},
+                "optionalDependencies": {"fsevents": "^2.0.0"},
+                "peerDependencies": {"typescript": "catalog:tooling"}
+            }"#,
+        )
+        .unwrap();
+        let mut references = CatalogReferences::new();
+
+        collect_catalog_references(&pkg, &mut references);
+
+        assert!(references["default"].contains("react"));
+        assert!(references["testing"].contains("vitest"));
+        assert!(references["tooling"].contains("typescript"));
+        assert!(
+            !references
+                .values()
+                .any(|packages| packages.contains("fsevents"))
+        );
+    }
+
+    #[test]
+    fn prune_unused_package_json_catalogs_removes_unreferenced_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let package_json_path = dir.path().join("package.json");
+        fs::write(
+            &package_json_path,
+            r#"{
+                "catalogs": {
+                    "default": {
+                        "react": "^18.0.0",
+                        "unused": "^1.0.0"
+                    },
+                    "testing": {
+                        "unused": "^1.0.0"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut references = CatalogReferences::new();
+        references
+            .entry("default".to_string())
+            .or_default()
+            .insert("react".to_string());
+
+        let changed = prune_unused_package_json_catalogs(&package_json_path, &references).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&package_json_path).unwrap()).unwrap();
+
+        assert!(changed);
+        assert_eq!(doc["catalogs"]["default"]["react"], "^18.0.0");
+        assert!(doc["catalogs"]["default"].get("unused").is_none());
+        assert!(doc["catalogs"].get("testing").is_none());
+    }
+
+    #[test]
+    fn prune_unused_pnpm_workspace_catalogs_removes_unreferenced_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_path = dir.path().join("pnpm-workspace.yaml");
+        fs::write(
+            &workspace_path,
+            r#"packages:
+  - "packages/*"
+catalog:
+  react: ^18.0.0
+  unused: ^1.0.0
+catalogs:
+  testing:
+    vitest: ^1.0.0
+    unused: ^1.0.0
+"#,
+        )
+        .unwrap();
+        let mut references = CatalogReferences::new();
+        references
+            .entry("default".to_string())
+            .or_default()
+            .insert("react".to_string());
+        references
+            .entry("testing".to_string())
+            .or_default()
+            .insert("vitest".to_string());
+
+        let changed = prune_unused_pnpm_workspace_catalogs(&workspace_path, &references).unwrap();
+        let updated = fs::read_to_string(&workspace_path).unwrap();
+
+        assert!(changed);
+        assert!(updated.contains("react"));
+        assert!(updated.contains("vitest"));
+        assert!(!updated.contains("unused"));
     }
 
     // ── matches_strict ──────────────────────────────────────────────

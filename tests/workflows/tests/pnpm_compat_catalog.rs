@@ -536,6 +536,172 @@ catalog:
     );
 }
 
+#[tokio::test]
+async fn cleanup_unused_catalogs_defaults_to_preserving_package_json_entries() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^2.0.0",
+                    "is-negative": "^1.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install with default cleanupUnusedCatalogs setting must succeed\n{text}"
+    );
+    assert_eq!(
+        catalog_entry(&project, "default", "is-negative"),
+        "^1.0.0",
+        "cleanupUnusedCatalogs must default to preserving unused catalog entries"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_unused_catalogs_removes_unused_package_json_default_entries() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^2.0.0",
+                    "is-negative": "^1.0.0"
+                }
+            },
+            "lpm": {
+                "cleanupUnusedCatalogs": true
+            }
+        }"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install with cleanupUnusedCatalogs must succeed\n{text}"
+    );
+    assert_eq!(
+        catalog_entry(&project, "default", "is-positive"),
+        "^2.0.0",
+        "referenced default catalog entry must stay"
+    );
+    assert!(
+        catalog_entry_optional(&project, "default", "is-negative").is_none(),
+        "unused default catalog entry must be removed"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_unused_catalogs_removes_unused_package_json_named_entries() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:testing"
+            },
+            "catalogs": {
+                "testing": {
+                    "is-positive": "^2.0.0",
+                    "is-negative": "^1.0.0"
+                },
+                "unused": {
+                    "is-negative": "^1.0.0"
+                }
+            },
+            "lpm": {
+                "cleanupUnusedCatalogs": true
+            }
+        }"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install with named cleanupUnusedCatalogs catalog must succeed\n{text}"
+    );
+    assert_eq!(
+        catalog_entry(&project, "testing", "is-positive"),
+        "^2.0.0",
+        "referenced named catalog entry must stay"
+    );
+    assert!(
+        catalog_entry_optional(&project, "testing", "is-negative").is_none(),
+        "unused named catalog entry must be removed"
+    );
+    assert!(
+        catalog_entry_optional(&project, "unused", "is-negative").is_none(),
+        "catalogs left empty by cleanup must be removed"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_unused_catalogs_removes_unused_pnpm_workspace_catalog_entries() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = pnpm_workspace_catalog_project(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            }
+        }"#,
+        r#"packages:
+  - "packages/*"
+cleanupUnusedCatalogs: true
+catalog:
+  is-positive: ^2.0.0
+  is-negative: ^1.0.0
+"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install with pnpm-workspace.yaml cleanupUnusedCatalogs must succeed\n{text}"
+    );
+    let workspace_yaml = project.read_file("pnpm-workspace.yaml");
+    assert!(
+        workspace_yaml.contains("is-positive"),
+        "referenced pnpm workspace catalog entry must stay\n{workspace_yaml}"
+    );
+    assert!(
+        !workspace_yaml.contains("is-negative"),
+        "unused pnpm workspace catalog entry must be removed\n{workspace_yaml}"
+    );
+}
+
 async fn mount_is_positive_versions(mock: &MockRegistry) {
     mock.with_full_package_metadata(
         "is-positive",
@@ -644,6 +810,22 @@ fn dependency_spec_optional(project: &TempProject, package: &str) -> Option<Stri
     package_json
         .get("dependencies")
         .and_then(|deps| deps.get(package))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn catalog_entry(project: &TempProject, catalog: &str, package: &str) -> String {
+    catalog_entry_optional(project, catalog, package)
+        .unwrap_or_else(|| panic!("expected catalog `{catalog}` entry for `{package}`"))
+}
+
+fn catalog_entry_optional(project: &TempProject, catalog: &str, package: &str) -> Option<String> {
+    let package_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).expect("package.json parses");
+    package_json
+        .get("catalogs")
+        .and_then(|catalogs| catalogs.get(catalog))
+        .and_then(|entries| entries.get(package))
         .and_then(|value| value.as_str())
         .map(str::to_string)
 }

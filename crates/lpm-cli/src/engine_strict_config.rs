@@ -81,6 +81,7 @@ mod tests {
                 auto_install_peers: None,
                 strict_peer_dependencies: None,
                 catalog_mode: None,
+                cleanup_unused_catalogs: None,
             }),
             ..Default::default()
         }
