@@ -171,6 +171,46 @@ fn resolve_strict_peer_dependencies(
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone)]
+struct CatalogSavePolicy {
+    mode: lpm_workspace::CatalogMode,
+    default_catalog: HashMap<String, String>,
+}
+
+impl CatalogSavePolicy {
+    #[cfg(test)]
+    fn manual() -> Self {
+        Self {
+            mode: lpm_workspace::CatalogMode::Manual,
+            default_catalog: HashMap::new(),
+        }
+    }
+
+    fn from_package(pkg: &lpm_workspace::PackageJson) -> Self {
+        let mode = pkg
+            .lpm
+            .as_ref()
+            .and_then(|lpm| lpm.catalog_mode)
+            .unwrap_or(lpm_workspace::CatalogMode::Manual);
+        let default_catalog = pkg.catalogs.get("default").cloned().unwrap_or_default();
+        Self {
+            mode,
+            default_catalog,
+        }
+    }
+
+    fn is_manual(&self) -> bool {
+        matches!(self.mode, lpm_workspace::CatalogMode::Manual)
+    }
+}
+
+fn catalog_save_policy_for_project(project_dir: &Path) -> Result<CatalogSavePolicy, LpmError> {
+    let pkg_json_path = project_dir.join("package.json");
+    let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+        .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
+    Ok(CatalogSavePolicy::from_package(&pkg))
+}
+
 fn strict_peer_dependency_error(
     peer_warnings: &[PeerWarning],
     peer_conflicts: &[PeerConflictReport],
@@ -11738,13 +11778,30 @@ fn collect_direct_versions(packages: &[InstallPackage]) -> HashMap<String, lpm_s
 ///
 /// Skips entirely if [`StagedManifest::needs_finalize`] is `false` — nothing
 /// to do, and we avoid the read/write round-trip.
+#[cfg(test)]
 pub(crate) fn finalize_packages_in_manifest(
     staged: &StagedManifest,
     resolved_versions: &HashMap<String, lpm_semver::Version>,
     flags: crate::save_spec::SaveFlags,
     config: crate::save_spec::SaveConfig,
 ) -> Result<(), LpmError> {
-    if !staged.needs_finalize() {
+    finalize_packages_in_manifest_with_catalog_policy(
+        staged,
+        resolved_versions,
+        flags,
+        config,
+        &CatalogSavePolicy::manual(),
+    )
+}
+
+fn finalize_packages_in_manifest_with_catalog_policy(
+    staged: &StagedManifest,
+    resolved_versions: &HashMap<String, lpm_semver::Version>,
+    flags: crate::save_spec::SaveFlags,
+    config: crate::save_spec::SaveConfig,
+    catalog_policy: &CatalogSavePolicy,
+) -> Result<(), LpmError> {
+    if !staged.needs_finalize() && catalog_policy.is_manual() {
         return Ok(());
     }
 
@@ -11757,38 +11814,123 @@ pub(crate) fn finalize_packages_in_manifest(
     } else {
         "dependencies"
     };
+    let mut doc_mutated = false;
 
     for entry in &staged.entries {
-        if !matches!(entry.kind, StagedKind::Placeholder | StagedKind::DistTag) {
-            continue;
+        let resolved = resolved_versions.get(&entry.name);
+
+        if !catalog_policy.is_manual() {
+            if let Some(catalog_range) = catalog_policy.default_catalog.get(&entry.name) {
+                let resolved = resolved.ok_or_else(|| {
+                    LpmError::Registry(format!(
+                        "catalogMode: resolver did not report a concrete version for `{}`",
+                        entry.name
+                    ))
+                })?;
+                if catalog_range_matches_resolved(&entry.name, catalog_range, resolved)? {
+                    if doc[dep_key][&entry.name].as_str() != Some("catalog:") {
+                        doc[dep_key][&entry.name] =
+                            serde_json::Value::String("catalog:".to_string());
+                        doc_mutated = true;
+                    }
+                    continue;
+                }
+
+                let requested_spec = catalog_mode_requested_spec(&entry.intent, resolved);
+                match catalog_policy.mode {
+                    lpm_workspace::CatalogMode::Strict => {
+                        return Err(catalog_mode_mismatch_error(
+                            &entry.name,
+                            &requested_spec,
+                            catalog_range,
+                        ));
+                    }
+                    lpm_workspace::CatalogMode::Prefer => {
+                        output::warn(&format!(
+                            "Catalog version mismatch for {}: using direct version {} instead of catalog:{}.",
+                            entry.name, requested_spec, catalog_range
+                        ));
+                    }
+                    lpm_workspace::CatalogMode::Manual => unreachable!("guarded above"),
+                }
+            } else if matches!(catalog_policy.mode, lpm_workspace::CatalogMode::Strict) {
+                return Err(LpmError::Registry(format!(
+                    "catalogMode strict rejected {}: no default catalog entry exists for this package",
+                    entry.name
+                )));
+            }
         }
 
-        let staged_spec = match (&entry.kind, &entry.intent) {
-            (StagedKind::Placeholder, _) => STAGE_PLACEHOLDER.to_string(),
-            (StagedKind::DistTag, crate::save_spec::UserSaveIntent::DistTag(tag)) => tag.clone(),
-            _ => unreachable!("deferred staged entry must be bare placeholder or dist-tag"),
-        };
+        if matches!(entry.kind, StagedKind::Placeholder | StagedKind::DistTag) {
+            let staged_spec = match (&entry.kind, &entry.intent) {
+                (StagedKind::Placeholder, _) => STAGE_PLACEHOLDER.to_string(),
+                (StagedKind::DistTag, crate::save_spec::UserSaveIntent::DistTag(tag)) => {
+                    tag.clone()
+                }
+                _ => unreachable!("deferred staged entry must be bare placeholder or dist-tag"),
+            };
 
-        let resolved = resolved_versions.get(&entry.name).ok_or_else(|| {
-            LpmError::Registry(format!(
-                "finalize: resolver did not report a concrete version for `{}` \
-                 (staged with provisional spec `{staged_spec}`). Refusing to leave the \
-                 provisional spec in {}.",
-                entry.name,
-                staged.pkg_json_path.display(),
-            ))
-        })?;
+            let resolved = resolved.ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "finalize: resolver did not report a concrete version for `{}` \
+                     (staged with provisional spec `{staged_spec}`). Refusing to leave the \
+                     provisional spec in {}.",
+                    entry.name,
+                    staged.pkg_json_path.display(),
+                ))
+            })?;
 
-        let decision =
-            crate::save_spec::decide_saved_dependency_spec(&entry.intent, resolved, flags, config);
+            let decision = crate::save_spec::decide_saved_dependency_spec(
+                &entry.intent,
+                resolved,
+                flags,
+                config,
+            );
 
-        doc[dep_key][&entry.name] = serde_json::Value::String(decision.spec_to_write);
+            doc[dep_key][&entry.name] = serde_json::Value::String(decision.spec_to_write);
+            doc_mutated = true;
+        }
     }
 
-    let updated =
-        serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
-    std::fs::write(&staged.pkg_json_path, format!("{updated}\n"))?;
+    if doc_mutated {
+        let updated =
+            serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
+        std::fs::write(&staged.pkg_json_path, format!("{updated}\n"))?;
+    }
     Ok(())
+}
+
+fn catalog_range_matches_resolved(
+    package: &str,
+    catalog_range: &str,
+    resolved: &lpm_semver::Version,
+) -> Result<bool, LpmError> {
+    let range = lpm_semver::VersionReq::parse(catalog_range).map_err(|e| {
+        LpmError::Registry(format!(
+            "catalogMode: invalid default catalog range for `{package}` (`{catalog_range}`): {e}"
+        ))
+    })?;
+    Ok(range.matches(resolved))
+}
+
+fn catalog_mode_requested_spec(
+    intent: &crate::save_spec::UserSaveIntent,
+    resolved: &lpm_semver::Version,
+) -> String {
+    match intent {
+        crate::save_spec::UserSaveIntent::Bare => resolved.to_string(),
+        _ => intent_to_range_string(intent),
+    }
+}
+
+fn catalog_mode_mismatch_error(
+    package: &str,
+    requested_spec: &str,
+    catalog_range: &str,
+) -> LpmError {
+    LpmError::Registry(format!(
+        "catalogMode strict rejected {package}@{requested_spec}: default catalog has catalog:{catalog_range}"
+    ))
 }
 
 /// Rewrite staged dist-tag literals to exact versions before the resolver runs.
@@ -12004,6 +12146,7 @@ pub async fn run_add_packages(
         //    `~/.lpm/config.toml` (global) for the persistent save-policy
         //    keys. CLI flags still beat config inside `decide_saved_dependency_spec`.
         let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
+        let catalog_policy = catalog_save_policy_for_project(project_dir)?;
         let staged =
             stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
         pin_staged_dist_tags_for_resolution(client, project_dir, &staged).await?;
@@ -12051,7 +12194,13 @@ pub async fn run_add_packages(
 
         // 5. Finalize the manifest using the resolved direct-dep versions
         //    from the resolver. No-op if stage produced no placeholders.
-        finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)?;
+        finalize_packages_in_manifest_with_catalog_policy(
+            &staged,
+            &direct_versions,
+            save_flags,
+            save_config,
+            &catalog_policy,
+        )?;
         maybe_test_panic("after-finalize");
 
         // 6. All steps succeeded — commit the transaction so the manifest
@@ -12277,6 +12426,7 @@ pub async fn run_install_filtered_add(
         .map_or_else(|| cwd.to_path_buf(), |ws| ws.root);
     let save_config =
         crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
+    let catalog_policy = catalog_save_policy_for_project(&workspace_root_for_config)?;
 
     // ** fix.** Wrap the workspace-install snapshot → loop
     // → commit in an exclusive per-WORKSPACE lock. Two concurrent
@@ -12380,9 +12530,13 @@ pub async fn run_install_filtered_add(
 
             // (d) Finalize this member's manifest using the direct-dep
             //     versions from the resolver.
-            if let Err(e) =
-                finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)
-            {
+            if let Err(e) = finalize_packages_in_manifest_with_catalog_policy(
+                &staged,
+                &direct_versions,
+                save_flags,
+                save_config,
+                &catalog_policy,
+            ) {
                 last_err = Some(e);
                 break;
             }
@@ -14447,6 +14601,72 @@ mod tests {
             after["dependencies"]["ms"], "^2.1.3",
             "finalize must replace `*` placeholder with `^<resolved>`"
         );
+    }
+
+    #[test]
+    fn finalize_prefer_catalog_policy_rewrites_matching_dep_to_catalog_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
+
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["is-positive".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+        )
+        .unwrap();
+        let resolved = make_resolved(&[("is-positive", "2.0.0")]);
+        let policy = CatalogSavePolicy {
+            mode: lpm_workspace::CatalogMode::Prefer,
+            default_catalog: HashMap::from([("is-positive".to_string(), "^2.0.0".to_string())]),
+        };
+
+        finalize_packages_in_manifest_with_catalog_policy(
+            &staged,
+            &resolved,
+            crate::save_spec::SaveFlags::default(),
+            crate::save_spec::SaveConfig::default(),
+            &policy,
+        )
+        .unwrap();
+
+        let after = read_manifest(&pkg_path);
+        assert_eq!(after["dependencies"]["is-positive"], "catalog:");
+    }
+
+    #[test]
+    fn finalize_strict_catalog_policy_errors_when_resolved_version_mismatches_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
+
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["is-positive@2.0.0".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+        )
+        .unwrap();
+        let resolved = make_resolved(&[("is-positive", "2.0.0")]);
+        let policy = CatalogSavePolicy {
+            mode: lpm_workspace::CatalogMode::Strict,
+            default_catalog: HashMap::from([("is-positive".to_string(), "^1.0.0".to_string())]),
+        };
+
+        let err = finalize_packages_in_manifest_with_catalog_policy(
+            &staged,
+            &resolved,
+            crate::save_spec::SaveFlags::default(),
+            crate::save_spec::SaveConfig::default(),
+            &policy,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("catalogMode strict"));
+        assert!(message.contains("is-positive@2.0.0"));
+        assert!(message.contains("catalog:^1.0.0"));
     }
 
     /// Finalize is a no-op when no entries are placeholders.

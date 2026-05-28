@@ -935,6 +935,20 @@ pub struct LpmConfig {
     ///   → default (`false`).
     #[serde(default, rename = "strictPeerDependencies")]
     pub strict_peer_dependencies: Option<bool>,
+
+    /// Controls whether `lpm install <pkg>` saves matching dependencies
+    /// through the root default catalog.
+    #[serde(default, rename = "catalogMode")]
+    pub catalog_mode: Option<CatalogMode>,
+}
+
+/// Save policy for dependencies that have a matching default catalog entry.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CatalogMode {
+    Manual,
+    Prefer,
+    Strict,
 }
 
 /// `package.json :: lpm.peerDependencyRules` — peer-dep behavior
@@ -3807,6 +3821,29 @@ mod trusted_dependencies_tests {
             lpm.trusted_dependencies,
             TrustedDependencies::Legacy(_)
         ));
+    }
+
+    #[test]
+    fn catalog_mode_deserializes_supported_lpm_values() {
+        for (raw, expected) in [
+            ("manual", CatalogMode::Manual),
+            ("prefer", CatalogMode::Prefer),
+            ("strict", CatalogMode::Strict),
+        ] {
+            let json = format!(r#"{{"lpm": {{"catalogMode": "{raw}"}}}}"#);
+            let pkg: PackageJson = serde_json::from_str(&json).unwrap();
+            assert_eq!(pkg.lpm.unwrap().catalog_mode, Some(expected));
+        }
+    }
+
+    #[test]
+    fn catalog_mode_rejects_unknown_lpm_value() {
+        let err = serde_json::from_str::<PackageJson>(r#"{"lpm": {"catalogMode": "loose"}}"#)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "unknown catalogMode must fail manifest parsing, got: {err}"
+        );
     }
 
     // ── matches_strict ──────────────────────────────────────────────
