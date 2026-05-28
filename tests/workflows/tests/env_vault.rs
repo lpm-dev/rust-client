@@ -14,6 +14,15 @@ use support::auth_state::{
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm};
 
+fn doctor_check<'a>(json: &'a serde_json::Value, code: &str) -> &'a serde_json::Value {
+    json["checks"]
+        .as_array()
+        .expect("doctor checks must be an array")
+        .iter()
+        .find(|check| check["code"].as_str() == Some(code))
+        .unwrap_or_else(|| panic!("doctor output must include `{code}`: {json}"))
+}
+
 fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serde_json::Value) {
     let lpm_dir = home.join(".lpm");
     let vaults_dir = lpm_dir.join("vaults");
@@ -49,6 +58,74 @@ fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serd
 
     std::fs::write(vaults_dir.join(format!("{vault_id}.enc")), encoded)
         .expect("failed to write encrypted local vault file");
+}
+
+#[test]
+fn doctor_json_reports_file_vault_fallback_when_forced_file_backend_is_active() {
+    let project = TempProject::empty(r#"{"name":"vault-doctor","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --json");
+    let json = parse_json_output(&output.stdout);
+    let check = doctor_check(&json, "vault_storage_fallback");
+
+    assert_eq!(check["severity"].as_str(), Some("warn"));
+    assert_eq!(check["passed"].as_bool(), Some(true));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn doctor_json_reports_native_vault_storage_when_native_key_is_active() {
+    let project = TempProject::empty(r#"{"name":"vault-doctor","version":"1.0.0"}"#);
+    let native_key_hex = hex::encode([0x5au8; 32]);
+
+    let output = lpm(&project)
+        .env_remove("LPM_FORCE_FILE_VAULT")
+        .env("LPM_TEST_VAULT_NATIVE_KEY_HEX", native_key_hex)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --json");
+    let json = parse_json_output(&output.stdout);
+    let check = doctor_check(&json, "vault_storage_native");
+
+    assert_eq!(check["severity"].as_str(), Some("pass"));
+    assert_eq!(check["passed"].as_bool(), Some(true));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn doctor_json_reports_unavailable_vault_storage_when_blob_has_no_key_source() {
+    let project = TempProject::empty(r#"{"name":"vault-doctor","version":"1.0.0"}"#);
+    let vaults_dir = project.home().join(".lpm").join("vaults");
+    std::fs::create_dir_all(&vaults_dir).expect("failed to create vaults dir");
+    std::fs::write(
+        vaults_dir.join("missing-key.enc"),
+        "not decrypted during status",
+    )
+    .expect("failed to seed vault blob");
+
+    let output = lpm(&project)
+        .env_remove("LPM_FORCE_FILE_VAULT")
+        .env(
+            "LPM_TEST_VAULT_NATIVE_KEY_READ_ERROR",
+            "native store locked",
+        )
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --json");
+    let json = parse_json_output(&output.stdout);
+    let check = doctor_check(&json, "vault_storage_unavailable");
+
+    assert_eq!(check["severity"].as_str(), Some("fail"));
+    assert_eq!(check["passed"].as_bool(), Some(false));
+    assert!(
+        check["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("native store locked")),
+        "unavailable detail should include native backend error: {check}"
+    );
 }
 
 #[tokio::test]

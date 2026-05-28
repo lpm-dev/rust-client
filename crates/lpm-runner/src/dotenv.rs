@@ -91,14 +91,15 @@ pub fn load_project_env(
 
     // Load vault secrets — use environment-specific vault if available
     let vault_vars = if let Some(env_name) = env_name {
-        let env_vars = lpm_vault::get_all_env(project_dir, env_name);
+        let env_vars =
+            lpm_vault::try_get_all_env(project_dir, env_name).map_err(LpmError::EnvValidation)?;
         if env_vars.is_empty() {
-            lpm_vault::get_all(project_dir)
+            lpm_vault::try_get_all(project_dir).map_err(LpmError::EnvValidation)?
         } else {
             env_vars
         }
     } else {
-        lpm_vault::get_all(project_dir)
+        lpm_vault::try_get_all(project_dir).map_err(LpmError::EnvValidation)?
     };
 
     if !vault_vars.is_empty() {

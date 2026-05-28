@@ -2,7 +2,8 @@
 //!
 //! Provides a secure, per-project secret store that integrates with `lpm run`
 //! for automatic env var injection. Secrets are stored in the macOS Keychain
-//! on macOS, with an encrypted file fallback on other platforms.
+//! on macOS. Linux and Windows keep encrypted local vault blobs on disk while
+//! protecting the local data key with the OS secure store when available.
 //!
 //! ## Keychain Contract (shared with SwiftUI Vault app)
 //!
@@ -36,6 +37,15 @@ pub(crate) mod test_env_lock;
 use std::collections::HashMap;
 use std::path::Path;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultStorageBackend {
+    MacosKeychain,
+    NativeProtected,
+    NativePreferred,
+    FileFallback,
+    Unavailable { message: String },
+}
+
 fn force_file_vault_backend() -> bool {
     // Release builds always use the OS keychain — env contamination
     // must not be able to redirect vault writes into a plain-file
@@ -47,6 +57,21 @@ fn force_file_vault_backend() -> bool {
         std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
     )
+}
+
+pub fn storage_backend() -> VaultStorageBackend {
+    if force_file_vault_backend() {
+        return VaultStorageBackend::FileFallback;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        VaultStorageBackend::MacosKeychain
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fallback::storage_backend_status()
+    }
 }
 
 /// Validate a vault key against the POSIX env var name shape
@@ -86,15 +111,23 @@ fn reject_invalid_keys<'a>(pairs: impl IntoIterator<Item = &'a str>) -> Result<(
 
 /// Get a single secret value by key (from "default" environment).
 pub fn get(project_dir: &Path, key: &str) -> Option<String> {
-    let secrets = get_all(project_dir);
-    secrets.get(key).cloned()
+    try_get(project_dir, key).ok().flatten()
+}
+
+pub fn try_get(project_dir: &Path, key: &str) -> Result<Option<String>, String> {
+    let secrets = try_get_all(project_dir)?;
+    Ok(secrets.get(key).cloned())
 }
 
 /// Get all vault secrets for the project (from "default" environment).
 ///
 /// Returns an empty HashMap if no vault exists (backwards compatible).
 pub fn get_all(project_dir: &Path) -> HashMap<String, String> {
-    get_all_env(project_dir, "default")
+    try_get_all(project_dir).unwrap_or_default()
+}
+
+pub fn try_get_all(project_dir: &Path) -> Result<HashMap<String, String>, String> {
+    try_get_all_env(project_dir, "default")
 }
 
 /// Get all environments with their secrets.
@@ -102,33 +135,43 @@ pub fn get_all(project_dir: &Path) -> HashMap<String, String> {
 /// Returns `{"default": {"KEY": "VALUE"}, "live": {"KEY": "VALUE"}}`.
 /// Empty map if no vault exists.
 pub fn get_all_environments(project_dir: &Path) -> HashMap<String, HashMap<String, String>> {
+    try_get_all_environments(project_dir).unwrap_or_default()
+}
+
+pub fn try_get_all_environments(
+    project_dir: &Path,
+) -> Result<HashMap<String, HashMap<String, String>>, String> {
     let vault_id = match vault_id::read_vault_id(project_dir) {
         Some(id) => id,
-        None => return HashMap::new(),
+        None => return Ok(HashMap::new()),
     };
 
     if force_file_vault_backend() {
-        return fallback::read_all_environments(&vault_id).unwrap_or_default();
+        return Ok(fallback::read_all_environments(&vault_id)?.unwrap_or_default());
     }
 
     #[cfg(target_os = "macos")]
     {
-        keychain::read_all_environments(&vault_id).unwrap_or_default()
+        Ok(keychain::try_read_all_environments(&vault_id)?.unwrap_or_default())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        fallback::read_all_environments(&vault_id).unwrap_or_default()
+        Ok(fallback::read_all_environments(&vault_id)?.unwrap_or_default())
     }
 }
 
 /// Get all vault secrets for a specific environment.
 pub fn get_all_env(project_dir: &Path, env: &str) -> HashMap<String, String> {
+    try_get_all_env(project_dir, env).unwrap_or_default()
+}
+
+pub fn try_get_all_env(project_dir: &Path, env: &str) -> Result<HashMap<String, String>, String> {
     let vault_id = match vault_id::read_vault_id(project_dir) {
         Some(id) => id,
-        None => return HashMap::new(),
+        None => return Ok(HashMap::new()),
     };
 
-    read_secrets_env(&vault_id, env).unwrap_or_default()
+    Ok(read_secrets_env(&vault_id, env)?.unwrap_or_default())
 }
 
 /// Set one or more secrets in the vault.
@@ -145,7 +188,7 @@ pub fn set(project_dir: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
         .display()
         .to_string();
 
-    let mut secrets = read_secrets(&vault_id).unwrap_or_default();
+    let mut secrets = read_secrets(&vault_id)?.unwrap_or_default();
 
     for (key, value) in pairs {
         secrets.insert(key.to_string(), value.to_string());
@@ -166,7 +209,7 @@ pub fn set_env(project_dir: &Path, env: &str, pairs: &[(&str, &str)]) -> Result<
         .display()
         .to_string();
 
-    let mut secrets = read_secrets_env(&vault_id, env).unwrap_or_default();
+    let mut secrets = read_secrets_env(&vault_id, env)?.unwrap_or_default();
 
     for (key, value) in pairs {
         secrets.insert(key.to_string(), value.to_string());
@@ -210,7 +253,7 @@ pub fn delete(project_dir: &Path, keys: &[&str]) -> Result<(), String> {
         .display()
         .to_string();
 
-    let mut secrets = read_secrets(&vault_id).unwrap_or_default();
+    let mut secrets = read_secrets(&vault_id)?.unwrap_or_default();
 
     for key in keys {
         secrets.remove(*key);
@@ -221,7 +264,12 @@ pub fn delete(project_dir: &Path, keys: &[&str]) -> Result<(), String> {
 
 /// Get a single secret from a specific environment.
 pub fn get_env(project_dir: &Path, env: &str, key: &str) -> Option<String> {
-    get_all_env(project_dir, env).get(key).cloned()
+    try_get_env(project_dir, env, key).ok().flatten()
+}
+
+pub fn try_get_env(project_dir: &Path, env: &str, key: &str) -> Result<Option<String>, String> {
+    let secrets = try_get_all_env(project_dir, env)?;
+    Ok(secrets.get(key).cloned())
 }
 
 /// Delete secrets from a specific environment.
@@ -238,7 +286,7 @@ pub fn delete_env(project_dir: &Path, env: &str, keys: &[&str]) -> Result<(), St
         .display()
         .to_string();
 
-    let mut secrets = read_secrets_env(&vault_id, env).unwrap_or_default();
+    let mut secrets = read_secrets_env(&vault_id, env)?.unwrap_or_default();
     for key in keys {
         secrets.remove(*key);
     }
@@ -277,7 +325,7 @@ pub fn import_env_file(
         .display()
         .to_string();
 
-    let mut secrets = read_secrets(&vault_id).unwrap_or_default();
+    let mut secrets = read_secrets(&vault_id)?.unwrap_or_default();
     let mut imported = 0;
 
     for (key, value) in &parsed {
@@ -320,7 +368,7 @@ pub fn import_env_file_to_env(
         .display()
         .to_string();
 
-    let mut secrets = read_secrets_env(&vault_id, env).unwrap_or_default();
+    let mut secrets = read_secrets_env(&vault_id, env)?.unwrap_or_default();
     let mut imported = 0;
 
     for (key, value) in &parsed {
@@ -410,7 +458,7 @@ pub fn export_env_file_from_env(
     env: &str,
     output_path: &Path,
 ) -> Result<usize, String> {
-    let secrets = get_all_env(project_dir, env);
+    let secrets = try_get_all_env(project_dir, env)?;
     if secrets.is_empty() {
         return Ok(0);
     }
@@ -427,7 +475,7 @@ pub fn export_env_file_from_env(
 ///
 /// Returns the number of exported secrets.
 pub fn export_env_file(project_dir: &Path, output_path: &Path) -> Result<usize, String> {
-    let secrets = get_all(project_dir);
+    let secrets = try_get_all(project_dir)?;
     if secrets.is_empty() {
         return Ok(0);
     }
@@ -442,19 +490,19 @@ pub fn export_env_file(project_dir: &Path, output_path: &Path) -> Result<usize, 
 
 // ─── Platform dispatch ─────────────────────────────────────────────
 
-fn read_secrets(vault_id: &str) -> Option<HashMap<String, String>> {
+fn read_secrets(vault_id: &str) -> Result<Option<HashMap<String, String>>, String> {
     read_secrets_env(vault_id, "default")
 }
 
-fn read_secrets_env(vault_id: &str, env: &str) -> Option<HashMap<String, String>> {
+fn read_secrets_env(vault_id: &str, env: &str) -> Result<Option<HashMap<String, String>>, String> {
     if force_file_vault_backend() {
         return fallback::read_vault_file_env(vault_id, env);
     }
 
     #[cfg(target_os = "macos")]
     {
-        if let Some(secrets) = keychain::read_vault_env(vault_id, env) {
-            return Some(secrets);
+        if let Some(secrets) = keychain::try_read_vault_env(vault_id, env)? {
+            return Ok(Some(secrets));
         }
     }
 

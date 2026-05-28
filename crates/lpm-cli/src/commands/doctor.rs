@@ -292,24 +292,7 @@ pub async fn run(
         }
     }
 
-    // 2.5. Vault storage backend — surface the platform-determined
-    // unlock model so Linux/Windows users see that the on-disk
-    // fallback key file is readable by any same-UID process. Pure
-    // observability check; never blocks anything.
-    #[cfg(target_os = "macos")]
-    {
-        checks.push(Check::pass(
-            &doctor_catalog::VAULT_STORAGE_KEYCHAIN,
-            "macOS Keychain (keyring crate)",
-        ));
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        checks.push(Check::warn(
-            &doctor_catalog::VAULT_STORAGE_FALLBACK,
-            "encrypted-file fallback (~/.lpm/.vault-fallback-key, 0600)",
-        ));
-    }
+    checks.push(vault_storage_check(lpm_vault::storage_backend()));
 
     // 3. Global store accessible?
     let store_result = PackageStore::default_location();
@@ -954,6 +937,29 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn vault_storage_check(backend: lpm_vault::VaultStorageBackend) -> Check {
+    match backend {
+        lpm_vault::VaultStorageBackend::MacosKeychain => {
+            Check::pass(&doctor_catalog::VAULT_STORAGE_KEYCHAIN, "macOS Keychain")
+        }
+        lpm_vault::VaultStorageBackend::NativeProtected => Check::pass(
+            &doctor_catalog::VAULT_STORAGE_NATIVE,
+            "native-protected data key",
+        ),
+        lpm_vault::VaultStorageBackend::NativePreferred => Check::pass(
+            &doctor_catalog::VAULT_STORAGE_NATIVE,
+            "native secure store preferred for new vault data",
+        ),
+        lpm_vault::VaultStorageBackend::FileFallback => Check::warn(
+            &doctor_catalog::VAULT_STORAGE_FALLBACK,
+            "encrypted-file fallback (~/.lpm/.vault-fallback-key, 0600)",
+        ),
+        lpm_vault::VaultStorageBackend::Unavailable { message } => {
+            Check::fail(&doctor_catalog::VAULT_STORAGE_UNAVAILABLE, &message)
+        }
+    }
 }
 
 /// Extract node version spec from doctor detail message.
@@ -3589,6 +3595,35 @@ commands = []
         assert!(!no_failures); // fail check makes no_failures false
         assert!(has_warnings);
         assert!(!clean);
+    }
+
+    #[test]
+    fn vault_storage_check_reports_native_backend_as_pass() {
+        let check = vault_storage_check(lpm_vault::VaultStorageBackend::NativeProtected);
+
+        assert_eq!(check.code(), "vault_storage_native");
+        assert!(matches!(check.severity, Severity::Pass));
+        assert!(check.detail.contains("native-protected"));
+    }
+
+    #[test]
+    fn vault_storage_check_reports_file_backend_as_warning() {
+        let check = vault_storage_check(lpm_vault::VaultStorageBackend::FileFallback);
+
+        assert_eq!(check.code(), "vault_storage_fallback");
+        assert!(matches!(check.severity, Severity::Warn));
+        assert!(check.detail.contains(".vault-fallback-key"));
+    }
+
+    #[test]
+    fn vault_storage_check_reports_unavailable_backend_as_failure() {
+        let check = vault_storage_check(lpm_vault::VaultStorageBackend::Unavailable {
+            message: "native store locked".to_string(),
+        });
+
+        assert_eq!(check.code(), "vault_storage_unavailable");
+        assert!(matches!(check.severity, Severity::Fail));
+        assert_eq!(check.detail, "native store locked");
     }
 
     #[test]

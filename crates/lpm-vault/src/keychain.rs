@@ -12,6 +12,9 @@
 
 use std::collections::HashMap;
 
+type SecretMap = HashMap<String, String>;
+type EnvironmentMap = HashMap<String, SecretMap>;
+
 /// Keychain service name — shared with the SwiftUI Vault app.
 const SERVICE: &str = "dev.lpm.vault";
 
@@ -32,50 +35,66 @@ pub struct IndexEntry {
 /// Wrapper for the environments Keychain format.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EnvironmentsWrapper {
-    environments: HashMap<String, HashMap<String, String>>,
+    environments: EnvironmentMap,
 }
 
 /// Read all secrets for a vault ID from the Keychain.
 /// Handles both new format (`{"environments": {...}}`) and old flat format (`{"KEY": "VALUE"}`).
 /// The `env` parameter selects which environment to return (default: "default").
-pub fn read_vault(vault_id: &str) -> Option<HashMap<String, String>> {
-    read_vault_env(vault_id, "default")
+pub fn read_vault(vault_id: &str) -> Option<SecretMap> {
+    try_read_vault(vault_id).ok().flatten()
+}
+
+pub fn try_read_vault(vault_id: &str) -> Result<Option<SecretMap>, String> {
+    try_read_vault_env(vault_id, "default")
 }
 
 /// Read secrets for a specific environment from the Keychain.
-pub fn read_vault_env(vault_id: &str, env: &str) -> Option<HashMap<String, String>> {
-    let json = read_keychain_password(SERVICE, vault_id)?;
+pub fn read_vault_env(vault_id: &str, env: &str) -> Option<SecretMap> {
+    try_read_vault_env(vault_id, env).ok().flatten()
+}
+
+pub fn try_read_vault_env(vault_id: &str, env: &str) -> Result<Option<SecretMap>, String> {
+    let Some(json) = try_read_keychain_password(SERVICE, vault_id)? else {
+        return Ok(None);
+    };
 
     // Try new format first
     if let Ok(wrapper) = serde_json::from_str::<EnvironmentsWrapper>(&json) {
-        return wrapper.environments.get(env).cloned();
+        return Ok(wrapper.environments.get(env).cloned());
     }
 
     // Fall back to old flat format (treat as "default" environment)
-    if env == "default" {
-        return serde_json::from_str(&json).ok();
+    match serde_json::from_str::<SecretMap>(&json) {
+        Ok(flat) if env == "default" => Ok(Some(flat)),
+        Ok(_) => Ok(None),
+        Err(e) => Err(format!("vault keychain data is not valid JSON: {e}")),
     }
-
-    None
 }
 
 /// Read all environments for a vault ID.
-pub fn read_all_environments(vault_id: &str) -> Option<HashMap<String, HashMap<String, String>>> {
-    let json = read_keychain_password(SERVICE, vault_id)?;
+pub fn read_all_environments(vault_id: &str) -> Option<EnvironmentMap> {
+    try_read_all_environments(vault_id).ok().flatten()
+}
+
+pub fn try_read_all_environments(vault_id: &str) -> Result<Option<EnvironmentMap>, String> {
+    let Some(json) = try_read_keychain_password(SERVICE, vault_id)? else {
+        return Ok(None);
+    };
 
     // Try new format
     if let Ok(wrapper) = serde_json::from_str::<EnvironmentsWrapper>(&json) {
-        return Some(wrapper.environments);
+        return Ok(Some(wrapper.environments));
     }
 
     // Fall back to old flat format
-    if let Ok(flat) = serde_json::from_str::<HashMap<String, String>>(&json) {
+    if let Ok(flat) = serde_json::from_str::<SecretMap>(&json) {
         let mut envs = HashMap::new();
         envs.insert("default".to_string(), flat);
-        return Some(envs);
+        return Ok(Some(envs));
     }
 
-    None
+    Err("vault keychain data is not a valid vault payload".to_string())
 }
 
 /// Write secrets to the Keychain using the environments format.
@@ -83,7 +102,7 @@ pub fn write_vault(
     vault_id: &str,
     project_name: &str,
     project_path: &str,
-    secrets: &HashMap<String, String>,
+    secrets: &SecretMap,
 ) -> Result<(), String> {
     write_vault_env(vault_id, project_name, project_path, "default", secrets)
 }
@@ -92,7 +111,7 @@ pub fn write_all_environments(
     vault_id: &str,
     project_name: &str,
     project_path: &str,
-    environments: &HashMap<String, HashMap<String, String>>,
+    environments: &EnvironmentMap,
 ) -> Result<(), String> {
     let wrapper = EnvironmentsWrapper {
         environments: environments.clone(),
@@ -131,10 +150,10 @@ pub fn write_vault_env(
     project_name: &str,
     project_path: &str,
     env: &str,
-    secrets: &HashMap<String, String>,
+    secrets: &SecretMap,
 ) -> Result<(), String> {
     // Read existing environments, update the target env, write back
-    let mut all_envs = read_all_environments(vault_id).unwrap_or_default();
+    let mut all_envs = try_read_all_environments(vault_id)?.unwrap_or_default();
     all_envs.insert(env.to_string(), secrets.clone());
 
     let wrapper = EnvironmentsWrapper {
@@ -260,19 +279,32 @@ fn write_index(entries: &[IndexEntry]) -> Result<(), String> {
 // ─── macOS Keychain via `security` CLI ─────────────────────────────
 
 fn read_keychain_password(service: &str, account: &str) -> Option<String> {
+    try_read_keychain_password(service, account).ok().flatten()
+}
+
+fn try_read_keychain_password(service: &str, account: &str) -> Result<Option<String>, String> {
     let output = std::process::Command::new("security")
         .args(["find-generic-password", "-s", service, "-a", account, "-w"])
         .output()
-        .ok()?;
+        .map_err(|e| format!("keychain read spawn error: {e}"))?;
 
     if output.status.success() {
-        let value = String::from_utf8(output.stdout).ok()?;
+        let value = String::from_utf8(output.stdout)
+            .map_err(|e| format!("keychain read utf8 error: {e}"))?;
         let value = value.trim().to_string();
-        if !value.is_empty() {
-            return Some(value);
-        }
+        return Ok((!value.is_empty()).then_some(value));
     }
-    None
+
+    if output.status.code() == Some(44) {
+        return Ok(None);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "security find-generic-password failed (exit {}): {}",
+        output.status.code().unwrap_or(-1),
+        stderr.trim()
+    ))
 }
 
 fn write_keychain_password(service: &str, account: &str, password: &str) -> Result<(), String> {
