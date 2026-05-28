@@ -875,6 +875,136 @@ async fn warm_install_updates_catalog_snapshot_when_catalog_specifier_drifts() {
     assert_eq!(entry.reference, "catalog:");
 }
 
+#[tokio::test]
+async fn override_default_catalog_reference_resolves_to_catalog_range() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+    mount_is_positive_consumer(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "uses-is-positive": "^1.0.0"
+            },
+            "overrides": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^1.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install with default catalog override must succeed\n{text}"
+    );
+    assert_eq!(
+        resolved_version(&project, "is-positive"),
+        "1.0.0",
+        "override value catalog: must resolve through the default catalog before override parsing"
+    );
+    let entry = catalog_snapshot_entry(&project, "default", "is-positive");
+    assert_eq!(entry.specifier, "^1.0.0");
+    assert_eq!(entry.version, "1.0.0");
+    assert_eq!(entry.reference, "catalog:");
+}
+
+#[tokio::test]
+async fn override_named_catalog_reference_resolves_to_catalog_range() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+    mount_is_positive_consumer(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "uses-is-positive": "^1.0.0"
+            },
+            "overrides": {
+                "is-positive": "catalog:testing"
+            },
+            "catalogs": {
+                "testing": {
+                    "is-positive": "^1.0.0"
+                }
+            }
+        }"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install with named catalog override must succeed\n{text}"
+    );
+    assert_eq!(
+        resolved_version(&project, "is-positive"),
+        "1.0.0",
+        "override value catalog:<name> must resolve through the named catalog before override parsing"
+    );
+    let entry = catalog_snapshot_entry(&project, "testing", "is-positive");
+    assert_eq!(entry.specifier, "^1.0.0");
+    assert_eq!(entry.version, "1.0.0");
+    assert_eq!(entry.reference, "catalog:testing");
+}
+
+#[tokio::test]
+async fn cleanup_unused_catalogs_preserves_catalog_entries_used_by_overrides() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+    mount_is_positive_consumer(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "uses-is-positive": "^1.0.0"
+            },
+            "overrides": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^1.0.0",
+                    "is-negative": "^1.0.0"
+                }
+            },
+            "lpm": {
+                "cleanupUnusedCatalogs": true
+            }
+        }"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install with cleanupUnusedCatalogs and catalog override must succeed\n{text}"
+    );
+    assert_eq!(
+        catalog_entry(&project, "default", "is-positive"),
+        "^1.0.0",
+        "cleanupUnusedCatalogs must keep catalog entries referenced by overrides"
+    );
+    assert!(
+        catalog_entry_optional(&project, "default", "is-negative").is_none(),
+        "cleanupUnusedCatalogs should still prune entries unused by deps or overrides"
+    );
+}
+
 async fn mount_is_positive_versions(mock: &MockRegistry) {
     mock.with_full_package_metadata(
         "is-positive",
@@ -891,6 +1021,21 @@ async fn mount_is_positive_versions(mock: &MockRegistry) {
                 Some(make_tarball("is-positive", "2.0.0")),
             ),
         ],
+    )
+    .await;
+}
+
+async fn mount_is_positive_consumer(mock: &MockRegistry) {
+    mock.with_full_package_metadata(
+        "uses-is-positive",
+        "1.0.0",
+        &[(
+            "1.0.0",
+            serde_json::json!({
+                "is-positive": "*"
+            }),
+            Some(make_tarball("uses-is-positive", "1.0.0")),
+        )],
     )
     .await;
 }

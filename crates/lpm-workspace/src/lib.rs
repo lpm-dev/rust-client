@@ -2335,6 +2335,11 @@ pub fn collect_catalog_references(package_json: &PackageJson, references: &mut C
     collect_catalog_references_from_deps(&package_json.dev_dependencies, references);
     collect_catalog_references_from_deps(&package_json.optional_dependencies, references);
     collect_catalog_references_from_deps(&package_json.peer_dependencies, references);
+    collect_catalog_references_from_overrides(&package_json.overrides, references);
+    collect_catalog_references_from_overrides(&package_json.resolutions, references);
+    if let Some(lpm) = &package_json.lpm {
+        collect_catalog_references_from_overrides(&lpm.overrides, references);
+    }
 }
 
 fn collect_catalog_references_from_deps(
@@ -2350,6 +2355,39 @@ fn collect_catalog_references_from_deps(
             .or_default()
             .insert(package.clone());
     }
+}
+
+fn collect_catalog_references_from_overrides(
+    overrides: &HashMap<String, String>,
+    references: &mut CatalogReferences,
+) {
+    for (selector, target) in overrides {
+        let Some(catalog_name) = catalog_name_from_reference(target) else {
+            continue;
+        };
+        let Some(package) = override_selector_leaf_name(selector) else {
+            continue;
+        };
+        references
+            .entry(catalog_name.to_string())
+            .or_default()
+            .insert(package.to_string());
+    }
+}
+
+fn override_selector_leaf_name(selector: &str) -> Option<&str> {
+    let leaf = selector.rsplit('>').next()?.trim();
+    if leaf.is_empty() {
+        return None;
+    }
+
+    let scope_offset = usize::from(leaf.starts_with('@'));
+    let search = &leaf[scope_offset..];
+    let name_end = search
+        .find('@')
+        .map_or(leaf.len(), |index| scope_offset + index);
+    let name = leaf[..name_end].trim();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn catalog_name_from_reference(reference: &str) -> Option<&str> {
@@ -4457,7 +4495,14 @@ mod trusted_dependencies_tests {
                 "dependencies": {"react": "catalog:"},
                 "devDependencies": {"vitest": "catalog:testing"},
                 "optionalDependencies": {"fsevents": "^2.0.0"},
-                "peerDependencies": {"typescript": "catalog:tooling"}
+                "peerDependencies": {"typescript": "catalog:tooling"},
+                "overrides": {"react-dom": "catalog:"},
+                "resolutions": {"vite>esbuild": "catalog:build"},
+                "lpm": {
+                    "overrides": {
+                        "@types/react@^18.0.0": "catalog:types"
+                    }
+                }
             }"#,
         )
         .unwrap();
@@ -4466,8 +4511,11 @@ mod trusted_dependencies_tests {
         collect_catalog_references(&pkg, &mut references);
 
         assert!(references["default"].contains("react"));
+        assert!(references["default"].contains("react-dom"));
         assert!(references["testing"].contains("vitest"));
         assert!(references["tooling"].contains("typescript"));
+        assert!(references["build"].contains("esbuild"));
+        assert!(references["types"].contains("@types/react"));
         assert!(
             !references
                 .values()

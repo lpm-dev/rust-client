@@ -14,6 +14,7 @@ use lpm_resolver::{
 };
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -4139,7 +4140,7 @@ async fn run_with_options_under_store_lock(
         .ok()
         .flatten();
 
-    let (mut workspace_member_deps, catalog_resolutions): (
+    let (mut workspace_member_deps, mut catalog_resolutions): (
         Vec<WorkspaceMemberLink>,
         Vec<lpm_workspace::CatalogProtocolResolution>,
     ) = if let Some(ref ws) = workspace {
@@ -4285,8 +4286,41 @@ async fn run_with_options_under_store_lock(
         .as_ref()
         .map(|l| l.overrides.clone())
         .unwrap_or_default();
-    let override_set = OverrideSet::parse(&lpm_overrides_map, &pkg.overrides, &pkg.resolutions)
-        .map_err(|e| LpmError::Script(format!("invalid override in package.json: {e}")))?;
+    let dependency_catalog_resolution_count = catalog_resolutions.len();
+    let override_catalogs = workspace
+        .as_ref()
+        .map(|ws| &ws.root_package.catalogs)
+        .unwrap_or(&pkg.catalogs);
+    let (lpm_overrides_map, lpm_override_catalog_resolutions) =
+        resolve_catalog_protocol_in_override_map(&lpm_overrides_map, override_catalogs)?;
+    let (overrides_map, npm_override_catalog_resolutions) =
+        resolve_catalog_protocol_in_override_map(&pkg.overrides, override_catalogs)?;
+    let (resolutions_map, resolution_catalog_resolutions) =
+        resolve_catalog_protocol_in_override_map(&pkg.resolutions, override_catalogs)?;
+    let mut override_catalog_resolutions = Vec::new();
+    extend_catalog_resolutions(
+        &mut override_catalog_resolutions,
+        lpm_override_catalog_resolutions,
+    );
+    extend_catalog_resolutions(
+        &mut override_catalog_resolutions,
+        npm_override_catalog_resolutions,
+    );
+    extend_catalog_resolutions(
+        &mut override_catalog_resolutions,
+        resolution_catalog_resolutions,
+    );
+    extend_catalog_resolutions(
+        &mut catalog_resolutions,
+        override_catalog_resolutions.clone(),
+    );
+
+    let override_set = OverrideSet::parse(
+        lpm_overrides_map.as_ref(),
+        overrides_map.as_ref(),
+        resolutions_map.as_ref(),
+    )
+    .map_err(|e| LpmError::Script(format!("invalid override in package.json: {e}")))?;
 
     // Manifest-side compatibility warnings (pnpm overrides / patches
     // / peer rules drift, ignored other-PM `engines.*` keys) fire from
@@ -7844,8 +7878,13 @@ async fn run_with_options_under_store_lock(
         // would skip the auto-installed peer (it isn't in
         // `pkg.dependencies`) and produce a broken tree.
         lockfile.ambient_peer_installs = ambient_peer_installs_for_lockfile.clone();
+        let lockfile_catalog_resolutions = catalog_resolutions_for_lockfile(
+            &catalog_resolutions[..dependency_catalog_resolution_count],
+            &override_catalog_resolutions,
+            &applied_overrides,
+        );
         lockfile.catalogs =
-            catalog_snapshot_from_install_packages(&catalog_resolutions, &packages)?;
+            catalog_snapshot_from_install_packages(&lockfile_catalog_resolutions, &packages)?;
 
         lockfile
             .write_all(&lockfile_path)
@@ -9464,6 +9503,96 @@ fn catalog_protocol_error_to_lpm(error: lpm_workspace::CatalogProtocolError) -> 
     }
 }
 
+fn resolve_catalog_protocol_in_override_map<'a>(
+    overrides: &'a HashMap<String, String>,
+    catalogs: &HashMap<String, HashMap<String, String>>,
+) -> Result<
+    (
+        Cow<'a, HashMap<String, String>>,
+        Vec<lpm_workspace::CatalogProtocolResolution>,
+    ),
+    LpmError,
+> {
+    if !overrides
+        .values()
+        .any(|target| target.starts_with("catalog:"))
+    {
+        return Ok((Cow::Borrowed(overrides), Vec::new()));
+    }
+
+    let mut resolved_overrides = HashMap::with_capacity(overrides.len());
+    let mut catalog_resolutions = Vec::new();
+
+    for (raw_key, raw_target) in overrides {
+        if !raw_target.starts_with("catalog:") {
+            resolved_overrides.insert(raw_key.clone(), raw_target.clone());
+            continue;
+        }
+
+        let target_name =
+            lpm_resolver::override_selector_target_name(raw_key).map_err(|error| {
+                LpmError::Script(format!("invalid override in package.json: {error}"))
+            })?;
+        let mut catalog_dep = HashMap::with_capacity(1);
+        catalog_dep.insert(target_name.clone(), raw_target.clone());
+        let resolved = lpm_workspace::resolve_catalog_protocol(&mut catalog_dep, catalogs)
+            .map_err(catalog_protocol_error_to_lpm)?;
+        let resolved_target = catalog_dep.remove(&target_name).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "catalog resolution failed: override target `{target_name}` was not resolved"
+            ))
+        })?;
+        resolved_overrides.insert(raw_key.clone(), resolved_target);
+        catalog_resolutions.extend(resolved);
+    }
+
+    Ok((Cow::Owned(resolved_overrides), catalog_resolutions))
+}
+
+fn extend_catalog_resolutions(
+    catalog_resolutions: &mut Vec<lpm_workspace::CatalogProtocolResolution>,
+    incoming: Vec<lpm_workspace::CatalogProtocolResolution>,
+) {
+    for resolution in incoming {
+        push_catalog_resolution(catalog_resolutions, resolution);
+    }
+}
+
+fn push_catalog_resolution(
+    catalog_resolutions: &mut Vec<lpm_workspace::CatalogProtocolResolution>,
+    resolution: lpm_workspace::CatalogProtocolResolution,
+) {
+    if catalog_resolutions.iter().any(|existing| {
+        existing.catalog_name == resolution.catalog_name
+            && existing.package_name == resolution.package_name
+    }) {
+        return;
+    }
+    catalog_resolutions.push(resolution);
+}
+
+fn catalog_resolutions_for_lockfile(
+    dependency_catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    override_catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    applied_overrides: &[OverrideHit],
+) -> Vec<lpm_workspace::CatalogProtocolResolution> {
+    let mut catalog_resolutions = Vec::with_capacity(
+        dependency_catalog_resolutions.len() + override_catalog_resolutions.len(),
+    );
+    catalog_resolutions.extend_from_slice(dependency_catalog_resolutions);
+
+    for resolution in override_catalog_resolutions {
+        if applied_overrides
+            .iter()
+            .any(|hit| hit.package == resolution.package_name)
+        {
+            push_catalog_resolution(&mut catalog_resolutions, resolution.clone());
+        }
+    }
+
+    catalog_resolutions
+}
+
 fn catalog_snapshot_from_install_packages(
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     packages: &[InstallPackage],
@@ -9472,26 +9601,15 @@ fn catalog_snapshot_from_install_packages(
         return Ok(lpm_lockfile::CatalogSnapshots::new());
     }
 
-    let mut root_versions = HashMap::with_capacity(catalog_resolutions.len());
-    for package in packages {
-        let Some(root_link_names) = package.root_link_names.as_ref() else {
-            continue;
-        };
-        for root_name in root_link_names {
-            root_versions
-                .entry(root_name.clone())
-                .or_insert_with(|| package.version.clone());
-        }
-    }
-
     let mut snapshots = lpm_lockfile::CatalogSnapshots::new();
     for resolution in catalog_resolutions {
-        let resolved_version = root_versions.get(&resolution.package_name).ok_or_else(|| {
-            LpmError::Registry(format!(
-                "catalog snapshot: resolver did not report a concrete version for `{}`",
-                resolution.package_name
-            ))
-        })?;
+        let resolved_version = resolved_catalog_version_from_install_packages(resolution, packages)
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "catalog snapshot: resolver did not report a concrete version for `{}`",
+                    resolution.package_name
+                ))
+            })?;
         snapshots
             .entry(resolution.catalog_name.clone())
             .or_default()
@@ -9499,13 +9617,65 @@ fn catalog_snapshot_from_install_packages(
                 resolution.package_name.clone(),
                 lpm_lockfile::CatalogSnapshotEntry {
                     specifier: resolution.specifier.clone(),
-                    version: resolved_version.clone(),
+                    version: resolved_version,
                     reference: resolution.reference.clone(),
                 },
             );
     }
 
     Ok(snapshots)
+}
+
+fn resolved_catalog_version_from_install_packages(
+    resolution: &lpm_workspace::CatalogProtocolResolution,
+    packages: &[InstallPackage],
+) -> Option<String> {
+    let requested_range = lpm_resolver::NpmRange::parse(&resolution.specifier).ok();
+    let mut first_match: Option<&InstallPackage> = None;
+    let mut best_satisfying: Option<(lpm_resolver::NpmVersion, &InstallPackage)> = None;
+    let mut best_any: Option<(lpm_resolver::NpmVersion, &InstallPackage)> = None;
+
+    for package in packages
+        .iter()
+        .filter(|package| package_matches_catalog_resolution(package, &resolution.package_name))
+    {
+        if first_match.is_none() {
+            first_match = Some(package);
+        }
+
+        let Ok(version) = lpm_resolver::NpmVersion::parse(&package.version) else {
+            continue;
+        };
+
+        let better_any = best_any.as_ref().is_none_or(|(best, _)| version > *best);
+        if better_any {
+            best_any = Some((version.clone(), package));
+        }
+
+        if let Some(range) = requested_range.as_ref()
+            && range.satisfies(&version)
+        {
+            let better_satisfying = best_satisfying
+                .as_ref()
+                .is_none_or(|(best, _)| version > *best);
+            if better_satisfying {
+                best_satisfying = Some((version, package));
+            }
+        }
+    }
+
+    best_satisfying
+        .map(|(_, package)| package.version.clone())
+        .or_else(|| best_any.map(|(_, package)| package.version.clone()))
+        .or_else(|| first_match.map(|package| package.version.clone()))
+}
+
+fn package_matches_catalog_resolution(package: &InstallPackage, package_name: &str) -> bool {
+    package.name == package_name
+        || package
+            .root_link_names
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|name| name == package_name))
 }
 
 fn catalog_snapshot_entry_count(snapshots: &lpm_lockfile::CatalogSnapshots) -> usize {
@@ -9533,13 +9703,13 @@ fn lockfile_catalog_snapshots_match_current(
             return false;
         }
 
-        let Some(requested_spec) = deps.get(&resolution.package_name) else {
-            return false;
-        };
         let target = lockfile
             .root_aliases
             .get(&resolution.package_name)
             .map_or(resolution.package_name.as_str(), String::as_str);
+        let requested_spec = deps
+            .get(&resolution.package_name)
+            .map_or(resolution.specifier.as_str(), String::as_str);
         let Some(locked_package) =
             select_locked_package_for_requested_spec(lockfile, target, requested_spec)
         else {
