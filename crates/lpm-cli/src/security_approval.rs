@@ -28,7 +28,7 @@ type HmacSha256 = Hmac<Sha256>;
 const APPROVED_POSTURE_SCHEMA_VERSION: u32 = 1;
 const UNLOCK_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_UNLOCK_TTL_SECS: u64 = 10 * 60;
-pub const MAX_UNLOCK_TTL_SECS: u64 = 30 * 60;
+pub const MAX_UNLOCK_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 const KEYRING_SERVICE: &str = "dev.lpm.security-approval";
 const KEYRING_ACCOUNT: &str = "signing-secret-v1";
 #[cfg(not(test))]
@@ -79,7 +79,43 @@ pub enum ApprovalScope {
     FloorEdit,
 }
 
+const ALL_APPROVAL_SCOPES: [ApprovalScope; 13] = [
+    ApprovalScope::CooldownBypass,
+    ApprovalScope::CooldownWindow,
+    ApprovalScope::ProvenanceIgnoreDrift,
+    ApprovalScope::ProvenanceUnverified,
+    ApprovalScope::ScriptsTriage,
+    ApprovalScope::ScriptsAllow,
+    ApprovalScope::TrustBulkApprove,
+    ApprovalScope::TrustScopeWiden,
+    ApprovalScope::SandboxDefault,
+    ApprovalScope::SandboxNone,
+    ApprovalScope::SandboxAllowDegraded,
+    ApprovalScope::CapabilityWiden,
+    ApprovalScope::FloorEdit,
+];
+
+const DEFAULT_UNLOCK_SCOPES: [ApprovalScope; 9] = [
+    ApprovalScope::CooldownBypass,
+    ApprovalScope::CooldownWindow,
+    ApprovalScope::ProvenanceIgnoreDrift,
+    ApprovalScope::ProvenanceUnverified,
+    ApprovalScope::ScriptsTriage,
+    ApprovalScope::ScriptsAllow,
+    ApprovalScope::SandboxDefault,
+    ApprovalScope::SandboxNone,
+    ApprovalScope::SandboxAllowDegraded,
+];
+
 impl ApprovalScope {
+    pub fn all_scopes() -> &'static [Self] {
+        &ALL_APPROVAL_SCOPES
+    }
+
+    pub fn default_unlock_scopes() -> &'static [Self] {
+        &DEFAULT_UNLOCK_SCOPES
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CooldownBypass => "cooldown-bypass",
@@ -310,6 +346,27 @@ pub struct UnlockGrant {
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub issuer: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UnlockRevocation {
+    pub id: String,
+    pub target: UnlockTargetKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_scopes: Vec<ApprovalScope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remaining_scopes: Vec<ApprovalScope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredUnlockGrant {
+    path: PathBuf,
+    grant: UnlockGrant,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1141,20 +1198,51 @@ fn normalized_packages(packages: &[String]) -> Vec<String> {
     values
 }
 
-fn suggested_unlock_command(
-    scope: ApprovalScope,
-    target: UnlockTargetKind,
-    packages: &[String],
-) -> String {
+fn scope_rank(scope: ApprovalScope) -> usize {
+    ApprovalScope::all_scopes()
+        .iter()
+        .position(|candidate| *candidate == scope)
+        .unwrap_or(usize::MAX)
+}
+
+fn normalized_scopes(scopes: &[ApprovalScope]) -> Vec<ApprovalScope> {
+    let mut values = scopes.to_vec();
+    values.sort_by_key(|scope| scope_rank(*scope));
+    values.dedup();
+    values
+}
+
+fn scope_names(scopes: &[ApprovalScope]) -> Vec<String> {
+    normalized_scopes(scopes)
+        .into_iter()
+        .map(|scope| scope.as_str().to_string())
+        .collect()
+}
+
+fn format_scope_list(scopes: &[ApprovalScope]) -> String {
+    scope_names(scopes).join(", ")
+}
+
+pub fn format_unlock_duration(ttl_secs: u64) -> String {
+    if ttl_secs.is_multiple_of(86_400) {
+        return format!("{}d", ttl_secs / 86_400);
+    }
+    if ttl_secs.is_multiple_of(3_600) {
+        return format!("{}h", ttl_secs / 3_600);
+    }
+    if ttl_secs.is_multiple_of(60) {
+        return format!("{}m", ttl_secs / 60);
+    }
+    format!("{ttl_secs}s")
+}
+
+fn suggested_unlock_command(scope: &str, target: UnlockTargetKind, packages: &[String]) -> String {
     let mut command = match target {
         UnlockTargetKind::Project => {
-            format!(
-                "lpm security unlock {} --project . --ttl 10m",
-                scope.as_str()
-            )
+            format!("lpm security unlock {scope} --project . --ttl 10m")
         }
         UnlockTargetKind::Global => {
-            format!("lpm security unlock {} --global --ttl 10m", scope.as_str())
+            format!("lpm security unlock {scope} --global --ttl 10m")
         }
     };
     for package in normalized_packages(packages) {
@@ -1665,8 +1753,8 @@ pub fn approval_required_error(
     }
 }
 
-fn create_unlock_grant(
-    scope: ApprovalScope,
+fn create_unlock_grant_for_scopes(
+    scopes: &[ApprovalScope],
     project_dir: &Path,
     ttl_secs: u64,
     min_release_age_secs: Option<u64>,
@@ -1678,11 +1766,47 @@ fn create_unlock_grant(
         id: format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
         target: UnlockTargetKind::Project,
         project_root: Some(canonical_project_root(project_dir)),
-        scopes: vec![scope],
+        scopes: normalized_scopes(scopes),
         packages: normalized_packages(packages),
         limits: UnlockLimits {
             min_release_age_secs,
         },
+        issued_at: now,
+        expires_at: now + chrono::Duration::seconds(ttl_secs as i64),
+        issuer: "user-presence".to_string(),
+    }
+}
+
+fn create_unlock_grant(
+    scope: ApprovalScope,
+    project_dir: &Path,
+    ttl_secs: u64,
+    min_release_age_secs: Option<u64>,
+    packages: &[String],
+) -> UnlockGrant {
+    create_unlock_grant_for_scopes(
+        &[scope],
+        project_dir,
+        ttl_secs,
+        min_release_age_secs,
+        packages,
+    )
+}
+
+fn create_global_unlock_grant_for_scopes(
+    scopes: &[ApprovalScope],
+    ttl_secs: u64,
+    packages: &[String],
+) -> UnlockGrant {
+    let now = Utc::now();
+    UnlockGrant {
+        schema_version: UNLOCK_SCHEMA_VERSION,
+        id: format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
+        target: UnlockTargetKind::Global,
+        project_root: None,
+        scopes: normalized_scopes(scopes),
+        packages: normalized_packages(packages),
+        limits: UnlockLimits::default(),
         issued_at: now,
         expires_at: now + chrono::Duration::seconds(ttl_secs as i64),
         issuer: "user-presence".to_string(),
@@ -1694,19 +1818,7 @@ fn create_global_unlock_grant(
     ttl_secs: u64,
     packages: &[String],
 ) -> UnlockGrant {
-    let now = Utc::now();
-    UnlockGrant {
-        schema_version: UNLOCK_SCHEMA_VERSION,
-        id: format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
-        target: UnlockTargetKind::Global,
-        project_root: None,
-        scopes: vec![scope],
-        packages: normalized_packages(packages),
-        limits: UnlockLimits::default(),
-        issued_at: now,
-        expires_at: now + chrono::Duration::seconds(ttl_secs as i64),
-        issuer: "user-presence".to_string(),
-    }
+    create_global_unlock_grant_for_scopes(&[scope], ttl_secs, packages)
 }
 
 fn persist_unlock_grant(grant: &UnlockGrant) -> Result<(), LpmError> {
@@ -1714,7 +1826,7 @@ fn persist_unlock_grant(grant: &UnlockGrant) -> Result<(), LpmError> {
     write_signed_json(&path, grant)
 }
 
-fn read_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
+fn read_active_unlock_entries() -> Result<Vec<StoredUnlockGrant>, LpmError> {
     let dir = unlocks_dir()?;
     if !dir.exists() {
         return Ok(Vec::new());
@@ -1729,7 +1841,9 @@ fn read_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
             continue;
         }
         match read_signed_json::<UnlockGrant>(&path) {
-            Ok(Some(grant)) if grant.expires_at > now => grants.push(grant),
+            Ok(Some(grant)) if grant.expires_at > now => {
+                grants.push(StoredUnlockGrant { path, grant })
+            }
             Ok(Some(_expired)) => {
                 let _ = std::fs::remove_file(&path);
             }
@@ -1738,6 +1852,13 @@ fn read_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
         }
     }
     Ok(grants)
+}
+
+fn read_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
+    Ok(read_active_unlock_entries()?
+        .into_iter()
+        .map(|entry| entry.grant)
+        .collect())
 }
 
 pub fn list_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
@@ -1831,6 +1952,133 @@ pub fn load_security_status(
         active_runtime_overrides,
         active_unlocks,
     })
+}
+
+fn grant_matches_lock_request(
+    grant: &UnlockGrant,
+    target: UnlockTargetKind,
+    project_root: Option<&str>,
+    scopes: &[ApprovalScope],
+    packages: &[String],
+) -> bool {
+    if grant.target != target {
+        return false;
+    }
+    if target == UnlockTargetKind::Project && grant.project_root.as_deref() != project_root {
+        return false;
+    }
+    if !grant.scopes.iter().any(|scope| scopes.contains(scope)) {
+        return false;
+    }
+    packages.is_empty() || grant.packages == packages
+}
+
+fn revoke_unlocks(
+    selector: &str,
+    target: UnlockTargetKind,
+    project_root: Option<&Path>,
+    scopes: &[ApprovalScope],
+    packages: &[String],
+) -> Result<Vec<UnlockRevocation>, LpmError> {
+    let requested_scopes = normalized_scopes(scopes);
+    if requested_scopes.is_empty() {
+        return Err(LpmError::Registry(
+            "at least one unlock scope is required".into(),
+        ));
+    }
+
+    let requested_packages = normalized_packages(packages);
+    let project_root = project_root.map(canonical_project_root);
+    let mut revocations = Vec::new();
+
+    for entry in read_active_unlock_entries()? {
+        if !grant_matches_lock_request(
+            &entry.grant,
+            target,
+            project_root.as_deref(),
+            &requested_scopes,
+            &requested_packages,
+        ) {
+            continue;
+        }
+
+        let revoked_scopes: Vec<_> = entry
+            .grant
+            .scopes
+            .iter()
+            .copied()
+            .filter(|scope| requested_scopes.contains(scope))
+            .collect();
+        let remaining_scopes: Vec<_> = entry
+            .grant
+            .scopes
+            .iter()
+            .copied()
+            .filter(|scope| !requested_scopes.contains(scope))
+            .collect();
+        let revoked_scopes = normalized_scopes(&revoked_scopes);
+        let remaining_scopes = normalized_scopes(&remaining_scopes);
+
+        if remaining_scopes.is_empty() {
+            std::fs::remove_file(&entry.path)?;
+        } else {
+            let mut updated = entry.grant.clone();
+            updated.scopes = remaining_scopes.clone();
+            write_signed_json(&entry.path, &updated)?;
+        }
+
+        let mut audit = AuditRecord::new("unlock-revoked", true, scope_names(&revoked_scopes))
+            .packages(entry.grant.packages.clone())
+            .source(ApprovalSource::SecurityCommand)
+            .unlock_id(entry.grant.id.clone());
+        if let Some(root) = entry.grant.project_root.clone() {
+            audit = audit.project_root(root);
+        }
+        let detail = if remaining_scopes.is_empty() {
+            format!("temporary unlock revoked for {selector}")
+        } else {
+            format!(
+                "temporary unlock narrowed for {selector}; remaining scopes: {}",
+                format_scope_list(&remaining_scopes)
+            )
+        };
+        record_audit_event(audit.detail(detail));
+
+        revocations.push(UnlockRevocation {
+            id: entry.grant.id,
+            target: entry.grant.target,
+            project_root: entry.grant.project_root,
+            revoked_scopes,
+            remaining_scopes,
+            packages: entry.grant.packages,
+            expires_at: entry.grant.expires_at,
+        });
+    }
+
+    Ok(revocations)
+}
+
+pub fn lock_project_scopes_command(
+    selector: &str,
+    scopes: &[ApprovalScope],
+    project_dir: &Path,
+    packages: &[String],
+) -> Result<Vec<UnlockRevocation>, LpmError> {
+    revoke_unlocks(
+        selector,
+        UnlockTargetKind::Project,
+        Some(project_dir),
+        scopes,
+        packages,
+    )
+}
+
+pub fn lock_global_scopes_command(
+    selector: &str,
+    scopes: &[ApprovalScope],
+    packages: &[String],
+) -> Result<Vec<UnlockRevocation>, LpmError> {
+    revoke_unlocks(selector, UnlockTargetKind::Global, None, scopes, packages)
 }
 
 fn trusted_dependencies_widened(
@@ -1930,7 +2178,7 @@ fn approval_required_for_scopes(
         .collect();
     let suggested_command = scopes
         .first()
-        .map(|scope| suggested_unlock_command(*scope, UnlockTargetKind::Project, &[]));
+        .map(|scope| suggested_unlock_command(scope.as_str(), UnlockTargetKind::Project, &[]));
     approval_required_error(message, requested_scopes, project_root, suggested_command)
 }
 
@@ -2224,10 +2472,9 @@ fn prompt_for_unlock(
 ) -> Result<(), LpmError> {
     crate::output::warn(message);
     let prompt = format!(
-        "Approve {} for this project for {} minute{}?",
+        "Approve {} for this project for {}?",
         scope.as_str(),
-        ttl_secs / 60,
-        if ttl_secs / 60 == 1 { "" } else { "s" }
+        format_unlock_duration(ttl_secs),
     );
     let confirmed = request_native_approval(&prompt)?;
 
@@ -2244,7 +2491,7 @@ fn prompt_for_unlock(
             vec![scope.as_str().to_string()],
             Some(canonical_project_root(project_dir)),
             Some(suggested_unlock_command(
-                scope,
+                scope.as_str(),
                 UnlockTargetKind::Project,
                 packages,
             )),
@@ -2262,10 +2509,9 @@ fn prompt_for_unlock(
             .detail(format!("temporary unlock granted for {}", scope.as_str())),
     );
     crate::output::success(&format!(
-        "Approved {} for this project for {} minute{}.",
+        "Approved {} for this project for {}.",
         scope.as_str(),
-        ttl_secs / 60,
-        if ttl_secs / 60 == 1 { "" } else { "s" }
+        format_unlock_duration(ttl_secs),
     ));
     Ok(())
 }
@@ -2332,7 +2578,7 @@ pub fn ensure_project_unlock(
         vec![scope.as_str().to_string()],
         Some(canonical_project_root(project_dir)),
         Some(suggested_unlock_command(
-            scope,
+            scope.as_str(),
             UnlockTargetKind::Project,
             packages,
         )),
@@ -2347,10 +2593,9 @@ fn prompt_for_global_unlock(
 ) -> Result<(), LpmError> {
     crate::output::warn(message);
     let prompt = format!(
-        "Approve {} globally for {} minute{}?",
+        "Approve {} globally for {}?",
         scope.as_str(),
-        ttl_secs / 60,
-        if ttl_secs / 60 == 1 { "" } else { "s" }
+        format_unlock_duration(ttl_secs),
     );
     let confirmed = request_native_approval(&prompt)?;
 
@@ -2366,7 +2611,7 @@ fn prompt_for_global_unlock(
             vec![scope.as_str().to_string()],
             None,
             Some(suggested_unlock_command(
-                scope,
+                scope.as_str(),
                 UnlockTargetKind::Global,
                 packages,
             )),
@@ -2386,10 +2631,9 @@ fn prompt_for_global_unlock(
             )),
     );
     crate::output::success(&format!(
-        "Approved {} globally for {} minute{}.",
+        "Approved {} globally for {}.",
         scope.as_str(),
-        ttl_secs / 60,
-        if ttl_secs / 60 == 1 { "" } else { "s" }
+        format_unlock_duration(ttl_secs),
     ));
     Ok(())
 }
@@ -2439,7 +2683,7 @@ pub fn ensure_global_unlock(
         vec![scope.as_str().to_string()],
         None,
         Some(suggested_unlock_command(
-            scope,
+            scope.as_str(),
             UnlockTargetKind::Global,
             packages,
         )),
@@ -2837,33 +3081,39 @@ pub fn ensure_runtime_sigstore_posture_for_global(
     Ok(())
 }
 
-pub fn unlock_scope_command(
-    scope: ApprovalScope,
+pub fn unlock_scopes_command(
+    selector: &str,
+    scopes: &[ApprovalScope],
     project_dir: &Path,
     ttl_secs: u64,
     json_output: bool,
     min_release_age_secs: Option<u64>,
     packages: &[String],
 ) -> Result<UnlockGrant, LpmError> {
+    let requested_scopes = normalized_scopes(scopes);
+    if requested_scopes.is_empty() {
+        return Err(LpmError::Registry(
+            "at least one unlock scope is required".into(),
+        ));
+    }
     if !(1..=MAX_UNLOCK_TTL_SECS).contains(&ttl_secs) {
         return Err(LpmError::Registry(format!(
             "unlock ttl must be between 1 and {MAX_UNLOCK_TTL_SECS} seconds"
         )));
     }
     let effective = load_effective_authorized_posture()?;
-    if let Some(err) = managed_policy_blocks_scope(&effective, scope) {
-        return Err(err);
+    for scope in &requested_scopes {
+        if let Some(err) = managed_policy_blocks_scope(&effective, *scope) {
+            return Err(err);
+        }
     }
     if is_automation(json_output) {
         return Err(approval_required_error(
-            format!(
-                "{} requires an interactive approval terminal",
-                scope.as_str()
-            ),
-            vec![scope.as_str().to_string()],
+            format!("{selector} requires an interactive approval terminal"),
+            scope_names(&requested_scopes),
             Some(canonical_project_root(project_dir)),
             Some(suggested_unlock_command(
-                scope,
+                selector,
                 UnlockTargetKind::Project,
                 packages,
             )),
@@ -2871,69 +3121,79 @@ pub fn unlock_scope_command(
     }
 
     crate::output::warn(&format!(
-        "{} will be allowed for this project for {} minute{} if you approve.",
-        scope.as_str(),
-        ttl_secs / 60,
-        if ttl_secs / 60 == 1 { "" } else { "s" }
+        "{selector} will be allowed for this project for {} if you approve.",
+        format_unlock_duration(ttl_secs),
     ));
     let confirmed = request_native_approval("Approve this temporary security unlock now?")?;
     if !confirmed {
         record_audit_event(
-            AuditRecord::new("unlock-granted", false, vec![scope.as_str().to_string()])
+            AuditRecord::new("unlock-granted", false, scope_names(&requested_scopes))
                 .project_root(canonical_project_root(project_dir))
                 .packages(packages.to_vec())
                 .source(ApprovalSource::SecurityCommand)
-                .detail(format!("user declined {}", scope.as_str())),
+                .detail(format!("user declined {selector}")),
         );
         return Err(approval_required_error(
-            format!("{} requires explicit approval", scope.as_str()),
-            vec![scope.as_str().to_string()],
+            format!("{selector} requires explicit approval"),
+            scope_names(&requested_scopes),
             Some(canonical_project_root(project_dir)),
             Some(suggested_unlock_command(
-                scope,
+                selector,
                 UnlockTargetKind::Project,
                 packages,
             )),
         ));
     }
-    let grant = create_unlock_grant(scope, project_dir, ttl_secs, min_release_age_secs, packages);
+    let grant = create_unlock_grant_for_scopes(
+        &requested_scopes,
+        project_dir,
+        ttl_secs,
+        min_release_age_secs,
+        packages,
+    );
     persist_unlock_grant(&grant)?;
     record_audit_event(
-        AuditRecord::new("unlock-granted", true, vec![scope.as_str().to_string()])
+        AuditRecord::new("unlock-granted", true, scope_names(&requested_scopes))
             .project_root(canonical_project_root(project_dir))
             .packages(packages.to_vec())
             .source(ApprovalSource::SecurityCommand)
             .unlock_id(grant.id.clone())
-            .detail(format!("temporary unlock granted for {}", scope.as_str())),
+            .detail(format!("temporary unlock granted for {selector}")),
     );
     Ok(grant)
 }
 
-pub fn unlock_global_scope_command(
-    scope: ApprovalScope,
+pub fn unlock_global_scopes_command(
+    selector: &str,
+    scopes: &[ApprovalScope],
     ttl_secs: u64,
     json_output: bool,
     packages: &[String],
 ) -> Result<UnlockGrant, LpmError> {
+    let requested_scopes = normalized_scopes(scopes);
+    if requested_scopes.is_empty() {
+        return Err(LpmError::Registry(
+            "at least one unlock scope is required".into(),
+        ));
+    }
     if !(1..=MAX_UNLOCK_TTL_SECS).contains(&ttl_secs) {
         return Err(LpmError::Registry(format!(
             "unlock ttl must be between 1 and {MAX_UNLOCK_TTL_SECS} seconds"
         )));
     }
     let effective = load_effective_authorized_posture()?;
-    if let Some(err) = managed_policy_blocks_scope(&effective, scope) {
-        return Err(err);
+    for scope in &requested_scopes {
+        if let Some(err) = managed_policy_blocks_scope(&effective, *scope) {
+            return Err(err);
+        }
     }
     if is_automation(json_output) {
         return Err(approval_required_error(
-            format!(
-                "{} requires an interactive approval terminal",
-                scope.as_str()
-            ),
-            vec![scope.as_str().to_string()],
+            format!("{selector} requires an interactive approval terminal"),
+            scope_names(&requested_scopes),
             None,
             Some(suggested_unlock_command(
-                scope,
+                selector,
                 UnlockTargetKind::Global,
                 packages,
             )),
@@ -2941,41 +3201,36 @@ pub fn unlock_global_scope_command(
     }
 
     crate::output::warn(&format!(
-        "{} will be allowed globally for {} minute{} if you approve.",
-        scope.as_str(),
-        ttl_secs / 60,
-        if ttl_secs / 60 == 1 { "" } else { "s" }
+        "{selector} will be allowed globally for {} if you approve.",
+        format_unlock_duration(ttl_secs),
     ));
     let confirmed = request_native_approval("Approve this temporary global security unlock now?")?;
     if !confirmed {
         record_audit_event(
-            AuditRecord::new("unlock-granted", false, vec![scope.as_str().to_string()])
+            AuditRecord::new("unlock-granted", false, scope_names(&requested_scopes))
                 .packages(packages.to_vec())
                 .source(ApprovalSource::SecurityCommand)
-                .detail(format!("user declined {}", scope.as_str())),
+                .detail(format!("user declined {selector}")),
         );
         return Err(approval_required_error(
-            format!("{} requires explicit approval", scope.as_str()),
-            vec![scope.as_str().to_string()],
+            format!("{selector} requires explicit approval"),
+            scope_names(&requested_scopes),
             None,
             Some(suggested_unlock_command(
-                scope,
+                selector,
                 UnlockTargetKind::Global,
                 packages,
             )),
         ));
     }
-    let grant = create_global_unlock_grant(scope, ttl_secs, packages);
+    let grant = create_global_unlock_grant_for_scopes(&requested_scopes, ttl_secs, packages);
     persist_unlock_grant(&grant)?;
     record_audit_event(
-        AuditRecord::new("unlock-granted", true, vec![scope.as_str().to_string()])
+        AuditRecord::new("unlock-granted", true, scope_names(&requested_scopes))
             .packages(packages.to_vec())
             .source(ApprovalSource::SecurityCommand)
             .unlock_id(grant.id.clone())
-            .detail(format!(
-                "temporary global unlock granted for {}",
-                scope.as_str()
-            )),
+            .detail(format!("temporary global unlock granted for {selector}")),
     );
     Ok(grant)
 }
@@ -3078,6 +3333,124 @@ mod tests {
             persist_unlock_grant(&grant).unwrap();
             assert!(
                 has_active_project_unlock(ApprovalScope::SandboxNone, &project, None, &[]).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn unlock_duration_formats_compact_units() {
+        assert_eq!(format_unlock_duration(600), "10m");
+        assert_eq!(format_unlock_duration(3_600), "1h");
+        assert_eq!(format_unlock_duration(365 * 24 * 60 * 60), "365d");
+        assert_eq!(format_unlock_duration(45), "45s");
+    }
+
+    #[test]
+    fn default_unlock_bundle_excludes_trust_capability_and_floor_scopes() {
+        let scopes = ApprovalScope::default_unlock_scopes();
+        assert!(scopes.contains(&ApprovalScope::CooldownBypass));
+        assert!(scopes.contains(&ApprovalScope::SandboxNone));
+        assert!(!scopes.contains(&ApprovalScope::TrustBulkApprove));
+        assert!(!scopes.contains(&ApprovalScope::TrustScopeWiden));
+        assert!(!scopes.contains(&ApprovalScope::CapabilityWiden));
+        assert!(!scopes.contains(&ApprovalScope::FloorEdit));
+    }
+
+    #[test]
+    fn unlock_scopes_command_accepts_year_long_ttl() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        with_test_env(temp.path(), || {
+            let grant = unlock_scopes_command(
+                "default",
+                ApprovalScope::default_unlock_scopes(),
+                &project,
+                MAX_UNLOCK_TTL_SECS,
+                false,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            assert_eq!(grant.scopes, ApprovalScope::default_unlock_scopes());
+            assert_eq!(
+                (grant.expires_at - grant.issued_at).num_seconds(),
+                MAX_UNLOCK_TTL_SECS as i64
+            );
+        });
+    }
+
+    #[test]
+    fn lock_global_scopes_command_revokes_only_requested_scopes() {
+        let temp = tempdir().unwrap();
+
+        with_test_env(temp.path(), || {
+            let grant = create_global_unlock_grant_for_scopes(
+                &[
+                    ApprovalScope::CooldownBypass,
+                    ApprovalScope::TrustBulkApprove,
+                ],
+                DEFAULT_UNLOCK_TTL_SECS,
+                &[],
+            );
+            persist_unlock_grant(&grant).unwrap();
+
+            let revocations =
+                lock_global_scopes_command("default", ApprovalScope::default_unlock_scopes(), &[])
+                    .unwrap();
+
+            assert_eq!(revocations.len(), 1);
+            assert_eq!(
+                revocations[0].revoked_scopes,
+                vec![ApprovalScope::CooldownBypass]
+            );
+            assert_eq!(
+                revocations[0].remaining_scopes,
+                vec![ApprovalScope::TrustBulkApprove]
+            );
+
+            let grants = list_active_global_unlocks().unwrap();
+            assert_eq!(grants.len(), 1);
+            assert_eq!(grants[0].id, grant.id);
+            assert_eq!(grants[0].scopes, vec![ApprovalScope::TrustBulkApprove]);
+        });
+    }
+
+    #[test]
+    fn lock_project_scopes_command_matches_exact_package_sets() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        with_test_env(temp.path(), || {
+            let grant = create_unlock_grant_for_scopes(
+                &[ApprovalScope::ProvenanceUnverified],
+                &project,
+                DEFAULT_UNLOCK_TTL_SECS,
+                None,
+                &["esbuild".to_string(), "sharp".to_string()],
+            );
+            persist_unlock_grant(&grant).unwrap();
+
+            let revocations = lock_project_scopes_command(
+                "provenance-unverified",
+                &[ApprovalScope::ProvenanceUnverified],
+                &project,
+                &["esbuild".to_string()],
+            )
+            .unwrap();
+
+            assert!(revocations.is_empty());
+            assert!(
+                has_active_project_unlock(
+                    ApprovalScope::ProvenanceUnverified,
+                    &project,
+                    None,
+                    &["esbuild".to_string(), "sharp".to_string()],
+                )
+                .unwrap()
             );
         });
     }
