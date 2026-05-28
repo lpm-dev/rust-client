@@ -2177,6 +2177,13 @@ pub fn resolve_catalog_protocol(
             )
         })?;
 
+        if version.starts_with("catalog:") {
+            return Err(format!(
+                "invalid recursive catalog entry for dependency '{}' in catalog '{}': catalog entries cannot use the catalog protocol recursively",
+                name, catalog_name
+            ));
+        }
+
         let original = range.clone();
         *range = version.clone();
         resolved.push((name.clone(), original, range.clone()));
@@ -3572,6 +3579,27 @@ mod catalog_protocol_tests {
             result
                 .unwrap_err()
                 .contains("dependency 'vue' not found in catalog")
+        );
+    }
+
+    #[test]
+    fn catalog_recursive_entry_errors_before_resolution() {
+        let mut deps = HashMap::from([("react".to_string(), "catalog:".to_string())]);
+        let catalogs = HashMap::from([(
+            "default".to_string(),
+            HashMap::from([("react".to_string(), "catalog:shared".to_string())]),
+        )]);
+
+        let result = resolve_catalog_protocol(&mut deps, &catalogs);
+        let err = result.expect_err("recursive catalog value must error");
+
+        assert!(
+            err.contains("recursive") && err.contains("react") && err.contains("catalog 'default'"),
+            "error should identify recursive catalog entry, got: {err}"
+        );
+        assert_eq!(
+            deps["react"], "catalog:",
+            "failed catalog resolution must leave dependency spec unchanged"
         );
     }
 

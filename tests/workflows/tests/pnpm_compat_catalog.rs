@@ -290,6 +290,39 @@ async fn prefer_catalog_mode_warns_and_saves_direct_range_when_catalog_mismatche
     );
 }
 
+#[tokio::test]
+async fn catalog_entry_recursive_definition_fails_with_clear_error() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "catalog:loop"
+                }
+            }
+        }"#,
+    );
+
+    let output = run_install(&project, &mock, &[]);
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "recursive catalog entries must fail install\n{text}"
+    );
+    assert!(
+        text.contains("recursive")
+            && text.contains("is-positive")
+            && text.contains("catalog 'default'"),
+        "recursive catalog error must name the package and catalog\n{text}"
+    );
+}
+
 async fn mount_is_positive_versions(mock: &MockRegistry) {
     mock.with_full_package_metadata(
         "is-positive",
