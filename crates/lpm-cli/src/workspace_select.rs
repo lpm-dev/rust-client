@@ -27,6 +27,7 @@ use std::path::Path;
 ///   only production graph edges.
 /// - **`--filter` AND `--affected`**: union of both target sets — `--affected`
 ///   is treated as an implicit additional positive filter.
+#[allow(clippy::too_many_arguments)]
 pub fn select_workspace_target_set(
     ws_graph: &lpm_task::graph::WorkspaceGraph,
     workspace_root: &Path,

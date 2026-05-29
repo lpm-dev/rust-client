@@ -89,6 +89,7 @@ fn looks_like_bare_name(raw: &str) -> bool {
         && !trimmed.contains("...")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     project_dir: &Path,
     exprs: &[String],

@@ -623,8 +623,17 @@ impl Lockfile {
             if use_binary {
                 match BinaryLockfileReader::open(&binary_path) {
                     Ok(Some(reader)) => {
-                        if let Ok(lockfile) = reader.to_lockfile() {
-                            return Ok(lockfile);
+                        if let Ok(binary_lockfile) = reader.to_lockfile() {
+                            let toml_lockfile = Self::read_from_file(toml_path)?;
+                            if binary_cache_matches_toml(&binary_lockfile, &toml_lockfile) {
+                                return Ok(binary_lockfile);
+                            }
+                            tracing::warn!(
+                                "ignoring binary lockfile cache ({}): contents do not match authoritative TOML {}",
+                                binary_path.display(),
+                                toml_path.display()
+                            );
+                            return Ok(toml_lockfile);
                         }
                         // Cross-format invariant failed; fall through
                         // to TOML so the same defect surfaces against
@@ -713,6 +722,41 @@ impl Default for Lockfile {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn binary_cache_matches_toml(binary_lockfile: &Lockfile, toml_lockfile: &Lockfile) -> bool {
+    if !binary::binary_format_supports(toml_lockfile) {
+        return false;
+    }
+    if binary_lockfile.packages.len() != toml_lockfile.packages.len() {
+        return false;
+    }
+
+    let mut binary_packages: Vec<&LockedPackage> = binary_lockfile.packages.iter().collect();
+    let mut toml_packages: Vec<&LockedPackage> = toml_lockfile.packages.iter().collect();
+    binary_packages.sort_by(|a, b| lockfile_package_order(a, b));
+    toml_packages.sort_by(|a, b| lockfile_package_order(a, b));
+
+    binary_packages
+        .iter()
+        .zip(toml_packages.iter())
+        .all(|(binary, toml)| binary_package_fields_match(binary, toml))
+}
+
+fn lockfile_package_order(a: &LockedPackage, b: &LockedPackage) -> std::cmp::Ordering {
+    a.name
+        .cmp(&b.name)
+        .then_with(|| a.version.cmp(&b.version))
+        .then_with(|| a.source.cmp(&b.source))
+}
+
+fn binary_package_fields_match(binary: &LockedPackage, toml: &LockedPackage) -> bool {
+    binary.name == toml.name
+        && binary.version == toml.version
+        && binary.source == toml.source
+        && binary.integrity == toml.integrity
+        && binary.dependencies == toml.dependencies
+        && binary.tarball == toml.tarball
 }
 
 /// Ensure `.gitattributes` marks `lpm.lockb` as binary.
@@ -1494,6 +1538,44 @@ version = "1.0.0"
             assert_eq!(orig.name, rest.name);
             assert_eq!(orig.version, rest.version);
         }
+    }
+
+    #[test]
+    fn read_fast_returns_toml_when_newer_binary_disagrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml_path = dir.path().join("lpm.lock");
+        let binary_path = dir.path().join("lpm.lockb");
+
+        let mut toml_lockfile = Lockfile::new();
+        toml_lockfile.add_package(LockedPackage {
+            name: "reviewed".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-reviewed".to_string()),
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: Some("https://registry.npmjs.org/reviewed/-/reviewed-1.0.0.tgz".to_string()),
+        });
+        toml_lockfile.write_to_file(&toml_path).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let mut poisoned_binary = Lockfile::new();
+        poisoned_binary.add_package(LockedPackage {
+            name: "reviewed".to_string(),
+            version: "9.9.9".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-poisoned".to_string()),
+            dependencies: vec!["payload@1.0.0".to_string()],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: Some("https://registry.npmjs.org/reviewed/-/reviewed-9.9.9.tgz".to_string()),
+        });
+        binary::write_binary(&poisoned_binary, &binary_path).unwrap();
+
+        let result = Lockfile::read_fast(&toml_path).unwrap();
+        assert_eq!(result, toml_lockfile);
     }
 
     #[test]

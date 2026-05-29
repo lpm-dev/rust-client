@@ -2676,6 +2676,7 @@ fn build_install_global_overrides(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_global_install_project_scoped_flags(
     save_dev: bool,
     filter: &[String],

@@ -28,6 +28,13 @@ pub struct DependencyEdge {
     pub kind: DependencyKind,
 }
 
+type WorkspaceEdgeLists = (
+    Vec<Vec<usize>>,
+    Vec<Vec<usize>>,
+    Vec<Vec<DependencyEdge>>,
+    Vec<Vec<DependencyEdge>>,
+);
+
 /// A workspace dependency graph.
 #[derive(Debug)]
 pub struct WorkspaceGraph {
@@ -328,14 +335,7 @@ impl<'a> WorkspaceEdgeBuilder<'a> {
         }
     }
 
-    fn finish(
-        self,
-    ) -> (
-        Vec<Vec<usize>>,
-        Vec<Vec<usize>>,
-        Vec<Vec<DependencyEdge>>,
-        Vec<Vec<DependencyEdge>>,
-    ) {
+    fn finish(self) -> WorkspaceEdgeLists {
         (
             self.edges,
             self.reverse_edges,

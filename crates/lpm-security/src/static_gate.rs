@@ -417,6 +417,26 @@ fn has_node_eval(tokens: &[String]) -> bool {
                 }
                 return true;
             }
+            if let Some(body) = follower.strip_prefix("--eval=") {
+                if parse_softfail_wrapper(body).is_some() {
+                    break;
+                }
+                return true;
+            }
+            if let Some(body) = follower.strip_prefix("-e=") {
+                if parse_softfail_wrapper(body).is_some() {
+                    break;
+                }
+                return true;
+            }
+            if let Some(body) = follower.strip_prefix("-e")
+                && !body.is_empty()
+            {
+                if parse_softfail_wrapper(body).is_some() {
+                    break;
+                }
+                return true;
+            }
             // Keep scanning past other flags (e.g. `node --no-warnings -e`).
             if !follower.starts_with('-') {
                 break;
@@ -1674,6 +1694,13 @@ mod tests {
     #[test]
     fn red_node_long_eval() {
         assert_eq!(tier("node --eval 'console.log(1)'"), StaticTier::Red);
+    }
+
+    #[test]
+    fn red_node_eval_glued_flag_forms() {
+        assert_eq!(tier("node --eval=console.log(1)"), StaticTier::Red);
+        assert_eq!(tier("node -e=console.log(1)"), StaticTier::Red);
+        assert_eq!(tier("node -econsole.log(1)"), StaticTier::Red);
     }
 
     #[test]

@@ -50,7 +50,7 @@ pub async fn run(
             output::field("ecosystem", eco);
         }
 
-        if let Some(integrity) = ver.integrity() {
+        if let Some(integrity) = ver.integrity_or_shasum() {
             let short = if integrity.len() > 30 {
                 format!("{}...", &integrity[..30])
             } else {

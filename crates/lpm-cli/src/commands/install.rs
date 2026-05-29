@@ -208,9 +208,7 @@ impl CatalogSavePolicy {
     }
 
     fn optional_catalog_entry(&self, catalog_name: &str, package: &str) -> Option<&String> {
-        let Some(catalog) = self.catalogs.get(catalog_name) else {
-            return None;
-        };
+        let catalog = self.catalogs.get(catalog_name)?;
         catalog.get(package)
     }
 
@@ -4279,8 +4277,7 @@ async fn run_with_options_under_store_lock(
     let dependency_catalog_resolution_count = catalog_resolutions.len();
     let override_catalogs = workspace
         .as_ref()
-        .map(|ws| &ws.root_package.catalogs)
-        .unwrap_or(&pkg.catalogs);
+        .map_or(&pkg.catalogs, |ws| &ws.root_package.catalogs);
     let (lpm_overrides_map, lpm_override_catalog_resolutions) =
         resolve_catalog_protocol_in_override_map(&lpm_overrides_map, override_catalogs)?;
     let (overrides_map, npm_override_catalog_resolutions) =
@@ -4788,6 +4785,7 @@ async fn run_with_options_under_store_lock(
             &mut workspace_member_deps,
             &all_workspace_members,
         )?;
+        enforce_registry_integrity_policy(&locked, strict_integrity, json_output)?;
 
         // Go directly to link step (skip resolution and download).
         // forward the already-resolved
@@ -5528,6 +5526,7 @@ async fn run_with_options_under_store_lock(
                 // plan — runs once after the merge regardless of
                 // PubGrub vs fusion.
                 apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps);
+                enforce_registry_integrity_policy(&packages, strict_integrity, json_output)?;
 
                 if !json_output {
                     // Persistent second phase line. Sub-second resolves don't
@@ -9493,16 +9492,15 @@ fn catalog_protocol_error_to_lpm(error: lpm_workspace::CatalogProtocolError) -> 
     }
 }
 
+type OverrideCatalogResolution<'a> = (
+    Cow<'a, HashMap<String, String>>,
+    Vec<lpm_workspace::CatalogProtocolResolution>,
+);
+
 fn resolve_catalog_protocol_in_override_map<'a>(
     overrides: &'a HashMap<String, String>,
     catalogs: &HashMap<String, HashMap<String, String>>,
-) -> Result<
-    (
-        Cow<'a, HashMap<String, String>>,
-        Vec<lpm_workspace::CatalogProtocolResolution>,
-    ),
-    LpmError,
-> {
+) -> Result<OverrideCatalogResolution<'a>, LpmError> {
     if !overrides
         .values()
         .any(|target| target.starts_with("catalog:"))
@@ -10768,7 +10766,7 @@ fn pick_speculative_version(
         return Some((
             pinned.clone(),
             url.to_string(),
-            vm.integrity().map(|s| s.to_string()),
+            vm.integrity_or_shasum().map(|s| s.into_owned()),
         ));
     }
 
@@ -10789,7 +10787,7 @@ fn pick_speculative_version(
     let (_v, v_str) = best?;
     let vm = meta.versions.get(v_str)?;
     let url = vm.tarball_url()?.to_string();
-    let integrity = vm.integrity().map(|s| s.to_string());
+    let integrity = vm.integrity_or_shasum().map(|s| s.into_owned());
     Some((v_str.to_string(), url, integrity))
 }
 
@@ -11367,6 +11365,84 @@ fn invalidate_metadata_routed(client: &Arc<RegistryClient>, route_table: &RouteT
     }
 }
 
+async fn verify_registry_signature_if_present(
+    client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
+    package: &InstallPackage,
+) -> Result<(), LpmError> {
+    if package.is_lpm || !install_package_is_registry_source(package) {
+        return Ok(());
+    }
+
+    let route = route_table.route_for_package(&package.name);
+    let metadata = client
+        .get_npm_metadata_routed(&package.name, route.clone())
+        .await?;
+    let version = metadata.version(&package.version).ok_or_else(|| {
+        LpmError::NotFound(format!(
+            "{}@{} not found in metadata",
+            package.name, package.version
+        ))
+    })?;
+    let Some(dist) = version.dist.as_ref() else {
+        return Ok(());
+    };
+    let Some(signatures) = dist.signatures.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let Some(integrity) = dist.integrity.as_deref() else {
+        return Err(LpmError::Registry(format!(
+            "{}@{} has registry signatures but no dist.integrity to verify",
+            package.name, package.version
+        )));
+    };
+
+    let (keys_base_url, auth): (&str, Option<&lpm_registry::RegistryAuth>) = match &route {
+        UpstreamRoute::Custom { target, auth } => (target.base_url.as_ref(), auth.as_ref()),
+        UpstreamRoute::LpmWorker | UpstreamRoute::NpmDirect => (client.npm_registry_url(), None),
+    };
+    let mut keys = client
+        .get_registry_signing_keys(keys_base_url, auth)
+        .await?;
+    if matches!(&route, UpstreamRoute::Custom { .. })
+        && !registry_signatures_have_matching_key(signatures, &keys)
+    {
+        keys.extend(
+            client
+                .get_registry_signing_keys(client.npm_registry_url(), None)
+                .await?,
+        );
+    }
+    let verification = lpm_registry::verify_registry_signatures(
+        &package.name,
+        &package.version,
+        integrity,
+        signatures,
+        &keys,
+        metadata.time.get(&package.version).map(String::as_str),
+    )?;
+    if let lpm_registry::RegistrySignatureVerification::Verified { count } = verification {
+        tracing::debug!(
+            target: "lpm_cli::install",
+            package = %package.name,
+            version = %package.version,
+            count,
+            "verified registry package signatures"
+        );
+    }
+    Ok(())
+}
+
+fn registry_signatures_have_matching_key(
+    signatures: &[lpm_registry::RegistrySignature],
+    keys: &[lpm_registry::RegistrySigningKey],
+) -> bool {
+    signatures
+        .iter()
+        .filter_map(|signature| signature.keyid.as_deref())
+        .any(|keyid| keys.iter().any(|key| key.keyid == keyid))
+}
+
 /// Shared 404-handling: when a tarball URL 404s and the same-run
 /// retry can't recover it either, the metadata cache is stale —
 /// nuke the lockfiles so the next `lpm install` re-resolves and
@@ -11471,6 +11547,8 @@ async fn fetch_and_store_legacy(
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
     let mut final_url = initial_url.clone();
 
+    verify_registry_signature_if_present(client, route_table, p).await?;
+
     let download_start = std::time::Instant::now();
     let downloaded = match client
         .download_tarball_routed(route_table, &p.name, &initial_url)
@@ -11517,6 +11595,7 @@ async fn fetch_and_store_legacy(
                     project_dir,
                 ));
             }
+            verify_registry_signature_if_present(client, route_table, p).await?;
             match client
                 .download_tarball_routed(route_table, &p.name, &fresh_url)
                 .await
@@ -11781,6 +11860,8 @@ async fn fetch_and_store_streaming(
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
     let mut final_url = initial_url.clone();
 
+    verify_registry_signature_if_present(client, route_table, p).await?;
+
     let response = match client
         .download_tarball_streaming_routed(route_table, &p.name, &initial_url)
         .await
@@ -11825,6 +11906,7 @@ async fn fetch_and_store_streaming(
                     project_dir,
                 ));
             }
+            verify_registry_signature_if_present(client, route_table, p).await?;
             match client
                 .download_tarball_streaming_routed(route_table, &p.name, &fresh_url)
                 .await
@@ -12202,6 +12284,45 @@ fn collect_direct_versions(packages: &[InstallPackage]) -> HashMap<String, lpm_s
         }
     }
     map
+}
+
+fn enforce_registry_integrity_policy(
+    packages: &[InstallPackage],
+    strict_integrity: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    for package in packages {
+        if package.integrity.is_some() || !install_package_is_registry_source(package) {
+            continue;
+        }
+        if strict_integrity {
+            return Err(LpmError::Registry(format!(
+                "--strict-integrity: registry package {}@{} has no dist.integrity or dist.shasum. \
+                 Refusing to install an unverified registry tarball.",
+                package.name, package.version
+            )));
+        }
+        tracing::warn!(
+            target: "lpm_cli::install",
+            package = %package.name,
+            version = %package.version,
+            "registry package has no dist.integrity or dist.shasum; download will be verified only after trust-on-first-use"
+        );
+        if !json_output {
+            output::warn(&format!(
+                "registry package {}@{} has no integrity hash; pinning trust-on-first-use",
+                package.name, package.version
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn install_package_is_registry_source(package: &InstallPackage) -> bool {
+    matches!(
+        package.source_kind(),
+        Ok(lpm_lockfile::Source::Registry { .. })
+    )
 }
 
 /// Replay the stage decisions against the
@@ -15512,6 +15633,54 @@ mod tests {
              it appears before the transitive in the input list"
         );
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn strict_integrity_rejects_registry_package_without_integrity() {
+        let packages = vec![fake_pkg("legacy-registry-pkg", "1.0.0", true)];
+        let err = enforce_registry_integrity_policy(&packages, true, true).unwrap_err();
+        assert!(
+            err.to_string().contains("legacy-registry-pkg@1.0.0"),
+            "error should identify the unverified package, got {err}"
+        );
+    }
+
+    #[test]
+    fn strict_integrity_does_not_apply_to_non_registry_install_packages() {
+        let mut package = fake_pkg("local-pkg", "1.0.0", true);
+        package.source = "directory+./vendor/local-pkg".to_string();
+        enforce_registry_integrity_policy(&[package], true, true).unwrap();
+    }
+
+    #[test]
+    fn registry_signature_key_match_detects_missing_custom_registry_keys() {
+        let signatures = vec![lpm_registry::RegistrySignature {
+            keyid: Some("SHA256:npm".to_string()),
+            sig: Some("MEUCIQD".to_string()),
+        }];
+        let custom_keys = vec![lpm_registry::RegistrySigningKey {
+            expires: None,
+            keyid: "SHA256:custom".to_string(),
+            keytype: "ecdsa-sha2-nistp256".to_string(),
+            scheme: "ecdsa-sha2-nistp256".to_string(),
+            key: String::new(),
+        }];
+        let npm_keys = vec![lpm_registry::RegistrySigningKey {
+            expires: None,
+            keyid: "SHA256:npm".to_string(),
+            keytype: "ecdsa-sha2-nistp256".to_string(),
+            scheme: "ecdsa-sha2-nistp256".to_string(),
+            key: String::new(),
+        }];
+
+        assert!(!registry_signatures_have_matching_key(
+            &signatures,
+            &custom_keys
+        ));
+        assert!(registry_signatures_have_matching_key(
+            &signatures,
+            &npm_keys
+        ));
     }
 
     /// Transitive-only packages are EXCLUDED from the map entirely.

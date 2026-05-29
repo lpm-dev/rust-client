@@ -337,6 +337,7 @@ fn args_imply_watch(args: &[String]) -> bool {
         .any(|arg| arg == "--watch" || arg.starts_with("--watch=") || arg == "-w")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pack_workspace(
     project_dir: &Path,
     options: &PackOptions,

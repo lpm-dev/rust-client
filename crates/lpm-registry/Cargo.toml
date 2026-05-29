@@ -28,6 +28,8 @@ secrecy = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 tempfile = "3"
+p256 = { workspace = true }
+time = { version = "0.3", features = ["parsing"] }
 # Encrypted PKCS#8 private-key decryption + TTY passphrase prompt.
 # See `tls_identity.rs` for the loader.
 pkcs8 = { workspace = true }
@@ -43,7 +45,6 @@ rcgen = "0.13"
 # rustls 0.23) so we don't fork the trust-store impl.
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
-time = "0.3"
 
 [lints]
 workspace = true
