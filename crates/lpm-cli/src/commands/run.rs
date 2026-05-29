@@ -213,6 +213,7 @@ pub async fn run_multi(
         output::warn("No scripts specified. Usage: lpm run <script> [scripts...]");
         return Ok(());
     }
+    reject_direct_hidden_scripts(scripts)?;
 
     // Read lpm.json for task dependencies
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
@@ -1117,6 +1118,8 @@ pub async fn run_workspace(
     stream: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    reject_direct_hidden_scripts(scripts)?;
+
     // Tier 1 (L3): capture the root hint so members without their
     // own version pin can inherit it. `run_workspace_package` does its own
     // per-member probe (cheap stat-based) and decides whether to reuse this
@@ -1461,6 +1464,8 @@ pub fn run_watch(
     env_mode: Option<&str>,
     bin_hint: ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
+    reject_direct_hidden_scripts(&[script_name.to_string()])?;
+
     // Read task config for input globs — only trigger on relevant file changes
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
         .ok()
@@ -1897,6 +1902,25 @@ fn try_cache_store_with_output_and_config(
         stdout.len()
     );
     Ok(())
+}
+
+fn reject_direct_hidden_scripts(scripts: &[String]) -> Result<(), LpmError> {
+    if lpm_runner::script::hidden_script_direct_invocation_allowed() {
+        return Ok(());
+    }
+    let hidden: Vec<&str> = scripts
+        .iter()
+        .map(String::as_str)
+        .filter(|name| lpm_runner::script::is_hidden_script_name(name))
+        .collect();
+    if hidden.is_empty() {
+        return Ok(());
+    }
+    Err(LpmError::Script(format!(
+        "hidden script{} {} cannot be invoked directly",
+        if hidden.len() == 1 { "" } else { "s" },
+        hidden.join(", ")
+    )))
 }
 
 #[cfg(test)]

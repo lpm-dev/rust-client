@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Global flag to skip env schema validation (set by `--no-env-check`).
 static SKIP_ENV_VALIDATION: AtomicBool = AtomicBool::new(false);
 
+const LPM_SCRIPT_CHILD_ENV: &str = "LPM_SCRIPT_CHILD";
+
 /// Set the global flag to skip env schema validation.
 ///
 /// Called by the CLI layer when `--no-env-check` is passed.
@@ -33,6 +35,18 @@ pub fn set_skip_env_validation(skip: bool) {
 
 pub(crate) fn should_skip_env_validation() -> bool {
     SKIP_ENV_VALIDATION.load(Ordering::Relaxed)
+}
+
+pub fn is_hidden_script_name(name: &str) -> bool {
+    name.starts_with('.')
+}
+
+pub fn hidden_script_direct_invocation_allowed() -> bool {
+    std::env::var_os(LPM_SCRIPT_CHILD_ENV).is_some()
+}
+
+fn mark_script_child_env(env_vars: &mut HashMap<String, String>) {
+    env_vars.insert(LPM_SCRIPT_CHILD_ENV.to_string(), "1".to_string());
 }
 
 /// Escape a string for safe interpolation inside a single-quoted POSIX
@@ -113,6 +127,7 @@ pub fn run_script_with_envs(
     for (key, value) in extra_envs {
         env_vars.insert(key.clone(), value.clone());
     }
+    mark_script_child_env(&mut env_vars);
 
     // Run pre-hook if it exists
     if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
@@ -195,7 +210,8 @@ pub fn run_script_captured(
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let loaded = resolve_and_load_env(project_dir, script_name, env_mode)?;
     print_env_context(&loaded);
-    let env_vars = loaded.vars;
+    let mut env_vars = loaded.vars;
+    mark_script_child_env(&mut env_vars);
 
     // Run pre-hook (not captured — hooks output goes to terminal only)
     if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
@@ -271,7 +287,8 @@ pub fn run_script_buffered(
     let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
-    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
+    let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
+    mark_script_child_env(&mut env_vars);
 
     // Pre-hook (not captured)
     if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
@@ -340,7 +357,8 @@ pub fn run_command_buffered(
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    mark_script_child_env(&mut env_vars);
 
     let full_cmd = assemble_shell_command(command, extra_args);
 
@@ -378,7 +396,8 @@ pub fn run_script_prefixed(
     let (script_cmd, _scripts) = resolve_script_command(project_dir, script_name)?;
 
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
-    let env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
+    let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
+    mark_script_child_env(&mut env_vars);
 
     let full_cmd = assemble_shell_command(&script_cmd, extra_args);
 
@@ -418,7 +437,8 @@ pub fn run_command_prefixed(
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    mark_script_child_env(&mut env_vars);
 
     let full_cmd = assemble_shell_command(command, extra_args);
 
@@ -461,7 +481,8 @@ pub fn run_command(
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    mark_script_child_env(&mut env_vars);
 
     let full_cmd = assemble_shell_command(command, extra_args);
 
@@ -488,7 +509,8 @@ pub fn run_command_captured(
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
-    let env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    mark_script_child_env(&mut env_vars);
 
     let full_cmd = assemble_shell_command(command, extra_args);
 
@@ -726,7 +748,11 @@ pub fn list_scripts(project_dir: &Path) -> Result<Vec<(String, String)>, LpmErro
     if pkg_json_path.exists()
         && let Ok(pkg) = read_package_json(&pkg_json_path)
     {
-        all_scripts.extend(pkg.scripts);
+        all_scripts.extend(
+            pkg.scripts
+                .into_iter()
+                .filter(|(name, _)| !is_hidden_script_name(name)),
+        );
     }
 
     // Load from lpm.json tasks (commands not already in package.json)
@@ -759,8 +785,17 @@ fn script_not_found_error(script_name: &str, scripts: &HashMap<String, String>) 
         ));
     }
 
-    let mut available: Vec<&str> = scripts.keys().map(|k| k.as_str()).collect();
+    let mut available: Vec<&str> = scripts
+        .keys()
+        .map(|k| k.as_str())
+        .filter(|name| !is_hidden_script_name(name))
+        .collect();
     available.sort();
+    if available.is_empty() {
+        return LpmError::Script(format!(
+            "script '{script_name}' not found — no visible scripts defined in package.json or lpm.json"
+        ));
+    }
 
     LpmError::Script(format!(
         "script '{script_name}' not found. Available: {}",
@@ -898,6 +933,44 @@ mod tests {
         assert_eq!(scripts[0].0, "build");
         assert_eq!(scripts[1].0, "dev");
         assert_eq!(scripts[2].0, "test");
+    }
+
+    #[test]
+    fn list_scripts_omits_hidden_package_json_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"build": "tsup", ".build": "node internal.js"}}"#,
+        )
+        .unwrap();
+
+        let scripts = list_scripts(dir.path()).unwrap();
+        assert_eq!(scripts, vec![("build".to_string(), "tsup".to_string())]);
+    }
+
+    #[test]
+    fn missing_script_suggestions_omit_hidden_package_json_scripts() {
+        let mut scripts = HashMap::new();
+        scripts.insert("build".to_string(), "tsup".to_string());
+        scripts.insert(".build".to_string(), "node internal.js".to_string());
+
+        let err = script_not_found_error("missing", &scripts);
+        let msg = err.to_string();
+        assert!(msg.contains("build"));
+        assert!(!msg.contains(".build"));
+    }
+
+    #[test]
+    fn script_children_receive_hidden_script_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts": {"check": "test \"$LPM_SCRIPT_CHILD\" = \"1\" "}}"#,
+        )
+        .unwrap();
+
+        let result = run_script(dir.path(), "check", &[], None, &Unknown);
+        assert!(result.is_ok());
     }
 
     #[test]
