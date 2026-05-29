@@ -96,6 +96,35 @@ fn v2_ids_reference_real_v1_surfaces() {
 }
 
 #[test]
+fn login_v2_json_contract_depth_matches_v1_json_contract_bit() {
+    let mut mismatches = Vec::new();
+    let login_surface_ids = [34, 35, 36, 37];
+
+    for surface in SURFACES_V2
+        .iter()
+        .filter(|surface| login_surface_ids.contains(&surface.id))
+    {
+        let v1_row = v1::SURFACES
+            .iter()
+            .find(|s| s.id == surface.id)
+            .expect("validated by `v2_ids_reference_real_v1_surfaces`");
+        let v2_has_json_contract = !matches!(surface.json_contract_depth, JsonContractDepth::None);
+        if v1_row.json_contract != v2_has_json_contract {
+            mismatches.push(format!(
+                "#{} {}: v1 json_contract={} but v2 json_contract_depth={:?}",
+                surface.id, v1_row.name, v1_row.json_contract, surface.json_contract_depth,
+            ));
+        }
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "v1/v2 login JSON contract coverage drifted:\n{}",
+        mismatches.join("\n"),
+    );
+}
+
+#[test]
 fn v2_failure_modes_have_no_overlap_between_tested_and_known() {
     // A failure mode should appear in `failure_modes_tested` XOR
     // `failure_modes_known`. The same string in both means "tested
