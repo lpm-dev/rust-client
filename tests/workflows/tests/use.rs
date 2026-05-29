@@ -1,10 +1,10 @@
 //! Workflow tests for `lpm use`.
 //!
-//! The local-only list/pin/remove paths are deterministic under an isolated
-//! HOME. `lpm use node@<v>` itself triggers a real download from nodejs.org
-//! and stays out of scope for the workflow tier.
+//! Local list/pin/remove paths are deterministic under an isolated HOME, and
+//! install-path coverage uses mocked runtime indexes/assets so the workflow tier
+//! never depends on live nodejs.org or GitHub traffic.
 //!
-//! `lpm_runtime::node::list_installed()` reads `<HOME>/.lpm/runtime/node/`,
+//! `lpm_runtime::node::list_installed()` reads `<HOME>/.lpm/runtimes/node/`,
 //! which is empty in a fresh isolated HOME.
 
 mod support;
@@ -13,8 +13,6 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use std::path::Path;
-use support::mock_registry::make_tarball;
 use support::{TempProject, lpm};
 use tar::Builder;
 use wiremock::matchers::{method, path};
@@ -114,36 +112,19 @@ fn managed_bun_dir(project: &TempProject, version: &str) -> std::path::PathBuf {
         .join(version)
 }
 
-fn current_node_dist_suffix() -> &'static str {
-    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        "darwin-arm64"
-    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        "darwin-x64"
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        "linux-x64"
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        "linux-arm64"
-    } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        "win-x64"
-    } else {
-        panic!("unsupported workflow-test node platform")
-    }
+fn current_node_dist_suffix() -> String {
+    lpm_runtime::platform::Platform::current()
+        .expect("resolve current node runtime platform")
+        .node_suffix()
 }
 
-fn current_bun_asset_name() -> &'static str {
-    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        "bun-darwin-aarch64.zip"
-    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
-        "bun-darwin-x64.zip"
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        "bun-linux-x64.zip"
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        "bun-linux-aarch64.zip"
-    } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        "bun-windows-x64.zip"
-    } else {
-        panic!("unsupported workflow-test bun platform")
-    }
+fn current_bun_asset_name() -> String {
+    format!(
+        "bun-{}.zip",
+        lpm_runtime::platform::Platform::current()
+            .expect("resolve current bun runtime platform")
+            .bun_suffix()
+    )
 }
 
 fn current_node_archive_name(version: &str) -> String {
@@ -178,10 +159,7 @@ fn make_node_runtime_archive(version: &str) -> Vec<u8> {
         writer
             .write_all(&node_contents)
             .expect("write node.exe in node zip");
-        writer
-            .finish()
-            .expect("finish node zip")
-            .into_inner()
+        writer.finish().expect("finish node zip").into_inner()
     } else {
         let encoder = GzEncoder::new(Vec::new(), Compression::default());
         let mut builder = Builder::new(encoder);
@@ -225,7 +203,7 @@ fn make_node_runtime_archive(version: &str) -> Vec<u8> {
 
 fn make_bun_runtime_zip() -> Vec<u8> {
     let asset_name = current_bun_asset_name();
-    let root_dir = asset_name.trim_end_matches(".zip");
+    let root_dir = asset_name.trim_end_matches(".zip").to_string();
     let binary_name = if cfg!(windows) { "bun.exe" } else { "bun" };
     let bun_contents = if cfg!(windows) {
         b"mock-bun.exe\n".to_vec()
@@ -613,9 +591,9 @@ async fn use_install_node_supported_specs_install_and_pin_from_mocked_dist() {
 
     Mock::given(method("GET"))
         .and(path(format!("/node-dist/v{version}/SHASUMS256.txt")))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            "{archive_sha}  {archive_name}\n"
-        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{archive_sha}  {archive_name}\n")),
+        )
         .mount(&server)
         .await;
 
@@ -703,9 +681,9 @@ async fn use_install_node_json_emits_installed_envelope_from_mocked_dist() {
         .await;
     Mock::given(method("GET"))
         .and(path(format!("/node-dist/v{version}/SHASUMS256.txt")))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            "{archive_sha}  {archive_name}\n"
-        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{archive_sha}  {archive_name}\n")),
+        )
         .mount(&server)
         .await;
 
@@ -735,10 +713,26 @@ async fn use_install_node_json_emits_installed_envelope_from_mocked_dist() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("--json use node@22.12.0 must emit JSON: {e}\n---\n{stdout}"));
-    assert_eq!(envelope["success"], serde_json::json!(true));
-    assert_eq!(envelope["pinned"]["node"], serde_json::json!("22.12.0"));
+    let envelopes: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("--json use node@22.12.0 must emit one JSON envelope per line: {e}\n---\n{stdout}")
+            })
+        })
+        .collect();
+    assert_eq!(
+        envelopes.len(),
+        2,
+        "install+pin path should emit two JSON envelopes"
+    );
+    assert_eq!(envelopes[0]["success"], serde_json::json!(true));
+    assert_eq!(envelopes[0]["status"], serde_json::json!("installed"));
+    assert_eq!(envelopes[0]["runtime"], serde_json::json!("node"));
+    assert_eq!(envelopes[0]["version"], serde_json::json!("22.12.0"));
+    assert_eq!(envelopes[1]["success"], serde_json::json!(true));
+    assert_eq!(envelopes[1]["pinned"]["node"], serde_json::json!("22.12.0"));
     assert!(managed_node_dir(&project, version).exists());
 }
 
@@ -1215,7 +1209,10 @@ async fn use_install_bun_from_cached_release_and_mocked_asset() {
         "lpm use bun@1.3.14 should pin the resolved Bun version, got:\n{stderr}"
     );
     assert!(managed_bun_dir(&project, version).exists());
-    assert_eq!(lpm_json_runtime(&project, "bun"), serde_json::json!(version));
+    assert_eq!(
+        lpm_json_runtime(&project, "bun"),
+        serde_json::json!(version)
+    );
 }
 
 #[test]

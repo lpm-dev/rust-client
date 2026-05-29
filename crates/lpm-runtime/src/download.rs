@@ -937,6 +937,7 @@ mod tests {
             version: "v22.5.0".into(),
             date: "2024-07-17".into(),
             lts: node::LtsField::Bool(false),
+            dist_base_url: None,
         };
 
         // Windows: must look for .zip in SHASUMS

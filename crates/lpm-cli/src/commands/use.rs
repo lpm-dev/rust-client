@@ -12,6 +12,12 @@ enum UseRequest {
     List(Option<String>),
 }
 
+#[derive(Debug, Clone)]
+struct InstalledRuntime {
+    runtime: RuntimeKind,
+    version: String,
+}
+
 pub async fn run_cli(
     args: &[String],
     list: bool,
@@ -22,8 +28,9 @@ pub async fn run_cli(
 ) -> Result<(), LpmError> {
     match parse_cli_request(args, list, pin, remove)? {
         UseRequest::InstallAndPin(spec) => {
-            run("install", Some(spec.as_str()), project_dir, json_output).await?;
-            run("pin", Some(spec.as_str()), project_dir, json_output).await
+            let installed = install_runtime(spec.as_str(), json_output).await?;
+            let exact_spec = format!("{}@{}", installed.runtime.as_str(), installed.version);
+            run("pin", Some(exact_spec.as_str()), project_dir, json_output).await
         }
         UseRequest::Pin(spec) => run("pin", Some(spec.as_str()), project_dir, json_output).await,
         UseRequest::Remove(spec) => {
@@ -118,85 +125,7 @@ pub async fn run(
             let spec = spec.ok_or_else(|| {
                 LpmError::Script("missing version spec. Usage: lpm use node@22".into())
             })?;
-
-            let (runtime, version_spec) = parse_runtime_spec(spec)?;
-            validate_runtime_spec(runtime, &version_spec)?;
-
-            let http_client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
-
-            let platform = lpm_runtime::platform::Platform::current()?;
-            use_ui::phase(&format!(
-                "resolving {}@{} for {}...",
-                runtime.as_str(),
-                version_spec,
-                platform
-            ));
-
-            let installed = match runtime {
-                RuntimeKind::Node => {
-                    let releases = lpm_runtime::node::fetch_index(&http_client).await?;
-                    let release = lpm_runtime::node::resolve_version(&releases, &version_spec)
-                        .ok_or_else(|| {
-                            LpmError::Script(format!(
-                                "no node.js release found matching '{version_spec}'"
-                            ))
-                        })?;
-                    let version = release.version_bare().to_string();
-
-                    if lpm_runtime::node::is_installed(&version) {
-                        print_already_installed(runtime, &version, json_output);
-                        return Ok(());
-                    }
-
-                    use_ui::phase(&format!(
-                        "downloading Node.js {}...",
-                        release.version.bold()
-                    ));
-                    lpm_runtime::download::install_node(&http_client, &release, &platform).await?
-                }
-                RuntimeKind::Bun => {
-                    let releases = lpm_runtime::bun::fetch_releases(&http_client).await?;
-                    let release = lpm_runtime::bun::resolve_version(&releases, &version_spec)?
-                        .ok_or_else(|| {
-                            LpmError::Script(format!(
-                                "no Bun release found matching '{version_spec}'"
-                            ))
-                        })?;
-                    let version = release.version_bare().to_string();
-
-                    if lpm_runtime::bun::is_installed(&version) {
-                        print_already_installed(runtime, &version, json_output);
-                        return Ok(());
-                    }
-
-                    let asset = release.asset_for_platform(&platform).ok_or_else(|| {
-                        LpmError::Script(format!(
-                            "no Bun asset found for platform {} in {}",
-                            platform, release.tag_name
-                        ))
-                    })?;
-                    use_ui::phase(&format!("downloading Bun {}...", release.tag_name.bold()));
-                    lpm_runtime::download::install_bun(&http_client, &release, &asset).await?
-                }
-            };
-
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"success": true, "status": "installed", "runtime": runtime.as_str(), "version": installed})
-                );
-            } else {
-                use_ui::done(&format!(
-                    "Installed {} {}",
-                    runtime.display_name(),
-                    installed.bold()
-                ));
-                let bin_dir = runtime_bin_dir(runtime, &installed)?;
-                use_ui::hint_line(&format!("installed at {}", bin_dir.display()));
-            }
+            let _ = install_runtime(spec, json_output).await?;
         }
 
         "remove" | "rm" | "uninstall" => {
@@ -353,6 +282,90 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRuntime, LpmError> {
+    let (runtime, version_spec) = parse_runtime_spec(spec)?;
+    validate_runtime_spec(runtime, &version_spec)?;
+
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
+
+    let platform = lpm_runtime::platform::Platform::current()?;
+    use_ui::phase(&format!(
+        "resolving {}@{} for {}...",
+        runtime.as_str(),
+        version_spec,
+        platform
+    ));
+
+    let installed = match runtime {
+        RuntimeKind::Node => {
+            let releases = lpm_runtime::node::fetch_index(&http_client).await?;
+            let release =
+                lpm_runtime::node::resolve_version(&releases, &version_spec).ok_or_else(|| {
+                    LpmError::Script(format!(
+                        "no node.js release found matching '{version_spec}'"
+                    ))
+                })?;
+            let version = release.version_bare().to_string();
+
+            if lpm_runtime::node::is_installed(&version) {
+                print_already_installed(runtime, &version, json_output);
+                return Ok(InstalledRuntime { runtime, version });
+            }
+
+            use_ui::phase(&format!(
+                "downloading Node.js {}...",
+                release.version.bold()
+            ));
+            lpm_runtime::download::install_node(&http_client, &release, &platform).await?
+        }
+        RuntimeKind::Bun => {
+            let releases = lpm_runtime::bun::fetch_releases(&http_client).await?;
+            let release =
+                lpm_runtime::bun::resolve_version(&releases, &version_spec)?.ok_or_else(|| {
+                    LpmError::Script(format!("no Bun release found matching '{version_spec}'"))
+                })?;
+            let version = release.version_bare().to_string();
+
+            if lpm_runtime::bun::is_installed(&version) {
+                print_already_installed(runtime, &version, json_output);
+                return Ok(InstalledRuntime { runtime, version });
+            }
+
+            let asset = release.asset_for_platform(&platform).ok_or_else(|| {
+                LpmError::Script(format!(
+                    "no Bun asset found for platform {} in {}",
+                    platform, release.tag_name
+                ))
+            })?;
+            use_ui::phase(&format!("downloading Bun {}...", release.tag_name.bold()));
+            lpm_runtime::download::install_bun(&http_client, &release, &asset).await?
+        }
+    };
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({"success": true, "status": "installed", "runtime": runtime.as_str(), "version": installed})
+        );
+    } else {
+        use_ui::done(&format!(
+            "Installed {} {}",
+            runtime.display_name(),
+            installed.bold()
+        ));
+        let bin_dir = runtime_bin_dir(runtime, &installed)?;
+        use_ui::hint_line(&format!("installed at {}", bin_dir.display()));
+    }
+
+    Ok(InstalledRuntime {
+        runtime,
+        version: installed,
+    })
 }
 
 fn parse_runtime_spec(spec: &str) -> Result<(RuntimeKind, String), LpmError> {
