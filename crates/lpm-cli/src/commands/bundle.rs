@@ -128,12 +128,15 @@ pub async fn dispatch(
     options: &BundleOptions,
     all: bool,
     filters: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     affected: bool,
     base_ref: &str,
     fail_if_no_match: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let workspace_mode = all || affected || !filters.is_empty();
+    let workspace_mode = all || affected || !filters.is_empty() || !filter_prod.is_empty();
 
     if workspace_mode && args_imply_watch(&options.args) {
         let workspace = lpm_workspace::discover_workspace(project_dir)
@@ -148,6 +151,9 @@ pub async fn dispatch(
             &ws_graph,
             &workspace.root,
             filters,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
             affected,
             base_ref,
         )?;
@@ -179,6 +185,9 @@ pub async fn dispatch(
             project_dir,
             options,
             filters,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
             if affected { Some(base_ref) } else { None },
             fail_if_no_match,
             json_output,
@@ -269,10 +278,14 @@ fn args_imply_watch(args: &[String]) -> bool {
         .any(|arg| arg == "--watch" || arg.starts_with("--watch=") || arg == "-w")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn bundle_workspace(
     project_dir: &Path,
     options: &BundleOptions,
     filters: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     affected_base: Option<&str>,
     fail_if_no_match: bool,
     json_output: bool,
@@ -293,12 +306,15 @@ async fn bundle_workspace(
         &ws_graph,
         &workspace.root,
         filters,
+        filter_prod,
+        changed_files_ignore_pattern,
+        test_pattern,
         affected_base.is_some(),
         affected_base.unwrap_or("main"),
     )?;
 
     if target_set.is_empty() {
-        let affected_only = filters.is_empty() && affected_base.is_some();
+        let affected_only = filters.is_empty() && filter_prod.is_empty() && affected_base.is_some();
         if fail_if_no_match {
             let msg = if affected_only {
                 format!(
@@ -306,7 +322,8 @@ async fn bundle_workspace(
                     affected_base.unwrap_or("main"),
                 )
             } else {
-                let hint = crate::commands::filter::format_no_match_hint(filters);
+                let hint =
+                    crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
                 let base = "no workspace packages matched the filter (--fail-if-no-match)";
                 match hint {
                     Some(h) => format!("{base}\n\n{h}"),
@@ -332,7 +349,7 @@ async fn bundle_workspace(
                 affected_base.unwrap_or("main"),
             ));
         } else {
-            let hint = crate::commands::filter::format_no_match_hint(filters);
+            let hint = crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
             output::warn("No packages matched");
             if let Some(h) = hint {
                 eprintln!();

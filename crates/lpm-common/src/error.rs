@@ -45,6 +45,17 @@ pub enum LpmError {
     #[diagnostic(code(lpm::registry))]
     Registry(String),
 
+    #[error("peer dependency check failed: {0}")]
+    #[diagnostic(
+        code(lpm::peer_dependency),
+        help(
+            "Fix the missing or incompatible peer dependencies, or pass \
+             --no-strict-peer-dependencies / set strict-peer-dependencies = false \
+             to return to warn-only mode."
+        )
+    )]
+    PeerDependency(String),
+
     #[error("network error: {0}")]
     #[diagnostic(
         code(lpm::network),
@@ -172,6 +183,19 @@ pub enum LpmError {
     )]
     Workspace(String),
 
+    #[error(
+        "invalid recursive catalog entry for dependency '{dependency}' in catalog '{catalog}': catalog entry value '{specifier}' cannot use the catalog protocol recursively"
+    )]
+    #[diagnostic(
+        code(lpm::catalog_entry_invalid_recursive_definition),
+        help("Replace the catalog entry with a concrete version range.")
+    )]
+    CatalogEntryInvalidRecursiveDefinition {
+        dependency: String,
+        catalog: String,
+        specifier: String,
+    },
+
     #[error("environment validation failed:\n{0}")]
     #[diagnostic(
         code(lpm::env_validation),
@@ -289,6 +313,7 @@ impl LpmError {
             LpmError::InvalidVersion(_) => "invalid_version",
             LpmError::InvalidVersionRange(_) => "invalid_version_range",
             LpmError::Registry(_) => "registry",
+            LpmError::PeerDependency(_) => "peer_dependency",
             LpmError::Network(_) => "network",
             LpmError::Http { .. } => "http",
             LpmError::AuthRequired => "auth_required",
@@ -308,6 +333,9 @@ impl LpmError {
             LpmError::Plugin(_) => "plugin",
             LpmError::Engine(_) => "engine",
             LpmError::Workspace(_) => "workspace",
+            LpmError::CatalogEntryInvalidRecursiveDefinition { .. } => {
+                "catalog_entry_invalid_recursive_definition"
+            }
             LpmError::EnvValidation(_) => "env_validation",
             LpmError::EngineMismatch { .. } => "engine_mismatch",
             LpmError::SelfUpdatePaused(_) => "self_update_paused",
@@ -427,6 +455,7 @@ mod tests {
             LpmError::InvalidVersion("x".into()),
             LpmError::InvalidVersionRange("x".into()),
             LpmError::Registry("x".into()),
+            LpmError::PeerDependency("x".into()),
             LpmError::Network("x".into()),
             LpmError::Http {
                 status: 500,
@@ -455,6 +484,11 @@ mod tests {
             LpmError::Plugin("x".into()),
             LpmError::Engine("x".into()),
             LpmError::Workspace("x".into()),
+            LpmError::CatalogEntryInvalidRecursiveDefinition {
+                dependency: "react".into(),
+                catalog: "default".into(),
+                specifier: "catalog:shared".into(),
+            },
             LpmError::EnvValidation("x".into()),
             LpmError::EngineMismatch {
                 engine: "lpm".into(),
@@ -551,10 +585,23 @@ mod tests {
             "invalid_package_name"
         );
         assert_eq!(LpmError::Store("x".into()).error_code(), "store");
+        assert_eq!(
+            LpmError::PeerDependency("x".into()).error_code(),
+            "peer_dependency"
+        );
         assert_eq!(LpmError::Task("x".into()).error_code(), "task");
         assert_eq!(LpmError::Plugin("x".into()).error_code(), "plugin");
         assert_eq!(LpmError::Engine("x".into()).error_code(), "engine");
         assert_eq!(LpmError::Workspace("x".into()).error_code(), "workspace");
+        assert_eq!(
+            LpmError::CatalogEntryInvalidRecursiveDefinition {
+                dependency: "react".into(),
+                catalog: "default".into(),
+                specifier: "catalog:shared".into(),
+            }
+            .error_code(),
+            "catalog_entry_invalid_recursive_definition"
+        );
         assert_eq!(
             LpmError::EnvValidation("x".into()).error_code(),
             "env_validation"

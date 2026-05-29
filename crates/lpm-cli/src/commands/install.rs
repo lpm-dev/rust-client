@@ -9,11 +9,13 @@ use lpm_common::color::Painted;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::{GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url};
 use lpm_resolver::{
-    CompiledPeerRules, OverrideHit, OverrideSet, ResolvedPackage, check_unmet_peers,
+    CompiledPeerRules, OverrideHit, OverrideSet, PeerConflictReport, PeerWarning, ResolvedPackage,
+    check_unmet_peers,
 };
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -153,6 +155,285 @@ fn install_pkg_key(p: &InstallPackage) -> String {
     k.push('\x00');
     k.push_str(&p.source);
     k
+}
+
+fn resolve_strict_peer_dependencies(
+    cli_override: Option<bool>,
+    pkg: &lpm_workspace::PackageJson,
+    global_config: &crate::commands::config::GlobalConfig,
+) -> bool {
+    cli_override
+        .or_else(|| {
+            pkg.lpm
+                .as_ref()
+                .and_then(|lpm| lpm.strict_peer_dependencies)
+        })
+        .or_else(|| global_config.get_bool("strict-peer-dependencies"))
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone)]
+struct CatalogSavePolicy {
+    mode: lpm_workspace::CatalogMode,
+    catalogs: HashMap<String, HashMap<String, String>>,
+    forced_catalog: Option<String>,
+}
+
+impl CatalogSavePolicy {
+    #[cfg(test)]
+    fn manual() -> Self {
+        Self {
+            mode: lpm_workspace::CatalogMode::Manual,
+            catalogs: HashMap::new(),
+            forced_catalog: None,
+        }
+    }
+
+    fn from_package(pkg: &lpm_workspace::PackageJson, forced_catalog: Option<&str>) -> Self {
+        let mode = pkg
+            .lpm
+            .as_ref()
+            .and_then(|lpm| lpm.catalog_mode)
+            .unwrap_or(lpm_workspace::CatalogMode::Manual);
+        let forced_catalog = forced_catalog.map(normalize_catalog_name);
+        Self {
+            mode,
+            catalogs: pkg.catalogs.clone(),
+            forced_catalog,
+        }
+    }
+
+    fn can_rewrite_manifest(&self) -> bool {
+        self.forced_catalog.is_some() || !matches!(self.mode, lpm_workspace::CatalogMode::Manual)
+    }
+
+    fn optional_catalog_entry(&self, catalog_name: &str, package: &str) -> Option<&String> {
+        let catalog = self.catalogs.get(catalog_name)?;
+        catalog.get(package)
+    }
+
+    fn catalog_entry(&self, catalog_name: &str, package: &str) -> Result<&String, LpmError> {
+        let catalog = self.catalogs.get(catalog_name).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{} rejected {package}: catalog `{catalog_name}` does not exist",
+                forced_catalog_flag(catalog_name)
+            ))
+        })?;
+        catalog.get(package).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{} rejected {package}: no catalog entry exists in catalog `{catalog_name}` for this package",
+                forced_catalog_flag(catalog_name)
+            ))
+        })
+    }
+}
+
+fn normalize_catalog_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == "default" {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn catalog_save_policy_for_project(
+    project_dir: &Path,
+    forced_catalog: Option<&str>,
+) -> Result<CatalogSavePolicy, LpmError> {
+    if let Some(workspace) = lpm_workspace::discover_workspace(project_dir)
+        .map_err(|e| LpmError::Registry(format!("failed to discover workspace catalogs: {e}")))?
+    {
+        return Ok(CatalogSavePolicy::from_package(
+            &workspace.root_package,
+            forced_catalog,
+        ));
+    }
+
+    let pkg_json_path = project_dir.join("package.json");
+    let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+        .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
+    Ok(CatalogSavePolicy::from_package(&pkg, forced_catalog))
+}
+
+fn cleanup_unused_catalogs_after_install(project_dir: &Path) -> Result<bool, LpmError> {
+    let workspace = lpm_workspace::discover_workspace(project_dir)
+        .map_err(|e| LpmError::Registry(format!("failed to discover workspace catalogs: {e}")))?;
+
+    let (root_dir, cleanup_enabled, member_dirs) = if let Some(workspace) = workspace {
+        let cleanup_enabled = cleanup_unused_catalogs_enabled(&workspace.root_package);
+        let member_dirs = workspace
+            .members
+            .into_iter()
+            .map(|member| member.path)
+            .collect();
+        (workspace.root, cleanup_enabled, member_dirs)
+    } else {
+        let pkg_json_path = project_dir.join("package.json");
+        let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+            .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
+        (
+            project_dir.to_path_buf(),
+            cleanup_unused_catalogs_enabled(&pkg),
+            Vec::new(),
+        )
+    };
+
+    if !cleanup_enabled {
+        return Ok(false);
+    }
+
+    let mut references = lpm_workspace::CatalogReferences::new();
+    let root_pkg_path = root_dir.join("package.json");
+    let root_pkg = lpm_workspace::read_package_json(&root_pkg_path)
+        .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
+    lpm_workspace::collect_catalog_references(&root_pkg, &mut references);
+
+    for member_dir in member_dirs {
+        let member_pkg_path = member_dir.join("package.json");
+        let member_pkg = lpm_workspace::read_package_json(&member_pkg_path).map_err(|e| {
+            LpmError::Registry(format!(
+                "failed to read workspace member package.json {}: {e}",
+                member_pkg_path.display()
+            ))
+        })?;
+        lpm_workspace::collect_catalog_references(&member_pkg, &mut references);
+    }
+
+    let package_json_changed =
+        lpm_workspace::prune_unused_package_json_catalogs(&root_pkg_path, &references).map_err(
+            |e| {
+                LpmError::Registry(format!(
+                    "failed to cleanup unused package.json catalog entries: {e}"
+                ))
+            },
+        )?;
+    let pnpm_workspace_changed = lpm_workspace::prune_unused_pnpm_workspace_catalogs(
+        &root_dir.join("pnpm-workspace.yaml"),
+        &references,
+    )
+    .map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to cleanup unused pnpm-workspace.yaml catalog entries: {e}"
+        ))
+    })?;
+
+    Ok(package_json_changed || pnpm_workspace_changed)
+}
+
+fn cleanup_unused_catalogs_enabled(pkg: &lpm_workspace::PackageJson) -> bool {
+    pkg.lpm
+        .as_ref()
+        .and_then(|lpm| lpm.cleanup_unused_catalogs)
+        .unwrap_or(false)
+}
+
+fn strict_peer_dependency_error(
+    peer_warnings: &[PeerWarning],
+    peer_conflicts: &[PeerConflictReport],
+) -> Option<LpmError> {
+    if peer_warnings.is_empty() && peer_conflicts.is_empty() {
+        return None;
+    }
+
+    let issue_count = peer_warnings.len() + peer_conflicts.len();
+    let mut details = Vec::with_capacity(issue_count + 1);
+    details.push(format!(
+        "strict-peer-dependencies failed with {issue_count} issue(s)"
+    ));
+    details.extend(peer_warnings.iter().map(|warning| format!("- {warning}")));
+    details.extend(peer_conflicts.iter().map(|conflict| {
+        let unsatisfied = conflict
+            .unsatisfied_consumers
+            .iter()
+            .map(|(consumer, range)| format!("{consumer} wants {range}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "- peer conflict: {} pinned to {} but {} unsatisfied consumer(s): {}",
+            conflict.canonical,
+            conflict.chosen_version,
+            conflict.unsatisfied_consumers.len(),
+            unsatisfied
+        )
+    }));
+
+    Some(LpmError::PeerDependency(details.join("\n")))
+}
+
+fn peer_warning_json_value(warning: &PeerWarning) -> serde_json::Value {
+    let issue_type = if warning.resolved_version.is_some() {
+        "bad"
+    } else {
+        "missing"
+    };
+    serde_json::json!({
+        "type": issue_type,
+        "package": warning.package.as_str(),
+        "version": warning.version.as_str(),
+        "peer": warning.peer.as_str(),
+        "required_range": warning.required_range.as_str(),
+        "resolved_version": warning.resolved_version.as_deref(),
+    })
+}
+
+fn peer_conflict_json_value(report: &PeerConflictReport) -> serde_json::Value {
+    serde_json::json!({
+        "canonical": report.canonical.as_str(),
+        "chosen_version": report.chosen_version.as_str(),
+        "unsatisfied_consumers": report
+            .unsatisfied_consumers
+            .iter()
+            .map(|(consumer, range)| serde_json::json!({
+                "consumer": consumer.as_str(),
+                "range": range.as_str(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn peer_issues_json_value(
+    peer_warnings: &[PeerWarning],
+    peer_conflicts: &[PeerConflictReport],
+) -> serde_json::Value {
+    let mut missing = Vec::new();
+    let mut bad = Vec::new();
+    for warning in peer_warnings {
+        let entry = peer_warning_json_value(warning);
+        if warning.resolved_version.is_some() {
+            bad.push(entry);
+        } else {
+            missing.push(entry);
+        }
+    }
+    let conflicts: Vec<serde_json::Value> = peer_conflicts
+        .iter()
+        .map(peer_conflict_json_value)
+        .collect();
+    let missing_count = missing.len();
+    let bad_count = bad.len();
+    let conflicts_count = conflicts.len();
+    let total_count = missing_count + bad_count + conflicts_count;
+
+    serde_json::json!({
+        "missing": missing,
+        "bad": bad,
+        "conflicts": conflicts,
+        "intersections": [],
+        "missing_count": missing_count,
+        "bad_count": bad_count,
+        "conflicts_count": conflicts_count,
+        "intersections_count": 0,
+        "total_count": total_count,
+    })
+}
+
+fn lockfile_has_auto_isolated_peer_conflicts(lockfile_path: &Path) -> bool {
+    const NEEDLE: &[u8] = b"auto-isolated-peer-conflicts = true";
+    let Ok(content) = std::fs::read(lockfile_path) else {
+        return false;
+    };
+    content.windows(NEEDLE.len()).any(|window| window == NEEDLE)
 }
 
 /// Default concurrent-tarball-download pool size. Overridable per-invocation
@@ -3372,6 +3653,9 @@ pub async fn run_with_options(
     // trusted; only the manifest-boundary trust-on-first-use is
     // disabled.
     strict_integrity: bool,
+    // CLI-level override for strict peer-dependency handling. `None`
+    // falls through to package.json / global config / default.
+    strict_peer_dependencies_override: Option<bool>,
     // Already-resolved linker override from CLI / `~/.lpm/config.toml` / env.
     // `None` means fall through to `package.json > lpm > linker` (which is
     // validated against `lpm_linker::LinkerMode::parse_str` inside the
@@ -3496,6 +3780,7 @@ pub async fn run_with_options(
             force,
             allow_new,
             strict_integrity,
+            strict_peer_dependencies_override,
             linker_override,
             no_skills,
             no_editor_setup,
@@ -3530,6 +3815,7 @@ async fn run_with_options_under_store_lock(
     force: bool,
     allow_new: bool,
     strict_integrity: bool,
+    strict_peer_dependencies_override: Option<bool>,
     linker_override: Option<lpm_linker::LinkerMode>,
     no_skills: bool,
     no_editor_setup: bool,
@@ -3568,6 +3854,7 @@ async fn run_with_options_under_store_lock(
 
     // Step 1: Read package.json
     let pkg_json_path = project_dir.join("package.json");
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     if !pkg_json_path.exists() {
         return Err(LpmError::NotFound(
             "no package.json found in current directory or any parent. \
@@ -3600,6 +3887,8 @@ async fn run_with_options_under_store_lock(
         .and_then(|l| l.auto_install_peers)
         .or_else(|| global_config.get_bool("auto-install-peers"))
         .unwrap_or(true);
+    let strict_peer_dependencies =
+        resolve_strict_peer_dependencies(strict_peer_dependencies_override, &pkg, &global_config);
     let pubgrub_opt_out = std::env::var("LPM_RESOLVER").as_deref() == Ok("pubgrub");
 
     // pubgrub-mismatch warning.
@@ -3643,24 +3932,36 @@ async fn run_with_options_under_store_lock(
     //      `LPM_LINKER` or `~/.lpm/config.toml > linker` invalidates the
     //      "up to date" cache and triggers a re-link.
     // Precedence: caller-supplied CLI override > config.toml > env >
-    // `package.json > lpm > linker` > default isolated. Lives in the
-    // shared `linker_config::resolve_effective_linker` so every install
-    // entry point (top-level + the 9 internal callers) honors the same
-    // chain.
+    // `package.json > lpm > linker` > workspace auto-detection > default
+    // hoisted. A persisted peer-conflict auto-isolation flag can override
+    // that final default on warm installs without taking over explicit
+    // linker choices.
     let global_cfg = crate::commands::config::GlobalConfig::load();
-    let linker_mode = crate::linker_config::resolve_effective_linker(
-        linker_override,
-        &pkg,
-        &global_cfg,
-        project_dir,
-    )
-    .map_err(|e| {
-        LpmError::Script(format!(
-            "{e} \
+    let (configured_linker_mode, linker_source) =
+        crate::linker_config::resolve_effective_linker_with_source(
+            linker_override,
+            &pkg,
+            &global_cfg,
+            project_dir,
+        )
+        .map_err(|e| {
+            LpmError::Script(format!(
+                "{e} \
              Update the offending surface or override with \
              `--linker=<isolated|hoisted>`."
-        ))
-    })?;
+            ))
+        })?;
+    let peer_conflict_auto_isolation_allowed = matches!(
+        linker_source,
+        crate::linker_config::LinkerModeSource::Default
+    );
+    let mut auto_isolated_peer_conflicts = peer_conflict_auto_isolation_allowed
+        && lockfile_has_auto_isolated_peer_conflicts(&lockfile_path);
+    let mut linker_mode = if auto_isolated_peer_conflicts {
+        lpm_linker::LinkerMode::Isolated
+    } else {
+        configured_linker_mode
+    };
 
     // Fast-exit: if package.json + lockfile haven't changed AND the
     // resolved linker matches the one used for the prior install, skip
@@ -3673,13 +3974,24 @@ async fn run_with_options_under_store_lock(
     // `~/.lpm/config.toml > linker` invalidates the cache. The mtime
     // fast path also reads the `l:<mode>` line written by
     // `write_install_hash` to detect the same flip without re-hashing.
+    // Strict peer mode runs a fresh peer check because the fast path
+    // does not have the resolver metadata needed to prove the tree is clean.
     let pkg_content_for_state = std::fs::read_to_string(&pkg_json_path).unwrap_or_default();
     let install_state = crate::install_state::check_install_state_with_linker(
         project_dir,
         &pkg_content_for_state,
         linker_mode,
     );
-    if !force && !offline && install_state.up_to_date {
+    let cleanup_catalogs_in_pipeline = requested_add_count.is_none();
+    if !force && !offline && !strict_peer_dependencies && install_state.up_to_date {
+        let catalogs_cleaned = if cleanup_catalogs_in_pipeline {
+            cleanup_unused_catalogs_after_install(project_dir)?
+        } else {
+            false
+        };
+        if catalogs_cleaned {
+            write_post_install_v6_hash(project_dir, linker_mode);
+        }
         let elapsed = start.elapsed();
         let total_ms = elapsed.as_millis();
         if json_output {
@@ -3700,6 +4012,7 @@ async fn run_with_options_under_store_lock(
                 //always-present empty array: up-to-date fast
                 // path runs no resolve, so no fresh conflict trace.
                 "peer_conflicts": [],
+                "peer_issues": peer_issues_json_value(&[], &[]),
             });
             // surface workspace target set for agents.
             if let Some(targets) = target_set {
@@ -3815,7 +4128,10 @@ async fn run_with_options_under_store_lock(
         .ok()
         .flatten();
 
-    let mut workspace_member_deps: Vec<WorkspaceMemberLink> = if let Some(ref ws) = workspace {
+    let (mut workspace_member_deps, mut catalog_resolutions): (
+        Vec<WorkspaceMemberLink>,
+        Vec<lpm_workspace::CatalogProtocolResolution>,
+    ) = if let Some(ref ws) = workspace {
         // workspace:* extraction (NEW: replaces resolve_workspace_protocol)
         let extracted = extract_workspace_protocol_deps(&mut deps, ws)?;
         if !extracted.is_empty() && !json_output {
@@ -3830,43 +4146,52 @@ async fn run_with_options_under_store_lock(
         }
 
         // catalog: protocol — resolve from workspace root catalogs
+        let mut catalog_resolutions: Vec<lpm_workspace::CatalogProtocolResolution> = Vec::new();
+
         if !ws.root_package.catalogs.is_empty() {
             match lpm_workspace::resolve_catalog_protocol(&mut deps, &ws.root_package.catalogs) {
                 Ok(resolved) => {
                     if !resolved.is_empty() && !json_output {
-                        for (name, _orig, ver) in &resolved {
-                            tracing::debug!("catalog: {name} → {ver}");
+                        for entry in &resolved {
+                            tracing::debug!(
+                                "catalog: {} → {}",
+                                entry.package_name,
+                                entry.specifier
+                            );
                         }
                     }
+                    catalog_resolutions = resolved;
                 }
                 Err(e) => {
-                    return Err(LpmError::Registry(format!(
-                        "catalog resolution failed: {e}"
-                    )));
+                    return Err(catalog_protocol_error_to_lpm(e));
                 }
             }
         }
-        extracted
+        (extracted, catalog_resolutions)
     } else {
         // Standalone project (no workspace): no workspace member deps possible.
         // Local catalogs are still resolved if present.
+        let mut catalog_resolutions = Vec::new();
         if !pkg.catalogs.is_empty() {
             match lpm_workspace::resolve_catalog_protocol(&mut deps, &pkg.catalogs) {
                 Ok(resolved) => {
                     if !resolved.is_empty() && !json_output {
-                        for (name, _orig, ver) in &resolved {
-                            tracing::debug!("catalog: {name} → {ver}");
+                        for entry in &resolved {
+                            tracing::debug!(
+                                "catalog: {} → {}",
+                                entry.package_name,
+                                entry.specifier
+                            );
                         }
                     }
+                    catalog_resolutions = resolved;
                 }
                 Err(e) => {
-                    return Err(LpmError::Registry(format!(
-                        "catalog resolution failed: {e}"
-                    )));
+                    return Err(catalog_protocol_error_to_lpm(e));
                 }
             }
         }
-        Vec::new()
+        (Vec::new(), catalog_resolutions)
     };
 
     //
@@ -3949,8 +4274,40 @@ async fn run_with_options_under_store_lock(
         .as_ref()
         .map(|l| l.overrides.clone())
         .unwrap_or_default();
-    let override_set = OverrideSet::parse(&lpm_overrides_map, &pkg.overrides, &pkg.resolutions)
-        .map_err(|e| LpmError::Script(format!("invalid override in package.json: {e}")))?;
+    let dependency_catalog_resolution_count = catalog_resolutions.len();
+    let override_catalogs = workspace
+        .as_ref()
+        .map_or(&pkg.catalogs, |ws| &ws.root_package.catalogs);
+    let (lpm_overrides_map, lpm_override_catalog_resolutions) =
+        resolve_catalog_protocol_in_override_map(&lpm_overrides_map, override_catalogs)?;
+    let (overrides_map, npm_override_catalog_resolutions) =
+        resolve_catalog_protocol_in_override_map(&pkg.overrides, override_catalogs)?;
+    let (resolutions_map, resolution_catalog_resolutions) =
+        resolve_catalog_protocol_in_override_map(&pkg.resolutions, override_catalogs)?;
+    let mut override_catalog_resolutions = Vec::new();
+    extend_catalog_resolutions(
+        &mut override_catalog_resolutions,
+        lpm_override_catalog_resolutions,
+    );
+    extend_catalog_resolutions(
+        &mut override_catalog_resolutions,
+        npm_override_catalog_resolutions,
+    );
+    extend_catalog_resolutions(
+        &mut override_catalog_resolutions,
+        resolution_catalog_resolutions,
+    );
+    extend_catalog_resolutions(
+        &mut catalog_resolutions,
+        override_catalog_resolutions.clone(),
+    );
+
+    let override_set = OverrideSet::parse(
+        lpm_overrides_map.as_ref(),
+        overrides_map.as_ref(),
+        resolutions_map.as_ref(),
+    )
+    .map_err(|e| LpmError::Script(format!("invalid override in package.json: {e}")))?;
 
     // Manifest-side compatibility warnings (pnpm overrides / patches
     // / peer rules drift, ignored other-PM `engines.*` keys) fire from
@@ -4082,6 +4439,9 @@ async fn run_with_options_under_store_lock(
     // No re-resolution here.
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
+        if cleanup_catalogs_in_pipeline {
+            cleanup_unused_catalogs_after_install(project_dir)?;
+        }
         // audit fix: emit a proper JSON object even on the
         // empty-deps short-circuit so agents driving install always get a
         // parseable result. Pre-fix this branch returned silently in JSON
@@ -4103,6 +4463,7 @@ async fn run_with_options_under_store_lock(
                 //always-present empty array: zero deps means
                 // zero peer requirements means zero conflicts.
                 "peer_conflicts": [],
+                "peer_issues": peer_issues_json_value(&[], &[]),
             });
             if let Some(targets) = target_set {
                 json["target_set"] = serde_json::Value::Array(
@@ -4199,8 +4560,6 @@ async fn run_with_options_under_store_lock(
     }
 
     // Step 2: Try lockfile fast path, else resolve
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-
     // Capture pre-install direct-dep versions BEFORE the resolver writes
     // a fresh lockfile. The Done block compares against this snapshot to
     // print the `+ pkg@version` diff list — only direct deps that
@@ -4304,17 +4663,24 @@ async fn run_with_options_under_store_lock(
         // strict (`false`) — they have the fresh-resolve fallback for
         // any non-admissible lockfile shape, and skipping the fresh-
         // resolve re-checks would be a real correctness regression.
-        let fast = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, true)
-            .ok_or_else(|| {
-                LpmError::Registry(
-                    "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
+        let fast = try_lockfile_fast_path(
+            &lockfile_path,
+            &deps,
+            &catalog_resolutions,
+            client,
+            &gate_stats,
+            true,
+        )
+        .ok_or_else(|| {
+            LpmError::Registry(
+                "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
                          missing — run `lpm install` online first; (2) lpm.lock is corrupted — \
                          delete it and re-run online; (3) a root dependency in package.json is \
                          absent from the lockfile (e.g., declared but never installed online). \
                          Run `lpm install` online to reconcile."
-                        .into(),
-                )
-            })?;
+                    .into(),
+            )
+        })?;
         //  Same repair-gate semantic as
         // the online path, but `--offline` can't re-resolve to
         // re-derive the missing. The choice is between
@@ -4419,6 +4785,7 @@ async fn run_with_options_under_store_lock(
             &mut workspace_member_deps,
             &all_workspace_members,
         )?;
+        enforce_registry_integrity_policy(&locked, strict_integrity, json_output)?;
 
         // Go directly to link step (skip resolution and download).
         // forward the already-resolved
@@ -4469,7 +4836,14 @@ async fn run_with_options_under_store_lock(
         // fresh resolve. The offline arm at line 3395 passes `true`
         // and trusts the lockfile because fresh-resolve isn't
         // available offline.
-        let candidate = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, false);
+        let candidate = try_lockfile_fast_path(
+            &lockfile_path,
+            &deps,
+            &catalog_resolutions,
+            client,
+            &gate_stats,
+            false,
+        );
         match candidate {
             Some(fast) if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) => {
                 if !json_output {
@@ -4503,6 +4877,7 @@ async fn run_with_options_under_store_lock(
     // empty — to match the `applied_patches` shape contract that
     // tooling already depends on.
     let mut peer_conflicts: Vec<lpm_resolver::PeerConflictReport> = Vec::new();
+    let mut peer_warnings: Vec<PeerWarning> = Vec::new();
 
     // ambient peer installs synthesized by the resolver,
     // captured here so the cold-resolve lockfile-write site below
@@ -5055,7 +5430,7 @@ async fn run_with_options_under_store_lock(
                     })?,
                     None => CompiledPeerRules::default(),
                 };
-                let peer_warnings = check_unmet_peers(
+                peer_warnings = check_unmet_peers(
                     &resolve_result.packages,
                     &resolve_result.cache,
                     &compiled_peer_rules,
@@ -5078,6 +5453,28 @@ async fn run_with_options_under_store_lock(
                 // `resolve_result` is consumed by `resolved_to_install_packages`
                 // a few lines down.
                 peer_conflicts = resolve_result.peer_conflicts.clone();
+
+                if strict_peer_dependencies
+                    && let Some(err) = strict_peer_dependency_error(&peer_warnings, &peer_conflicts)
+                {
+                    return Err(err);
+                }
+
+                if peer_conflict_auto_isolation_allowed {
+                    auto_isolated_peer_conflicts = !peer_conflicts.is_empty();
+                    linker_mode = if auto_isolated_peer_conflicts {
+                        if matches!(configured_linker_mode, lpm_linker::LinkerMode::Hoisted)
+                            && !json_output
+                        {
+                            output::info(
+                                "Peer conflicts detected; using isolated linker for this install.",
+                            );
+                        }
+                        lpm_linker::LinkerMode::Isolated
+                    } else {
+                        configured_linker_mode
+                    };
+                }
 
                 // — capture the platform-filtered optional
                 // skip count. Surfaced as `timing.resolve.platform_skipped`
@@ -5129,6 +5526,7 @@ async fn run_with_options_under_store_lock(
                 // plan — runs once after the merge regardless of
                 // PubGrub vs fusion.
                 apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps);
+                enforce_registry_integrity_policy(&packages, strict_integrity, json_output)?;
 
                 if !json_output {
                     // Persistent second phase line. Sub-second resolves don't
@@ -7401,6 +7799,7 @@ async fn run_with_options_under_store_lock(
     // Step 9: Write lockfile (only if we resolved fresh)
     if !used_lockfile {
         let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver(resolved_with);
+        lockfile.metadata.auto_isolated_peer_conflicts = auto_isolated_peer_conflicts;
         for p in &packages {
             let dep_strings: Vec<String> = p
                 .dependencies
@@ -7468,6 +7867,13 @@ async fn run_with_options_under_store_lock(
         // would skip the auto-installed peer (it isn't in
         // `pkg.dependencies`) and produce a broken tree.
         lockfile.ambient_peer_installs = ambient_peer_installs_for_lockfile.clone();
+        let lockfile_catalog_resolutions = catalog_resolutions_for_lockfile(
+            &catalog_resolutions[..dependency_catalog_resolution_count],
+            &override_catalog_resolutions,
+            &applied_overrides,
+        );
+        lockfile.catalogs =
+            catalog_snapshot_from_install_packages(&lockfile_catalog_resolutions, &packages)?;
 
         lockfile
             .write_all(&lockfile_path)
@@ -7701,6 +8107,10 @@ async fn run_with_options_under_store_lock(
         &prior_patch_state,
         &applied_patches,
     );
+
+    if cleanup_catalogs_in_pipeline {
+        cleanup_unused_catalogs_after_install(project_dir)?;
+    }
 
     // Audit-after-install: run a silent audit pass and stash the
     // resulting counts. Both the JSON envelope and the human Done
@@ -7973,6 +8383,8 @@ async fn run_with_options_under_store_lock(
             },
             "warnings": [],
             "errors": [],
+            "peer_conflicts": [],
+            "peer_issues": peer_issues_json_value(&[], &[]),
         });
         // surface workspace target set for agents.
         // None for legacy/standalone callers; Some(...) for the filtered path.
@@ -8030,22 +8442,10 @@ async fn run_with_options_under_store_lock(
         json["peer_conflicts"] = serde_json::Value::Array(
             peer_conflicts
                 .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "canonical": r.canonical,
-                        "chosen_version": r.chosen_version,
-                        "unsatisfied_consumers": r
-                            .unsatisfied_consumers
-                            .iter()
-                            .map(|(consumer, range)| serde_json::json!({
-                                "consumer": consumer,
-                                "range": range,
-                            }))
-                            .collect::<Vec<_>>(),
-                    })
-                })
+                .map(peer_conflict_json_value)
                 .collect(),
         );
+        json["peer_issues"] = peer_issues_json_value(&peer_warnings, &peer_conflicts);
 
         // surface the patch apply trace + counts.
         // Audit fix : filter to entries that ACTUALLY did
@@ -9077,6 +9477,240 @@ fn lockfile_needs_r25_repair(lockfile: &lpm_lockfile::Lockfile, auto_install_pee
     auto_install_peers && lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION
 }
 
+fn catalog_protocol_error_to_lpm(error: lpm_workspace::CatalogProtocolError) -> LpmError {
+    match error {
+        lpm_workspace::CatalogProtocolError::RecursiveDefinition {
+            dependency,
+            catalog,
+            specifier,
+        } => LpmError::CatalogEntryInvalidRecursiveDefinition {
+            dependency,
+            catalog,
+            specifier,
+        },
+        other => LpmError::Registry(format!("catalog resolution failed: {other}")),
+    }
+}
+
+type OverrideCatalogResolution<'a> = (
+    Cow<'a, HashMap<String, String>>,
+    Vec<lpm_workspace::CatalogProtocolResolution>,
+);
+
+fn resolve_catalog_protocol_in_override_map<'a>(
+    overrides: &'a HashMap<String, String>,
+    catalogs: &HashMap<String, HashMap<String, String>>,
+) -> Result<OverrideCatalogResolution<'a>, LpmError> {
+    if !overrides
+        .values()
+        .any(|target| target.starts_with("catalog:"))
+    {
+        return Ok((Cow::Borrowed(overrides), Vec::new()));
+    }
+
+    let mut resolved_overrides = HashMap::with_capacity(overrides.len());
+    let mut catalog_resolutions = Vec::new();
+
+    for (raw_key, raw_target) in overrides {
+        if !raw_target.starts_with("catalog:") {
+            resolved_overrides.insert(raw_key.clone(), raw_target.clone());
+            continue;
+        }
+
+        let target_name =
+            lpm_resolver::override_selector_target_name(raw_key).map_err(|error| {
+                LpmError::Script(format!("invalid override in package.json: {error}"))
+            })?;
+        let mut catalog_dep = HashMap::with_capacity(1);
+        catalog_dep.insert(target_name.clone(), raw_target.clone());
+        let resolved = lpm_workspace::resolve_catalog_protocol(&mut catalog_dep, catalogs)
+            .map_err(catalog_protocol_error_to_lpm)?;
+        let resolved_target = catalog_dep.remove(&target_name).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "catalog resolution failed: override target `{target_name}` was not resolved"
+            ))
+        })?;
+        resolved_overrides.insert(raw_key.clone(), resolved_target);
+        catalog_resolutions.extend(resolved);
+    }
+
+    Ok((Cow::Owned(resolved_overrides), catalog_resolutions))
+}
+
+fn extend_catalog_resolutions(
+    catalog_resolutions: &mut Vec<lpm_workspace::CatalogProtocolResolution>,
+    incoming: Vec<lpm_workspace::CatalogProtocolResolution>,
+) {
+    for resolution in incoming {
+        push_catalog_resolution(catalog_resolutions, resolution);
+    }
+}
+
+fn push_catalog_resolution(
+    catalog_resolutions: &mut Vec<lpm_workspace::CatalogProtocolResolution>,
+    resolution: lpm_workspace::CatalogProtocolResolution,
+) {
+    if catalog_resolutions.iter().any(|existing| {
+        existing.catalog_name == resolution.catalog_name
+            && existing.package_name == resolution.package_name
+    }) {
+        return;
+    }
+    catalog_resolutions.push(resolution);
+}
+
+fn catalog_resolutions_for_lockfile(
+    dependency_catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    override_catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    applied_overrides: &[OverrideHit],
+) -> Vec<lpm_workspace::CatalogProtocolResolution> {
+    let mut catalog_resolutions = Vec::with_capacity(
+        dependency_catalog_resolutions.len() + override_catalog_resolutions.len(),
+    );
+    catalog_resolutions.extend_from_slice(dependency_catalog_resolutions);
+
+    for resolution in override_catalog_resolutions {
+        if applied_overrides
+            .iter()
+            .any(|hit| hit.package == resolution.package_name)
+        {
+            push_catalog_resolution(&mut catalog_resolutions, resolution.clone());
+        }
+    }
+
+    catalog_resolutions
+}
+
+fn catalog_snapshot_from_install_packages(
+    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    packages: &[InstallPackage],
+) -> Result<lpm_lockfile::CatalogSnapshots, LpmError> {
+    if catalog_resolutions.is_empty() {
+        return Ok(lpm_lockfile::CatalogSnapshots::new());
+    }
+
+    let mut snapshots = lpm_lockfile::CatalogSnapshots::new();
+    for resolution in catalog_resolutions {
+        let resolved_version = resolved_catalog_version_from_install_packages(resolution, packages)
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "catalog snapshot: resolver did not report a concrete version for `{}`",
+                    resolution.package_name
+                ))
+            })?;
+        snapshots
+            .entry(resolution.catalog_name.clone())
+            .or_default()
+            .insert(
+                resolution.package_name.clone(),
+                lpm_lockfile::CatalogSnapshotEntry {
+                    specifier: resolution.specifier.clone(),
+                    version: resolved_version,
+                    reference: resolution.reference.clone(),
+                },
+            );
+    }
+
+    Ok(snapshots)
+}
+
+fn resolved_catalog_version_from_install_packages(
+    resolution: &lpm_workspace::CatalogProtocolResolution,
+    packages: &[InstallPackage],
+) -> Option<String> {
+    let requested_range = lpm_resolver::NpmRange::parse(&resolution.specifier).ok();
+    let mut first_match: Option<&InstallPackage> = None;
+    let mut best_satisfying: Option<(lpm_resolver::NpmVersion, &InstallPackage)> = None;
+    let mut best_any: Option<(lpm_resolver::NpmVersion, &InstallPackage)> = None;
+
+    for package in packages
+        .iter()
+        .filter(|package| package_matches_catalog_resolution(package, &resolution.package_name))
+    {
+        if first_match.is_none() {
+            first_match = Some(package);
+        }
+
+        let Ok(version) = lpm_resolver::NpmVersion::parse(&package.version) else {
+            continue;
+        };
+
+        let better_any = best_any.as_ref().is_none_or(|(best, _)| version > *best);
+        if better_any {
+            best_any = Some((version.clone(), package));
+        }
+
+        if let Some(range) = requested_range.as_ref()
+            && range.satisfies(&version)
+        {
+            let better_satisfying = best_satisfying
+                .as_ref()
+                .is_none_or(|(best, _)| version > *best);
+            if better_satisfying {
+                best_satisfying = Some((version, package));
+            }
+        }
+    }
+
+    best_satisfying
+        .map(|(_, package)| package.version.clone())
+        .or_else(|| best_any.map(|(_, package)| package.version.clone()))
+        .or_else(|| first_match.map(|package| package.version.clone()))
+}
+
+fn package_matches_catalog_resolution(package: &InstallPackage, package_name: &str) -> bool {
+    package.name == package_name
+        || package
+            .root_link_names
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|name| name == package_name))
+}
+
+fn catalog_snapshot_entry_count(snapshots: &lpm_lockfile::CatalogSnapshots) -> usize {
+    snapshots.values().map(BTreeMap::len).sum()
+}
+
+fn lockfile_catalog_snapshots_match_current(
+    lockfile: &lpm_lockfile::Lockfile,
+    deps: &HashMap<String, String>,
+    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+) -> bool {
+    if catalog_snapshot_entry_count(&lockfile.catalogs) != catalog_resolutions.len() {
+        return false;
+    }
+
+    for resolution in catalog_resolutions {
+        let Some(entry) = lockfile
+            .catalogs
+            .get(&resolution.catalog_name)
+            .and_then(|catalog| catalog.get(&resolution.package_name))
+        else {
+            return false;
+        };
+        if entry.specifier != resolution.specifier || entry.reference != resolution.reference {
+            return false;
+        }
+
+        let target = lockfile
+            .root_aliases
+            .get(&resolution.package_name)
+            .map_or(resolution.package_name.as_str(), String::as_str);
+        let requested_spec = deps
+            .get(&resolution.package_name)
+            .map_or(resolution.specifier.as_str(), String::as_str);
+        let Some(locked_package) =
+            select_locked_package_for_requested_spec(lockfile, target, requested_spec)
+        else {
+            return false;
+        };
+        if locked_package.version != entry.version {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn requested_range_for_locked_lookup(requested_spec: &str) -> Option<String> {
     match lpm_resolver::Specifier::parse(requested_spec).ok()? {
         lpm_resolver::Specifier::SemverRange(range) => Some(range),
@@ -9163,6 +9797,7 @@ fn install_package_is_direct(
 fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
+    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     // — the URL-reuse gate needs the client to check
     // origin (`is_configured_origin`) and the shared `GateStats`
     // to bump mismatch counters. Both passed by ref; the fast
@@ -9187,21 +9822,22 @@ fn try_lockfile_fast_path(
         return None;
     }
 
-    // — probe the binary lockfile state so the driver can
-    // decide whether to trigger a writeback for migration purposes
-    // even when no URL diverged. `lpm.lockb` missing OR opened with
-    // `UnsupportedVersion` → needs rewrite. Other errors (structural
-    // corruption) leave the file alone so users can forensically
-    // inspect; `read_fast` will still fall back to TOML below.
-    let binary_path = lockfile_path.with_extension("lockb");
-    let needs_binary_upgrade = match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
-        Ok(Some(_)) => false,
-        Ok(None) => true,
-        Err(lpm_lockfile::LockfileError::UnsupportedVersion { .. }) => true,
-        Err(_) => false,
-    };
-
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
+
+    // Probe binary state only when this lockfile can be represented by
+    // the binary format. TOML-only metadata intentionally skips `lpm.lockb`;
+    // treating a missing binary as an upgrade need would rewrite forever.
+    let binary_path = lockfile_path.with_extension("lockb");
+    let needs_binary_upgrade = if lpm_lockfile::binary::binary_format_supports(&lockfile) {
+        match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            Err(lpm_lockfile::LockfileError::UnsupportedVersion { .. }) => true,
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
 
     // L19: scan the lockfile for entries with `http://` sources and
     // emit a single aggregate warn so re-installs against a lockfile
@@ -9257,6 +9893,11 @@ fn try_lockfile_fast_path(
             );
             return None; // Force re-resolution from trusted registries
         }
+    }
+
+    if !lockfile_catalog_snapshots_match_current(&lockfile, deps, catalog_resolutions) {
+        tracing::debug!("catalog snapshot drift detected — invalidating lockfile fast path");
+        return None;
     }
 
     // — verify every declared root dep has a lockfile
@@ -10125,7 +10766,7 @@ fn pick_speculative_version(
         return Some((
             pinned.clone(),
             url.to_string(),
-            vm.integrity().map(|s| s.to_string()),
+            vm.integrity_or_shasum().map(|s| s.into_owned()),
         ));
     }
 
@@ -10146,7 +10787,7 @@ fn pick_speculative_version(
     let (_v, v_str) = best?;
     let vm = meta.versions.get(v_str)?;
     let url = vm.tarball_url()?.to_string();
-    let integrity = vm.integrity().map(|s| s.to_string());
+    let integrity = vm.integrity_or_shasum().map(|s| s.into_owned());
     Some((v_str.to_string(), url, integrity))
 }
 
@@ -10724,6 +11365,84 @@ fn invalidate_metadata_routed(client: &Arc<RegistryClient>, route_table: &RouteT
     }
 }
 
+async fn verify_registry_signature_if_present(
+    client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
+    package: &InstallPackage,
+) -> Result<(), LpmError> {
+    if package.is_lpm || !install_package_is_registry_source(package) {
+        return Ok(());
+    }
+
+    let route = route_table.route_for_package(&package.name);
+    let metadata = client
+        .get_npm_metadata_routed(&package.name, route.clone())
+        .await?;
+    let version = metadata.version(&package.version).ok_or_else(|| {
+        LpmError::NotFound(format!(
+            "{}@{} not found in metadata",
+            package.name, package.version
+        ))
+    })?;
+    let Some(dist) = version.dist.as_ref() else {
+        return Ok(());
+    };
+    let Some(signatures) = dist.signatures.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let Some(integrity) = dist.integrity.as_deref() else {
+        return Err(LpmError::Registry(format!(
+            "{}@{} has registry signatures but no dist.integrity to verify",
+            package.name, package.version
+        )));
+    };
+
+    let (keys_base_url, auth): (&str, Option<&lpm_registry::RegistryAuth>) = match &route {
+        UpstreamRoute::Custom { target, auth } => (target.base_url.as_ref(), auth.as_ref()),
+        UpstreamRoute::LpmWorker | UpstreamRoute::NpmDirect => (client.npm_registry_url(), None),
+    };
+    let mut keys = client
+        .get_registry_signing_keys(keys_base_url, auth)
+        .await?;
+    if matches!(&route, UpstreamRoute::Custom { .. })
+        && !registry_signatures_have_matching_key(signatures, &keys)
+    {
+        keys.extend(
+            client
+                .get_registry_signing_keys(client.npm_registry_url(), None)
+                .await?,
+        );
+    }
+    let verification = lpm_registry::verify_registry_signatures(
+        &package.name,
+        &package.version,
+        integrity,
+        signatures,
+        &keys,
+        metadata.time.get(&package.version).map(String::as_str),
+    )?;
+    if let lpm_registry::RegistrySignatureVerification::Verified { count } = verification {
+        tracing::debug!(
+            target: "lpm_cli::install",
+            package = %package.name,
+            version = %package.version,
+            count,
+            "verified registry package signatures"
+        );
+    }
+    Ok(())
+}
+
+fn registry_signatures_have_matching_key(
+    signatures: &[lpm_registry::RegistrySignature],
+    keys: &[lpm_registry::RegistrySigningKey],
+) -> bool {
+    signatures
+        .iter()
+        .filter_map(|signature| signature.keyid.as_deref())
+        .any(|keyid| keys.iter().any(|key| key.keyid == keyid))
+}
+
 /// Shared 404-handling: when a tarball URL 404s and the same-run
 /// retry can't recover it either, the metadata cache is stale —
 /// nuke the lockfiles so the next `lpm install` re-resolves and
@@ -10828,6 +11547,8 @@ async fn fetch_and_store_legacy(
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
     let mut final_url = initial_url.clone();
 
+    verify_registry_signature_if_present(client, route_table, p).await?;
+
     let download_start = std::time::Instant::now();
     let downloaded = match client
         .download_tarball_routed(route_table, &p.name, &initial_url)
@@ -10874,6 +11595,7 @@ async fn fetch_and_store_legacy(
                     project_dir,
                 ));
             }
+            verify_registry_signature_if_present(client, route_table, p).await?;
             match client
                 .download_tarball_routed(route_table, &p.name, &fresh_url)
                 .await
@@ -11138,6 +11860,8 @@ async fn fetch_and_store_streaming(
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
     let mut final_url = initial_url.clone();
 
+    verify_registry_signature_if_present(client, route_table, p).await?;
+
     let response = match client
         .download_tarball_streaming_routed(route_table, &p.name, &initial_url)
         .await
@@ -11182,6 +11906,7 @@ async fn fetch_and_store_streaming(
                     project_dir,
                 ));
             }
+            verify_registry_signature_if_present(client, route_table, p).await?;
             match client
                 .download_tarball_streaming_routed(route_table, &p.name, &fresh_url)
                 .await
@@ -11561,6 +12286,45 @@ fn collect_direct_versions(packages: &[InstallPackage]) -> HashMap<String, lpm_s
     map
 }
 
+fn enforce_registry_integrity_policy(
+    packages: &[InstallPackage],
+    strict_integrity: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    for package in packages {
+        if package.integrity.is_some() || !install_package_is_registry_source(package) {
+            continue;
+        }
+        if strict_integrity {
+            return Err(LpmError::Registry(format!(
+                "--strict-integrity: registry package {}@{} has no dist.integrity or dist.shasum. \
+                 Refusing to install an unverified registry tarball.",
+                package.name, package.version
+            )));
+        }
+        tracing::warn!(
+            target: "lpm_cli::install",
+            package = %package.name,
+            version = %package.version,
+            "registry package has no dist.integrity or dist.shasum; download will be verified only after trust-on-first-use"
+        );
+        if !json_output {
+            output::warn(&format!(
+                "registry package {}@{} has no integrity hash; pinning trust-on-first-use",
+                package.name, package.version
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn install_package_is_registry_source(package: &InstallPackage) -> bool {
+    matches!(
+        package.source_kind(),
+        Ok(lpm_lockfile::Source::Registry { .. })
+    )
+}
+
 /// Replay the stage decisions against the
 /// current manifest using the resolver's output, replacing any
 /// deferred entries with the final save spec computed by
@@ -11578,13 +12342,30 @@ fn collect_direct_versions(packages: &[InstallPackage]) -> HashMap<String, lpm_s
 ///
 /// Skips entirely if [`StagedManifest::needs_finalize`] is `false` — nothing
 /// to do, and we avoid the read/write round-trip.
+#[cfg(test)]
 pub(crate) fn finalize_packages_in_manifest(
     staged: &StagedManifest,
     resolved_versions: &HashMap<String, lpm_semver::Version>,
     flags: crate::save_spec::SaveFlags,
     config: crate::save_spec::SaveConfig,
 ) -> Result<(), LpmError> {
-    if !staged.needs_finalize() {
+    finalize_packages_in_manifest_with_catalog_policy(
+        staged,
+        resolved_versions,
+        flags,
+        config,
+        &CatalogSavePolicy::manual(),
+    )
+}
+
+fn finalize_packages_in_manifest_with_catalog_policy(
+    staged: &StagedManifest,
+    resolved_versions: &HashMap<String, lpm_semver::Version>,
+    flags: crate::save_spec::SaveFlags,
+    config: crate::save_spec::SaveConfig,
+    catalog_policy: &CatalogSavePolicy,
+) -> Result<(), LpmError> {
+    if !staged.needs_finalize() && !catalog_policy.can_rewrite_manifest() {
         return Ok(());
     }
 
@@ -11597,37 +12378,308 @@ pub(crate) fn finalize_packages_in_manifest(
     } else {
         "dependencies"
     };
+    let mut doc_mutated = false;
 
     for entry in &staged.entries {
-        if !matches!(entry.kind, StagedKind::Placeholder | StagedKind::DistTag) {
+        let resolved = resolved_versions.get(&entry.name);
+
+        if let Some(catalog_name) = catalog_policy.forced_catalog.as_deref() {
+            let catalog_range = catalog_policy.catalog_entry(catalog_name, &entry.name)?;
+            let resolved = resolved.ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "{}: resolver did not report a concrete version for `{}`",
+                    forced_catalog_flag(catalog_name),
+                    entry.name
+                ))
+            })?;
+            if catalog_range_matches_resolved(&entry.name, catalog_range, resolved)? {
+                let catalog_ref = catalog_reference(catalog_name);
+                if doc[dep_key][&entry.name].as_str() != Some(catalog_ref.as_str()) {
+                    doc[dep_key][&entry.name] = serde_json::Value::String(catalog_ref);
+                    doc_mutated = true;
+                }
+                continue;
+            }
+
+            let requested_spec = catalog_mode_requested_spec(&entry.intent, resolved);
+            return Err(forced_catalog_mismatch_error(
+                catalog_name,
+                &entry.name,
+                &requested_spec,
+                catalog_range,
+            ));
+        }
+
+        if !matches!(catalog_policy.mode, lpm_workspace::CatalogMode::Manual) {
+            if let Some(catalog_range) =
+                catalog_policy.optional_catalog_entry("default", &entry.name)
+            {
+                let resolved = resolved.ok_or_else(|| {
+                    LpmError::Registry(format!(
+                        "catalogMode: resolver did not report a concrete version for `{}`",
+                        entry.name
+                    ))
+                })?;
+                if catalog_range_matches_resolved(&entry.name, catalog_range, resolved)? {
+                    if doc[dep_key][&entry.name].as_str() != Some("catalog:") {
+                        doc[dep_key][&entry.name] =
+                            serde_json::Value::String("catalog:".to_string());
+                        doc_mutated = true;
+                    }
+                    continue;
+                }
+
+                let requested_spec = catalog_mode_requested_spec(&entry.intent, resolved);
+                match catalog_policy.mode {
+                    lpm_workspace::CatalogMode::Strict => {
+                        return Err(catalog_mode_mismatch_error(
+                            &entry.name,
+                            &requested_spec,
+                            catalog_range,
+                        ));
+                    }
+                    lpm_workspace::CatalogMode::Prefer => {
+                        output::warn(&format!(
+                            "Catalog version mismatch for {}: using direct version {} instead of catalog:{}.",
+                            entry.name, requested_spec, catalog_range
+                        ));
+                    }
+                    lpm_workspace::CatalogMode::Manual => unreachable!("guarded above"),
+                }
+            } else if matches!(catalog_policy.mode, lpm_workspace::CatalogMode::Strict) {
+                return Err(LpmError::Registry(format!(
+                    "catalogMode strict rejected {}: no default catalog entry exists for this package",
+                    entry.name
+                )));
+            }
+        }
+
+        if matches!(entry.kind, StagedKind::Placeholder | StagedKind::DistTag) {
+            let staged_spec = match (&entry.kind, &entry.intent) {
+                (StagedKind::Placeholder, _) => STAGE_PLACEHOLDER.to_string(),
+                (StagedKind::DistTag, crate::save_spec::UserSaveIntent::DistTag(tag)) => {
+                    tag.clone()
+                }
+                _ => unreachable!("deferred staged entry must be bare placeholder or dist-tag"),
+            };
+
+            let resolved = resolved.ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "finalize: resolver did not report a concrete version for `{}` \
+                     (staged with provisional spec `{staged_spec}`). Refusing to leave the \
+                     provisional spec in {}.",
+                    entry.name,
+                    staged.pkg_json_path.display(),
+                ))
+            })?;
+
+            let decision = crate::save_spec::decide_saved_dependency_spec(
+                &entry.intent,
+                resolved,
+                flags,
+                config,
+            );
+
+            doc[dep_key][&entry.name] = serde_json::Value::String(decision.spec_to_write);
+            doc_mutated = true;
+        }
+    }
+
+    if doc_mutated {
+        let updated =
+            serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
+        std::fs::write(&staged.pkg_json_path, format!("{updated}\n"))?;
+    }
+    Ok(())
+}
+
+fn catalog_range_matches_resolved(
+    package: &str,
+    catalog_range: &str,
+    resolved: &lpm_semver::Version,
+) -> Result<bool, LpmError> {
+    let range = lpm_semver::VersionReq::parse(catalog_range).map_err(|e| {
+        LpmError::Registry(format!(
+            "catalogMode: invalid default catalog range for `{package}` (`{catalog_range}`): {e}"
+        ))
+    })?;
+    Ok(range.matches(resolved))
+}
+
+fn catalog_reference(catalog_name: &str) -> String {
+    if catalog_name == "default" {
+        "catalog:".to_string()
+    } else {
+        format!("catalog:{catalog_name}")
+    }
+}
+
+fn forced_catalog_flag(catalog_name: &str) -> String {
+    if catalog_name == "default" {
+        "--catalog".to_string()
+    } else {
+        format!("--catalog={catalog_name}")
+    }
+}
+
+fn catalog_mode_requested_spec(
+    intent: &crate::save_spec::UserSaveIntent,
+    resolved: &lpm_semver::Version,
+) -> String {
+    match intent {
+        crate::save_spec::UserSaveIntent::Bare => resolved.to_string(),
+        _ => intent_to_range_string(intent),
+    }
+}
+
+fn catalog_mode_mismatch_error(
+    package: &str,
+    requested_spec: &str,
+    catalog_range: &str,
+) -> LpmError {
+    LpmError::Registry(format!(
+        "catalogMode strict rejected {package}@{requested_spec}: default catalog has catalog:{catalog_range}"
+    ))
+}
+
+fn forced_catalog_mismatch_error(
+    catalog_name: &str,
+    package: &str,
+    requested_spec: &str,
+    catalog_range: &str,
+) -> LpmError {
+    LpmError::Registry(format!(
+        "{} rejected {package}@{requested_spec}: catalog `{catalog_name}` has catalog:{catalog_range}",
+        forced_catalog_flag(catalog_name)
+    ))
+}
+
+fn resolve_catalog_policy_manifest_spec(
+    package: &str,
+    specifier: &str,
+    catalog_policy: &CatalogSavePolicy,
+) -> Result<String, LpmError> {
+    if !specifier.starts_with("catalog:") {
+        return Ok(specifier.to_string());
+    }
+
+    let mut deps = HashMap::from([(package.to_string(), specifier.to_string())]);
+    lpm_workspace::resolve_catalog_protocol(&mut deps, &catalog_policy.catalogs)
+        .map_err(catalog_protocol_error_to_lpm)?;
+    deps.remove(package).ok_or_else(|| {
+        LpmError::Registry(format!(
+            "catalogMode: failed to resolve catalog protocol for `{package}`"
+        ))
+    })
+}
+
+async fn resolve_catalog_policy_candidate_version(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    package: &str,
+    requested_spec: &str,
+) -> Result<lpm_semver::Version, LpmError> {
+    let resolved = if lpm_common::package_name::is_lpm_package(package) {
+        let pkg_name = lpm_common::PackageName::parse(package)
+            .map_err(|e| LpmError::Registry(e.to_string()))?;
+        client.get_package_metadata(&pkg_name).await?
+    } else {
+        let route = route_table.route_for_package(package);
+        client.get_npm_metadata_routed(package, route).await?
+    }
+    .resolve_version_spec(requested_spec)?;
+
+    lpm_semver::Version::parse(&resolved).map_err(|e| {
+        LpmError::Registry(format!(
+            "catalogMode: resolved version `{resolved}` for `{package}` did not parse as semver: {e}"
+        ))
+    })
+}
+
+async fn preflight_catalog_policy_rejection(
+    client: &RegistryClient,
+    route_cwd: &Path,
+    staged: &StagedManifest,
+    catalog_policy: &CatalogSavePolicy,
+) -> Result<(), LpmError> {
+    let forced_catalog = catalog_policy.forced_catalog.as_deref();
+    let strict_mode = matches!(catalog_policy.mode, lpm_workspace::CatalogMode::Strict);
+    if forced_catalog.is_none() && !strict_mode {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&staged.pkg_json_path)?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
+    let dep_key = if staged.save_dev {
+        "devDependencies"
+    } else {
+        "dependencies"
+    };
+    let route_table = RouteTable::from_env_and_filesystem(route_cwd)
+        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+
+    for entry in &staged.entries {
+        let manifest_spec = doc
+            .get(dep_key)
+            .and_then(|deps| deps.get(&entry.name))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "catalogMode: staged manifest is missing `{}` under {}",
+                    entry.name, dep_key
+                ))
+            })?;
+
+        let effective_spec =
+            resolve_catalog_policy_manifest_spec(&entry.name, manifest_spec, catalog_policy)?;
+
+        if let Some(catalog_name) = forced_catalog {
+            let catalog_range = catalog_policy.catalog_entry(catalog_name, &entry.name)?;
+            let resolved = resolve_catalog_policy_candidate_version(
+                client,
+                &route_table,
+                &entry.name,
+                &effective_spec,
+            )
+            .await?;
+            if !catalog_range_matches_resolved(&entry.name, catalog_range, &resolved)? {
+                let requested_spec = catalog_mode_requested_spec(&entry.intent, &resolved);
+                return Err(forced_catalog_mismatch_error(
+                    catalog_name,
+                    &entry.name,
+                    &requested_spec,
+                    catalog_range,
+                ));
+            }
             continue;
         }
 
-        let staged_spec = match (&entry.kind, &entry.intent) {
-            (StagedKind::Placeholder, _) => STAGE_PLACEHOLDER.to_string(),
-            (StagedKind::DistTag, crate::save_spec::UserSaveIntent::DistTag(tag)) => tag.clone(),
-            _ => unreachable!("deferred staged entry must be bare placeholder or dist-tag"),
+        let Some(catalog_range) = catalog_policy.optional_catalog_entry("default", &entry.name)
+        else {
+            return Err(LpmError::Registry(format!(
+                "catalogMode strict rejected {}: no default catalog entry exists for this package",
+                entry.name
+            )));
         };
 
-        let resolved = resolved_versions.get(&entry.name).ok_or_else(|| {
-            LpmError::Registry(format!(
-                "finalize: resolver did not report a concrete version for `{}` \
-                 (staged with provisional spec `{staged_spec}`). Refusing to leave the \
-                 provisional spec in {}.",
-                entry.name,
-                staged.pkg_json_path.display(),
-            ))
-        })?;
-
-        let decision =
-            crate::save_spec::decide_saved_dependency_spec(&entry.intent, resolved, flags, config);
-
-        doc[dep_key][&entry.name] = serde_json::Value::String(decision.spec_to_write);
+        let resolved = resolve_catalog_policy_candidate_version(
+            client,
+            &route_table,
+            &entry.name,
+            &effective_spec,
+        )
+        .await?;
+        if !catalog_range_matches_resolved(&entry.name, catalog_range, &resolved)? {
+            let requested_spec = catalog_mode_requested_spec(&entry.intent, &resolved);
+            return Err(catalog_mode_mismatch_error(
+                &entry.name,
+                &requested_spec,
+                catalog_range,
+            ));
+        }
     }
 
-    let updated =
-        serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
-    std::fs::write(&staged.pkg_json_path, format!("{updated}\n"))?;
     Ok(())
 }
 
@@ -11723,6 +12775,7 @@ pub async fn run_add_packages(
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
+    catalog_name_override: Option<&str>,
     // forwarded CLI-side policy override. See
     // [`run_with_options`] for the resolution precedence and the
     // current consumer (triage-mode install summary line).
@@ -11740,6 +12793,8 @@ pub async fn run_add_packages(
     // forwarded composed Sigstore verifier policy. Opaque
     // pass-through — see [`run_with_options`].
     verify_policy: crate::provenance_fetch::VerifyPolicy,
+    // forwarded strict peer-dependency override — see [`run_with_options`].
+    strict_peer_dependencies_override: Option<bool>,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -11805,6 +12860,7 @@ pub async fn run_add_packages(
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     let lockfile_bin_path = lockfile_path.with_extension("lockb");
     let install_hash_path = project_dir.join(".lpm").join("install-hash");
+    let pnpm_workspace_path = project_dir.join("pnpm-workspace.yaml");
 
     // ** fix.** Wrap the entire snapshot → stage → install
     // → finalize → commit window in a per-project exclusive lock so
@@ -11827,9 +12883,14 @@ pub async fn run_add_packages(
         //    exist by precondition); lockfile + binary lockfile are optional
         //    (absent on a fresh project); install-hash is invalidate-only
         //    (cache file, deleted on rollback regardless of pre-state).
+        let optional_refs = [
+            lockfile_path.as_path(),
+            lockfile_bin_path.as_path(),
+            pnpm_workspace_path.as_path(),
+        ];
         let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
             &[&pkg_json_path],
-            &[&lockfile_path, &lockfile_bin_path],
+            &optional_refs,
             &[&install_hash_path],
         )?;
         maybe_test_panic("after-snapshot");
@@ -11842,9 +12903,11 @@ pub async fn run_add_packages(
         //    `~/.lpm/config.toml` (global) for the persistent save-policy
         //    keys. CLI flags still beat config inside `decide_saved_dependency_spec`.
         let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
+        let catalog_policy = catalog_save_policy_for_project(project_dir, catalog_name_override)?;
         let staged =
             stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
         pin_staged_dist_tags_for_resolution(client, project_dir, &staged).await?;
+        preflight_catalog_policy_rejection(client, project_dir, &staged, &catalog_policy).await?;
         maybe_test_panic("after-stage");
 
         // 3. Run the full install pipeline, capturing the direct-dep version
@@ -11865,6 +12928,7 @@ pub async fn run_add_packages(
             force,
             allow_new,
             false, // strict_integrity — internal call, no flag
+            strict_peer_dependencies_override,
             None,  // linker_override
             false, // no_skills
             false, // no_editor_setup
@@ -11888,8 +12952,16 @@ pub async fn run_add_packages(
 
         // 5. Finalize the manifest using the resolved direct-dep versions
         //    from the resolver. No-op if stage produced no placeholders.
-        finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)?;
+        finalize_packages_in_manifest_with_catalog_policy(
+            &staged,
+            &direct_versions,
+            save_flags,
+            save_config,
+            &catalog_policy,
+        )?;
         maybe_test_panic("after-finalize");
+
+        cleanup_unused_catalogs_after_install(project_dir)?;
 
         // 6. All steps succeeded — commit the transaction so the manifest
         //    edits persist.
@@ -11922,6 +12994,9 @@ pub async fn run_install_filtered_add(
     packages: &[String],
     save_dev: bool,
     filters: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     workspace_root_flag: bool,
     fail_if_no_match: bool,
     yes: bool,
@@ -11929,6 +13004,7 @@ pub async fn run_install_filtered_add(
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
+    catalog_name_override: Option<&str>,
     // forwarded CLI-side policy override.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     // forwarded `--advisor` override. Opaque
@@ -11944,6 +13020,8 @@ pub async fn run_install_filtered_add(
     // forwarded composed Sigstore verifier policy. Opaque
     // pass-through — see [`run_with_options`].
     verify_policy: crate::provenance_fetch::VerifyPolicy,
+    // forwarded strict peer-dependency override — see [`run_with_options`].
+    strict_peer_dependencies_override: Option<bool>,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -11957,6 +13035,9 @@ pub async fn run_install_filtered_add(
     let targets = crate::commands::install_targets::resolve_install_targets(
         cwd,
         filters,
+        filter_prod,
+        changed_files_ignore_pattern,
+        test_pattern,
         workspace_root_flag,
         true, // has_packages — install_filtered_add is only called with non-empty packages
     )?;
@@ -11970,7 +13051,7 @@ pub async fn run_install_filtered_add(
     // users coming from the legacy substring matcher get a generic "no
     // packages matched" with no recovery path.
     if targets.member_manifests.is_empty() {
-        let hint = crate::commands::filter::format_no_match_hint(filters);
+        let hint = crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
 
         if fail_if_no_match {
             let base = "no workspace packages matched the filter (--fail-if-no-match)";
@@ -12068,22 +13149,36 @@ pub async fn run_install_filtered_add(
         .map(|r| r.join(".lpm").join("install-hash"))
         .collect();
 
+    // Workspace-aware config resolution reads from the workspace root, and
+    // catalog cleanup can mutate the root package even when only a member was
+    // targeted.
+    let workspace_root_for_config: PathBuf = lpm_workspace::discover_workspace(cwd)
+        .ok()
+        .flatten()
+        .map_or_else(|| cwd.to_path_buf(), |ws| ws.root);
+    let root_package_json_path = workspace_root_for_config.join("package.json");
+    let pnpm_workspace_path = workspace_root_for_config.join("pnpm-workspace.yaml");
+
     // Build the (required, optional, invalidate) reference slices the
     // transaction expects. `required` = manifests; `optional` = lockfile
     // + lockfile.b for every member; `invalidate` = install-hash for
     // every member.
-    let required_refs: Vec<&Path> = targets
-        .member_manifests
+    let mut required_paths = targets.member_manifests.clone();
+    if !required_paths
         .iter()
-        .map(|p| p.as_path())
-        .collect();
-    let mut optional_refs: Vec<&Path> = Vec::with_capacity(lockfile_paths.len() * 2);
+        .any(|path| path == &root_package_json_path)
+    {
+        required_paths.push(root_package_json_path);
+    }
+    let required_refs: Vec<&Path> = required_paths.iter().map(|p| p.as_path()).collect();
+    let mut optional_refs: Vec<&Path> = Vec::with_capacity(lockfile_paths.len() * 2 + 1);
     for p in &lockfile_paths {
         optional_refs.push(p.as_path());
     }
     for p in &lockfile_bin_paths {
         optional_refs.push(p.as_path());
     }
+    optional_refs.push(pnpm_workspace_path.as_path());
     let invalidate_refs: Vec<&Path> = install_hash_paths.iter().map(|p| p.as_path()).collect();
 
     // per-command save flags from the CLI flow into stage and
@@ -12106,12 +13201,10 @@ pub async fn run_install_filtered_add(
     // reachable from a workspace context, but the fallback keeps the
     // loader call infallible if `discover_workspace` ever returns None
     // through some future code change).
-    let workspace_root_for_config: PathBuf = lpm_workspace::discover_workspace(cwd)
-        .ok()
-        .flatten()
-        .map_or_else(|| cwd.to_path_buf(), |ws| ws.root);
     let save_config =
         crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
+    let catalog_policy =
+        catalog_save_policy_for_project(&workspace_root_for_config, catalog_name_override)?;
 
     // ** fix.** Wrap the workspace-install snapshot → loop
     // → commit in an exclusive per-WORKSPACE lock. Two concurrent
@@ -12131,6 +13224,8 @@ pub async fn run_install_filtered_add(
             &invalidate_refs,
         )?;
 
+        let mut staged_manifests: Vec<StagedManifest> =
+            Vec::with_capacity(targets.member_manifests.len());
         let mut last_err: Option<LpmError> = None;
         for (idx, manifest_path) in targets.member_manifests.iter().enumerate() {
             // (a) Stage the target manifest. Explicit specs land verbatim;
@@ -12155,6 +13250,24 @@ pub async fn run_install_filtered_add(
                 break;
             }
 
+            if let Err(e) =
+                preflight_catalog_policy_rejection(client, install_root, &staged, &catalog_policy)
+                    .await
+            {
+                last_err = Some(e);
+                break;
+            }
+
+            staged_manifests.push(staged);
+        }
+
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+
+        for (idx, staged) in staged_manifests.iter().enumerate() {
+            let install_root = &member_install_roots[idx];
+
             // (b) Run the install pipeline at THIS member's directory,
             //     capturing the direct-dep map for finalize via  the             //     out-param.
             //     We intentionally keep each member's existing lockfile so the
@@ -12170,6 +13283,7 @@ pub async fn run_install_filtered_add(
                 force,
                 allow_new,
                 false, // strict_integrity — workspace-add path, no flag
+                strict_peer_dependencies_override,
                 None,  // linker_override
                 false, // no_skills
                 false, // no_editor_setup
@@ -12214,9 +13328,13 @@ pub async fn run_install_filtered_add(
 
             // (d) Finalize this member's manifest using the direct-dep
             //     versions from the resolver.
-            if let Err(e) =
-                finalize_packages_in_manifest(&staged, &direct_versions, save_flags, save_config)
-            {
+            if let Err(e) = finalize_packages_in_manifest_with_catalog_policy(
+                staged,
+                &direct_versions,
+                save_flags,
+                save_config,
+                &catalog_policy,
+            ) {
                 last_err = Some(e);
                 break;
             }
@@ -12227,6 +13345,8 @@ pub async fn run_install_filtered_add(
             // is restored to its pre-stage bytes.
             return Err(e);
         }
+
+        cleanup_unused_catalogs_after_install(&workspace_root_for_config)?;
 
         // All members succeeded — persist every staged + finalized manifest.
         tx.commit();
@@ -14283,6 +15403,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn finalize_prefer_catalog_policy_rewrites_matching_dep_to_catalog_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
+
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["is-positive".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+        )
+        .unwrap();
+        let resolved = make_resolved(&[("is-positive", "2.0.0")]);
+        let policy = CatalogSavePolicy {
+            mode: lpm_workspace::CatalogMode::Prefer,
+            catalogs: HashMap::from([(
+                "default".to_string(),
+                HashMap::from([("is-positive".to_string(), "^2.0.0".to_string())]),
+            )]),
+            forced_catalog: None,
+        };
+
+        finalize_packages_in_manifest_with_catalog_policy(
+            &staged,
+            &resolved,
+            crate::save_spec::SaveFlags::default(),
+            crate::save_spec::SaveConfig::default(),
+            &policy,
+        )
+        .unwrap();
+
+        let after = read_manifest(&pkg_path);
+        assert_eq!(after["dependencies"]["is-positive"], "catalog:");
+    }
+
+    #[test]
+    fn finalize_forced_named_catalog_policy_rewrites_matching_dep_to_named_catalog_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
+
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["is-positive@2.0.0".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+        )
+        .unwrap();
+        let resolved = make_resolved(&[("is-positive", "2.0.0")]);
+        let policy = CatalogSavePolicy {
+            mode: lpm_workspace::CatalogMode::Manual,
+            catalogs: HashMap::from([(
+                "testing".to_string(),
+                HashMap::from([("is-positive".to_string(), "^2.0.0".to_string())]),
+            )]),
+            forced_catalog: Some("testing".to_string()),
+        };
+
+        finalize_packages_in_manifest_with_catalog_policy(
+            &staged,
+            &resolved,
+            crate::save_spec::SaveFlags::default(),
+            crate::save_spec::SaveConfig::default(),
+            &policy,
+        )
+        .unwrap();
+
+        let after = read_manifest(&pkg_path);
+        assert_eq!(after["dependencies"]["is-positive"], "catalog:testing");
+    }
+
+    #[test]
+    fn finalize_strict_catalog_policy_errors_when_resolved_version_mismatches_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_path = dir.path().join("package.json");
+        write_manifest(&pkg_path, &serde_json::json!({"name": "demo"}));
+
+        let staged = stage_packages_to_manifest(
+            &pkg_path,
+            &["is-positive@2.0.0".to_string()],
+            false,
+            crate::save_spec::SaveFlags::default(),
+        )
+        .unwrap();
+        let resolved = make_resolved(&[("is-positive", "2.0.0")]);
+        let policy = CatalogSavePolicy {
+            mode: lpm_workspace::CatalogMode::Strict,
+            catalogs: HashMap::from([(
+                "default".to_string(),
+                HashMap::from([("is-positive".to_string(), "^1.0.0".to_string())]),
+            )]),
+            forced_catalog: None,
+        };
+
+        let err = finalize_packages_in_manifest_with_catalog_policy(
+            &staged,
+            &resolved,
+            crate::save_spec::SaveFlags::default(),
+            crate::save_spec::SaveConfig::default(),
+            &policy,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("catalogMode strict"));
+        assert!(message.contains("is-positive@2.0.0"));
+        assert!(message.contains("catalog:^1.0.0"));
+    }
+
     /// Finalize is a no-op when no entries are placeholders.
     #[test]
     fn finalize_is_noop_when_no_placeholders() {
@@ -14403,6 +15633,54 @@ mod tests {
              it appears before the transitive in the input list"
         );
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn strict_integrity_rejects_registry_package_without_integrity() {
+        let packages = vec![fake_pkg("legacy-registry-pkg", "1.0.0", true)];
+        let err = enforce_registry_integrity_policy(&packages, true, true).unwrap_err();
+        assert!(
+            err.to_string().contains("legacy-registry-pkg@1.0.0"),
+            "error should identify the unverified package, got {err}"
+        );
+    }
+
+    #[test]
+    fn strict_integrity_does_not_apply_to_non_registry_install_packages() {
+        let mut package = fake_pkg("local-pkg", "1.0.0", true);
+        package.source = "directory+./vendor/local-pkg".to_string();
+        enforce_registry_integrity_policy(&[package], true, true).unwrap();
+    }
+
+    #[test]
+    fn registry_signature_key_match_detects_missing_custom_registry_keys() {
+        let signatures = vec![lpm_registry::RegistrySignature {
+            keyid: Some("SHA256:npm".to_string()),
+            sig: Some("MEUCIQD".to_string()),
+        }];
+        let custom_keys = vec![lpm_registry::RegistrySigningKey {
+            expires: None,
+            keyid: "SHA256:custom".to_string(),
+            keytype: "ecdsa-sha2-nistp256".to_string(),
+            scheme: "ecdsa-sha2-nistp256".to_string(),
+            key: String::new(),
+        }];
+        let npm_keys = vec![lpm_registry::RegistrySigningKey {
+            expires: None,
+            keyid: "SHA256:npm".to_string(),
+            keytype: "ecdsa-sha2-nistp256".to_string(),
+            scheme: "ecdsa-sha2-nistp256".to_string(),
+            key: String::new(),
+        }];
+
+        assert!(!registry_signatures_have_matching_key(
+            &signatures,
+            &custom_keys
+        ));
+        assert!(registry_signatures_have_matching_key(
+            &signatures,
+            &npm_keys
+        ));
     }
 
     /// Transitive-only packages are EXCLUDED from the map entirely.
@@ -14542,6 +15820,9 @@ mod tests {
             &["react".to_string()],
             false,                // save_dev
             &["app".to_string()], // bare-name filter that matches nothing
+            &[],                  // filter_prod
+            &[],                  // changed_files_ignore_pattern
+            &[],                  // test_pattern
             false,                // workspace_root_flag
             true,                 // fail_if_no_match — required for the error path
             false,                // yes — not exercising the prompt here
@@ -14549,15 +15830,17 @@ mod tests {
             false,                // allow_new
             false,                // force
             crate::save_spec::SaveFlags::default(),
+            None,                                                  // catalog_name_override
             None,                                                  // script_policy_override
             None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
             crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
-            false,                                                 // strict_sandbox
-            false,                                                 // no_sandbox
-            false,                                                 // verbose
-            false,                                                 // audit_after_install
+            None,  // strict_peer_dependencies_override
+            false, // strict_sandbox
+            false, // no_sandbox
+            false, // verbose
+            false, // audit_after_install
         )
         .await;
 
@@ -14586,6 +15869,9 @@ mod tests {
             &["react".to_string()],
             false,
             &["nonexistent-*".to_string()],
+            &[],
+            &[],
+            &[],
             false,
             true,
             false, // yes
@@ -14593,15 +15879,17 @@ mod tests {
             false,
             false,
             crate::save_spec::SaveFlags::default(),
+            None,                                                  // catalog_name_override
             None,                                                  // script_policy_override
             None,                                                  // advisor_override
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
             crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
-            false,                                                 // strict_sandbox
-            false,                                                 // no_sandbox
-            false,                                                 // verbose
-            false,                                                 // audit_after_install
+            None,  // strict_peer_dependencies_override
+            false, // strict_sandbox
+            false, // no_sandbox
+            false, // verbose
+            false, // audit_after_install
         )
         .await;
 
@@ -14654,6 +15942,9 @@ mod tests {
         let targets = crate::commands::install_targets::resolve_install_targets(
             &cwd,
             &["@test/app".to_string()],
+            &[],
+            &[],
+            &[],
             false,
             true,
         )
@@ -15760,16 +17051,16 @@ mod tests {
         // might have been deleted already. Either way,
         // `needs_binary_upgrade` should be true (missing or stale).
         //
-        // Actually the order is: `try_lockfile_fast_path` probes the
-        // binary FIRST (to check `needs_binary_upgrade`), THEN calls
-        // `read_fast`. So at probe time, the v1 binary is still on
-        // disk and `open` returns `UnsupportedVersion`.
+        // `try_lockfile_fast_path` loads the lockfile, then probes the
+        // binary to decide whether a representable lockfile should be
+        // rewritten. The stale v1 file must still trigger the writeback.
 
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed via TOML fallback");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed via TOML fallback");
 
         assert!(
             result.needs_binary_upgrade,
@@ -15807,8 +17098,9 @@ mod tests {
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed with only TOML");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed with only TOML");
 
         assert!(
             result.needs_binary_upgrade,
@@ -15843,8 +17135,9 @@ mod tests {
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed with both TOML + v2 binary");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed with both TOML + v2 binary");
 
         assert!(
             !result.needs_binary_upgrade,
@@ -15889,8 +17182,9 @@ mod tests {
         let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed on valid lockfile");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed on valid lockfile");
 
         assert_eq!(result.packages.len(), 1);
         assert_eq!(
@@ -15937,8 +17231,9 @@ mod tests {
             let deps: HashMap<String, String> =
                 [("victim".to_string(), "^1.0.0".to_string())].into();
             let gate_stats = GateStats::default();
-            let result = try_lockfile_fast_path(&lockfile_path, &deps, client, &gate_stats, false)
-                .expect("fast path should succeed even with a gate-rejected URL");
+            let result =
+                try_lockfile_fast_path(&lockfile_path, &deps, &[], client, &gate_stats, false)
+                    .expect("fast path should succeed even with a gate-rejected URL");
             (result, gate_stats, dir)
         };
 
@@ -16001,8 +17296,9 @@ mod tests {
             [("old-entry".to_string(), "^1.0.0".to_string())].into();
         let client = RegistryClient::new();
         let gate_stats = GateStats::default();
-        let result = try_lockfile_fast_path(&lockfile_path, &deps, &client, &gate_stats, false)
-            .expect("fast path should succeed on pre-existing lockfile");
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed on pre-existing lockfile");
 
         assert_eq!(result.packages[0].tarball_url, None);
 

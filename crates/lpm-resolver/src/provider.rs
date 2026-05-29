@@ -957,7 +957,7 @@ pub(crate) fn parse_metadata_to_cache_info(
                 ver_str.clone(),
                 CachedDistInfo {
                     tarball_url: ver_meta.tarball_url().map(str::to_string),
-                    integrity: ver_meta.integrity().map(str::to_string),
+                    integrity: ver_meta.integrity_or_shasum().map(|s| s.into_owned()),
                 },
             );
 

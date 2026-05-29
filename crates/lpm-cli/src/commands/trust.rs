@@ -784,12 +784,14 @@ mod tests {
             metadata: lpm_lockfile::LockfileMetadata {
                 lockfile_version: 1,
                 resolved_with: Some("test".into()),
+                auto_isolated_peer_conflicts: false,
             },
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
                 ..Default::default()
             }],
+            catalogs: Default::default(),
             root_aliases: Default::default(),
             ambient_peer_installs: Vec::new(),
         };
@@ -914,12 +916,14 @@ mod tests {
             metadata: lpm_lockfile::LockfileMetadata {
                 lockfile_version: 1,
                 resolved_with: Some("test".into()),
+                auto_isolated_peer_conflicts: false,
             },
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
                 ..Default::default()
             }],
+            catalogs: Default::default(),
             root_aliases: Default::default(),
             ambient_peer_installs: Vec::new(),
         };
@@ -952,12 +956,14 @@ mod tests {
             metadata: lpm_lockfile::LockfileMetadata {
                 lockfile_version: 1,
                 resolved_with: Some("test".into()),
+                auto_isolated_peer_conflicts: false,
             },
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
                 ..Default::default()
             }],
+            catalogs: Default::default(),
             root_aliases: Default::default(),
             ambient_peer_installs: Vec::new(),
         };
@@ -987,8 +993,10 @@ mod tests {
             metadata: lpm_lockfile::LockfileMetadata {
                 lockfile_version: 1,
                 resolved_with: Some("test".into()),
+                auto_isolated_peer_conflicts: false,
             },
             packages: vec![],
+            catalogs: Default::default(),
             root_aliases: Default::default(),
             ambient_peer_installs: Vec::new(),
         };

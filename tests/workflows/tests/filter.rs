@@ -33,6 +33,32 @@ fn filter_exact_name_selects_only_that_member() {
     );
 }
 
+#[test]
+fn filter_bare_name_does_not_fuzzy_match_scoped_member() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    let output = lpm(&project)
+        .args(["filter", "core"])
+        .output()
+        .expect("failed to run lpm filter with bare name");
+
+    assert!(
+        output.status.success(),
+        "bare-name filter with no exact match must still exit 0\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.lines().any(|line| line.trim() == "@test/core"),
+        "strict exact-name matching must not fuzzy-match scoped members like @test/core\nfull stdout:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("strict exact matches") || stdout.contains("design decision D2"),
+        "empty strict-name matches should keep the D2 migration hint\nfull stdout:\n{stdout}",
+    );
+}
+
 // ─── glob selector ─────────────────────────────────────────────────────
 
 #[test]

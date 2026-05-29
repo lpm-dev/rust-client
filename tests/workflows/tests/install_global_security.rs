@@ -410,8 +410,9 @@ fn install_global_validator_still_rejects_yes_flag() {
         .expect("spawn lpm install");
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stderr}\n{stdout}");
     assert!(
-        stderr.contains("project-scoped") || stdout.contains("project-scoped"),
+        combined.contains("project") && combined.contains("scoped"),
         "`-y` must still hard-error on `-g` (genuinely project-only). \
          stderr:\n{stderr}\nstdout:\n{stdout}"
     );

@@ -1,6 +1,7 @@
 use crate::{CheckEngine, output};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -38,6 +39,29 @@ fn truncate_output(text: &str) -> String {
 pub enum StdioMode {
     Inherit,
     Capture,
+}
+
+#[derive(Clone, Copy)]
+pub enum WorkspaceConcurrency {
+    HostDefault,
+    Configured { cli_value: Option<NonZeroUsize> },
+}
+
+impl WorkspaceConcurrency {
+    fn resolve(self, workspace_root: &Path) -> Result<usize, LpmError> {
+        let value = match self {
+            Self::HostDefault => {
+                crate::workspace_concurrency_config::default_workspace_concurrency()
+            }
+            Self::Configured { cli_value } => {
+                crate::workspace_concurrency_config::resolve_workspace_concurrency(
+                    workspace_root,
+                    cli_value,
+                )?
+            }
+        };
+        Ok(value.get())
+    }
 }
 
 /// Captured stdio from a single tool invocation.
@@ -561,8 +585,12 @@ pub async fn tool_workspace(
     check: bool,
     check_engine: Option<CheckEngine>,
     filters: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     affected_base: Option<&str>,
     fail_if_no_match: bool,
+    workspace_concurrency: WorkspaceConcurrency,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let workspace = lpm_workspace::discover_workspace(project_dir)
@@ -577,11 +605,15 @@ pub async fn tool_workspace(
     let levels = ws_graph
         .topological_levels()
         .map_err(|e| LpmError::Script(e.to_string()))?;
+    let workspace_concurrency = workspace_concurrency.resolve(&workspace.root)?;
 
     let target_set = crate::workspace_select::select_workspace_target_set(
         &ws_graph,
         &workspace.root,
         filters,
+        filter_prod,
+        changed_files_ignore_pattern,
+        test_pattern,
         affected_base.is_some(),
         affected_base.unwrap_or("main"),
     )?;
@@ -592,7 +624,7 @@ pub async fn tool_workspace(
         // filter typo. With explicit `--filter` (with or without `--affected`)
         // we fall into the filter-miss path so the D2 hint can fire on bare
         // names that would have substring-matched in earlier filter behavior.
-        let affected_only = filters.is_empty() && affected_base.is_some();
+        let affected_only = filters.is_empty() && filter_prod.is_empty() && affected_base.is_some();
 
         if fail_if_no_match {
             let msg = if affected_only {
@@ -601,7 +633,8 @@ pub async fn tool_workspace(
                     affected_base.unwrap_or("main"),
                 )
             } else {
-                let hint = crate::commands::filter::format_no_match_hint(filters);
+                let hint =
+                    crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
                 let base = "no workspace packages matched the filter (--fail-if-no-match)";
                 match hint {
                     Some(h) => format!("{base}\n\n{h}"),
@@ -627,7 +660,7 @@ pub async fn tool_workspace(
                 affected_base.unwrap_or("main"),
             ));
         } else {
-            let hint = crate::commands::filter::format_no_match_hint(filters);
+            let hint = crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
             output::warn("No packages matched");
             if let Some(h) = hint {
                 eprintln!();
@@ -711,6 +744,7 @@ pub async fn tool_workspace(
             check_engine,
             stdio,
             &root_pin,
+            workspace_concurrency,
         )
         .await;
         member_results.extend(level_outcomes);
@@ -789,7 +823,7 @@ struct MemberResult {
 }
 
 /// Run all members in a single topological level. Within a level, members are
-/// independent; we fan out across `available_parallelism()` threads.
+/// independent; callers decide the workspace concurrency cap.
 #[allow(clippy::too_many_arguments)]
 async fn run_level(
     ws_graph: &lpm_task::graph::WorkspaceGraph,
@@ -800,6 +834,7 @@ async fn run_level(
     check_engine: Option<CheckEngine>,
     stdio: StdioMode,
     root_pin: &Option<(String, Option<String>, PathBuf)>,
+    workspace_concurrency: usize,
 ) -> Vec<MemberResult> {
     if level_targets.len() == 1 {
         let idx = level_targets[0];
@@ -817,11 +852,9 @@ async fn run_level(
         return vec![result];
     }
 
-    let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-
     let mut all_results: Vec<MemberResult> = Vec::with_capacity(level_targets.len());
 
-    for chunk in level_targets.chunks(max_threads) {
+    for chunk in level_targets.chunks(workspace_concurrency) {
         let mut chunk_futs = Vec::with_capacity(chunk.len());
         for &idx in chunk {
             let member_dir = ws_graph.members[idx].path.clone();
@@ -1059,12 +1092,21 @@ pub async fn dispatch_test_or_bench(
     args: &[String],
     all: bool,
     filters: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     affected: bool,
     base_ref: &str,
     fail_if_no_match: bool,
+    workspace_concurrency: Option<NonZeroUsize>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let workspace_mode = all || affected || !filters.is_empty();
+    let workspace_mode = all || affected || !filters.is_empty() || !filter_prod.is_empty();
+    if workspace_concurrency.is_some() && !workspace_mode {
+        return Err(LpmError::Script(format!(
+            "--workspace-concurrency requires --all, --filter, --filter-prod, or --affected for `lpm {tool}`"
+        )));
+    }
 
     // Resolve workspace target selection up-front when watch is requested,
     // so we can hand off to single-package mode for the one-member case
@@ -1083,6 +1125,9 @@ pub async fn dispatch_test_or_bench(
             &ws_graph,
             &workspace.root,
             filters,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
             affected,
             affected_ref_for_select.unwrap_or("main"),
         )?;
@@ -1122,8 +1167,14 @@ pub async fn dispatch_test_or_bench(
             false,
             None,
             filters,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
             affected_ref,
             fail_if_no_match,
+            WorkspaceConcurrency::Configured {
+                cli_value: workspace_concurrency,
+            },
             json_output,
         )
         .await
@@ -1761,6 +1812,7 @@ mod tests {
                 args,
                 filter,
                 fail_if_no_match,
+                ..
             } => {
                 assert!(!all);
                 assert!(affected);
@@ -2026,6 +2078,8 @@ mod tests {
             members,
             edges: vec![vec![], vec![], vec![]],
             reverse_edges: vec![vec![], vec![], vec![]],
+            dependency_edges: vec![vec![], vec![], vec![]],
+            reverse_dependency_edges: vec![vec![], vec![], vec![]],
             name_to_idx: HashMap::from([
                 ("pkg-a".to_string(), 0usize),
                 ("pkg-b".to_string(), 1usize),
@@ -2077,6 +2131,8 @@ mod tests {
             members,
             edges: vec![vec![], vec![]],
             reverse_edges: vec![vec![], vec![]],
+            dependency_edges: vec![vec![], vec![]],
+            reverse_dependency_edges: vec![vec![], vec![]],
             name_to_idx: HashMap::from([
                 ("pkg-a".to_string(), 0usize),
                 ("pkg-b".to_string(), 1usize),

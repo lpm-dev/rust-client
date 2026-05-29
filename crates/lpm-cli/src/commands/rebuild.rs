@@ -130,7 +130,18 @@ const STRIPPED_ENV_PATTERNS: &[&str] = &[
 ];
 
 /// Env var suffix patterns — any var ending with these is stripped.
-const STRIPPED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY", "_PRIVATE_KEY"];
+const STRIPPED_ENV_SUFFIXES: &[&str] = &[
+    "_SECRET",
+    "_PASSWORD",
+    "_KEY",
+    "_PRIVATE_KEY",
+    "_KEY_ID",
+    "_TOKEN",
+    "_URL",
+    "_URI",
+    "_DSN",
+    "_CONNECTION_STRING",
+];
 
 // the per-file `SCRIPT_PHASES` const previously
 // declared here was removed and consolidated into
@@ -1944,12 +1955,12 @@ fn build_sanitized_env() -> HashMap<String, String> {
 
     for (key, value) in std::env::vars() {
         // Skip explicitly blocked vars
-        if STRIPPED_ENV_PATTERNS.contains(&key.as_str()) {
+        let upper = key.to_ascii_uppercase();
+        if STRIPPED_ENV_PATTERNS.contains(&upper.as_str()) {
             continue;
         }
 
         // Skip vars matching suffix patterns
-        let upper = key.to_uppercase();
         if STRIPPED_ENV_SUFFIXES
             .iter()
             .any(|suffix| upper.ends_with(suffix))
@@ -2393,7 +2404,7 @@ fn evaluate_trust_unsuspended(
 
     if effective_policy == ScriptPolicy::Triage {
         let tier = classify_package_worst_tier(scripts);
-        if tier == Some(StaticTier::Green) {
+        if tier == Some(StaticTier::Green) && green_tier_can_auto_trust(scripts) {
             return TrustReason::GreenTierUnderTriage;
         }
         // Amber + advisor said Approve →
@@ -2440,6 +2451,12 @@ fn classify_package_worst_tier(scripts: &HashMap<String, String>) -> Option<Stat
         .values()
         .map(|body| lpm_security::static_gate::classify(body))
         .reduce(StaticTier::worse_of)
+}
+
+fn green_tier_can_auto_trust(scripts: &HashMap<String, String>) -> bool {
+    scripts
+        .values()
+        .all(|body| lpm_security::static_gate::extract_delegate_path(body).is_none())
 }
 
 /// Count scripted packages that would be skipped under the default
@@ -3447,6 +3464,41 @@ mod tests {
     }
 
     #[test]
+    fn sanitized_env_strips_lowercase_exact_secret_names() {
+        let _env = crate::test_env::ScopedEnv::set([
+            ("github_token", "secret".into()),
+            ("npm_token", "secret".into()),
+        ]);
+        let env = build_sanitized_env();
+        assert!(!env.keys().any(|key| key == "github_token"));
+        assert!(!env.keys().any(|key| key == "npm_token"));
+    }
+
+    #[test]
+    fn sanitized_env_strips_token_and_connection_string_suffixes() {
+        let _env = crate::test_env::ScopedEnv::set([
+            ("CLOUDFLARE_API_TOKEN", "secret".into()),
+            ("DATABASE_URL", "postgres://user:pass@localhost/db".into()),
+            ("REDIS_URI", "redis://:pass@localhost:6379".into()),
+            (
+                "SENTRY_DSN",
+                "https://public:secret@example.invalid/1".into(),
+            ),
+            ("AWS_ACCESS_KEY_ID", "key".into()),
+        ]);
+        let env = build_sanitized_env();
+        for key in [
+            "CLOUDFLARE_API_TOKEN",
+            "DATABASE_URL",
+            "REDIS_URI",
+            "SENTRY_DSN",
+            "AWS_ACCESS_KEY_ID",
+        ] {
+            assert!(!env.contains_key(key), "{key} must be stripped");
+        }
+    }
+
+    #[test]
     fn sanitized_env_keeps_path() {
         // PATH and HOME are always present in the test environment
         let env = build_sanitized_env();
@@ -4442,6 +4494,35 @@ mod tests {
         );
         assert_eq!(reason, TrustReason::GreenTierUnderTriage);
         assert!(reason.is_trusted());
+    }
+
+    #[test]
+    fn triage_does_not_auto_trust_node_delegate_without_manifest_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
+        let store = PackageStore::at(dir.path().join("store"));
+        let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let pkg_dir = write_p6_pkg(&store, "delegate-pkg", "1.0.0", "node setup.js");
+        std::fs::write(pkg_dir.join("setup.js"), b"require('./payload.js')\n").unwrap();
+        let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+        let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
+
+        let reason = evaluate_trust(
+            &pkg_dir,
+            "delegate-pkg",
+            "1.0.0",
+            None,
+            &scripts,
+            &policy,
+            dir.path(),
+            ScriptPolicy::Triage,
+            false,
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            None,
+        );
+        assert_eq!(reason, TrustReason::Untrusted);
+        assert!(!reason.is_trusted());
     }
 
     #[test]

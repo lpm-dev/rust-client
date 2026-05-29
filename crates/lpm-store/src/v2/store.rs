@@ -178,6 +178,7 @@ fn sri_to_segment(sri: &str) -> Result<String, LpmError> {
     use std::fmt::Write as _;
     let int = Integrity::parse(sri)?;
     let algo = match int.algorithm {
+        HashAlgorithm::Sha1 => "sha1",
         HashAlgorithm::Sha256 => "sha256",
         HashAlgorithm::Sha512 => "sha512",
     };
@@ -477,10 +478,13 @@ impl Store {
             } else if expected.starts_with("sha256-") {
                 candidate_owned = crate::compute_sri_hash_sha256(tarball_data);
                 &candidate_owned
+            } else if expected.starts_with("sha1-") {
+                candidate_owned = crate::compute_sri_hash_sha1(tarball_data);
+                &candidate_owned
             } else {
                 return Err(LpmError::Registry(format!(
                     "unsupported integrity algorithm in v2 extract: {expected} — \
-                     expected sha512-… (preferred) or sha256-…"
+                     expected sha512-… (preferred), sha256-…, or sha1-…"
                 )));
             };
             let matches_expected = expected.len() == candidate.len()
@@ -2056,6 +2060,25 @@ mod tests {
             .extract_object_from_bytes(&tarball, Some(&expected))
             .unwrap();
         assert_eq!(sri, expected);
+    }
+
+    #[test]
+    fn extract_object_from_bytes_accepts_correct_sha1_integrity() {
+        use base64::Engine;
+        use sha1::{Digest, Sha1};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[("package.json", b"{}")]);
+        let expected = format!(
+            "sha1-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha1::digest(&tarball))
+        );
+
+        let (_obj_dir, sri, _) = store
+            .extract_object_from_bytes(&tarball, Some(&expected))
+            .unwrap();
+        assert_eq!(sri, crate::compute_sri_hash(&tarball));
     }
 
     #[test]

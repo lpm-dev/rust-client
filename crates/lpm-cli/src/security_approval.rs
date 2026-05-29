@@ -3630,7 +3630,16 @@ script-policy = "deny"
 
     #[test]
     fn automation_mode_includes_json() {
-        assert!(is_automation(true));
+        let original_auth = std::env::var_os(TEST_AUTH_RESULT_ENV);
+        unsafe {
+            std::env::remove_var(TEST_AUTH_RESULT_ENV);
+        }
+        let automation = is_automation(true);
+        match original_auth {
+            Some(value) => unsafe { std::env::set_var(TEST_AUTH_RESULT_ENV, value) },
+            None => unsafe { std::env::remove_var(TEST_AUTH_RESULT_ENV) },
+        }
+        assert!(automation);
     }
 
     #[test]

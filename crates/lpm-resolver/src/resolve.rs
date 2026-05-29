@@ -698,8 +698,102 @@ fn format_solution(
             }
         })
         .collect();
+    dedupe_peer_superset_packages(&mut resolved);
     resolved.sort_by_key(|a| a.package.to_string());
     resolved
+}
+
+/// Collapse same-package/same-version rows when one materialization graph can
+/// safely stand in for another.
+///
+/// The resolver can temporarily produce multiple rows for the same canonical
+/// package and version when peer-bound contexts differ. A row whose dependency
+/// edges, alias edges, and resolved peer bindings are all subsets of another
+/// row is interchangeable with that larger wrapper: the larger wrapper exposes
+/// everything the smaller one needs. Non-comparable peer contexts stay distinct.
+pub(crate) fn dedupe_peer_superset_packages(packages: &mut Vec<ResolvedPackage>) {
+    if packages.len() < 2 {
+        return;
+    }
+
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::with_capacity(packages.len());
+    for (idx, package) in packages.iter().enumerate() {
+        groups
+            .entry(resolved_package_identity_key(package))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut dominated = vec![false; packages.len()];
+    for indices in groups.values().filter(|indices| indices.len() > 1) {
+        for &idx in indices {
+            for &candidate_idx in indices {
+                if idx == candidate_idx {
+                    continue;
+                }
+                let package = &packages[idx];
+                let candidate = &packages[candidate_idx];
+                if !resolved_package_can_replace(candidate, package) {
+                    continue;
+                }
+                if resolved_package_is_strict_superset(candidate, package) || candidate_idx < idx {
+                    dominated[idx] = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut idx = 0usize;
+    packages.retain(|_| {
+        let keep = !dominated[idx];
+        idx += 1;
+        keep
+    });
+}
+
+fn resolved_package_identity_key(package: &ResolvedPackage) -> String {
+    let name = package.package.canonical_name();
+    let version = package.version.to_string();
+    let mut key = String::with_capacity(name.len() + 1 + version.len());
+    key.push_str(&name);
+    key.push('\0');
+    key.push_str(&version);
+    key
+}
+
+fn resolved_package_can_replace(candidate: &ResolvedPackage, package: &ResolvedPackage) -> bool {
+    candidate.tarball_url == package.tarball_url
+        && candidate.integrity == package.integrity
+        && entries_are_superset(&candidate.dependencies, &package.dependencies)
+        && aliases_are_superset(&candidate.aliases, &package.aliases)
+        && entries_are_superset(&candidate.peers, &package.peers)
+}
+
+fn resolved_package_is_strict_superset(
+    candidate: &ResolvedPackage,
+    package: &ResolvedPackage,
+) -> bool {
+    candidate.dependencies.len() > package.dependencies.len()
+        || candidate.aliases.len() > package.aliases.len()
+        || candidate.peers.len() > package.peers.len()
+}
+
+fn entries_are_superset(candidate: &[(String, String)], package: &[(String, String)]) -> bool {
+    package.iter().all(|entry| {
+        candidate
+            .iter()
+            .any(|candidate_entry| candidate_entry == entry)
+    })
+}
+
+fn aliases_are_superset(
+    candidate: &HashMap<String, String>,
+    package: &HashMap<String, String>,
+) -> bool {
+    package
+        .iter()
+        .all(|(local, target)| candidate.get(local) == Some(target))
 }
 
 /// Intersect a consumer's declared `peerDependencies` against the
@@ -1861,6 +1955,157 @@ these are incompatible
         let fallback = extract_conflicts_fallback(report);
         assert!(!fallback.is_empty(), "fallback should find something");
         assert!(fallback.contains("foo"));
+    }
+
+    fn resolved_pkg_with_graph(
+        name: &str,
+        version: &str,
+        context: Option<&str>,
+        dependencies: &[(&str, &str)],
+        peers: &[(&str, &str)],
+    ) -> ResolvedPackage {
+        let package = match context {
+            Some(context) => ResolverPackage::npm(name).with_context(context),
+            None => ResolverPackage::npm(name),
+        };
+        ResolvedPackage {
+            package,
+            version: NpmVersion::parse(version).unwrap(),
+            dependencies: dependencies
+                .iter()
+                .map(|(name, version)| ((*name).to_string(), (*version).to_string()))
+                .collect(),
+            aliases: HashMap::new(),
+            peers: peers
+                .iter()
+                .map(|(name, version)| ((*name).to_string(), (*version).to_string()))
+                .collect(),
+            tarball_url: None,
+            integrity: None,
+        }
+    }
+
+    #[test]
+    fn peer_superset_dedup_prefers_row_with_superset_edges_and_peers() {
+        let mut packages = vec![
+            resolved_pkg_with_graph(
+                "plugin",
+                "1.0.0",
+                Some("react"),
+                &[("shared", "1.0.0")],
+                &[("react", "18.2.0")],
+            ),
+            resolved_pkg_with_graph(
+                "plugin",
+                "1.0.0",
+                Some("react-dom"),
+                &[("shared", "1.0.0"), ("extra", "1.0.0")],
+                &[("react", "18.2.0"), ("react-dom", "18.2.0")],
+            ),
+        ];
+
+        dedupe_peer_superset_packages(&mut packages);
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(
+            packages[0].dependencies,
+            vec![
+                ("shared".to_string(), "1.0.0".to_string()),
+                ("extra".to_string(), "1.0.0".to_string())
+            ],
+            "the retained row must be the graph superset"
+        );
+        assert_eq!(
+            packages[0].peers,
+            vec![
+                ("react".to_string(), "18.2.0".to_string()),
+                ("react-dom".to_string(), "18.2.0".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_superset_dedup_collapses_identical_split_contexts() {
+        let mut packages = vec![
+            resolved_pkg_with_graph(
+                "cross-spawn",
+                "7.0.6",
+                Some("parent-a"),
+                &[("path-key", "3.1.1")],
+                &[],
+            ),
+            resolved_pkg_with_graph(
+                "cross-spawn",
+                "7.0.6",
+                Some("parent-b"),
+                &[("path-key", "3.1.1")],
+                &[],
+            ),
+        ];
+
+        dedupe_peer_superset_packages(&mut packages);
+
+        assert_eq!(
+            packages.len(),
+            1,
+            "identical same-version split contexts must collapse before install conversion"
+        );
+    }
+
+    #[test]
+    fn peer_superset_dedup_keeps_non_comparable_peer_contexts() {
+        let mut packages = vec![
+            resolved_pkg_with_graph(
+                "plugin",
+                "1.0.0",
+                Some("react-17"),
+                &[("shared", "1.0.0")],
+                &[("react", "17.0.2")],
+            ),
+            resolved_pkg_with_graph(
+                "plugin",
+                "1.0.0",
+                Some("react-18"),
+                &[("shared", "1.0.0")],
+                &[("react", "18.2.0")],
+            ),
+        ];
+
+        dedupe_peer_superset_packages(&mut packages);
+
+        assert_eq!(
+            packages.len(),
+            2,
+            "same package/version rows with different peer bindings are not interchangeable"
+        );
+    }
+
+    #[test]
+    fn peer_superset_dedup_keeps_non_comparable_dependency_edges() {
+        let mut packages = vec![
+            resolved_pkg_with_graph(
+                "plugin",
+                "1.0.0",
+                Some("left"),
+                &[("left-only", "1.0.0")],
+                &[("react", "18.2.0")],
+            ),
+            resolved_pkg_with_graph(
+                "plugin",
+                "1.0.0",
+                Some("right"),
+                &[("right-only", "1.0.0")],
+                &[("react", "18.2.0"), ("react-dom", "18.2.0")],
+            ),
+        ];
+
+        dedupe_peer_superset_packages(&mut packages);
+
+        assert_eq!(
+            packages.len(),
+            2,
+            "peer supersets cannot replace rows with unrelated dependency edges"
+        );
     }
 
     // === Post-resolution peer dependency checking ===

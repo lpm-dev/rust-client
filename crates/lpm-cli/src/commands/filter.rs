@@ -14,6 +14,7 @@ use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_task::filter::{FilterEngine, FilterExpr, MatchKind, TraceReason};
 use lpm_task::graph::WorkspaceGraph;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Format the D2 substring → glob migration hint when a filter set returns
@@ -52,6 +53,20 @@ pub(crate) fn format_no_match_hint(raw_filters: &[String]) -> Option<String> {
     ))
 }
 
+pub(crate) fn format_no_match_hint_for_sets(
+    filters: &[String],
+    filter_prod: &[String],
+) -> Option<String> {
+    if filter_prod.is_empty() {
+        return format_no_match_hint(filters);
+    }
+
+    let mut combined = Vec::with_capacity(filters.len() + filter_prod.len());
+    combined.extend_from_slice(filters);
+    combined.extend_from_slice(filter_prod);
+    format_no_match_hint(&combined)
+}
+
 /// Heuristic: does this filter string look like a bare name (no special
 /// characters), suggesting the user might be expecting substring matching?
 ///
@@ -68,17 +83,29 @@ fn looks_like_bare_name(raw: &str) -> bool {
         && !trimmed.starts_with("../")
         && !trimmed.starts_with('[')
         && !trimmed.starts_with('{')
+        && !trimmed.contains('{')
+        && !trimmed.contains('}')
         && !trimmed.starts_with('!')
         && !trimmed.contains("...")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     project_dir: &Path,
     exprs: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     explain_mode: bool,
     fail_if_no_match: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    if exprs.is_empty() && filter_prod.is_empty() {
+        return Err(LpmError::Script(
+            "lpm filter requires at least one expression or --filter-prod <expr>".into(),
+        ));
+    }
+
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
         .ok_or_else(|| {
@@ -86,7 +113,6 @@ pub async fn run(
         })?;
 
     let graph = WorkspaceGraph::from_workspace(&workspace);
-    let engine = FilterEngine::new(&graph, &workspace.root);
 
     // Parse all CLI exprs through the same parser as `lpm run --filter`.
     let mut parsed: Vec<FilterExpr> = Vec::with_capacity(exprs.len());
@@ -96,13 +122,74 @@ pub async fn run(
                 .map_err(|e| LpmError::Script(format!("invalid filter {raw:?}: {e}")))?,
         );
     }
+    let mut parsed_prod: Vec<FilterExpr> = Vec::with_capacity(filter_prod.len());
+    for raw in filter_prod {
+        parsed_prod.push(
+            FilterEngine::parse(raw)
+                .map_err(|e| LpmError::Script(format!("invalid --filter-prod {raw:?}: {e}")))?,
+        );
+    }
 
-    let mut explain = engine
-        .explain(&parsed)
-        .map_err(|e| LpmError::Script(format!("filter error: {e}")))?;
+    let needs_changed_files = parsed.iter().any(FilterExpr::contains_git_ref)
+        || parsed_prod.iter().any(FilterExpr::contains_git_ref);
+    let changed_files_ignore_patterns =
+        if needs_changed_files || !changed_files_ignore_pattern.is_empty() {
+            crate::workspace_filter_config::resolve_changed_files_ignore_patterns(
+                &workspace.root,
+                changed_files_ignore_pattern,
+            )?
+        } else {
+            Vec::new()
+        };
+    let test_patterns = if needs_changed_files || !test_pattern.is_empty() {
+        crate::workspace_filter_config::resolve_test_patterns(&workspace.root, test_pattern)?
+    } else {
+        Vec::new()
+    };
+
+    let engine = FilterEngine::with_options(
+        &graph,
+        &workspace.root,
+        lpm_task::filter::FilterOptions {
+            changed_files_ignore_patterns: &changed_files_ignore_patterns,
+            test_patterns: &test_patterns,
+            ..Default::default()
+        },
+    );
+    let prod_engine = FilterEngine::with_options(
+        &graph,
+        &workspace.root,
+        lpm_task::filter::FilterOptions {
+            follow_prod_deps_only: true,
+            changed_files_ignore_patterns: &changed_files_ignore_patterns,
+            test_patterns: &test_patterns,
+        },
+    );
+
+    let mut explain = if parsed.is_empty() {
+        None
+    } else {
+        Some(
+            engine
+                .explain(&parsed)
+                .map_err(|e| LpmError::Script(format!("filter error: {e}")))?,
+        )
+    };
+
+    if !parsed_prod.is_empty() {
+        let mut prod_explain = prod_engine
+            .explain(&parsed_prod)
+            .map_err(|e| LpmError::Script(format!("filter error: {e}")))?;
+        match &mut explain {
+            Some(explain) => merge_explain(&graph, explain, &mut prod_explain),
+            None => explain = Some(prod_explain),
+        }
+    }
+
+    let mut explain = explain.expect("at least one filter set was evaluated");
 
     // Populate the input field that the engine leaves empty.
-    explain.input = exprs.to_vec();
+    explain.input = combined_filter_inputs(exprs, filter_prod);
 
     if json_output {
         // Stable JSON shape for agents. Always includes the full trace
@@ -154,6 +241,54 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn combined_filter_inputs(filters: &[String], filter_prod: &[String]) -> Vec<String> {
+    let mut input = Vec::with_capacity(filters.len() + filter_prod.len());
+    input.extend_from_slice(filters);
+    input.extend_from_slice(filter_prod);
+    input
+}
+
+fn merge_explain(
+    graph: &WorkspaceGraph,
+    base: &mut lpm_task::filter::FilterExplain,
+    extra: &mut lpm_task::filter::FilterExplain,
+) {
+    let mut selected: HashSet<usize> = base.selected.iter().copied().collect();
+    selected.extend(extra.selected.iter().copied());
+
+    base.selected = topologically_sorted_selection(graph, &selected);
+
+    let mut traced: HashSet<usize> = base.traces.iter().map(|trace| trace.package).collect();
+    for trace in extra.traces.drain(..) {
+        if traced.insert(trace.package) {
+            base.traces.push(trace);
+        }
+    }
+
+    for note in extra.notes.drain(..) {
+        if !base.notes.contains(&note) {
+            base.notes.push(note);
+        }
+    }
+    if !base.selected.is_empty() {
+        base.notes.clear();
+    }
+}
+
+fn topologically_sorted_selection(graph: &WorkspaceGraph, selected: &HashSet<usize>) -> Vec<usize> {
+    match graph.topological_levels() {
+        Ok(levels) => levels
+            .iter()
+            .flat_map(|level| level.iter().filter(|id| selected.contains(id)).copied())
+            .collect(),
+        Err(_) => {
+            let mut ids: Vec<usize> = selected.iter().copied().collect();
+            ids.sort_unstable();
+            ids
+        }
+    }
 }
 
 /// Shared empty-result rendering used by both terse and explain modes.
@@ -235,6 +370,7 @@ fn describe_reason(graph: &WorkspaceGraph, reason: &TraceReason) -> String {
                 MatchKind::GlobName => "glob",
                 MatchKind::PathGlob => "path-glob",
                 MatchKind::PathExact => "path",
+                MatchKind::NamePathScope => "name+path",
                 MatchKind::GitRef => "git-ref",
             };
             format!("matched {filter:?} ({kind_label})")
@@ -264,6 +400,7 @@ fn trace_reason_to_json(reason: &TraceReason) -> serde_json::Value {
                 MatchKind::GlobName => "glob_name",
                 MatchKind::PathGlob => "path_glob",
                 MatchKind::PathExact => "path_exact",
+                MatchKind::NamePathScope => "name_path_scope",
                 MatchKind::GitRef => "git_ref",
             },
         }),

@@ -21,6 +21,7 @@
 
 use lpm_common::integrity::{HashAlgorithm, Integrity};
 use lpm_common::{LpmError, LpmRoot};
+use sha1::Sha1;
 use sha2::{Digest, Sha512};
 use std::path::{Path, PathBuf};
 
@@ -214,7 +215,7 @@ impl PackageStore {
     /// keyed by SRI integrity hash.
     ///
     /// Layout: `~/.lpm/store/v1/tarball/{algo}-{hex}/` where `{algo}`
-    /// is `sha256` or `sha512` and `{hex}` is lowercase hex of the
+    /// is `sha1`, `sha256`, or `sha512` and `{hex}` is lowercase hex of the
     /// raw hash bytes. Hex keeps the directory filesystem-safe on
     /// every platform (no `/`, `+`, or `=`).
     ///
@@ -227,6 +228,7 @@ impl PackageStore {
     pub fn tarball_store_path(&self, integrity_sri: &str) -> Result<PathBuf, LpmError> {
         let int = Integrity::parse(integrity_sri)?;
         let algo = match int.algorithm {
+            HashAlgorithm::Sha1 => "sha1",
             HashAlgorithm::Sha256 => "sha256",
             HashAlgorithm::Sha512 => "sha512",
         };
@@ -664,7 +666,8 @@ impl PackageStore {
             return Err(LpmError::Io(e));
         }
 
-        let (computed_sri, computed_sha256, _compressed_size) = hashing_reader.finalize();
+        let (computed_sri, computed_sha256, computed_sha1, _compressed_size) =
+            hashing_reader.finalize();
         timings.extract_ms = extract_start.elapsed().as_millis();
 
         // M18: verify against the algorithm declared in `expected`.
@@ -686,11 +689,13 @@ impl PackageStore {
                 &computed_sri
             } else if expected.starts_with("sha256-") {
                 &computed_sha256
+            } else if expected.starts_with("sha1-") {
+                &computed_sha1
             } else {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 return Err(LpmError::Registry(format!(
                     "unsupported integrity algorithm for {name}@{version}: {expected} — \
-                     expected sha512-… (preferred) or sha256-…"
+                     expected sha512-… (preferred), sha256-…, or sha1-…"
                 )));
             };
             let matches_expected = expected.len() == candidate.len()
@@ -1100,6 +1105,17 @@ pub fn compute_sri_hash_sha256(data: &[u8]) -> String {
     let hash = Sha256::digest(data);
     let b64 = base64::engine::general_purpose::STANDARD.encode(hash);
     format!("sha256-{b64}")
+}
+
+/// Compute a sha1 SRI for tarball data. npm's legacy `dist.shasum`
+/// field is a hex SHA-1 digest; converting it to SRI lets the same
+/// verifier cover old registry metadata without falling back to
+/// unverified downloads.
+pub fn compute_sri_hash_sha1(data: &[u8]) -> String {
+    use base64::Engine;
+    let hash = Sha1::digest(data);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(hash);
+    format!("sha1-{b64}")
 }
 
 /// Read the stored `.integrity` file for a package.
@@ -1638,11 +1654,12 @@ pub fn find_installed_package_baseline(
 /// actually gets verified against the matching computation.
 ///
 /// After the extractor finishes consuming the stream, call
-/// [`HashingReader::finalize`] to obtain `(sha512_sri, sha256_sri, total_bytes)`.
+/// [`HashingReader::finalize`] to obtain `(sha512_sri, sha256_sri, sha1_sri, total_bytes)`.
 struct HashingReader<R> {
     inner: R,
     sha512: Sha512,
     sha256: sha2::Sha256,
+    sha1: Sha1,
     bytes: u64,
 }
 
@@ -1653,16 +1670,18 @@ impl<R: std::io::Read> HashingReader<R> {
             inner,
             sha512: Sha512::new(),
             sha256: sha2::Sha256::new(),
+            sha1: Sha1::new(),
             bytes: 0,
         }
     }
 
-    /// Finalize both hashers and return `(sha512_sri, sha256_sri, total_bytes)`.
+    /// Finalize all hashers and return `(sha512_sri, sha256_sri, sha1_sri, total_bytes)`.
     /// Consumes `self` because the hashers are one-shot.
-    fn finalize(self) -> (String, String, u64) {
+    fn finalize(self) -> (String, String, String, u64) {
         use base64::Engine;
         let sha512_digest = self.sha512.finalize();
         let sha256_digest = self.sha256.finalize();
+        let sha1_digest = self.sha1.finalize();
         let sha512_sri = format!(
             "sha512-{}",
             base64::engine::general_purpose::STANDARD.encode(sha512_digest)
@@ -1671,7 +1690,11 @@ impl<R: std::io::Read> HashingReader<R> {
             "sha256-{}",
             base64::engine::general_purpose::STANDARD.encode(sha256_digest)
         );
-        (sha512_sri, sha256_sri, self.bytes)
+        let sha1_sri = format!(
+            "sha1-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha1_digest)
+        );
+        (sha512_sri, sha256_sri, sha1_sri, self.bytes)
     }
 }
 
@@ -1682,6 +1705,7 @@ impl<R: std::io::Read> std::io::Read for HashingReader<R> {
         if n > 0 {
             self.sha512.update(&buf[..n]);
             self.sha256.update(&buf[..n]);
+            self.sha1.update(&buf[..n]);
             self.bytes += n as u64;
         }
         Ok(n)
@@ -2073,7 +2097,7 @@ mod tests {
         let data = b"hello world";
         let mut reader = HashingReader::new(std::io::Cursor::new(data));
         let _ = std::io::copy(&mut reader, &mut std::io::sink()).unwrap();
-        let (sha512_sri, sha256_sri, bytes) = reader.finalize();
+        let (sha512_sri, sha256_sri, sha1_sri, bytes) = reader.finalize();
 
         // Bytes counted match input length.
         assert_eq!(bytes, data.len() as u64);
@@ -2082,10 +2106,12 @@ mod tests {
         assert_eq!(sha512_sri, compute_sri_hash(data));
         // sha256 SRI matches the standalone helper.
         assert_eq!(sha256_sri, compute_sri_hash_sha256(data));
+        assert_eq!(sha1_sri, compute_sri_hash_sha1(data));
 
         // Sanity-check the algorithm prefixes.
         assert!(sha512_sri.starts_with("sha512-"));
         assert!(sha256_sri.starts_with("sha256-"));
+        assert!(sha1_sri.starts_with("sha1-"));
     }
 
     /// M18: the dual-digest helper produces stable, known-good
@@ -2099,6 +2125,12 @@ mod tests {
         // base64 of that digest = 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
         let sri = compute_sri_hash_sha256(b"");
         assert_eq!(sri, "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=");
+    }
+
+    #[test]
+    fn compute_sri_hash_sha1_known_vector() {
+        let sri = compute_sri_hash_sha1(b"");
+        assert_eq!(sri, "sha1-2jmj7l5rSw0yVb/vlWAYkK/YBwk=");
     }
 
     #[test]

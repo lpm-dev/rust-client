@@ -15,10 +15,11 @@
 //!              | atom                       (* ...foo  = with-dependents *)
 //! inner_fwd   := atom "^"                  (* foo^... = deps-only *)
 //!              | atom                       (* foo...  = with-deps *)
-//! atom        := git_ref | path_exact | path_glob | name_glob | name
+//! atom        := git_ref | path_exact | path_glob | name_path | name_glob | name
 //! git_ref     := "[" <ref characters> "]"
 //! path_exact  := "{" path "}"
 //! path_glob   := "./" <glob chars> | "../" <glob chars>
+//! name_path   := name_or_glob "{" path "}"
 //! name_glob   := <package name with * or ?>
 //! name        := <package name>
 //! ```
@@ -198,6 +199,22 @@ fn parse_atom(s: &str, original_input: &str) -> Result<FilterExpr, ParseError> {
         return Ok(FilterExpr::PathExact(inner.to_string()));
     }
 
+    if let Some(open_brace) = s.find('{') {
+        let path_end = s
+            .strip_suffix('}')
+            .ok_or_else(|| ParseError::UnclosedPath(original_input.to_string()))?;
+        let name_part = &s[..open_brace];
+        let path_part = &path_end[open_brace + 1..];
+        if name_part.is_empty() || path_part.is_empty() {
+            return Err(ParseError::Empty);
+        }
+        let name = parse_name_atom(name_part, original_input)?;
+        return Ok(FilterExpr::NamePathScope {
+            name: Box::new(name),
+            path: Box::new(FilterExpr::PathExact(path_part.to_string())),
+        });
+    }
+
     // Path glob: starts with `./` or `../`
     if s.starts_with("./") || s.starts_with("../") {
         // Reject embedded `[` and `{` which would be ambiguous with other atoms
@@ -207,6 +224,10 @@ fn parse_atom(s: &str, original_input: &str) -> Result<FilterExpr, ParseError> {
         return Ok(FilterExpr::PathGlob(s.to_string()));
     }
 
+    parse_name_atom(s, original_input)
+}
+
+fn parse_name_atom(s: &str, original_input: &str) -> Result<FilterExpr, ParseError> {
     // Reject characters that are not legal anywhere in a bare-name atom.
     // Catches `foo!bar`, `foo[bar`, `foo{bar`, bare `]` / `}`, etc.
     for (pos, ch) in s.chars().enumerate() {
@@ -320,6 +341,28 @@ mod tests {
         assert_eq!(
             parse("{packages/foo}").unwrap(),
             FilterExpr::PathExact("packages/foo".into())
+        );
+    }
+
+    #[test]
+    fn parses_name_path_scope_with_exact_name() {
+        assert_eq!(
+            parse("foo{./packages/foo}").unwrap(),
+            FilterExpr::NamePathScope {
+                name: Box::new(FilterExpr::ExactName("foo".into())),
+                path: Box::new(FilterExpr::PathExact("./packages/foo".into())),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_name_path_scope_with_name_glob() {
+        assert_eq!(
+            parse("@scope/*{./apps/web}").unwrap(),
+            FilterExpr::NamePathScope {
+                name: Box::new(FilterExpr::GlobName("@scope/*".into())),
+                path: Box::new(FilterExpr::PathExact("./apps/web".into())),
+            }
         );
     }
 

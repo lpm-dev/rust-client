@@ -6,6 +6,35 @@
 use lpm_workspace::Workspace;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Dependency declaration section that produced a workspace graph edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyKind {
+    Dependency,
+    DevDependency,
+    OptionalDependency,
+    PeerDependency,
+}
+
+impl DependencyKind {
+    fn is_production_graph_edge(self) -> bool {
+        !matches!(self, DependencyKind::DevDependency)
+    }
+}
+
+/// A typed workspace graph edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencyEdge {
+    pub target: usize,
+    pub kind: DependencyKind,
+}
+
+type WorkspaceEdgeLists = (
+    Vec<Vec<usize>>,
+    Vec<Vec<usize>>,
+    Vec<Vec<DependencyEdge>>,
+    Vec<Vec<DependencyEdge>>,
+);
+
 /// A workspace dependency graph.
 #[derive(Debug)]
 pub struct WorkspaceGraph {
@@ -15,6 +44,10 @@ pub struct WorkspaceGraph {
     pub edges: Vec<Vec<usize>>,
     /// Reverse adjacency: reverse_edges[i] = indices of packages that depend on package i.
     pub reverse_edges: Vec<Vec<usize>>,
+    /// Typed adjacency list parallel to `edges`.
+    pub dependency_edges: Vec<Vec<DependencyEdge>>,
+    /// Typed reverse adjacency parallel to `reverse_edges`.
+    pub reverse_dependency_edges: Vec<Vec<DependencyEdge>>,
     /// Name → index mapping.
     pub name_to_idx: HashMap<String, usize>,
 }
@@ -49,28 +82,39 @@ impl WorkspaceGraph {
         }
 
         // Build edges: member i depends on member j if j's name appears in i's deps
-        let mut edges = vec![vec![]; members.len()];
-        let mut reverse_edges = vec![vec![]; members.len()];
+        let mut edge_builder = WorkspaceEdgeBuilder::new(members.len(), &name_to_idx);
 
         for (idx, member) in workspace.members.iter().enumerate() {
-            let all_deps = member
-                .package
-                .dependencies
-                .keys()
-                .chain(member.package.dev_dependencies.keys());
-
-            for dep_name in all_deps {
-                if let Some(&dep_idx) = name_to_idx.get(dep_name) {
-                    edges[idx].push(dep_idx);
-                    reverse_edges[dep_idx].push(idx);
-                }
-            }
+            edge_builder.push_edges(
+                idx,
+                member.package.dependencies.keys(),
+                DependencyKind::Dependency,
+            );
+            edge_builder.push_edges(
+                idx,
+                member.package.dev_dependencies.keys(),
+                DependencyKind::DevDependency,
+            );
+            edge_builder.push_edges(
+                idx,
+                member.package.optional_dependencies.keys(),
+                DependencyKind::OptionalDependency,
+            );
+            edge_builder.push_edges(
+                idx,
+                member.package.peer_dependencies.keys(),
+                DependencyKind::PeerDependency,
+            );
         }
+        let (edges, reverse_edges, dependency_edges, reverse_dependency_edges) =
+            edge_builder.finish();
 
         WorkspaceGraph {
             members,
             edges,
             reverse_edges,
+            dependency_edges,
+            reverse_dependency_edges,
             name_to_idx,
         }
     }
@@ -141,6 +185,23 @@ impl WorkspaceGraph {
         result
     }
 
+    /// Get all transitive production dependents of a package.
+    pub fn transitive_prod_dependents(&self, idx: usize) -> HashSet<usize> {
+        let mut result = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(idx);
+
+        while let Some(node) = queue.pop_front() {
+            for edge in &self.reverse_dependency_edges[node] {
+                if edge.kind.is_production_graph_edge() && result.insert(edge.target) {
+                    queue.push_back(edge.target);
+                }
+            }
+        }
+
+        result
+    }
+
     /// Get all transitive dependencies of a package (packages it depends on, recursively).
     ///
     /// Mirror of `transitive_dependents` but walking `edges` (forward) instead of
@@ -157,6 +218,23 @@ impl WorkspaceGraph {
             for &dep in &self.edges[node] {
                 if result.insert(dep) {
                     queue.push_back(dep);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Get all transitive production dependencies of a package.
+    pub fn transitive_prod_dependencies(&self, idx: usize) -> HashSet<usize> {
+        let mut result = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(idx);
+
+        while let Some(node) = queue.pop_front() {
+            for edge in &self.dependency_edges[node] {
+                if edge.kind.is_production_graph_edge() && result.insert(edge.target) {
+                    queue.push_back(edge.target);
                 }
             }
         }
@@ -216,6 +294,57 @@ impl WorkspaceGraph {
     }
 }
 
+struct WorkspaceEdgeBuilder<'a> {
+    name_to_idx: &'a HashMap<String, usize>,
+    edges: Vec<Vec<usize>>,
+    reverse_edges: Vec<Vec<usize>>,
+    dependency_edges: Vec<Vec<DependencyEdge>>,
+    reverse_dependency_edges: Vec<Vec<DependencyEdge>>,
+}
+
+impl<'a> WorkspaceEdgeBuilder<'a> {
+    fn new(member_count: usize, name_to_idx: &'a HashMap<String, usize>) -> Self {
+        WorkspaceEdgeBuilder {
+            name_to_idx,
+            edges: vec![vec![]; member_count],
+            reverse_edges: vec![vec![]; member_count],
+            dependency_edges: vec![vec![]; member_count],
+            reverse_dependency_edges: vec![vec![]; member_count],
+        }
+    }
+
+    fn push_edges<'dep>(
+        &mut self,
+        from_idx: usize,
+        dep_names: impl Iterator<Item = &'dep String>,
+        kind: DependencyKind,
+    ) {
+        for dep_name in dep_names {
+            if let Some(&dep_idx) = self.name_to_idx.get(dep_name) {
+                self.edges[from_idx].push(dep_idx);
+                self.reverse_edges[dep_idx].push(from_idx);
+                self.dependency_edges[from_idx].push(DependencyEdge {
+                    target: dep_idx,
+                    kind,
+                });
+                self.reverse_dependency_edges[dep_idx].push(DependencyEdge {
+                    target: from_idx,
+                    kind,
+                });
+            }
+        }
+    }
+
+    fn finish(self) -> WorkspaceEdgeLists {
+        (
+            self.edges,
+            self.reverse_edges,
+            self.dependency_edges,
+            self.reverse_dependency_edges,
+        )
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GraphError {
     #[error("dependency cycle detected in workspace: {0}")]
@@ -229,16 +358,34 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
+    fn dependency_map(deps: &[&str]) -> HashMap<String, String> {
+        deps.iter()
+            .map(|d| ((*d).to_string(), "*".to_string()))
+            .collect()
+    }
+
     fn make_member(name: &str, deps: &[&str]) -> WorkspaceMember {
+        make_member_with_sections(name, deps, &[], &[], &[])
+    }
+
+    fn make_member_with_sections(
+        name: &str,
+        deps: &[&str],
+        dev_deps: &[&str],
+        optional_deps: &[&str],
+        peer_deps: &[&str],
+    ) -> WorkspaceMember {
         let mut dependencies = HashMap::new();
-        for d in deps {
-            dependencies.insert(d.to_string(), "*".to_string());
-        }
+        dependencies.extend(dependency_map(deps));
+
         WorkspaceMember {
             path: PathBuf::from(format!("packages/{name}")),
             package: PackageJson {
                 name: Some(name.to_string()),
                 dependencies,
+                dev_dependencies: dependency_map(dev_deps),
+                optional_dependencies: dependency_map(optional_deps),
+                peer_dependencies: dependency_map(peer_deps),
                 ..Default::default()
             },
         }
@@ -425,6 +572,52 @@ mod tests {
         let deps_of_app = graph.transitive_dependencies(1);
         assert!(deps_of_app.contains(&0), "app depends on ui");
         assert_eq!(deps_of_app.len(), 1, "external react is not a member");
+    }
+
+    #[test]
+    fn transitive_prod_dependencies_skip_dev_dependency_edges() {
+        let ws = make_workspace(vec![
+            make_member("core", &[]),
+            make_member("test-utils", &[]),
+            make_member_with_sections("app", &["core"], &["test-utils"], &[], &[]),
+        ]);
+        let graph = WorkspaceGraph::from_workspace(&ws);
+
+        let all_deps = graph.transitive_dependencies(2);
+        let prod_deps = graph.transitive_prod_dependencies(2);
+
+        assert_eq!(all_deps, HashSet::from([0usize, 1]));
+        assert_eq!(prod_deps, HashSet::from([0usize]));
+    }
+
+    #[test]
+    fn transitive_prod_dependents_skip_dev_dependency_edges() {
+        let ws = make_workspace(vec![
+            make_member("shared", &[]),
+            make_member("app", &["shared"]),
+            make_member_with_sections("test-runner", &[], &["shared"], &[], &[]),
+        ]);
+        let graph = WorkspaceGraph::from_workspace(&ws);
+
+        let all_dependents = graph.transitive_dependents(0);
+        let prod_dependents = graph.transitive_prod_dependents(0);
+
+        assert_eq!(all_dependents, HashSet::from([1usize, 2]));
+        assert_eq!(prod_dependents, HashSet::from([1usize]));
+    }
+
+    #[test]
+    fn transitive_prod_dependencies_include_optional_and_peer_edges() {
+        let ws = make_workspace(vec![
+            make_member("optional-helper", &[]),
+            make_member("peer-runtime", &[]),
+            make_member_with_sections("app", &[], &[], &["optional-helper"], &["peer-runtime"]),
+        ]);
+        let graph = WorkspaceGraph::from_workspace(&ws);
+
+        let prod_deps = graph.transitive_prod_dependencies(2);
+
+        assert_eq!(prod_deps, HashSet::from([0usize, 1]));
     }
 
     #[test]

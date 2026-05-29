@@ -1720,17 +1720,18 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         false,                                                   // force
         false,                                                   // allow_new
         false,                                                   // strict_integrity
-        None,                                                    // linker_override
-        false,                                                   // no_skills
-        false,                                                   // no_editor_setup
-        true,                                                    // no_security_summary
-        false,                                                   // auto_build
-        None, // target_set: doctor is single-project
-        None, // direct_versions_out: doctor does not finalize placeholders
-        None, // requested_add_count: doctor auto-fix install is not an add-path install
-        None, // script_policy_override: `lpm doctor` does not expose policy flags
-        None, // advisor_override: `lpm doctor` does not expose `--advisor`
-        None, // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
+        None,  // strict_peer_dependencies_override
+        None,  // linker_override
+        false, // no_skills
+        false, // no_editor_setup
+        true,  // no_security_summary
+        false, // auto_build
+        None,  // target_set: doctor is single-project
+        None,  // direct_versions_out: doctor does not finalize placeholders
+        None,  // requested_add_count: doctor auto-fix install is not an add-path install
+        None,  // script_policy_override: `lpm doctor` does not expose policy flags
+        None,  // advisor_override: `lpm doctor` does not expose `--advisor`
+        None,  // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
         crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: doctor's auto-fix install honors env + config posture chain
         // doctor's auto-fix install does not

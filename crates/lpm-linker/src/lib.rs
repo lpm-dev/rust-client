@@ -216,6 +216,56 @@ fn relative_symlink_target_from_parent(target: &Path, link_parent: &Path) -> Pat
     pathdiff::diff_paths(target, &link_parent_canonical).unwrap_or_else(|| target.to_path_buf())
 }
 
+#[cfg(unix)]
+pub(crate) fn make_bin_target_executable(target: &Path) -> Result<(), LpmError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(meta) = std::fs::metadata(target) else {
+        return Ok(());
+    };
+    let mode = meta.permissions().mode();
+    if mode & 0o111 != 0 {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    detach_single_hardlinked_file(target)?;
+    #[cfg(all(unix, not(target_os = "linux")))]
+    detach_single_hardlinked_file(target);
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode | 0o111))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn detach_single_hardlinked_file(path: &Path) -> Result<(), LpmError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.nlink() <= 1 {
+        return Ok(());
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let tmp = path.with_file_name(format!("{DETACH_TMP_PREFIX}{file_name}-{}", metadata.ino()));
+    if tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    std::fs::copy(path, &tmp)?;
+    std::fs::set_permissions(&tmp, metadata.permissions())?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(error.into())
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn detach_single_hardlinked_file(_path: &Path) {}
+
 // Follow-up: cmd-path validation moved to
 // `lpm_common::symlink` so lpm-store v2 shares the same security check
 // (was duplicated). Re-imported under the legacy local name to keep
@@ -2301,17 +2351,7 @@ fn create_bin_links_hoisted(
                 let rel_target = relative_symlink_target_from_parent(&target, &bin_dir);
                 std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
-                // Add execute only (0o111), not full 0o755
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = std::fs::metadata(&target) {
-                    let mode = meta.permissions().mode();
-                    if mode & 0o111 == 0 {
-                        std::fs::set_permissions(
-                            &target,
-                            std::fs::Permissions::from_mode(mode | 0o111),
-                        )?;
-                    }
-                }
+                make_bin_target_executable(&target)?;
             }
 
             #[cfg(windows)]
@@ -2429,17 +2469,7 @@ pub fn create_bin_links(
                 let rel_target = relative_symlink_target_from_parent(&target, &bin_dir);
                 std::os::unix::fs::symlink(&rel_target, &bin_link)?;
 
-                // Add execute only (0o111), not full 0o755
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = std::fs::metadata(&target) {
-                    let mode = meta.permissions().mode();
-                    if mode & 0o111 == 0 {
-                        std::fs::set_permissions(
-                            &target,
-                            std::fs::Permissions::from_mode(mode | 0o111),
-                        )?;
-                    }
-                }
+                make_bin_target_executable(&target)?;
             }
 
             #[cfg(windows)]
@@ -2678,9 +2708,15 @@ fn link_dir_recursive(src: &Path, dst: &Path) -> Result<(), LpmError> {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
-        if src_path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             link_dir_recursive(&src_path, &dst_path)?;
-        } else {
+        } else if file_type.is_symlink() {
+            return Err(LpmError::Store(format!(
+                "refusing to follow symlink while linking package store entry: {}",
+                src_path.display()
+            )));
+        } else if file_type.is_file() {
             // Try hardlink first (instant, zero disk cost on same filesystem)
             if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
                 // **Round-7 audit response — trace fallback.** Hardlink
@@ -4170,7 +4206,7 @@ mod tests {
             is_direct: true,
             root_link_names: None,
             wrapper_id: None,
-            materialization: Materialization::CasBacked,
+            materialization: Materialization::DirectorySource,
             peers: Vec::new(),
             patch_fingerprint: None,
         }];
@@ -5893,6 +5929,62 @@ mod tests {
             .unwrap()
             .ino();
         assert_ne!(store_ino, live_ino);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn make_bin_target_executable_detaches_hardlink_before_chmod() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let store = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        let store_bin = store.path().join("cli.js");
+        let live_bin = live.path().join("cli.js");
+        std::fs::write(&store_bin, b"#!/usr/bin/env node\n").unwrap();
+        std::fs::set_permissions(&store_bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::hard_link(&store_bin, &live_bin).unwrap();
+
+        make_bin_target_executable(&live_bin).unwrap();
+
+        assert_ne!(
+            std::fs::metadata(&store_bin).unwrap().ino(),
+            std::fs::metadata(&live_bin).unwrap().ino(),
+            "chmod target must no longer share the store inode"
+        );
+        assert_eq!(
+            std::fs::metadata(&store_bin).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "store mode must stay unchanged"
+        );
+        assert_eq!(
+            std::fs::metadata(&live_bin).unwrap().permissions().mode() & 0o111,
+            0o111,
+            "live bin target must become executable"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn link_dir_recursive_rejects_symlinked_directory_entries() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(target.path().join("payload.js"), b"payload").unwrap();
+        std::os::unix::fs::symlink(target.path(), src.path().join("dep")).unwrap();
+
+        let err = link_dir_recursive(src.path(), &dst.path().join("out")).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink refusal, got {err}"
+        );
+        assert!(
+            !dst.path()
+                .join("out")
+                .join("dep")
+                .join("payload.js")
+                .exists(),
+            "linking must not follow a symlinked directory out of the store tree"
+        );
     }
 
     #[cfg(target_os = "linux")]

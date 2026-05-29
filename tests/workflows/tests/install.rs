@@ -2208,6 +2208,104 @@ async fn install_filtered_from_member_dir_reads_workspace_root_lpm_toml() {
     );
 }
 
+#[tokio::test]
+async fn install_filtered_strict_catalog_mismatch_fails_before_member_side_effects() {
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "is-positive",
+        "1.0.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("is-positive", "1.0.0")),
+            ),
+            (
+                "2.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("is-positive", "2.0.0")),
+            ),
+        ],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "catalog-filter-workspace",
+        "version": "1.0.0",
+        "private": true,
+        "lpm": {
+            "catalogMode": "strict"
+        }
+    }"#,
+    );
+    project.write_file(
+        "pnpm-workspace.yaml",
+        r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^1.0.0
+"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+        "name": "app",
+        "version": "1.0.0"
+    }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "is-positive@2.0.0",
+            "--filter",
+            "app",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run filtered install with strict catalog mismatch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "filtered strict catalog mismatch must fail:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("catalogMode strict")
+            && stderr.contains("is-positive@2.0.0")
+            && stderr.contains("catalog:^1.0.0"),
+        "filtered strict mismatch error must name the requested and catalog specs:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Installing 1 package") && !stderr.contains("+ is-positive@2.0.0"),
+        "filtered strict catalog mismatch must fail before install progress output:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let app_pkg: serde_json::Value =
+        serde_json::from_str(&project.read_file("packages/app/package.json")).unwrap();
+    assert!(
+        app_pkg
+            .get("dependencies")
+            .and_then(|deps| deps.get("is-positive"))
+            .is_none(),
+        "failed filtered strict install must roll back the targeted member manifest: {app_pkg}"
+    );
+    assert!(
+        !project.file_exists("packages/app/lpm.lock")
+            && !project.file_exists("packages/app/lpm.lockb"),
+        "filtered strict catalog mismatch must not leave member lockfiles behind"
+    );
+    assert!(
+        !project.file_exists("packages/app/node_modules")
+            && !project.file_exists("packages/app/node_modules/is-positive"),
+        "filtered strict catalog mismatch must not materialize member node_modules"
+    );
+}
+
 /// **Step 6 end-to-end:** project-tier `./lpm.toml` with
 /// `save-prefix = "~"` must affect a bare `lpm install ms` so the
 /// manifest gets `"ms": "~2.1.3"`. Validates that the loader is

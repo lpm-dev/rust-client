@@ -22,7 +22,7 @@ pub use greedy::resolve_greedy_fused;
 pub use npm_version::NpmVersion;
 pub use overrides::{
     NpmRangeMatcher, OverrideEntry, OverrideError, OverrideHit, OverrideSelector, OverrideSet,
-    OverrideSource, OverrideTarget,
+    OverrideSource, OverrideTarget, override_selector_target_name,
 };
 pub use package::{CanonicalKey, ResolverPackage};
 pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta};

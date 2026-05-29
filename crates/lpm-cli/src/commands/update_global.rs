@@ -170,7 +170,7 @@ pub async fn run(
     // Audit Medium: exit non-zero on any failure so shell
     // automation can detect partial / total bulk-update failures.
     // Single-target update failure also surfaces here. A future
-    // `--continue-on-error` flag could opt out for users who want
+    // `--no-bail` flag could opt out for users who want
     // best-effort-bulk semantics.
     //
     // Audit pass-2 Medium 2: in --json mode, `emit_results` has already
@@ -734,6 +734,7 @@ async fn do_install_upgrade(
         false,                  // force
         false,                  // allow_new
         false,                  // strict_integrity
+        None,                   // strict_peer_dependencies_override
         None,                   // linker_override
         true,                   // no_skills
         true,                   // no_editor_setup

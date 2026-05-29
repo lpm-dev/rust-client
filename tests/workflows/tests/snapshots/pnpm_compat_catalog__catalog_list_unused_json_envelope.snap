@@ -1,0 +1,26 @@
+---
+source: tests/workflows/tests/pnpm_compat_catalog.rs
+assertion_line: 1061
+expression: envelope
+---
+{
+  "success": true,
+  "mode": "unused",
+  "count": 2,
+  "used_count": 1,
+  "unused_count": 2,
+  "entries": [
+    {
+      "catalog": "default",
+      "package": "is-negative",
+      "specifier": "^1.0.0",
+      "used": false
+    },
+    {
+      "catalog": "testing",
+      "package": "is-odd",
+      "specifier": "^3.0.0",
+      "used": false
+    }
+  ]
+}

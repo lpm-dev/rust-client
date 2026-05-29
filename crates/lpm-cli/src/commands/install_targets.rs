@@ -28,7 +28,6 @@
 //! Use [`install_root_for`] to get the per-target install root.
 
 use lpm_common::LpmError;
-use lpm_task::filter::FilterEngine;
 use lpm_task::graph::WorkspaceGraph;
 use std::path::{Path, PathBuf};
 
@@ -94,15 +93,23 @@ pub fn install_root_for(manifest: &Path) -> &Path {
 pub fn resolve_install_targets(
     cwd: &Path,
     filters: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     workspace_root_flag: bool,
     has_packages: bool,
 ) -> Result<InstallTargets, LpmError> {
     // ── Mutual exclusion: -w and --filter never compose ──────────────────
-    if workspace_root_flag && !filters.is_empty() {
+    if workspace_root_flag
+        && (!filters.is_empty()
+            || !filter_prod.is_empty()
+            || !changed_files_ignore_pattern.is_empty()
+            || !test_pattern.is_empty())
+    {
         return Err(LpmError::Script(
             "`-w` (workspace root) and `--filter` cannot be used together. \
-             Pick one: `-w` to target the workspace root, or `--filter <expr>` \
-             to target specific members."
+             This also applies to `--filter-prod`, `--changed-files-ignore-pattern`, and `--test-pattern`. \
+             Pick one: `-w` to target the workspace root, or a filter to target specific members."
                 .into(),
         ));
     }
@@ -120,10 +127,14 @@ pub fn resolve_install_targets(
                     .into(),
             ));
         }
-        if !filters.is_empty() {
+        if !filters.is_empty()
+            || !filter_prod.is_empty()
+            || !changed_files_ignore_pattern.is_empty()
+        {
             return Err(LpmError::Script(
-                "`--filter` requires a workspace. The current directory is a standalone project. \
-                 Run from inside a workspace, or omit `--filter` for a regular install."
+                "`--filter` requires a workspace. This also applies to `--filter-prod`, \
+                 `--changed-files-ignore-pattern`, and `--test-pattern`. The current directory \
+                 is a standalone project. Run from inside a workspace, or omit filters for a regular install."
                     .into(),
             ));
         }
@@ -147,22 +158,21 @@ pub fn resolve_install_targets(
         });
     }
 
-    // --filter → consume the shared FilterEngine
-    if !filters.is_empty() {
+    // --filter / --filter-prod → consume the shared FilterEngine
+    if !filters.is_empty() || !filter_prod.is_empty() {
         let graph = WorkspaceGraph::from_workspace(&workspace);
 
-        // Parse all filter strings into ASTs
-        let mut exprs = Vec::with_capacity(filters.len());
-        for raw in filters {
-            let parsed = FilterEngine::parse(raw)
-                .map_err(|e| LpmError::Script(format!("invalid --filter {raw:?}: {e}")))?;
-            exprs.push(parsed);
-        }
-
-        let engine = FilterEngine::new(&graph, &workspace.root);
-        let selected = engine
-            .evaluate(&exprs)
-            .map_err(|e| LpmError::Script(format!("filter error: {e}")))?;
+        let selected_set = crate::workspace_select::select_workspace_target_set(
+            &graph,
+            &workspace.root,
+            filters,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
+            false,
+            "main",
+        )?;
+        let selected = topologically_sorted_selection(&graph, &selected_set);
 
         let member_manifests: Vec<PathBuf> = selected
             .iter()
@@ -236,11 +246,45 @@ pub fn resolve_install_targets(
     })
 }
 
+fn topologically_sorted_selection(
+    graph: &WorkspaceGraph,
+    selected: &std::collections::HashSet<usize>,
+) -> Vec<usize> {
+    match graph.topological_levels() {
+        Ok(levels) => levels
+            .iter()
+            .flat_map(|level| level.iter().filter(|id| selected.contains(id)).copied())
+            .collect(),
+        Err(_) => {
+            let mut ids: Vec<usize> = selected.iter().copied().collect();
+            ids.sort_unstable();
+            ids
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+
+    fn resolve_install_targets(
+        cwd: &Path,
+        filters: &[String],
+        workspace_root_flag: bool,
+        has_packages: bool,
+    ) -> Result<InstallTargets, LpmError> {
+        super::resolve_install_targets(
+            cwd,
+            filters,
+            &[],
+            &[],
+            &[],
+            workspace_root_flag,
+            has_packages,
+        )
+    }
 
     /// Build a synthetic on-disk workspace at `root`. Each member is
     /// `(name, path_segments)` — `path_segments` is joined under the root

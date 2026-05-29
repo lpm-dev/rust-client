@@ -23,61 +23,142 @@ use std::path::Path;
 ///   dependents via `find_affected`. This matches the pre-existing contract.
 /// - **`--filter <expr>...`**: parsed and evaluated through `FilterEngine`.
 ///   Multi-filter unions are handled inside the engine.
+/// - **`--filter-prod <expr>...`**: same parser, but closure operators walk
+///   only production graph edges.
 /// - **`--filter` AND `--affected`**: union of both target sets — `--affected`
 ///   is treated as an implicit additional positive filter.
+#[allow(clippy::too_many_arguments)]
 pub fn select_workspace_target_set(
     ws_graph: &lpm_task::graph::WorkspaceGraph,
     workspace_root: &Path,
     filters: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     affected: bool,
     base_ref: &str,
 ) -> Result<HashSet<usize>, LpmError> {
-    use lpm_task::filter::{FilterEngine, FilterExpr};
-
-    if filters.is_empty() && !affected {
+    if filters.is_empty() && filter_prod.is_empty() && !affected {
         return Ok((0..ws_graph.len()).collect());
     }
 
-    let engine = FilterEngine::new(ws_graph, workspace_root);
+    let exprs = parse_filter_set(filters, false)?;
+    let prod_exprs = parse_filter_set(filter_prod, true)?;
+    let needs_changed_files = affected
+        || exprs
+            .iter()
+            .any(lpm_task::filter::FilterExpr::contains_git_ref)
+        || prod_exprs
+            .iter()
+            .any(lpm_task::filter::FilterExpr::contains_git_ref);
+    let changed_files_ignore_patterns =
+        if needs_changed_files || !changed_files_ignore_pattern.is_empty() {
+            crate::workspace_filter_config::resolve_changed_files_ignore_patterns(
+                workspace_root,
+                changed_files_ignore_pattern,
+            )?
+        } else {
+            Vec::new()
+        };
+    let test_patterns = if needs_changed_files || !test_pattern.is_empty() {
+        crate::workspace_filter_config::resolve_test_patterns(workspace_root, test_pattern)?
+    } else {
+        Vec::new()
+    };
 
-    let mut exprs: Vec<FilterExpr> = Vec::with_capacity(filters.len() + 1);
+    let affected_set: HashSet<usize> = if affected {
+        lpm_task::affected::find_affected_with_options(
+            ws_graph,
+            workspace_root,
+            base_ref,
+            lpm_task::affected::AffectedOptions {
+                changed_files_ignore_patterns: &changed_files_ignore_patterns,
+                test_patterns: &test_patterns,
+            },
+        )
+        .map_err(LpmError::Script)?
+    } else {
+        HashSet::new()
+    };
+
+    let mut target_set = evaluate_filter_set(
+        ws_graph,
+        workspace_root,
+        &exprs,
+        false,
+        &changed_files_ignore_patterns,
+        &test_patterns,
+    )?;
+    target_set.extend(evaluate_filter_set(
+        ws_graph,
+        workspace_root,
+        &prod_exprs,
+        true,
+        &changed_files_ignore_patterns,
+        &test_patterns,
+    )?);
+    target_set.extend(affected_set);
+    Ok(target_set)
+}
+
+fn parse_filter_set(
+    filters: &[String],
+    follow_prod_deps_only: bool,
+) -> Result<Vec<lpm_task::filter::FilterExpr>, LpmError> {
+    use lpm_task::filter::FilterEngine;
+    let flag_name = if follow_prod_deps_only {
+        "--filter-prod"
+    } else {
+        "--filter"
+    };
+    let mut exprs = Vec::with_capacity(filters.len());
     for raw in filters {
         let parsed = FilterEngine::parse(raw).map_err(|e| {
             LpmError::Script(format!(
-                "invalid --filter {raw:?}: {e}\n  \
+                "invalid {flag_name} {raw:?}: {e}\n  \
                  (substring matching is not supported; use a glob like '*{raw}*' \
                  if you intended a partial match.)"
             ))
         })?;
         exprs.push(parsed);
     }
+    Ok(exprs)
+}
 
-    let affected_set: HashSet<usize> = if affected {
-        lpm_task::affected::find_affected(ws_graph, workspace_root, base_ref)
-            .map_err(LpmError::Script)?
-    } else {
-        HashSet::new()
-    };
+fn evaluate_filter_set(
+    ws_graph: &lpm_task::graph::WorkspaceGraph,
+    workspace_root: &Path,
+    filters: &[lpm_task::filter::FilterExpr],
+    follow_prod_deps_only: bool,
+    changed_files_ignore_patterns: &[String],
+    test_patterns: &[String],
+) -> Result<HashSet<usize>, LpmError> {
+    use lpm_task::filter::{FilterEngine, FilterOptions};
 
-    let filter_target: HashSet<usize> = if exprs.is_empty() {
-        HashSet::new()
-    } else {
-        engine
-            .evaluate(&exprs)
-            .map_err(|e| LpmError::Script(format!("filter error: {e}")))?
-            .into_iter()
-            .collect()
-    };
+    if filters.is_empty() {
+        return Ok(HashSet::new());
+    }
 
-    let mut target_set: HashSet<usize> = filter_target;
-    target_set.extend(affected_set);
-    Ok(target_set)
+    let engine = FilterEngine::with_options(
+        ws_graph,
+        workspace_root,
+        FilterOptions {
+            follow_prod_deps_only,
+            changed_files_ignore_patterns,
+            test_patterns,
+        },
+    );
+    Ok(engine
+        .evaluate(filters)
+        .map_err(|e| LpmError::Script(format!("filter error: {e}")))?
+        .into_iter()
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lpm_task::graph::{GraphNode, WorkspaceGraph};
+    use lpm_task::graph::{DependencyEdge, DependencyKind, GraphNode, WorkspaceGraph};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -98,6 +179,7 @@ mod tests {
         ];
         let edges = vec![vec![], vec![0], vec![1]];
         let reverse_edges = vec![vec![1], vec![2], vec![]];
+        let (dependency_edges, reverse_dependency_edges) = typed_dependency_edges(&edges);
         let name_to_idx = HashMap::from([
             ("pkg-a".to_string(), 0usize),
             ("pkg-b".to_string(), 1usize),
@@ -107,6 +189,98 @@ mod tests {
             members,
             edges,
             reverse_edges,
+            dependency_edges,
+            reverse_dependency_edges,
+            name_to_idx,
+        }
+    }
+
+    fn typed_dependency_edges(
+        edges: &[Vec<usize>],
+    ) -> (Vec<Vec<DependencyEdge>>, Vec<Vec<DependencyEdge>>) {
+        let mut dependency_edges = vec![vec![]; edges.len()];
+        let mut reverse_dependency_edges = vec![vec![]; edges.len()];
+        for (idx, deps) in edges.iter().enumerate() {
+            for &dep in deps {
+                dependency_edges[idx].push(DependencyEdge {
+                    target: dep,
+                    kind: DependencyKind::Dependency,
+                });
+                reverse_dependency_edges[dep].push(DependencyEdge {
+                    target: idx,
+                    kind: DependencyKind::Dependency,
+                });
+            }
+        }
+        (dependency_edges, reverse_dependency_edges)
+    }
+
+    fn make_filter_prod_graph() -> WorkspaceGraph {
+        let members = vec![
+            GraphNode {
+                name: "project-2".into(),
+                path: PathBuf::from("packages/project-2"),
+            },
+            GraphNode {
+                name: "project-3".into(),
+                path: PathBuf::from("packages/project-3"),
+            },
+            GraphNode {
+                name: "project-1".into(),
+                path: PathBuf::from("packages/project-1"),
+            },
+            GraphNode {
+                name: "project-4".into(),
+                path: PathBuf::from("packages/project-4"),
+            },
+        ];
+        let edges = vec![vec![], vec![0], vec![1], vec![1]];
+        let reverse_edges = vec![vec![1], vec![2, 3], vec![], vec![]];
+        let dependency_edges = vec![
+            vec![],
+            vec![DependencyEdge {
+                target: 0,
+                kind: DependencyKind::Dependency,
+            }],
+            vec![DependencyEdge {
+                target: 1,
+                kind: DependencyKind::Dependency,
+            }],
+            vec![DependencyEdge {
+                target: 1,
+                kind: DependencyKind::DevDependency,
+            }],
+        ];
+        let reverse_dependency_edges = vec![
+            vec![DependencyEdge {
+                target: 1,
+                kind: DependencyKind::Dependency,
+            }],
+            vec![
+                DependencyEdge {
+                    target: 2,
+                    kind: DependencyKind::Dependency,
+                },
+                DependencyEdge {
+                    target: 3,
+                    kind: DependencyKind::DevDependency,
+                },
+            ],
+            vec![],
+            vec![],
+        ];
+        let name_to_idx = HashMap::from([
+            ("project-2".to_string(), 0usize),
+            ("project-3".to_string(), 1usize),
+            ("project-1".to_string(), 2usize),
+            ("project-4".to_string(), 3usize),
+        ]);
+        WorkspaceGraph {
+            members,
+            edges,
+            reverse_edges,
+            dependency_edges,
+            reverse_dependency_edges,
             name_to_idx,
         }
     }
@@ -114,8 +288,9 @@ mod tests {
     #[test]
     fn no_filter_no_affected_returns_all_members() {
         let graph = make_workspace_graph();
-        let result = select_workspace_target_set(&graph, Path::new("."), &[], false, "main")
-            .expect("no-filter no-affected mode should succeed");
+        let result =
+            select_workspace_target_set(&graph, Path::new("."), &[], &[], &[], &[], false, "main")
+                .expect("no-filter no-affected mode should succeed");
         assert_eq!(result, HashSet::from([0usize, 1, 2]));
     }
 
@@ -126,6 +301,9 @@ mod tests {
             &graph,
             Path::new("."),
             &["pkg-b".to_string()],
+            &[],
+            &[],
+            &[],
             false,
             "main",
         )
@@ -140,6 +318,9 @@ mod tests {
             &graph,
             Path::new("."),
             &["pkg-*".to_string()],
+            &[],
+            &[],
+            &[],
             false,
             "main",
         )
@@ -155,6 +336,9 @@ mod tests {
             &graph,
             Path::new("."),
             &["pkg".to_string()],
+            &[],
+            &[],
+            &[],
             false,
             "main",
         )
@@ -172,6 +356,9 @@ mod tests {
             &graph,
             Path::new("."),
             &["foo!bar".to_string()],
+            &[],
+            &[],
+            &[],
             false,
             "main",
         )
@@ -190,6 +377,9 @@ mod tests {
             &graph,
             Path::new("."),
             &["pkg-a".to_string(), "tooling-app".to_string()],
+            &[],
+            &[],
+            &[],
             false,
             "main",
         )
@@ -205,6 +395,9 @@ mod tests {
             &graph,
             Path::new("."),
             &["...pkg-a".to_string()],
+            &[],
+            &[],
+            &[],
             false,
             "main",
         )
@@ -220,6 +413,9 @@ mod tests {
             &graph,
             Path::new("."),
             &["tooling-app...".to_string()],
+            &[],
+            &[],
+            &[],
             false,
             "main",
         )
@@ -239,6 +435,9 @@ mod tests {
                 "tooling-app".to_string(),
                 "!pkg-a".to_string(),
             ],
+            &[],
+            &[],
+            &[],
             false,
             "main",
         )
@@ -254,10 +453,31 @@ mod tests {
             &graph,
             Path::new("."),
             &["does-not-exist".to_string()],
+            &[],
+            &[],
+            &[],
             false,
             "main",
         )
         .unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn filter_prod_closure_omits_dev_dependency_dependents() {
+        let graph = make_filter_prod_graph();
+        let result = select_workspace_target_set(
+            &graph,
+            Path::new("."),
+            &[],
+            &["...project-3".to_string()],
+            &[],
+            &[],
+            false,
+            "main",
+        )
+        .unwrap();
+
+        assert_eq!(result, HashSet::from([1usize, 2]));
     }
 }

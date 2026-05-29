@@ -166,13 +166,13 @@ impl CollisionResolution {
     }
 }
 
-/// per-invocation security overrides forwarded from `lpm install -g`.
-/// Bundles the five flags the dispatcher used to silently drop so the
-/// `do_install` boundary is clear and adding/removing a knob doesn't
-/// touch every call site.
+/// per-invocation install policy overrides forwarded from `lpm install -g`.
+/// Keeps the `do_install` boundary clear as the global command grows
+/// flags that need to affect the inner project-shaped install.
 #[derive(Debug, Clone, Default)]
 pub struct InstallGlobalOverrides {
     pub allow_new: bool,
+    pub strict_peer_dependencies_override: Option<bool>,
     pub min_release_age_override: Option<u64>,
     pub drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
     /// Composed `(EnforceMode, SkipPolicy)` for the install-time
@@ -593,9 +593,10 @@ async fn do_install(
         false,                  // force
         overrides.allow_new,
         false, // strict_integrity — global installs use lockfile path
-        None,  // linker_override
-        true,  // no_skills (global installs skip skill auto-install)
-        true,  // no_editor_setup (global installs are not project-specific)
+        overrides.strict_peer_dependencies_override,
+        None, // linker_override
+        true, // no_skills (global installs skip skill auto-install)
+        true, // no_editor_setup (global installs are not project-specific)
         // keep the inner project-shape security summary
         // suppressed — the global wrapper banner at
         // `emit_post_install_blocked_warning` is the right surface and
