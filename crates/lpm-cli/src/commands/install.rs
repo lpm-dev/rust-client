@@ -196,19 +196,9 @@ impl CatalogSavePolicy {
             .and_then(|lpm| lpm.catalog_mode)
             .unwrap_or(lpm_workspace::CatalogMode::Manual);
         let forced_catalog = forced_catalog.map(normalize_catalog_name);
-        let mut catalogs = HashMap::with_capacity(1);
-        if let Some(catalog_name) = forced_catalog.as_deref() {
-            if let Some(catalog) = pkg.catalogs.get(catalog_name) {
-                catalogs.insert(catalog_name.to_string(), catalog.clone());
-            }
-        } else if !matches!(mode, lpm_workspace::CatalogMode::Manual)
-            && let Some(default_catalog) = pkg.catalogs.get("default")
-        {
-            catalogs.insert("default".to_string(), default_catalog.clone());
-        }
         Self {
             mode,
-            catalogs,
+            catalogs: pkg.catalogs.clone(),
             forced_catalog,
         }
     }
@@ -12443,6 +12433,134 @@ fn forced_catalog_mismatch_error(
     ))
 }
 
+fn resolve_catalog_policy_manifest_spec(
+    package: &str,
+    specifier: &str,
+    catalog_policy: &CatalogSavePolicy,
+) -> Result<String, LpmError> {
+    if !specifier.starts_with("catalog:") {
+        return Ok(specifier.to_string());
+    }
+
+    let mut deps = HashMap::from([(package.to_string(), specifier.to_string())]);
+    lpm_workspace::resolve_catalog_protocol(&mut deps, &catalog_policy.catalogs)
+        .map_err(catalog_protocol_error_to_lpm)?;
+    deps.remove(package).ok_or_else(|| {
+        LpmError::Registry(format!(
+            "catalogMode: failed to resolve catalog protocol for `{package}`"
+        ))
+    })
+}
+
+async fn resolve_catalog_policy_candidate_version(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    package: &str,
+    requested_spec: &str,
+) -> Result<lpm_semver::Version, LpmError> {
+    let resolved = if lpm_common::package_name::is_lpm_package(package) {
+        let pkg_name =
+            lpm_common::PackageName::parse(package).map_err(|e| LpmError::Registry(e.to_string()))?;
+        client.get_package_metadata(&pkg_name).await?
+    } else {
+        let route = route_table.route_for_package(package);
+        client.get_npm_metadata_routed(package, route).await?
+    }
+    .resolve_version_spec(requested_spec)?;
+
+    lpm_semver::Version::parse(&resolved).map_err(|e| {
+        LpmError::Registry(format!(
+            "catalogMode: resolved version `{resolved}` for `{package}` did not parse as semver: {e}"
+        ))
+    })
+}
+
+async fn preflight_catalog_policy_rejection(
+    client: &RegistryClient,
+    route_cwd: &Path,
+    staged: &StagedManifest,
+    catalog_policy: &CatalogSavePolicy,
+) -> Result<(), LpmError> {
+    let forced_catalog = catalog_policy.forced_catalog.as_deref();
+    let strict_mode = matches!(catalog_policy.mode, lpm_workspace::CatalogMode::Strict);
+    if forced_catalog.is_none() && !strict_mode {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&staged.pkg_json_path)?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
+    let dep_key = if staged.save_dev {
+        "devDependencies"
+    } else {
+        "dependencies"
+    };
+    let route_table = RouteTable::from_env_and_filesystem(route_cwd)
+        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+
+    for entry in &staged.entries {
+        let manifest_spec = doc
+            .get(dep_key)
+            .and_then(|deps| deps.get(&entry.name))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "catalogMode: staged manifest is missing `{}` under {}",
+                    entry.name, dep_key
+                ))
+            })?;
+
+        let effective_spec =
+            resolve_catalog_policy_manifest_spec(&entry.name, manifest_spec, catalog_policy)?;
+
+        if let Some(catalog_name) = forced_catalog {
+            let catalog_range = catalog_policy.catalog_entry(catalog_name, &entry.name)?;
+            let resolved = resolve_catalog_policy_candidate_version(
+                client,
+                &route_table,
+                &entry.name,
+                &effective_spec,
+            )
+            .await?;
+            if !catalog_range_matches_resolved(&entry.name, catalog_range, &resolved)? {
+                let requested_spec = catalog_mode_requested_spec(&entry.intent, &resolved);
+                return Err(forced_catalog_mismatch_error(
+                    catalog_name,
+                    &entry.name,
+                    &requested_spec,
+                    catalog_range,
+                ));
+            }
+            continue;
+        }
+
+        let Some(catalog_range) = catalog_policy.optional_catalog_entry("default", &entry.name) else {
+            return Err(LpmError::Registry(format!(
+                "catalogMode strict rejected {}: no default catalog entry exists for this package",
+                entry.name
+            )));
+        };
+
+        let resolved = resolve_catalog_policy_candidate_version(
+            client,
+            &route_table,
+            &entry.name,
+            &effective_spec,
+        )
+        .await?;
+        if !catalog_range_matches_resolved(&entry.name, catalog_range, &resolved)? {
+            let requested_spec = catalog_mode_requested_spec(&entry.intent, &resolved);
+            return Err(catalog_mode_mismatch_error(
+                &entry.name,
+                &requested_spec,
+                catalog_range,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Rewrite staged dist-tag literals to exact versions before the resolver runs.
 ///
 /// The CLI `install pkg@beta` flow needs two different representations of the
@@ -12667,6 +12785,7 @@ pub async fn run_add_packages(
         let staged =
             stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
         pin_staged_dist_tags_for_resolution(client, project_dir, &staged).await?;
+        preflight_catalog_policy_rejection(client, project_dir, &staged, &catalog_policy).await?;
         maybe_test_panic("after-stage");
 
         // 3. Run the full install pipeline, capturing the direct-dep version
@@ -12981,6 +13100,7 @@ pub async fn run_install_filtered_add(
             &invalidate_refs,
         )?;
 
+        let mut staged_manifests: Vec<StagedManifest> = Vec::with_capacity(targets.member_manifests.len());
         let mut last_err: Option<LpmError> = None;
         for (idx, manifest_path) in targets.member_manifests.iter().enumerate() {
             // (a) Stage the target manifest. Explicit specs land verbatim;
@@ -13004,6 +13124,24 @@ pub async fn run_install_filtered_add(
                 last_err = Some(e);
                 break;
             }
+
+            if let Err(e) =
+                preflight_catalog_policy_rejection(client, install_root, &staged, &catalog_policy)
+                    .await
+            {
+                last_err = Some(e);
+                break;
+            }
+
+            staged_manifests.push(staged);
+        }
+
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+
+        for (idx, staged) in staged_manifests.iter().enumerate() {
+            let install_root = &member_install_roots[idx];
 
             // (b) Run the install pipeline at THIS member's directory,
             //     capturing the direct-dep map for finalize via  the             //     out-param.
@@ -13066,7 +13204,7 @@ pub async fn run_install_filtered_add(
             // (d) Finalize this member's manifest using the direct-dep
             //     versions from the resolver.
             if let Err(e) = finalize_packages_in_manifest_with_catalog_policy(
-                &staged,
+                staged,
                 &direct_versions,
                 save_flags,
                 save_config,

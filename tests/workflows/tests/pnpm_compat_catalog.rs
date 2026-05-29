@@ -160,8 +160,20 @@ async fn strict_catalog_mode_rejects_direct_range_outside_catalog() {
         "strict mismatch error must name the requested and catalog specs\n{text}"
     );
     assert!(
+        !text.contains("Installing 1 package") && !text.contains("+ is-positive@2.0.0"),
+        "strict catalog mismatch must fail before install progress output\n{text}"
+    );
+    assert!(
         dependency_spec_optional(&project, "is-positive").is_none(),
         "failed strict install must roll package.json back"
+    );
+    assert!(
+        !project.file_exists("lpm.lock") && !project.file_exists("lpm.lockb"),
+        "strict catalog mismatch must not leave lockfiles behind"
+    );
+    assert!(
+        !project.file_exists("node_modules") && !project.file_exists("node_modules/is-positive"),
+        "strict catalog mismatch must not materialize node_modules"
     );
 }
 
@@ -186,8 +198,20 @@ async fn install_catalog_flag_rejects_direct_range_outside_catalog() {
         "forced catalog mismatch error must name the requested and catalog specs\n{text}"
     );
     assert!(
+        !text.contains("Installing 1 package") && !text.contains("+ is-positive@2.0.0"),
+        "forced catalog mismatch must fail before install progress output\n{text}"
+    );
+    assert!(
         dependency_spec_optional(&project, "is-positive").is_none(),
         "failed forced catalog install must roll package.json back"
+    );
+    assert!(
+        !project.file_exists("lpm.lock") && !project.file_exists("lpm.lockb"),
+        "forced catalog mismatch must not leave lockfiles behind"
+    );
+    assert!(
+        !project.file_exists("node_modules") && !project.file_exists("node_modules/is-positive"),
+        "forced catalog mismatch must not materialize node_modules"
     );
 }
 
