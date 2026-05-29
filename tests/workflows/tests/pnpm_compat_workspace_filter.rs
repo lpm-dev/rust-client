@@ -4,6 +4,25 @@ mod support;
 
 use support::{TempProject, lpm};
 
+fn git(project: &TempProject, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project.path())
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+
+    assert!(
+        output.status.success(),
+        "git {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 fn seed_independent_workspace_with_concurrency_scripts(project: &TempProject) {
     project.write_file(
         "record-concurrency.js",
@@ -174,6 +193,29 @@ fn seed_workspace_with_filter_prod_scripts(project: &TempProject) {
     }
 }
 
+fn seed_workspace_with_readme_only_git_change(project: &TempProject) {
+    project.write_file(
+        "packages/app/package.json",
+        &serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "scripts": {
+                "check": "node -e \"require('fs').writeFileSync('ran-app.txt','ok')\""
+            }
+        })
+        .to_string(),
+    );
+    project.write_file("packages/app/README.md", "before\n");
+
+    git(project, &["init", "-b", "main"]);
+    git(project, &["add", "."]);
+    git(project, &["commit", "-m", "init"]);
+    git(project, &["checkout", "-b", "feature"]);
+    project.write_file("packages/app/README.md", "after\n");
+    git(project, &["add", "."]);
+    git(project, &["commit", "-m", "readme change"]);
+}
+
 fn member_ran(project: &TempProject, member: &str) -> bool {
     project.file_exists(&format!("packages/{member}/ran-{member}.txt"))
 }
@@ -331,4 +373,110 @@ fn run_filter_prod_omits_dev_dependency_dependents() {
     assert!(member_ran(&project, "project-3"));
     assert!(!member_ran(&project, "project-2"));
     assert!(!member_ran(&project, "project-4"));
+}
+
+#[test]
+fn filter_git_ref_ignores_changed_files_matching_ignore_pattern() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "changed-files-ignore-test",
+        "version": "1.0.0",
+        "private": true,
+        "workspaces": ["packages/*"]
+    }"#,
+    );
+    seed_workspace_with_readme_only_git_change(&project);
+
+    let output = lpm(&project)
+        .args([
+            "filter",
+            "[main]",
+            "--changed-files-ignore-pattern",
+            "**/README.md",
+        ])
+        .output()
+        .expect("failed to run lpm filter with changed files ignore pattern");
+
+    assert!(
+        output.status.success(),
+        "filter should accept --changed-files-ignore-pattern\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.lines().any(|line| line.trim() == "app"),
+        "README-only changes matching the ignore pattern should not select the app package\nstdout:\n{stdout}",
+    );
+}
+
+#[test]
+fn filter_git_ref_uses_workspace_changed_files_ignore_pattern_config() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "changed-files-ignore-config-test",
+        "version": "1.0.0",
+        "private": true,
+        "workspaces": ["packages/*"]
+    }"#,
+    );
+    project.write_file(
+        "lpm.toml",
+        r#"[workspace]
+changed-files-ignore-pattern = "**/README.md"
+"#,
+    );
+    seed_workspace_with_readme_only_git_change(&project);
+
+    let output = lpm(&project)
+        .args(["filter", "[main]"])
+        .output()
+        .expect("failed to run lpm filter with configured changed files ignore pattern");
+
+    assert!(
+        output.status.success(),
+        "filter should read [workspace].changed-files-ignore-pattern\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.lines().any(|line| line.trim() == "app"),
+        "configured ignore pattern should remove README-only changes from git-ref selection\nstdout:\n{stdout}",
+    );
+}
+
+#[test]
+fn run_affected_ignores_changed_files_matching_ignore_pattern() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "changed-files-ignore-run-test",
+        "version": "1.0.0",
+        "private": true,
+        "workspaces": ["packages/*"]
+    }"#,
+    );
+    seed_workspace_with_readme_only_git_change(&project);
+
+    let output = lpm(&project)
+        .args([
+            "run",
+            "check",
+            "--affected",
+            "--changed-files-ignore-pattern",
+            "**/README.md",
+        ])
+        .output()
+        .expect("failed to run lpm run --affected with changed files ignore pattern");
+
+    assert!(
+        output.status.success(),
+        "ignored README-only changes should leave no affected workspace work\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !member_ran(&project, "app"),
+        "app script should not run when its only changed file matched the ignore pattern"
+    );
 }

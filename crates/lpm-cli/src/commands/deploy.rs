@@ -257,6 +257,7 @@ pub(crate) fn resolve_deploy_target(
     output_dir: &Path,
     filters: &[String],
     filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
     force: bool,
 ) -> Result<DeployPlan, LpmError> {
     if filters.is_empty() && filter_prod.is_empty() {
@@ -268,7 +269,14 @@ pub(crate) fn resolve_deploy_target(
     // 1. Resolve target via the shared install_targets helper.
     //    has_packages=true so we never hit the "ambiguous root refresh" branch.
     //    workspace_root_flag=false because deploy never targets the root manifest.
-    let targets = resolve_install_targets(cwd, filters, filter_prod, false, true)?;
+    let targets = resolve_install_targets(
+        cwd,
+        filters,
+        filter_prod,
+        changed_files_ignore_pattern,
+        false,
+        true,
+    )?;
 
     // 2. Single-member assertion.
     if targets.member_manifests.is_empty() {
@@ -621,12 +629,20 @@ pub async fn run(
     output_dir: &Path,
     filters: &[String],
     filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
     force: bool,
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
-    let plan = resolve_deploy_target(cwd, output_dir, filters, filter_prod, force)?;
+    let plan = resolve_deploy_target(
+        cwd,
+        output_dir,
+        filters,
+        filter_prod,
+        changed_files_ignore_pattern,
+        force,
+    )?;
     let member_name = read_member_name(&plan.member_manifest);
 
     if dry_run {
@@ -839,7 +855,7 @@ mod tests {
         filters: &[String],
         force: bool,
     ) -> Result<DeployPlan, LpmError> {
-        super::resolve_deploy_target(cwd, output_dir, filters, &[], force)
+        super::resolve_deploy_target(cwd, output_dir, filters, &[], &[], force)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -857,6 +873,7 @@ mod tests {
             cwd,
             output_dir,
             filters,
+            &[],
             &[],
             force,
             dry_run,

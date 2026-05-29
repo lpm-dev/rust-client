@@ -94,11 +94,16 @@ pub fn resolve_install_targets(
     cwd: &Path,
     filters: &[String],
     filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
     workspace_root_flag: bool,
     has_packages: bool,
 ) -> Result<InstallTargets, LpmError> {
     // ── Mutual exclusion: -w and --filter never compose ──────────────────
-    if workspace_root_flag && (!filters.is_empty() || !filter_prod.is_empty()) {
+    if workspace_root_flag
+        && (!filters.is_empty()
+            || !filter_prod.is_empty()
+            || !changed_files_ignore_pattern.is_empty())
+    {
         return Err(LpmError::Script(
             "`-w` (workspace root) and filters cannot be used together. \
              Pick one: `-w` to target the workspace root, or `--filter <expr>` / `--filter-prod <expr>` \
@@ -120,9 +125,12 @@ pub fn resolve_install_targets(
                     .into(),
             ));
         }
-        if !filters.is_empty() || !filter_prod.is_empty() {
+        if !filters.is_empty()
+            || !filter_prod.is_empty()
+            || !changed_files_ignore_pattern.is_empty()
+        {
             return Err(LpmError::Script(
-                "`--filter` / `--filter-prod` require a workspace. The current directory is a standalone project. \
+                "`--filter` / `--filter-prod` / `--changed-files-ignore-pattern` require a workspace. The current directory is a standalone project. \
                  Run from inside a workspace, or omit filters for a regular install."
                     .into(),
             ));
@@ -156,6 +164,7 @@ pub fn resolve_install_targets(
             &workspace.root,
             filters,
             filter_prod,
+            changed_files_ignore_pattern,
             false,
             "main",
         )?;
@@ -262,7 +271,7 @@ mod tests {
         workspace_root_flag: bool,
         has_packages: bool,
     ) -> Result<InstallTargets, LpmError> {
-        super::resolve_install_targets(cwd, filters, &[], workspace_root_flag, has_packages)
+        super::resolve_install_targets(cwd, filters, &[], &[], workspace_root_flag, has_packages)
     }
 
     /// Build a synthetic on-disk workspace at `root`. Each member is

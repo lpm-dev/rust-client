@@ -305,6 +305,7 @@ pub async fn run(
     packages: &[String],
     filters: &[String],
     filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
     workspace_root_flag: bool,
     fail_if_no_match: bool,
     yes: bool,
@@ -323,6 +324,7 @@ pub async fn run(
         cwd,
         filters,
         filter_prod,
+        changed_files_ignore_pattern,
         workspace_root_flag,
         true, // has_packages
     )?;
@@ -466,6 +468,7 @@ mod tests {
             cwd,
             packages,
             filters,
+            &[],
             &[],
             workspace_root_flag,
             fail_if_no_match,

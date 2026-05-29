@@ -281,9 +281,15 @@ impl<'a> FilterEngine<'a> {
     /// Git ref atom. Per D1, returns directly changed packages only —
     /// dependents are added by an enclosing `WithDependents` closure.
     fn eval_git_ref(&self, base_ref: &str) -> Result<PackageBits, FilterError> {
-        let affected_set =
-            affected::find_affected_direct_only(self.graph, self.workspace_root, base_ref)
-                .map_err(FilterError::GitError)?;
+        let affected_set = affected::find_affected_direct_only_with_options(
+            self.graph,
+            self.workspace_root,
+            base_ref,
+            affected::AffectedOptions {
+                changed_files_ignore_patterns: self.options.changed_files_ignore_patterns,
+            },
+        )
+        .map_err(FilterError::GitError)?;
         let mut bits = PackageBits::empty(self.graph.len());
         for idx in affected_set {
             bits.set(idx);
@@ -1184,6 +1190,7 @@ mod tests {
             &ws.root,
             crate::filter::FilterOptions {
                 follow_prod_deps_only: true,
+                ..Default::default()
             },
         );
         let exprs = vec![FilterExpr::WithDependents(Box::new(FilterExpr::ExactName(

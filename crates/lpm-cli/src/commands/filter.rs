@@ -91,6 +91,7 @@ pub async fn run(
     project_dir: &Path,
     exprs: &[String],
     filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
     explain_mode: bool,
     fail_if_no_match: bool,
     json_output: bool,
@@ -108,14 +109,6 @@ pub async fn run(
         })?;
 
     let graph = WorkspaceGraph::from_workspace(&workspace);
-    let engine = FilterEngine::new(&graph, &workspace.root);
-    let prod_engine = FilterEngine::with_options(
-        &graph,
-        &workspace.root,
-        lpm_task::filter::FilterOptions {
-            follow_prod_deps_only: true,
-        },
-    );
 
     // Parse all CLI exprs through the same parser as `lpm run --filter`.
     let mut parsed: Vec<FilterExpr> = Vec::with_capacity(exprs.len());
@@ -125,6 +118,42 @@ pub async fn run(
                 .map_err(|e| LpmError::Script(format!("invalid filter {raw:?}: {e}")))?,
         );
     }
+    let mut parsed_prod: Vec<FilterExpr> = Vec::with_capacity(filter_prod.len());
+    for raw in filter_prod {
+        parsed_prod.push(
+            FilterEngine::parse(raw)
+                .map_err(|e| LpmError::Script(format!("invalid --filter-prod {raw:?}: {e}")))?,
+        );
+    }
+
+    let needs_changed_files = parsed.iter().any(FilterExpr::contains_git_ref)
+        || parsed_prod.iter().any(FilterExpr::contains_git_ref);
+    let changed_files_ignore_patterns =
+        if needs_changed_files || !changed_files_ignore_pattern.is_empty() {
+            crate::workspace_filter_config::resolve_changed_files_ignore_patterns(
+                &workspace.root,
+                changed_files_ignore_pattern,
+            )?
+        } else {
+            Vec::new()
+        };
+
+    let engine = FilterEngine::with_options(
+        &graph,
+        &workspace.root,
+        lpm_task::filter::FilterOptions {
+            changed_files_ignore_patterns: &changed_files_ignore_patterns,
+            ..Default::default()
+        },
+    );
+    let prod_engine = FilterEngine::with_options(
+        &graph,
+        &workspace.root,
+        lpm_task::filter::FilterOptions {
+            follow_prod_deps_only: true,
+            changed_files_ignore_patterns: &changed_files_ignore_patterns,
+        },
+    );
 
     let mut explain = if parsed.is_empty() {
         None
@@ -136,14 +165,7 @@ pub async fn run(
         )
     };
 
-    if !filter_prod.is_empty() {
-        let mut parsed_prod: Vec<FilterExpr> = Vec::with_capacity(filter_prod.len());
-        for raw in filter_prod {
-            parsed_prod
-                .push(FilterEngine::parse(raw).map_err(|e| {
-                    LpmError::Script(format!("invalid --filter-prod {raw:?}: {e}"))
-                })?);
-        }
+    if !parsed_prod.is_empty() {
         let mut prod_explain = prod_engine
             .explain(&parsed_prod)
             .map_err(|e| LpmError::Script(format!("filter error: {e}")))?;

@@ -12754,6 +12754,7 @@ pub async fn run_install_filtered_add(
     save_dev: bool,
     filters: &[String],
     filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
     workspace_root_flag: bool,
     fail_if_no_match: bool,
     yes: bool,
@@ -12793,6 +12794,7 @@ pub async fn run_install_filtered_add(
         cwd,
         filters,
         filter_prod,
+        changed_files_ignore_pattern,
         workspace_root_flag,
         true, // has_packages — install_filtered_add is only called with non-empty packages
     )?;
@@ -15508,6 +15510,7 @@ mod tests {
             false,                // save_dev
             &["app".to_string()], // bare-name filter that matches nothing
             &[],                  // filter_prod
+            &[],                  // changed_files_ignore_pattern
             false,                // workspace_root_flag
             true,                 // fail_if_no_match — required for the error path
             false,                // yes — not exercising the prompt here
@@ -15554,6 +15557,7 @@ mod tests {
             &["react".to_string()],
             false,
             &["nonexistent-*".to_string()],
+            &[],
             &[],
             false,
             true,
@@ -15625,6 +15629,7 @@ mod tests {
         let targets = crate::commands::install_targets::resolve_install_targets(
             &cwd,
             &["@test/app".to_string()],
+            &[],
             &[],
             false,
             true,

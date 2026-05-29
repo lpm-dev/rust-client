@@ -69,4 +69,20 @@ impl FilterExpr {
     pub fn is_exclude(&self) -> bool {
         matches!(self, FilterExpr::Exclude(_))
     }
+
+    /// Returns true when this expression contains a git-ref atom.
+    pub fn contains_git_ref(&self) -> bool {
+        match self {
+            FilterExpr::GitRef(_) => true,
+            FilterExpr::WithDeps(inner)
+            | FilterExpr::DepsOnly(inner)
+            | FilterExpr::WithDependents(inner)
+            | FilterExpr::DependentsOnly(inner)
+            | FilterExpr::Exclude(inner) => inner.contains_git_ref(),
+            FilterExpr::ExactName(_)
+            | FilterExpr::GlobName(_)
+            | FilterExpr::PathExact(_)
+            | FilterExpr::PathGlob(_) => false,
+        }
+    }
 }

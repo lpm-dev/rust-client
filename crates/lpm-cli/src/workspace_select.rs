@@ -32,6 +32,7 @@ pub fn select_workspace_target_set(
     workspace_root: &Path,
     filters: &[String],
     filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
     affected: bool,
     base_ref: &str,
 ) -> Result<HashSet<usize>, LpmError> {
@@ -39,42 +40,68 @@ pub fn select_workspace_target_set(
         return Ok((0..ws_graph.len()).collect());
     }
 
+    let exprs = parse_filter_set(filters, false)?;
+    let prod_exprs = parse_filter_set(filter_prod, true)?;
+    let needs_changed_files = affected
+        || exprs
+            .iter()
+            .any(lpm_task::filter::FilterExpr::contains_git_ref)
+        || prod_exprs
+            .iter()
+            .any(lpm_task::filter::FilterExpr::contains_git_ref);
+    let changed_files_ignore_patterns =
+        if needs_changed_files || !changed_files_ignore_pattern.is_empty() {
+            crate::workspace_filter_config::resolve_changed_files_ignore_patterns(
+                workspace_root,
+                changed_files_ignore_pattern,
+            )?
+        } else {
+            Vec::new()
+        };
+
     let affected_set: HashSet<usize> = if affected {
-        lpm_task::affected::find_affected(ws_graph, workspace_root, base_ref)
-            .map_err(LpmError::Script)?
+        lpm_task::affected::find_affected_with_options(
+            ws_graph,
+            workspace_root,
+            base_ref,
+            lpm_task::affected::AffectedOptions {
+                changed_files_ignore_patterns: &changed_files_ignore_patterns,
+            },
+        )
+        .map_err(LpmError::Script)?
     } else {
         HashSet::new()
     };
 
-    let mut target_set = evaluate_filter_set(ws_graph, workspace_root, filters, false)?;
+    let mut target_set = evaluate_filter_set(
+        ws_graph,
+        workspace_root,
+        &exprs,
+        false,
+        &changed_files_ignore_patterns,
+    )?;
     target_set.extend(evaluate_filter_set(
         ws_graph,
         workspace_root,
-        filter_prod,
+        &prod_exprs,
         true,
+        &changed_files_ignore_patterns,
     )?);
     target_set.extend(affected_set);
     Ok(target_set)
 }
 
-fn evaluate_filter_set(
-    ws_graph: &lpm_task::graph::WorkspaceGraph,
-    workspace_root: &Path,
+fn parse_filter_set(
     filters: &[String],
     follow_prod_deps_only: bool,
-) -> Result<HashSet<usize>, LpmError> {
-    use lpm_task::filter::{FilterEngine, FilterExpr, FilterOptions};
-
-    if filters.is_empty() {
-        return Ok(HashSet::new());
-    }
-
+) -> Result<Vec<lpm_task::filter::FilterExpr>, LpmError> {
+    use lpm_task::filter::FilterEngine;
     let flag_name = if follow_prod_deps_only {
         "--filter-prod"
     } else {
         "--filter"
     };
-    let mut exprs: Vec<FilterExpr> = Vec::with_capacity(filters.len());
+    let mut exprs = Vec::with_capacity(filters.len());
     for raw in filters {
         let parsed = FilterEngine::parse(raw).map_err(|e| {
             LpmError::Script(format!(
@@ -85,16 +112,32 @@ fn evaluate_filter_set(
         })?;
         exprs.push(parsed);
     }
+    Ok(exprs)
+}
+
+fn evaluate_filter_set(
+    ws_graph: &lpm_task::graph::WorkspaceGraph,
+    workspace_root: &Path,
+    filters: &[lpm_task::filter::FilterExpr],
+    follow_prod_deps_only: bool,
+    changed_files_ignore_patterns: &[String],
+) -> Result<HashSet<usize>, LpmError> {
+    use lpm_task::filter::{FilterEngine, FilterOptions};
+
+    if filters.is_empty() {
+        return Ok(HashSet::new());
+    }
 
     let engine = FilterEngine::with_options(
         ws_graph,
         workspace_root,
         FilterOptions {
             follow_prod_deps_only,
+            changed_files_ignore_patterns,
         },
     );
     Ok(engine
-        .evaluate(&exprs)
+        .evaluate(filters)
         .map_err(|e| LpmError::Script(format!("filter error: {e}")))?
         .into_iter()
         .collect())
@@ -233,8 +276,9 @@ mod tests {
     #[test]
     fn no_filter_no_affected_returns_all_members() {
         let graph = make_workspace_graph();
-        let result = select_workspace_target_set(&graph, Path::new("."), &[], &[], false, "main")
-            .expect("no-filter no-affected mode should succeed");
+        let result =
+            select_workspace_target_set(&graph, Path::new("."), &[], &[], &[], false, "main")
+                .expect("no-filter no-affected mode should succeed");
         assert_eq!(result, HashSet::from([0usize, 1, 2]));
     }
 
@@ -245,6 +289,7 @@ mod tests {
             &graph,
             Path::new("."),
             &["pkg-b".to_string()],
+            &[],
             &[],
             false,
             "main",
@@ -261,6 +306,7 @@ mod tests {
             Path::new("."),
             &["pkg-*".to_string()],
             &[],
+            &[],
             false,
             "main",
         )
@@ -276,6 +322,7 @@ mod tests {
             &graph,
             Path::new("."),
             &["pkg".to_string()],
+            &[],
             &[],
             false,
             "main",
@@ -294,6 +341,7 @@ mod tests {
             &graph,
             Path::new("."),
             &["foo!bar".to_string()],
+            &[],
             &[],
             false,
             "main",
@@ -314,6 +362,7 @@ mod tests {
             Path::new("."),
             &["pkg-a".to_string(), "tooling-app".to_string()],
             &[],
+            &[],
             false,
             "main",
         )
@@ -330,6 +379,7 @@ mod tests {
             Path::new("."),
             &["...pkg-a".to_string()],
             &[],
+            &[],
             false,
             "main",
         )
@@ -345,6 +395,7 @@ mod tests {
             &graph,
             Path::new("."),
             &["tooling-app...".to_string()],
+            &[],
             &[],
             false,
             "main",
@@ -366,6 +417,7 @@ mod tests {
                 "!pkg-a".to_string(),
             ],
             &[],
+            &[],
             false,
             "main",
         )
@@ -382,6 +434,7 @@ mod tests {
             Path::new("."),
             &["does-not-exist".to_string()],
             &[],
+            &[],
             false,
             "main",
         )
@@ -397,6 +450,7 @@ mod tests {
             Path::new("."),
             &[],
             &["...project-3".to_string()],
+            &[],
             false,
             "main",
         )

@@ -586,6 +586,7 @@ pub async fn tool_workspace(
     check_engine: Option<CheckEngine>,
     filters: &[String],
     filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
     affected_base: Option<&str>,
     fail_if_no_match: bool,
     workspace_concurrency: WorkspaceConcurrency,
@@ -610,6 +611,7 @@ pub async fn tool_workspace(
         &workspace.root,
         filters,
         filter_prod,
+        changed_files_ignore_pattern,
         affected_base.is_some(),
         affected_base.unwrap_or("main"),
     )?;
@@ -1089,6 +1091,7 @@ pub async fn dispatch_test_or_bench(
     all: bool,
     filters: &[String],
     filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
     affected: bool,
     base_ref: &str,
     fail_if_no_match: bool,
@@ -1120,6 +1123,7 @@ pub async fn dispatch_test_or_bench(
             &workspace.root,
             filters,
             filter_prod,
+            changed_files_ignore_pattern,
             affected,
             affected_ref_for_select.unwrap_or("main"),
         )?;
@@ -1160,6 +1164,7 @@ pub async fn dispatch_test_or_bench(
             None,
             filters,
             filter_prod,
+            changed_files_ignore_pattern,
             affected_ref,
             fail_if_no_match,
             WorkspaceConcurrency::Configured {

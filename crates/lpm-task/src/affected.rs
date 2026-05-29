@@ -4,9 +4,16 @@
 //! workspace members by directory path (with proper boundary checking).
 
 use crate::graph::WorkspaceGraph;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
+
+/// Options for git-based workspace change detection.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AffectedOptions<'a> {
+    pub changed_files_ignore_patterns: &'a [String],
+}
 
 /// Find workspace members **directly** changed since a base ref.
 ///
@@ -24,7 +31,24 @@ pub fn find_affected_direct_only(
     workspace_root: &Path,
     base_ref: &str,
 ) -> Result<HashSet<usize>, String> {
+    find_affected_direct_only_with_options(
+        graph,
+        workspace_root,
+        base_ref,
+        AffectedOptions::default(),
+    )
+}
+
+/// Find directly changed workspace members with explicit git-diff options.
+pub fn find_affected_direct_only_with_options(
+    graph: &WorkspaceGraph,
+    workspace_root: &Path,
+    base_ref: &str,
+    options: AffectedOptions<'_>,
+) -> Result<HashSet<usize>, String> {
     let changed_files = git_diff_files(workspace_root, base_ref)?;
+    let changed_files =
+        filter_ignored_changed_files(changed_files, options.changed_files_ignore_patterns)?;
 
     if changed_files.is_empty() {
         return Ok(HashSet::new());
@@ -93,7 +117,18 @@ pub fn find_affected(
     workspace_root: &Path,
     base_ref: &str,
 ) -> Result<HashSet<usize>, String> {
-    let directly_changed = find_affected_direct_only(graph, workspace_root, base_ref)?;
+    find_affected_with_options(graph, workspace_root, base_ref, AffectedOptions::default())
+}
+
+/// Find affected workspace members with explicit git-diff options.
+pub fn find_affected_with_options(
+    graph: &WorkspaceGraph,
+    workspace_root: &Path,
+    base_ref: &str,
+    options: AffectedOptions<'_>,
+) -> Result<HashSet<usize>, String> {
+    let directly_changed =
+        find_affected_direct_only_with_options(graph, workspace_root, base_ref, options)?;
 
     if directly_changed.is_empty() {
         return Ok(directly_changed);
@@ -115,6 +150,34 @@ pub fn find_affected(
     }
 
     Ok(all_affected)
+}
+
+fn filter_ignored_changed_files(
+    changed_files: Vec<String>,
+    ignore_patterns: &[String],
+) -> Result<Vec<String>, String> {
+    if changed_files.is_empty() || ignore_patterns.is_empty() {
+        return Ok(changed_files);
+    }
+
+    let matcher = compile_changed_files_ignore_patterns(ignore_patterns)?;
+    Ok(changed_files
+        .into_iter()
+        .filter(|file| !matcher.is_match(file))
+        .collect())
+}
+
+fn compile_changed_files_ignore_patterns(patterns: &[String]) -> Result<GlobSet, String> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern)
+            .map_err(|e| format!("invalid changed files ignore pattern {pattern:?}: {e}"))?;
+        builder.add(glob);
+    }
+
+    builder
+        .build()
+        .map_err(|e| format!("invalid changed files ignore patterns: {e}"))
 }
 
 /// Get changed files from git diff relative to a base ref.
@@ -629,5 +692,109 @@ mod tests {
             );
         }
         assert!(with_deps.len() >= direct.len());
+    }
+
+    #[test]
+    fn changed_files_ignore_pattern_removes_matching_direct_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        git(&root, &["init", "-b", "main"]);
+        std::fs::create_dir_all(root.join("packages/utils")).unwrap();
+        std::fs::write(root.join("packages/utils/package.json"), "{}").unwrap();
+        std::fs::write(root.join("packages/utils/README.md"), "before").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "init"]);
+
+        git(&root, &["checkout", "-b", "feature"]);
+        std::fs::write(root.join("packages/utils/README.md"), "after").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "readme change"]);
+
+        let graph = make_graph(
+            &[("utils", &root.join("packages/utils").to_string_lossy())],
+            vec![vec![]],
+        );
+        let patterns = vec!["**/README.md".to_string()];
+
+        let direct = find_affected_direct_only_with_options(
+            &graph,
+            &root,
+            "main",
+            AffectedOptions {
+                changed_files_ignore_patterns: &patterns,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            direct.is_empty(),
+            "README-only changes matching the ignore pattern should not mark the package changed"
+        );
+    }
+
+    #[test]
+    fn changed_files_ignore_pattern_runs_before_dependent_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        git(&root, &["init", "-b", "main"]);
+        std::fs::create_dir_all(root.join("packages/utils")).unwrap();
+        std::fs::create_dir_all(root.join("packages/app")).unwrap();
+        std::fs::write(root.join("packages/utils/package.json"), "{}").unwrap();
+        std::fs::write(root.join("packages/app/package.json"), "{}").unwrap();
+        std::fs::write(root.join("packages/utils/README.md"), "before").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "init"]);
+
+        git(&root, &["checkout", "-b", "feature"]);
+        std::fs::write(root.join("packages/utils/README.md"), "after").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "readme change"]);
+
+        let graph = make_graph(
+            &[
+                ("utils", &root.join("packages/utils").to_string_lossy()),
+                ("app", &root.join("packages/app").to_string_lossy()),
+            ],
+            vec![vec![], vec![0]],
+        );
+        let patterns = vec!["**/README.md".to_string()];
+
+        let affected = find_affected_with_options(
+            &graph,
+            &root,
+            "main",
+            AffectedOptions {
+                changed_files_ignore_patterns: &patterns,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            affected.is_empty(),
+            "ignored direct changes should not expand to dependent packages"
+        );
+    }
+
+    #[test]
+    fn invalid_changed_files_ignore_pattern_returns_error() {
+        let (_dir, graph, root) = setup_two_package_workspace_with_change("utils");
+        let patterns = vec!["[".to_string()];
+
+        let err = find_affected_direct_only_with_options(
+            &graph,
+            &root,
+            "main",
+            AffectedOptions {
+                changed_files_ignore_patterns: &patterns,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("invalid changed files ignore pattern"),
+            "error should identify the invalid ignore glob: {err}"
+        );
     }
 }

@@ -91,14 +91,15 @@ pub enum FilterError {
 pub struct FilterEngine<'a> {
     pub(crate) graph: &'a WorkspaceGraph,
     pub(crate) workspace_root: &'a Path,
-    pub(crate) options: FilterOptions,
+    pub(crate) options: FilterOptions<'a>,
     pub(crate) glob_cache: RefCell<HashMap<String, GlobMatcher>>,
 }
 
 /// Evaluation options for workspace filters.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct FilterOptions {
+pub struct FilterOptions<'a> {
     pub follow_prod_deps_only: bool,
+    pub changed_files_ignore_patterns: &'a [String],
 }
 
 impl<'a> FilterEngine<'a> {
@@ -114,7 +115,7 @@ impl<'a> FilterEngine<'a> {
     pub fn with_options(
         graph: &'a WorkspaceGraph,
         workspace_root: &'a Path,
-        options: FilterOptions,
+        options: FilterOptions<'a>,
     ) -> Self {
         FilterEngine {
             graph,
