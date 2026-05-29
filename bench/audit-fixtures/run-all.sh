@@ -5,6 +5,40 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+IS_WINDOWS=0
+case "${OSTYPE:-}" in
+    msys*|cygwin*|win32*) IS_WINDOWS=1 ;;
+esac
+case "${OS:-}" in
+    Windows_NT) IS_WINDOWS=1 ;;
+esac
+
+python_path() {
+    if [[ $IS_WINDOWS -eq 1 ]] && command -v cygpath &>/dev/null; then
+        cygpath -w "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+json_field_or_default() {
+    local path="$1"
+    local field="$2"
+    local default="$3"
+    if [[ ! -f "$path" ]]; then
+        printf '%s\n' "$default"
+        return
+    fi
+    PY_JSON_FILE="$(python_path "$path")" PY_JSON_FIELD="$field" PY_JSON_DEFAULT="$default" python3 - <<'PY'
+import json
+import os
+
+with open(os.environ["PY_JSON_FILE"]) as handle:
+    data = json.load(handle)
+print(data.get(os.environ["PY_JSON_FIELD"], os.environ["PY_JSON_DEFAULT"]))
+PY
+}
+
 # Wipe the work-dir parent ONCE at suite start. `run-audit.sh` already
 # wipes `/tmp/lpm-audit-work/<fixture>-<mode>/` per fixture, but it
 # does not clean the parent — so a previous suite run that ever
@@ -78,8 +112,8 @@ for fixture in "${FIXTURES[@]}"; do
     fixture_name="$(echo "$fixture" | tr '/' '-')"
     iso=$(ls -t "$HERE/results/$fixture_name-isolated-"*.json 2>/dev/null | head -1)
     hst=$(ls -t "$HERE/results/$fixture_name-hoisted-"*.json 2>/dev/null | head -1)
-    iso_verdict=$([[ -f "$iso" ]] && python3 -c "import json;print(json.load(open('$iso'))['verdict'])" || echo "?")
-    hst_verdict=$([[ -f "$hst" ]] && python3 -c "import json;print(json.load(open('$hst'))['verdict'])" || echo "?")
+    iso_verdict=$(json_field_or_default "$iso" verdict "?")
+    hst_verdict=$(json_field_or_default "$hst" verdict "?")
     FIXTURE_NAMES+=("$fixture")
     RESULTS+=("${iso_verdict}/${hst_verdict}")
 done
@@ -102,8 +136,8 @@ for i in "${!FIXTURE_NAMES[@]}"; do
     fixture_name="$(echo "${FIXTURE_NAMES[$i]}" | tr '/' '-')"
     iso_file=$(ls -t "$HERE/results/$fixture_name-isolated-"*.json 2>/dev/null | head -1)
     hst_file=$(ls -t "$HERE/results/$fixture_name-hoisted-"*.json 2>/dev/null | head -1)
-    iso_c=$([[ -f "$iso_file" ]] && python3 -c "import json;print(json.load(open('$iso_file')).get('classification','unclassified-failure'))" || echo "?")
-    hst_c=$([[ -f "$hst_file" ]] && python3 -c "import json;print(json.load(open('$hst_file')).get('classification','unclassified-failure'))" || echo "?")
+    iso_c=$(json_field_or_default "$iso_file" classification "?")
+    hst_c=$(json_field_or_default "$hst_file" classification "?")
     if [[ "$iso_c" == "$hst_c" ]]; then
         category_summary="$iso_c"
     else
