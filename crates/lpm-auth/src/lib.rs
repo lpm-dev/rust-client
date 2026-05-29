@@ -51,6 +51,8 @@ const KEYCHAIN_SERVICE: &str = "lpm-cli";
 /// Keychain account prefix (matches JS CLI scoped format).
 const KEYCHAIN_ACCOUNT_PREFIX: &str = "auth-token";
 
+const DISABLE_HOST_CLI_AUTH_ENV: &str = "LPM_DISABLE_HOST_CLI_AUTH";
+
 #[cfg(target_os = "macos")]
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
@@ -196,17 +198,7 @@ pub fn get_npm_token() -> Option<String> {
     }
 
     // 2. Keychain (stored via `lpm login --npm`)
-    match std::panic::catch_unwind(|| get_token_from_keychain(NPM_REGISTRY_URL)) {
-        Ok(Some(token)) => return Some(token),
-        Ok(None) => {}
-        Err(_) => {
-            tracing::debug!("keychain access panicked for npm token");
-        }
-    }
-
-    if force_file_auth()
-        && let Some(token) = get_token_from_file(NPM_REGISTRY_URL)
-    {
+    if let Some(token) = get_stored_builtin_token(NPM_REGISTRY_URL) {
         return Some(token);
     }
 
@@ -244,7 +236,7 @@ const GITHUB_REGISTRY_URL: &str = "https://npm.pkg.github.com";
 
 /// Get the token for GitHub Packages.
 ///
-/// Priority: `GITHUB_TOKEN` env → keychain(`npm.pkg.github.com`)
+/// Priority: `GITHUB_TOKEN` env → `gh auth token` → keychain(`npm.pkg.github.com`)
 pub fn get_github_token() -> Option<String> {
     if let Ok(token) = std::env::var("GITHUB_TOKEN")
         && !token.is_empty()
@@ -252,11 +244,7 @@ pub fn get_github_token() -> Option<String> {
         return Some(token);
     }
 
-    match std::panic::catch_unwind(|| get_token_from_keychain(GITHUB_REGISTRY_URL)) {
-        Ok(Some(token)) => Some(token),
-        _ if force_file_auth() => get_token_from_file(GITHUB_REGISTRY_URL),
-        _ => None,
-    }
+    get_github_cli_token().or_else(|| get_stored_builtin_token(GITHUB_REGISTRY_URL))
 }
 
 /// Store a GitHub Packages token in the keychain.
@@ -285,8 +273,16 @@ const GITLAB_REGISTRY_URL: &str = "https://gitlab.com/packages/npm";
 
 /// Get the token for GitLab Packages.
 ///
-/// Priority: `GITLAB_TOKEN` env → `CI_JOB_TOKEN` env → keychain(`gitlab.com`)
+/// Priority: `GITLAB_TOKEN` env → `CI_JOB_TOKEN` env → `glab auth token` → keychain(`gitlab.com`)
 pub fn get_gitlab_token() -> Option<String> {
+    get_gitlab_token_for_host("https://gitlab.com")
+}
+
+/// Get the token for GitLab Packages at a resolved GitLab host.
+///
+/// The GitLab CLI token is only used for `gitlab.com`. Self-managed GitLab
+/// instances keep the existing env/keychain/manual-token behavior.
+pub fn get_gitlab_token_for_host(gitlab_host: &str) -> Option<String> {
     // GITLAB_TOKEN (personal access token / deploy token)
     if let Ok(token) = std::env::var("GITLAB_TOKEN")
         && !token.is_empty()
@@ -301,11 +297,13 @@ pub fn get_gitlab_token() -> Option<String> {
         return Some(token);
     }
 
-    match std::panic::catch_unwind(|| get_token_from_keychain(GITLAB_REGISTRY_URL)) {
-        Ok(Some(token)) => Some(token),
-        _ if force_file_auth() => get_token_from_file(GITLAB_REGISTRY_URL),
-        _ => None,
+    if is_default_gitlab_host(gitlab_host)
+        && let Some(token) = get_gitlab_cli_token()
+    {
+        return Some(token);
     }
+
+    get_stored_builtin_token(GITLAB_REGISTRY_URL)
 }
 
 /// Store a GitLab Packages token in the keychain.
@@ -327,6 +325,66 @@ pub fn clear_gitlab_token() -> Result<(), String> {
         .map_err(|e| format!("failed to clear GitLab token: {e}"))
 }
 
+fn get_stored_builtin_token(registry_url: &str) -> Option<String> {
+    match std::panic::catch_unwind(|| get_token_from_keychain(registry_url)) {
+        Ok(Some(token)) => Some(token),
+        Ok(None) => {
+            if force_file_auth() {
+                get_token_from_file(registry_url)
+            } else {
+                None
+            }
+        }
+        Err(_) => {
+            tracing::debug!("keychain access panicked for builtin registry token");
+            if force_file_auth() {
+                get_token_from_file(registry_url)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn host_cli_token(program: &str, args: &[&str]) -> Option<String> {
+    if host_cli_auth_disabled() {
+        return None;
+    }
+
+    let output = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn host_cli_auth_disabled() -> bool {
+    matches!(
+        std::env::var(DISABLE_HOST_CLI_AUTH_ENV).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+fn is_default_gitlab_host(raw: &str) -> bool {
+    reqwest::Url::parse(raw)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.eq_ignore_ascii_case("gitlab.com"))
+        })
+        .unwrap_or(false)
+}
+
 // ─── Custom Registry Token ─────────────────────────────────────────
 
 /// Get the token for a custom registry URL.
@@ -338,6 +396,16 @@ pub fn get_custom_registry_token(registry_url: &str) -> Option<String> {
         _ if force_file_auth() => get_token_from_file(registry_url),
         _ => None,
     }
+}
+
+/// Return a token from the GitHub CLI without storing or copying it.
+pub fn get_github_cli_token() -> Option<String> {
+    host_cli_token("gh", &["auth", "token", "--hostname", "github.com"])
+}
+
+/// Return a token from the GitLab CLI without storing or copying it.
+pub fn get_gitlab_cli_token() -> Option<String> {
+    host_cli_token("glab", &["auth", "token"])
 }
 
 /// Store a token for a custom registry URL and track it for enumeration.
@@ -547,12 +615,7 @@ pub fn list_stored_registries() -> Vec<(String, String)> {
     let mut result = Vec::new();
 
     // npm: check env, keychain, .npmrc — show source so user knows where token came from
-    let npm_stored_token =
-        match std::panic::catch_unwind(|| get_token_from_keychain(NPM_REGISTRY_URL)) {
-            Ok(Some(token)) => Some(token),
-            _ if force_file_auth() => get_token_from_file(NPM_REGISTRY_URL),
-            _ => None,
-        };
+    let npm_stored_token = get_stored_builtin_token(NPM_REGISTRY_URL);
 
     if let Ok(token) = std::env::var("NPM_TOKEN") {
         if !token.is_empty() {
@@ -567,16 +630,18 @@ pub fn list_stored_registries() -> Vec<(String, String)> {
         ));
     }
 
-    // GitHub: env or keychain
+    // GitHub: env, host CLI, or keychain
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         if !token.is_empty() {
             result.push(("github.com".into(), "configured (env: GITHUB_TOKEN)".into()));
         }
-    } else if get_github_token().is_some() {
+    } else if get_github_cli_token().is_some() {
+        result.push(("github.com".into(), "available (gh auth)".into()));
+    } else if get_stored_builtin_token(GITHUB_REGISTRY_URL).is_some() {
         result.push(("github.com".into(), "configured (keychain)".into()));
     }
 
-    // GitLab: env or keychain
+    // GitLab: env, host CLI, or keychain
     if let Ok(token) = std::env::var("GITLAB_TOKEN") {
         if !token.is_empty() {
             result.push(("gitlab.com".into(), "configured (env: GITLAB_TOKEN)".into()));
@@ -585,7 +650,9 @@ pub fn list_stored_registries() -> Vec<(String, String)> {
         if !token.is_empty() {
             result.push(("gitlab.com".into(), "configured (env: CI_JOB_TOKEN)".into()));
         }
-    } else if get_gitlab_token().is_some() {
+    } else if get_gitlab_cli_token().is_some() {
+        result.push(("gitlab.com".into(), "available (glab auth)".into()));
+    } else if get_stored_builtin_token(GITLAB_REGISTRY_URL).is_some() {
         result.push(("gitlab.com".into(), "configured (keychain)".into()));
     }
 
@@ -1592,7 +1659,10 @@ mod tests {
 
     fn with_temp_home<T>(test: impl FnOnce(&std::path::Path) -> T) -> T {
         let temp = tempfile::tempdir().unwrap();
-        let _env = super::test_env::ScopedEnv::set([("HOME", temp.path().as_os_str().to_owned())]);
+        let _env = super::test_env::ScopedEnv::update([
+            ("HOME", Some(temp.path().as_os_str().to_owned())),
+            (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
+        ]);
 
         let result = catch_unwind(AssertUnwindSafe(|| test(temp.path())));
 
@@ -1699,6 +1769,15 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
         }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_host_command(dir: &std::path::Path, name: &str, script: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, script).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
     }
 
     #[test]
@@ -1823,6 +1902,284 @@ mod tests {
         let _env = super::test_env::ScopedEnv::set([("NPM_TOKEN", "npm_test_from_env".into())]);
         let token = get_npm_token();
         assert_eq!(token, Some("npm_test_from_env".to_string()));
+    }
+
+    #[test]
+    fn npm_token_prefers_stored_token_over_npmrc_fallback() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("NPM_TOKEN", None),
+            ]);
+
+            write_test_npmrc(
+                &home.join(".npmrc"),
+                "//registry.npmjs.org/:_authToken=npmrc-fallback-token\n",
+            );
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({ NPM_REGISTRY_URL: "npm-file-token" }).to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(get_npm_token(), Some("npm-file-token".to_string()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_token_env_priority_over_gh_cli_and_stored_fallback() {
+        with_temp_home(|_| {
+            let bin = tempfile::tempdir().unwrap();
+            write_fake_host_command(bin.path(), "gh", "#!/bin/sh\nprintf 'gh-cli-token\\n'\n");
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                (DISABLE_HOST_CLI_AUTH_ENV, None),
+                ("GITHUB_TOKEN", Some("github-env-token".into())),
+                ("PATH", Some(bin.path().as_os_str().to_owned())),
+            ]);
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({ GITHUB_REGISTRY_URL: "github-file-token" }).to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(get_github_token(), Some("github-env-token".to_string()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_token_uses_gh_cli_before_stored_fallback() {
+        with_temp_home(|_| {
+            let bin = tempfile::tempdir().unwrap();
+            write_fake_host_command(bin.path(), "gh", "#!/bin/sh\nprintf 'gh-cli-token\\n'\n");
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                (DISABLE_HOST_CLI_AUTH_ENV, None),
+                ("GITHUB_TOKEN", None),
+                ("PATH", Some(bin.path().as_os_str().to_owned())),
+            ]);
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({ GITHUB_REGISTRY_URL: "github-file-token" }).to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(get_github_token(), Some("gh-cli-token".to_string()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_token_falls_back_to_stored_token_when_gh_is_missing() {
+        with_temp_home(|_| {
+            let bin = tempfile::tempdir().unwrap();
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                (DISABLE_HOST_CLI_AUTH_ENV, None),
+                ("GITHUB_TOKEN", None),
+                ("PATH", Some(bin.path().as_os_str().to_owned())),
+            ]);
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({ GITHUB_REGISTRY_URL: "github-file-token" }).to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(get_github_token(), Some("github-file-token".to_string()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_token_ignores_empty_gh_output_and_uses_stored_token() {
+        with_temp_home(|_| {
+            let bin = tempfile::tempdir().unwrap();
+            write_fake_host_command(bin.path(), "gh", "#!/bin/sh\nexit 0\n");
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                (DISABLE_HOST_CLI_AUTH_ENV, None),
+                ("GITHUB_TOKEN", None),
+                ("PATH", Some(bin.path().as_os_str().to_owned())),
+            ]);
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({ GITHUB_REGISTRY_URL: "github-file-token" }).to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(get_github_token(), Some("github-file-token".to_string()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_token_ignores_failing_gh_command_and_uses_stored_token() {
+        with_temp_home(|_| {
+            let bin = tempfile::tempdir().unwrap();
+            write_fake_host_command(bin.path(), "gh", "#!/bin/sh\nexit 1\n");
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                (DISABLE_HOST_CLI_AUTH_ENV, None),
+                ("GITHUB_TOKEN", None),
+                ("PATH", Some(bin.path().as_os_str().to_owned())),
+            ]);
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({ GITHUB_REGISTRY_URL: "github-file-token" }).to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(get_github_token(), Some("github-file-token".to_string()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitlab_token_uses_glab_cli_for_gitlab_dot_com() {
+        with_temp_home(|_| {
+            let bin = tempfile::tempdir().unwrap();
+            write_fake_host_command(
+                bin.path(),
+                "glab",
+                "#!/bin/sh\nprintf 'glab-cli-token\\n'\n",
+            );
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                (DISABLE_HOST_CLI_AUTH_ENV, None),
+                ("GITLAB_TOKEN", None),
+                ("CI_JOB_TOKEN", None),
+                ("PATH", Some(bin.path().as_os_str().to_owned())),
+            ]);
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({ GITLAB_REGISTRY_URL: "gitlab-file-token" }).to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(
+                get_gitlab_token_for_host("https://gitlab.com"),
+                Some("glab-cli-token".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn gitlab_ci_job_token_priority_over_stored_fallback_for_self_managed_host() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("GITLAB_TOKEN", None),
+                ("CI_JOB_TOKEN", Some("gitlab-ci-token".into())),
+            ]);
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({ GITLAB_REGISTRY_URL: "gitlab-file-token" }).to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(
+                get_gitlab_token_for_host("https://gitlab.example.com"),
+                Some("gitlab-ci-token".to_string())
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitlab_token_for_self_managed_host_skips_glab_cli() {
+        with_temp_home(|_| {
+            let bin = tempfile::tempdir().unwrap();
+            write_fake_host_command(
+                bin.path(),
+                "glab",
+                "#!/bin/sh\nprintf 'glab-cli-token\\n'\n",
+            );
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                (DISABLE_HOST_CLI_AUTH_ENV, None),
+                ("GITLAB_TOKEN", None),
+                ("CI_JOB_TOKEN", None),
+                ("PATH", Some(bin.path().as_os_str().to_owned())),
+            ]);
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({ GITLAB_REGISTRY_URL: "gitlab-file-token" }).to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(
+                get_gitlab_token_for_host("https://gitlab.example.com"),
+                Some("gitlab-file-token".to_string())
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitlab_token_ignores_failing_glab_command_and_uses_stored_token() {
+        with_temp_home(|_| {
+            let bin = tempfile::tempdir().unwrap();
+            write_fake_host_command(bin.path(), "glab", "#!/bin/sh\nexit 1\n");
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                (DISABLE_HOST_CLI_AUTH_ENV, None),
+                ("GITLAB_TOKEN", None),
+                ("CI_JOB_TOKEN", None),
+                ("PATH", Some(bin.path().as_os_str().to_owned())),
+            ]);
+
+            std::fs::write(
+                credentials_path().expect("credentials path should resolve"),
+                encrypt(
+                    &serde_json::json!({ GITLAB_REGISTRY_URL: "gitlab-file-token" }).to_string(),
+                )
+                .expect("failed to encrypt credentials store"),
+            )
+            .expect("failed to write encrypted credentials store");
+
+            assert_eq!(
+                get_gitlab_token_for_host("https://gitlab.com"),
+                Some("gitlab-file-token".to_string())
+            );
+        });
     }
 
     #[test]

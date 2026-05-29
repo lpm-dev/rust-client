@@ -218,6 +218,9 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     // Clear auth tokens to prevent accidental network calls with real creds
     cmd.remove_env("LPM_TOKEN");
     cmd.remove_env("NPM_TOKEN");
+    cmd.remove_env("GITHUB_TOKEN");
+    cmd.remove_env("GITLAB_TOKEN");
+    cmd.remove_env("CI_JOB_TOKEN");
 
     // Clear CI-environment OIDC vars that GitHub Actions / GitLab inject
     // into every job. Without this, OIDC tests running ON GitHub Actions
@@ -245,6 +248,7 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.set_env("LPM_FORCE_FILE_AUTH", OsStr::new("1"));
     cmd.set_env("LPM_TEST_FAST_SCRYPT", OsStr::new("1"));
     cmd.set_env("LPM_FORCE_FILE_VAULT", OsStr::new("1"));
+    cmd.set_env("LPM_DISABLE_HOST_CLI_AUTH", OsStr::new("1"));
 
     // Clear `LPM_LINKER` so a developer's exported value (or a prior test
     // process) can't override the package.json + config.toml linker chain

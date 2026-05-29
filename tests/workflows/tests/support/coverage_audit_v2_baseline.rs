@@ -874,11 +874,13 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 35: lpm login --npm ──
     SurfaceV2 {
         id: 35,
-        scenarios: 3,
+        scenarios: 4,
         failure_modes_tested: &[
             "env token precedence over stored custom registry token",
             "authenticated install attaches bearer on every registry request",
             "--json without --token emits error envelope (directs user to npmjs.com tokens)",
+            "--json with --token stores fallback token",
+            "--json with NPM_TOKEN stores fallback token",
         ],
         failure_modes_known: &[
             "NPM 401 invalid credentials",
@@ -887,22 +889,23 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[
-            ("tests/workflows/tests/auth_lifecycle.rs", 2),
+            ("tests/workflows/tests/auth_lifecycle.rs", 3),
             ("tests/workflows/tests/npmrc.rs", 1),
         ],
-        last_audited_at: "2026-05-14",
+        last_audited_at: "2026-05-29",
     },
     // ── id 36: lpm login --github / --gitlab ──
     SurfaceV2 {
         id: 36,
-        scenarios: 6,
+        scenarios: 7,
         failure_modes_tested: &[
-            "logout-github clears only github state",
-            "logout-gitlab clears only gitlab state",
-            "logout-npm-and-github clear both and preserve gitlab",
             "OIDC setup snippet contract (cli-binary)",
             "login --github --json without --token emits error envelope (directs to github.com tokens)",
             "login --gitlab --json without --token emits error envelope (directs to gitlab.com tokens)",
+            "login --github --json with --token stores fallback token",
+            "login --gitlab --json with --token stores fallback token",
+            "login --github --json with gh auth avoids storing copied token",
+            "login --gitlab --json with glab auth avoids storing copied token",
         ],
         failure_modes_known: &[
             "github device-flow timeout awaiting user approval",
@@ -911,10 +914,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[
-            ("tests/workflows/tests/auth_lifecycle.rs", 5),
+            ("tests/workflows/tests/auth_lifecycle.rs", 6),
             ("crates/lpm-cli/tests/oidc_setup_snippet_contract.rs", 1),
         ],
-        last_audited_at: "2026-05-14",
+        last_audited_at: "2026-05-29",
     },
     // ── id 37: lpm login --login-registry <URL> ──
     SurfaceV2 {

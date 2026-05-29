@@ -42,6 +42,15 @@ fn builtin_expiry_key(registry_url: &str) -> &'static str {
     }
 }
 
+#[cfg(unix)]
+fn write_fake_host_command(dir: &std::path::Path, name: &str, script: &str) {
+    let path = dir.join(name);
+    std::fs::write(&path, script).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+}
+
 async fn assert_targeted_builtin_logout_preserves_primary_session(
     project_name: &str,
     flag: &str,
@@ -1463,11 +1472,7 @@ async fn logout_registry_clears_only_targeted_custom_registry_state() {
 
 // ─── --json error envelope contracts for login --npm/--github/--gitlab/--login-registry ───
 //
-// The login dispatcher requires a `--token <token>` when invoked under
-// `--json` (interactive prompt is suppressed). Without one, every
-// registry-target variant surfaces the same shape on stdout. These
-// tests pin that contract — they're the cheapest envelope claim that
-// proves `lpm --json login --<target>` is machine-readable.
+// These tests pin the machine-readable login contracts for third-party targets.
 
 #[test]
 fn login_npm_without_token_under_json_emits_error_envelope_on_stdout() {
@@ -1484,8 +1489,10 @@ fn login_npm_without_token_under_json_emits_error_envelope_on_stdout() {
     assert_eq!(envelope["success"], serde_json::json!(false));
     let err = envelope["error"].as_str().unwrap_or_default();
     assert!(
-        err.contains("--token") && err.contains("npmjs.com"),
-        "error must direct user to npmjs.com tokens page, got: {err}",
+        err.contains("interactive terminal")
+            && err.contains("--token")
+            && err.contains("NPM_TOKEN"),
+        "error must direct non-interactive npm login to TTY, --token, or NPM_TOKEN, got: {err}",
     );
 }
 
@@ -1504,8 +1511,8 @@ fn login_github_without_token_under_json_emits_error_envelope_on_stdout() {
     assert_eq!(envelope["success"], serde_json::json!(false));
     let err = envelope["error"].as_str().unwrap_or_default();
     assert!(
-        err.contains("--token") && err.contains("github.com"),
-        "error must direct user to github.com tokens page, got: {err}",
+        err.contains("gh auth login") && err.contains("--token") && err.contains("GITHUB_TOKEN"),
+        "error must direct user to gh auth, --token, or GITHUB_TOKEN, got: {err}",
     );
 }
 
@@ -1524,8 +1531,187 @@ fn login_gitlab_without_token_under_json_emits_error_envelope_on_stdout() {
     assert_eq!(envelope["success"], serde_json::json!(false));
     let err = envelope["error"].as_str().unwrap_or_default();
     assert!(
-        err.contains("--token") && err.contains("gitlab.com"),
-        "error must direct user to gitlab.com tokens page, got: {err}",
+        err.contains("glab auth login") && err.contains("--token") && err.contains("GITLAB_TOKEN"),
+        "error must direct user to glab auth, --token, or GitLab token env, got: {err}",
+    );
+}
+
+#[test]
+fn login_npm_with_explicit_token_under_json_stores_fallback_token() {
+    let project = TempProject::empty(r#"{"name":"login-npm-token","version":"1.0.0"}"#);
+    write_credentials_store(project.home(), &serde_json::json!({}));
+
+    let output = lpm(&project)
+        .args(["--json", "login", "--npm", "--token", "npm-fallback-token"])
+        .output()
+        .expect("failed to run lpm --json login --npm --token");
+
+    assert!(
+        output.status.success(),
+        "explicit npm token login should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["source"], serde_json::json!("explicit-token"));
+    assert_eq!(json["stored"], serde_json::json!(true));
+
+    let credentials = read_credentials(project.home());
+    assert_eq!(credentials[NPM_REGISTRY_URL], "npm-fallback-token");
+}
+
+#[test]
+fn login_npm_with_env_token_under_json_stores_fallback_token() {
+    let project = TempProject::empty(r#"{"name":"login-npm-env-token","version":"1.0.0"}"#);
+    write_credentials_store(project.home(), &serde_json::json!({}));
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", "npm-env-token")
+        .args(["--json", "login", "--npm"])
+        .output()
+        .expect("failed to run lpm --json login --npm with NPM_TOKEN");
+
+    assert!(
+        output.status.success(),
+        "npm env-token login should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["source"], serde_json::json!("env:NPM_TOKEN"));
+    assert_eq!(json["stored"], serde_json::json!(true));
+
+    let credentials = read_credentials(project.home());
+    assert_eq!(credentials[NPM_REGISTRY_URL], "npm-env-token");
+}
+
+#[test]
+fn login_github_with_explicit_token_under_json_stores_fallback_token() {
+    let project = TempProject::empty(r#"{"name":"login-gh-token","version":"1.0.0"}"#);
+    write_credentials_store(project.home(), &serde_json::json!({}));
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--github",
+            "--token",
+            "github-fallback-token",
+        ])
+        .output()
+        .expect("failed to run lpm --json login --github --token");
+
+    assert!(
+        output.status.success(),
+        "explicit GitHub token login should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["source"], serde_json::json!("explicit-token"));
+    assert_eq!(json["stored"], serde_json::json!(true));
+
+    let credentials = read_credentials(project.home());
+    assert_eq!(credentials[GITHUB_REGISTRY_URL], "github-fallback-token");
+}
+
+#[test]
+fn login_gitlab_with_explicit_token_under_json_stores_fallback_token() {
+    let project = TempProject::empty(r#"{"name":"login-gitlab-token","version":"1.0.0"}"#);
+    write_credentials_store(project.home(), &serde_json::json!({}));
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--gitlab",
+            "--token",
+            "gitlab-fallback-token",
+        ])
+        .output()
+        .expect("failed to run lpm --json login --gitlab --token");
+
+    assert!(
+        output.status.success(),
+        "explicit GitLab token login should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["source"], serde_json::json!("explicit-token"));
+    assert_eq!(json["stored"], serde_json::json!(true));
+
+    let credentials = read_credentials(project.home());
+    assert_eq!(credentials[GITLAB_REGISTRY_URL], "gitlab-fallback-token");
+}
+
+#[cfg(unix)]
+#[test]
+fn login_github_with_gh_auth_under_json_does_not_store_cli_token() {
+    let project = TempProject::empty(r#"{"name":"login-gh-cli","version":"1.0.0"}"#);
+    let bin = tempfile::tempdir().expect("failed to create fake bin dir");
+    write_fake_host_command(
+        bin.path(),
+        "gh",
+        "#!/bin/sh\n[ \"$1\" = auth ] && [ \"$2\" = token ] && printf 'gh-cli-token\\n'\n",
+    );
+
+    let output = lpm(&project)
+        .env("PATH", bin.path())
+        .env_remove("LPM_DISABLE_HOST_CLI_AUTH")
+        .args(["--json", "login", "--github"])
+        .output()
+        .expect("failed to run lpm --json login --github with fake gh");
+
+    assert!(
+        output.status.success(),
+        "GitHub CLI backed login should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["source"], serde_json::json!("gh"));
+    assert_eq!(json["stored"], serde_json::json!(false));
+    assert!(
+        !credentials_path(project.home()).exists(),
+        "gh-backed login must not copy the GitHub CLI token into LPM storage"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn login_gitlab_with_glab_auth_under_json_does_not_store_cli_token() {
+    let project = TempProject::empty(r#"{"name":"login-glab-cli","version":"1.0.0"}"#);
+    let bin = tempfile::tempdir().expect("failed to create fake bin dir");
+    write_fake_host_command(
+        bin.path(),
+        "glab",
+        "#!/bin/sh\n[ \"$1\" = auth ] && [ \"$2\" = token ] && printf 'glab-cli-token\\n'\n",
+    );
+
+    let output = lpm(&project)
+        .env("PATH", bin.path())
+        .env_remove("LPM_DISABLE_HOST_CLI_AUTH")
+        .args(["--json", "login", "--gitlab"])
+        .output()
+        .expect("failed to run lpm --json login --gitlab with fake glab");
+
+    assert!(
+        output.status.success(),
+        "GitLab CLI backed login should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["source"], serde_json::json!("glab"));
+    assert_eq!(json["stored"], serde_json::json!(false));
+    assert!(
+        !credentials_path(project.home()).exists(),
+        "glab-backed login must not copy the GitLab CLI token into LPM storage"
     );
 }
 

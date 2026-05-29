@@ -4,9 +4,11 @@
 //! OTP detection and retry, and npm-specific error handling.
 
 use crate::commands::publish_common::build_npm_payload;
+use crate::commands::web_auth;
 use crate::output;
 use lpm_common::LpmError;
 use lpm_runner::lpm_json::NpmPublishConfig;
+use std::time::Duration;
 
 /// Default npm registry URL.
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
@@ -156,6 +158,70 @@ pub async fn publish_to_npm(
     json_output: bool,
     yes: bool,
 ) -> Result<NpmPublishResult, LpmError> {
+    publish_to_npm_impl(
+        token,
+        npm_name,
+        version,
+        version_data,
+        tarball_data,
+        access,
+        tag,
+        registry_url,
+        otp_preempt,
+        json_output,
+        yes,
+        NpmPublishRuntime::production(),
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct NpmPublishRuntime {
+    allow_http: bool,
+    interactive: Option<bool>,
+    open_browser: bool,
+    web_auth_timeout: Duration,
+    web_auth_poll_interval: Duration,
+}
+
+impl NpmPublishRuntime {
+    fn production() -> Self {
+        Self {
+            allow_http: false,
+            interactive: None,
+            open_browser: true,
+            web_auth_timeout: Duration::from_secs(5 * 60),
+            web_auth_poll_interval: Duration::from_secs(1),
+        }
+    }
+
+    #[cfg(test)]
+    fn test() -> Self {
+        Self {
+            allow_http: true,
+            interactive: Some(true),
+            open_browser: false,
+            web_auth_timeout: Duration::from_secs(1),
+            web_auth_poll_interval: Duration::from_millis(1),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_to_npm_impl(
+    token: &str,
+    npm_name: &str,
+    version: &str,
+    version_data: &serde_json::Value,
+    tarball_data: &[u8],
+    access: &str,
+    tag: &str,
+    registry_url: &str,
+    otp_preempt: bool,
+    json_output: bool,
+    yes: bool,
+    runtime: NpmPublishRuntime,
+) -> Result<NpmPublishResult, LpmError> {
     let start = std::time::Instant::now();
 
     // S1: Credential isolation — assert no LPM token leaks to npm
@@ -165,7 +231,7 @@ pub async fn publish_to_npm(
     );
 
     // Reject HTTP for publish (S9)
-    if !registry_url.starts_with("https://") {
+    if !registry_url.starts_with("https://") && !runtime.allow_http {
         return Err(LpmError::Registry(format!(
             "refusing to publish over HTTP to {registry_url} — credentials require HTTPS"
         )));
@@ -205,7 +271,10 @@ pub async fn publish_to_npm(
     }
 
     // First attempt
-    let mut req = client.put(&url).json(&payload).bearer_auth(token);
+    let mut req =
+        web_auth::add_npm_web_auth_headers(client.put(&url), web_auth::NPM_COMMAND_PUBLISH)
+            .json(&payload)
+            .bearer_auth(token);
     if let Some(code) = &otp_code {
         req = req.header("npm-otp", code);
     }
@@ -219,15 +288,42 @@ pub async fn publish_to_npm(
     let headers = response.headers().clone();
 
     // OTP required? (A4)
-    // npm returns `www-authenticate: OTP` (uppercase) — match case-insensitively
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        let needs_otp = headers
-            .get("www-authenticate")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.to_lowercase().contains("otp"));
+        let body = response_json_or_empty(response).await;
+        if let Some(challenge) = web_auth::parse_web_auth_challenge_from_body(&body) {
+            if !can_handle_interactive_challenge(json_output, yes, runtime) {
+                return Err(LpmError::Registry(
+                    "npm requires browser authentication to finish publishing, but this command is running in non-interactive mode. Re-run in a TTY or use an automation token.".into(),
+                ));
+            }
 
-        if needs_otp {
-            if json_output || yes {
+            let otp = web_auth::complete_web_auth_challenge(
+                &client,
+                &challenge,
+                "publish",
+                json_output,
+                runtime.open_browser,
+                runtime.web_auth_timeout,
+                runtime.web_auth_poll_interval,
+            )
+            .await?;
+
+            let retry_req =
+                web_auth::add_npm_web_auth_headers(client.put(&url), web_auth::NPM_COMMAND_PUBLISH)
+                    .json(&payload)
+                    .bearer_auth(token)
+                    .header("npm-otp", &otp);
+
+            let retry_response = retry_req
+                .send()
+                .await
+                .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
+
+            return handle_npm_response(retry_response, npm_name, version, start).await;
+        }
+
+        if is_otp_required(status, &headers) {
+            if !can_handle_interactive_challenge(json_output, yes, runtime) {
                 return Err(LpmError::Registry(
                     "npm OTP required but running in non-interactive mode. \
 					 Use an automation token (no OTP required)."
@@ -242,11 +338,11 @@ pub async fn publish_to_npm(
             let otp = prompt_npm_otp()?;
 
             // Retry with OTP header
-            let retry_req = client
-                .put(&url)
-                .json(&payload)
-                .bearer_auth(token)
-                .header("npm-otp", &otp);
+            let retry_req =
+                web_auth::add_npm_web_auth_headers(client.put(&url), web_auth::NPM_COMMAND_PUBLISH)
+                    .json(&payload)
+                    .bearer_auth(token)
+                    .header("npm-otp", &otp);
 
             let retry_response = retry_req
                 .send()
@@ -255,6 +351,10 @@ pub async fn publish_to_npm(
 
             return handle_npm_response(retry_response, npm_name, version, start).await;
         }
+
+        return Ok(handle_npm_response_body(
+            status, body, npm_name, version, start,
+        ));
     }
 
     handle_npm_response(response, npm_name, version, start).await
@@ -268,21 +368,30 @@ async fn handle_npm_response(
     start: std::time::Instant,
 ) -> Result<NpmPublishResult, LpmError> {
     let status = response.status();
-    let duration = start.elapsed();
+    let body = response_json_or_empty(response).await;
 
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .unwrap_or_else(|_| serde_json::json!({}));
+    Ok(handle_npm_response_body(
+        status, body, npm_name, version, start,
+    ))
+}
+
+fn handle_npm_response_body(
+    status: reqwest::StatusCode,
+    body: serde_json::Value,
+    npm_name: &str,
+    version: &str,
+    start: std::time::Instant,
+) -> NpmPublishResult {
+    let duration = start.elapsed();
 
     let error_msg = body.get("error").and_then(|e| e.as_str()).unwrap_or("");
 
     if status.is_success() {
-        return Ok(NpmPublishResult {
+        return NpmPublishResult {
             success: true,
             error: None,
             duration,
-        });
+        };
     }
 
     // Map npm-specific status codes to clear error messages
@@ -308,11 +417,31 @@ async fn handle_npm_response(
 		),
 	};
 
-    Ok(NpmPublishResult {
+    NpmPublishResult {
         success: false,
         error: Some(detailed_error),
         duration,
-    })
+    }
+}
+
+async fn response_json_or_empty(response: reqwest::Response) -> serde_json::Value {
+    response
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn can_handle_interactive_challenge(
+    json_output: bool,
+    yes: bool,
+    runtime: NpmPublishRuntime,
+) -> bool {
+    if json_output || yes {
+        return false;
+    }
+    runtime
+        .interactive
+        .unwrap_or_else(web_auth::terminal_is_interactive)
 }
 
 /// Prompt the user for an npm OTP code.
@@ -331,18 +460,19 @@ fn prompt_npm_otp() -> Result<String, LpmError> {
 }
 
 /// Detect if an HTTP response indicates OTP is required.
-#[cfg(test)]
 fn is_otp_required(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> bool {
     status == reqwest::StatusCode::UNAUTHORIZED
         && headers
             .get("www-authenticate")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("otp"))
+            .is_some_and(|v| v.to_ascii_lowercase().contains("otp"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn resolve_npm_name_with_config_override() {
@@ -412,7 +542,7 @@ mod tests {
         use reqwest::header::HeaderMap;
 
         let mut headers = HeaderMap::new();
-        headers.insert("www-authenticate", "otp".parse().unwrap());
+        headers.insert("www-authenticate", "OTP".parse().unwrap());
         assert!(is_otp_required(reqwest::StatusCode::UNAUTHORIZED, &headers));
 
         // No OTP header
@@ -424,5 +554,165 @@ mod tests {
 
         // Wrong status
         assert!(!is_otp_required(reqwest::StatusCode::FORBIDDEN, &headers));
+    }
+
+    #[tokio::test]
+    async fn publish_to_npm_sends_web_auth_publish_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let result = publish_to_npm_impl(
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
+            b"fake-tarball",
+            "public",
+            "latest",
+            &server.uri(),
+            false,
+            false,
+            false,
+            NpmPublishRuntime::test(),
+        )
+        .await
+        .expect("publish should succeed");
+
+        assert!(result.success);
+        let requests = server.received_requests().await.unwrap();
+        let publish_request = requests
+            .iter()
+            .find(|request| request.method.as_str() == "PUT")
+            .expect("publish request should be recorded");
+        assert_eq!(
+            publish_request
+                .headers
+                .get(web_auth::NPM_AUTH_TYPE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(web_auth::NPM_AUTH_TYPE_WEB)
+        );
+        assert_eq!(
+            publish_request
+                .headers
+                .get(web_auth::NPM_COMMAND_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(web_auth::NPM_COMMAND_PUBLISH)
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_to_npm_retries_with_web_auth_otp_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/done"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "web-otp-token",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .and(header("npm-otp", "web-otp-token"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "authUrl": format!("{}/auth", server.uri()),
+                "doneUrl": format!("{}/done", server.uri()),
+            })))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let result = publish_to_npm_impl(
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
+            b"fake-tarball",
+            "public",
+            "latest",
+            &server.uri(),
+            false,
+            false,
+            false,
+            NpmPublishRuntime::test(),
+        )
+        .await
+        .expect("publish should complete after web-auth OTP retry");
+
+        assert!(result.success);
+        let requests = server.received_requests().await.unwrap();
+        let publish_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PUT")
+            .collect();
+        assert_eq!(publish_requests.len(), 2);
+        assert_eq!(
+            publish_requests[1]
+                .headers
+                .get("npm-otp")
+                .and_then(|value| value.to_str().ok()),
+            Some("web-otp-token")
+        );
+        for request in publish_requests {
+            assert_eq!(
+                request
+                    .headers
+                    .get(web_auth::NPM_AUTH_TYPE_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(web_auth::NPM_AUTH_TYPE_WEB)
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .get(web_auth::NPM_COMMAND_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(web_auth::NPM_COMMAND_PUBLISH)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_to_npm_preserves_classic_otp_noninteractive_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("www-authenticate", "OTP")
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&server)
+            .await;
+
+        let err = publish_to_npm_impl(
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
+            b"fake-tarball",
+            "public",
+            "latest",
+            &server.uri(),
+            false,
+            true,
+            false,
+            NpmPublishRuntime::test(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("npm OTP required"),
+            "unexpected error: {err}"
+        );
     }
 }
