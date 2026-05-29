@@ -494,7 +494,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: true,
         references: &[
             "tests/workflows/tests/auth_lifecycle.rs",
             "tests/workflows/tests/npmrc.rs",
@@ -507,7 +507,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: false,
+        json_contract: true,
         references: &[
             "tests/workflows/tests/auth_lifecycle.rs",
             "crates/lpm-cli/tests/oidc_setup_snippet_contract.rs",
@@ -520,7 +520,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: true,
         references: &["tests/workflows/tests/auth_lifecycle.rs"],
     },
     SurfaceBaseline {

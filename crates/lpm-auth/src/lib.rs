@@ -1919,10 +1919,8 @@ mod tests {
 
             std::fs::write(
                 credentials_path().expect("credentials path should resolve"),
-                encrypt(
-                    &serde_json::json!({ NPM_REGISTRY_URL: "npm-file-token" }).to_string(),
-                )
-                .expect("failed to encrypt credentials store"),
+                encrypt(&serde_json::json!({ NPM_REGISTRY_URL: "npm-file-token" }).to_string())
+                    .expect("failed to encrypt credentials store"),
             )
             .expect("failed to write encrypted credentials store");
 
