@@ -58,14 +58,15 @@ fn is_workspace_root(dir: &Path) -> bool {
 }
 
 /// Hint passed by callers that have already resolved (or definitively failed
-/// to resolve) the project's managed Node.js runtime via `lpm_runtime::ensure_runtime`.
+/// to resolve) the project's managed runtime bins via `lpm_runtime::ensure_runtime`.
 ///
 /// The PATH builder uses this to skip the `detect_node_version` + `list_installed`
 /// I/O on the warm `lpm run` startup path.
 ///
 /// Three states are required to honestly avoid redundant detection:
 ///
-/// - `Bin(path)` — caller already resolved the managed runtime bin dir.
+/// - `Bin(path)` — caller already resolved one managed runtime bin dir.
+/// - `Bins(paths)` — caller already resolved multiple managed runtime bin dirs.
 /// - `Absent` — caller called `ensure_runtime` and confirmed there is no
 ///   managed runtime to use (no spec detected, or spec detected but no
 ///   matching install). The PATH builder skips the silent detect entirely.
@@ -75,6 +76,7 @@ fn is_workspace_root(dir: &Path) -> bool {
 #[derive(Debug, Clone)]
 pub enum ManagedRuntimeHint {
     Bin(std::path::PathBuf),
+    Bins(Vec<std::path::PathBuf>),
     Absent,
     Unknown,
 }
@@ -88,7 +90,7 @@ impl Default for ManagedRuntimeHint {
     }
 }
 
-/// Build a PATH string with managed runtime and `node_modules/.bin` directories prepended.
+/// Build a PATH string with managed runtimes and `node_modules/.bin` directories prepended.
 ///
 /// Thin wrapper around `build_path_with_bins_pre_resolved` with `Unknown` hint —
 /// preserves the silent-detect contract for callers that don't go through
@@ -102,7 +104,7 @@ pub fn build_path_with_bins(start_dir: &Path) -> String {
 ///
 /// Order (highest priority first):
 /// 1. `node_modules/.bin` dirs (project-level, then workspace root)
-/// 2. Managed Node.js runtime bin dir (per `hint`)
+/// 2. Managed Node.js runtime bin dir, then managed Bun bin dir (per `hint`)
 /// 3. Existing system PATH
 pub fn build_path_with_bins_pre_resolved(start_dir: &Path, hint: &ManagedRuntimeHint) -> String {
     let bin_dirs = find_bin_dirs(start_dir);
@@ -118,13 +120,14 @@ pub fn build_path_with_bins_pre_resolved(start_dir: &Path, hint: &ManagedRuntime
         ManagedRuntimeHint::Bin(path) => {
             parts.push(path.to_string_lossy().to_string());
         }
+        ManagedRuntimeHint::Bins(paths) => {
+            parts.extend(paths.iter().map(|path| path.to_string_lossy().to_string()));
+        }
         ManagedRuntimeHint::Absent => {
             // Caller confirmed no managed runtime — skip the silent detect.
         }
         ManagedRuntimeHint::Unknown => {
-            if let Some(runtime_bin) = detect_managed_runtime_bin(start_dir) {
-                parts.push(runtime_bin);
-            }
+            parts.extend(detect_managed_runtime_bins(start_dir));
         }
     }
 
@@ -135,31 +138,52 @@ pub fn build_path_with_bins_pre_resolved(start_dir: &Path, hint: &ManagedRuntime
     parts.join(separator)
 }
 
-/// Detect if the project has a pinned Node.js version that is installed locally.
+/// Detect if the project has pinned managed runtimes that are installed locally.
 ///
-/// If found, returns the path to the managed runtime's `bin/` directory.
+/// If found, returns managed runtime `bin/` directories in PATH precedence order.
 /// Messaging is handled by `ensure_runtime()` in the CLI layer — this function
 /// is a silent PATH builder.
-fn detect_managed_runtime_bin(project_dir: &Path) -> Option<String> {
-    let detected = lpm_runtime::detect::detect_node_version(project_dir)?;
+fn detect_managed_runtime_bins(project_dir: &Path) -> Vec<String> {
+    let mut bins = Vec::with_capacity(2);
+    for detected in lpm_runtime::detect::detect_runtime_versions(project_dir) {
+        if let Some(bin_dir) = detect_one_managed_runtime_bin(&detected) {
+            bins.push(bin_dir);
+        }
+    }
+    bins
+}
 
-    // For simple version specs (just a number like "22" or "22.5.0"), check if installed
-    let spec = &detected.spec;
+fn detect_one_managed_runtime_bin(
+    detected: &lpm_runtime::detect::DetectedRuntimeVersion,
+) -> Option<String> {
+    let (matched, bin_dir) = match detected.runtime {
+        lpm_runtime::detect::RuntimeKind::Node => {
+            let spec = detected
+                .spec
+                .trim_start_matches(">=")
+                .trim_start_matches("^")
+                .trim_start_matches("~")
+                .trim_start_matches('>');
+            let installed = lpm_runtime::node::list_installed().ok()?;
+            let matched = lpm_runtime::node::find_matching_installed(spec, &installed)?;
+            let bin_dir = lpm_runtime::node::node_bin_dir(&matched).ok()?;
+            (matched, bin_dir)
+        }
+        lpm_runtime::detect::RuntimeKind::Bun => {
+            let installed = lpm_runtime::bun::list_installed().ok()?;
+            let matched = lpm_runtime::bun::find_matching_installed(&detected.spec, &installed)?;
+            let bin_dir = lpm_runtime::bun::bun_bin_dir(&matched).ok()?;
+            (matched, bin_dir)
+        }
+    };
 
-    // Strip range operators for lookup — we only auto-switch for pinned/simple specs
-    let clean_spec = spec
-        .trim_start_matches(">=")
-        .trim_start_matches("^")
-        .trim_start_matches("~")
-        .trim_start_matches('>');
-
-    // Try to find an installed version matching this spec
-    let installed = lpm_runtime::node::list_installed().ok()?;
-    let matched = lpm_runtime::node::find_matching_installed(clean_spec, &installed)?;
-
-    let bin_dir = lpm_runtime::node::node_bin_dir(&matched).ok()?;
     if bin_dir.exists() {
-        tracing::debug!("using managed node {} (from {})", matched, detected.source);
+        tracing::debug!(
+            "using managed {} {} (from {})",
+            detected.runtime,
+            matched,
+            detected.source
+        );
         Some(bin_dir.to_string_lossy().to_string())
     } else {
         None
@@ -278,6 +302,31 @@ mod tests {
         ];
         expected.extend(inherited);
         let parts_owned: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
+        assert_eq!(parts_owned, expected);
+    }
+
+    #[test]
+    fn build_path_with_bins_pre_resolved_preserves_multiple_runtime_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm_bin = dir.path().join("node_modules/.bin");
+        fs::create_dir_all(&nm_bin).unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+
+        let node_bin = dir.path().join("node/bin");
+        let bun_bin = dir.path().join("bun/bin");
+
+        let path = build_path_with_bins_pre_resolved(
+            dir.path(),
+            &ManagedRuntimeHint::Bins(vec![node_bin.clone(), bun_bin.clone()]),
+        );
+
+        let mut expected: Vec<String> = vec![
+            nm_bin.to_string_lossy().to_string(),
+            node_bin.to_string_lossy().to_string(),
+            bun_bin.to_string_lossy().to_string(),
+        ];
+        expected.extend(inherited_path_segments());
+        let parts_owned: Vec<String> = path_segments(&path).iter().map(|s| s.to_string()).collect();
         assert_eq!(parts_owned, expected);
     }
 

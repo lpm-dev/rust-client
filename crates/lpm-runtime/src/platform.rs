@@ -2,8 +2,8 @@
 
 use lpm_common::LpmError;
 
-/// Supported platforms for Node.js runtime downloads.
-const SUPPORTED_PLATFORMS: &str = "darwin-arm64, darwin-x64, linux-x64, linux-arm64, win-x64";
+/// Supported platforms for managed runtime downloads.
+const SUPPORTED_PLATFORMS: &str = "Node: darwin-arm64, darwin-x64, linux-x64, linux-arm64, win-x64; Bun: darwin-aarch64, darwin-x64, linux-aarch64, linux-x64, linux-*-musl, windows-*";
 
 /// Current platform information.
 #[derive(Debug, Clone)]
@@ -47,6 +47,34 @@ impl Platform {
     pub fn node_suffix(&self) -> String {
         format!("{}-{}", self.os, self.arch)
     }
+
+    /// Bun distribution filename suffix.
+    ///
+    /// Bun follows installer target names such as `darwin-aarch64`,
+    /// `linux-x64-musl`, `linux-x64-baseline`, and `windows-x64`.
+    pub fn bun_suffix(&self) -> String {
+        self.bun_suffix_with(detect_avx2(), lpm_common::platform::detect_libc())
+    }
+
+    pub(crate) fn bun_suffix_with(&self, has_avx2: bool, libc: Option<&str>) -> String {
+        let os = match self.os {
+            "win" => "windows",
+            other => other,
+        };
+        let arch = match self.arch {
+            "arm64" => "aarch64",
+            other => other,
+        };
+
+        let mut suffix = format!("{os}-{arch}");
+        if self.os == "linux" && libc == Some("musl") {
+            suffix.push_str("-musl");
+        }
+        if self.arch == "x64" && !has_avx2 {
+            suffix.push_str("-baseline");
+        }
+        suffix
+    }
 }
 
 impl std::fmt::Display for Platform {
@@ -74,6 +102,17 @@ fn detect_arch() -> &'static str {
         "x64"
     } else {
         "unknown"
+    }
+}
+
+fn detect_avx2() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        true
     }
 }
 
@@ -109,5 +148,44 @@ mod tests {
         assert!(suffix.contains('-'));
         // Should be something like "darwin-arm64" or "linux-x64"
         assert!(suffix.len() > 5);
+    }
+
+    #[test]
+    fn bun_suffix_maps_macos_arm64_to_aarch64() {
+        let p = Platform {
+            os: "darwin",
+            arch: "arm64",
+        };
+        assert_eq!(p.bun_suffix_with(true, None), "darwin-aarch64");
+    }
+
+    #[test]
+    fn bun_suffix_maps_windows_os_name() {
+        let p = Platform {
+            os: "win",
+            arch: "x64",
+        };
+        assert_eq!(p.bun_suffix_with(true, None), "windows-x64");
+    }
+
+    #[test]
+    fn bun_suffix_adds_musl_before_baseline_for_linux_x64() {
+        let p = Platform {
+            os: "linux",
+            arch: "x64",
+        };
+        assert_eq!(
+            p.bun_suffix_with(false, Some("musl")),
+            "linux-x64-musl-baseline"
+        );
+    }
+
+    #[test]
+    fn bun_suffix_does_not_add_baseline_for_arm64() {
+        let p = Platform {
+            os: "linux",
+            arch: "arm64",
+        };
+        assert_eq!(p.bun_suffix_with(false, Some("glibc")), "linux-aarch64");
     }
 }

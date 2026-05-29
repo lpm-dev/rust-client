@@ -2,9 +2,11 @@
 
 use crate::download;
 use crate::platform::Platform;
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot};
 use serde::Deserialize;
 use std::path::PathBuf;
+
+const NODE_DIST_BASE_URL: &str = "https://nodejs.org/dist";
 
 /// A single Node.js release from the distribution index.
 #[derive(Debug, Clone, Deserialize)]
@@ -15,6 +17,9 @@ pub struct NodeRelease {
     pub date: String,
     /// Whether this is an LTS release
     pub lts: LtsField,
+    /// Optional distribution base URL override used by tests and mirrors.
+    #[serde(default)]
+    pub dist_base_url: Option<String>,
 }
 
 /// The `lts` field can be `false` or a string like `"Jod"`.
@@ -47,6 +52,14 @@ impl NodeRelease {
         self.version.strip_prefix('v').unwrap_or(&self.version)
     }
 
+    fn dist_base_url(&self) -> String {
+        self.dist_base_url
+            .as_deref()
+            .unwrap_or(NODE_DIST_BASE_URL)
+            .trim_end_matches('/')
+            .to_string()
+    }
+
     /// Download URL for this release on the given platform.
     ///
     /// e.g., `https://nodejs.org/dist/v22.5.0/node-v22.5.0-darwin-arm64.tar.gz`
@@ -56,8 +69,9 @@ impl NodeRelease {
         } else {
             "tar.gz"
         };
+        let dist_base_url = self.dist_base_url();
         format!(
-            "https://nodejs.org/dist/{}/node-{}-{}.{ext}",
+            "{dist_base_url}/{}/node-{}-{}.{ext}",
             self.version,
             self.version,
             platform.node_suffix(),
@@ -68,15 +82,13 @@ impl NodeRelease {
     ///
     /// e.g., `https://nodejs.org/dist/v22.5.0/SHASUMS256.txt`
     pub fn shasums_url(&self) -> String {
-        format!("https://nodejs.org/dist/{}/SHASUMS256.txt", self.version)
+        format!("{}/{}/SHASUMS256.txt", self.dist_base_url(), self.version)
     }
 }
 
 /// Base directory for LPM runtime storage.
 pub fn runtimes_dir() -> Result<PathBuf, LpmError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| LpmError::Script("could not determine home directory".into()))?;
-    Ok(home.join(".lpm").join("runtimes"))
+    Ok(LpmRoot::from_env()?.root().join("runtimes"))
 }
 
 /// Directory for a specific installed Node.js version.
