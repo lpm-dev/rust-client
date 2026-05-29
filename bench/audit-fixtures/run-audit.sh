@@ -227,7 +227,11 @@ path = Path(os.environ["PY_REQUIRE_FAILURES_FILE"])
 if path.exists():
     with path.open(newline="") as handle:
         reader = csv.reader(handle, delimiter="\t")
-        for dep, error in reader:
+        for row in reader:
+            if not row:
+                continue
+            dep = row[0]
+            error = "\t".join(row[1:]) if len(row) > 1 else ""
             rows.append({"dep": dep, "error": error})
 
 print(json.dumps(rows))
