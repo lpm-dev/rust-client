@@ -2969,6 +2969,43 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/pack.rs", 3)],
         last_audited_at: "2026-05-25",
     },
+    // ── id 140: lpm catalog list --unused ──
+    SurfaceV2 {
+        id: 140,
+        scenarios: 1,
+        failure_modes_tested: &[
+            "unused default catalog entries reported",
+            "unused named catalog entries reported",
+            "JSON envelope count and entries snapshot",
+        ],
+        failure_modes_known: &[
+            "pnpm-workspace.yaml-only unused catalog entries",
+            "workspace member reference keeps root catalog entry live",
+            "malformed package.json catalog shape",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/pnpm_compat_catalog.rs", 1)],
+        last_audited_at: "2026-05-28",
+    },
+    // ── id 141: lpm catalog show --resolved ──
+    SurfaceV2 {
+        id: 141,
+        scenarios: 1,
+        failure_modes_tested: &[
+            "resolved catalog snapshot reports catalog name",
+            "resolved catalog snapshot reports package specifier and version",
+            "resolved catalog snapshot reports consumer reference shape",
+            "JSON envelope count and entries snapshot",
+        ],
+        failure_modes_known: &[
+            "missing lockfile",
+            "lockfile without catalog snapshot",
+            "stale lockfile catalog snapshot after manifest drift",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/pnpm_compat_catalog.rs", 1)],
+        last_audited_at: "2026-05-28",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

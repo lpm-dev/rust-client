@@ -2,6 +2,7 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use lpm_common::color::Painted;
 use miette::{IntoDiagnostic, Result};
+use std::num::NonZeroUsize;
 
 mod added_sources_state;
 mod auth;
@@ -57,6 +58,8 @@ mod tsc_status;
 mod update_check;
 pub mod upgrade_engine;
 pub mod version_diff;
+mod workspace_concurrency_config;
+mod workspace_filter_config;
 pub mod workspace_select;
 mod xcode_project;
 
@@ -304,6 +307,22 @@ enum Commands {
         /// only affects the manifest-declaration boundary.
         #[arg(long)]
         strict_integrity: bool,
+
+        /// Fail install when peer-dependency warnings or best-effort
+        /// peer conflicts are detected. Default is warn-only, matching
+        /// pnpm's current `strict-peer-dependencies=false` default.
+        ///
+        /// Precedence: this flag / `--no-strict-peer-dependencies` >
+        /// `package.json > lpm > strictPeerDependencies` >
+        /// `~/.lpm/config.toml > strict-peer-dependencies` > default
+        /// (false).
+        #[arg(long, conflicts_with = "no_strict_peer_dependencies")]
+        strict_peer_dependencies: bool,
+
+        /// Disable strict peer-dependency failures for this install,
+        /// overriding project or user config.
+        #[arg(long, conflicts_with = "strict_peer_dependencies")]
+        no_strict_peer_dependencies: bool,
 
         /// Override the minimumReleaseAge cooldown for this install only.
         /// Accepts `<N>h` (hours), `<N>d` (days), or plain `<N>` seconds.
@@ -555,6 +574,22 @@ enum Commands {
         #[arg(long)]
         filter: Vec<String>,
 
+        /// Filter workspace members with production dependency closures.
+        /// Same grammar as `--filter`, but `...` and `^...` do not walk
+        /// `devDependencies` edges.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
+
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// reverse git-ref closures do not fan out to dependents from them.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
+
         /// Target the workspace root `package.json` instead of the
         /// current member. Mutually exclusive with `--filter`. Use when
         /// adding tooling packages that belong at the root rather than
@@ -600,6 +635,21 @@ enum Commands {
         /// Example: `lpm install zod --save-prefix '~'` saves `"zod": "~4.3.6"`.
         #[arg(long, value_name = "PREFIX", conflicts_with_all = ["exact", "tilde"])]
         save_prefix: Option<String>,
+
+        /// Save matching package specs through the root catalog instead of
+        /// writing a direct range. `--catalog` uses the default catalog and
+        /// writes `"catalog:"`; `--catalog=<name>` uses a named catalog and
+        /// writes `"catalog:<name>"`. The package must already exist in that
+        /// catalog and the resolved version must satisfy the catalog range.
+        #[arg(
+            long,
+            value_name = "NAME",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "default",
+            conflicts_with_all = ["exact", "tilde", "save_prefix"],
+        )]
+        catalog: Option<String>,
 
         /// Install the package globally into `~/.lpm/global/` instead of
         /// into a project's `node_modules/`. Exposes the package's bin
@@ -686,6 +736,22 @@ enum Commands {
         /// `packages/web/package.json` only.
         #[arg(long)]
         filter: Vec<String>,
+
+        /// Filter workspace members with production dependency closures.
+        /// Same grammar as `--filter`, but `...` and `^...` do not walk
+        /// `devDependencies` edges.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
+
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// reverse git-ref closures do not fan out to dependents from them.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
 
         /// target the workspace root `package.json` instead
         /// of the current member.
@@ -997,6 +1063,12 @@ enum Commands {
         /// Auto-fix issues found during verify (e.g., refresh stale security caches).
         #[arg(long)]
         fix: bool,
+    },
+
+    /// Inspect workspace catalog usage and resolved catalog provenance.
+    Catalog {
+        #[command(subcommand)]
+        action: commands::catalog::CatalogCmd,
     },
 
     /// Manage globally-installed CLI packages under ~/.lpm/global/.
@@ -1347,17 +1419,21 @@ enum Commands {
         #[arg(long, short = 'p')]
         parallel: bool,
 
-        /// Continue running remaining tasks even if one fails.
-        #[arg(long)]
+        /// Do not bail after a task or selected workspace package fails.
+        #[arg(long = "no-bail")]
         continue_on_error: bool,
+
+        /// Limit concurrently running workspace packages.
+        #[arg(long = "workspace-concurrency", value_name = "N", value_parser = parse_workspace_concurrency)]
+        workspace_concurrency: Option<NonZeroUsize>,
 
         /// Stream output with task prefixes instead of buffering.
         #[arg(long)]
         stream: bool,
 
         /// Run in all workspace packages (topological order). Mutually
-        /// exclusive with `--filter` and `--affected`.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        /// exclusive with filters and `--affected`.
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
 
         /// Filter workspace packages with the grammar. Can be passed
@@ -1374,6 +1450,12 @@ enum Commands {
         #[arg(long)]
         filter: Vec<String>,
 
+        /// Filter workspace packages with production dependency closures.
+        /// Same grammar as `--filter`, but `...` and `^...` do not walk
+        /// `devDependencies` edges.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
+
         /// Exit with a non-zero status if no workspace package matches the
         /// filter set. Recommended in CI to catch typo'd filters early.
         #[arg(long)]
@@ -1386,6 +1468,17 @@ enum Commands {
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// `--affected` and reverse git-ref closures do not fan out to
+        /// dependents from them.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
 
         /// Disable task caching (force re-execution).
         #[arg(long)]
@@ -1461,8 +1554,24 @@ enum Commands {
 
         /// Filter expression identifying the member to deploy. Must match
         /// exactly one workspace member. Same grammar as `lpm run --filter`.
-        #[arg(long, required = true)]
+        #[arg(long)]
         filter: Vec<String>,
+
+        /// Filter expression using production dependency closures. May be
+        /// used instead of or alongside `--filter`; the combined result must
+        /// still match exactly one workspace member.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
+
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// reverse git-ref closures do not fan out to dependents from them.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
 
         /// Overwrite the output directory if it is non-empty. Without this
         /// flag, deploy refuses to write into a non-empty directory.
@@ -1582,8 +1691,21 @@ enum Commands {
     Filter {
         /// Filter expressions. Multiple expressions union; use `!expr` to
         /// exclude. Same grammar as `lpm run --filter`.
-        #[arg(required = true)]
         exprs: Vec<String>,
+
+        /// Filter expressions evaluated with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
+
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// reverse git-ref closures do not fan out to dependents from them.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
 
         /// Show the full structured selection trace (which filter matched
         /// each package and how). Without this flag, output is a terse name
@@ -1606,9 +1728,9 @@ enum Commands {
 
     /// Lint source files (powered by Oxlint, lazy-downloaded on first use).
     Lint {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
@@ -1619,12 +1741,23 @@ enum Commands {
         /// reverse closure (`...foo`, `...^foo`), exclusion (`!foo`).
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long, conflicts_with = "all")]
         affected: bool,
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         /// Recommended in CI to catch typo'd filters early.
         #[arg(long)]
@@ -1639,20 +1772,31 @@ enum Commands {
         /// Check formatting without writing (CI mode, exits non-zero if unformatted).
         #[arg(long)]
         check: bool,
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
@@ -1663,20 +1807,31 @@ enum Commands {
 
     /// Type-check the project (runs tsc --noEmit by default).
     Check {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
@@ -1690,20 +1845,31 @@ enum Commands {
 
     /// Bundle the project with Rolldown through an LPM-owned command surface.
     Bundle {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
@@ -1735,20 +1901,31 @@ enum Commands {
 
     /// Build package-oriented library output through a stable LPM command surface.
     Pack {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
@@ -1795,23 +1972,37 @@ enum Commands {
     /// to the runner itself (e.g. bun's `--filter`), prefix with `--`:
     /// `lpm test -- --filter pattern`.
     Test {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
+        /// Limit concurrently running workspace packages.
+        #[arg(long = "workspace-concurrency", value_name = "N", value_parser = parse_workspace_concurrency)]
+        workspace_concurrency: Option<NonZeroUsize>,
         /// Extra arguments passed to the test runner.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -1822,23 +2013,37 @@ enum Commands {
     /// Workspace flags behave the same as `lpm test`. To forward `--all`
     /// / `--filter` etc. to the bench runner itself, prefix with `--`.
     Bench {
-        /// Run in all workspace packages. Mutually exclusive with `--filter`
+        /// Run in all workspace packages. Mutually exclusive with filters
         /// and `--affected` — pick one selection mode.
-        #[arg(long, conflicts_with_all = ["filter", "affected"])]
+        #[arg(long, conflicts_with_all = ["filter", "filter_prod", "affected"])]
         all: bool,
         /// Filter workspace packages with the grammar. Can be passed
         /// multiple times: `--filter foo --filter bar` unions the two sets.
         #[arg(long)]
         filter: Vec<String>,
+        /// Filter workspace packages with production dependency closures.
+        #[arg(long = "filter-prod")]
+        filter_prod: Vec<String>,
         /// Run only in packages affected by git changes (vs base branch).
         #[arg(long)]
         affected: bool,
         /// Git base ref for --affected (default: main).
         #[arg(long, default_value = "main")]
         base: String,
+        /// Ignore changed files matching this git-diff glob when evaluating
+        /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
+        #[arg(long = "changed-files-ignore-pattern")]
+        changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
+        /// Limit concurrently running workspace packages.
+        #[arg(long = "workspace-concurrency", value_name = "N", value_parser = parse_workspace_concurrency)]
+        workspace_concurrency: Option<NonZeroUsize>,
         /// Extra arguments passed to the bench runner.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -2422,6 +2627,10 @@ fn parse_advisor_slug(s: &str) -> Result<String, String> {
     }
 }
 
+fn parse_workspace_concurrency(s: &str) -> Result<NonZeroUsize, String> {
+    workspace_concurrency_config::parse_workspace_concurrency(s)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_install_global_overrides(
     allow_new: bool,
@@ -2455,6 +2664,7 @@ fn build_install_global_overrides(
     );
     Ok(commands::install_global::InstallGlobalOverrides {
         allow_new,
+        strict_peer_dependencies_override: None,
         min_release_age_override,
         drift_ignore_policy,
         verify_policy,
@@ -2466,12 +2676,17 @@ fn build_install_global_overrides(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_global_install_project_scoped_flags(
     save_dev: bool,
     filter: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
+    catalog: bool,
 ) -> Result<(), lpm_common::LpmError> {
     // `--allow-new`, `--min-release-age`, and
     // `--ignore-provenance-drift[-all]` are now forwarded into the
@@ -2479,10 +2694,20 @@ fn validate_global_install_project_scoped_flags(
     // synthetic project's package.json), so they are no longer rejected
     // here. The flags below remain genuinely project-scoped and have no
     // meaningful semantics on `-g`.
-    if save_dev || !filter.is_empty() || workspace_root || fail_if_no_match || yes {
+    if save_dev
+        || !filter.is_empty()
+        || !filter_prod.is_empty()
+        || !changed_files_ignore_pattern.is_empty()
+        || !test_pattern.is_empty()
+        || workspace_root
+        || fail_if_no_match
+        || yes
+        || catalog
+    {
         return Err(lpm_common::LpmError::Script(
-            "`-g` is mutually exclusive with `-D` / `--filter` / `-w` / \
-             `--fail-if-no-match` / `-y` (those are project-scoped)."
+            "`-g` is mutually exclusive with `-D` / `--filter` / `--filter-prod` / \
+             `--changed-files-ignore-pattern` / `--test-pattern` / `-w` / \
+             `--fail-if-no-match` / `-y` / `--catalog` (those are project-scoped)."
                 .into(),
         ));
     }
@@ -2491,13 +2716,24 @@ fn validate_global_install_project_scoped_flags(
 
 fn validate_global_uninstall_project_scoped_flags(
     filter: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
 ) -> Result<(), lpm_common::LpmError> {
-    if !filter.is_empty() || workspace_root || fail_if_no_match || yes {
+    if !filter.is_empty()
+        || !filter_prod.is_empty()
+        || !changed_files_ignore_pattern.is_empty()
+        || !test_pattern.is_empty()
+        || workspace_root
+        || fail_if_no_match
+        || yes
+    {
         return Err(lpm_common::LpmError::Script(
-            "`-g` is mutually exclusive with `--filter` / `-w` / \
+            "`-g` is mutually exclusive with `--filter` / `--filter-prod` / \
+             `--changed-files-ignore-pattern` / `--test-pattern` / `-w` / \
              `--fail-if-no-match` / `-y` (those are project-scoped)."
                 .into(),
         ));
@@ -3062,6 +3298,8 @@ async fn async_main() -> Result<()> {
             force,
             allow_new,
             strict_integrity,
+            strict_peer_dependencies,
+            no_strict_peer_dependencies,
             min_release_age,
             ignore_provenance_drift,
             ignore_provenance_drift_all,
@@ -3076,12 +3314,16 @@ async fn async_main() -> Result<()> {
             audit_after_install,
             no_audit_after_install,
             filter,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
             workspace_root,
             fail_if_no_match,
             yes,
             exact,
             tilde,
             save_prefix,
+            catalog,
             global,
             replace_bin,
             alias,
@@ -3093,6 +3335,13 @@ async fn async_main() -> Result<()> {
             paranoid,
             no_sandbox,
         } => {
+            let cli_strict_peer_dependencies =
+                match (strict_peer_dependencies, no_strict_peer_dependencies) {
+                    (true, false) => Some(true),
+                    (false, true) => Some(false),
+                    _ => None,
+                };
+
             // Route `lpm install --global` / `-g` to the persistent
             // IsolatedInstall pipeline. Supports fresh install, upgrade,
             // and collision resolution. The pipeline takes care of the
@@ -3120,9 +3369,13 @@ async fn async_main() -> Result<()> {
                 validate_global_install_project_scoped_flags(
                     save_dev,
                     &filter,
+                    &filter_prod,
+                    &changed_files_ignore_pattern,
+                    &test_pattern,
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    catalog.is_some(),
                 )?;
                 // parse collision-resolution flags. Syntactic
                 // validation only (no lookup against marker commands —
@@ -3142,9 +3395,10 @@ async fn async_main() -> Result<()> {
                     exact,
                     tilde,
                     save_prefix,
+                    catalog,
                 ); // not wired for global install; ignored for now.
 
-                let overrides = build_install_global_overrides(
+                let mut overrides = build_install_global_overrides(
                     allow_new,
                     auto_build,
                     policy.as_deref(),
@@ -3156,6 +3410,7 @@ async fn async_main() -> Result<()> {
                     unverified_provenance,
                     unverified_provenance_all,
                 )?;
+                overrides.strict_peer_dependencies_override = cli_strict_peer_dependencies;
 
                 return commands::install_global::run(
                     &client,
@@ -3385,9 +3640,23 @@ async fn async_main() -> Result<()> {
                 // apply when adding packages. Bare `lpm install` is the
                 // refresh-from-package.json operation and ignores them
                 // (or hard-errors if the user mistakenly passed them).
-                if !filter.is_empty() || workspace_root || fail_if_no_match {
+                if catalog.is_some() {
+                    return Err(lpm_common::LpmError::Script(
+                        "`--catalog` only applies when adding packages. Pass package specs \
+                         (e.g., `lpm install --catalog react`) or run `lpm install` alone \
+                         to refresh from package.json."
+                            .into(),
+                    ));
+                }
+                if !filter.is_empty()
+                    || !filter_prod.is_empty()
+                    || !changed_files_ignore_pattern.is_empty()
+                    || !test_pattern.is_empty()
+                    || workspace_root
+                    || fail_if_no_match
+                {
                     Err(lpm_common::LpmError::Script(
-                        "`--filter`, `-w`, and `--fail-if-no-match` only apply when adding packages. \
+                        "`--filter`, `--filter-prod`, `--changed-files-ignore-pattern`, `--test-pattern`, `-w`, and `--fail-if-no-match` only apply when adding packages. \
                          Pass package specs (e.g., `lpm install react --filter web`) or run `lpm install` \
                          alone to refresh from package.json."
                             .into(),
@@ -3417,6 +3686,7 @@ async fn async_main() -> Result<()> {
                         force,
                         eff_allow_new,
                         strict_integrity,
+                        cli_strict_peer_dependencies,
                         cli_linker,
                         eff_no_skills,
                         eff_no_editor,
@@ -3442,7 +3712,7 @@ async fn async_main() -> Result<()> {
                     )
                     .await
                 }
-            } else if !filter.is_empty() || workspace_root {
+            } else if !filter.is_empty() || !filter_prod.is_empty() || workspace_root {
                 // explicit filter or -w flag → workspace-aware path.
                 commands::install::run_install_filtered_add(
                     &client,
@@ -3450,6 +3720,9 @@ async fn async_main() -> Result<()> {
                     &packages,
                     save_dev,
                     &filter,
+                    &filter_prod,
+                    &changed_files_ignore_pattern,
+                    &test_pattern,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -3457,11 +3730,13 @@ async fn async_main() -> Result<()> {
                     eff_allow_new,
                     force,
                     save_flags,
+                    catalog.as_deref(),
                     cli_script_policy_override,
                     advisor.clone(),
                     min_release_age_override,
                     drift_ignore_policy,
                     verify_policy,
+                    cli_strict_peer_dependencies,
                     strict_sandbox || paranoid,
                     no_sandbox,
                     cli.verbose,
@@ -3483,6 +3758,9 @@ async fn async_main() -> Result<()> {
                         &packages,
                         save_dev,
                         &filter,
+                        &filter_prod,
+                        &changed_files_ignore_pattern,
+                        &test_pattern,
                         workspace_root,
                         fail_if_no_match,
                         yes,
@@ -3490,11 +3768,13 @@ async fn async_main() -> Result<()> {
                         eff_allow_new,
                         force,
                         save_flags,
+                        catalog.as_deref(),
                         cli_script_policy_override,
                         advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
                         verify_policy,
+                        cli_strict_peer_dependencies,
                         strict_sandbox || paranoid,
                         no_sandbox,
                         cli.verbose,
@@ -3511,11 +3791,13 @@ async fn async_main() -> Result<()> {
                         eff_allow_new,
                         force,
                         save_flags,
+                        catalog.as_deref(),
                         cli_script_policy_override,
                         advisor.clone(),
                         min_release_age_override,
                         drift_ignore_policy,
                         verify_policy,
+                        cli_strict_peer_dependencies,
                         strict_sandbox || paranoid,
                         no_sandbox,
                         cli.verbose,
@@ -3528,6 +3810,9 @@ async fn async_main() -> Result<()> {
         Commands::Uninstall {
             packages,
             filter,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
             workspace_root,
             fail_if_no_match,
             yes,
@@ -3554,6 +3839,9 @@ async fn async_main() -> Result<()> {
                     )))
                 } else if let Err(error) = validate_global_uninstall_project_scoped_flags(
                     &filter,
+                    &filter_prod,
+                    &changed_files_ignore_pattern,
+                    &test_pattern,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -3569,6 +3857,9 @@ async fn async_main() -> Result<()> {
                     &cwd,
                     &packages,
                     &filter,
+                    &filter_prod,
+                    &changed_files_ignore_pattern,
+                    &test_pattern,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -3958,6 +4249,10 @@ async fn async_main() -> Result<()> {
         Commands::Store { action, deep, fix } => {
             commands::store::run(&action, deep, fix, cli.json).await
         }
+        Commands::Catalog { action } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::catalog::run(&cwd, action, cli.json)
+        }
         Commands::Global { action } => commands::global::run(&client, action, cli.json).await,
         Commands::Trust { action } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -4152,12 +4447,16 @@ async fn async_main() -> Result<()> {
             env,
             parallel,
             continue_on_error,
+            workspace_concurrency,
             stream,
             all,
             filter,
+            filter_prod,
             fail_if_no_match,
             affected,
             base,
+            changed_files_ignore_pattern,
+            test_pattern,
             no_cache,
             no_env_check,
             watch,
@@ -4165,21 +4464,28 @@ async fn async_main() -> Result<()> {
         } => {
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let workspace_mode = all || !filter.is_empty() || !filter_prod.is_empty() || affected;
+            if workspace_concurrency.is_some() && !workspace_mode {
+                return Err(lpm_common::LpmError::Script(
+                    "--workspace-concurrency requires --all, --filter, --filter-prod, or --affected"
+                        .into(),
+                ));
+            }
             if watch {
                 if scripts.len() != 1 {
                     return Err(lpm_common::LpmError::Script(
                         "--watch supports exactly one script".into(),
                     ));
                 }
-                if all || !filter.is_empty() || affected {
+                if all || !filter.is_empty() || !filter_prod.is_empty() || affected {
                     return Err(lpm_common::LpmError::Script(
-                        "--watch does not support --all/--filter/--affected; run the watcher inside a single package instead"
+                        "--watch does not support --all/--filter/--filter-prod/--affected; run the watcher inside a single package instead"
                             .into(),
                     ));
                 }
                 let bin_hint = commands::run::ensure_runtime(&cwd).await;
                 commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), bin_hint)
-            } else if all || !filter.is_empty() || affected {
+            } else if workspace_mode {
                 // Workspace mode: run scripts across packages with task graph
                 commands::run::run_workspace(
                     &cwd,
@@ -4187,12 +4493,16 @@ async fn async_main() -> Result<()> {
                     &args,
                     env.as_deref(),
                     &filter,
+                    &filter_prod,
                     affected,
                     &base,
+                    &changed_files_ignore_pattern,
+                    &test_pattern,
                     fail_if_no_match,
                     no_cache,
                     parallel,
                     continue_on_error,
+                    workspace_concurrency,
                     stream,
                     cli.json,
                 )
@@ -4232,15 +4542,31 @@ async fn async_main() -> Result<()> {
         }
         Commands::Filter {
             exprs,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
             explain,
             fail_if_no_match,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::filter::run(&cwd, &exprs, explain, fail_if_no_match, cli.json).await
+            commands::filter::run(
+                &cwd,
+                &exprs,
+                &filter_prod,
+                &changed_files_ignore_pattern,
+                &test_pattern,
+                explain,
+                fail_if_no_match,
+                cli.json,
+            )
+            .await
         }
         Commands::Deploy {
             output,
             filter,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
             force,
             dry_run,
         } => {
@@ -4251,6 +4577,9 @@ async fn async_main() -> Result<()> {
                 &cwd,
                 &output_path,
                 &filter,
+                &filter_prod,
+                &changed_files_ignore_pattern,
+                &test_pattern,
                 force,
                 dry_run,
                 cli.json,
@@ -4318,14 +4647,17 @@ async fn async_main() -> Result<()> {
         Commands::Lint {
             all,
             filter,
+            filter_prod,
             affected,
             base,
+            changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
-            if all || affected || !filter.is_empty() {
+            if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
                 commands::tools::tool_workspace(
                     &cwd,
@@ -4334,8 +4666,12 @@ async fn async_main() -> Result<()> {
                     false,
                     None,
                     &filter,
+                    &filter_prod,
+                    &changed_files_ignore_pattern,
+                    &test_pattern,
                     affected_ref,
                     fail_if_no_match,
+                    commands::tools::WorkspaceConcurrency::HostDefault,
                     cli.json,
                 )
                 .await
@@ -4347,14 +4683,17 @@ async fn async_main() -> Result<()> {
             check,
             all,
             filter,
+            filter_prod,
             affected,
             base,
+            changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
-            if all || affected || !filter.is_empty() {
+            if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
                 commands::tools::tool_workspace(
                     &cwd,
@@ -4363,8 +4702,12 @@ async fn async_main() -> Result<()> {
                     check,
                     None,
                     &filter,
+                    &filter_prod,
+                    &changed_files_ignore_pattern,
+                    &test_pattern,
                     affected_ref,
                     fail_if_no_match,
+                    commands::tools::WorkspaceConcurrency::HostDefault,
                     cli.json,
                 )
                 .await
@@ -4375,15 +4718,18 @@ async fn async_main() -> Result<()> {
         Commands::Check {
             all,
             filter,
+            filter_prod,
             affected,
             base,
+            changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             engine,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
-            if all || affected || !filter.is_empty() {
+            if all || affected || !filter.is_empty() || !filter_prod.is_empty() {
                 let affected_ref = if affected { Some(base.as_str()) } else { None };
                 commands::tools::tool_workspace(
                     &cwd,
@@ -4392,8 +4738,12 @@ async fn async_main() -> Result<()> {
                     false,
                     Some(engine),
                     &filter,
+                    &filter_prod,
+                    &changed_files_ignore_pattern,
+                    &test_pattern,
                     affected_ref,
                     fail_if_no_match,
+                    commands::tools::WorkspaceConcurrency::HostDefault,
                     cli.json,
                 )
                 .await
@@ -4404,8 +4754,11 @@ async fn async_main() -> Result<()> {
         Commands::Bundle {
             all,
             filter,
+            filter_prod,
             affected,
             base,
+            changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             entry,
             out_dir,
@@ -4432,6 +4785,9 @@ async fn async_main() -> Result<()> {
                 &options,
                 all,
                 &filter,
+                &filter_prod,
+                &changed_files_ignore_pattern,
+                &test_pattern,
                 affected,
                 &base,
                 fail_if_no_match,
@@ -4442,8 +4798,11 @@ async fn async_main() -> Result<()> {
         Commands::Pack {
             all,
             filter,
+            filter_prod,
             affected,
             base,
+            changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             entry,
             out_dir,
@@ -4476,6 +4835,9 @@ async fn async_main() -> Result<()> {
                 &options,
                 all,
                 &filter,
+                &filter_prod,
+                &changed_files_ignore_pattern,
+                &test_pattern,
                 affected,
                 &base,
                 fail_if_no_match,
@@ -4486,9 +4848,13 @@ async fn async_main() -> Result<()> {
         Commands::Test {
             all,
             filter,
+            filter_prod,
             affected,
             base,
+            changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
+            workspace_concurrency,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -4499,9 +4865,13 @@ async fn async_main() -> Result<()> {
                 &args,
                 all,
                 &filter,
+                &filter_prod,
+                &changed_files_ignore_pattern,
+                &test_pattern,
                 affected,
                 &base,
                 fail_if_no_match,
+                workspace_concurrency,
                 cli.json,
             )
             .await
@@ -4509,9 +4879,13 @@ async fn async_main() -> Result<()> {
         Commands::Bench {
             all,
             filter,
+            filter_prod,
             affected,
             base,
+            changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
+            workspace_concurrency,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -4522,9 +4896,13 @@ async fn async_main() -> Result<()> {
                 &args,
                 all,
                 &filter,
+                &filter_prod,
+                &changed_files_ignore_pattern,
+                &test_pattern,
                 affected,
                 &base,
                 fail_if_no_match,
+                workspace_concurrency,
                 cli.json,
             )
             .await
@@ -5306,6 +5684,81 @@ mod tests {
     }
 
     #[test]
+    fn run_filter_prod_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "run",
+            "build",
+            "--filter-prod",
+            "...app",
+            "--filter-prod",
+            "core...",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Run { filter_prod, .. } => {
+                assert_eq!(
+                    filter_prod,
+                    vec!["...app".to_string(), "core...".to_string()]
+                );
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_changed_files_ignore_pattern_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "run",
+            "build",
+            "--filter",
+            "[main]",
+            "--changed-files-ignore-pattern",
+            "**/README.md",
+            "--changed-files-ignore-pattern",
+            "docs/**",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Run {
+                changed_files_ignore_pattern,
+                ..
+            } => {
+                assert_eq!(
+                    changed_files_ignore_pattern,
+                    vec!["**/README.md".to_string(), "docs/**".to_string()]
+                );
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_test_pattern_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "run",
+            "build",
+            "--affected",
+            "--test-pattern",
+            "**/*.test.js",
+            "--test-pattern",
+            "**/*.spec.js",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Run { test_pattern, .. } => {
+                assert_eq!(
+                    test_pattern,
+                    vec!["**/*.test.js".to_string(), "**/*.spec.js".to_string()]
+                );
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
     fn run_fail_if_no_match_flag_parses() {
         let cli = Cli::try_parse_from([
             "lpm",
@@ -5330,6 +5783,109 @@ mod tests {
     }
 
     #[test]
+    fn run_no_bail_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "run", "build", "--no-bail"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Run {
+                continue_on_error, ..
+            } => {
+                assert!(continue_on_error);
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_continue_on_error_flag_is_not_accepted() {
+        let result = Cli::try_parse_from(["lpm", "run", "build", "--continue-on-error"]);
+        assert!(
+            result.is_err(),
+            "--continue-on-error must not remain as a legacy alias for --no-bail"
+        );
+    }
+
+    #[test]
+    fn run_workspace_concurrency_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "run",
+            "build",
+            "--filter",
+            "@test/*",
+            "--workspace-concurrency",
+            "2",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Run {
+                workspace_concurrency,
+                ..
+            } => {
+                assert_eq!(workspace_concurrency.map(NonZeroUsize::get), Some(2));
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn run_workspace_concurrency_rejects_zero() {
+        let result = Cli::try_parse_from([
+            "lpm",
+            "run",
+            "build",
+            "--filter",
+            "@test/*",
+            "--workspace-concurrency",
+            "0",
+        ]);
+        assert!(result.is_err(), "--workspace-concurrency must reject zero");
+    }
+
+    #[test]
+    fn test_workspace_concurrency_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "test",
+            "--filter",
+            "@test/*",
+            "--workspace-concurrency",
+            "3",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Test {
+                workspace_concurrency,
+                ..
+            } => {
+                assert_eq!(workspace_concurrency.map(NonZeroUsize::get), Some(3));
+            }
+            _ => panic!("expected Test command"),
+        }
+    }
+
+    #[test]
+    fn bench_workspace_concurrency_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "bench",
+            "--filter",
+            "@test/*",
+            "--workspace-concurrency",
+            "4",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Bench {
+                workspace_concurrency,
+                ..
+            } => {
+                assert_eq!(workspace_concurrency.map(NonZeroUsize::get), Some(4));
+            }
+            _ => panic!("expected Bench command"),
+        }
+    }
+
+    #[test]
     fn run_all_and_filter_conflict() {
         let result = Cli::try_parse_from(["lpm", "run", "build", "--all", "--filter", "web"]);
         assert!(result.is_err(), "--all and --filter must conflict");
@@ -5349,10 +5905,13 @@ mod tests {
         match cli.command.expect("test parse missing subcommand") {
             Commands::Filter {
                 exprs,
+                filter_prod,
                 explain,
                 fail_if_no_match,
+                ..
             } => {
                 assert_eq!(exprs, vec!["@ui/*".to_string(), "core".to_string()]);
+                assert!(filter_prod.is_empty());
                 assert!(!explain, "default mode is terse, not explain");
                 assert!(!fail_if_no_match);
             }
@@ -5381,8 +5940,10 @@ mod tests {
         match cli.command.expect("test parse missing subcommand") {
             Commands::Filter {
                 exprs,
+                filter_prod: _,
                 explain,
                 fail_if_no_match,
+                ..
             } => {
                 assert_eq!(exprs, vec!["core".to_string()]);
                 assert!(explain);
@@ -5393,10 +5954,59 @@ mod tests {
     }
 
     #[test]
-    fn filter_command_requires_at_least_one_expr() {
-        // exprs is `#[arg(required = true)]` so empty args is a parse error
-        let result = Cli::try_parse_from(["lpm", "filter"]);
-        assert!(result.is_err(), "empty exprs must be rejected");
+    fn filter_command_allows_filter_prod_without_positional_exprs() {
+        let cli = Cli::try_parse_from(["lpm", "filter", "--filter-prod", "...app"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Filter {
+                exprs, filter_prod, ..
+            } => {
+                assert!(exprs.is_empty());
+                assert_eq!(filter_prod, vec!["...app".to_string()]);
+            }
+            _ => panic!("expected Filter command"),
+        }
+    }
+
+    #[test]
+    fn filter_command_changed_files_ignore_pattern_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "filter",
+            "[main]",
+            "--changed-files-ignore-pattern",
+            "**/README.md",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Filter {
+                changed_files_ignore_pattern,
+                ..
+            } => {
+                assert_eq!(
+                    changed_files_ignore_pattern,
+                    vec!["**/README.md".to_string()]
+                );
+            }
+            _ => panic!("expected Filter command"),
+        }
+    }
+
+    #[test]
+    fn filter_command_test_pattern_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "filter",
+            "...[main]",
+            "--test-pattern",
+            "**/*.test.js",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Filter { test_pattern, .. } => {
+                assert_eq!(test_pattern, vec!["**/*.test.js".to_string()]);
+            }
+            _ => panic!("expected Filter command"),
+        }
     }
 
     // ── install --filter / -w / --fail-if-no-match ──
@@ -5488,6 +6098,44 @@ mod tests {
     }
 
     #[test]
+    fn install_catalog_flag_parses_without_consuming_package() {
+        let cli = Cli::try_parse_from(["lpm", "install", "--catalog", "react"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                packages, catalog, ..
+            } => {
+                assert_eq!(packages, vec!["react".to_string()]);
+                assert_eq!(catalog.as_deref(), Some("default"));
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_named_catalog_flag_parses_with_equals() {
+        let cli = Cli::try_parse_from(["lpm", "install", "--catalog=testing", "react"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                packages, catalog, ..
+            } => {
+                assert_eq!(packages, vec!["react".to_string()]);
+                assert_eq!(catalog.as_deref(), Some("testing"));
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_catalog_flag_conflicts_with_direct_save_policy_flags() {
+        assert!(Cli::try_parse_from(["lpm", "install", "--catalog", "--exact", "react"]).is_err());
+        assert!(Cli::try_parse_from(["lpm", "install", "--catalog", "--tilde", "react"]).is_err());
+        assert!(
+            Cli::try_parse_from(["lpm", "install", "--catalog", "--save-prefix", "~", "react"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn install_save_dev_with_filter_composes() {
         let cli = Cli::try_parse_from(["lpm", "install", "-D", "vitest", "--filter", "./apps/*"])
             .unwrap();
@@ -5528,6 +6176,68 @@ mod tests {
     }
 
     #[test]
+    fn install_strict_peer_dependencies_flags_parse_and_conflict() {
+        let cli = Cli::try_parse_from(["lpm", "install", "--strict-peer-dependencies"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                ..
+            } => {
+                assert!(strict_peer_dependencies);
+                assert!(!no_strict_peer_dependencies);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        let cli = Cli::try_parse_from(["lpm", "install", "--no-strict-peer-dependencies"])
+            .expect("`lpm install --no-strict-peer-dependencies` should parse");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                ..
+            } => {
+                assert!(!strict_peer_dependencies);
+                assert!(no_strict_peer_dependencies);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "install",
+            "-g",
+            "eslint",
+            "--strict-peer-dependencies",
+        ])
+        .expect("`lpm install -g --strict-peer-dependencies` should parse");
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                global,
+                strict_peer_dependencies,
+                no_strict_peer_dependencies,
+                ..
+            } => {
+                assert!(global);
+                assert!(strict_peer_dependencies);
+                assert!(!no_strict_peer_dependencies);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "lpm",
+                "install",
+                "--strict-peer-dependencies",
+                "--no-strict-peer-dependencies",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn install_global_rejects_project_scoped_yes_flag() {
         let cli = Cli::try_parse_from(["lpm", "install", "-g", "eslint", "-y"]).unwrap();
         match cli.command.expect("test parse missing subcommand") {
@@ -5546,9 +6256,13 @@ mod tests {
                 let err = validate_global_install_project_scoped_flags(
                     save_dev,
                     &filter,
+                    &[],
+                    &[],
+                    &[],
                     workspace_root,
                     fail_if_no_match,
                     yes,
+                    false,
                 )
                 .unwrap_err();
 
@@ -5579,8 +6293,18 @@ mod tests {
     #[test]
     fn install_global_validator_only_rejects_project_scoped_grouping_flags() {
         // Genuine project-only flag: still rejected.
-        let err = validate_global_install_project_scoped_flags(true, &[], false, false, false)
-            .unwrap_err();
+        let err = validate_global_install_project_scoped_flags(
+            true,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
         match err {
             lpm_common::LpmError::Script(message) => {
                 assert!(message.contains("project-scoped"));
@@ -5588,15 +6312,46 @@ mod tests {
             other => panic!("expected Script error, got {other:?}"),
         }
 
+        let err = validate_global_install_project_scoped_flags(
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap_err();
+        match err {
+            lpm_common::LpmError::Script(message) => {
+                assert!(message.contains("`--catalog`"));
+                assert!(message.contains("project-scoped"));
+            }
+            other => panic!("expected Script error, got {other:?}"),
+        }
+
         // No project-only flags set → accept.
-        validate_global_install_project_scoped_flags(false, &[], false, false, false).unwrap();
+        validate_global_install_project_scoped_flags(
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
     }
 
     // ── forwarding regression tests ─────────────────────────
     //
     // These tests pin the wiring between CLI args and
-    // `InstallGlobalOverrides`. A regression that drops any of the
-    // five overrides on the way to `install_global::run` is caught
+    // `InstallGlobalOverrides`. A regression that drops these
+    // overrides on the way to `install_global::run` is caught
     // here. Validator acceptance (above) is necessary but not
     // sufficient — without these, a future refactor that silently
     // hardcoded e.g. `allow_new: false` inside the bundle constructor
@@ -6048,6 +6803,9 @@ mod tests {
 
                 let err = validate_global_uninstall_project_scoped_flags(
                     &filter,
+                    &[],
+                    &[],
+                    &[],
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -6095,6 +6853,7 @@ mod tests {
                 filter,
                 force,
                 dry_run,
+                ..
             } => {
                 assert_eq!(output, "/prod/api");
                 assert_eq!(filter, vec!["api".to_string()]);
@@ -6140,16 +6899,31 @@ mod tests {
     }
 
     #[test]
-    fn deploy_command_requires_filter() {
-        // The Deploy command marks --filter as required = true. Missing it
-        // is a parse error, NOT a runtime error. This guards against the
-        // case where someone runs `lpm deploy /prod/api` and expects it to
-        // somehow figure out which member to deploy.
-        let result = Cli::try_parse_from(["lpm", "deploy", "/prod/api"]);
-        assert!(
-            result.is_err(),
-            "deploy without --filter must be a parse error"
-        );
+    fn deploy_command_without_filter_parses_for_runtime_validation() {
+        let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Deploy {
+                filter,
+                filter_prod,
+                ..
+            } => {
+                assert!(filter.is_empty());
+                assert!(filter_prod.is_empty());
+            }
+            _ => panic!("expected Deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_command_filter_prod_flag_parses() {
+        let cli =
+            Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter-prod", "...api"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Deploy { filter_prod, .. } => {
+                assert_eq!(filter_prod, vec!["...api".to_string()]);
+            }
+            _ => panic!("expected Deploy command"),
+        }
     }
 
     #[test]

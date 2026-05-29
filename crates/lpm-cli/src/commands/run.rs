@@ -3,6 +3,7 @@ use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_runner::bin_path::ManagedRuntimeHint;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 /// Maximum size for captured task output before truncation ().
@@ -176,8 +177,8 @@ pub async fn run(
 /// prerequisites even for single-script invocations. When `parallel` is true,
 /// independent tasks run concurrently; otherwise they run in topological order.
 ///
-/// Supports `--continue-on-error` to keep running after failures,
-/// `--stream` for interleaved output with task prefixes, and
+/// Supports `--no-bail` to keep running after failures, `--stream` for
+/// interleaved output with task prefixes, and
 /// `--no-cache` to skip task caching.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_multi(
@@ -1088,12 +1089,16 @@ pub async fn run_workspace(
     extra_args: &[String],
     env_mode: Option<&str>,
     filters: &[String],
+    filter_prod: &[String],
     affected: bool,
     base_ref: &str,
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     fail_if_no_match: bool,
     no_cache: bool,
     parallel: bool,
     continue_on_error: bool,
+    workspace_concurrency: Option<NonZeroUsize>,
     stream: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
@@ -1116,11 +1121,19 @@ pub async fn run_workspace(
     let levels = ws_graph
         .topological_levels()
         .map_err(|e| LpmError::Script(e.to_string()))?;
+    let workspace_concurrency = crate::workspace_concurrency_config::resolve_workspace_concurrency(
+        &workspace.root,
+        workspace_concurrency,
+    )?
+    .get();
 
     let target_set = crate::workspace_select::select_workspace_target_set(
         &ws_graph,
         &workspace.root,
         filters,
+        filter_prod,
+        changed_files_ignore_pattern,
+        test_pattern,
         affected,
         base_ref,
     )?;
@@ -1129,7 +1142,7 @@ pub async fn run_workspace(
         // D2 follow-through: surface the substring → glob migration
         // hint when any filter looks like a bare name that would have
         // substring-matched by earlier filter behavior.
-        let hint = crate::commands::filter::format_no_match_hint(filters);
+        let hint = crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
 
         if fail_if_no_match {
             let base_msg = "no workspace packages matched the filter (--fail-if-no-match)";
@@ -1198,9 +1211,7 @@ pub async fn run_workspace(
             }
         } else {
             // Multiple packages in this level — run in parallel
-            let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-
-            for chunk in level_targets.chunks(max_threads) {
+            for chunk in level_targets.chunks(workspace_concurrency) {
                 let handles: Vec<_> = chunk
                     .iter()
                     .map(|&idx| {
@@ -1565,9 +1576,10 @@ pub async fn dlx(
             false,                                                   // force
             false,                                                   // allow_new
             false,                                                   // strict_integrity
-            None,                                                    // linker_override
-            false,                                                   // no_skills
-            false,                                                   // no_editor_setup
+            None,  // strict_peer_dependencies_override
+            None,  // linker_override
+            false, // no_skills
+            false, // no_editor_setup
             true,  // no_security_summary (dlx doesn't need it)
             false, // auto_build
             None,  // target_set: dlx is single-project

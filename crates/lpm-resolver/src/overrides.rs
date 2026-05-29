@@ -534,6 +534,14 @@ impl Clone for OverrideSet {
     }
 }
 
+/// Return the package name targeted by an override selector key.
+pub fn override_selector_target_name(raw_key: &str) -> Result<String, OverrideError> {
+    if raw_key.trim().is_empty() {
+        return Err(OverrideError::EmptyKey);
+    }
+    Ok(parse_selector(raw_key)?.target_name().to_string())
+}
+
 /// Errors emitted during override parsing. Every variant is a hard
 /// error in the install pipeline — parsing has no warnings.
 #[derive(Debug, thiserror::Error)]
@@ -964,6 +972,17 @@ mod tests {
         let set =
             OverrideSet::parse(&map(&[("baz>qar@1", "2.0.0")]), &map(&[]), &map(&[])).unwrap();
         assert!(set.split_targets().contains("qar"));
+    }
+
+    #[test]
+    fn override_selector_target_name_extracts_path_leaf() {
+        assert_eq!(override_selector_target_name("baz>qar@1").unwrap(), "qar");
+    }
+
+    #[test]
+    fn override_selector_target_name_rejects_multi_segment_path() {
+        let err = override_selector_target_name("a>b>c").unwrap_err();
+        assert!(matches!(err, OverrideError::MultiSegmentPath { .. }));
     }
 
     #[test]

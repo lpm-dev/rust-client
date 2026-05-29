@@ -247,8 +247,8 @@ pub(crate) struct DeployPlan {
 /// Returns a [`DeployPlan`] on success, or an actionable [`LpmError::Script`]
 /// describing what's wrong. Validation rules:
 ///
-/// - `--filter` must be non-empty
-/// - `--filter` must match exactly one workspace member
+/// - a filter must be non-empty
+/// - filters must match exactly one workspace member
 /// - The output directory must NOT be inside the workspace tree (self-deploy
 ///   loop prevention)
 /// - The output directory must be empty (or not exist), unless `force` is set
@@ -256,18 +256,29 @@ pub(crate) fn resolve_deploy_target(
     cwd: &Path,
     output_dir: &Path,
     filters: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     force: bool,
 ) -> Result<DeployPlan, LpmError> {
-    if filters.is_empty() {
+    if filters.is_empty() && filter_prod.is_empty() {
         return Err(LpmError::Script(
-            "lpm deploy requires --filter <expr> to identify the workspace member to deploy".into(),
+            "lpm deploy requires --filter <expr> or --filter-prod <expr> to identify the workspace member to deploy".into(),
         ));
     }
 
     // 1. Resolve target via the shared install_targets helper.
     //    has_packages=true so we never hit the "ambiguous root refresh" branch.
     //    workspace_root_flag=false because deploy never targets the root manifest.
-    let targets = resolve_install_targets(cwd, filters, false, true)?;
+    let targets = resolve_install_targets(
+        cwd,
+        filters,
+        filter_prod,
+        changed_files_ignore_pattern,
+        test_pattern,
+        false,
+        true,
+    )?;
 
     // 2. Single-member assertion.
     if targets.member_manifests.is_empty() {
@@ -619,12 +630,23 @@ pub async fn run(
     cwd: &Path,
     output_dir: &Path,
     filters: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     force: bool,
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
-    let plan = resolve_deploy_target(cwd, output_dir, filters, force)?;
+    let plan = resolve_deploy_target(
+        cwd,
+        output_dir,
+        filters,
+        filter_prod,
+        changed_files_ignore_pattern,
+        test_pattern,
+        force,
+    )?;
     let member_name = read_member_name(&plan.member_manifest);
 
     if dry_run {
@@ -731,6 +753,7 @@ pub async fn run(
         false, // force — don't force re-link, the output dir is fresh
         true,  // allow_new — deploy bypasses minimumReleaseAge
         false, // strict_integrity — deploy uses lockfile, integrity is recorded
+        None,  // strict_peer_dependencies_override
         None,  // linker_override
         true,  // no_skills — deploy outputs are typically Docker images
         true,  // no_editor_setup — same reason
@@ -829,6 +852,40 @@ pub async fn run(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn resolve_deploy_target(
+        cwd: &Path,
+        output_dir: &Path,
+        filters: &[String],
+        force: bool,
+    ) -> Result<DeployPlan, LpmError> {
+        super::resolve_deploy_target(cwd, output_dir, filters, &[], &[], &[], force)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        client: &RegistryClient,
+        cwd: &Path,
+        output_dir: &Path,
+        filters: &[String],
+        force: bool,
+        dry_run: bool,
+        json_output: bool,
+    ) -> Result<(), LpmError> {
+        super::run(
+            client,
+            cwd,
+            output_dir,
+            filters,
+            &[],
+            &[],
+            &[],
+            force,
+            dry_run,
+            json_output,
+        )
+        .await
+    }
 
     /// Helper: build a real on-disk workspace fixture with the given members.
     fn write_workspace_fixture(root: &Path, members: &[(&str, &str)]) {

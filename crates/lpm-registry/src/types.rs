@@ -3,7 +3,10 @@
 //! Strongly typed structs matching the JSON responses from every endpoint.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
+
+const NPM_MISSING_SIGNATURE_TIME_CUTOFF: &str = "2015-01-01T00:00:00.000Z";
 
 /// Per-peer metadata as declared in a package's
 /// `peerDependenciesMeta` map. The npm spec is open-ended; today
@@ -402,6 +405,22 @@ pub struct RegistrySignature {
     pub sig: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistrySigningKey {
+    #[serde(default)]
+    pub expires: Option<String>,
+    pub keyid: String,
+    pub keytype: String,
+    pub scheme: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrySignatureVerification {
+    NoSignatures,
+    Verified { count: usize },
+}
+
 /// Pointer to a Sigstore attestation bundle for this version, plus
 /// the pre-parsed provenance summary that npm inlines in the metadata
 /// response.
@@ -524,6 +543,17 @@ impl VersionMetadata {
         self.dist.as_ref()?.integrity.as_deref()
     }
 
+    pub fn integrity_or_shasum(&self) -> Option<Cow<'_, str>> {
+        let dist = self.dist.as_ref()?;
+        if let Some(integrity) = dist.integrity.as_deref() {
+            return Some(Cow::Borrowed(integrity));
+        }
+        dist.shasum
+            .as_deref()
+            .and_then(shasum_to_sha1_sri)
+            .map(Cow::Owned)
+    }
+
     /// Returns the first library product name from Swift metadata.
     pub fn swift_product_name(&self) -> Option<&str> {
         let meta = self.swift_meta.as_ref()?;
@@ -571,6 +601,168 @@ impl VersionMetadata {
         }
         "js"
     }
+}
+
+fn shasum_to_sha1_sri(shasum: &str) -> Option<String> {
+    use base64::Engine;
+
+    if shasum.len() != 40 {
+        return None;
+    }
+    let bytes = hex::decode(shasum).ok()?;
+    if bytes.len() != 20 {
+        return None;
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Some(format!("sha1-{b64}"))
+}
+
+pub fn verify_registry_signatures(
+    name: &str,
+    version: &str,
+    integrity: &str,
+    signatures: &[RegistrySignature],
+    keys: &[RegistrySigningKey],
+    published_at: Option<&str>,
+) -> Result<RegistrySignatureVerification, lpm_common::LpmError> {
+    if signatures.is_empty() {
+        return Ok(RegistrySignatureVerification::NoSignatures);
+    }
+
+    let message = format!("{name}@{version}:{integrity}");
+    let mut verified = 0usize;
+    for signature in signatures {
+        let keyid = signature.keyid.as_deref().ok_or_else(|| {
+            lpm_common::LpmError::Registry(format!(
+                "{name}@{version} has a registry signature without keyid"
+            ))
+        })?;
+        let sig = signature.sig.as_deref().ok_or_else(|| {
+            lpm_common::LpmError::Registry(format!(
+                "{name}@{version} has a registry signature without sig"
+            ))
+        })?;
+        let key = keys.iter().find(|key| key.keyid == keyid).ok_or_else(|| {
+            lpm_common::LpmError::Registry(format!(
+                "{name}@{version} has a registry signature with keyid {keyid} but no matching public key"
+            ))
+        })?;
+        verify_registry_signature_key_supported(name, version, key)?;
+        verify_registry_signature_key_not_expired(name, version, key, published_at)?;
+        verify_registry_signature_bytes(name, version, key, sig, message.as_bytes())?;
+        verified += 1;
+    }
+
+    Ok(RegistrySignatureVerification::Verified { count: verified })
+}
+
+fn verify_registry_signature_key_supported(
+    name: &str,
+    version: &str,
+    key: &RegistrySigningKey,
+) -> Result<(), lpm_common::LpmError> {
+    if key.keytype == "ecdsa-sha2-nistp256" && key.scheme == "ecdsa-sha2-nistp256" {
+        Ok(())
+    } else {
+        Err(lpm_common::LpmError::Registry(format!(
+            "{name}@{version} registry signature key {} uses unsupported keytype/scheme {}/{}",
+            key.keyid, key.keytype, key.scheme
+        )))
+    }
+}
+
+fn verify_registry_signature_key_not_expired(
+    name: &str,
+    version: &str,
+    key: &RegistrySigningKey,
+    published_at: Option<&str>,
+) -> Result<(), lpm_common::LpmError> {
+    let Some(expires) = key.expires.as_deref() else {
+        return Ok(());
+    };
+    let published_at = published_at.unwrap_or(NPM_MISSING_SIGNATURE_TIME_CUTOFF);
+    let expires_time = parse_registry_signature_time(expires).ok_or_else(|| {
+        lpm_common::LpmError::Registry(format!(
+            "{name}@{version} registry signature key {} has invalid expires timestamp {expires}",
+            key.keyid
+        ))
+    })?;
+    let published_time = parse_registry_signature_time(published_at).ok_or_else(|| {
+        lpm_common::LpmError::Registry(format!(
+            "{name}@{version} has invalid publish timestamp {published_at}"
+        ))
+    })?;
+    if published_time < expires_time {
+        Ok(())
+    } else {
+        Err(lpm_common::LpmError::Registry(format!(
+            "{name}@{version} registry signature key {} expired at {expires} before publish time {published_at}",
+            key.keyid
+        )))
+    }
+}
+
+fn parse_registry_signature_time(input: &str) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(input, &time::format_description::well_known::Rfc3339).ok()
+}
+
+fn verify_registry_signature_bytes(
+    name: &str,
+    version: &str,
+    key: &RegistrySigningKey,
+    sig: &str,
+    message: &[u8],
+) -> Result<(), lpm_common::LpmError> {
+    use base64::Engine;
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
+    use p256::pkcs8::DecodePublicKey;
+
+    let key_b64 = if key.key.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        Cow::Owned(
+            key.key
+                .bytes()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .map(char::from)
+                .collect::<String>(),
+        )
+    } else {
+        Cow::Borrowed(key.key.as_str())
+    };
+    let key_der = base64::engine::general_purpose::STANDARD
+        .decode(key_b64.as_bytes())
+        .map_err(|e| {
+            lpm_common::LpmError::Registry(format!(
+                "{name}@{version} registry signature key {} is not valid base64: {e}",
+                key.keyid
+            ))
+        })?;
+    let verifying_key = VerifyingKey::from_public_key_der(&key_der).map_err(|e| {
+        lpm_common::LpmError::Registry(format!(
+            "{name}@{version} registry signature key {} is not a valid P-256 public key: {e}",
+            key.keyid
+        ))
+    })?;
+    let sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(sig)
+        .map_err(|e| {
+            lpm_common::LpmError::Registry(format!(
+                "{name}@{version} registry signature for key {} is not valid base64: {e}",
+                key.keyid
+            ))
+        })?;
+    let signature = Signature::from_der(&sig_bytes).map_err(|e| {
+        lpm_common::LpmError::Registry(format!(
+            "{name}@{version} registry signature for key {} is not DER ECDSA: {e}",
+            key.keyid
+        ))
+    })?;
+    verifying_key.verify(message, &signature).map_err(|_| {
+        lpm_common::LpmError::Registry(format!(
+            "{name}@{version} has an invalid registry signature for keyid {}",
+            key.keyid
+        ))
+    })
 }
 
 // ─── Search ────────────────────────────────────────────────────────
@@ -1039,6 +1231,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn version_integrity_uses_sha1_sri_from_dist_shasum_when_integrity_missing() {
+        let meta = VersionMetadata {
+            name: "legacy".to_string(),
+            version: "1.0.0".to_string(),
+            dist: Some(DistInfo {
+                tarball: Some("https://example.com/legacy-1.0.0.tgz".to_string()),
+                integrity: None,
+                shasum: Some("da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string()),
+                signatures: None,
+                attestations: None,
+            }),
+            ..VersionMetadata::default()
+        };
+
+        assert_eq!(
+            meta.integrity_or_shasum().as_deref(),
+            Some("sha1-2jmj7l5rSw0yVb/vlWAYkK/YBwk=")
+        );
+    }
+
     /// npm wire shape: `dist.signatures` is an array of
     /// `{keyid, sig}` pairs; `dist.attestations` is an object with
     /// `url` and an inline `provenance` summary. Parse both fields
@@ -1117,6 +1330,98 @@ mod tests {
         let parsed: RegistrySignature = serde_json::from_str(sig_only).unwrap();
         assert!(parsed.keyid.is_none());
         assert_eq!(parsed.sig.as_deref(), Some("MEUCIAbc"));
+    }
+
+    #[test]
+    fn registry_signature_verifier_accepts_valid_npm_ecdsa_signature() {
+        use base64::Engine;
+        use p256::ecdsa::signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+
+        let signing_key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let pem = verifying_key.to_public_key_pem(LineEnding::LF).unwrap();
+        let public_key_body = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>();
+        let message = "signed-pkg@1.0.0:sha512-test";
+        let sig: Signature = signing_key.sign(message.as_bytes());
+        let sig = base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes());
+
+        let result = verify_registry_signatures(
+            "signed-pkg",
+            "1.0.0",
+            "sha512-test",
+            &[RegistrySignature {
+                keyid: Some("SHA256:test".to_string()),
+                sig: Some(sig),
+            }],
+            &[RegistrySigningKey {
+                expires: None,
+                keyid: "SHA256:test".to_string(),
+                keytype: "ecdsa-sha2-nistp256".to_string(),
+                scheme: "ecdsa-sha2-nistp256".to_string(),
+                key: public_key_body,
+            }],
+            Some("2026-05-29T00:00:00.000Z"),
+        )
+        .unwrap();
+
+        assert_eq!(result, RegistrySignatureVerification::Verified { count: 1 });
+    }
+
+    #[test]
+    fn registry_signature_verifier_rejects_tampered_message() {
+        use base64::Engine;
+        use p256::ecdsa::signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+
+        let signing_key = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let verifying_key = signing_key.verifying_key();
+        let pem = verifying_key.to_public_key_pem(LineEnding::LF).unwrap();
+        let public_key_body = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>();
+        let sig: Signature = signing_key.sign(b"signed-pkg@1.0.0:sha512-good");
+        let sig = base64::engine::general_purpose::STANDARD.encode(sig.to_der().as_bytes());
+
+        let err = verify_registry_signatures(
+            "signed-pkg",
+            "1.0.0",
+            "sha512-tampered",
+            &[RegistrySignature {
+                keyid: Some("SHA256:test".to_string()),
+                sig: Some(sig),
+            }],
+            &[RegistrySigningKey {
+                expires: None,
+                keyid: "SHA256:test".to_string(),
+                keytype: "ecdsa-sha2-nistp256".to_string(),
+                scheme: "ecdsa-sha2-nistp256".to_string(),
+                key: public_key_body,
+            }],
+            Some("2026-05-29T00:00:00.000Z"),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid registry signature"));
+    }
+
+    #[test]
+    fn registry_signature_expiry_uses_cutoff_when_publish_time_missing() {
+        let key = RegistrySigningKey {
+            expires: Some("2025-01-29T00:00:00.000Z".to_string()),
+            keyid: "SHA256:test".to_string(),
+            keytype: "ecdsa-sha2-nistp256".to_string(),
+            scheme: "ecdsa-sha2-nistp256".to_string(),
+            key: String::new(),
+        };
+
+        verify_registry_signature_key_not_expired("signed-pkg", "1.0.0", &key, None).unwrap();
     }
 
     /// `AttestationRef.provenance` is kept untyped so an unexpected

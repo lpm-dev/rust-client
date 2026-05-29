@@ -867,6 +867,107 @@ impl MockRegistry {
             .await
     }
 
+    /// Mount a package using one manifest-shaped JSON value as both
+    /// tarball `package.json` and registry metadata.
+    ///
+    /// Prefer this in compatibility tests where fields such as
+    /// `peerDependencies`, `peerDependenciesMeta`, `bin`, or platform
+    /// constraints are part of the behavior under test.
+    pub async fn with_manifest_package(
+        &self,
+        pkg_json: serde_json::Value,
+        extra_files: &[(&str, &[u8])],
+    ) -> &Self {
+        let name = pkg_json
+            .get("name")
+            .and_then(|value| value.as_str())
+            .expect("with_manifest_package: package.json must contain string `name`")
+            .to_string();
+        let version = pkg_json
+            .get("version")
+            .and_then(|value| value.as_str())
+            .expect("with_manifest_package: package.json must contain string `version`")
+            .to_string();
+
+        let tarball_bytes = make_tarball_from_pkg_json(pkg_json.clone(), extra_files);
+        let tarball_url = self.tarball_url(&name, &version);
+        let integrity = compute_integrity(&tarball_bytes);
+
+        let mut version_meta = serde_json::Map::new();
+        version_meta.insert("name".to_string(), serde_json::Value::String(name.clone()));
+        version_meta.insert(
+            "version".to_string(),
+            serde_json::Value::String(version.clone()),
+        );
+        version_meta.insert(
+            "dist".to_string(),
+            serde_json::json!({
+                "tarball": tarball_url,
+                "integrity": integrity,
+            }),
+        );
+        for field in [
+            "dependencies",
+            "optionalDependencies",
+            "peerDependencies",
+            "peerDependenciesMeta",
+            "bin",
+            "scripts",
+            "engines",
+            "os",
+            "cpu",
+            "libc",
+        ] {
+            if let Some(value) = pkg_json.get(field) {
+                version_meta.insert(field.to_string(), value.clone());
+            }
+        }
+
+        let mut versions = serde_json::Map::new();
+        versions.insert(version.clone(), serde_json::Value::Object(version_meta));
+        let mut time = serde_json::Map::new();
+        time.insert(
+            version.clone(),
+            serde_json::Value::String("2025-01-01T00:00:00.000Z".into()),
+        );
+
+        let metadata = serde_json::json!({
+            "name": name,
+            "dist-tags": {
+                "latest": version,
+            },
+            "versions": versions,
+            "time": time,
+        });
+
+        let metadata_path = format!("/api/registry/{name}");
+        Mock::given(method("GET"))
+            .and(path(&metadata_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(&self.server)
+            .await;
+        let npm_direct_path = format!("/{name}");
+        Mock::given(method("GET"))
+            .and(path(&npm_direct_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(&self.server)
+            .await;
+
+        let tarball_path = Self::tarball_path(&name, &version);
+        Mock::given(method("GET"))
+            .and(path(&tarball_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball_bytes)
+                    .insert_header("content-type", "application/octet-stream"),
+            )
+            .mount(&self.server)
+            .await;
+
+        self.with_batch_metadata(vec![metadata]).await;
+        self
+    }
+
     /// Mount a package with explicit dependencies.
     pub async fn with_package_and_deps(
         &self,
@@ -1147,7 +1248,7 @@ impl MockRegistry {
     /// Mount a publish endpoint that accepts PUT and returns success.
     pub async fn with_publish_endpoint(&self) -> &Self {
         Mock::given(method("PUT"))
-            .and(path_regex("/api/registry/packages/.*"))
+            .and(path_regex("/api/registry/.*"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "message": "Package published"

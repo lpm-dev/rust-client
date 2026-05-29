@@ -2181,6 +2181,35 @@ impl RegistryClient {
         finish!(Ok(metadata))
     }
 
+    pub async fn get_registry_signing_keys(
+        &self,
+        base_url: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<Vec<RegistrySigningKey>, LpmError> {
+        #[derive(serde::Deserialize)]
+        struct KeysResponse {
+            #[serde(default)]
+            keys: Vec<RegistrySigningKey>,
+        }
+
+        let url = format!("{}/-/npm/v1/keys", base_url.trim_end_matches('/'));
+        let req = self
+            .http
+            .for_url(&url)
+            .await?
+            .get(&url)
+            .header("Accept", "application/json");
+        let req = apply_npmrc_auth(req, &url, auth)?;
+        let response = match self.send_with_retry(req).await {
+            Ok(response) => response,
+            Err(LpmError::NotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let keys =
+            parse_capped_metadata::<KeysResponse>(response, "get_registry_signing_keys").await?;
+        Ok(keys.keys)
+    }
+
     /// Fan-out npm metadata fetches at `max_concurrency`, direct to
     /// `registry.npmjs.org`, with **halve-on-429** adaptive back-pressure.
     ///
@@ -2783,7 +2812,7 @@ impl RegistryClient {
     ///   algorithm-aware: the expected SRI is parsed for its algorithm
     ///   prefix, the tarball is re-hashed with that algorithm if it differs
     ///   from the streaming download's default sha512, and the raw hash
-    ///   bytes are compared. Both `sha256-…` and `sha512-…` work natively.
+    ///   bytes are compared. `sha1-…`, `sha256-…`, and `sha512-…` work natively.
     ///   Mismatch returns [`LpmError::IntegrityMismatch`] with `actual` in
     ///   the same algorithm the caller declared.
     /// - `expected_integrity = None` — trust-on-first-use. Returns the
@@ -2826,6 +2855,7 @@ impl RegistryClient {
                 // streaming default — rare.
                 Integrity::from_bytes(HashAlgorithm::Sha256, &data)
             }
+            HashAlgorithm::Sha1 => Integrity::from_bytes(HashAlgorithm::Sha1, &data),
         };
         if expected_int.hash != actual_int.hash {
             return Err(LpmError::IntegrityMismatch {

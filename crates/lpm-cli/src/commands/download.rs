@@ -48,7 +48,7 @@ pub async fn run(
         LpmError::Registry(format!("no tarball URL for {package_name}@{version_key}"))
     })?;
 
-    let integrity_str = ver.integrity();
+    let integrity_str = ver.integrity_or_shasum();
 
     if let Some(s) = spinner {
         s.stop(format!(
@@ -97,7 +97,7 @@ pub async fn run(
              should not normally take that path).",
         )));
     }
-    let integrity_verified = if let Some(sri) = integrity_str {
+    let integrity_verified = if let Some(sri) = integrity_str.as_ref() {
         let spinner = if !json_output {
             let s = cliclack::spinner();
             s.start("Verifying integrity...");
@@ -106,7 +106,7 @@ pub async fn run(
             None
         };
 
-        lpm_extractor::verify_integrity(&tarball_data, sri)?;
+        lpm_extractor::verify_integrity(&tarball_data, sri.as_ref())?;
 
         if let Some(s) = spinner {
             s.stop("Integrity verified ✓");

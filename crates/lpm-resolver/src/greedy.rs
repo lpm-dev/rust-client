@@ -70,6 +70,7 @@ use ahash::{AHashMap, AHashSet};
 #[cfg(test)]
 use lpm_registry::RouteMode;
 use lpm_registry::{RegistryClient, RouteTable, UpstreamRoute};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -902,6 +903,10 @@ struct ResolveState {
     /// prints a single warning per entry. Empty when no peer group needed
     /// best-effort fallback.
     peer_conflicts: Vec<PeerConflictReport>,
+    /// Per-run peer resolution cache. Keyed by peer canonical plus a
+    /// stable hash of the sorted parent peer context so repeated peer-drain
+    /// passes don't recompute the same manifest decision.
+    peer_resolution_cache: dashmap::DashMap<PeerResolutionCacheKey, CachedPeerResolution>,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -935,6 +940,7 @@ impl ResolveState {
             // Typically 0 (most installs have a clean peer graph).
             // Allocated lazily on first conflict.
             peer_conflicts: Vec::new(),
+            peer_resolution_cache: dashmap::DashMap::with_capacity(64),
         }
     }
 
@@ -1114,6 +1120,8 @@ impl ResolveState {
                 }
             })
             .collect();
+
+        crate::resolve::dedupe_peer_superset_packages(&mut out);
 
         // Match `format_solution`'s deterministic order so lockfile
         // serialization is stable regardless of resolution order.
@@ -1694,6 +1702,32 @@ fn enqueue_child_deps(
 // ROOT scope, satisfying the peer's canonical from the side without
 // modifying the consumer's child list.
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PeerResolutionCacheKey {
+    canonical: CanonicalKey,
+    sorted_parent_peers_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+enum CachedPeerResolution {
+    Synthesize { chosen: NpmVersion },
+    BestEffortSynthesize { chosen: NpmVersion },
+}
+
+impl CachedPeerResolution {
+    fn to_outcome(&self, state: &ResolveState, reqs: &[&PeerRequirement]) -> PeerDrainOutcome {
+        match self {
+            Self::Synthesize { chosen } => PeerDrainOutcome::Synthesize {
+                chosen: chosen.clone(),
+            },
+            Self::BestEffortSynthesize { chosen } => PeerDrainOutcome::BestEffortSynthesize {
+                chosen: chosen.clone(),
+                unsatisfied: unsatisfied_required_consumers(state, reqs, chosen),
+            },
+        }
+    }
+}
+
 /// Classification outcome for a single peer-canonical group during
 /// the drain pass.
 enum PeerDrainOutcome {
@@ -1846,6 +1880,69 @@ fn group_satisfied_by_existing(
     nodes
         .iter()
         .any(|(v, _)| reqs.iter().all(|r| r.range.satisfies(v)))
+}
+
+fn peer_resolution_cache_key(
+    canonical: &CanonicalKey,
+    reqs: &[&PeerRequirement],
+) -> PeerResolutionCacheKey {
+    let mut parent_peers: Vec<(String, String, bool)> = Vec::with_capacity(reqs.len());
+    for req in reqs {
+        parent_peers.push((req.peer_name.clone(), req.range.to_string(), req.optional));
+    }
+    parent_peers.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-peer-resolution-cache-v1\0");
+    for (peer_name, range, optional) in parent_peers {
+        hasher.update(peer_name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(range.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(if optional {
+            b"optional\0"
+        } else {
+            b"required\0"
+        });
+    }
+    let digest = hasher.finalize();
+    let mut sorted_parent_peers_hash = [0u8; 32];
+    sorted_parent_peers_hash.copy_from_slice(&digest);
+
+    PeerResolutionCacheKey {
+        canonical: canonical.clone(),
+        sorted_parent_peers_hash,
+    }
+}
+
+fn unsatisfied_required_consumers(
+    state: &ResolveState,
+    reqs: &[&PeerRequirement],
+    chosen: &NpmVersion,
+) -> Vec<(String, String)> {
+    reqs.iter()
+        .filter(|req| !req.optional && !req.range.satisfies(chosen))
+        .map(|req| peer_conflict_consumer_entry(state, req))
+        .collect()
+}
+
+fn unsatisfied_required_consumers_at_indices(
+    state: &ResolveState,
+    reqs: &[&PeerRequirement],
+    indices: Vec<usize>,
+) -> Vec<(String, String)> {
+    indices
+        .into_iter()
+        .map(|i| peer_conflict_consumer_entry(state, reqs[i]))
+        .collect()
+}
+
+fn peer_conflict_consumer_entry(state: &ResolveState, req: &PeerRequirement) -> (String, String) {
+    let consumer_canonical = state
+        .nodes
+        .get(req.consumer as usize)
+        .map_or_else(|| "<unknown>".to_string(), |n| n.canonical.to_string());
+    (consumer_canonical, req.range.to_string())
 }
 
 /// One peer-drain pass.
@@ -2105,6 +2202,11 @@ where
         return Ok(PeerDrainOutcome::SkippedOptOut);
     }
 
+    let cache_key = peer_resolution_cache_key(canonical, reqs);
+    if let Some(cached) = state.peer_resolution_cache.get(&cache_key) {
+        return Ok(cached.value().to_outcome(state, reqs));
+    }
+
     // Step 3 — synthesis path. Fetch the manifest, find the version
     // satisfying every consumer's range. Raising `PeerConflict` when no
     // version threads every range breaks real-world installs whose
@@ -2114,23 +2216,25 @@ where
     // and warn about the stuck consumers; lpm now matches.
     let info = fetch_manifest(canonical.clone()).await?;
     if let Some(chosen) = find_version_satisfying_all(&info, reqs) {
-        return Ok(PeerDrainOutcome::Synthesize { chosen });
+        let outcome = PeerDrainOutcome::Synthesize {
+            chosen: chosen.clone(),
+        };
+        state
+            .peer_resolution_cache
+            .insert(cache_key, CachedPeerResolution::Synthesize { chosen });
+        return Ok(outcome);
     }
     if let Some((chosen, unsatisfied_idx)) = find_version_satisfying_most(&info, reqs) {
-        let unsatisfied: Vec<(String, String)> = unsatisfied_idx
-            .into_iter()
-            .map(|i| {
-                let consumer_canonical = state
-                    .nodes
-                    .get(reqs[i].consumer as usize)
-                    .map_or_else(|| "<unknown>".to_string(), |n| n.canonical.to_string());
-                (consumer_canonical, reqs[i].range.to_string())
-            })
-            .collect();
-        return Ok(PeerDrainOutcome::BestEffortSynthesize {
-            chosen,
+        let unsatisfied = unsatisfied_required_consumers_at_indices(state, reqs, unsatisfied_idx);
+        let outcome = PeerDrainOutcome::BestEffortSynthesize {
+            chosen: chosen.clone(),
             unsatisfied,
-        });
+        };
+        state.peer_resolution_cache.insert(
+            cache_key,
+            CachedPeerResolution::BestEffortSynthesize { chosen },
+        );
+        return Ok(outcome);
     }
     // Truly irreconcilable: no platform-compatible version satisfies
     // any required consumer's range. Hard error — this means the
@@ -3576,6 +3680,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn peer_resolution_cache_key_uses_canonical_and_sorted_parent_peer_context() {
+        let legacy_req = mk_peer_req(1, "react", CanonicalKey::npm("react"), "^17.0.0", false);
+        let modern_req = mk_peer_req(2, "react", CanonicalKey::npm("react"), "^18.0.0", false);
+
+        let canonical = CanonicalKey::npm("react");
+        let forward = peer_resolution_cache_key(&canonical, &[&legacy_req, &modern_req]);
+        let reversed = peer_resolution_cache_key(&canonical, &[&modern_req, &legacy_req]);
+        assert_eq!(
+            forward, reversed,
+            "parent peer context hash must be order-insensitive"
+        );
+
+        let other_range_req = mk_peer_req(2, "react", CanonicalKey::npm("react"), "^19.0.0", false);
+        let other_range = peer_resolution_cache_key(&canonical, &[&legacy_req, &other_range_req]);
+        assert_ne!(
+            forward, other_range,
+            "different parent peer context must miss the cache"
+        );
+
+        let other_canonical =
+            peer_resolution_cache_key(&CanonicalKey::npm("preact"), &[&legacy_req, &modern_req]);
+        assert_ne!(
+            forward, other_canonical,
+            "same parent context for a different peer canonical must miss the cache"
+        );
+    }
+
     /// Pre-allocate a consumer node and return its NodeId. Mirrors
     /// what `process_edge` would produce after consuming a regular
     /// dep edge for the consumer.
@@ -3679,6 +3811,187 @@ mod tests {
         assert!(
             edge.behavior.required && !edge.behavior.peer && !edge.behavior.optional,
             "ambient install behaves as a required regular dep"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_drain_reuses_resolution_for_same_parent_peer_context_regardless_order() {
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let legacy = push_node(&mut state, CanonicalKey::npm("legacy"), "1.0.0");
+        let modern = push_node(&mut state, CanonicalKey::npm("modern"), "2.0.0");
+
+        let legacy_req = mk_peer_req(
+            legacy,
+            "react",
+            CanonicalKey::npm("react"),
+            "^17.0.0",
+            false,
+        );
+        let modern_req = mk_peer_req(
+            modern,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        );
+        state.peer_requirements.push(legacy_req.clone());
+        state.peer_requirements.push(modern_req.clone());
+
+        let info_arc = mk_info_arc(&["18.2.0", "17.0.2"], &[]);
+        let fetch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let first = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+            let info = info_arc.clone();
+            let fetch_count = fetch_count.clone();
+            async move {
+                fetch_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(info)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 1);
+
+        state.peer_requirements.push(modern_req);
+        state.peer_requirements.push(legacy_req);
+
+        let second = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+            let info = info_arc.clone();
+            let fetch_count = fetch_count.clone();
+            async move {
+                fetch_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(info)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            fetch_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "same peer canonical + same parent peer context should reuse the cached decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_drain_cached_best_effort_reports_current_unsatisfied_consumers() {
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let first_legacy = push_node(&mut state, CanonicalKey::npm("legacy-one"), "1.0.0");
+        let first_modern = push_node(&mut state, CanonicalKey::npm("modern-one"), "2.0.0");
+
+        state.peer_requirements.push(mk_peer_req(
+            first_legacy,
+            "react",
+            CanonicalKey::npm("react"),
+            "^17.0.0",
+            false,
+        ));
+        state.peer_requirements.push(mk_peer_req(
+            first_modern,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+
+        let info_arc = mk_info_arc(&["18.2.0", "17.0.2"], &[]);
+        let fetch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+            let info = info_arc.clone();
+            let fetch_count = fetch_count.clone();
+            async move {
+                fetch_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(info)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(state.peer_conflicts.len(), 1);
+        assert_eq!(
+            state.peer_conflicts[0].unsatisfied_consumers,
+            vec![("legacy-one".to_string(), "^17.0.0".to_string())]
+        );
+
+        state.peer_conflicts.clear();
+        let second_legacy = push_node(&mut state, CanonicalKey::npm("legacy-two"), "1.0.0");
+        let second_modern = push_node(&mut state, CanonicalKey::npm("modern-two"), "2.0.0");
+        state.peer_requirements.push(mk_peer_req(
+            second_modern,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        ));
+        state.peer_requirements.push(mk_peer_req(
+            second_legacy,
+            "react",
+            CanonicalKey::npm("react"),
+            "^17.0.0",
+            false,
+        ));
+
+        let second = drain_peer_requirements_one_pass(
+            &mut state,
+            true,
+            |canonical: CanonicalKey| async move {
+                panic!("cached best-effort resolution should not refetch {canonical}")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(fetch_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(state.peer_conflicts.len(), 1);
+        assert_eq!(state.peer_conflicts[0].canonical, "react");
+        assert_eq!(state.peer_conflicts[0].chosen_version, "18.2.0");
+        assert_eq!(
+            state.peer_conflicts[0].unsatisfied_consumers,
+            vec![("legacy-two".to_string(), "^17.0.0".to_string())],
+            "cached best-effort decisions must render warnings from the current consumers"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_drain_cached_resolution_does_not_override_existing_satisfaction() {
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let consumer = push_node(&mut state, CanonicalKey::npm("react-redux"), "9.0.0");
+        let req = mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            "^18.0.0",
+            false,
+        );
+
+        state.peer_requirements.push(req.clone());
+        let info_arc = mk_info_arc(&["18.2.0"], &[]);
+        let first = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+            let info = info_arc.clone();
+            async move { Ok(info) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(first.len(), 1);
+
+        let _react = push_node(&mut state, CanonicalKey::npm("react"), "18.2.0");
+        state.peer_requirements.push(req);
+
+        let second = drain_peer_requirements_one_pass(
+            &mut state,
+            true,
+            |canonical: CanonicalKey| async move {
+                panic!("cache hit must not run before existing satisfaction for {canonical}")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            second.is_empty(),
+            "live resolved tree satisfaction wins over a cached synthesize decision"
         );
     }
 

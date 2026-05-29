@@ -82,6 +82,16 @@ impl PackageBits {
         }
     }
 
+    pub fn intersect_with(&mut self, other: &PackageBits) {
+        let len = self.0.len().min(other.0.len());
+        for i in 0..len {
+            self.0[i] &= other.0[i];
+        }
+        for i in len..self.0.len() {
+            self.0[i] = false;
+        }
+    }
+
     /// Iterate over the set member IDs in ascending order.
     pub fn iter_ids(&self) -> impl Iterator<Item = PackageId> + '_ {
         self.0
@@ -158,6 +168,12 @@ impl<'a> FilterEngine<'a> {
             FilterExpr::GlobName(pat) => self.eval_glob_name(pat),
             FilterExpr::PathExact(path) => self.eval_path_exact(path),
             FilterExpr::PathGlob(pat) => self.eval_path_glob(pat),
+            FilterExpr::NamePathScope { name, path } => {
+                let mut name_bits = self.eval_expr(name)?;
+                let path_bits = self.eval_expr(path)?;
+                name_bits.intersect_with(&path_bits);
+                Ok(name_bits)
+            }
             FilterExpr::GitRef(reff) => self.eval_git_ref(reff),
             FilterExpr::WithDeps(inner) => {
                 let base = self.eval_expr(inner)?;
@@ -170,10 +186,16 @@ impl<'a> FilterEngine<'a> {
                 Ok(closure)
             }
             FilterExpr::WithDependents(inner) => {
+                if let FilterExpr::GitRef(base_ref) = inner.as_ref() {
+                    return self.eval_git_ref_with_dependents(base_ref, true);
+                }
                 let base = self.eval_expr(inner)?;
                 Ok(self.closure_with_dependents(&base))
             }
             FilterExpr::DependentsOnly(inner) => {
+                if let FilterExpr::GitRef(base_ref) = inner.as_ref() {
+                    return self.eval_git_ref_with_dependents(base_ref, false);
+                }
                 let base = self.eval_expr(inner)?;
                 let mut closure = self.closure_with_dependents(&base);
                 closure.subtract(&base);
@@ -281,12 +303,57 @@ impl<'a> FilterEngine<'a> {
     /// Git ref atom. Per D1, returns directly changed packages only —
     /// dependents are added by an enclosing `WithDependents` closure.
     fn eval_git_ref(&self, base_ref: &str) -> Result<PackageBits, FilterError> {
-        let affected_set =
-            affected::find_affected_direct_only(self.graph, self.workspace_root, base_ref)
-                .map_err(FilterError::GitError)?;
+        let affected_set = affected::find_affected_direct_only_with_options(
+            self.graph,
+            self.workspace_root,
+            base_ref,
+            affected::AffectedOptions {
+                changed_files_ignore_patterns: self.options.changed_files_ignore_patterns,
+                test_patterns: self.options.test_patterns,
+            },
+        )
+        .map_err(FilterError::GitError)?;
         let mut bits = PackageBits::empty(self.graph.len());
         for idx in affected_set {
             bits.set(idx);
+        }
+        Ok(bits)
+    }
+
+    fn eval_git_ref_with_dependents(
+        &self,
+        base_ref: &str,
+        include_source_seed: bool,
+    ) -> Result<PackageBits, FilterError> {
+        let affected = affected::find_affected_direct_sets_with_options(
+            self.graph,
+            self.workspace_root,
+            base_ref,
+            affected::AffectedOptions {
+                changed_files_ignore_patterns: self.options.changed_files_ignore_patterns,
+                test_patterns: self.options.test_patterns,
+            },
+        )
+        .map_err(FilterError::GitError)?;
+
+        let mut bits = PackageBits::empty(self.graph.len());
+        for idx in affected.test_only_changed {
+            bits.set(idx);
+        }
+        if include_source_seed {
+            for &idx in &affected.source_changed {
+                bits.set(idx);
+            }
+        }
+        for idx in affected.source_changed {
+            let dependents = if self.options.follow_prod_deps_only {
+                self.graph.transitive_prod_dependents(idx)
+            } else {
+                self.graph.transitive_dependents(idx)
+            };
+            for dep_idx in dependents {
+                bits.set(dep_idx);
+            }
         }
         Ok(bits)
     }
@@ -298,7 +365,12 @@ impl<'a> FilterEngine<'a> {
     fn closure_with_deps(&self, base: &PackageBits) -> PackageBits {
         let mut result = base.clone();
         for idx in base.iter_ids() {
-            for dep_idx in self.graph.transitive_dependencies(idx) {
+            let dependencies = if self.options.follow_prod_deps_only {
+                self.graph.transitive_prod_dependencies(idx)
+            } else {
+                self.graph.transitive_dependencies(idx)
+            };
+            for dep_idx in dependencies {
                 result.set(dep_idx);
             }
         }
@@ -310,7 +382,12 @@ impl<'a> FilterEngine<'a> {
     fn closure_with_dependents(&self, base: &PackageBits) -> PackageBits {
         let mut result = base.clone();
         for idx in base.iter_ids() {
-            for dep_idx in self.graph.transitive_dependents(idx) {
+            let dependents = if self.options.follow_prod_deps_only {
+                self.graph.transitive_prod_dependents(idx)
+            } else {
+                self.graph.transitive_dependents(idx)
+            };
+            for dep_idx in dependents {
                 result.set(dep_idx);
             }
         }
@@ -436,6 +513,7 @@ impl<'a> FilterEngine<'a> {
             | FilterExpr::GlobName(_)
             | FilterExpr::PathExact(_)
             | FilterExpr::PathGlob(_)
+            | FilterExpr::NamePathScope { .. }
             | FilterExpr::GitRef(_) => TraceReason::DirectMatch {
                 filter: format_expr(filter),
                 kind: match_kind_for(filter),
@@ -493,11 +571,12 @@ fn trace_origin_dep(
     let base = base_bits?;
     let mut matches: Vec<PackageId> = Vec::new();
     for base_id in base.iter_ids() {
-        if engine
-            .graph
-            .transitive_dependencies(base_id)
-            .contains(&package)
-        {
+        let dependencies = if engine.options.follow_prod_deps_only {
+            engine.graph.transitive_prod_dependencies(base_id)
+        } else {
+            engine.graph.transitive_dependencies(base_id)
+        };
+        if dependencies.contains(&package) {
             matches.push(base_id);
             if matches.len() > 1 {
                 return None;
@@ -516,11 +595,12 @@ fn trace_origin_dependent(
     let base = base_bits?;
     let mut matches: Vec<PackageId> = Vec::new();
     for base_id in base.iter_ids() {
-        if engine
-            .graph
-            .transitive_dependents(base_id)
-            .contains(&package)
-        {
+        let dependents = if engine.options.follow_prod_deps_only {
+            engine.graph.transitive_prod_dependents(base_id)
+        } else {
+            engine.graph.transitive_dependents(base_id)
+        };
+        if dependents.contains(&package) {
             matches.push(base_id);
             if matches.len() > 1 {
                 return None;
@@ -539,6 +619,9 @@ fn format_expr(expr: &FilterExpr) -> String {
         FilterExpr::GlobName(s) => s.clone(),
         FilterExpr::PathExact(p) => format!("{{{p}}}"),
         FilterExpr::PathGlob(p) => p.clone(),
+        FilterExpr::NamePathScope { name, path } => {
+            format!("{}{}", format_expr(name), format_expr(path))
+        }
         FilterExpr::GitRef(r) => format!("[{r}]"),
         FilterExpr::WithDeps(inner) => format!("{}...", format_expr(inner)),
         FilterExpr::DepsOnly(inner) => format!("{}^...", format_expr(inner)),
@@ -556,6 +639,7 @@ fn match_kind_for(expr: &FilterExpr) -> MatchKind {
         FilterExpr::GlobName(_) => MatchKind::GlobName,
         FilterExpr::PathExact(_) => MatchKind::PathExact,
         FilterExpr::PathGlob(_) => MatchKind::PathGlob,
+        FilterExpr::NamePathScope { .. } => MatchKind::NamePathScope,
         FilterExpr::GitRef(_) => MatchKind::GitRef,
         FilterExpr::WithDeps(inner)
         | FilterExpr::DepsOnly(inner)
@@ -749,6 +833,22 @@ mod tests {
     }
 
     #[test]
+    fn intersect_keeps_only_shared_bits() {
+        let mut a = PackageBits::empty(5);
+        a.set(0);
+        a.set(2);
+        a.set(4);
+        let mut b = PackageBits::empty(5);
+        b.set(2);
+        b.set(3);
+        b.set(4);
+
+        a.intersect_with(&b);
+
+        assert_eq!(a.to_sorted_vec(), vec![2, 4]);
+    }
+
+    #[test]
     fn to_sorted_vec_is_deterministic_and_ordered() {
         let mut bits = PackageBits::empty(10);
         bits.set(7);
@@ -778,15 +878,32 @@ mod tests {
 
     /// Build a synthetic workspace member with explicit deps.
     fn member(name: &str, deps: &[&str]) -> WorkspaceMember {
+        member_with_sections(name, deps, &[], &[], &[])
+    }
+
+    fn dep_map(deps: &[&str]) -> HashMap<String, String> {
+        deps.iter()
+            .map(|d| ((*d).to_string(), "*".to_string()))
+            .collect()
+    }
+
+    fn member_with_sections(
+        name: &str,
+        deps: &[&str],
+        dev_deps: &[&str],
+        optional_deps: &[&str],
+        peer_deps: &[&str],
+    ) -> WorkspaceMember {
         let mut dependencies = HashMap::new();
-        for d in deps {
-            dependencies.insert((*d).to_string(), "*".to_string());
-        }
+        dependencies.extend(dep_map(deps));
         WorkspaceMember {
             path: PathBuf::from(format!("/workspace/packages/{name}")),
             package: PackageJson {
                 name: Some(name.to_string()),
                 dependencies,
+                dev_dependencies: dep_map(dev_deps),
+                optional_dependencies: dep_map(optional_deps),
+                peer_dependencies: dep_map(peer_deps),
                 ..Default::default()
             },
         }
@@ -900,6 +1017,20 @@ mod tests {
             Err(FilterError::InvalidGlob { .. }) => {}
             other => panic!("expected InvalidGlob, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn evaluator_name_path_scope_intersects_name_and_path_matches() {
+        let (_ws, graph, root) = make_engine();
+        let engine = FilterEngine::new(&graph, &root);
+        let expr = FilterExpr::NamePathScope {
+            name: Box::new(FilterExpr::GlobName("ui-*".into())),
+            path: Box::new(FilterExpr::PathExact("./packages/ui-button".into())),
+        };
+
+        let result = engine.evaluate(&[expr]).unwrap();
+
+        assert_eq!(result, vec![idx(&graph, "ui-button")]);
     }
 
     // ── Closure operators ──────────────────────────────────────────────────
@@ -1137,6 +1268,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn evaluator_prod_only_dependent_closure_omits_dev_dependency_dependents() {
+        let ws = Workspace {
+            root: PathBuf::from("/workspace"),
+            root_package: PackageJson::default(),
+            members: vec![
+                member("project-2", &[]),
+                member("project-3", &["project-2"]),
+                member("project-1", &["project-3"]),
+                member_with_sections("project-4", &[], &["project-3"], &[], &[]),
+            ],
+        };
+        let graph = WorkspaceGraph::from_workspace(&ws);
+        let engine = FilterEngine::with_options(
+            &graph,
+            &ws.root,
+            crate::filter::FilterOptions {
+                follow_prod_deps_only: true,
+                ..Default::default()
+            },
+        );
+        let exprs = vec![FilterExpr::WithDependents(Box::new(FilterExpr::ExactName(
+            "project-3".into(),
+        )))];
+
+        let result = engine.evaluate(&exprs).unwrap();
+
+        assert_eq!(
+            result,
+            vec![idx(&graph, "project-3"), idx(&graph, "project-1")]
+        );
+    }
+
     // ── Helpers (split_glob_pattern, lexical_normalize) ────────────────────
 
     #[test]
@@ -1357,6 +1521,13 @@ mod tests {
         assert_eq!(
             format_expr(&FilterExpr::PathExact("./apps/web".into())),
             "{./apps/web}"
+        );
+        assert_eq!(
+            format_expr(&FilterExpr::NamePathScope {
+                name: Box::new(FilterExpr::GlobName("@ui/*".into())),
+                path: Box::new(FilterExpr::PathExact("./apps/web".into())),
+            }),
+            "@ui/*{./apps/web}"
         );
     }
 

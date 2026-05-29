@@ -65,6 +65,8 @@ use lpm_store::v2::{
     DepLink, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple, Store,
 };
 
+#[cfg(unix)]
+use crate::make_bin_target_executable;
 use crate::{
     LinkResult, LinkTarget, LinkerMode, MaterializedPackage, validate_bin_name, validate_bin_target,
 };
@@ -1082,19 +1084,13 @@ fn create_bin_links_v2(
             bin_target.clear();
             bin_target.push(&pkg_dir);
             bin_target.push(&bin_rel_path);
-            // Make the bin file executable (npm tarballs sometimes
-            // ship without the +x bit). Same fix as v1.
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = std::fs::metadata(&bin_target) {
-                    let mut perms = meta.permissions();
-                    let mode = perms.mode();
-                    if mode & 0o111 == 0 {
-                        perms.set_mode(mode | 0o111);
-                        let _ = std::fs::set_permissions(&bin_target, perms);
-                    }
-                }
+            if let Err(error) = make_bin_target_executable(&bin_target) {
+                tracing::warn!(
+                    "v2 linker: skipping bin {cmd_name} from {}: failed to mark target executable: {error}",
+                    v2t.target.name
+                );
+                continue;
             }
             link_path.clear();
             link_path.push(&bin_dir);

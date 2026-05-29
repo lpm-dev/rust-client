@@ -11,6 +11,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+sha1 = { workspace = true }
 subtle = "2"
 base64 = { workspace = true }
 miette = { workspace = true }

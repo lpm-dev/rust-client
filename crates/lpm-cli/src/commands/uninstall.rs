@@ -304,6 +304,9 @@ pub async fn run(
     cwd: &Path,
     packages: &[String],
     filters: &[String],
+    filter_prod: &[String],
+    changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     workspace_root_flag: bool,
     fail_if_no_match: bool,
     yes: bool,
@@ -321,6 +324,9 @@ pub async fn run(
     let targets = crate::commands::install_targets::resolve_install_targets(
         cwd,
         filters,
+        filter_prod,
+        changed_files_ignore_pattern,
+        test_pattern,
         workspace_root_flag,
         true, // has_packages
     )?;
@@ -332,7 +338,7 @@ pub async fn run(
     // substring-matched pre-Same behavior as `lpm install --filter`
     // and `lpm run --filter`.
     if targets.member_manifests.is_empty() {
-        let hint = crate::commands::filter::format_no_match_hint(filters);
+        let hint = crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
 
         if fail_if_no_match {
             let base = "no workspace packages matched the filter (--fail-if-no-match)";
@@ -447,6 +453,33 @@ pub async fn run(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        client: &RegistryClient,
+        cwd: &Path,
+        packages: &[String],
+        filters: &[String],
+        workspace_root_flag: bool,
+        fail_if_no_match: bool,
+        yes: bool,
+        json_output: bool,
+    ) -> Result<(), LpmError> {
+        super::run(
+            client,
+            cwd,
+            packages,
+            filters,
+            &[],
+            &[],
+            &[],
+            workspace_root_flag,
+            fail_if_no_match,
+            yes,
+            json_output,
+        )
+        .await
+    }
 
     fn write_package_json(project_dir: &Path, value: &Value) {
         std::fs::write(

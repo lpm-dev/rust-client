@@ -295,7 +295,8 @@ pub async fn run(
     // SHA-512 hash already computed during download. Slow path: stream-
     // verify from the temp file (covers non-sha512 expected values).
     // Mirrors install.rs:8156-8170.
-    if let Some(integrity) = ver_meta.integrity() {
+    if let Some(integrity) = ver_meta.integrity_or_shasum() {
+        let integrity = integrity.as_ref();
         if downloaded.sri != integrity
             && let Err(e) = lpm_extractor::verify_integrity_file(downloaded.file.path(), integrity)
         {
@@ -2505,6 +2506,7 @@ async fn handle_dependencies(
                 false,                                                 // force
                 false,                                                 // allow_new
                 false, // strict_integrity
+                None,  // strict_peer_dependencies_override
                 None,  // linker_override
                 false, // no_skills
                 false, // no_editor_setup

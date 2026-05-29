@@ -1,6 +1,7 @@
 use crate::error::LpmError;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
 use subtle::ConstantTimeEq;
@@ -21,6 +22,7 @@ pub struct Integrity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HashAlgorithm {
+    Sha1,
     Sha256,
     Sha512,
 }
@@ -33,6 +35,7 @@ impl HashAlgorithm {
     #[inline]
     pub const fn digest_len(self) -> usize {
         match self {
+            HashAlgorithm::Sha1 => 20,
             HashAlgorithm::Sha256 => 32,
             HashAlgorithm::Sha512 => 64,
         }
@@ -47,11 +50,12 @@ impl Integrity {
         })?;
 
         let algorithm = match algo_str {
+            "sha1" => HashAlgorithm::Sha1,
             "sha256" => HashAlgorithm::Sha256,
             "sha512" => HashAlgorithm::Sha512,
             other => {
                 return Err(LpmError::InvalidIntegrity(format!(
-                    "unsupported algorithm: {other} (expected sha256 or sha512)"
+                    "unsupported algorithm: {other} (expected sha1, sha256, or sha512)"
                 )));
             }
         };
@@ -74,6 +78,11 @@ impl Integrity {
     /// Compute integrity hash from raw bytes.
     pub fn from_bytes(algorithm: HashAlgorithm, data: &[u8]) -> Self {
         let hash = match algorithm {
+            HashAlgorithm::Sha1 => {
+                let mut hasher = Sha1::new();
+                hasher.update(data);
+                hasher.finalize().to_vec()
+            }
             HashAlgorithm::Sha256 => {
                 let mut hasher = Sha256::new();
                 hasher.update(data);
@@ -113,7 +122,7 @@ impl Integrity {
     /// Verify a file on disk matches this integrity hash (bounded-memory).
     ///
     /// Reads the file in 64KB chunks — never buffers the full file in memory.
-    /// Supports SHA-256 and SHA-512.
+    /// Supports SHA-1, SHA-256, and SHA-512.
     pub fn verify_file(&self, path: &std::path::Path) -> Result<(), LpmError> {
         use std::io::Read;
 
@@ -121,6 +130,17 @@ impl Integrity {
         let mut buf = [0u8; 64 * 1024];
 
         let computed_hash = match self.algorithm {
+            HashAlgorithm::Sha1 => {
+                let mut hasher = Sha1::new();
+                loop {
+                    let n = file.read(&mut buf).map_err(LpmError::Io)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                hasher.finalize().to_vec()
+            }
             HashAlgorithm::Sha256 => {
                 let mut hasher = Sha256::new();
                 loop {
@@ -168,6 +188,7 @@ impl Integrity {
 impl fmt::Display for Integrity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let algo = match self.algorithm {
+            HashAlgorithm::Sha1 => "sha1",
             HashAlgorithm::Sha256 => "sha256",
             HashAlgorithm::Sha512 => "sha512",
         };
@@ -199,14 +220,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_sha1_integrity() {
+        let sri = "sha1-2jmj7l5rSw0yVb/vlWAYkK/YBwk=";
+        let integrity = Integrity::parse(sri).unwrap();
+        assert_eq!(integrity.algorithm, HashAlgorithm::Sha1);
+        assert_eq!(integrity.hash.len(), 20);
+        assert_eq!(integrity.to_string(), sri);
+    }
+
+    #[test]
     fn reject_missing_algorithm() {
         assert!(Integrity::parse("noprefixhere").is_err());
     }
 
     #[test]
     fn reject_unsupported_algorithm() {
-        // Length is irrelevant for the algorithm gate — sha1 fails first.
-        assert!(Integrity::parse("sha1-YWJjMTIz").is_err());
+        assert!(Integrity::parse("md5-1B2M2Y8AsgTpgAmY7PhCfg==").is_err());
     }
 
     #[test]

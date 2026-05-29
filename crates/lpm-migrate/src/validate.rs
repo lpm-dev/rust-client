@@ -262,7 +262,9 @@ mod tests {
             metadata: LockfileMetadata {
                 lockfile_version: LOCKFILE_VERSION,
                 resolved_with: Some("migrate".to_string()),
+                auto_isolated_peer_conflicts: false,
             },
+            catalogs: lpm_lockfile::CatalogSnapshots::new(),
             packages,
             root_aliases: std::collections::BTreeMap::new(),
             ambient_peer_installs: Vec::new(),

@@ -21,7 +21,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 139;
+pub const EXPECTED_SURFACE_COUNT: usize = 141;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -45,6 +45,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Config",
     "Cache",
     "Store",
+    "Catalog",
     "Global",
     "Trust",
     "Pool",
@@ -1679,5 +1680,25 @@ pub const SURFACES: &[SurfaceBaseline] = &[
             "crates/lpm-cli/src/commands/pack.rs",
             "tests/workflows/tests/pack.rs",
         ],
+    },
+    SurfaceBaseline {
+        id: 140,
+        name: "`lpm catalog list --unused`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &["tests/workflows/tests/pnpm_compat_catalog.rs"],
+    },
+    SurfaceBaseline {
+        id: 141,
+        name: "`lpm catalog show --resolved`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &["tests/workflows/tests/pnpm_compat_catalog.rs"],
     },
 ];

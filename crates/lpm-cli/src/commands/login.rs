@@ -57,6 +57,11 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         hex::encode(bytes)
     };
 
+    // Bind the exchange code to this CLI invocation. The browser URL carries
+    // only the challenge; the verifier is sent later, when the CLI redeems the
+    // callback code.
+    let (code_verifier, code_challenge) = generate_pkce_pair();
+
     // Per-install random fingerprint stored at ~/.lpm/device-id; see
     // `lpm_auth::compute_device_fingerprint` for the L13 rationale.
     let device_fingerprint = lpm_auth::compute_device_fingerprint();
@@ -66,7 +71,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
 
     // Open browser
     let login_url = format!(
-        "{registry_url}/cli/login?port={port}&state={state}&fp={device_fingerprint}&dn={}",
+        "{registry_url}/cli/login?port={port}&state={state}&fp={device_fingerprint}&code_challenge={code_challenge}&dn={}",
         urlencoding::encode(&device_name)
     );
     if open::that(&login_url).is_err() && !json_output {
@@ -105,7 +110,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         let http_client = reqwest::Client::new();
         let resp = http_client
             .post(&exchange_url)
-            .json(&serde_json::json!({ "code": code }))
+            .json(&serde_json::json!({ "code": code, "code_verifier": code_verifier }))
             .send()
             .await
             .map_err(|e| LpmError::Registry(format!("exchange request failed: {e}")))?;
@@ -541,6 +546,30 @@ fn render_login_page(success: bool, _username: Option<&str>) -> String {
     )
 }
 
+/// Derive the PKCE S256 `code_challenge` from a `code_verifier`:
+/// `base64url-no-pad(sha256(verifier-bytes))`. Must match the server's
+/// `createHash("sha256").update(verifier).digest("base64url")` exactly, or the
+/// exchange-code redemption will reject the verifier.
+fn pkce_challenge(verifier: &str) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+/// Generate a fresh PKCE (`code_verifier`, `code_challenge`) pair. The verifier
+/// is 32 CSPRNG bytes encoded as base64url-no-pad (43 chars, within the PKCE
+/// 43–128-char range). Both values are URL-safe, so they pass through the login
+/// URL query string and the exchange JSON body untouched.
+fn generate_pkce_pair() -> (String, String) {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
+    let challenge = pkce_challenge(&verifier);
+    (verifier, challenge)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +604,29 @@ mod tests {
         let resp = format_callback_response("400 Bad Request", "");
         assert!(resp.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(resp.contains("Content-Length: 0\r\n"));
+    }
+
+    #[test]
+    fn pkce_challenge_matches_known_s256_vector() {
+        // base64url-no-pad(sha256("test")).
+        assert_eq!(
+            pkce_challenge("test"),
+            "n4bQgYhMfWWaL-qgxVrQFaO_TxsrC4Is0V1sFbDwCgg"
+        );
+    }
+
+    #[test]
+    fn generate_pkce_pair_is_s256_consistent_and_url_safe() {
+        let (verifier, challenge) = generate_pkce_pair();
+        // The challenge we send is the S256 hash of the verifier we keep.
+        assert_eq!(challenge, pkce_challenge(&verifier));
+        // Both are URL-safe (no +, /, =), so query-param / JSON transport is lossless.
+        for s in [&verifier, &challenge] {
+            assert!(!s.is_empty());
+            assert!(!s.contains('+') && !s.contains('/') && !s.contains('='));
+        }
+        // Fresh CSPRNG verifier each call.
+        let (verifier2, _) = generate_pkce_pair();
+        assert_ne!(verifier, verifier2);
     }
 }

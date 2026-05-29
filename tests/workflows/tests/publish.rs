@@ -190,21 +190,116 @@ async fn publish_to_mock_registry_succeeds() {
         .output()
         .expect("failed to run lpm publish");
 
+    assert!(
+        output.status.success(),
+        "mock publish should succeed when the registry accepts the upload\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // The publish may fail at tarball upload validation or succeed —
-    // the key assertion is that it reached the registry (not a local-only error)
     let combined = format!("{stdout}{stderr}");
     assert!(
-        combined.contains("publish")
-            || combined.contains("Published")
-            || combined.contains("quality")
-            || combined.contains("tarball")
-            || combined.contains("Upload")
-            || combined.contains("Package published")
-            || combined.contains("error"),
-        "expected publish-related output (success or server error), got:\n{combined}"
+        combined.contains("Published") || combined.contains("Package published"),
+        "expected publish success output, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn publish_rewrites_catalog_dependency_in_uploaded_tarball() {
+    use base64::Engine;
+
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "catalog-publish-workspace",
+        "version": "1.0.0",
+        "private": true
+    }"#,
+    );
+
+    project.write_file(
+        "pnpm-workspace.yaml",
+        r#"packages:
+  - "packages/*"
+catalog:
+  ms: ^2.1.3
+"#,
+    );
+    project.write_file(
+        "packages/lib/package.json",
+        r#"{
+        "name": "@lpm.dev/testuser.catalog-publish",
+        "version": "1.0.0",
+        "description": "Catalog publish rewrite test",
+        "main": "index.js",
+        "license": "MIT",
+        "dependencies": {
+            "ms": "catalog:"
+        }
+    }"#,
+    );
+    project.write_file("packages/lib/index.js", "module.exports = require(\"ms\")");
+
+    let mut cmd = lpm_with_registry(&project, &mock.url());
+    cmd.current_dir(project.path().join("packages/lib"));
+    let output = cmd
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("failed to run lpm publish for catalog workspace member");
+
+    assert!(
+        output.status.success(),
+        "catalog-backed publish must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let publish_request = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a publish PUT request, got {} request(s)",
+                requests.len()
+            )
+        });
+
+    let payload: serde_json::Value = serde_json::from_slice(&publish_request.body)
+        .expect("publish request body must be valid JSON");
+    let attachment = payload["_attachments"]
+        .as_object()
+        .and_then(|attachments| attachments.values().next())
+        .unwrap_or_else(|| panic!("publish payload must contain one tarball attachment"));
+    let tarball_data = base64::engine::general_purpose::STANDARD
+        .decode(
+            attachment["data"]
+                .as_str()
+                .expect("tarball attachment must be base64 text"),
+        )
+        .expect("tarball attachment must decode from base64");
+
+    let published_package_json = extract_uploaded_package_json(&tarball_data);
+    assert_eq!(
+        published_package_json["dependencies"]["ms"],
+        serde_json::json!("^2.1.3"),
+        "published tarball must rewrite catalog: to the workspace catalog range"
+    );
+    assert!(
+        !published_package_json.to_string().contains("catalog:"),
+        "published tarball manifest must not leak catalog: references\n{}",
+        serde_json::to_string_pretty(&published_package_json)
+            .expect("published manifest must serialize")
     );
 }
 
@@ -468,4 +563,36 @@ fn publish_github_and_gitlab_together_yields_two_targets() {
         target_registries.contains(&"github") && target_registries.contains(&"gitlab"),
         "both providers must appear in the targets array, got: {target_registries:?}",
     );
+}
+
+fn extract_uploaded_package_json(tarball_data: &[u8]) -> serde_json::Value {
+    use std::io::Read;
+
+    let mut decoder = flate2::read::GzDecoder::new(tarball_data);
+    let mut tar_data = Vec::new();
+    decoder
+        .read_to_end(&mut tar_data)
+        .expect("published tarball must decompress");
+
+    let mut archive = tar::Archive::new(tar_data.as_slice());
+    for entry in archive
+        .entries()
+        .expect("published tarball must list entries")
+    {
+        let mut entry = entry.expect("published tarball entry must read");
+        if entry
+            .path()
+            .expect("published tarball entry path must read")
+            .to_string_lossy()
+            == "package/package.json"
+        {
+            let mut content = String::new();
+            entry
+                .read_to_string(&mut content)
+                .expect("published package.json must read");
+            return serde_json::from_str(&content).expect("published package.json must parse");
+        }
+    }
+
+    panic!("published tarball missing package/package.json");
 }
