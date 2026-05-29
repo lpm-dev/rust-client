@@ -572,6 +572,37 @@ pub async fn run(
         }
     }
 
+    if let Some(det) = lpm_runtime::detect::detect_bun_version(project_dir) {
+        let system_bun = get_system_bun_version(project_dir);
+        let managed_versions = lpm_runtime::bun::list_installed().unwrap_or_default();
+        let spec = &det.spec;
+        let clean = lpm_runtime::bun::normalize_spec(spec);
+        let matched_managed = lpm_runtime::bun::find_matching_installed(spec, &managed_versions);
+
+        if let Some(ver) = matched_managed {
+            checks.push(Check::pass(
+                &doctor_catalog::BUN_MANAGED_MATCH,
+                &format!("{ver} (managed, from {})", det.source),
+            ));
+        } else if let Some(sys) = &system_bun {
+            checks.push(Check::warn(
+                &doctor_catalog::BUN_PINNED_UNMET,
+                &format!(
+                    "{sys} (system) — pinned {spec} from {} not installed. Run: lpm use bun@{clean}",
+                    det.source
+                ),
+            ));
+        } else {
+            checks.push(Check::fail(
+                &doctor_catalog::BUN_MISSING_PINNED,
+                &format!(
+                    "not found — pinned {spec} from {}. Run: lpm use bun@{clean}",
+                    det.source
+                ),
+            ));
+        }
+    }
+
     // === Tunnel  ===
     //
     // Touches network in the authenticated path (`tunnel_domain_lookup`
@@ -978,6 +1009,24 @@ fn extract_node_spec_from_detail(detail: &str) -> Option<String> {
 fn get_system_node_version(project_dir: &Path) -> Option<String> {
     let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
     let output = Command::new("node")
+        .arg("--version")
+        .env("PATH", &path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Get system Bun version by running `bun --version`.
+fn get_system_bun_version(project_dir: &Path) -> Option<String> {
+    let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
+    let output = Command::new("bun")
         .arg("--version")
         .env("PATH", &path)
         .stdout(Stdio::piped())
@@ -1890,9 +1939,9 @@ fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     if let Some(runtime) = obj.get("runtime") {
         if let Some(runtime_obj) = runtime.as_object() {
             for (rt_name, rt_value) in runtime_obj {
-                if rt_name != "node" {
+                if rt_name != "node" && rt_name != "bun" {
                     warnings.push(format!(
-                        "runtime \"{rt_name}\" not yet supported (only \"node\")"
+                        "runtime \"{rt_name}\" not yet supported (supported: \"node\", \"bun\")"
                     ));
                 }
                 if !rt_value.is_string() {

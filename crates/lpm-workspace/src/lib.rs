@@ -368,7 +368,7 @@ pub const ENGINES_BUN_IGNORED_META: ManifestCompatCatalogEntry = ManifestCompatC
     name: "Manifest compat: engines.bun",
     description: "`engines.bun` is declared but LPM does not enforce bun's version constraint.",
     when_fires: "`engines.bun` is set on the (workspace root) `package.json`.",
-    remediation: "Remove the field, or accept that LPM ignores it. `engines.node` and `engines.lpm` are enforced.",
+    remediation: "LPM does not enforce `engines.bun`; use `lpm.json > runtime.bun` when the project needs a managed Bun binary on PATH. `engines.node` and `engines.lpm` are enforced.",
     possible_severities: &["warn"],
 };
 
@@ -673,6 +673,13 @@ fn detect_engines_other_pm_ignored(pkg: &PackageJson) -> Vec<ManifestCompatIssue
     let mut out = Vec::new();
     for (key, code) in OTHER_PM_ENGINE_KEYS {
         if let Some(constraint) = pkg.engines.get(*key) {
+            let remediation = if *key == "bun" {
+                "use `lpm.json > runtime.bun` when the project needs a managed Bun binary on PATH. \
+                 LPM does not enforce `engines.bun`; `engines.node` and `engines.lpm` are enforced."
+            } else {
+                "remove the field or use `engines.lpm` to constrain the LPM CLI \
+                 version. LPM enforces `engines.lpm` and `engines.node` only."
+            };
             out.push(ManifestCompatIssue {
                 code,
                 severity: ManifestCompatSeverity::Warn,
@@ -680,9 +687,7 @@ fn detect_engines_other_pm_ignored(pkg: &PackageJson) -> Vec<ManifestCompatIssue
                     "package.json has `engines.{key}` set ({constraint:?}) but LPM does not \
                      enforce it"
                 ),
-                remediation: "remove the field or use `engines.lpm` to constrain the LPM CLI \
-                              version. LPM enforces `engines.lpm` and `engines.node` only."
-                    .into(),
+                remediation: remediation.into(),
                 entries: vec![(*key).to_string()],
             });
         }
@@ -3297,6 +3302,8 @@ mod tests {
             // render `engines.<name>` consistently.
             assert_eq!(issue.entries.len(), 1);
         }
+        let bun_issue = issue_with_code(&issues, "engines_bun_ignored").unwrap();
+        assert!(bun_issue.remediation.contains("runtime.bun"));
     }
 
     /// Only-node + only-lpm engines pins are honored — no other-PM

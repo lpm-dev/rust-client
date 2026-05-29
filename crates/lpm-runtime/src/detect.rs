@@ -1,23 +1,81 @@
-//! Auto-detect required Node.js version from project configuration.
+//! Auto-detect managed runtime version requirements from project configuration.
 //!
-//! Resolution order (first match wins):
+//! Node resolution order (first match wins):
 //! 1. `lpm.json` -> `runtime.node`
 //! 2. `package.json` -> `engines.node`
 //! 3. `.nvmrc` file
 //! 4. `.node-version` file
 //! 5. None (use system Node)
+//!
+//! Bun is currently detected only from `lpm.json` -> `runtime.bun`.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Detected Node.js version requirement.
+/// Managed runtime kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RuntimeKind {
+    Node,
+    Bun,
+}
+
+impl RuntimeKind {
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Bun => "bun",
+        }
+    }
+
+    #[inline]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Node => "Node",
+            Self::Bun => "Bun",
+        }
+    }
+
+    #[inline]
+    pub fn binary_name(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Bun => "bun",
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RuntimeKind {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "node" => Ok(Self::Node),
+            "bun" => Ok(Self::Bun),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Detected managed runtime version requirement.
 #[derive(Debug, Clone)]
-pub struct DetectedNodeVersion {
+pub struct DetectedRuntimeVersion {
+    /// Runtime provider.
+    pub runtime: RuntimeKind,
     /// The version spec (e.g., ">=22.0.0", "22", "22.5.0")
     pub spec: String,
     /// Where it was found
     pub source: VersionSource,
 }
+
+/// Backward-compatible alias for Node-only callers.
+pub type DetectedNodeVersion = DetectedRuntimeVersion;
 
 /// Where a version requirement was detected from.
 #[derive(Debug, Clone)]
@@ -46,6 +104,26 @@ pub fn detect_node_version(project_dir: &Path) -> Option<DetectedNodeVersion> {
     detect_node_version_inner(project_dir, None)
 }
 
+/// Detect the required Bun version for a project.
+///
+/// Bun is intentionally scoped to `lpm.json > runtime.bun`; `engines.bun`
+/// remains a compatibility warning, not an enforced runtime contract.
+pub fn detect_bun_version(project_dir: &Path) -> Option<DetectedRuntimeVersion> {
+    detect_from_lpm_json_runtime(project_dir, RuntimeKind::Bun)
+}
+
+/// Detect every managed runtime requirement in deterministic PATH order.
+pub fn detect_runtime_versions(project_dir: &Path) -> Vec<DetectedRuntimeVersion> {
+    let mut detected = Vec::with_capacity(2);
+    if let Some(node) = detect_node_version(project_dir) {
+        detected.push(node);
+    }
+    if let Some(bun) = detect_bun_version(project_dir) {
+        detected.push(bun);
+    }
+    detected
+}
+
 /// Variant for callers that have already parsed `package.json`'s
 /// `engines` block. Avoids a second disk read when the install
 /// pipeline (or another command) already loaded the manifest.
@@ -65,7 +143,7 @@ fn detect_node_version_inner(
     engines: Option<&HashMap<String, String>>,
 ) -> Option<DetectedNodeVersion> {
     // 1. lpm.json -> runtime.node
-    if let Some(v) = detect_from_lpm_json(project_dir) {
+    if let Some(v) = detect_from_lpm_json_runtime(project_dir, RuntimeKind::Node) {
         return Some(v);
     }
 
@@ -92,13 +170,17 @@ fn detect_node_version_inner(
     None
 }
 
-fn detect_from_lpm_json(project_dir: &Path) -> Option<DetectedNodeVersion> {
+fn detect_from_lpm_json_runtime(
+    project_dir: &Path,
+    runtime: RuntimeKind,
+) -> Option<DetectedRuntimeVersion> {
     let path = project_dir.join("lpm.json");
     let content = std::fs::read_to_string(&path).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let spec = doc.get("runtime")?.get("node")?.as_str()?;
+    let spec = doc.get("runtime")?.get(runtime.as_str())?.as_str()?;
 
-    Some(DetectedNodeVersion {
+    Some(DetectedRuntimeVersion {
+        runtime,
         spec: spec.to_string(),
         source: VersionSource::LpmJson,
     })
@@ -110,7 +192,8 @@ fn detect_from_engines(project_dir: &Path) -> Option<DetectedNodeVersion> {
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
     let spec = doc.get("engines")?.get("node")?.as_str()?;
 
-    Some(DetectedNodeVersion {
+    Some(DetectedRuntimeVersion {
+        runtime: RuntimeKind::Node,
         spec: spec.to_string(),
         source: VersionSource::PackageJsonEngines,
     })
@@ -122,7 +205,8 @@ fn detect_from_engines_map(engines: &HashMap<String, String>) -> Option<Detected
     if spec.is_empty() {
         return None;
     }
-    Some(DetectedNodeVersion {
+    Some(DetectedRuntimeVersion {
+        runtime: RuntimeKind::Node,
         spec: spec.clone(),
         source: VersionSource::PackageJsonEngines,
     })
@@ -167,7 +251,11 @@ fn detect_from_file(
         return None;
     }
 
-    Some(DetectedNodeVersion { spec, source })
+    Some(DetectedRuntimeVersion {
+        runtime: RuntimeKind::Node,
+        spec,
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -185,8 +273,55 @@ mod tests {
         .unwrap();
 
         let v = detect_node_version(dir.path()).unwrap();
+        assert_eq!(v.runtime, RuntimeKind::Node);
         assert_eq!(v.spec, ">=22.0.0");
         assert!(matches!(v.source, VersionSource::LpmJson));
+    }
+
+    #[test]
+    fn detect_bun_from_lpm_json_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"runtime": {"bun": "1.3.14"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"engines": {"bun": ">=1"}}"#,
+        )
+        .unwrap();
+
+        let v = detect_bun_version(dir.path()).unwrap();
+        assert_eq!(v.runtime, RuntimeKind::Bun);
+        assert_eq!(v.spec, "1.3.14");
+        assert!(matches!(v.source, VersionSource::LpmJson));
+    }
+
+    #[test]
+    fn engines_bun_is_not_a_managed_runtime_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"engines": {"bun": ">=1"}}"#,
+        )
+        .unwrap();
+
+        assert!(detect_bun_version(dir.path()).is_none());
+    }
+
+    #[test]
+    fn detect_runtime_versions_returns_node_before_bun() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"runtime": {"bun": "1.3.14", "node": "22"}}"#,
+        )
+        .unwrap();
+
+        let versions = detect_runtime_versions(dir.path());
+        let kinds: Vec<RuntimeKind> = versions.iter().map(|v| v.runtime).collect();
+        assert_eq!(kinds, vec![RuntimeKind::Node, RuntimeKind::Bun]);
     }
 
     #[test]
