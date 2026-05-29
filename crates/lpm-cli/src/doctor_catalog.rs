@@ -835,6 +835,42 @@ pub static NODE_MISSING_UNPINNED: CheckEntry = CheckEntry {
     auto_fix: Some("lpm use node@22"),
 };
 
+pub static BUN_MANAGED_MATCH: CheckEntry = CheckEntry {
+    code: "bun_managed_match",
+    name: "Bun",
+    category: Category::Runtime,
+    tier: Tier::Fast,
+    description: "A managed Bun install matches the pinned spec.",
+    when_fires: "`lpm.json > runtime.bun` resolves to an installed version.",
+    remediation: "No action — informational pass.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static BUN_PINNED_UNMET: CheckEntry = CheckEntry {
+    code: "bun_pinned_unmet",
+    name: "Bun",
+    category: Category::Runtime,
+    tier: Tier::Fast,
+    description: "Project pins a Bun version but no managed Bun install matches.",
+    when_fires: "Pin found in `lpm.json > runtime.bun`, but no managed install matches; system Bun may differ.",
+    remediation: "Run `lpm use bun@<version>` to install and pin the managed version.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: Some("lpm use bun@<spec>"),
+};
+
+pub static BUN_MISSING_PINNED: CheckEntry = CheckEntry {
+    code: "bun_missing_pinned",
+    name: "Bun",
+    category: Category::Runtime,
+    tier: Tier::Fast,
+    description: "Project pins a Bun version and no Bun is reachable.",
+    when_fires: "Pin found in `lpm.json > runtime.bun`; no system or managed Bun available.",
+    remediation: "Run `lpm use bun@<version>` to install the pinned version.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: Some("lpm use bun@<spec>"),
+};
+
 // ──────────────────────────────────────────────────────────────────
 // Tunnel
 // ──────────────────────────────────────────────────────────────────
@@ -1825,6 +1861,9 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &NODE_MISSING_PINNED,
     &NODE_SYSTEM_UNPINNED,
     &NODE_MISSING_UNPINNED,
+    &BUN_MANAGED_MATCH,
+    &BUN_PINNED_UNMET,
+    &BUN_MISSING_PINNED,
     // Tunnel
     &TUNNEL_ACTIVE,
     &TUNNEL_IDLE,

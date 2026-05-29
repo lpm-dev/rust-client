@@ -1,5 +1,6 @@
 //! Binary download and extraction for runtime installations.
 
+use crate::bun::{self, BunAsset, BunRelease};
 use crate::node::{self, NodeRelease};
 use crate::platform::Platform;
 use lpm_common::LpmError;
@@ -95,6 +96,107 @@ pub async fn install_node(
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     tracing::debug!("installed node {version} to {}", target_dir.display());
+    Ok(version.to_string())
+}
+
+/// Download and install a Bun release.
+///
+/// Bun archives contain a single `bun-<target>/bun` (or `bun.exe`) binary.
+/// LPM stores it under `~/.lpm/runtimes/bun/<version>/bin/`.
+pub async fn install_bun(
+    client: &reqwest::Client,
+    release: &BunRelease,
+    asset: &BunAsset,
+) -> Result<String, LpmError> {
+    let version = release.version_bare();
+    let target_dir = bun::bun_version_dir(version)?;
+
+    if target_dir.exists() {
+        tracing::debug!(
+            "bun {version} already installed at {}",
+            target_dir.display()
+        );
+        return Ok(version.to_string());
+    }
+
+    tracing::debug!(
+        "downloading bun {version} from {}",
+        asset.browser_download_url
+    );
+    let resp = client
+        .get(&asset.browser_download_url)
+        .header(reqwest::header::USER_AGENT, "lpm-runtime")
+        .send()
+        .await
+        .map_err(|e| LpmError::Network(format!("failed to download bun {version}: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(LpmError::Http {
+            status: resp.status().as_u16(),
+            message: format!(
+                "failed to download bun {version} from {}",
+                asset.browser_download_url
+            ),
+        });
+    }
+
+    if let Some(content_length) = resp.content_length() {
+        validate_download_size(content_length as usize)?;
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| LpmError::Network(format!("failed to read bun download: {e}")))?;
+    validate_download_size(bytes.len())?;
+
+    verify_bun_checksum(client, release, asset, &bytes).await?;
+
+    let parent = target_dir
+        .parent()
+        .ok_or_else(|| LpmError::Script("invalid runtime path".into()))?;
+    create_restricted_dir(parent)?;
+
+    let temp_dir = parent.join(format!(".{version}-installing"));
+    if temp_dir.exists() {
+        std::fs::remove_dir_all(&temp_dir)?;
+    }
+    create_restricted_dir(&temp_dir)?;
+
+    let extract_dir = temp_dir.join("extract");
+    create_restricted_dir(&extract_dir)?;
+    extract_zip(&bytes, &extract_dir)?;
+
+    let inner_dir = find_single_subdir(&extract_dir)?;
+    let stage_dir = temp_dir.join("stage");
+    let bin_dir = stage_dir.join("bin");
+    create_restricted_dir(&bin_dir)?;
+
+    let binary_name = if cfg!(windows) { "bun.exe" } else { "bun" };
+    let source_binary = inner_dir.join(binary_name);
+    if !source_binary.exists() {
+        return Err(LpmError::Script(format!(
+            "Bun archive {} did not contain {binary_name}",
+            asset.name
+        )));
+    }
+    let staged_binary = bin_dir.join(binary_name);
+    std::fs::rename(&source_binary, &staged_binary).or_else(|_| {
+        std::fs::copy(&source_binary, &staged_binary).map(|_| {
+            let _ = std::fs::remove_file(&source_binary);
+        })
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged_binary, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    rename_with_fallback(&stage_dir, &target_dir)?;
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    tracing::debug!("installed bun {version} to {}", target_dir.display());
     Ok(version.to_string())
 }
 
@@ -451,6 +553,88 @@ async fn verify_checksum(
     Ok(())
 }
 
+async fn verify_bun_checksum(
+    client: &reqwest::Client,
+    release: &BunRelease,
+    asset: &BunAsset,
+    data: &[u8],
+) -> Result<(), LpmError> {
+    let mut verified = false;
+
+    if let Some(expected_hash) = asset
+        .digest
+        .as_deref()
+        .filter(|digest| !digest.trim().is_empty())
+        .map(parse_github_sha256_digest)
+        .transpose()?
+    {
+        compare_checksum(&expected_hash, data)?;
+        verified = true;
+    }
+
+    if let Some(shasums_url) = release.shasums_url() {
+        let resp = client
+            .get(shasums_url)
+            .header(reqwest::header::USER_AGENT, "lpm-runtime")
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| LpmError::Network(format!("failed to fetch Bun SHASUMS256: {e}")))?;
+
+        if !resp.status().is_success() {
+            return Err(LpmError::Network(format!(
+                "Bun SHASUMS256 returned {}",
+                resp.status()
+            )));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| LpmError::Network(format!("failed to read Bun SHASUMS256: {e}")))?;
+        let expected_hash = checksum_from_shasums(&body, &asset.name).ok_or_else(|| {
+            LpmError::Network(format!(
+                "checksum not found for {} in Bun SHASUMS256",
+                asset.name
+            ))
+        })?;
+        compare_checksum(&expected_hash, data)?;
+        verified = true;
+    }
+
+    if !verified {
+        return Err(LpmError::Network(format!(
+            "no SHA-256 checksum available for Bun asset {}",
+            asset.name
+        )));
+    }
+
+    Ok(())
+}
+
+fn parse_github_sha256_digest(digest: &str) -> Result<String, LpmError> {
+    let expected = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| LpmError::Network(format!("unsupported GitHub asset digest: {digest}")))?;
+    if expected.len() != 64 || !expected.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(LpmError::Network(format!(
+            "invalid SHA-256 digest on GitHub asset: {digest}"
+        )));
+    }
+    Ok(expected.to_ascii_lowercase())
+}
+
+fn checksum_from_shasums(body: &str, filename: &str) -> Option<String> {
+    body.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let hash = fields.next()?;
+            let name = fields.next()?.trim_start_matches('*');
+            (name == filename).then(|| hash.to_ascii_lowercase())
+        })
+        .next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +937,7 @@ mod tests {
             version: "v22.5.0".into(),
             date: "2024-07-17".into(),
             lts: node::LtsField::Bool(false),
+            dist_base_url: None,
         };
 
         // Windows: must look for .zip in SHASUMS
@@ -813,6 +998,39 @@ mod tests {
         assert_eq!(
             linux_filename, "node-v22.5.0-linux-x64.tar.gz",
             "Linux checksum lookup must search for .tar.gz"
+        );
+    }
+
+    #[test]
+    fn parse_github_sha256_digest_accepts_valid_digest() {
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_github_sha256_digest(digest).unwrap(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn parse_github_sha256_digest_rejects_missing_algorithm() {
+        let err = parse_github_sha256_digest(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported GitHub asset digest"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn checksum_from_shasums_selects_exact_asset_filename() {
+        let body = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  bun-linux-x64.zip\n\
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  *bun-linux-x64-musl.zip\n";
+
+        assert_eq!(
+            checksum_from_shasums(body, "bun-linux-x64-musl.zip").as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         );
     }
 }

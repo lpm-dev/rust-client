@@ -26,11 +26,10 @@ fn truncate_output(output: String) -> String {
     }
 }
 
-/// Ensure the required Node.js runtime is available before running scripts.
+/// Ensure required managed runtimes are available before running scripts.
 ///
-/// Detects version requirements from lpm.json/package.json/.nvmrc/.node-version,
-/// auto-installs if needed, and prints a user-visible notice about which version
-/// is being used.
+/// Detects version requirements from project config, auto-installs if needed,
+/// and prints a user-visible notice about which versions are being used.
 ///
 /// This replaces the silent fallback behavior — developers always know which
 /// Node version they're running on.
@@ -40,51 +39,67 @@ fn truncate_output(output: String) -> String {
 /// `detect_node_version` + `list_installed` re-check on every script execution
 /// (Tier 1 — saves ~5–12 ms per `lpm run` invocation).
 pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
-    match lpm_runtime::ensure_runtime(project_dir).await {
-        lpm_runtime::RuntimeStatus::Ready {
-            version,
-            source,
-            bin_dir,
-        } => {
-            // Point 1: one-line notice when using managed runtime
-            eprintln!(
-                "  {} node {} (from {})",
-                "Using".dimmed(),
-                version.bold(),
-                source.dimmed(),
-            );
-            ManagedRuntimeHint::Bin(bin_dir)
-        }
-        lpm_runtime::RuntimeStatus::Installed {
-            version,
-            source,
-            bin_dir,
-        } => {
-            // Point 3: auto-installed
-            output::success(&format!(
-                "Auto-installed node {} (from {})",
-                version.bold(),
+    let statuses = lpm_runtime::ensure_runtime(project_dir).await;
+    if statuses.is_empty() {
+        return ManagedRuntimeHint::Absent;
+    }
+
+    let mut bin_dirs = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        match status {
+            lpm_runtime::RuntimeStatus::Ready {
+                runtime,
+                version,
                 source,
-            ));
-            ManagedRuntimeHint::Bin(bin_dir)
-        }
-        lpm_runtime::RuntimeStatus::NotInstalled { spec, source } => {
-            // Point 2: warn when required version isn't installed
-            output::warn(&format!(
-                "{} requires node {}, but it's not installed. Using system node.",
+                bin_dir,
+            } => {
+                eprintln!(
+                    "  {} {} {} (from {})",
+                    "Using".dimmed(),
+                    runtime.as_str(),
+                    version.bold(),
+                    source.dimmed(),
+                );
+                bin_dirs.push(bin_dir);
+            }
+            lpm_runtime::RuntimeStatus::Installed {
+                runtime,
+                version,
                 source,
-                spec.bold(),
-            ));
-            eprintln!("    Run: {}", format!("lpm use node@{spec}").cyan(),);
-            // No managed runtime to use — confirm absence so the PATH builder
-            // skips the silent re-detect.
-            ManagedRuntimeHint::Absent
+                bin_dir,
+            } => {
+                output::success(&format!(
+                    "Auto-installed {} {} (from {})",
+                    runtime.as_str(),
+                    version.bold(),
+                    source,
+                ));
+                bin_dirs.push(bin_dir);
+            }
+            lpm_runtime::RuntimeStatus::NotInstalled {
+                runtime,
+                spec,
+                source,
+            } => {
+                output::warn(&format!(
+                    "{} requires {} {}, but it's not installed. Using system {}.",
+                    source,
+                    runtime.as_str(),
+                    spec.bold(),
+                    runtime.as_str(),
+                ));
+                eprintln!(
+                    "    Run: {}",
+                    format!("lpm use {}@{spec}", runtime.as_str()).cyan(),
+                );
+            }
         }
-        lpm_runtime::RuntimeStatus::NoRequirement => {
-            // No version pinned — nothing to show, and no managed runtime is
-            // expected on the PATH.
-            ManagedRuntimeHint::Absent
-        }
+    }
+
+    match bin_dirs.len() {
+        0 => ManagedRuntimeHint::Absent,
+        1 => ManagedRuntimeHint::Bin(bin_dirs.remove(0)),
+        _ => ManagedRuntimeHint::Bins(bin_dirs),
     }
 }
 
