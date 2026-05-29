@@ -910,7 +910,7 @@ pub async fn run(
                             publish_npm::resolve_npm_registry(npm_config),
                             auth::get_npm_token().ok_or_else(|| {
                                 LpmError::Registry(
-                                    "no npm token found. Run `lpm login --npm --token <token>` or set NPM_TOKEN env var.".into(),
+                                    "no npm token found. Run `lpm login --npm` for browser login, pass `lpm login --npm --token <token>`, or set NPM_TOKEN.".into(),
                                 )
                             }),
                             "npm",
@@ -919,7 +919,7 @@ pub async fn run(
                             "https://npm.pkg.github.com".to_string(),
                             auth::get_github_token().ok_or_else(|| {
                                 LpmError::Registry(
-                                    "no GitHub token found. Run `lpm login --github --token <pat>` or set GITHUB_TOKEN env var.".into(),
+                                    "no GitHub Packages token found. Run `gh auth login --hostname github.com`, run `lpm login --github --token <pat>`, or set GITHUB_TOKEN.".into(),
                                 )
                             }),
                             "GitHub Packages",
@@ -959,9 +959,9 @@ pub async fn run(
                             );
                             (
                                 url,
-                                auth::get_gitlab_token().ok_or_else(|| {
+                                auth::get_gitlab_token_for_host(gitlab_host).ok_or_else(|| {
                                     LpmError::Registry(
-                                        "no GitLab token found. Run `lpm login --gitlab --token <token>` or set GITLAB_TOKEN env var.".into(),
+                                        "no GitLab Packages token found. For gitlab.com, run `glab auth login`; otherwise run `lpm login --gitlab --token <token>` or set GITLAB_TOKEN/CI_JOB_TOKEN.".into(),
                                     )
                                 }),
                                 "GitLab Packages",
