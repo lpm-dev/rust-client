@@ -48,6 +48,7 @@ pub mod registry_reads;
 pub mod remove;
 pub mod resolve;
 pub mod run;
+pub mod sbom;
 pub mod schema;
 pub mod search;
 pub mod security;

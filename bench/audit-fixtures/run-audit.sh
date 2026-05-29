@@ -28,6 +28,14 @@ case "${OS:-}" in
     Windows_NT) IS_WINDOWS=1 ;;
 esac
 
+python_path() {
+    if [[ $IS_WINDOWS -eq 1 ]] && command -v cygpath &>/dev/null; then
+        cygpath -w "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
 DEFAULT_BIN="$REPO_ROOT/target/release/lpm-rs"
 if [[ $IS_WINDOWS -eq 1 && ! -e "$DEFAULT_BIN" && -e "${DEFAULT_BIN}.exe" ]]; then
     DEFAULT_BIN="${DEFAULT_BIN}.exe"
@@ -98,13 +106,15 @@ now_ms() { python3 -c 'import time;print(int(time.perf_counter_ns()))'; }
 # (vitest is ESM-only, prisma's @prisma/client needs `prisma generate`
 # first, etc.). The fixture's smoke.sh exercises devDeps as needed.
 direct_deps() {
-    python3 - <<EOF
-import json, sys
-with open("$FIXTURE_DIR/package.json") as f:
+    PY_FIXTURE_PACKAGE="$(python_path "$FIXTURE_DIR/package.json")" python3 - <<'PY'
+import json
+import os
+
+with open(os.environ["PY_FIXTURE_PACKAGE"]) as f:
     pkg = json.load(f)
 for k in (pkg.get("dependencies") or {}).keys():
     print(k)
-EOF
+PY
 }
 
 json_string() {
@@ -206,25 +216,30 @@ run_mode() {
     fi
 
     local require_failures_json
-    require_failures_json=$(python3 - <<EOF
+    require_failures_json=$(PY_REQUIRE_FAILURES_FILE="$(python_path "$require_failures_file")" python3 - <<'PY'
 import csv
 import json
+import os
 from pathlib import Path
 
 rows = []
-path = Path("$require_failures_file")
+path = Path(os.environ["PY_REQUIRE_FAILURES_FILE"])
 if path.exists():
     with path.open(newline="") as handle:
         reader = csv.reader(handle, delimiter="\t")
-        for dep, error in reader:
+        for row in reader:
+            if not row:
+                continue
+            dep = row[0]
+            error = "\t".join(row[1:]) if len(row) > 1 else ""
             rows.append({"dep": dep, "error": error})
 
 print(json.dumps(rows))
-EOF
+PY
 )
 
     local package_surfaces_json
-    package_surfaces_json=$(python3 - <<EOF
+    package_surfaces_json=$(PY_FIXTURE_PACKAGE="$(python_path "$FIXTURE_DIR/package.json")" PY_WORK="$(python_path "$work")" python3 - <<'PY'
 import json
 import os
 
@@ -241,12 +256,15 @@ def has_root_runtime_entry(exports_value):
     return any(not str(key).startswith(".") for key in exports_value)
 
 
-with open("$FIXTURE_DIR/package.json") as fixture_handle:
+fixture_package_path = os.environ["PY_FIXTURE_PACKAGE"]
+work_dir = os.environ["PY_WORK"]
+
+with open(fixture_package_path) as fixture_handle:
     fixture_package = json.load(fixture_handle)
 
 rows = []
 for dep in (fixture_package.get("dependencies") or {}).keys():
-    manifest_path = os.path.join("$work", "node_modules", *dep.split("/"), "package.json")
+    manifest_path = os.path.join(work_dir, "node_modules", *dep.split("/"), "package.json")
     surface = {
         "dep": dep,
         "manifest_found": os.path.exists(manifest_path),
@@ -290,7 +308,7 @@ for dep in (fixture_package.get("dependencies") or {}).keys():
     rows.append(surface)
 
 print(json.dumps(rows))
-EOF
+PY
 )
 
     # Verdict.
@@ -323,7 +341,7 @@ EOF
     fail_reason_json=$(json_string "$fail_reason")
 
     local classification_json
-    classification_json=$(python3 "$HERE/classify_result.py" <<EOF
+    classification_json=$(python3 "$(python_path "$HERE/classify_result.py")" <<EOF
 {
   "fixture": "$FIXTURE_REL",
   "mode": "$mode",
@@ -411,9 +429,9 @@ echo "==================================="
 for mode in isolated hoisted; do
     current_result="$RESULTS_DIR/$FIXTURE_NAME-$mode-$TS.json"
     if [[ -f "$current_result" ]]; then
-        verdict=$(python3 -c "import json;print(json.load(open('$current_result'))['verdict'])")
-        classification=$(python3 -c "import json;print(json.load(open('$current_result')).get('classification','unclassified-failure'))")
-        reason=$(python3 -c "import json;print(json.load(open('$current_result')).get('fail_reason','') or '-')")
+        verdict=$(PY_JSON_FILE="$(python_path "$current_result")" python3 -c 'import json, os; print(json.load(open(os.environ["PY_JSON_FILE"]))["verdict"])')
+        classification=$(PY_JSON_FILE="$(python_path "$current_result")" python3 -c 'import json, os; print(json.load(open(os.environ["PY_JSON_FILE"])).get("classification", "unclassified-failure"))')
+        reason=$(PY_JSON_FILE="$(python_path "$current_result")" python3 -c 'import json, os; print(json.load(open(os.environ["PY_JSON_FILE"])).get("fail_reason", "") or "-")')
         printf "  %-10s %-5s %-22s %s\n" "$mode" "$verdict" "$classification" "$reason"
     fi
 done

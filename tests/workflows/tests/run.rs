@@ -87,6 +87,101 @@ fn run_missing_script_fails_with_error() {
     );
 }
 
+#[test]
+fn run_hidden_script_cannot_be_invoked_directly() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "hidden-direct-test",
+        "version": "1.0.0",
+        "scripts": {
+            ".build": "echo hidden"
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .env_remove("LPM_SCRIPT_CHILD")
+        .args(["run", ".build"])
+        .output()
+        .expect("failed to run lpm run .build");
+
+    assert!(
+        !output.status.success(),
+        "direct hidden script must fail; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("hidden script") && stderr.contains("cannot be invoked directly"),
+        "stderr must explain hidden direct invocation, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn script_shortcut_hidden_script_cannot_be_invoked_directly() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "hidden-shortcut-test",
+        "version": "1.0.0",
+        "scripts": {
+            ".build": "echo hidden"
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .env_remove("LPM_SCRIPT_CHILD")
+        .args([".build"])
+        .output()
+        .expect("failed to run lpm .build");
+
+    assert!(
+        !output.status.success(),
+        "hidden shortcut must fail; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("hidden script") && stderr.contains("cannot be invoked directly"),
+        "stderr must explain hidden direct invocation, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn run_missing_script_suggestions_omit_hidden_package_json_scripts() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "hidden-suggestion-test",
+        "version": "1.0.0",
+        "scripts": {
+            "build": "echo visible",
+            ".build": "echo hidden"
+        }
+    }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["run", "missing"])
+        .output()
+        .expect("failed to run lpm run missing");
+
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("build"),
+        "stderr must still suggest visible scripts, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(".build"),
+        "stderr must not reveal hidden scripts, got:\n{stderr}"
+    );
+}
+
 // ─── No package.json ─────────────────────────────────────────────
 
 #[test]
@@ -275,6 +370,86 @@ fn run_respects_task_dependencies_from_lpm_json() {
         combined.contains("tested") || combined.contains("test"),
         "test should have run, got:\n{combined}"
     );
+}
+
+#[test]
+fn run_visible_script_can_invoke_hidden_script() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "hidden-nested-test",
+        "version": "1.0.0",
+        "scripts": {
+            "build": "node invoke-hidden.js",
+            ".build": "node write-marker.js"
+        }
+    }"#,
+    );
+    project.write_file(
+        "invoke-hidden.js",
+        r#"const { spawnSync } = require('child_process');
+const result = spawnSync(process.env.LPM_TEST_BIN, ['run', '.build'], { stdio: 'inherit' });
+process.exit(result.status === null ? 1 : result.status);
+"#,
+    );
+    project.write_file(
+        "write-marker.js",
+        "require('fs').writeFileSync('hidden-ran.txt', 'yes\\n');",
+    );
+
+    let output = lpm(&project)
+        .env("LPM_TEST_BIN", assert_cmd::cargo::cargo_bin("lpm-rs"))
+        .args(["run", "build"])
+        .output()
+        .expect("failed to run lpm run build");
+
+    assert!(
+        output.status.success(),
+        "visible script must be allowed to invoke hidden script; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(project.read_file("hidden-ran.txt"), "yes\n");
+}
+
+#[test]
+fn run_lpm_json_dependency_can_invoke_hidden_script() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "hidden-dependency-test",
+        "version": "1.0.0",
+        "scripts": {
+            "build": "echo visible",
+            ".build": "node write-marker.js"
+        }
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "dependsOn": [".build"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "write-marker.js",
+        "require('fs').writeFileSync('dependency-hidden-ran.txt', 'yes\\n');",
+    );
+
+    let output = lpm(&project)
+        .args(["run", "build"])
+        .output()
+        .expect("failed to run lpm run build");
+
+    assert!(
+        output.status.success(),
+        "lpm.json dependency must be allowed to invoke hidden script; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(project.read_file("dependency-hidden-ran.txt"), "yes\n");
 }
 
 #[test]

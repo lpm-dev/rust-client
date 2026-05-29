@@ -3009,6 +3009,58 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/pnpm_compat_catalog.rs", 1)],
         last_audited_at: "2026-05-28",
     },
+    // ── id 142: lpm patch-remove <selector> ──
+    SurfaceV2 {
+        id: 142,
+        scenarios: 7,
+        failure_modes_tested: &[
+            "exact key removes manifest entry and deletes unshared patch file",
+            "bare-name selector requires a unique patched version",
+            "shared patch file is retained",
+            "dry-run leaves manifest and patch file untouched",
+            "parent-escape patch path is never deleted",
+            "workflow exact pin removes manifest entry and patch file",
+            "workflow dry-run preserves manifest entry and patch file",
+        ],
+        failure_modes_known: &[
+            "permission denied while rewriting package.json",
+            "permission denied while deleting a patch file",
+            "concurrent patch-remove invocations on the same package.json",
+            "workspace member patch-remove routed from a non-root cwd",
+        ],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[
+            ("crates/lpm-cli/src/commands/patch.rs", 5),
+            ("tests/workflows/tests/patch.rs", 2),
+        ],
+        last_audited_at: "2026-05-29",
+    },
+    // ── id 143: lpm sbom ──
+    SurfaceV2 {
+        id: 143,
+        scenarios: 6,
+        failure_modes_tested: &[
+            "CycloneDX output includes lockfile dependency graph",
+            "CycloneDX output includes local package metadata",
+            "CycloneDX output includes patch metadata",
+            "SPDX output includes dependency relationships",
+            "--output writes the SBOM to a file without stdout JSON",
+            "scoped npm package names render valid purls",
+        ],
+        failure_modes_known: &[
+            "missing lpm.lock error",
+            "registry metadata fetch failure under --registry-metadata",
+            "provenance attestation verification rejection under --registry-metadata",
+            "duplicate name/version packages from distinct sources in one lockfile",
+            "permission denied writing --output file",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[
+            ("crates/lpm-cli/src/commands/sbom.rs", 3),
+            ("tests/workflows/tests/sbom.rs", 3),
+        ],
+        last_audited_at: "2026-05-29",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

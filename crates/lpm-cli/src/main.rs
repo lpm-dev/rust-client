@@ -1678,6 +1678,45 @@ enum Commands {
         staging_dir: String,
     },
 
+    /// Remove one or more registered local patches.
+    ///
+    /// Removes entries from `package.json :: lpm.patchedDependencies`.
+    /// Patch files are deleted when they are safely inside the project and
+    /// no remaining patch entry still references them.
+    #[command(name = "patch-remove")]
+    PatchRemove {
+        /// Patched package selector(s). Exact pins (`lodash@4.17.21`) match
+        /// one manifest entry; bare names (`lodash`) are accepted only when
+        /// they uniquely match one patched version.
+        #[arg(required = true, num_args = 1..)]
+        selectors: Vec<String>,
+
+        /// Preview the manifest/file changes without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remove manifest entries but leave patch files on disk.
+        #[arg(long = "keep-file")]
+        keep_file: bool,
+    },
+
+    /// Generate a Software Bill of Materials from lpm.lock.
+    #[command(name = "sbom")]
+    Sbom {
+        /// SBOM output format.
+        #[arg(long, value_enum, default_value_t = commands::sbom::SbomFormat::Cyclonedx)]
+        format: commands::sbom::SbomFormat,
+
+        /// Write the SBOM to a file instead of stdout.
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+
+        /// Fetch registry metadata and provenance attestations instead of
+        /// using only local install metadata and cached provenance.
+        #[arg(long = "registry-metadata")]
+        registry_metadata: bool,
+    },
+
     /// Preview the workspace package set that a `--filter` expression would
     /// select. Read-only — never executes scripts or modifies state.
     ///
@@ -4525,6 +4564,22 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let staging = std::path::PathBuf::from(staging_dir);
             commands::patch::run_patch_commit(&cwd, &staging, cli.json).await
+        }
+        Commands::PatchRemove {
+            selectors,
+            dry_run,
+            keep_file,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::patch::run_patch_remove(&cwd, &selectors, dry_run, keep_file, cli.json).await
+        }
+        Commands::Sbom {
+            format,
+            output,
+            registry_metadata,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::sbom::run(&client, &cwd, format, output.as_deref(), registry_metadata).await
         }
         Commands::Plugin { action, name } => {
             commands::plugin::run(&action, name.as_deref(), cli.json).await

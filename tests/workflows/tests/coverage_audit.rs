@@ -49,8 +49,8 @@ fn coverage_audit_baseline_shape_matches_command_matrix() {
         .filter(|surface| !surface.has_any_coverage())
         .count();
     assert_eq!(
-        covered, 141,
-        "all command surfaces now have at least one tier of coverage (vault was the last uncovered row before the env+vault tranche; ids 136/137 carved out of install.rs orphan tests on 2026-05-14)"
+        covered, EXPECTED_SURFACE_COUNT,
+        "all command surfaces now have at least one tier of coverage"
     );
     assert_eq!(
         uncovered, 0,

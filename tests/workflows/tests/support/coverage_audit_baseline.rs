@@ -21,7 +21,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 141;
+pub const EXPECTED_SURFACE_COUNT: usize = 143;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -66,6 +66,8 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "ApproveScripts",
     "Patch",
     "PatchCommit",
+    "PatchRemove",
+    "Sbom",
     "Filter",
     "Plugin",
     "Lint",
@@ -1700,5 +1702,31 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: false,
         json_contract: true,
         references: &["tests/workflows/tests/pnpm_compat_catalog.rs"],
+    },
+    SurfaceBaseline {
+        id: 142,
+        name: "`lpm patch-remove <selector>`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/patch.rs",
+            "tests/workflows/tests/patch.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 143,
+        name: "`lpm sbom`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/sbom.rs",
+            "tests/workflows/tests/sbom.rs",
+        ],
     },
 ];
