@@ -327,6 +327,105 @@ fn patch_commit_writes_patch_file_and_updates_manifest() {
     );
 }
 
+/// `lpm patch-remove <exact-pin> --json` removes the manifest entry
+/// and deletes the now-unreferenced patch file.
+#[test]
+fn patch_remove_exact_pin_removes_manifest_entry_and_patch_file() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "patch-remove-flow",
+  "version": "0.0.0",
+  "lpm": {
+    "patchedDependencies": {
+      "lodash@4.17.21": {
+        "path": "patches/lodash@4.17.21.patch",
+        "originalIntegrity": "sha512-fixture"
+      }
+    }
+  }
+}"#,
+    );
+    project.write_file("patches/lodash@4.17.21.patch", "diff --git a/a b/a\n");
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch-remove", "lodash@4.17.21"])
+        .output()
+        .expect("spawn lpm patch-remove");
+    assert!(
+        out.status.success(),
+        "patch-remove failed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout))).unwrap();
+    assert_eq!(parsed["success"], serde_json::json!(true));
+    assert_eq!(parsed["dry_run"], serde_json::json!(false));
+    assert_eq!(parsed["removed"][0]["key"].as_str(), Some("lodash@4.17.21"));
+    assert_eq!(
+        parsed["removed"][0]["patch_file"].as_str(),
+        Some("patches/lodash@4.17.21.patch")
+    );
+    assert_eq!(
+        parsed["removed"][0]["deleted_patch_file"],
+        serde_json::json!(true)
+    );
+
+    assert!(
+        !project.file_exists("patches/lodash@4.17.21.patch"),
+        "patch file should be deleted"
+    );
+    let pkg: serde_json::Value = serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert!(
+        pkg.get("lpm").is_none(),
+        "empty lpm section should be removed after the last patch entry"
+    );
+}
+
+/// Dry-run reports the same target but leaves both package.json and the
+/// patch file untouched.
+#[test]
+fn patch_remove_dry_run_keeps_manifest_entry_and_patch_file() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "patch-remove-dry-run",
+  "version": "0.0.0",
+  "lpm": {
+    "patchedDependencies": {
+      "lodash@4.17.21": {
+        "path": "patches/lodash@4.17.21.patch",
+        "originalIntegrity": "sha512-fixture"
+      }
+    }
+  }
+}"#,
+    );
+    project.write_file("patches/lodash@4.17.21.patch", "diff --git a/a b/a\n");
+    let before = project.read_file("package.json");
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch-remove", "--dry-run", "lodash@4.17.21"])
+        .output()
+        .expect("spawn lpm patch-remove --dry-run");
+    assert!(
+        out.status.success(),
+        "patch-remove dry-run failed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout))).unwrap();
+    assert_eq!(parsed["dry_run"], serde_json::json!(true));
+    assert_eq!(
+        parsed["removed"][0]["retained_reason"].as_str(),
+        Some("dry-run")
+    );
+    assert_eq!(project.read_file("package.json"), before);
+    assert!(project.file_exists("patches/lodash@4.17.21.patch"));
+}
+
 /// **GPT audit follow-up (2026-05-15).** Scoped packages (both npm-
 /// style `@scope/name` and lpm.dev-style `@lpm.dev/owner.name`) flow
 /// through `patch-commit` correctly:

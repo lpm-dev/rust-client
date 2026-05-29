@@ -28,7 +28,8 @@ use lpm_common::color::Painted;
 use lpm_lockfile::Lockfile;
 use lpm_store::find_installed_package_baseline;
 use serde_json::json;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
 
 // ── lpm patch ────────────────────────────────────────────────────────
 
@@ -326,6 +327,293 @@ async fn run_patch_commit_inner(
     Ok(())
 }
 
+// ── lpm patch-remove ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchRemoval {
+    key: String,
+    patch_file: String,
+    deleted_patch_file: bool,
+    retained_reason: Option<String>,
+}
+
+/// `lpm patch-remove <selector...>` — unregister local patches.
+pub async fn run_patch_remove(
+    project_dir: &Path,
+    selectors: &[String],
+    dry_run: bool,
+    keep_file: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let outcome = remove_package_json_patches(project_dir, selectors, dry_run, keep_file)?;
+
+    if json_output {
+        let removed: Vec<_> = outcome
+            .removed
+            .iter()
+            .map(|r| {
+                json!({
+                    "key": r.key,
+                    "patch_file": r.patch_file,
+                    "deleted_patch_file": r.deleted_patch_file,
+                    "retained_reason": r.retained_reason,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "success": true,
+                "dry_run": dry_run,
+                "keep_file": keep_file,
+                "removed": removed,
+            }))
+            .unwrap()
+        );
+    } else {
+        let verb = if dry_run { "Would remove" } else { "Removed" };
+        for removal in &outcome.removed {
+            output::success(&format!("{verb} {}", removal.key.bold()));
+            if removal.deleted_patch_file {
+                output::info(&format!("Deleted {}", removal.patch_file));
+            } else if let Some(reason) = &removal.retained_reason {
+                output::info(&format!("Kept {} ({reason})", removal.patch_file));
+            }
+        }
+        if !dry_run {
+            output::info("Run `lpm install` to refresh node_modules.");
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchRemovalOutcome {
+    removed: Vec<PatchRemoval>,
+}
+
+fn remove_package_json_patches(
+    project_dir: &Path,
+    selectors: &[String],
+    dry_run: bool,
+    keep_file: bool,
+) -> Result<PatchRemovalOutcome, LpmError> {
+    if selectors.is_empty() {
+        return Err(LpmError::Script(
+            "patch-remove requires at least one selector".into(),
+        ));
+    }
+
+    let pkg_path = project_dir.join("package.json");
+    let raw = std::fs::read_to_string(&pkg_path)
+        .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
+
+    let patches_obj = value
+        .get("lpm")
+        .and_then(|l| l.get("patchedDependencies"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            LpmError::Script("package.json has no `lpm.patchedDependencies` entries".into())
+        })?;
+
+    if patches_obj.is_empty() {
+        return Err(LpmError::Script(
+            "package.json has no `lpm.patchedDependencies` entries".into(),
+        ));
+    }
+
+    let mut requested = BTreeSet::new();
+    for selector in selectors {
+        requested.insert(resolve_patch_remove_selector(selector, patches_obj)?);
+    }
+
+    let remaining_file_refs = remaining_patch_file_refs(patches_obj, &requested);
+    let mut removals = Vec::with_capacity(requested.len());
+    let mut files_to_delete = BTreeMap::<String, PathBuf>::new();
+
+    for key in &requested {
+        let entry = patches_obj.get(key).ok_or_else(|| {
+            LpmError::Script(format!(
+                "patch entry {key:?} disappeared while planning removal"
+            ))
+        })?;
+        let patch_file = entry
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                LpmError::Script(format!(
+                    "package.json `lpm.patchedDependencies[{key}].path` is missing or not a string"
+                ))
+            })?
+            .to_string();
+
+        let (deleted_patch_file, retained_reason) = if dry_run {
+            (false, Some("dry-run".to_string()))
+        } else if keep_file {
+            (false, Some("keep-file".to_string()))
+        } else if remaining_file_refs.contains(&patch_file) {
+            (false, Some("still referenced by another patch".to_string()))
+        } else {
+            let safe_path = safe_project_relative_file(project_dir, &patch_file)?;
+            if safe_path.exists() {
+                files_to_delete
+                    .entry(patch_file.clone())
+                    .or_insert(safe_path);
+                (true, None)
+            } else {
+                (false, Some("file already missing".to_string()))
+            }
+        };
+
+        removals.push(PatchRemoval {
+            key: key.clone(),
+            patch_file,
+            deleted_patch_file,
+            retained_reason,
+        });
+    }
+
+    if !dry_run {
+        remove_patch_entries_from_value(&mut value, &requested)?;
+        write_package_json_value(project_dir, &value)?;
+
+        let mut delete_errors = Vec::new();
+        for (rel, abs) in files_to_delete {
+            if let Err(e) = std::fs::remove_file(&abs) {
+                delete_errors.push(format!("{rel}: {e}"));
+            }
+        }
+        if !delete_errors.is_empty() {
+            return Err(LpmError::Script(format!(
+                "removed patch entries from package.json, but failed to delete patch file(s): {}",
+                delete_errors.join(", ")
+            )));
+        }
+    }
+
+    Ok(PatchRemovalOutcome { removed: removals })
+}
+
+fn resolve_patch_remove_selector(
+    selector: &str,
+    patches: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, LpmError> {
+    match parse_patch_selector(selector)? {
+        PatchSelector::Exact { name, version } => {
+            let key = format!("{name}@{version}");
+            if patches.contains_key(&key) {
+                Ok(key)
+            } else {
+                Err(LpmError::Script(format!(
+                    "no patch entry found for {key}; run `lpm patch-remove` with an existing `lpm.patchedDependencies` key"
+                )))
+            }
+        }
+        PatchSelector::BareName(name) => {
+            let mut matches = Vec::new();
+            for key in patches.keys() {
+                if let Ok((patched_name, _)) = crate::patch_engine::parse_patch_key(key)
+                    && patched_name == name
+                {
+                    matches.push(key.clone());
+                }
+            }
+            match matches.len() {
+                0 => Err(LpmError::Script(format!("no patch entry found for {name}"))),
+                1 => Ok(matches.pop().unwrap()),
+                _ => {
+                    matches.sort();
+                    Err(LpmError::Script(format!(
+                        "patch selector {name:?} is ambiguous; specify a precise version: {}",
+                        matches.join(", ")
+                    )))
+                }
+            }
+        }
+        PatchSelector::Range { name, range } => Err(LpmError::Script(format!(
+            "patch-remove does not accept range selector {name}@{range}; use an exact patched key or a unique bare package name"
+        ))),
+    }
+}
+
+fn remaining_patch_file_refs(
+    patches: &serde_json::Map<String, serde_json::Value>,
+    removed_keys: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
+    for (key, entry) in patches {
+        if removed_keys.contains(key) {
+            continue;
+        }
+        if let Some(path) = entry.get("path").and_then(serde_json::Value::as_str) {
+            refs.insert(path.to_string());
+        }
+    }
+    refs
+}
+
+fn safe_project_relative_file(project_dir: &Path, rel: &str) -> Result<PathBuf, LpmError> {
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(LpmError::Script(format!(
+            "refusing to delete unsafe patch path {rel:?}; rerun with --keep-file to remove only the manifest entry"
+        )));
+    }
+
+    let path = project_dir.join(rel_path);
+    if let Some(parent) = path.parent()
+        && parent.exists()
+    {
+        let project_real = std::fs::canonicalize(project_dir).map_err(LpmError::Io)?;
+        let parent_real = std::fs::canonicalize(parent).map_err(LpmError::Io)?;
+        if !parent_real.starts_with(&project_real) {
+            return Err(LpmError::Script(format!(
+                "refusing to delete patch path {rel:?} because its parent resolves outside the project; rerun with --keep-file to remove only the manifest entry"
+            )));
+        }
+    }
+
+    Ok(path)
+}
+
+fn remove_patch_entries_from_value(
+    value: &mut serde_json::Value,
+    removed_keys: &BTreeSet<String>,
+) -> Result<(), LpmError> {
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| LpmError::Script("package.json root is not an object".into()))?;
+    let Some(lpm) = root.get_mut("lpm") else {
+        return Ok(());
+    };
+    let lpm_obj = lpm
+        .as_object_mut()
+        .ok_or_else(|| LpmError::Script("package.json `lpm` is not an object".into()))?;
+    let Some(patches) = lpm_obj.get_mut("patchedDependencies") else {
+        return Ok(());
+    };
+    let patches_obj = patches.as_object_mut().ok_or_else(|| {
+        LpmError::Script("package.json `lpm.patchedDependencies` is not an object".into())
+    })?;
+    for key in removed_keys {
+        patches_obj.remove(key);
+    }
+    if patches_obj.is_empty() {
+        lpm_obj.remove("patchedDependencies");
+    }
+    if lpm_obj.is_empty() {
+        root.remove("lpm");
+    }
+    Ok(())
+}
+
 /// Inject `lpm.patchedDependencies.<key>` into `package.json` using the
 /// JSON Value mutation pattern. Same approach as `add.rs` — `serde_json`
 /// has `preserve_order` enabled at the workspace level, so existing key
@@ -371,12 +659,17 @@ fn update_package_json_patches(
         }),
     );
 
-    let mut output = serde_json::to_string_pretty(&value)
+    write_package_json_value(project_dir, &value)
+}
+
+fn write_package_json_value(project_dir: &Path, value: &serde_json::Value) -> Result<(), LpmError> {
+    let mut output = serde_json::to_string_pretty(value)
         .map_err(|e| LpmError::Script(format!("failed to re-serialize package.json: {e}")))?;
     if !output.ends_with('\n') {
         output.push('\n');
     }
 
+    let pkg_path = project_dir.join("package.json");
     let tmp = project_dir.join("package.json.tmp");
     std::fs::write(&tmp, output.as_bytes()).map_err(LpmError::Io)?;
     if let Err(e) = std::fs::rename(&tmp, &pkg_path) {
@@ -548,6 +841,141 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("malformed"));
+    }
+
+    #[test]
+    fn patch_remove_exact_key_removes_manifest_entry_and_deletes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("patches")).unwrap();
+        std::fs::write(dir.path().join("patches/lodash@4.17.21.patch"), "diff").unwrap();
+        write_pkg(
+            dir.path(),
+            r#"{
+  "name": "x",
+  "lpm": {
+    "patchedDependencies": {
+      "lodash@4.17.21": {
+        "path": "patches/lodash@4.17.21.patch",
+        "originalIntegrity": "sha512-old"
+      }
+    }
+  }
+}"#,
+        );
+
+        let outcome =
+            remove_package_json_patches(dir.path(), &["lodash@4.17.21".to_string()], false, false)
+                .unwrap();
+
+        assert_eq!(outcome.removed[0].key, "lodash@4.17.21");
+        assert!(outcome.removed[0].deleted_patch_file);
+        assert!(!dir.path().join("patches/lodash@4.17.21.patch").exists());
+        let v = read_pkg(dir.path());
+        assert!(v.get("lpm").is_none());
+    }
+
+    #[test]
+    fn patch_remove_bare_name_requires_unique_match() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pkg(
+            dir.path(),
+            r#"{
+  "lpm": {
+    "patchedDependencies": {
+      "lodash@3.10.1": { "path": "patches/lodash@3.10.1.patch", "originalIntegrity": "sha512-a" },
+      "lodash@4.17.21": { "path": "patches/lodash@4.17.21.patch", "originalIntegrity": "sha512-b" }
+    }
+  }
+}"#,
+        );
+
+        let err = remove_package_json_patches(dir.path(), &["lodash".to_string()], false, true)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous"));
+        assert!(msg.contains("lodash@3.10.1"));
+        assert!(msg.contains("lodash@4.17.21"));
+    }
+
+    #[test]
+    fn patch_remove_keeps_file_when_still_referenced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("patches")).unwrap();
+        std::fs::write(dir.path().join("patches/shared.patch"), "diff").unwrap();
+        write_pkg(
+            dir.path(),
+            r#"{
+  "lpm": {
+    "patchedDependencies": {
+      "a@1.0.0": { "path": "patches/shared.patch", "originalIntegrity": "sha512-a" },
+      "b@1.0.0": { "path": "patches/shared.patch", "originalIntegrity": "sha512-b" }
+    }
+  }
+}"#,
+        );
+
+        let outcome =
+            remove_package_json_patches(dir.path(), &["a@1.0.0".to_string()], false, false)
+                .unwrap();
+
+        assert!(!outcome.removed[0].deleted_patch_file);
+        assert_eq!(
+            outcome.removed[0].retained_reason.as_deref(),
+            Some("still referenced by another patch")
+        );
+        assert!(dir.path().join("patches/shared.patch").exists());
+        let v = read_pkg(dir.path());
+        assert!(v["lpm"]["patchedDependencies"].get("a@1.0.0").is_none());
+        assert!(v["lpm"]["patchedDependencies"].get("b@1.0.0").is_some());
+    }
+
+    #[test]
+    fn patch_remove_dry_run_does_not_mutate_manifest_or_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("patches")).unwrap();
+        std::fs::write(dir.path().join("patches/a.patch"), "diff").unwrap();
+        write_pkg(
+            dir.path(),
+            r#"{
+  "lpm": {
+    "patchedDependencies": {
+      "a@1.0.0": { "path": "patches/a.patch", "originalIntegrity": "sha512-a" }
+    }
+  }
+}"#,
+        );
+        let before = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+
+        let outcome =
+            remove_package_json_patches(dir.path(), &["a@1.0.0".to_string()], true, false).unwrap();
+
+        assert!(!outcome.removed[0].deleted_patch_file);
+        assert_eq!(
+            before,
+            std::fs::read_to_string(dir.path().join("package.json")).unwrap()
+        );
+        assert!(dir.path().join("patches/a.patch").exists());
+    }
+
+    #[test]
+    fn patch_remove_refuses_to_delete_parent_escape_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pkg(
+            dir.path(),
+            r#"{
+  "lpm": {
+    "patchedDependencies": {
+      "a@1.0.0": { "path": "../outside.patch", "originalIntegrity": "sha512-a" }
+    }
+  }
+}"#,
+        );
+
+        let err = remove_package_json_patches(dir.path(), &["a@1.0.0".to_string()], false, false)
+            .unwrap_err();
+        assert!(format!("{err}").contains("unsafe patch path"));
+        let v = read_pkg(dir.path());
+        assert!(v["lpm"]["patchedDependencies"].get("a@1.0.0").is_some());
     }
 
     /// **Slice A structural contract.** `read_lockfile_for_patch_selector`

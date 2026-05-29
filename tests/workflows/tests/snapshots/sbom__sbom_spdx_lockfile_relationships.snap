@@ -1,0 +1,99 @@
+---
+source: tests/workflows/tests/sbom.rs
+expression: envelope
+---
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "sbom-app",
+  "documentNamespace": "https://lpm.dev/sbom/sbom-app/8974f6d0-0559-57fd-a63d-be425be0829d",
+  "creationInfo": {
+    "created": "[TIMESTAMP]",
+    "creators": [
+      "[TOOL]"
+    ]
+  },
+  "packages": [
+    {
+      "name": "sbom-app",
+      "SPDXID": "SPDXRef-RootPackage",
+      "versionInfo": "1.0.0",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:npm/sbom-app@1.0.0"
+        }
+      ]
+    },
+    {
+      "name": "ansi-regex",
+      "SPDXID": "SPDXRef-Package-ansi-regex-5.0.1-edef7430b6f1",
+      "versionInfo": "5.0.1",
+      "downloadLocation": "https://registry.npmjs.org/ansi-regex/-/ansi-regex-5.0.1.tgz",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:npm/ansi-regex@5.0.1"
+        }
+      ],
+      "attributionTexts": [
+        "lpm:source=registry+https://registry.npmjs.org",
+        "lpm:integrity=sha512-ansi"
+      ]
+    },
+    {
+      "name": "left-pad",
+      "SPDXID": "SPDXRef-Package-left-pad-1.3.0-1cb6d6231420",
+      "versionInfo": "1.3.0",
+      "downloadLocation": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "filesAnalyzed": false,
+      "licenseConcluded": "WTFPL",
+      "licenseDeclared": "WTFPL",
+      "copyrightText": "NOASSERTION",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:npm/left-pad@1.3.0"
+        }
+      ],
+      "description": "left pad test fixture",
+      "attributionTexts": [
+        "lpm:source=registry+https://registry.npmjs.org",
+        "lpm:integrity=sha512-leftpad",
+        "lpm:patch:path=patches/left-pad@1.3.0.patch",
+        "lpm:patch:originalIntegrity=sha512-leftpad-original",
+        "lpm:patch:sha256=sha256-2692094a267de7e28825147fd6cb2ebde098a4e68c25dfa3976ac806f4a1a784"
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-RootPackage"
+    },
+    {
+      "spdxElementId": "SPDXRef-RootPackage",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-left-pad-1.3.0-1cb6d6231420"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-left-pad-1.3.0-1cb6d6231420",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-ansi-regex-5.0.1-edef7430b6f1"
+    }
+  ]
+}

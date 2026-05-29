@@ -1029,6 +1029,14 @@ fn read_cache(
     Ok(Some(entry.snapshot))
 }
 
+pub(crate) fn read_cached_provenance_snapshot(
+    cache_root: &Path,
+    name: &str,
+    version: &str,
+) -> Result<Option<ProvenanceSnapshot>, LpmError> {
+    read_cache(cache_root, name, version)
+}
+
 /// Write a cache entry atomically: serialize to a temp file in the
 /// same directory, then `rename`. Creates the cache directory if
 /// absent.
