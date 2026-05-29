@@ -109,6 +109,169 @@ async fn required_peer_dependency_missing_warns_and_succeeds_without_strict_mode
 }
 
 #[tokio::test]
+async fn peer_top_dependency_satisfies_peer_without_missing_warning() {
+    let mock = MockRegistry::start().await;
+    mount_top_dependency_peer_graph(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0"
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL_ARGS)
+        .args(["ajv@4.10.4", "ajv-keywords@1.5.0"])
+        .output()
+        .expect("failed to run lpm install");
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install must succeed when the peer is also a top dependency\n{text}"
+    );
+    assert!(
+        !text.contains("requires peer ajv") && !text.contains("none was installed"),
+        "top-level peer install must suppress the missing-peer warning\n{text}"
+    );
+
+    let node_modules = project.path().join("node_modules");
+    assert!(
+        node_modules.join("ajv").join("package.json").exists(),
+        "top dependency ajv must be installed"
+    );
+    assert!(
+        node_modules
+            .join("ajv-keywords")
+            .join("package.json")
+            .exists(),
+        "peer-dependent ajv-keywords must be installed"
+    );
+
+    assert_lockfile_has_peer_binding(&project, "ajv-keywords", "1.5.0", "ajv@4.10.4");
+}
+
+#[tokio::test]
+async fn transitive_peer_host_satisfies_peer_and_survives_warm_reinstall() {
+    let mock = MockRegistry::start().await;
+    mount_transitive_peer_graph(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0"
+        }"#,
+    );
+
+    let first_output = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL_ARGS)
+        .arg("@pnpm.e2e/using-ajv")
+        .output()
+        .expect("failed to run initial lpm install");
+    let first_text = output_text(&first_output);
+
+    assert!(
+        first_output.status.success(),
+        "installing the transitive peer-host graph must succeed\n{first_text}"
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules")
+            .join("@pnpm.e2e")
+            .join("using-ajv")
+            .join("package.json")
+            .exists(),
+        "top-level transitive peer host must be installed"
+    );
+    assert_lockfile_has_peer_binding(&project, "ajv-keywords", "1.5.0", "ajv@4.10.4");
+
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before warm reinstall");
+
+    let second_output = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL_ARGS)
+        .output()
+        .expect("failed to rerun lpm install after removing node_modules");
+    let second_text = output_text(&second_output);
+
+    assert!(
+        second_output.status.success(),
+        "warm reinstall from the saved manifest and lockfile must succeed\n{second_text}"
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules")
+            .join("@pnpm.e2e")
+            .join("using-ajv")
+            .join("package.json")
+            .exists(),
+        "warm reinstall must restore the top-level package after node_modules is removed"
+    );
+    assert_lockfile_has_peer_binding(&project, "ajv-keywords", "1.5.0", "ajv@4.10.4");
+}
+
+#[tokio::test]
+async fn uninstalling_direct_peer_copy_keeps_transitive_peer_bound_package() {
+    let mock = MockRegistry::start().await;
+    mount_transitive_peer_graph(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0"
+        }"#,
+    );
+
+    let install_output = lpm_with_registry(&project, &mock.url())
+        .args(INSTALL_ARGS)
+        .args(["@pnpm.e2e/using-ajv", "ajv-keywords@1.5.0"])
+        .output()
+        .expect("failed to run initial lpm install");
+    let install_text = output_text(&install_output);
+
+    assert!(
+        install_output.status.success(),
+        "installing direct and transitive peer consumers must succeed\n{install_text}"
+    );
+    assert_lockfile_has_peer_binding(&project, "ajv-keywords", "1.5.0", "ajv@4.10.4");
+
+    let uninstall_output = lpm_with_registry(&project, &mock.url())
+        .args(["uninstall", "ajv-keywords"])
+        .output()
+        .expect("failed to uninstall direct ajv-keywords dependency");
+    let uninstall_text = output_text(&uninstall_output);
+
+    assert!(
+        uninstall_output.status.success(),
+        "uninstalling the direct peer-dependent copy must succeed\n{uninstall_text}"
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(&project.read_file("package.json"))
+        .expect("package.json remains valid JSON after uninstall");
+    assert_eq!(
+        manifest["dependencies"],
+        serde_json::json!({
+            "@pnpm.e2e/using-ajv": "^1.0.0"
+        }),
+        "uninstall must remove only the direct ajv-keywords dependency from package.json"
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules")
+            .join("@pnpm.e2e")
+            .join("using-ajv")
+            .join("package.json")
+            .exists(),
+        "uninstalling the direct copy must keep the transitive parent installed"
+    );
+    assert_lockfile_has_peer_binding(&project, "ajv-keywords", "1.5.0", "ajv@4.10.4");
+}
+
+#[tokio::test]
 async fn install_json_reports_missing_peer_issue() {
     let mock = MockRegistry::start().await;
     mount_required_peer_host(&mock).await;
@@ -433,6 +596,44 @@ async fn mount_required_peer_host(mock: &MockRegistry) {
     .await;
 }
 
+async fn mount_top_dependency_peer_graph(mock: &MockRegistry) {
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "ajv",
+            "version": "4.10.4"
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "ajv-keywords",
+            "version": "1.5.0",
+            "peerDependencies": {
+                "ajv": ">=4.10.0"
+            }
+        }),
+        &[],
+    )
+    .await;
+}
+
+async fn mount_transitive_peer_graph(mock: &MockRegistry) {
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "@pnpm.e2e/using-ajv",
+            "version": "1.0.0",
+            "dependencies": {
+                "ajv": "4.10.4",
+                "ajv-keywords": "1.5.0"
+            }
+        }),
+        &[],
+    )
+    .await;
+    mount_top_dependency_peer_graph(mock).await;
+}
+
 async fn mount_conflicting_peer_graph(mock: &MockRegistry) {
     mock.with_manifest_package(
         serde_json::json!({
@@ -489,6 +690,26 @@ fn json_output(output: &Output, context: &str) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim())
         .unwrap_or_else(|err| panic!("{context} must emit valid JSON: {err}\n{text}"))
+}
+
+fn assert_lockfile_has_peer_binding(
+    project: &TempProject,
+    package_name: &str,
+    version: &str,
+    peer_binding: &str,
+) {
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("lpm.lock parses");
+    let package = lockfile
+        .packages
+        .iter()
+        .find(|pkg| pkg.name == package_name && pkg.version == version)
+        .unwrap_or_else(|| panic!("expected {package_name}@{version} in lpm.lock"));
+    assert!(
+        package.peers.contains(&peer_binding.to_string()),
+        "lockfile must retain peer binding {peer_binding} for {package_name}@{version}\n{}",
+        project.read_file("lpm.lock")
+    );
 }
 
 fn assert_install_hash_linker(project_dir: &std::path::Path, expected: &str) {

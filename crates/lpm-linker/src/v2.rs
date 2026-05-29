@@ -65,9 +65,10 @@ use lpm_store::v2::{
     DepLink, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple, Store,
 };
 
+#[cfg(unix)]
+use crate::make_bin_target_executable;
 use crate::{
-    LinkResult, LinkTarget, LinkerMode, MaterializedPackage, make_bin_target_executable,
-    validate_bin_name, validate_bin_target,
+    LinkResult, LinkTarget, LinkerMode, MaterializedPackage, validate_bin_name, validate_bin_target,
 };
 
 /// One LinkTarget plus the source SRI needed to resolve its v2 object

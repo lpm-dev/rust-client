@@ -4206,7 +4206,7 @@ mod tests {
             is_direct: true,
             root_link_names: None,
             wrapper_id: None,
-            materialization: Materialization::CasBacked,
+            materialization: Materialization::DirectorySource,
             peers: Vec::new(),
             patch_fingerprint: None,
         }];

@@ -1248,7 +1248,7 @@ impl MockRegistry {
     /// Mount a publish endpoint that accepts PUT and returns success.
     pub async fn with_publish_endpoint(&self) -> &Self {
         Mock::given(method("PUT"))
-            .and(path_regex("/api/registry/packages/.*"))
+            .and(path_regex("/api/registry/.*"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
                 "message": "Package published"
