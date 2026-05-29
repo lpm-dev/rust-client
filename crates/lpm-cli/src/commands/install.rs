@@ -12459,8 +12459,8 @@ async fn resolve_catalog_policy_candidate_version(
     requested_spec: &str,
 ) -> Result<lpm_semver::Version, LpmError> {
     let resolved = if lpm_common::package_name::is_lpm_package(package) {
-        let pkg_name =
-            lpm_common::PackageName::parse(package).map_err(|e| LpmError::Registry(e.to_string()))?;
+        let pkg_name = lpm_common::PackageName::parse(package)
+            .map_err(|e| LpmError::Registry(e.to_string()))?;
         client.get_package_metadata(&pkg_name).await?
     } else {
         let route = route_table.route_for_package(package);
@@ -12534,7 +12534,8 @@ async fn preflight_catalog_policy_rejection(
             continue;
         }
 
-        let Some(catalog_range) = catalog_policy.optional_catalog_entry("default", &entry.name) else {
+        let Some(catalog_range) = catalog_policy.optional_catalog_entry("default", &entry.name)
+        else {
             return Err(LpmError::Registry(format!(
                 "catalogMode strict rejected {}: no default catalog entry exists for this package",
                 entry.name
@@ -12874,6 +12875,7 @@ pub async fn run_install_filtered_add(
     filters: &[String],
     filter_prod: &[String],
     changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     workspace_root_flag: bool,
     fail_if_no_match: bool,
     yes: bool,
@@ -12914,6 +12916,7 @@ pub async fn run_install_filtered_add(
         filters,
         filter_prod,
         changed_files_ignore_pattern,
+        test_pattern,
         workspace_root_flag,
         true, // has_packages — install_filtered_add is only called with non-empty packages
     )?;
@@ -13100,7 +13103,8 @@ pub async fn run_install_filtered_add(
             &invalidate_refs,
         )?;
 
-        let mut staged_manifests: Vec<StagedManifest> = Vec::with_capacity(targets.member_manifests.len());
+        let mut staged_manifests: Vec<StagedManifest> =
+            Vec::with_capacity(targets.member_manifests.len());
         let mut last_err: Option<LpmError> = None;
         for (idx, manifest_path) in targets.member_manifests.iter().enumerate() {
             // (a) Stage the target manifest. Explicit specs land verbatim;
@@ -15649,6 +15653,7 @@ mod tests {
             &["app".to_string()], // bare-name filter that matches nothing
             &[],                  // filter_prod
             &[],                  // changed_files_ignore_pattern
+            &[],                  // test_pattern
             false,                // workspace_root_flag
             true,                 // fail_if_no_match — required for the error path
             false,                // yes — not exercising the prompt here
@@ -15695,6 +15700,7 @@ mod tests {
             &["react".to_string()],
             false,
             &["nonexistent-*".to_string()],
+            &[],
             &[],
             &[],
             false,
@@ -15767,6 +15773,7 @@ mod tests {
         let targets = crate::commands::install_targets::resolve_install_targets(
             &cwd,
             &["@test/app".to_string()],
+            &[],
             &[],
             &[],
             false,

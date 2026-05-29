@@ -95,6 +95,7 @@ pub fn resolve_install_targets(
     filters: &[String],
     filter_prod: &[String],
     changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     workspace_root_flag: bool,
     has_packages: bool,
 ) -> Result<InstallTargets, LpmError> {
@@ -102,12 +103,13 @@ pub fn resolve_install_targets(
     if workspace_root_flag
         && (!filters.is_empty()
             || !filter_prod.is_empty()
-            || !changed_files_ignore_pattern.is_empty())
+            || !changed_files_ignore_pattern.is_empty()
+            || !test_pattern.is_empty())
     {
         return Err(LpmError::Script(
-            "`-w` (workspace root) and filters cannot be used together. \
-             Pick one: `-w` to target the workspace root, or `--filter <expr>` / `--filter-prod <expr>` \
-             to target specific members."
+            "`-w` (workspace root) and `--filter` cannot be used together. \
+             This also applies to `--filter-prod`, `--changed-files-ignore-pattern`, and `--test-pattern`. \
+             Pick one: `-w` to target the workspace root, or a filter to target specific members."
                 .into(),
         ));
     }
@@ -130,8 +132,9 @@ pub fn resolve_install_targets(
             || !changed_files_ignore_pattern.is_empty()
         {
             return Err(LpmError::Script(
-                "`--filter` / `--filter-prod` / `--changed-files-ignore-pattern` require a workspace. The current directory is a standalone project. \
-                 Run from inside a workspace, or omit filters for a regular install."
+                "`--filter` requires a workspace. This also applies to `--filter-prod`, \
+                 `--changed-files-ignore-pattern`, and `--test-pattern`. The current directory \
+                 is a standalone project. Run from inside a workspace, or omit filters for a regular install."
                     .into(),
             ));
         }
@@ -165,6 +168,7 @@ pub fn resolve_install_targets(
             filters,
             filter_prod,
             changed_files_ignore_pattern,
+            test_pattern,
             false,
             "main",
         )?;
@@ -271,7 +275,15 @@ mod tests {
         workspace_root_flag: bool,
         has_packages: bool,
     ) -> Result<InstallTargets, LpmError> {
-        super::resolve_install_targets(cwd, filters, &[], &[], workspace_root_flag, has_packages)
+        super::resolve_install_targets(
+            cwd,
+            filters,
+            &[],
+            &[],
+            &[],
+            workspace_root_flag,
+            has_packages,
+        )
     }
 
     /// Build a synthetic on-disk workspace at `root`. Each member is

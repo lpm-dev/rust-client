@@ -81,6 +81,8 @@ pub enum MatchKind {
     PathGlob,
     /// `{./apps/web}` — exact directory match.
     PathExact,
+    /// `foo{./apps/foo}` — combined package-name and path match.
+    NamePathScope,
     /// `[origin/main]` — git-ref direct change set.
     GitRef,
 }

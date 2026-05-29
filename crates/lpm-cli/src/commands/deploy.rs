@@ -258,6 +258,7 @@ pub(crate) fn resolve_deploy_target(
     filters: &[String],
     filter_prod: &[String],
     changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     force: bool,
 ) -> Result<DeployPlan, LpmError> {
     if filters.is_empty() && filter_prod.is_empty() {
@@ -274,6 +275,7 @@ pub(crate) fn resolve_deploy_target(
         filters,
         filter_prod,
         changed_files_ignore_pattern,
+        test_pattern,
         false,
         true,
     )?;
@@ -630,6 +632,7 @@ pub async fn run(
     filters: &[String],
     filter_prod: &[String],
     changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     force: bool,
     dry_run: bool,
     json_output: bool,
@@ -641,6 +644,7 @@ pub async fn run(
         filters,
         filter_prod,
         changed_files_ignore_pattern,
+        test_pattern,
         force,
     )?;
     let member_name = read_member_name(&plan.member_manifest);
@@ -855,7 +859,7 @@ mod tests {
         filters: &[String],
         force: bool,
     ) -> Result<DeployPlan, LpmError> {
-        super::resolve_deploy_target(cwd, output_dir, filters, &[], &[], force)
+        super::resolve_deploy_target(cwd, output_dir, filters, &[], &[], &[], force)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -873,6 +877,7 @@ mod tests {
             cwd,
             output_dir,
             filters,
+            &[],
             &[],
             &[],
             force,

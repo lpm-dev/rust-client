@@ -1093,6 +1093,7 @@ pub async fn run_workspace(
     affected: bool,
     base_ref: &str,
     changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     fail_if_no_match: bool,
     no_cache: bool,
     parallel: bool,
@@ -1132,6 +1133,7 @@ pub async fn run_workspace(
         filters,
         filter_prod,
         changed_files_ignore_pattern,
+        test_pattern,
         affected,
         base_ref,
     )?;

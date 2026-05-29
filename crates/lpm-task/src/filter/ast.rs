@@ -33,6 +33,13 @@ pub enum FilterExpr {
     /// Canonicalized literal prefix; the glob suffix matches member paths.
     PathGlob(String),
 
+    /// Package name scoped to a directory: `foo{./packages/foo}`.
+    /// Matches only members satisfying both the name atom and the path atom.
+    NamePathScope {
+        name: Box<FilterExpr>,
+        path: Box<FilterExpr>,
+    },
+
     /// Changed-since-git-ref atom: `[origin/main]`, `[HEAD~5]`.
     ///
     /// Per design decision D1: returns DIRECTLY changed packages only,
@@ -79,6 +86,9 @@ impl FilterExpr {
             | FilterExpr::WithDependents(inner)
             | FilterExpr::DependentsOnly(inner)
             | FilterExpr::Exclude(inner) => inner.contains_git_ref(),
+            FilterExpr::NamePathScope { name, path } => {
+                name.contains_git_ref() || path.contains_git_ref()
+            }
             FilterExpr::ExactName(_)
             | FilterExpr::GlobName(_)
             | FilterExpr::PathExact(_)

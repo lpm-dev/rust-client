@@ -100,6 +100,7 @@ pub struct FilterEngine<'a> {
 pub struct FilterOptions<'a> {
     pub follow_prod_deps_only: bool,
     pub changed_files_ignore_patterns: &'a [String],
+    pub test_patterns: &'a [String],
 }
 
 impl<'a> FilterEngine<'a> {

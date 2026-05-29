@@ -13,6 +13,35 @@ use std::process::Command;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AffectedOptions<'a> {
     pub changed_files_ignore_patterns: &'a [String],
+    pub test_patterns: &'a [String],
+}
+
+/// Directly changed workspace members partitioned by whether their changed
+/// files are source changes or test-only changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AffectedSets {
+    pub source_changed: HashSet<usize>,
+    pub test_only_changed: HashSet<usize>,
+}
+
+impl AffectedSets {
+    pub fn is_empty(&self) -> bool {
+        self.source_changed.is_empty() && self.test_only_changed.is_empty()
+    }
+
+    pub fn directly_changed(&self) -> HashSet<usize> {
+        let mut changed =
+            HashSet::with_capacity(self.source_changed.len() + self.test_only_changed.len());
+        changed.extend(self.source_changed.iter().copied());
+        changed.extend(self.test_only_changed.iter().copied());
+        changed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeType {
+    Source,
+    Test,
 }
 
 /// Find workspace members **directly** changed since a base ref.
@@ -46,13 +75,29 @@ pub fn find_affected_direct_only_with_options(
     base_ref: &str,
     options: AffectedOptions<'_>,
 ) -> Result<HashSet<usize>, String> {
+    Ok(
+        find_affected_direct_sets_with_options(graph, workspace_root, base_ref, options)?
+            .directly_changed(),
+    )
+}
+
+/// Find directly changed workspace members, partitioned into source and
+/// test-only changes according to `test_patterns`.
+pub fn find_affected_direct_sets_with_options(
+    graph: &WorkspaceGraph,
+    workspace_root: &Path,
+    base_ref: &str,
+    options: AffectedOptions<'_>,
+) -> Result<AffectedSets, String> {
     let changed_files = git_diff_files(workspace_root, base_ref)?;
     let changed_files =
         filter_ignored_changed_files(changed_files, options.changed_files_ignore_patterns)?;
 
     if changed_files.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(AffectedSets::default());
     }
+
+    let test_matcher = compile_changed_files_test_patterns(options.test_patterns)?;
 
     // Collect all member relative paths for root-level detection
     let member_paths: Vec<String> = graph
@@ -68,10 +113,11 @@ pub fn find_affected_direct_only_with_options(
         .collect();
 
     // Map changed files to workspace members
-    let mut directly_changed: HashSet<usize> = HashSet::new();
-    let mut has_root_change = false;
+    let mut directly_changed = AffectedSets::default();
+    let mut root_change_type: Option<ChangeType> = None;
 
     for file in &changed_files {
+        let change_type = classify_changed_file(file, test_matcher.as_ref());
         let mut matched_any = false;
 
         for (idx, member_rel) in member_paths.iter().enumerate() {
@@ -83,7 +129,7 @@ pub fn find_affected_direct_only_with_options(
             // This prevents "packages/api-client/x.ts" matching "packages/api"
             let member_with_sep = format!("{member_rel}/");
             if file.starts_with(&member_with_sep) || file == member_rel.as_str() {
-                directly_changed.insert(idx);
+                record_change(&mut directly_changed, idx, change_type);
                 matched_any = true;
             }
         }
@@ -93,12 +139,21 @@ pub fn find_affected_direct_only_with_options(
         // changes are treated as touching ALL members directly — workspace
         // config conceptually applies to every member.
         if !matched_any {
-            has_root_change = true;
+            record_root_change(&mut root_change_type, change_type);
         }
     }
 
-    if has_root_change {
-        return Ok((0..graph.members.len()).collect());
+    match root_change_type {
+        Some(ChangeType::Source) => {
+            directly_changed.source_changed = (0..graph.members.len()).collect();
+            directly_changed.test_only_changed.clear();
+        }
+        Some(ChangeType::Test) => {
+            for idx in 0..graph.members.len() {
+                record_change(&mut directly_changed, idx, ChangeType::Test);
+            }
+        }
+        None => {}
     }
 
     Ok(directly_changed)
@@ -128,23 +183,28 @@ pub fn find_affected_with_options(
     options: AffectedOptions<'_>,
 ) -> Result<HashSet<usize>, String> {
     let directly_changed =
-        find_affected_direct_only_with_options(graph, workspace_root, base_ref, options)?;
+        find_affected_direct_sets_with_options(graph, workspace_root, base_ref, options)?;
 
     if directly_changed.is_empty() {
-        return Ok(directly_changed);
+        return Ok(HashSet::new());
+    }
+
+    let mut all_affected = directly_changed.directly_changed();
+
+    if directly_changed.source_changed.is_empty() {
+        return Ok(all_affected);
     }
 
     // Optimization: if direct-only already returned every member (root-level
     // change short-circuit, or every member happens to have changed), expanding
     // transitive dependents can only return members already in the set, so
     // skip the O(V*(V+E)) traversal.
-    if directly_changed.len() == graph.members.len() {
-        return Ok(directly_changed);
+    if directly_changed.source_changed.len() == graph.members.len() {
+        return Ok(all_affected);
     }
 
     // Add transitive dependents
-    let mut all_affected = directly_changed.clone();
-    for &idx in &directly_changed {
+    for &idx in &directly_changed.source_changed {
         let dependents = graph.transitive_dependents(idx);
         all_affected.extend(dependents);
     }
@@ -178,6 +238,60 @@ fn compile_changed_files_ignore_patterns(patterns: &[String]) -> Result<GlobSet,
     builder
         .build()
         .map_err(|e| format!("invalid changed files ignore patterns: {e}"))
+}
+
+fn compile_changed_files_test_patterns(patterns: &[String]) -> Result<Option<GlobSet>, String> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut builder = GlobSetBuilder::new();
+    let mut added = 0usize;
+    for pattern in patterns {
+        if pattern.is_empty() {
+            continue;
+        }
+        let glob =
+            Glob::new(pattern).map_err(|e| format!("invalid test pattern {pattern:?}: {e}"))?;
+        builder.add(glob);
+        added += 1;
+    }
+
+    if added == 0 {
+        return Ok(None);
+    }
+
+    builder
+        .build()
+        .map(Some)
+        .map_err(|e| format!("invalid test patterns: {e}"))
+}
+
+fn classify_changed_file(file: &str, test_matcher: Option<&GlobSet>) -> ChangeType {
+    match test_matcher {
+        Some(matcher) if matcher.is_match(file) => ChangeType::Test,
+        _ => ChangeType::Source,
+    }
+}
+
+fn record_change(sets: &mut AffectedSets, idx: usize, change_type: ChangeType) {
+    match change_type {
+        ChangeType::Source => {
+            sets.test_only_changed.remove(&idx);
+            sets.source_changed.insert(idx);
+        }
+        ChangeType::Test => {
+            if !sets.source_changed.contains(&idx) {
+                sets.test_only_changed.insert(idx);
+            }
+        }
+    }
+}
+
+fn record_root_change(root_change_type: &mut Option<ChangeType>, change_type: ChangeType) {
+    if *root_change_type != Some(ChangeType::Source) {
+        *root_change_type = Some(change_type);
+    }
 }
 
 /// Get changed files from git diff relative to a base ref.
@@ -563,6 +677,37 @@ mod tests {
         (dir, graph, root)
     }
 
+    fn setup_two_package_workspace_with_changed_file(
+        changed_file: &str,
+    ) -> (tempfile::TempDir, WorkspaceGraph, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        git(&root, &["init", "-b", "main"]);
+        std::fs::create_dir_all(root.join("packages/utils/src")).unwrap();
+        std::fs::create_dir_all(root.join("packages/app/src")).unwrap();
+        std::fs::write(root.join("packages/utils/src/index.js"), "v1").unwrap();
+        std::fs::write(root.join("packages/utils/src/index.test.js"), "v1").unwrap();
+        std::fs::write(root.join("packages/app/src/index.js"), "v1").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "init"]);
+
+        git(&root, &["checkout", "-b", "feature"]);
+        std::fs::write(root.join(changed_file), "v2").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "change"]);
+
+        let graph = make_graph(
+            &[
+                ("utils", &root.join("packages/utils").to_string_lossy()),
+                ("app", &root.join("packages/app").to_string_lossy()),
+            ],
+            vec![vec![], vec![0]],
+        );
+
+        (dir, graph, root)
+    }
+
     #[test]
     fn find_affected_direct_only_excludes_transitive_dependents() {
         // utils changes, app depends on utils.
@@ -723,6 +868,7 @@ mod tests {
             "main",
             AffectedOptions {
                 changed_files_ignore_patterns: &patterns,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -767,6 +913,7 @@ mod tests {
             "main",
             AffectedOptions {
                 changed_files_ignore_patterns: &patterns,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -788,6 +935,7 @@ mod tests {
             "main",
             AffectedOptions {
                 changed_files_ignore_patterns: &patterns,
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -796,5 +944,69 @@ mod tests {
             err.contains("invalid changed files ignore pattern"),
             "error should identify the invalid ignore glob: {err}"
         );
+    }
+
+    #[test]
+    fn test_pattern_partitions_test_only_changes_without_dependent_expansion() {
+        let (_dir, graph, root) =
+            setup_two_package_workspace_with_changed_file("packages/utils/src/index.test.js");
+        let patterns = vec!["**/*.test.js".to_string()];
+
+        let direct = find_affected_direct_sets_with_options(
+            &graph,
+            &root,
+            "main",
+            AffectedOptions {
+                test_patterns: &patterns,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let affected = find_affected_with_options(
+            &graph,
+            &root,
+            "main",
+            AffectedOptions {
+                test_patterns: &patterns,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(direct.source_changed.is_empty());
+        assert_eq!(direct.test_only_changed, HashSet::from([0usize]));
+        assert_eq!(affected, HashSet::from([0usize]));
+    }
+
+    #[test]
+    fn test_pattern_keeps_source_changes_as_dependent_expansion_seeds() {
+        let (_dir, graph, root) =
+            setup_two_package_workspace_with_changed_file("packages/utils/src/index.js");
+        let patterns = vec!["**/*.test.js".to_string()];
+
+        let direct = find_affected_direct_sets_with_options(
+            &graph,
+            &root,
+            "main",
+            AffectedOptions {
+                test_patterns: &patterns,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let affected = find_affected_with_options(
+            &graph,
+            &root,
+            "main",
+            AffectedOptions {
+                test_patterns: &patterns,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(direct.source_changed, HashSet::from([0usize]));
+        assert!(direct.test_only_changed.is_empty());
+        assert_eq!(affected, HashSet::from([0usize, 1]));
     }
 }

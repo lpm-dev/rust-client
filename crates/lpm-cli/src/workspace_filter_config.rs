@@ -2,6 +2,7 @@ use lpm_common::LpmError;
 use std::path::Path;
 
 const PROJECT_KEY: &str = "workspace.changed-files-ignore-pattern";
+const TEST_PATTERN_PROJECT_KEY: &str = "workspace.test-pattern";
 
 pub(crate) fn resolve_changed_files_ignore_patterns(
     workspace_root: &Path,
@@ -10,6 +11,16 @@ pub(crate) fn resolve_changed_files_ignore_patterns(
     let project_path = workspace_root.join("lpm.toml");
     let mut patterns =
         read_project_changed_files_ignore_patterns_from_file(&project_path)?.unwrap_or_default();
+    patterns.extend_from_slice(cli_patterns);
+    Ok(patterns)
+}
+
+pub(crate) fn resolve_test_patterns(
+    workspace_root: &Path,
+    cli_patterns: &[String],
+) -> Result<Vec<String>, LpmError> {
+    let project_path = workspace_root.join("lpm.toml");
+    let mut patterns = read_project_test_patterns_from_file(&project_path)?.unwrap_or_default();
     patterns.extend_from_slice(cli_patterns);
     Ok(patterns)
 }
@@ -37,6 +48,29 @@ fn read_project_changed_files_ignore_patterns_from_file(
     };
 
     parse_changed_files_ignore_patterns(path, PROJECT_KEY, value).map(Some)
+}
+
+fn read_project_test_patterns_from_file(path: &Path) -> Result<Option<Vec<String>>, LpmError> {
+    let Some(table) = read_toml_table(path)? else {
+        return Ok(None);
+    };
+
+    let Some(workspace) = table.get("workspace") else {
+        return Ok(None);
+    };
+
+    let workspace_table = workspace.as_table().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "{}: `workspace` must be a TOML table when present",
+            path.display()
+        ))
+    })?;
+
+    let Some(value) = workspace_table.get("test-pattern") else {
+        return Ok(None);
+    };
+
+    parse_changed_files_ignore_patterns(path, TEST_PATTERN_PROJECT_KEY, value).map(Some)
 }
 
 fn read_toml_table(path: &Path) -> Result<Option<toml::map::Map<String, toml::Value>>, LpmError> {
@@ -148,5 +182,34 @@ mod tests {
             err.contains(PROJECT_KEY),
             "error should name the invalid key: {err}"
         );
+    }
+
+    #[test]
+    fn project_config_accepts_test_pattern_array() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.toml"),
+            "[workspace]\ntest-pattern = [\"**/*.test.js\", \"**/*.spec.js\"]\n",
+        )
+        .unwrap();
+
+        let patterns = resolve_test_patterns(dir.path(), &[]).unwrap();
+
+        assert_eq!(patterns, vec!["**/*.test.js", "**/*.spec.js"]);
+    }
+
+    #[test]
+    fn cli_test_patterns_append_to_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.toml"),
+            "[workspace]\ntest-pattern = \"**/*.test.js\"\n",
+        )
+        .unwrap();
+        let cli_patterns = vec!["**/*.spec.js".to_string()];
+
+        let patterns = resolve_test_patterns(dir.path(), &cli_patterns).unwrap();
+
+        assert_eq!(patterns, vec!["**/*.test.js", "**/*.spec.js"]);
     }
 }

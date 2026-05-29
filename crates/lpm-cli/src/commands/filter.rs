@@ -83,6 +83,8 @@ fn looks_like_bare_name(raw: &str) -> bool {
         && !trimmed.starts_with("../")
         && !trimmed.starts_with('[')
         && !trimmed.starts_with('{')
+        && !trimmed.contains('{')
+        && !trimmed.contains('}')
         && !trimmed.starts_with('!')
         && !trimmed.contains("...")
 }
@@ -92,6 +94,7 @@ pub async fn run(
     exprs: &[String],
     filter_prod: &[String],
     changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     explain_mode: bool,
     fail_if_no_match: bool,
     json_output: bool,
@@ -137,12 +140,18 @@ pub async fn run(
         } else {
             Vec::new()
         };
+    let test_patterns = if needs_changed_files || !test_pattern.is_empty() {
+        crate::workspace_filter_config::resolve_test_patterns(&workspace.root, test_pattern)?
+    } else {
+        Vec::new()
+    };
 
     let engine = FilterEngine::with_options(
         &graph,
         &workspace.root,
         lpm_task::filter::FilterOptions {
             changed_files_ignore_patterns: &changed_files_ignore_patterns,
+            test_patterns: &test_patterns,
             ..Default::default()
         },
     );
@@ -152,6 +161,7 @@ pub async fn run(
         lpm_task::filter::FilterOptions {
             follow_prod_deps_only: true,
             changed_files_ignore_patterns: &changed_files_ignore_patterns,
+            test_patterns: &test_patterns,
         },
     );
 
@@ -359,6 +369,7 @@ fn describe_reason(graph: &WorkspaceGraph, reason: &TraceReason) -> String {
                 MatchKind::GlobName => "glob",
                 MatchKind::PathGlob => "path-glob",
                 MatchKind::PathExact => "path",
+                MatchKind::NamePathScope => "name+path",
                 MatchKind::GitRef => "git-ref",
             };
             format!("matched {filter:?} ({kind_label})")
@@ -388,6 +399,7 @@ fn trace_reason_to_json(reason: &TraceReason) -> serde_json::Value {
                 MatchKind::GlobName => "glob_name",
                 MatchKind::PathGlob => "path_glob",
                 MatchKind::PathExact => "path_exact",
+                MatchKind::NamePathScope => "name_path_scope",
                 MatchKind::GitRef => "git_ref",
             },
         }),

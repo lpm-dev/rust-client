@@ -585,6 +585,11 @@ enum Commands {
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
 
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// reverse git-ref closures do not fan out to dependents from them.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
+
         /// Target the workspace root `package.json` instead of the
         /// current member. Mutually exclusive with `--filter`. Use when
         /// adding tooling packages that belong at the root rather than
@@ -742,6 +747,11 @@ enum Commands {
         /// `[git-ref]` filters. Can be passed multiple times.
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
+
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// reverse git-ref closures do not fan out to dependents from them.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
 
         /// target the workspace root `package.json` instead
         /// of the current member.
@@ -1464,6 +1474,12 @@ enum Commands {
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
 
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// `--affected` and reverse git-ref closures do not fan out to
+        /// dependents from them.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
+
         /// Disable task caching (force re-execution).
         #[arg(long)]
         no_cache: bool,
@@ -1551,6 +1567,11 @@ enum Commands {
         /// `[git-ref]` filters. Can be passed multiple times.
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
+
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// reverse git-ref closures do not fan out to dependents from them.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
 
         /// Overwrite the output directory if it is non-empty. Without this
         /// flag, deploy refuses to write into a non-empty directory.
@@ -1681,6 +1702,11 @@ enum Commands {
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
 
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// reverse git-ref closures do not fan out to dependents from them.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
+
         /// Show the full structured selection trace (which filter matched
         /// each package and how). Without this flag, output is a terse name
         /// list suitable for piping into shell tools.
@@ -1728,6 +1754,10 @@ enum Commands {
         /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         /// Recommended in CI to catch typo'd filters early.
         #[arg(long)]
@@ -1763,6 +1793,10 @@ enum Commands {
         /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
@@ -1794,6 +1828,10 @@ enum Commands {
         /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
@@ -1828,6 +1866,10 @@ enum Commands {
         /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
@@ -1880,6 +1922,10 @@ enum Commands {
         /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
@@ -1947,6 +1993,10 @@ enum Commands {
         /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
@@ -1984,6 +2034,10 @@ enum Commands {
         /// `--affected` or `[git-ref]` filters. Can be passed multiple times.
         #[arg(long = "changed-files-ignore-pattern")]
         changed_files_ignore_pattern: Vec<String>,
+        /// Treat changed files matching this git-diff glob as tests, so
+        /// affected reverse fan-out skips dependents for test-only changes.
+        #[arg(long = "test-pattern")]
+        test_pattern: Vec<String>,
         /// Exit non-zero if no workspace package matches the filter set.
         #[arg(long)]
         fail_if_no_match: bool,
@@ -2627,6 +2681,7 @@ fn validate_global_install_project_scoped_flags(
     filter: &[String],
     filter_prod: &[String],
     changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
@@ -2642,6 +2697,7 @@ fn validate_global_install_project_scoped_flags(
         || !filter.is_empty()
         || !filter_prod.is_empty()
         || !changed_files_ignore_pattern.is_empty()
+        || !test_pattern.is_empty()
         || workspace_root
         || fail_if_no_match
         || yes
@@ -2649,7 +2705,7 @@ fn validate_global_install_project_scoped_flags(
     {
         return Err(lpm_common::LpmError::Script(
             "`-g` is mutually exclusive with `-D` / `--filter` / `--filter-prod` / \
-             `--changed-files-ignore-pattern` / `-w` / \
+             `--changed-files-ignore-pattern` / `--test-pattern` / `-w` / \
              `--fail-if-no-match` / `-y` / `--catalog` (those are project-scoped)."
                 .into(),
         ));
@@ -2661,6 +2717,7 @@ fn validate_global_uninstall_project_scoped_flags(
     filter: &[String],
     filter_prod: &[String],
     changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     workspace_root: bool,
     fail_if_no_match: bool,
     yes: bool,
@@ -2668,13 +2725,14 @@ fn validate_global_uninstall_project_scoped_flags(
     if !filter.is_empty()
         || !filter_prod.is_empty()
         || !changed_files_ignore_pattern.is_empty()
+        || !test_pattern.is_empty()
         || workspace_root
         || fail_if_no_match
         || yes
     {
         return Err(lpm_common::LpmError::Script(
             "`-g` is mutually exclusive with `--filter` / `--filter-prod` / \
-             `--changed-files-ignore-pattern` / `-w` / \
+             `--changed-files-ignore-pattern` / `--test-pattern` / `-w` / \
              `--fail-if-no-match` / `-y` (those are project-scoped)."
                 .into(),
         ));
@@ -3257,6 +3315,7 @@ async fn async_main() -> Result<()> {
             filter,
             filter_prod,
             changed_files_ignore_pattern,
+            test_pattern,
             workspace_root,
             fail_if_no_match,
             yes,
@@ -3311,6 +3370,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     &filter_prod,
                     &changed_files_ignore_pattern,
+                    &test_pattern,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -3590,11 +3650,12 @@ async fn async_main() -> Result<()> {
                 if !filter.is_empty()
                     || !filter_prod.is_empty()
                     || !changed_files_ignore_pattern.is_empty()
+                    || !test_pattern.is_empty()
                     || workspace_root
                     || fail_if_no_match
                 {
                     Err(lpm_common::LpmError::Script(
-                        "`--filter`, `--filter-prod`, `--changed-files-ignore-pattern`, `-w`, and `--fail-if-no-match` only apply when adding packages. \
+                        "`--filter`, `--filter-prod`, `--changed-files-ignore-pattern`, `--test-pattern`, `-w`, and `--fail-if-no-match` only apply when adding packages. \
                          Pass package specs (e.g., `lpm install react --filter web`) or run `lpm install` \
                          alone to refresh from package.json."
                             .into(),
@@ -3660,6 +3721,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     &filter_prod,
                     &changed_files_ignore_pattern,
+                    &test_pattern,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -3697,6 +3759,7 @@ async fn async_main() -> Result<()> {
                         &filter,
                         &filter_prod,
                         &changed_files_ignore_pattern,
+                        &test_pattern,
                         workspace_root,
                         fail_if_no_match,
                         yes,
@@ -3748,6 +3811,7 @@ async fn async_main() -> Result<()> {
             filter,
             filter_prod,
             changed_files_ignore_pattern,
+            test_pattern,
             workspace_root,
             fail_if_no_match,
             yes,
@@ -3776,6 +3840,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     &filter_prod,
                     &changed_files_ignore_pattern,
+                    &test_pattern,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -3793,6 +3858,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     &filter_prod,
                     &changed_files_ignore_pattern,
+                    &test_pattern,
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -4389,6 +4455,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             changed_files_ignore_pattern,
+            test_pattern,
             no_cache,
             no_env_check,
             watch,
@@ -4429,6 +4496,7 @@ async fn async_main() -> Result<()> {
                     affected,
                     &base,
                     &changed_files_ignore_pattern,
+                    &test_pattern,
                     fail_if_no_match,
                     no_cache,
                     parallel,
@@ -4475,6 +4543,7 @@ async fn async_main() -> Result<()> {
             exprs,
             filter_prod,
             changed_files_ignore_pattern,
+            test_pattern,
             explain,
             fail_if_no_match,
         } => {
@@ -4484,6 +4553,7 @@ async fn async_main() -> Result<()> {
                 &exprs,
                 &filter_prod,
                 &changed_files_ignore_pattern,
+                &test_pattern,
                 explain,
                 fail_if_no_match,
                 cli.json,
@@ -4495,6 +4565,7 @@ async fn async_main() -> Result<()> {
             filter,
             filter_prod,
             changed_files_ignore_pattern,
+            test_pattern,
             force,
             dry_run,
         } => {
@@ -4507,6 +4578,7 @@ async fn async_main() -> Result<()> {
                 &filter,
                 &filter_prod,
                 &changed_files_ignore_pattern,
+                &test_pattern,
                 force,
                 dry_run,
                 cli.json,
@@ -4578,6 +4650,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             args,
         } => {
@@ -4594,6 +4667,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     &filter_prod,
                     &changed_files_ignore_pattern,
+                    &test_pattern,
                     affected_ref,
                     fail_if_no_match,
                     commands::tools::WorkspaceConcurrency::HostDefault,
@@ -4612,6 +4686,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             args,
         } => {
@@ -4628,6 +4703,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     &filter_prod,
                     &changed_files_ignore_pattern,
+                    &test_pattern,
                     affected_ref,
                     fail_if_no_match,
                     commands::tools::WorkspaceConcurrency::HostDefault,
@@ -4645,6 +4721,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             engine,
             args,
@@ -4662,6 +4739,7 @@ async fn async_main() -> Result<()> {
                     &filter,
                     &filter_prod,
                     &changed_files_ignore_pattern,
+                    &test_pattern,
                     affected_ref,
                     fail_if_no_match,
                     commands::tools::WorkspaceConcurrency::HostDefault,
@@ -4679,6 +4757,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             entry,
             out_dir,
@@ -4707,6 +4786,7 @@ async fn async_main() -> Result<()> {
                 &filter,
                 &filter_prod,
                 &changed_files_ignore_pattern,
+                &test_pattern,
                 affected,
                 &base,
                 fail_if_no_match,
@@ -4721,6 +4801,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             entry,
             out_dir,
@@ -4755,6 +4836,7 @@ async fn async_main() -> Result<()> {
                 &filter,
                 &filter_prod,
                 &changed_files_ignore_pattern,
+                &test_pattern,
                 affected,
                 &base,
                 fail_if_no_match,
@@ -4769,6 +4851,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             workspace_concurrency,
             args,
@@ -4783,6 +4866,7 @@ async fn async_main() -> Result<()> {
                 &filter,
                 &filter_prod,
                 &changed_files_ignore_pattern,
+                &test_pattern,
                 affected,
                 &base,
                 fail_if_no_match,
@@ -4798,6 +4882,7 @@ async fn async_main() -> Result<()> {
             affected,
             base,
             changed_files_ignore_pattern,
+            test_pattern,
             fail_if_no_match,
             workspace_concurrency,
             args,
@@ -4812,6 +4897,7 @@ async fn async_main() -> Result<()> {
                 &filter,
                 &filter_prod,
                 &changed_files_ignore_pattern,
+                &test_pattern,
                 affected,
                 &base,
                 fail_if_no_match,
@@ -5648,6 +5734,30 @@ mod tests {
     }
 
     #[test]
+    fn run_test_pattern_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "run",
+            "build",
+            "--affected",
+            "--test-pattern",
+            "**/*.test.js",
+            "--test-pattern",
+            "**/*.spec.js",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Run { test_pattern, .. } => {
+                assert_eq!(
+                    test_pattern,
+                    vec!["**/*.test.js".to_string(), "**/*.spec.js".to_string()]
+                );
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
     fn run_fail_if_no_match_flag_parses() {
         let cli = Cli::try_parse_from([
             "lpm",
@@ -5875,6 +5985,24 @@ mod tests {
                     changed_files_ignore_pattern,
                     vec!["**/README.md".to_string()]
                 );
+            }
+            _ => panic!("expected Filter command"),
+        }
+    }
+
+    #[test]
+    fn filter_command_test_pattern_flag_collects_into_vec() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "filter",
+            "...[main]",
+            "--test-pattern",
+            "**/*.test.js",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Filter { test_pattern, .. } => {
+                assert_eq!(test_pattern, vec!["**/*.test.js".to_string()]);
             }
             _ => panic!("expected Filter command"),
         }
@@ -6129,6 +6257,7 @@ mod tests {
                     &filter,
                     &[],
                     &[],
+                    &[],
                     workspace_root,
                     fail_if_no_match,
                     yes,
@@ -6168,6 +6297,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             false,
             false,
             false,
@@ -6183,6 +6313,7 @@ mod tests {
 
         let err = validate_global_install_project_scoped_flags(
             false,
+            &[],
             &[],
             &[],
             &[],
@@ -6203,6 +6334,7 @@ mod tests {
         // No project-only flags set → accept.
         validate_global_install_project_scoped_flags(
             false,
+            &[],
             &[],
             &[],
             &[],
@@ -6670,6 +6802,7 @@ mod tests {
 
                 let err = validate_global_uninstall_project_scoped_flags(
                     &filter,
+                    &[],
                     &[],
                     &[],
                     workspace_root,

@@ -33,6 +33,7 @@ pub fn select_workspace_target_set(
     filters: &[String],
     filter_prod: &[String],
     changed_files_ignore_pattern: &[String],
+    test_pattern: &[String],
     affected: bool,
     base_ref: &str,
 ) -> Result<HashSet<usize>, LpmError> {
@@ -58,6 +59,11 @@ pub fn select_workspace_target_set(
         } else {
             Vec::new()
         };
+    let test_patterns = if needs_changed_files || !test_pattern.is_empty() {
+        crate::workspace_filter_config::resolve_test_patterns(workspace_root, test_pattern)?
+    } else {
+        Vec::new()
+    };
 
     let affected_set: HashSet<usize> = if affected {
         lpm_task::affected::find_affected_with_options(
@@ -66,6 +72,7 @@ pub fn select_workspace_target_set(
             base_ref,
             lpm_task::affected::AffectedOptions {
                 changed_files_ignore_patterns: &changed_files_ignore_patterns,
+                test_patterns: &test_patterns,
             },
         )
         .map_err(LpmError::Script)?
@@ -79,6 +86,7 @@ pub fn select_workspace_target_set(
         &exprs,
         false,
         &changed_files_ignore_patterns,
+        &test_patterns,
     )?;
     target_set.extend(evaluate_filter_set(
         ws_graph,
@@ -86,6 +94,7 @@ pub fn select_workspace_target_set(
         &prod_exprs,
         true,
         &changed_files_ignore_patterns,
+        &test_patterns,
     )?);
     target_set.extend(affected_set);
     Ok(target_set)
@@ -121,6 +130,7 @@ fn evaluate_filter_set(
     filters: &[lpm_task::filter::FilterExpr],
     follow_prod_deps_only: bool,
     changed_files_ignore_patterns: &[String],
+    test_patterns: &[String],
 ) -> Result<HashSet<usize>, LpmError> {
     use lpm_task::filter::{FilterEngine, FilterOptions};
 
@@ -134,6 +144,7 @@ fn evaluate_filter_set(
         FilterOptions {
             follow_prod_deps_only,
             changed_files_ignore_patterns,
+            test_patterns,
         },
     );
     Ok(engine
@@ -277,7 +288,7 @@ mod tests {
     fn no_filter_no_affected_returns_all_members() {
         let graph = make_workspace_graph();
         let result =
-            select_workspace_target_set(&graph, Path::new("."), &[], &[], &[], false, "main")
+            select_workspace_target_set(&graph, Path::new("."), &[], &[], &[], &[], false, "main")
                 .expect("no-filter no-affected mode should succeed");
         assert_eq!(result, HashSet::from([0usize, 1, 2]));
     }
@@ -289,6 +300,7 @@ mod tests {
             &graph,
             Path::new("."),
             &["pkg-b".to_string()],
+            &[],
             &[],
             &[],
             false,
@@ -305,6 +317,7 @@ mod tests {
             &graph,
             Path::new("."),
             &["pkg-*".to_string()],
+            &[],
             &[],
             &[],
             false,
@@ -324,6 +337,7 @@ mod tests {
             &["pkg".to_string()],
             &[],
             &[],
+            &[],
             false,
             "main",
         )
@@ -341,6 +355,7 @@ mod tests {
             &graph,
             Path::new("."),
             &["foo!bar".to_string()],
+            &[],
             &[],
             &[],
             false,
@@ -363,6 +378,7 @@ mod tests {
             &["pkg-a".to_string(), "tooling-app".to_string()],
             &[],
             &[],
+            &[],
             false,
             "main",
         )
@@ -380,6 +396,7 @@ mod tests {
             &["...pkg-a".to_string()],
             &[],
             &[],
+            &[],
             false,
             "main",
         )
@@ -395,6 +412,7 @@ mod tests {
             &graph,
             Path::new("."),
             &["tooling-app...".to_string()],
+            &[],
             &[],
             &[],
             false,
@@ -418,6 +436,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
             false,
             "main",
         )
@@ -435,6 +454,7 @@ mod tests {
             &["does-not-exist".to_string()],
             &[],
             &[],
+            &[],
             false,
             "main",
         )
@@ -450,6 +470,7 @@ mod tests {
             Path::new("."),
             &[],
             &["...project-3".to_string()],
+            &[],
             &[],
             false,
             "main",
