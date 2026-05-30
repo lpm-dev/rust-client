@@ -11,6 +11,7 @@
 //! ```
 
 use lpm_common::{LpmError, LpmRoot};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 /// Base directory for task cache.
@@ -124,6 +125,163 @@ pub fn store_cache(
     Ok(())
 }
 
+pub struct RemoteArtifactCreate<'a> {
+    pub key: &'a str,
+    pub project_dir: &'a Path,
+    pub command: &'a str,
+    pub output_globs: &'a [String],
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    pub duration_ms: u64,
+    pub artifact_path: &'a Path,
+}
+
+/// Create a portable remote-cache artifact for a successful task run.
+pub fn create_remote_artifact(args: RemoteArtifactCreate<'_>) -> Result<(), LpmError> {
+    let file = std::fs::File::create(args.artifact_path)?;
+    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+    let mut builder = tar::Builder::new(enc);
+
+    let output_file_count = append_output_files(
+        &mut builder,
+        args.project_dir,
+        args.output_globs,
+        Some(Path::new("outputs")),
+    )?;
+
+    let meta = CacheMeta {
+        command: args.command.to_string(),
+        cache_key: args.key.to_string(),
+        duration_ms: args.duration_ms,
+        output_file_count,
+    };
+    let meta_json = serde_json::to_string_pretty(&meta)
+        .map_err(|e| LpmError::Task(format!("failed to serialize remote cache meta: {e}")))?;
+
+    append_bytes(
+        &mut builder,
+        Path::new(".lpm-cache/meta.json"),
+        meta_json.as_bytes(),
+    )?;
+    append_bytes(
+        &mut builder,
+        Path::new(".lpm-cache/stdout.log"),
+        args.stdout.as_bytes(),
+    )?;
+    append_bytes(
+        &mut builder,
+        Path::new(".lpm-cache/stderr.log"),
+        args.stderr.as_bytes(),
+    )?;
+
+    builder
+        .finish()
+        .map_err(|e| LpmError::Task(format!("failed to finalize remote cache artifact: {e}")))?;
+
+    Ok(())
+}
+
+/// Restore a portable remote-cache artifact into a project directory.
+pub fn restore_remote_artifact(
+    expected_key: &str,
+    artifact_path: &Path,
+    project_dir: &Path,
+) -> Result<CacheHit, LpmError> {
+    let file = std::fs::File::open(artifact_path)?;
+    let dec = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(dec);
+    archive.set_preserve_permissions(false);
+    archive.set_preserve_ownerships(false);
+
+    let mut total_bytes: u64 = 0;
+    let mut entries_seen: usize = 0;
+    let mut meta_json: Option<String> = None;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut output_file_count = 0usize;
+
+    for entry in archive
+        .entries()
+        .map_err(|e| LpmError::Task(format!("failed to read remote cache artifact entries: {e}")))?
+    {
+        let mut entry = entry.map_err(|e| {
+            LpmError::Task(format!("failed to read remote cache artifact entry: {e}"))
+        })?;
+
+        entries_seen += 1;
+        if entries_seen > MAX_CACHE_ARCHIVE_ENTRIES {
+            return Err(LpmError::Task(format!(
+                "remote cache artifact exceeds entry-count cap ({MAX_CACHE_ARCHIVE_ENTRIES} entries)"
+            )));
+        }
+
+        let path = entry
+            .path()
+            .map_err(|e| LpmError::Task(format!("failed to read entry path: {e}")))?
+            .to_path_buf();
+        validate_archive_path(&path, "remote cache artifact")?;
+        validate_archive_entry_type(&entry, &path, "remote cache artifact")?;
+
+        let entry_size = entry.header().size().unwrap_or(0);
+        check_archive_size_limits(entry_size, &mut total_bytes, &path, "remote cache artifact")?;
+
+        if path == Path::new(".lpm-cache/meta.json") {
+            meta_json = Some(read_entry_to_string(&mut entry, &path)?);
+            continue;
+        }
+        if path == Path::new(".lpm-cache/stdout.log") {
+            stdout = read_entry_to_string(&mut entry, &path)?;
+            continue;
+        }
+        if path == Path::new(".lpm-cache/stderr.log") {
+            stderr = read_entry_to_string(&mut entry, &path)?;
+            continue;
+        }
+
+        let Ok(rel) = path.strip_prefix("outputs") else {
+            return Err(LpmError::Task(format!(
+                "remote cache artifact contains unexpected entry: {}",
+                path.display()
+            )));
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(project_dir.join(rel))?;
+        } else {
+            restore_remote_output_file(&mut entry, project_dir, rel)?;
+            output_file_count += 1;
+        }
+    }
+
+    let meta_json = meta_json.ok_or_else(|| {
+        LpmError::Task("remote cache artifact is missing .lpm-cache/meta.json".into())
+    })?;
+    let meta: CacheMeta = serde_json::from_str(&meta_json)
+        .map_err(|e| LpmError::Task(format!("failed to parse remote cache meta: {e}")))?;
+
+    if meta.cache_key != expected_key {
+        return Err(LpmError::Task(format!(
+            "remote cache artifact key mismatch (expected {expected_key}, got {})",
+            meta.cache_key
+        )));
+    }
+    if meta.output_file_count != output_file_count {
+        return Err(LpmError::Task(format!(
+            "remote cache artifact output count mismatch (expected {}, restored {})",
+            meta.output_file_count, output_file_count
+        )));
+    }
+
+    Ok(CacheHit {
+        meta,
+        stdout,
+        stderr,
+    })
+}
+
 /// Clean the entire task cache.
 pub fn clean_cache() -> Result<u64, LpmError> {
     let dir = cache_dir()?;
@@ -144,6 +302,7 @@ pub fn clean_cache() -> Result<u64, LpmError> {
 }
 
 /// Cache hit result.
+#[derive(Debug)]
 pub struct CacheHit {
     pub meta: CacheMeta,
     pub stdout: String,
@@ -171,6 +330,23 @@ fn create_archive(
     let file = std::fs::File::create(archive_path)?;
     let enc = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
     let mut builder = tar::Builder::new(enc);
+
+    let file_count = append_output_files(&mut builder, project_dir, output_globs, None)?;
+
+    builder
+        .finish()
+        .map_err(|e| LpmError::Task(format!("failed to finalize archive: {e}")))?;
+
+    tracing::debug!("archived {file_count} files to {}", archive_path.display());
+    Ok(file_count)
+}
+
+fn append_output_files<W: Write>(
+    builder: &mut tar::Builder<W>,
+    project_dir: &Path,
+    output_globs: &[String],
+    archive_prefix: Option<&Path>,
+) -> Result<usize, LpmError> {
     let mut file_count = 0;
 
     for pattern in output_globs {
@@ -190,12 +366,16 @@ fn create_archive(
                 for entry in entries.flatten() {
                     if entry.is_file() {
                         let rel = entry.strip_prefix(project_dir).unwrap_or(&entry);
-                        builder.append_path_with_name(&entry, rel).map_err(|e| {
-                            LpmError::Task(format!(
-                                "failed to add {} to archive: {e}",
-                                entry.display()
-                            ))
-                        })?;
+                        let archive_name = archive_prefix
+                            .map_or_else(|| rel.to_path_buf(), |prefix| prefix.join(rel));
+                        builder
+                            .append_path_with_name(&entry, &archive_name)
+                            .map_err(|e| {
+                                LpmError::Task(format!(
+                                    "failed to add {} to archive: {e}",
+                                    entry.display()
+                                ))
+                            })?;
                         file_count += 1;
                     }
                 }
@@ -203,12 +383,22 @@ fn create_archive(
         }
     }
 
-    builder
-        .finish()
-        .map_err(|e| LpmError::Task(format!("failed to finalize archive: {e}")))?;
-
-    tracing::debug!("archived {file_count} files to {}", archive_path.display());
     Ok(file_count)
+}
+
+fn append_bytes<W: Write>(
+    builder: &mut tar::Builder<W>,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), LpmError> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o600);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, bytes)
+        .map_err(|e| LpmError::Task(format!("failed to add {} to artifact: {e}", path.display())))
 }
 
 /// Expand a glob pattern to cover both directories and files at any depth.
@@ -285,54 +475,98 @@ fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result<(), LpmErr
             .path()
             .map_err(|e| LpmError::Task(format!("failed to read entry path: {e}")))?
             .to_path_buf();
-        if path.components().any(|c| {
-            matches!(
-                c,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        }) {
-            return Err(LpmError::Task(format!(
-                "path traversal in cache archive: {}",
-                path.display()
-            )));
-        }
+        validate_archive_path(&path, "cache archive")?;
 
-        // Refuse non-regular-file entry types — only files and dirs
-        // belong in a task cache. Symlinks would allow disclosing
-        // arbitrary files via later `cat` of the restored path;
-        // hardlinks bind the cached content to an attacker-chosen
-        // existing-file path; FIFOs / char / block / GNU-sparse have
-        // no legitimate task-output meaning.
-        let header_type = entry.header().entry_type();
-        if !(header_type.is_file() || header_type.is_dir()) {
-            return Err(LpmError::Task(format!(
-                "task cache archive contains non-regular entry ({:?}): {}",
-                header_type,
-                path.display(),
-            )));
-        }
+        validate_archive_entry_type(&entry, &path, "task cache archive")?;
 
         let entry_size = entry.header().size().unwrap_or(0);
-        if entry_size > MAX_CACHE_ENTRY_BYTES {
-            return Err(LpmError::Task(format!(
-                "task cache entry exceeds size cap ({} > {} bytes): {}",
-                entry_size,
-                MAX_CACHE_ENTRY_BYTES,
-                path.display(),
-            )));
-        }
-        total_bytes = total_bytes.saturating_add(entry_size);
-        if total_bytes > MAX_CACHE_ARCHIVE_BYTES {
-            return Err(LpmError::Task(format!(
-                "task cache archive exceeds aggregate cap ({MAX_CACHE_ARCHIVE_BYTES} bytes)"
-            )));
-        }
+        check_archive_size_limits(entry_size, &mut total_bytes, &path, "task cache archive")?;
 
         entry
             .unpack_in(project_dir)
             .map_err(|e| LpmError::Task(format!("failed to unpack {}: {e}", path.display())))?;
     }
 
+    Ok(())
+}
+
+fn validate_archive_path(path: &Path, label: &str) -> Result<(), LpmError> {
+    if path.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(LpmError::Task(format!(
+            "path traversal in {label}: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_archive_entry_type(
+    entry: &tar::Entry<'_, impl Read>,
+    path: &Path,
+    label: &str,
+) -> Result<(), LpmError> {
+    let header_type = entry.header().entry_type();
+    if !(header_type.is_file() || header_type.is_dir()) {
+        return Err(LpmError::Task(format!(
+            "{label} contains non-regular entry ({:?}): {}",
+            header_type,
+            path.display(),
+        )));
+    }
+    Ok(())
+}
+
+fn check_archive_size_limits(
+    entry_size: u64,
+    total_bytes: &mut u64,
+    path: &Path,
+    label: &str,
+) -> Result<(), LpmError> {
+    if entry_size > MAX_CACHE_ENTRY_BYTES {
+        return Err(LpmError::Task(format!(
+            "{label} entry exceeds size cap ({} > {} bytes): {}",
+            entry_size,
+            MAX_CACHE_ENTRY_BYTES,
+            path.display(),
+        )));
+    }
+    *total_bytes = total_bytes.saturating_add(entry_size);
+    if *total_bytes > MAX_CACHE_ARCHIVE_BYTES {
+        return Err(LpmError::Task(format!(
+            "{label} exceeds aggregate cap ({MAX_CACHE_ARCHIVE_BYTES} bytes)"
+        )));
+    }
+    Ok(())
+}
+
+fn read_entry_to_string(
+    entry: &mut tar::Entry<'_, impl Read>,
+    path: &Path,
+) -> Result<String, LpmError> {
+    let mut content = String::new();
+    entry
+        .read_to_string(&mut content)
+        .map_err(|e| LpmError::Task(format!("failed to read {}: {e}", path.display())))?;
+    Ok(content)
+}
+
+fn restore_remote_output_file(
+    entry: &mut tar::Entry<'_, impl Read>,
+    project_dir: &Path,
+    rel: &Path,
+) -> Result<(), LpmError> {
+    let target = project_dir.join(rel);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(&target)?;
+    std::io::copy(entry, &mut file)
+        .map_err(|e| LpmError::Task(format!("failed to restore {}: {e}", rel.display())))?;
     Ok(())
 }
 
@@ -450,6 +684,109 @@ mod tests {
 
         // Cleanup this specific entry
         let _ = fs::remove_dir_all(cache_entry_dir(&key).unwrap());
+    }
+
+    #[test]
+    fn remote_artifact_roundtrip_restores_outputs_and_logs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::create_dir_all(dir.path().join("dist")).unwrap();
+        fs::write(dir.path().join("dist/index.js"), "remote output").unwrap();
+
+        let key = unique_key("remote-roundtrip");
+        let artifact_path = dir.path().join("remote-artifact.tar.gz");
+
+        create_remote_artifact(RemoteArtifactCreate {
+            key: &key,
+            project_dir: dir.path(),
+            command: "node build.js",
+            output_globs: &["dist/**".into()],
+            stdout: "remote stdout\n",
+            stderr: "remote stderr\n",
+            duration_ms: 4321,
+            artifact_path: &artifact_path,
+        })
+        .unwrap();
+
+        fs::remove_dir_all(dir.path().join("dist")).unwrap();
+
+        let hit = restore_remote_artifact(&key, &artifact_path, dir.path()).unwrap();
+
+        assert_eq!(hit.meta.command, "node build.js");
+        assert_eq!(hit.meta.cache_key, key);
+        assert_eq!(hit.meta.duration_ms, 4321);
+        assert_eq!(hit.meta.output_file_count, 1);
+        assert_eq!(hit.stdout, "remote stdout\n");
+        assert_eq!(hit.stderr, "remote stderr\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("dist/index.js")).unwrap(),
+            "remote output"
+        );
+    }
+
+    #[test]
+    fn remote_artifact_rejects_cache_key_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("dist")).unwrap();
+        fs::write(dir.path().join("dist/index.js"), "remote output").unwrap();
+
+        let key = unique_key("remote-key");
+        let artifact_path = dir.path().join("remote-key.tar.gz");
+        create_remote_artifact(RemoteArtifactCreate {
+            key: &key,
+            project_dir: dir.path(),
+            command: "node build.js",
+            output_globs: &["dist/**".into()],
+            stdout: "",
+            stderr: "",
+            duration_ms: 1,
+            artifact_path: &artifact_path,
+        })
+        .unwrap();
+
+        let err = restore_remote_artifact("deadbeef", &artifact_path, dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("key mismatch"),
+            "mismatched remote artifact key must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn remote_artifact_rejects_unexpected_top_level_entry() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let artifact_path = dir.path().join("unexpected.tar.gz");
+        let key = unique_key("remote-unexpected");
+
+        {
+            let file = fs::File::create(&artifact_path).unwrap();
+            let enc = GzEncoder::new(file, Compression::fast());
+            let mut builder = tar::Builder::new(enc);
+
+            let meta = CacheMeta {
+                command: "build".into(),
+                cache_key: key.clone(),
+                duration_ms: 1,
+                output_file_count: 0,
+            };
+            let meta_json = serde_json::to_string(&meta).unwrap();
+            append_bytes(
+                &mut builder,
+                Path::new(".lpm-cache/meta.json"),
+                meta_json.as_bytes(),
+            )
+            .unwrap();
+            append_bytes(&mut builder, Path::new("outside.txt"), b"nope").unwrap();
+            builder.finish().unwrap();
+        }
+
+        let err = restore_remote_artifact(&key, &artifact_path, dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected entry"),
+            "unexpected top-level entries must be rejected, got: {err}"
+        );
     }
 
     // -- zip-slip prevention --

@@ -6,6 +6,8 @@
 mod support;
 
 use support::{TempProject, lpm};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn cache_root(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("cache")
@@ -17,6 +19,58 @@ fn seed_subcat(project: &TempProject, subcat: &str, filename: &str, bytes: &[u8]
     let dir = cache_root(project).join(subcat);
     std::fs::create_dir_all(&dir).expect("failed to create cache subcat");
     std::fs::write(dir.join(filename), bytes).expect("failed to seed cache file");
+}
+
+#[tokio::test]
+async fn cache_status_json_reports_local_usage_and_remote_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "enabled",
+            "usageBytes": 1024,
+            "limitBytes": 2048
+        })))
+        .mount(&server)
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
+    seed_subcat(&project, "tasks", "entry.bin", b"cached-task");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("failed to run lpm cache status --json");
+
+    assert!(
+        output.status.success(),
+        "cache status --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("cache status --json must be valid JSON: {e}\n---\n{stdout}"));
+
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert!(envelope["local"]["bytes"].as_u64().unwrap_or(0) >= 11);
+    assert_eq!(envelope["remote"]["enabled"], serde_json::json!(true));
+    assert_eq!(envelope["remote"]["status"], serde_json::json!("enabled"));
+    assert_eq!(envelope["remote"]["usage_bytes"], serde_json::json!(1024));
+    assert_eq!(envelope["remote"]["limit_bytes"], serde_json::json!(2048));
 }
 
 // ─── path subcommand ──────────────────────────────────────────────────

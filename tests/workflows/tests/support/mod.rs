@@ -217,6 +217,12 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
 
     // Clear auth tokens to prevent accidental network calls with real creds
     cmd.remove_env("LPM_TOKEN");
+    cmd.remove_env("LPM_REMOTE_CACHE");
+    cmd.remove_env("LPM_REMOTE_CACHE_TOKEN");
+    cmd.remove_env("LPM_REMOTE_CACHE_URL");
+    cmd.remove_env("LPM_REMOTE_CACHE_TEAM");
+    cmd.remove_env("LPM_REMOTE_CACHE_SIGNATURE_KEY");
+    cmd.remove_env("LPM_REMOTE_CACHE_READ_ONLY");
     cmd.remove_env("NPM_TOKEN");
     cmd.remove_env("GITHUB_TOKEN");
     cmd.remove_env("GITLAB_TOKEN");
