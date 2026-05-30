@@ -14,6 +14,7 @@
 //!   lpm cache clean dlx
 //!   lpm cache path                  prints the cache root
 //!   lpm cache path metadata         prints one subcategory path
+//!   lpm cache status                reports local task cache usage + remote status
 //!
 //! No `--all` flag. If a user wants the store wiped too, they chain
 //! `lpm cache clean && lpm store clean`. Keeping the command/directory
@@ -53,8 +54,9 @@ pub async fn run(
         "clean" | "clear" => run_clean(&root, subcategory, json_output),
         "path" => run_path(&root, subcategory, json_output),
         "prune" => super::cache_prune::run(&root, json_output, prune_flags).await,
+        "status" => run_status(json_output),
         other => Err(LpmError::Registry(format!(
-            "unknown cache action '{other}'. Use: clean [metadata|tasks|dlx], path [metadata|tasks|dlx], prune [--apply] [--max-age <dur>] [--project <path>]"
+            "unknown cache action '{other}'. Use: clean [metadata|tasks|dlx], path [metadata|tasks|dlx], status, prune [--apply] [--max-age <dur>] [--project <path>]"
         ))),
     }
 }
@@ -191,6 +193,20 @@ fn run_path(root: &LpmRoot, subcategory: Option<&str>, json_output: bool) -> Res
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         println!("{}", path.display());
+    }
+    Ok(())
+}
+
+fn run_status(json_output: bool) -> Result<(), LpmError> {
+    let cwd = std::env::current_dir()?;
+    let status = super::remote_cache::status_for_project(&cwd);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&super::remote_cache::cache_status_json(&status)).unwrap()
+        );
+    } else {
+        super::remote_cache::print_cache_status_human(&status);
     }
     Ok(())
 }

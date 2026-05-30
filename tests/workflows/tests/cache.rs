@@ -6,6 +6,8 @@
 mod support;
 
 use support::{TempProject, lpm};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn cache_root(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("cache")
@@ -17,6 +19,165 @@ fn seed_subcat(project: &TempProject, subcat: &str, filename: &str, bytes: &[u8]
     let dir = cache_root(project).join(subcat);
     std::fs::create_dir_all(&dir).expect("failed to create cache subcat");
     std::fs::write(dir.join(filename), bytes).expect("failed to seed cache file");
+}
+
+#[tokio::test]
+async fn cache_status_json_reports_local_usage_and_remote_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "enabled",
+            "usageBytes": 1024,
+            "limitBytes": 2048
+        })))
+        .mount(&server)
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
+    seed_subcat(&project, "tasks", "entry.bin", b"cached-task");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("failed to run lpm cache status --json");
+
+    assert!(
+        output.status.success(),
+        "cache status --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("cache status --json must be valid JSON: {e}\n---\n{stdout}"));
+
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert!(envelope["local"]["bytes"].as_u64().unwrap_or(0) >= 11);
+    assert_eq!(envelope["remote"]["enabled"], serde_json::json!(true));
+    assert_eq!(envelope["remote"]["status"], serde_json::json!("enabled"));
+    assert_eq!(envelope["remote"]["usage_bytes"], serde_json::json!(1024));
+    assert_eq!(envelope["remote"]["limit_bytes"], serde_json::json!(2048));
+}
+
+#[tokio::test]
+async fn cache_status_does_not_send_registry_token_to_third_party_host() {
+    // A checked-in lpm.json must not be able to redirect the ambient registry
+    // token (LPM_TOKEN) to an arbitrary cache host. With no cache-specific
+    // token and a non-lpm.dev URL, the client must refuse rather than leak.
+    let server = MockServer::start().await;
+    // Deliberately mount NO routes: any request that arrives is the leak.
+
+    let project = TempProject::empty(r#"{"name":"cache-token-leak","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "super-secret-registry-token")
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("failed to run lpm cache status --json");
+
+    assert!(
+        output.status.success(),
+        "cache status is best-effort and must not hard-fail:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "registry token must never be sent to a non-lpm.dev cache host, got {} request(s)",
+        requests.len(),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("cache status --json must be valid JSON: {e}\n---\n{stdout}"));
+    let error = envelope["remote"]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("LPM_REMOTE_CACHE_TOKEN"),
+        "third-party cache host without a cache token must report a token-required error, got: {error}",
+    );
+}
+
+#[tokio::test]
+async fn cache_status_requires_signing_key_for_third_party_cache_host() {
+    let server = MockServer::start().await;
+
+    let project = TempProject::empty(r#"{"name":"cache-signing-required","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("failed to run lpm cache status --json");
+
+    assert!(
+        output.status.success(),
+        "cache status is best-effort and must not hard-fail:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "third-party remote cache without a signing key must not be contacted, got {} request(s)",
+        requests.len(),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("cache status --json must be valid JSON: {e}\n---\n{stdout}"));
+    let error = envelope["remote"]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("LPM_REMOTE_CACHE_SIGNATURE_KEY"),
+        "third-party cache host without a signing key must report a signing-key-required error, got: {error}",
+    );
 }
 
 // ─── path subcommand ──────────────────────────────────────────────────

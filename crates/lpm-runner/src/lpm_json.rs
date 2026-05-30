@@ -4,6 +4,7 @@
 //! - `runtime` — pinned runtime versions (e.g., `{"node": ">=22.0.0"}`)
 //! - `env` — env file mapping per script (e.g., `{"dev": ".env.development"}`)
 //! - `tasks` — task configuration with caching, dependencies, outputs
+//! - `remoteCache` — hosted cache settings for cache-enabled tasks
 //!
 //! This file is optional. Falls back to `package.json` fields when absent.
 
@@ -28,6 +29,10 @@ pub struct LpmJsonConfig {
     /// Task configuration for caching, dependency ordering, and outputs.
     #[serde(default)]
     pub tasks: HashMap<String, TaskConfig>,
+
+    /// Hosted task cache configuration.
+    #[serde(default, rename = "remoteCache")]
+    pub remote_cache: Option<RemoteCacheConfig>,
 
     /// Pinned tool plugin versions.
     /// e.g., `{"oxlint": "1.57.0", "biome": "2.4.8"}`
@@ -75,6 +80,52 @@ pub struct LpmJsonConfig {
     /// surface by treating arbitrary strings from `lpm.json` as trustworthy.
     #[serde(default)]
     pub cert: Option<CertBlock>,
+}
+
+/// Hosted cache configuration in `lpm.json`.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCacheConfig {
+    /// Enable hosted task cache reads and writes for cache-enabled tasks.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Organization slug/team namespace. Omit for the authenticated personal namespace.
+    #[serde(default)]
+    pub team: Option<String>,
+
+    /// Remote cache service URL. Defaults to the configured LPM registry plus `/v8`.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// Require HMAC tags on downloads and attach them to uploads.
+    #[serde(default)]
+    pub signature: bool,
+
+    /// Read remote artifacts but do not upload newly produced artifacts.
+    #[serde(default, rename = "readOnly")]
+    pub read_only: bool,
+
+    /// Controls which loaded environment variables may be used with remote uploads.
+    #[serde(default)]
+    pub env: RemoteCacheEnvConfig,
+}
+
+/// Env safety controls for hosted task cache uploads.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCacheEnvConfig {
+    /// Variable-name patterns explicitly allowed for remote uploads.
+    #[serde(default)]
+    pub include: Vec<String>,
+
+    /// Variable-name patterns that block remote uploads.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+
+    /// Permit secret-looking variable names after explicit project opt-in.
+    #[serde(default, rename = "allowSecrets")]
+    pub allow_secrets: bool,
 }
 
 /// `cert` configuration block in `lpm.json`.
@@ -358,7 +409,8 @@ pub fn generate_schema() -> serde_json::Value {
         serde_json::Value::String(
             "Project-level LPM configuration. Sits alongside package.json and \
              provides runtime pinning, env file mapping, task runner config, \
-             dev services, publish targets, and tunnel/HTTPS settings."
+             hosted task cache settings, dev services, publish targets, and \
+             tunnel/HTTPS settings."
                 .to_string(),
         ),
     );
@@ -526,6 +578,7 @@ mod tests {
             tasks: HashMap::new(),
             tools: HashMap::new(),
             services: HashMap::new(),
+            remote_cache: None,
             https: None,
             tunnel: None,
             publish: None,
@@ -594,6 +647,40 @@ mod tests {
         assert_eq!(dev.command.as_deref(), Some("vite dev"));
         assert_eq!(dev.env.as_deref(), Some("development"));
         assert!(!dev.cache);
+    }
+
+    #[test]
+    fn read_lpm_json_with_remote_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "remoteCache": {
+                    "enabled": true,
+                    "team": "acme",
+                    "url": "http://localhost:3000/v8",
+                    "signature": true,
+                    "readOnly": true,
+                    "env": {
+                        "include": ["CI"],
+                        "exclude": ["*_TOKEN"],
+                        "allowSecrets": true
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = read_lpm_json(dir.path()).unwrap().unwrap();
+        let remote = config.remote_cache.expect("remote cache parsed");
+        assert!(remote.enabled);
+        assert_eq!(remote.team.as_deref(), Some("acme"));
+        assert_eq!(remote.url.as_deref(), Some("http://localhost:3000/v8"));
+        assert!(remote.signature);
+        assert!(remote.read_only);
+        assert_eq!(remote.env.include, vec!["CI"]);
+        assert_eq!(remote.env.exclude, vec!["*_TOKEN"]);
+        assert!(remote.env.allow_secrets);
     }
 
     #[test]

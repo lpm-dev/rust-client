@@ -2,7 +2,7 @@ use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_runner::bin_path::ManagedRuntimeHint;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -1782,6 +1782,8 @@ struct CacheContext {
     task_config: lpm_runner::lpm_json::TaskConfig,
     cache_key: String,
     command: String,
+    env_vars: HashMap<String, String>,
+    remote_cache: Option<crate::commands::remote_cache::RemoteCacheClient>,
 }
 
 /// Build the cache context for a task: reads lpm.json (or uses provided config),
@@ -1844,6 +1846,8 @@ fn build_cache_context(
         task_config: task_config.clone(),
         cache_key,
         command,
+        env_vars,
+        remote_cache: crate::commands::remote_cache::client_from_config(config_ref),
     }))
 }
 
@@ -1864,6 +1868,24 @@ fn try_cache_hit_with_config(
 
     if lpm_task::cache::has_cache_hit(&ctx.cache_key) {
         let hit = lpm_task::cache::restore_cache(&ctx.cache_key, project_dir)?;
+        return Ok(Some(hit));
+    }
+
+    if let Some(remote_cache) = &ctx.remote_cache
+        && let Some(hit) =
+            crate::commands::remote_cache::try_restore(remote_cache, &ctx.cache_key, project_dir)
+    {
+        if let Err(error) = lpm_task::cache::store_cache(
+            &ctx.cache_key,
+            project_dir,
+            &hit.meta.command,
+            &ctx.task_config.outputs,
+            &hit.stdout,
+            &hit.stderr,
+            hit.meta.duration_ms,
+        ) {
+            tracing::warn!("failed to populate local task cache from remote hit: {error}");
+        }
         return Ok(Some(hit));
     }
 
@@ -1895,6 +1917,20 @@ fn try_cache_store_with_output_and_config(
         stderr,
         duration_ms,
     )?;
+
+    if let Some(remote_cache) = &ctx.remote_cache {
+        crate::commands::remote_cache::try_store(
+            remote_cache,
+            &ctx.cache_key,
+            project_dir,
+            &ctx.command,
+            &ctx.task_config.outputs,
+            stdout,
+            stderr,
+            duration_ms,
+            &ctx.env_vars,
+        );
+    }
 
     tracing::debug!(
         "stored cache for task '{script_name}' (key: {}, stdout: {} bytes)",
