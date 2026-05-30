@@ -1,6 +1,6 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
+use std::path::Path;
 
 /// resolve a usable LPM bearer for Swift Package Manager
 /// integration. SPM's login flow takes the token as a CLI arg, so a
@@ -64,10 +64,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
     let is_https = registry_url.starts_with("https://");
 
     if !json_output {
-        output::info(&format!(
-            "Configuring SPM to use LPM registry at {}",
-            swift_registry_url.bold()
-        ));
+        install_ui::phase("Configuring Swift Package Manager for lpmdev");
     }
 
     // Step 1: Set the registry for the lpmdev scope
@@ -115,12 +112,15 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
             "swift package-registry set failed".into(),
         ));
     }
+    if !json_output {
+        install_ui::done(&scope_set_message(&swift_registry_url));
+    }
 
     // Step 2: Login with LPM token (HTTPS only — SPM refuses auth over HTTP)
     if is_https {
         if let Some(token) = resolve_lpm_bearer_optional(registry_url).await {
             if !json_output {
-                output::info("Configuring authentication...");
+                install_ui::phase("Configuring authentication");
             }
 
             // SPM's `swift package-registry login` does not support reading
@@ -173,16 +173,18 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
                 login_result.map_err(|e| LpmError::Registry(format!("swift login failed: {e}")))?;
 
             if !login_status.success() {
-                output::warn(
+                install_ui::warn(
                     "Token login failed — you may need to run: swift package-registry login manually",
                 );
+            } else if !json_output {
+                install_ui::done("Authentication configured");
             }
         } else if !json_output {
             // User-facing binary name is `lpm`, not `lpm-rs`
-            output::warn("No LPM token found — run `lpm login` first for authenticated access");
+            install_ui::warn("No LPM token found — run `lpm login` first for authenticated access");
         }
     } else if !json_output {
-        output::warn("HTTP registry — SPM won't send auth. Use HTTPS in production.");
+        install_ui::warn("HTTP registry — SPM won't send auth. Use HTTPS in production.");
     }
 
     // Step 3: Install signing certificate to SPM trust store. Fatal on
@@ -224,34 +226,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        println!();
-        output::success("SPM configured to use LPM registry");
-        println!(
-            "  {} LPM signing cert installed; CMS detached signature integrity is checked.",
-            "✔".green()
-        );
-        println!(
-            "  {} Signer trust = silentAllow for the lpmdev scope.",
-            "ⓘ".dimmed()
-        );
-        println!(
-            "  {} Trust anchor: HTTPS to {} (not a public-CA-chained signer).",
-            "ⓘ".dimmed(),
-            "lpm.dev".bold()
-        );
-        println!();
-        println!("  Use in Package.swift:");
-        println!(
-            "    {}",
-            ".package(id: \"lpmdev.<owner>_<package>\", from: \"1.0.0\")".dimmed()
-        );
-        println!();
-        println!(
-            "  Identity mapping: {} → {}",
-            "@lpm.dev/owner.pkg".dimmed(),
-            "lpmdev.owner_pkg".bold()
-        );
-        println!();
+        install_ui::done("Done · Swift registry integration is ready");
     }
 
     Ok(())
@@ -332,7 +307,7 @@ pub async fn ensure_configured(
                 "SwiftPM `lpmdev` scope is mapped to a non-LPM URL — re-resolving",
             );
             if !json_output {
-                output::warn(&format!(
+                install_ui::warn(&format!(
                     "SwiftPM `lpmdev` scope mapped to {existing}, expected {swift_registry_url} — re-resolving"
                 ));
             }
@@ -341,7 +316,7 @@ pub async fn ensure_configured(
     }
 
     if !json_output {
-        output::info("Configuring SPM registry scope for lpmdev...");
+        install_ui::phase("Configuring Swift Package Manager for lpmdev");
     }
 
     // Step 1: Set the registry scope
@@ -369,6 +344,9 @@ pub async fn ensure_configured(
         return Err(LpmError::Registry(
             "Failed to configure SPM registry scope. Run `lpm swift-registry` manually.".into(),
         ));
+    }
+    if !json_output {
+        install_ui::done(&scope_set_message(&swift_registry_url));
     }
 
     // Step 2: Login (HTTPS only)
@@ -447,16 +425,16 @@ async fn install_signing_certificate(
     // previously-truncated install (empty / aborted writes).
     if !force && is_cert_valid(&cert_path) {
         if !json_output {
-            output::info("Signing certificate already installed");
+            install_ui::done(&signing_certificate_already_installed_message(&cert_path));
         }
         return Ok(CertOutcome::AlreadyInstalled);
     }
 
     if !json_output {
         if force && cert_path.exists() {
-            output::info("Force re-downloading signing certificate...");
+            install_ui::phase("Re-downloading package signing certificate");
         } else {
-            output::info("Installing package signing certificate...");
+            install_ui::phase("Installing package signing certificate");
         }
     }
 
@@ -504,10 +482,7 @@ async fn install_signing_certificate(
     })?;
 
     if !json_output {
-        output::info(&format!(
-            "Signing certificate installed to {}",
-            cert_path.display().to_string().dimmed()
-        ));
+        install_ui::done(&signing_certificate_installed_message(&cert_path));
     }
 
     Ok(CertOutcome::Installed)
@@ -566,6 +541,9 @@ fn configure_signing_trust(json_output: bool) -> Result<TrustOutcome, LpmError> 
         .is_some_and(|v| v == "silentAllow");
 
     if already_configured {
+        if !json_output {
+            install_ui::done(&signing_trust_already_configured_message(&config_path));
+        }
         return Ok(TrustOutcome::AlreadyConfigured);
     }
 
@@ -649,10 +627,82 @@ fn configure_signing_trust(json_output: bool) -> Result<TrustOutcome, LpmError> 
     })?;
 
     if !json_output {
-        output::info("Configured signing trust policy in registries.json");
+        install_ui::done(&signing_trust_updated_message(&config_path));
     }
 
     Ok(TrustOutcome::Configured)
+}
+
+fn scope_set_message(swift_registry_url: &str) -> String {
+    format!("Scope set: lpmdev → {swift_registry_url}")
+}
+
+fn signing_certificate_installed_message(cert_path: &Path) -> String {
+    let home = dirs::home_dir();
+    signing_certificate_installed_message_with_home(cert_path, home.as_deref())
+}
+
+fn signing_certificate_installed_message_with_home(
+    cert_path: &Path,
+    home: Option<&Path>,
+) -> String {
+    format!(
+        "Installed signing certificate {}",
+        display_home_relative_with(cert_path, home)
+    )
+}
+
+fn signing_certificate_already_installed_message(cert_path: &Path) -> String {
+    let home = dirs::home_dir();
+    signing_certificate_already_installed_message_with_home(cert_path, home.as_deref())
+}
+
+fn signing_certificate_already_installed_message_with_home(
+    cert_path: &Path,
+    home: Option<&Path>,
+) -> String {
+    format!(
+        "Signing certificate already installed {}",
+        display_home_relative_with(cert_path, home)
+    )
+}
+
+fn signing_trust_updated_message(config_path: &Path) -> String {
+    let home = dirs::home_dir();
+    signing_trust_updated_message_with_home(config_path, home.as_deref())
+}
+
+fn signing_trust_updated_message_with_home(config_path: &Path, home: Option<&Path>) -> String {
+    format!("Updated {}", display_home_relative_with(config_path, home))
+}
+
+fn signing_trust_already_configured_message(config_path: &Path) -> String {
+    let home = dirs::home_dir();
+    signing_trust_already_configured_message_with_home(config_path, home.as_deref())
+}
+
+fn signing_trust_already_configured_message_with_home(
+    config_path: &Path,
+    home: Option<&Path>,
+) -> String {
+    format!(
+        "Signing trust already configured {}",
+        display_home_relative_with(config_path, home)
+    )
+}
+
+fn display_home_relative_with(path: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return path.display().to_string();
+    };
+    let Ok(relative) = path.strip_prefix(home) else {
+        return path.display().to_string();
+    };
+    if relative.as_os_str().is_empty() {
+        "~".to_string()
+    } else {
+        format!("~/{}", relative.display())
+    }
 }
 
 #[cfg(test)]
@@ -746,12 +796,29 @@ mod tests {
         assert!(is_cert_valid(&path));
     }
 
-    // Binary name should be `lpm`, not `lpm-rs`.
-    // This is a string literal test — we verify the warning message references the correct name.
-    // The actual string is on the `output::warn` call in the `run` function.
-    // We can't easily unit-test the full `run` function (it requires subprocess + network),
-    // but we verify the constant is correct by checking source text indirectly.
-    // The real coverage comes from the code review + the edit itself.
+    #[test]
+    fn swift_registry_slim_messages_match_design_copy() {
+        let home = std::path::PathBuf::from("/Users/example");
+        let cert_path = home.join(".swiftpm/security/trusted-root-certs/lpm.der");
+        let config_path = home.join(".swiftpm/configuration/registries.json");
+
+        assert_eq!(
+            scope_set_message("https://lpm.dev/api/swift-registry"),
+            "Scope set: lpmdev → https://lpm.dev/api/swift-registry"
+        );
+        assert_eq!(
+            display_home_relative_with(&cert_path, Some(&home)),
+            "~/.swiftpm/security/trusted-root-certs/lpm.der"
+        );
+        assert_eq!(
+            signing_certificate_installed_message_with_home(&cert_path, Some(&home)),
+            "Installed signing certificate ~/.swiftpm/security/trusted-root-certs/lpm.der"
+        );
+        assert_eq!(
+            signing_trust_updated_message_with_home(&config_path, Some(&home)),
+            "Updated ~/.swiftpm/configuration/registries.json"
+        );
+    }
 
     // configure_signing_trust tests use the real home dir, so we test the
     // serialization/merge logic on mock JSON structures instead.

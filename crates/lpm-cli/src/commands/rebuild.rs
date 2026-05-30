@@ -29,7 +29,7 @@
 //!   entire group (not just the direct child), preventing orphaned subprocesses
 //! - On Windows: `Child::kill()` terminates the process tree via `TerminateProcess`
 
-use crate::output;
+use crate::install_ui;
 use crate::script_policy_config::ScriptPolicy;
 use lpm_common::LpmError;
 use lpm_sandbox::SandboxMode;
@@ -271,7 +271,7 @@ async fn run_under_store_lock(
         crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir).deny_all;
     if deny_all || config_deny_all {
         if !json_output {
-            output::warn(
+            install_ui::warn(
                 "Script execution denied. All scripts are blocked by --deny-all or lpm.scripts.denyAll config.",
             );
         }
@@ -394,7 +394,7 @@ async fn run_under_store_lock(
         // Surface drift to the user — even though the script is skipped,
         // they need to know WHY so they can re-review with `lpm approve-scripts`.
         if trust_reason == TrustReason::BindingDrift && !json_output {
-            output::warn(&format!(
+            install_ui::warn(&format!(
                 "{}: stored approval drifted (script changed since approval). \
                  Re-run `lpm approve-scripts {}` to re-review.",
                 lp.name, lp.name,
@@ -406,7 +406,7 @@ async fn run_under_store_lock(
         // `LegacyName` only when `TrustMatch::LegacyNameOnly` won AND
         // scope did not).
         if trust_reason == TrustReason::LegacyName && !json_output {
-            output::warn(&format!(
+            install_ui::warn(&format!(
                 "{}: legacy bare-name trustedDependencies entry — run \
                  `lpm approve-scripts {}` to upgrade to a strict (script-hash-bound) approval",
                 lp.name, lp.name,
@@ -455,7 +455,7 @@ async fn run_under_store_lock(
             .filter(|p| p.trust_reason == TrustReason::SuspendedByForceFloor)
             .count();
         if suspended_count > 0 {
-            output::warn(&format!(
+            install_ui::warn(&format!(
                 "{suspended_count} approval(s) suspended by \
                  `force-security-floor = true` in ~/.lpm/config.toml. \
                  Run `lpm config unset force-security-floor` to reactivate."
@@ -465,7 +465,7 @@ async fn run_under_store_lock(
 
     if scriptable_packages.is_empty() {
         if !json_output {
-            output::success("No packages have lifecycle scripts. Nothing to build.");
+            install_ui::done("No packages have lifecycle scripts · nothing to build");
         }
         // Warn about stale trustedDependencies entries
         if !json_output {
@@ -490,7 +490,7 @@ async fn run_under_store_lock(
             match found {
                 Some(pkg) => selected.push(pkg),
                 None => {
-                    output::warn(&format!(
+                    install_ui::warn(&format!(
                         "{name} has no lifecycle scripts or is not installed"
                     ));
                 }
@@ -550,7 +550,7 @@ async fn run_under_store_lock(
                 && specific_packages.is_empty()
                 && effective_policy != ScriptPolicy::Allow
             {
-                output::warn(&format!(
+                install_ui::warn(&format!(
                     "{untrusted_unbuilt_count_local} package(s) are not in trustedDependencies and will be skipped."
                 ));
                 if effective_policy == ScriptPolicy::Triage {
@@ -566,7 +566,7 @@ async fn run_under_store_lock(
                     );
                 }
             } else {
-                output::success(&format!(
+                install_ui::done(&format!(
                     "All {built}/{total} packages with scripts are already built."
                 ));
                 if !force {
@@ -596,7 +596,7 @@ async fn run_under_store_lock(
             crate::security_floor::attach_security_posture(&mut json, force_security_floor);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            output::info(&format!(
+            install_ui::phase(&format!(
                 "Dry run: {} package(s) would be built:",
                 to_build.len()
             ));
@@ -672,7 +672,7 @@ async fn run_under_store_lock(
     // any human-readable continuation text on stdout breaks
     // `JSON.parse`. Surfaced by the subprocess integration
     // fixture which routes stdout through `serde_json::from_str`.
-    // The adjacent `output::warn` already emits on stderr via
+    // The adjacent slim warning already emits on stderr via
     // cliclack; routing the continuation there too keeps the
     // two-line UX visually grouped on the same stream.
     // close-out the "will be skipped" warning is
@@ -693,7 +693,7 @@ async fn run_under_store_lock(
         && specific_packages.is_empty()
         && effective_policy != ScriptPolicy::Allow
     {
-        output::warn(&format!(
+        install_ui::warn(&format!(
             "{untrusted_unbuilt_count} package(s) are not in trustedDependencies and will be skipped."
         ));
         if effective_policy == ScriptPolicy::Triage {
@@ -711,7 +711,7 @@ async fn run_under_store_lock(
     }
 
     if !json_output {
-        output::info(&format!("Building {} package(s)...", to_build.len()));
+        install_ui::phase("Rebuilding lifecycle scripts for trusted packages");
         // summary line for green-tier auto-
         // approvals. Under `script-policy = "triage"`, the shared
         // [`evaluate_trust`] helper promotes packages whose lifecycle
@@ -725,7 +725,7 @@ async fn run_under_store_lock(
             .filter(|p| p.trust_reason == TrustReason::GreenTierUnderTriage)
             .count();
         if green_auto_count > 0 {
-            output::info(&format!(
+            install_ui::phase(&format!(
                 "  {green_auto_count} of these were auto-approved by green-tier classification \
                  (script-policy = \"triage\"). Run `lpm rebuild --dry-run` to see why."
             ));
@@ -802,12 +802,12 @@ async fn run_under_store_lock(
             );
         }
         if !json_output {
-            output::warn(
+            install_ui::warn(
                 "sandbox disabled: credential env vars will NOT be stripped and scripts run \
                  WITHOUT filesystem / network containment.",
             );
             if in_ci {
-                output::warn(
+                install_ui::warn(
                     "CI environment detected with sandbox disabled — confirm this is intentional. \
                      The default (containment ON) is the safer posture for CI.",
                 );
@@ -972,7 +972,7 @@ async fn run_under_store_lock(
         // probe's effective posture is `Degraded`. The structured
         // line names kernel + active ABI + missing dimension so log
         // scrapers can detect the gap mechanically. Human mode
-        // formats via `output::warn`; JSON mode emits the same line
+        // formats via the slim warning path; JSON mode emits the same line
         // via `tracing::warn` so consumers running with `RUST_LOG=warn`
         // see the degraded posture without parsing stderr — the JSON
         // envelope on stdout stays well-formed. Previously suppressed
@@ -981,15 +981,15 @@ async fn run_under_store_lock(
         if let Some(line) = probe_sandbox.posture().degraded_warning_line() {
             // M65: always emit via tracing::warn (CI / RUST_LOG=warn
             // pipelines pick it up regardless of output mode) AND via
-            // output::warn for the human path. Pre-fix, JSON mode
+            // a slim warning for the human path. Pre-fix, JSON mode
             // emitted via tracing only and human mode emitted via
             // output only — splitting the visibility unnecessarily.
             // Now both paths fire in both modes; the degraded posture
             // is a security signal a strict-mode user must not miss.
             tracing::warn!(target: "lpm_cli::sandbox", "{line}");
             if !json_output {
-                output::warn(&line);
-                output::warn(
+                install_ui::warn(&line);
+                install_ui::warn(
                     "strict sandbox requested but kernel-level network containment is NOT \
                      enforced under this posture. Lifecycle scripts can reach the network. \
                      Either upgrade to kernel >= 6.7 (landlock V4) or unset \
@@ -1037,7 +1037,7 @@ async fn run_under_store_lock(
         && let Some(line) =
             crate::sandbox_config::strict_banner_for_runtime(sandbox_mode, resolved_sandbox_mode)
     {
-        output::warn(line);
+        install_ui::warn(line);
     }
     if sandbox_log {
         // The `--sandbox-log` banner is a SECURITY signal — the user
@@ -1045,7 +1045,7 @@ async fn run_under_store_lock(
         // install effectively unsandboxed on macOS. JSON-mode callers
         // (CI / agents) need to know they're NOT getting enforcement,
         // so emit via `tracing::warn` (lands on stderr regardless of
-        // mode) AND via `output::warn` for the human path. Matches
+        // mode) AND via a slim warning for the human path. Matches
         // the M11/L11 posture for the same class of "loud signal
         // must survive --json" warnings.
         tracing::warn!(
@@ -1053,7 +1053,7 @@ async fn run_under_store_lock(
             "--sandbox-log: diagnostic mode only — rule triggers are LOGGED but NOT enforced. Do not treat a clean run as a safety signal."
         );
         if !json_output {
-            output::warn(
+            install_ui::warn(
                 "--sandbox-log: diagnostic mode only. Rule triggers are logged but NOT \
                  enforced — do not treat a clean run as a safety signal. View reported \
                  accesses via `log show --last 5m --predicate 'senderImagePath CONTAINS \
@@ -1100,7 +1100,7 @@ async fn run_under_store_lock(
             Ok(d) => d,
             Err(e) => {
                 if !json_output {
-                    println!("    {} {e}", "✖".red());
+                    println!("    {} {e}", "✗".red());
                 }
                 // Always to stderr so JSON consumers (parsing stdout)
                 // still see the failure; the summary `failed` count
@@ -1145,7 +1145,7 @@ async fn run_under_store_lock(
                 Err(e) => {
                     pkg_success = false;
                     if !json_output {
-                        println!("    {} {phase} failed: {e}", "✖".red());
+                        println!("    {} {phase} failed: {e}", "✗".red());
                     }
                     break; // Don't run subsequent phases if one fails
                 }
@@ -1175,9 +1175,9 @@ async fn run_under_store_lock(
         crate::security_floor::attach_security_posture(&mut json, force_security_floor);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if failures == 0 {
-        output::success(&format!("{successes} package(s) built successfully."));
+        install_ui::done(&format!("{successes} package(s) built successfully"));
     } else {
-        output::warn(&format!("{successes} succeeded, {failures} failed."));
+        install_ui::warn(&format!("{successes} succeeded, {failures} failed"));
     }
 
     if failures > 0 {
@@ -2731,7 +2731,7 @@ pub fn show_install_build_hint(
     }
 
     println!();
-    output::info(&format!(
+    install_ui::phase(&format!(
         "{} package(s) have install scripts:",
         unbuilt.len()
     ));
@@ -3005,7 +3005,7 @@ fn warn_stale_trusted_deps(policy: &SecurityPolicy, scriptable_packages: &[Scrip
 
     if !stale.is_empty() {
         stale.sort();
-        output::warn(&format!(
+        install_ui::warn(&format!(
             "Stale trustedDependencies (no lifecycle scripts): {}",
             stale.join(", ")
         ));

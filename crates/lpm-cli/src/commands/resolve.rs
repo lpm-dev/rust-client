@@ -1,5 +1,5 @@
 use crate::commands::registry_reads::prepare_routed_read_context;
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -37,10 +37,13 @@ pub async fn run(
 
     let start = Instant::now();
 
-    output::info(&format!(
-        "Resolving {} package(s)...",
-        deps.len().to_string().bold()
-    ));
+    if !json_output {
+        install_ui::phase(&format!(
+            "Resolving {} {}",
+            install_ui::bold(&deps.len().to_string()),
+            install_ui::packages_word(deps.len())
+        ));
+    }
 
     let top_level_specs: Vec<String> = deps.keys().cloned().collect();
     let context = prepare_routed_read_context(client, project_dir, &top_level_specs, json_output)?;
@@ -71,11 +74,6 @@ pub async fn run(
                 return Ok(());
             }
 
-            output::success(&format!(
-                "Resolved {} package(s) in {:.1}s",
-                resolved.len().to_string().bold(),
-                elapsed.as_secs_f64()
-            ));
             println!();
 
             for r in resolved {
@@ -92,6 +90,13 @@ pub async fn run(
                 );
             }
             println!();
+            let duration = install_ui::format_duration(elapsed);
+            install_ui::done(&format!(
+                "Resolved {} {} in {}",
+                install_ui::bold(&resolved.len().to_string()),
+                install_ui::packages_word(resolved.len()),
+                install_ui::green(&duration)
+            ));
 
             Ok(())
         }

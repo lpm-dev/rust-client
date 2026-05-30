@@ -282,16 +282,16 @@ fn doctor_default_human_output_suppresses_passes_except_linker_mode_when_fails_p
     // Substring match needs care: the strings "package.json" and
     // "Global store" appear in remediation details for other rows
     // ("run: lpm install (creates package.json)" style). Anchor on
-    // the row prefix `✔ {name}` — the `name` is the second token
+    // the row prefix `✓ {name}` — the `name` is the second token
     // after the icon, and the suppressed rows have a `✔` icon.
     // With NO_COLOR=1, icons render as bare unicode characters.
     assert!(
-        !stdout.contains("✔ package.json"),
+        !stdout.contains("✓ package.json"),
         "fast-mode human output must suppress the `package.json` \
          pass row. stdout:\n{stdout}"
     );
     assert!(
-        !stdout.contains("✔ Global store"),
+        !stdout.contains("✓ Global store"),
         "fast-mode human output must suppress the `Global store` \
          pass row. stdout:\n{stdout}"
     );

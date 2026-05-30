@@ -34,7 +34,7 @@ fn sample_quality_report() -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn quality_human_output_groups_checks_and_shows_failed_detail_only() {
+async fn quality_human_output_uses_slim_completion_and_shows_failed_detail_only() {
     let project = TempProject::empty(r#"{"name":"quality-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     mock.with_quality_report("owner.widget", sample_quality_report())
@@ -52,32 +52,37 @@ async fn quality_human_output_groups_checks_and_shows_failed_detail_only() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(combined.contains("owner.widget"), "package name missing");
-    assert!(combined.contains("score"), "score field missing");
-    assert!(combined.contains("tier"), "tier field missing");
-    assert!(combined.contains("ecosystem"), "ecosystem field missing");
-    assert!(combined.contains("docs"), "docs category missing");
-    assert!(combined.contains("security"), "security category missing");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("owner.widget"), "package name missing");
+    assert!(stdout.contains("score"), "score field missing");
+    assert!(stdout.contains("tier"), "tier field missing");
+    assert!(stdout.contains("ecosystem"), "ecosystem field missing");
+    assert!(stdout.contains("checks"), "checks section missing");
     assert!(
-        combined.contains("README present"),
+        stdout.contains("✓ README present"),
         "passed check label missing"
     );
     assert!(
-        combined.contains("Provenance attestations"),
+        stdout.contains("✗ Provenance attestations"),
         "failed check label missing"
     );
     assert!(
-        combined.contains("missing provenance attestations"),
+        stdout.contains("missing provenance attestations"),
         "failed detail must be shown"
     );
     assert!(
-        !combined.contains("this detail must stay hidden"),
+        !stdout.contains("this detail must stay hidden"),
         "passed-check detail must stay hidden"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Quality report ready"),
+        "quality must finish with a slim completion line, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "quality must not use cliclack gutter output, got:\n{stderr}",
     );
 }
 

@@ -10,6 +10,25 @@ use support::{TempProject, lpm};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[derive(Clone, Default)]
 struct RemoteCacheState {
     artifact: Arc<Mutex<Option<Vec<u8>>>>,
@@ -192,6 +211,40 @@ fn run_script_output_reaches_stdout() {
     assert!(
         combined.contains("built"),
         "expected 'built' in output, got:\n{combined}"
+    );
+}
+
+#[test]
+fn run_human_output_uses_slim_status_lines() {
+    let project = TempProject::from_fixture("with-scripts");
+
+    let output = lpm(&project)
+        .args(["run", "build"])
+        .output()
+        .expect("failed to run lpm run build");
+
+    assert!(
+        output.status.success(),
+        "run build must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+    assert!(
+        combined.contains("› Running build"),
+        "must show slim run phase; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("built"),
+        "must preserve script output; got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('│') && !combined.contains('◇'),
+        "run output should not use bordered/cliclack glyphs; got:\n{combined}"
     );
 }
 

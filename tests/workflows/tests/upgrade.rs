@@ -283,6 +283,54 @@ async fn upgrade_dry_run_does_not_mutate_manifest_or_lockfile() {
     );
 }
 
+#[tokio::test]
+async fn upgrade_dry_run_human_output_uses_slim_ui() {
+    let pkg = "@lpm.dev/owner.slim-upgrade";
+    let project = TempProject::empty("");
+    seed_pinned_dep(&project, pkg, "^1.0.0", "1.0.0");
+
+    let mock = MockRegistry::start().await;
+    mount_lpm_pkg(&mock, pkg, "1.5.0").await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y", "--dry-run"])
+        .output()
+        .expect("spawn lpm upgrade --dry-run");
+    assert!(
+        out.status.success(),
+        "upgrade --dry-run must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "human status output must stay off stdout; got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("› Checking dependencies for newer matching versions"),
+        "stderr must show the slim checking phase; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("› Upgrading 1 package"),
+        "stderr must show the slim upgrading phase; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("↑ @lpm.dev/owner.slim-upgrade") && stderr.contains("1.0.0 → 1.5.0"),
+        "stderr must show the slim upgrade row; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · would upgrade 1 package (dry run)"),
+        "stderr must show the slim dry-run terminus; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('│') && !stderr.contains('◇'),
+        "dry-run status must not use cliclack's boxed gutter; got:\n{stderr}"
+    );
+}
+
 /// Without `--dry-run`, upgrade rewrites the manifest range and runs
 /// install end-to-end. Asserts the new range lands and the lockfile
 /// reflects the upgraded version.

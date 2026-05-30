@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -19,58 +19,87 @@ pub async fn run(
         return Ok(());
     }
 
-    println!();
-    println!("  {}", report.name.bold());
-    println!();
+    println!("{}", report.name.bold());
 
     if let Some(score) = report.score {
         let max = report.max_score.unwrap_or(100);
         let tier = report.tier.as_deref().unwrap_or("—");
-        output::field("score", &output::score_colored(score, max));
-        output::field("tier", &output::tier_colored(tier));
+        print_field("score", &score_colored(score, max));
+        print_field("tier", &tier_colored(tier));
     }
 
     if let Some(eco) = &report.ecosystem {
-        output::field("ecosystem", eco);
+        print_field("ecosystem", eco);
     }
 
     if !report.checks.is_empty() {
-        // Group by category
-        let mut categories: std::collections::BTreeMap<String, Vec<&lpm_registry::QualityCheck>> =
-            std::collections::BTreeMap::new();
+        println!();
+        println!("checks");
+
+        let label_width = report
+            .checks
+            .iter()
+            .map(|check| check.label.as_deref().unwrap_or(&check.id).len())
+            .max()
+            .unwrap_or(0);
+
         for check in &report.checks {
-            let cat = check.category.as_deref().unwrap_or("other").to_string();
-            categories.entry(cat).or_default().push(check);
-        }
+            let passed = check.passed.unwrap_or(false);
+            let icon = if passed {
+                "✓".green().to_string()
+            } else {
+                "✗".red().to_string()
+            };
+            let label = check.label.as_deref().unwrap_or(&check.id);
+            let points = format_points(passed, check.points.unwrap_or(0), check.max_points);
 
-        for (category, checks) in &categories {
-            output::header(category);
-            for check in checks {
-                let passed = check.passed.unwrap_or(false);
-                let icon = if passed {
-                    "+".green().to_string()
-                } else {
-                    "-".red().to_string()
-                };
-                let label = check.label.as_deref().unwrap_or(&check.id);
-                let points = check.points.unwrap_or(0);
-                let max = check.max_points.unwrap_or(0);
+            println!("  {icon} {label:<label_width$}  {}", points.dimmed());
 
-                println!(
-                    "    [{icon}] {label}  {}",
-                    format!("({points}/{max})").dimmed()
-                );
-
-                if let Some(detail) = &check.detail
-                    && !detail.is_empty()
-                    && !passed
-                {
-                    println!("        {}", detail.dimmed());
-                }
+            if let Some(detail) = &check.detail
+                && !detail.is_empty()
+                && !passed
+            {
+                println!("    {}", detail.dimmed());
             }
         }
     }
 
     println!();
+    install_ui::done("Quality report ready");
     Ok(())
+}
+
+fn print_field(label: &str, value: &str) {
+    println!("  {label:<10} {value}");
+}
+
+fn score_colored(score: u32, max: u32) -> String {
+    let pct = (score * 100).checked_div(max).unwrap_or(0);
+    let text = format!("{score}/{max}");
+    if pct >= 80 {
+        text.green()
+    } else if pct >= 50 {
+        text.yellow()
+    } else {
+        text.red()
+    }
+}
+
+fn tier_colored(tier: &str) -> String {
+    match tier.to_lowercase().as_str() {
+        "gold" | "excellent" => tier.green().bold(),
+        "silver" | "good" => tier.yellow().bold(),
+        "bronze" => tier.red(),
+        _ => tier.dimmed(),
+    }
+}
+
+fn format_points(passed: bool, points: u32, max_points: Option<u32>) -> String {
+    if passed {
+        return format!("+{points}");
+    }
+    match max_points {
+        Some(max) if max > 0 => format!("{points}/{max}"),
+        _ => points.to_string(),
+    }
 }

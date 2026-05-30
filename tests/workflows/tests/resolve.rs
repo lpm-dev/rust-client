@@ -76,8 +76,12 @@ async fn resolve_bare_scoped_package_defaults_to_latest_version_in_human_output(
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("Resolved") && combined.contains("package(s)"),
+        combined.contains("Resolved 1 package in"),
         "expected success summary, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("› Resolving 1 package"),
+        "resolve must use a slim phase line, got:\n{combined}"
     );
     assert!(
         combined.contains(package),
@@ -90,6 +94,10 @@ async fn resolve_bare_scoped_package_defaults_to_latest_version_in_human_output(
     assert!(
         combined.contains("lpm"),
         "resolved LPM package must be labeled as lpm, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('●') && !combined.contains('│'),
+        "resolve output must not use cliclack gutter output, got:\n{combined}"
     );
 }
 

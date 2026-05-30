@@ -1,4 +1,5 @@
 use crate::commands::registry_reads::{prepare_routed_read_context, search_route_for_query};
+use crate::install_ui;
 use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
@@ -15,6 +16,9 @@ pub async fn run(
     let context =
         prepare_routed_read_context(client, project_dir, &[query.to_string()], json_output)?;
     let route = search_route_for_query(&context.route_table, query);
+    if !json_output {
+        install_ui::phase(&format!("Searching lpm.dev for \"{query}\""));
+    }
     let results = context
         .client
         .search_npm_packages_routed(query, limit, route)
@@ -34,7 +38,7 @@ pub async fn run(
     }
 
     if results.packages.is_empty() {
-        output::warn(&format!("No packages found for \"{query}\""));
+        install_ui::warn(&format!("No packages found for \"{query}\""));
         return Ok(());
     }
 
@@ -83,6 +87,12 @@ pub async fn run(
         }
         println!();
     }
+
+    install_ui::done(&format!(
+        "Found {} {}",
+        results.packages.len(),
+        install_ui::packages_word(results.packages.len())
+    ));
 
     Ok(())
 }

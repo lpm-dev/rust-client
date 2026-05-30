@@ -1,5 +1,5 @@
 use super::whoami_ui;
-use crate::auth;
+use crate::{auth, install_ui};
 use lpm_common::color::Painted;
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError};
 use lpm_registry::RegistryClient;
@@ -94,7 +94,11 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             // Storage
             if let Some(limit_bytes) = limits.storage_bytes {
                 let limit_mb = limit_bytes as f64 / (1024.0 * 1024.0);
-                let storage_msg = format!("{:.2}MB / {:.0}MB", storage_mb, limit_mb);
+                let storage_msg = with_usage_bar(
+                    format!("{:.2}MB / {:.0}MB", storage_mb, limit_mb),
+                    usage.storage_bytes,
+                    limit_bytes,
+                );
                 if usage.storage_bytes > limit_bytes {
                     whoami_ui::warn(&format!("Storage: {} (OVER LIMIT)", storage_msg));
                 } else {
@@ -112,7 +116,11 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                         &format!("{} (Unlimited)", usage.private_packages),
                     );
                 } else {
-                    let pkg_msg = format!("{} / {}", usage.private_packages, limit_pkgs);
+                    let pkg_msg = with_usage_bar(
+                        format!("{} / {}", usage.private_packages, limit_pkgs),
+                        usage.private_packages.into(),
+                        limit_pkgs.into(),
+                    );
                     if usage.private_packages > limit_pkgs {
                         whoami_ui::warn(&format!("Private Packages: {} (OVER LIMIT)", pkg_msg));
                     } else {
@@ -158,10 +166,15 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         whoami_ui::list_item("Organizations:");
         for org in &user.organizations {
             let role = org.role.as_deref().unwrap_or("member");
+            let role_label = if role.eq_ignore_ascii_case("admin") {
+                install_ui::yellow_badge(role)
+            } else {
+                role.dimmed()
+            };
             whoami_ui::list_item(&format!(
                 "  {} {}",
                 format!("@lpm.dev/{}.*", org.slug).cyan(),
-                format!("({role})").dimmed()
+                role_label
             ));
         }
     }
@@ -203,6 +216,15 @@ fn login_command_for_registry(registry_url: &str) -> String {
     } else {
         format!("`lpm login --registry {registry_url}`")
     }
+}
+
+fn with_usage_bar(mut message: String, used: u64, limit: u64) -> String {
+    let bar = install_ui::usage_bar(used, limit, 10);
+    if !bar.is_empty() {
+        message.push_str("  ");
+        message.push_str(&bar);
+    }
+    message
 }
 
 #[cfg(test)]

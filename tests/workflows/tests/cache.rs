@@ -75,6 +75,69 @@ async fn cache_status_json_reports_local_usage_and_remote_status() {
 }
 
 #[tokio::test]
+async fn cache_status_human_renders_tables_and_slim_completion() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "enabled",
+            "usageBytes": 1024,
+            "limitBytes": 2048
+        })))
+        .mount(&server)
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
+    seed_subcat(&project, "tasks", "entry.bin", b"cached-task");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["cache", "status"])
+        .output()
+        .expect("failed to run lpm cache status");
+
+    assert!(
+        output.status.success(),
+        "cache status failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Local cache") && stdout.contains("Remote cache"),
+        "cache status must render local and remote sections, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1.0 KB / 2.0 KB  █████░░░░░"),
+        "cache status must render remote usage with a quota bar, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Cache status loaded"),
+        "cache status must report a slim completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "cache status output must not use cliclack gutter output, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn cache_status_does_not_send_registry_token_to_third_party_host() {
     // A checked-in lpm.json must not be able to redirect the ambient registry
     // token (LPM_TOKEN) to an arbitrary cache host. With no cache-specific
@@ -295,6 +358,15 @@ fn cache_clean_blanket_removes_all_three_subcategories() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Cleared 3 cache directories"),
+        "cache clean must report a slim summary, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "cache clean output must not use cliclack gutter output, got:\n{stderr}"
+    );
 
     // Assert on the seed *file*, not the parent dir. Under heavy
     // parallel pressure on macOS, `Path::exists()` for a directory
@@ -426,5 +498,10 @@ fn cache_clean_on_empty_cache_succeeds_idempotently() {
         "lpm cache clean on empty cache must succeed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Cache is already empty"),
+        "empty cache clean must use a slim completion line, got:\n{stderr}"
     );
 }

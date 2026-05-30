@@ -1,4 +1,4 @@
-use crate::{auth, output};
+use crate::{auth, install_ui};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -24,10 +24,10 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
                 .or(info.username.as_deref())
                 .unwrap_or("unknown");
             if !json_output {
-                output::info(&format!(
+                install_ui::done(&format!(
                     "Already logged in as {}. Use {} to log out first.",
-                    name.bold(),
-                    "lpm logout".dimmed()
+                    install_ui::bold(name),
+                    install_ui::dim("lpm logout")
                 ));
             }
             return Ok(());
@@ -36,7 +36,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
     }
 
     if !json_output {
-        output::info("Opening browser for authentication...");
+        install_ui::phase("Opening browser for authentication");
     }
 
     // Create a oneshot channel to receive the token from the callback
@@ -75,7 +75,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         urlencoding::encode(&device_name)
     );
     if open::that(&login_url).is_err() && !json_output {
-        output::warn("Could not open browser automatically.");
+        install_ui::warn("Could not open browser automatically");
         println!("  Open this URL manually: {}", login_url.bold());
     }
 
@@ -104,7 +104,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
     // Exchange code for token if needed (Feature 42 / Feature 44)
     let (token, expires_at, refresh_token) = if let Some(code) = credential.strip_prefix("code:") {
         if !json_output {
-            output::info("Exchanging authorization code...");
+            install_ui::phase("Exchanging authorization code");
         }
         let exchange_url = format!("{registry_url}/api/cli/exchange");
         let http_client = reqwest::Client::new();
@@ -196,12 +196,12 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         let email_str = info.username.as_deref().unwrap_or("");
         println!();
         if email_str.is_empty() || email_str == username {
-            output::success(&format!("Logged in as {}", username.bold()));
+            install_ui::done(&format!("Logged in as {}", install_ui::bold(&username)));
         } else {
-            output::success(&format!(
+            install_ui::done(&format!(
                 "Logged in as {} - {}",
-                username.bold(),
-                email_str.dimmed()
+                install_ui::bold(&username),
+                install_ui::dim(email_str)
             ));
         }
         println!();

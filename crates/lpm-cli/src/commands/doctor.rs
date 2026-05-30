@@ -1,5 +1,5 @@
 use crate::doctor_catalog::{self, CheckEntry, Severity};
-use crate::{auth, output};
+use crate::{auth, install_ui};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -691,9 +691,7 @@ pub async fn run(
     // === Auto-fix (runs before output so JSON includes fixes_applied) ===
     if fix {
         if !json_output {
-            println!();
-            output::info("Running auto-fix...");
-            println!();
+            install_ui::phase("Running auto-fix");
         }
 
         let mut install_ran = false;
@@ -713,20 +711,20 @@ pub async fn run(
                     if !install_ran =>
                 {
                     if !json_output {
-                        output::info("fixing: lpm install");
+                        install_ui::phase("fixing: lpm install");
                     }
                     match run_doctor_install(client, project_dir).await {
                         Ok(()) => {
                             fixes_applied.push("lpm install".into());
                             install_ran = true;
                         }
-                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
+                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m lpm install failed: {e}"),
                     }
                 }
                 "node_pinned_unmet" | "node_missing_pinned" | "node_missing_unpinned" => {
                     if let Some(spec) = extract_node_spec_from_detail(&check.detail) {
                         if !json_output {
-                            output::info(&format!("fixing: lpm use node@{spec}"));
+                            install_ui::phase(&format!("fixing: lpm use node@{spec}"));
                         }
                         let http_client = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(60))
@@ -746,61 +744,63 @@ pub async fn run(
                             .await
                             {
                                 Ok(ver) => fixes_applied.push(format!("installed node {ver}")),
-                                Err(e) => eprintln!("  \x1b[31m✖\x1b[0m node install failed: {e}"),
+                                Err(e) => eprintln!("  \x1b[31m✗\x1b[0m node install failed: {e}"),
                             }
                         }
                     }
                 }
                 "fmt_unformatted" | "fmt_other_issue" => {
                     if !json_output {
-                        output::info("fixing: lpm fmt");
+                        install_ui::phase("fixing: lpm fmt");
                     }
                     let result = crate::commands::tools::fmt(project_dir, &[], false, false).await;
                     match result {
                         Ok(()) => fixes_applied.push("lpm fmt".into()),
-                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm fmt failed: {e}"),
+                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m lpm fmt failed: {e}"),
                     }
                 }
                 "lockfile_missing" if !install_ran => {
                     if !json_output {
-                        output::info("fixing: lpm install (generates lockfile)");
+                        install_ui::phase("fixing: lpm install (generates lockfile)");
                     }
                     match run_doctor_install(client, project_dir).await {
                         Ok(()) => {
                             fixes_applied.push("lpm install (lockfile)".into());
                             install_ran = true;
                         }
-                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
+                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m lpm install failed: {e}"),
                     }
                 }
                 "deps_sync_drift" if !install_ran => {
                     if !json_output {
-                        output::info("fixing: lpm install (sync lockfile)");
+                        install_ui::phase("fixing: lpm install (sync lockfile)");
                     }
                     match run_doctor_install(client, project_dir).await {
                         Ok(()) => {
                             fixes_applied.push("lpm install (deps sync)".into());
                             install_ran = true;
                         }
-                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m lpm install failed: {e}"),
+                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m lpm install failed: {e}"),
                     }
                 }
                 "lockfile_binary_stale" | "lockfile_binary_corrupt" | "lockfile_binary_missing" => {
                     if !json_output {
-                        output::info("fixing: regenerating lpm.lockb from lpm.lock");
+                        install_ui::phase("fixing: regenerating lpm.lockb from lpm.lock");
                     }
                     match fix_binary_lockfile(project_dir) {
                         Ok(()) => fixes_applied.push("regenerated lpm.lockb".into()),
-                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m {e}"),
+                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m {e}"),
                     }
                 }
                 "gitattributes_missing" | "gitattributes_lockb_unmarked" => {
                     if !json_output {
-                        output::info("fixing: ensuring .gitattributes marks lpm.lockb as binary");
+                        install_ui::phase(
+                            "fixing: ensuring .gitattributes marks lpm.lockb as binary",
+                        );
                     }
                     match fix_gitattributes(project_dir) {
                         Ok(()) => fixes_applied.push("updated .gitattributes".into()),
-                        Err(e) => eprintln!("  \x1b[31m✖\x1b[0m {e}"),
+                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m {e}"),
                     }
                 }
                 "tunnel_not_claimed" => {
@@ -808,14 +808,14 @@ pub async fn run(
                     if let Some(domain) = check.detail.split(" —").next() {
                         let domain = domain.trim();
                         if !json_output {
-                            output::info(&format!("fixing: lpm tunnel claim {domain}"));
+                            install_ui::phase(&format!("fixing: lpm tunnel claim {domain}"));
                         }
                         match client.tunnel_claim(domain, None).await {
                             Ok(_) => {
                                 fixes_applied.push(format!("claimed tunnel domain {domain}"));
                             }
                             Err(e) => {
-                                eprintln!("  \x1b[31m✖\x1b[0m tunnel claim failed: {e}");
+                                eprintln!("  \x1b[31m✗\x1b[0m tunnel claim failed: {e}");
                             }
                         }
                     }
@@ -826,10 +826,9 @@ pub async fn run(
 
         if !json_output {
             if fixes_applied.is_empty() {
-                output::info("no auto-fixable issues found");
+                install_ui::phase("no auto-fixable issues found");
             } else {
-                println!();
-                output::success(&format!(
+                install_ui::done(&format!(
                     "applied {} fix(es): {}",
                     fixes_applied.len(),
                     fixes_applied.join(", ")
@@ -928,16 +927,16 @@ pub async fn run(
                 continue;
             }
             let icon = match check.severity {
-                Severity::Pass => "✔".green().to_string(),
-                Severity::Fail => "✖".red().to_string(),
-                Severity::Warn => "⚠".yellow().to_string(),
+                Severity::Pass => "✓".green().to_string(),
+                Severity::Fail => "✗".red().to_string(),
+                Severity::Warn => "!".yellow().to_string(),
             };
             println!("  {icon} {} {}", check.name().bold(), check.detail.dimmed());
         }
         println!();
 
         if failed == 0 && warned == 0 {
-            output::success(&format!("All {total} checks passed"));
+            println!("  {} All {total} checks passed", "✓".green());
             if !all {
                 println!(
                     "\n  Run {} for registry, auth, tunnel, tooling, plugin, global,\n  \
@@ -946,13 +945,17 @@ pub async fn run(
                 );
             }
         } else if failed == 0 {
-            output::success(&format!(
-                "{} checks passed, {} warning(s)",
-                total - warned,
-                warned
-            ));
+            println!(
+                "  {} doctor found {}",
+                "!".yellow(),
+                format_doctor_issue_summary(0, warned)
+            );
         } else {
-            output::warn(&format!("{failed} check(s) failed, {warned} warning(s)"));
+            println!(
+                "  {} doctor found {}",
+                "✗".red(),
+                format_doctor_issue_summary(failed, warned)
+            );
         }
         println!();
     }
@@ -964,6 +967,12 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn format_doctor_issue_summary(failed: usize, warned: usize) -> String {
+    let failure_word = if failed == 1 { "failure" } else { "failures" };
+    let warning_word = if warned == 1 { "warning" } else { "warnings" };
+    format!("{failed} {failure_word} and {warned} {warning_word}")
 }
 
 fn vault_storage_check(backend: lpm_vault::VaultStorageBackend) -> Check {
@@ -3170,6 +3179,15 @@ mod tests {
         assert_eq!(c.code(), "deps_sync_drift");
         assert!(c.passed);
         assert!(matches!(c.severity, Severity::Warn));
+    }
+
+    #[test]
+    fn doctor_issue_summary_uses_singular_words_for_one_each() {
+        assert_eq!(format_doctor_issue_summary(1, 1), "1 failure and 1 warning");
+        assert_eq!(
+            format_doctor_issue_summary(2, 0),
+            "2 failures and 0 warnings"
+        );
     }
 
     /// Codes flow from the catalog entry, never the call site.

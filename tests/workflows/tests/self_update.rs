@@ -75,6 +75,44 @@ fn self_update_cache_hit_with_matching_latest_reports_up_to_date() {
     assert_eq!(envelope["latest"], serde_json::json!(current));
 }
 
+#[test]
+fn self_update_human_cache_hit_uses_slim_status() {
+    let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+    let current = read_current_version(&project);
+
+    std::fs::create_dir_all(cache_path(&project).parent().unwrap()).expect("mkdir ~/.lpm");
+    let payload = serde_json::json!({
+        "latest": current,
+        "lastCheck": now_secs(),
+    });
+    std::fs::write(cache_path(&project), payload.to_string()).expect("seed cache");
+
+    let output = lpm(&project)
+        .args(["self-update"])
+        .output()
+        .expect("failed to run lpm self-update");
+
+    assert!(
+        output.status.success(),
+        "cache-hit on matching latest must exit 0\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Checking for updates")
+            && stderr.contains("current")
+            && stderr.contains("latest")
+            && stderr.contains("✓ Done · already on latest version"),
+        "self-update cache hit must use slim status output, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "self-update must not use cliclack spinner/gutter output, got:\n{stderr}",
+    );
+}
+
 // ─── failure-backoff path ─────────────────────────────────────────────
 
 #[test]
@@ -102,5 +140,9 @@ fn self_update_recent_failure_short_circuits_with_backoff_error() {
     assert!(
         stderr.contains("last attempt failed") || stderr.contains("--refresh"),
         "stderr must mention the backoff condition + --refresh, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('◇'),
+        "self-update backoff must not use cliclack spinner glyphs, got:\n{stderr}",
     );
 }

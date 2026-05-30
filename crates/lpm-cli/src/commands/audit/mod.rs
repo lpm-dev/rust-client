@@ -2,7 +2,7 @@ pub mod cache;
 pub mod discovery;
 pub mod inventory;
 
-use crate::output;
+use crate::install_ui;
 use cache::ProjectAuditCache;
 #[cfg(test)]
 use discovery::ManagerKind;
@@ -214,7 +214,7 @@ pub async fn run(
 
     if discovery.packages.is_empty() {
         if !json_output {
-            output::info("No packages found to audit");
+            install_ui::warn("No packages found to audit");
         }
         return Ok(());
     }
@@ -339,7 +339,7 @@ pub async fn run(
                 for w in &confusion_warnings {
                     println!(
                         "    {} {} shares name with npm package '{}'",
-                        "⚠".yellow(),
+                        "!".yellow(),
                         w.lpm_package,
                         w.npm_name,
                     );
@@ -748,26 +748,14 @@ fn run_behavioral_analysis(
 
     // Progress indicator for large scans
     let show_progress = !json_output && scannable.len() > 50;
-    let spinner = if show_progress {
-        let s = cliclack::spinner();
-        s.start(format!("Analyzing {} packages...", scannable.len()));
-        Some(s)
-    } else {
-        None
-    };
+    if show_progress {
+        install_ui::phase(&format!("Analyzing {} packages", scannable.len()));
+    }
 
     let mut scanned = 0usize;
     let mut with_findings = 0usize;
 
-    for (i, pkg) in scannable.iter().enumerate() {
-        if show_progress
-            && i % 50 == 0
-            && i > 0
-            && let Some(ref s) = spinner
-        {
-            s.start(format!("Analyzing... {}/{}", i, scannable.len()));
-        }
-
+    for pkg in &scannable {
         let is_lpm = lpm_names.contains(pkg.name.as_str());
         let source = if is_lpm { "combined" } else { "local" };
 
@@ -874,10 +862,6 @@ fn run_behavioral_analysis(
             });
             results_by_key.insert(merge_key, idx);
         }
-    }
-
-    if let Some(s) = spinner {
-        s.stop(format!("Analyzed {} packages", scanned));
     }
 
     // Write project cache back to disk
@@ -1049,9 +1033,8 @@ async fn run_osv_scan(
     }
 
     if !json_output {
-        println!();
-        output::info(&format!(
-            "Checking {} packages against OSV vulnerability database...",
+        install_ui::phase(&format!(
+            "Checking {} packages against OSV vulnerability database",
             osv_queries.len()
         ));
     }
@@ -1071,7 +1054,7 @@ async fn run_osv_scan(
                 println!(
                     "  {} OSV database unavailable; vulnerability scan is INCOMPLETE — \
                      a green result does NOT mean no vulnerabilities exist.",
-                    "⚠".yellow()
+                    "!".yellow()
                 );
                 println!("    reason: {reason}");
             }
@@ -1101,7 +1084,7 @@ async fn run_osv_scan(
 
 fn print_discovery_header(discovery: &DiscoveryResult, lpm_count: usize, npm_count: usize) {
     let total = discovery.packages.len();
-    output::info(&format!("Scanning {total} packages..."));
+    install_ui::phase(&format!("Scanning {total} packages"));
 
     // Show lockfile info
     if let Some(ref lockfile_path) = discovery.lockfile_path {
@@ -1110,37 +1093,27 @@ fn print_discovery_header(discovery: &DiscoveryResult, lpm_count: usize, npm_cou
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_default();
         println!(
-            "  {} Lockfile: {} ({})",
-            "│".dimmed(),
+            "  lockfile  {} ({})",
             lockfile_name.bold(),
             discovery.manager,
         );
     } else {
         println!(
-            "  {} {}",
-            "│".dimmed(),
+            "  {}",
             "No lockfile found — scanning node_modules directly (degraded mode)".yellow(),
         );
     }
 
     if discovery.is_yarn_pnp {
         println!(
-            "  {} {}",
-            "│".dimmed(),
+            "  {}",
             "Yarn PnP detected — source scanning unavailable (packages are zipped)".yellow(),
         );
-        println!(
-            "  {} Running vulnerability scan only (OSV)...",
-            "│".dimmed(),
-        );
+        println!("  Running vulnerability scan only (OSV)...");
     }
 
     if lpm_count > 0 {
-        println!(
-            "  {} LPM packages: {} (with registry metadata)",
-            "│".dimmed(),
-            lpm_count
-        );
+        println!("  LPM packages: {} (with registry metadata)", lpm_count);
     }
     if npm_count > 0 {
         let label = if discovery.is_yarn_pnp {
@@ -1148,7 +1121,7 @@ fn print_discovery_header(discovery: &DiscoveryResult, lpm_count: usize, npm_cou
         } else {
             "client-side analysis"
         };
-        println!("  {} npm packages: {} ({})", "│".dimmed(), npm_count, label,);
+        println!("  npm packages: {} ({})", npm_count, label,);
     }
     println!();
 }
@@ -1180,7 +1153,7 @@ fn print_lpm_results(results: &[AuditResult], lpm_packages: &[(String, String)])
         if registry_issues.is_empty() {
             println!(
                 "  {} {}{}",
-                "✔".green(),
+                "✓".green(),
                 format!("{}@{}", result.name, result.version).dimmed(),
                 score_str.dimmed(),
             );
@@ -1195,8 +1168,8 @@ fn print_lpm_results(results: &[AuditResult], lpm_packages: &[(String, String)])
 
         for issue in registry_issues {
             let icon = match issue.severity.as_str() {
-                "high" | "critical" => "✖".red().to_string(),
-                "moderate" => "⚠".yellow().to_string(),
+                "high" | "critical" => "✗".red().to_string(),
+                "moderate" => "!".yellow().to_string(),
                 _ => "ℹ".blue().to_string(),
             };
             println!(
@@ -1220,8 +1193,8 @@ fn print_osv_results(osv_vulns: &[OsvVulnerability]) {
 
     for vuln in osv_vulns {
         let icon = match vuln.severity.as_str() {
-            "HIGH" | "CRITICAL" => "✖".red().to_string(),
-            "MODERATE" | "MEDIUM" => "⚠".yellow().to_string(),
+            "HIGH" | "CRITICAL" => "✗".red().to_string(),
+            "MODERATE" | "MEDIUM" => "!".yellow().to_string(),
             _ => "ℹ".cyan().to_string(),
         };
         let summary_text = lpm_common::sanitize_for_terminal(&vuln.summary);
@@ -1304,7 +1277,7 @@ fn print_behavioral_results(results: &[AuditResult], lpm_packages: &[(String, St
             };
             println!(
                 "    {} {} {} — {}{}",
-                "✖".red(),
+                "✗".red(),
                 format_severity("critical"),
                 message,
                 preview.join(", "),
@@ -1330,7 +1303,7 @@ fn print_behavioral_results(results: &[AuditResult], lpm_packages: &[(String, St
             };
             println!(
                 "    {} {count:<4} {:<40} {}{}",
-                "⚠".yellow(),
+                "!".yellow(),
                 message,
                 preview.join(", "),
                 suffix,
@@ -1391,7 +1364,7 @@ fn print_summary(
     let npm_count = total_scanned - lpm_count;
 
     if vuln_count == 0 && lpm_issues == 0 && behavioral.packages_with_findings == 0 {
-        output::success(&format!(
+        install_ui::done(&format!(
             "No issues found ({total_scanned} packages scanned{}{})",
             if checked_lpm > 0 {
                 format!(", {checked_lpm} LPM audited")
@@ -1422,7 +1395,7 @@ fn print_summary(
             ));
         }
 
-        output::warn(&format!(
+        install_ui::warn(&format!(
             "{} ({} LPM + {} npm scanned)",
             parts.join(", "),
             lpm_count,
@@ -1794,7 +1767,7 @@ pub async fn run_secrets(
     }
 
     if !json_output {
-        crate::output::info("scanning installed packages for secrets...");
+        install_ui::phase("Scanning installed packages for secrets");
     }
 
     let mut total_packages = 0u32;
@@ -1877,7 +1850,7 @@ pub async fn run_secrets(
     println!();
 
     if packages_with_secrets.is_empty() {
-        crate::output::success("no hardcoded secrets found");
+        install_ui::done("no hardcoded secrets found");
         return Ok(());
     }
 
@@ -1888,7 +1861,7 @@ pub async fn run_secrets(
 
         println!(
             "  {} {}  {} finding(s) ({} critical, {} high)",
-            "⚠".yellow(),
+            "!".yellow(),
             pkg_name.bold(),
             total,
             critical.to_string().red(),
@@ -1904,9 +1877,9 @@ pub async fn run_secrets(
             println!(
                 "    {} {}{}  {}",
                 match m.severity.as_str() {
-                    "critical" => "●".red().to_string(),
-                    "high" => "●".yellow().to_string(),
-                    _ => "●".dimmed().to_string(),
+                    "critical" => "·".red().to_string(),
+                    "high" => "·".yellow().to_string(),
+                    _ => "·".dimmed().to_string(),
                 },
                 m.matched_text.dimmed(),
                 location.dimmed(),

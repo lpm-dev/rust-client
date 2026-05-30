@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::color::Painted;
 use lpm_common::{
     LpmError, LpmRoot, format_bytes, sanitize_for_terminal, with_exclusive_lock, with_shared_lock,
@@ -86,7 +86,7 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
                 serde_json::to_string_pretty(&clean_json_payload(&v1, &v2, 0, 0)).unwrap()
             );
         } else {
-            output::info("Store is already empty");
+            install_ui::done("Store is already empty");
         }
         return Ok(());
     }
@@ -118,11 +118,14 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
                 .unwrap()
         );
     } else {
-        output::success(&format!(
-            "Wiped package store ({})",
+        install_ui::done(&format!(
+            "Wiped package store · freed {}",
             format_bytes(bytes_before)
         ));
-        output::info("Use `lpm install` to repopulate from lockfiles.");
+        eprintln!(
+            "  {}",
+            install_ui::dim("Use `lpm install` to repopulate from lockfiles.")
+        );
     }
 
     Ok(())
@@ -200,6 +203,10 @@ fn run_verify(
     let (v2_entries, mut sidecar_issues) = list_v2_verify_entries(lpm_root)?;
     packages.extend(v2_entries);
 
+    if !json_output {
+        install_ui::phase("Verifying store integrity");
+    }
+
     if packages.is_empty() && sidecar_issues.is_empty() {
         if json_output {
             // F4: empty-store envelope mirrors the populated-store
@@ -220,7 +227,7 @@ fn run_verify(
                 .unwrap()
             );
         } else {
-            output::info("Store is empty — nothing to verify");
+            install_ui::done("Store is empty — nothing to verify");
         }
         return Ok(());
     }
@@ -402,16 +409,14 @@ fn run_verify(
                                 security_reanalyzed += 1;
                             }
                             if !json_output {
-                                eprintln!(
-                                    "    {} {name}@{version} — security analysis mismatch (fixed)",
-                                    "⚠".yellow()
-                                );
+                                install_ui::warn(&format!(
+                                    "{name}@{version} — security analysis mismatch (fixed)"
+                                ));
                             }
                         } else if !json_output {
-                            eprintln!(
-                                "    {} {name}@{version} — security analysis mismatch (use --fix to refresh)",
-                                "⚠".yellow()
-                            );
+                            install_ui::warn(&format!(
+                                "{name}@{version} — security analysis mismatch (use --fix to refresh)"
+                            ));
                         }
                     }
                 }
@@ -427,16 +432,14 @@ fn run_verify(
                             security_reanalyzed += 1;
                         }
                         if !json_output {
-                            eprintln!(
-                                "    {} {name}@{version} — missing security cache (fixed)",
-                                "⚠".yellow()
-                            );
+                            install_ui::warn(&format!(
+                                "{name}@{version} — missing security cache (fixed)"
+                            ));
                         }
                     } else if !json_output {
-                        eprintln!(
-                            "    {} {name}@{version} — missing security cache (use --fix to generate)",
-                            "⚠".yellow()
-                        );
+                        install_ui::warn(&format!(
+                            "{name}@{version} — missing security cache (use --fix to generate)"
+                        ));
                     }
                 }
             }
@@ -506,38 +509,39 @@ fn run_verify(
             ));
         }
         if deep && security_mismatches > 0 && !fix {
-            output::warn(&format!(
+            install_ui::warn(&format!(
                 "{verified} store entries verified, {security_mismatches} security analysis mismatch{} (use --fix to refresh)",
                 if security_mismatches == 1 { "" } else { "es" }
             ));
         } else if deep && security_mismatches > 0 && fix {
-            output::warn(&format!(
+            install_ui::warn(&format!(
                 "{verified} store entries verified, {security_mismatches} security analysis mismatch{} (fixed)",
                 if security_mismatches == 1 { "" } else { "es" }
             ));
         } else {
-            output::success(&msg);
+            install_ui::done(&format!("Store verified · {msg}"));
         }
         if deep {
             // Make the scope explicit so users don't assume a clean
             // exit attests to bytes-on-disk integrity.
-            output::info(
-                "Note: --deep verifies lockfile↔marker consistency, not extracted-bytes \
-                 integrity. Re-hashing the extracted directory contents is not implemented.",
+            eprintln!(
+                "  {}",
+                install_ui::dim(
+                    "Note: --deep verifies lockfile-marker consistency, not extracted-bytes integrity. Re-hashing the extracted directory contents is not implemented."
+                )
             );
         }
     } else {
-        output::warn(&format!("{} corrupted, {} OK", corrupted.len(), verified));
+        install_ui::failed(&format!("{} corrupted, {} OK", corrupted.len(), verified));
         for issue in &corrupted {
-            eprintln!("    {} {issue}", "⚠".yellow());
+            install_ui::warn(issue);
         }
         if deep && security_mismatches > 0 {
             let suffix = if fix { "fixed" } else { "use --fix to refresh" };
-            eprintln!(
-                "    {} {security_mismatches} security analysis mismatch{} ({suffix})",
-                "⚠".yellow(),
+            install_ui::warn(&format!(
+                "{security_mismatches} security analysis mismatch{} ({suffix})",
                 if security_mismatches == 1 { "" } else { "es" }
-            );
+            ));
         }
         eprintln!();
         eprintln!(

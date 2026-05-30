@@ -9,7 +9,7 @@
 //! deliverable. Future phases will expose this through the
 //! MCP `lpm_filter_preview` tool sharing the same engine.
 
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_task::filter::{FilterEngine, FilterExpr, MatchKind, TraceReason};
@@ -294,24 +294,22 @@ fn topologically_sorted_selection(graph: &WorkspaceGraph, selected: &HashSet<usi
 /// Shared empty-result rendering used by both terse and explain modes.
 /// Surfaces the D2 substring → glob migration hint when applicable.
 fn render_no_match(explain: &lpm_task::filter::FilterExplain) {
-    output::warn("Filter set produced no matches.");
+    install_ui::warn("Filter set produced no matches");
     for note in &explain.notes {
-        println!("  {}", note.dimmed());
+        eprintln!("  {}", note.dimmed());
     }
     if let Some(hint) = format_no_match_hint(&explain.input) {
-        println!();
+        eprintln!();
         for line in hint.lines() {
-            println!("  {}", line.dimmed());
+            eprintln!("  {}", line.dimmed());
         }
     }
-    println!();
 }
 
 /// Default human rendering: terse name list, one per line. Suitable for
 /// piping into shell tools (`lpm filter "@ui/*" | xargs ...`).
 fn render_human_terse(graph: &WorkspaceGraph, explain: &lpm_task::filter::FilterExplain) {
     if explain.selected.is_empty() {
-        println!();
         render_no_match(explain);
         return;
     }
@@ -320,6 +318,15 @@ fn render_human_terse(graph: &WorkspaceGraph, explain: &lpm_task::filter::Filter
             println!("{}", member.name);
         }
     }
+    let member_word = if explain.selected.len() == 1 {
+        "member"
+    } else {
+        "members"
+    };
+    install_ui::done(&format!(
+        "{} workspace {member_word} matched",
+        explain.selected.len()
+    ));
 }
 
 /// Verbose human rendering (`lpm filter --explain`): full per-package trace
@@ -331,13 +338,6 @@ fn render_human_explain(graph: &WorkspaceGraph, explain: &lpm_task::filter::Filt
         render_no_match(explain);
         return;
     }
-
-    output::success(&format!(
-        "Selected {} of {} workspace packages",
-        explain.selected.len().to_string().bold(),
-        graph.len()
-    ));
-    println!();
 
     // Build a quick package_id → trace lookup so we can render in
     // selection order with the correct trace alongside.
@@ -360,6 +360,11 @@ fn render_human_explain(graph: &WorkspaceGraph, explain: &lpm_task::filter::Filt
         }
     }
     println!();
+    install_ui::done(&format!(
+        "Selected {} of {} workspace packages",
+        install_ui::bold(&explain.selected.len().to_string()),
+        graph.len()
+    ));
 }
 
 fn describe_reason(graph: &WorkspaceGraph, reason: &TraceReason) -> String {

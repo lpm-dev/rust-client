@@ -747,6 +747,285 @@ fn check_all_happy_path_with_seeded_root_tsc() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn lint_single_package_reports_slim_completion_with_elapsed_time() {
+    let project = TempProject::empty(r#"{"name":"slim-lint","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"tools":{"oxlint":"1.0.0"}}"#);
+    seed_fake_plugin(&project, "oxlint", "1.0.0", ".lint-ok");
+
+    let output = lpm(&project)
+        .args(["lint"])
+        .output()
+        .expect("failed to run lpm lint");
+
+    assert!(
+        output.status.success(),
+        "lint stand-in must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        project.file_exists(".lint-ok"),
+        "lint stand-in must execute inside the project"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Using Oxlint 1.0.0"),
+        "lint must announce the selected tool, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ lint passed in "),
+        "lint must report a meaningful elapsed completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "lint output must not use cliclack gutter output, got:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_write_single_package_reports_slim_completion_with_elapsed_time() {
+    let project = TempProject::empty(r#"{"name":"slim-fmt","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"tools":{"biome":"1.0.0"}}"#);
+    seed_fake_plugin(&project, "biome", "1.0.0", ".fmt-ok");
+
+    let output = lpm(&project)
+        .args(["fmt"])
+        .output()
+        .expect("failed to run lpm fmt");
+
+    assert!(
+        output.status.success(),
+        "fmt stand-in must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        project.file_exists(".fmt-ok"),
+        "fmt stand-in must execute inside the project"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Using Biome 1.0.0"),
+        "fmt must announce the selected tool, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · codebase is now formatted in "),
+        "fmt must report a meaningful elapsed completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "fmt output must not use cliclack gutter output, got:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_check_single_package_reports_slim_completion_with_elapsed_time() {
+    let project = TempProject::empty(r#"{"name":"slim-fmt-check","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"tools":{"biome":"1.0.0"}}"#);
+    seed_fake_plugin(&project, "biome", "1.0.0", ".fmt-check-ok");
+
+    let output = lpm(&project)
+        .args(["fmt", "--check"])
+        .output()
+        .expect("failed to run lpm fmt --check");
+
+    assert!(
+        output.status.success(),
+        "fmt --check stand-in must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        project.file_exists(".fmt-check-ok"),
+        "fmt --check stand-in must execute inside the project"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ fmt check passed in "),
+        "fmt --check must report a meaningful elapsed completion line, got:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_single_package_reports_slim_completion_with_elapsed_time() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "slim-check",
+            "version": "1.0.0",
+            "devDependencies": { "typescript": "5.0.0" }
+        }"#,
+    );
+    project.write_file("tsconfig.json", r#"{"compilerOptions": {}}"#);
+    seed_fake_root_tsc(&project, ".check-ok");
+
+    let output = lpm(&project)
+        .args(["check"])
+        .output()
+        .expect("failed to run lpm check");
+
+    assert!(
+        output.status.success(),
+        "check stand-in must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        project.file_exists(".check-ok"),
+        "check stand-in must execute inside the project"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Using tsc --noEmit"),
+        "check must announce the selected typecheck engine, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ typecheck passed in "),
+        "check must report a meaningful elapsed completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "check output must not use cliclack gutter output, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_single_package_reports_slim_runner_and_timed_completion() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "slim-test-runner",
+            "version": "1.0.0",
+            "scripts": { "test": "echo test-ok" }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["test"])
+        .output()
+        .expect("failed to run lpm test");
+
+    assert!(
+        output.status.success(),
+        "test script must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("test-ok"),
+        "runner stdout must pass through, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Using package.json test script"),
+        "test runner line must use slim UI, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Tests complete in "),
+        "test must report a meaningful elapsed completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "test runner line must not use cliclack gutter output, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn bench_single_package_reports_slim_completion_with_elapsed_time() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "slim-bench-runner",
+            "version": "1.0.0",
+            "scripts": { "bench": "echo bench-ok" }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["bench"])
+        .output()
+        .expect("failed to run lpm bench");
+
+    assert!(
+        output.status.success(),
+        "bench script must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("bench-ok"),
+        "runner stdout must pass through, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Using package.json bench script"),
+        "bench runner line must use slim UI, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Benchmarks complete in "),
+        "bench must report a meaningful elapsed completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "bench output must not use cliclack gutter output, got:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_failure_reports_slim_failed_line_with_exit_code() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "slim-check-runner",
+            "version": "1.0.0",
+            "devDependencies": { "typescript": "5.0.0" }
+        }"#,
+    );
+    project.write_file("tsconfig.json", r#"{"compilerOptions": {}}"#);
+    write_unix_executable(
+        &project.path().join("node_modules/.bin/tsc"),
+        "#!/bin/sh\necho 'type error' >&2\nexit 2\n",
+    );
+
+    let output = lpm(&project)
+        .args(["check"])
+        .output()
+        .expect("failed to run lpm check");
+
+    assert!(
+        !output.status.success(),
+        "check stand-in must fail\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Using tsc --noEmit"),
+        "check runner line must use slim UI, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✗ typecheck failed · exit code 2"),
+        "check failure must use a slim failed terminus, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('▲') && !stderr.contains('●') && !stderr.contains('│'),
+        "check failure must not use cliclack warning/gutter output, got:\n{stderr}"
+    );
+}
+
 // Parser-level coverage for `--filter` / `--fail-if-no-match` lives in
 // `crates/lpm-cli/src/commands/tools.rs::tests` (lint_filter_parses_with_grammar,
 // fmt_filter_and_check_compose, check_filter_parses). The compat contract that

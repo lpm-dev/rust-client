@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::path::{Path, PathBuf};
@@ -78,20 +78,20 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    output::header("Root CA");
+    println!("Root CA");
     if status.ca_exists {
-        let trusted_str = if status.ca_trusted {
+        let trust_status = if status.ca_trusted {
             "trusted".green()
         } else {
             "not trusted".red()
         };
-        output::field("status", &format!("installed ({})", trusted_str));
+        print_field("status", &trust_status);
 
         if let Some(subject) = &status.ca_subject {
-            output::field("subject", subject);
+            print_field("subject", subject);
         }
         if let Some(expires) = &status.ca_expires {
-            output::field("expires", expires);
+            print_field("expires", expires);
         }
         if let Some(days) = days_remaining {
             let txt = format!("{days} days");
@@ -102,7 +102,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             } else {
                 txt.green()
             };
-            output::field("remaining", &colored);
+            print_field("remaining", &colored);
             if days < 60 {
                 println!(
                     "  {}",
@@ -111,7 +111,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             }
         }
     } else {
-        output::field("status", &"not installed".red());
+        print_field("status", &"not installed".red());
         println!(
             "  {}",
             "Run `lpm cert trust` to generate and install the CA".dimmed()
@@ -119,32 +119,45 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     }
 
     if !drifts.is_empty() {
-        output::header("Permission Drift");
+        println!();
+        println!("Permission drift");
         for d in &drifts {
-            output::field(d.role, &d.summary().red().to_string());
+            print_field(d.role, &d.summary().red().to_string());
             println!("  {}", format!("fix: {}", d.chmod_hint()).dimmed());
         }
     }
 
-    output::header("Project Certificate");
+    println!();
+    println!("Project cert");
     if status.project_cert_exists {
         if status.project_cert_needs_renewal {
-            output::field("status", &"needs renewal".yellow());
+            print_field("status", &"needs renewal".yellow());
         } else {
-            output::field("status", &"valid".green());
-        }
-        if let Some(expires) = &status.project_cert_expires {
-            output::field("expires", expires);
+            print_field("status", &"valid".green());
         }
         if !status.project_cert_hostnames.is_empty() {
-            output::field("hostnames", &status.project_cert_hostnames.join(", "));
+            print_field("hosts", &status.project_cert_hostnames.join(", "));
+        }
+        if let Some(expires) = &status.project_cert_expires {
+            print_field("expires", expires);
         }
     } else {
-        output::field("status", &"not generated".dimmed());
+        print_field("status", &"not generated".dimmed());
         println!(
             "  {}",
             "Run `lpm dev --https` or `lpm cert generate` to create".dimmed()
         );
+    }
+
+    println!();
+    if status.ca_exists
+        && status.ca_trusted
+        && status.project_cert_exists
+        && !status.project_cert_needs_renewal
+    {
+        install_ui::done("HTTPS certificates are ready");
+    } else {
+        install_ui::warn("HTTPS certificates need setup");
     }
 
     Ok(())
@@ -176,7 +189,7 @@ fn run_trust(json_output: bool) -> Result<(), LpmError> {
         });
 
         if !json_output {
-            output::success("root CA generated");
+            install_ui::done("root CA generated");
         }
     }
 
@@ -208,11 +221,11 @@ fn run_trust(json_output: bool) -> Result<(), LpmError> {
             serde_json::json!({ "success": true, "ca_installed": true })
         );
     } else {
-        output::success("CA installed to system trust store");
+        install_ui::done("CA installed to system trust store");
         let info = lpm_cert::cert::read_cert_info(&ca_cert_path)?;
-        output::field("subject", &info.subject);
-        output::field("expires", &info.not_after);
-        output::field("path", &ca_cert_path.to_string_lossy());
+        print_field("subject", &info.subject);
+        print_field("expires", &info.not_after);
+        print_field("path", &ca_cert_path.to_string_lossy());
     }
 
     Ok(())
@@ -254,7 +267,7 @@ fn run_uninstall(json_output: bool) -> Result<(), LpmError> {
             serde_json::json!({ "success": true, "ca_uninstalled": true })
         );
     } else {
-        output::success("CA removed from system trust store");
+        install_ui::done("CA removed from system trust store");
     }
 
     Ok(())
@@ -284,15 +297,15 @@ fn run_generate(
         );
     } else {
         if setup.ca_freshly_installed {
-            output::success("root CA generated and installed to trust store");
+            install_ui::done("root CA generated and installed to trust store");
         }
         if setup.cert_freshly_generated {
-            output::success("project certificate generated");
+            install_ui::done("project certificate generated");
         } else {
-            output::info("project certificate already exists and is valid");
+            install_ui::done("project certificate already exists and is valid");
         }
-        output::field("cert", &setup.cert_path);
-        output::field("key", &setup.key_path);
+        print_field("cert", &setup.cert_path);
+        print_field("key", &setup.key_path);
     }
 
     Ok(())
@@ -311,18 +324,18 @@ fn run_rotate(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    output::success("CA rotated");
-    output::field("mode", result.mode);
-    output::field("old_fingerprint", &result.old_fingerprint);
-    output::field("new_fingerprint", &result.new_fingerprint);
-    output::field("reissued", &result.reissued_leaves.len().to_string());
+    install_ui::done("CA rotated");
+    print_field("mode", result.mode);
+    print_field("old_fingerprint", &result.old_fingerprint);
+    print_field("new_fingerprint", &result.new_fingerprint);
+    print_field("reissued", &result.reissued_leaves.len().to_string());
     if !result.skipped_missing.is_empty() {
-        output::field("skipped_missing", &result.skipped_missing.len().to_string());
+        print_field("skipped_missing", &result.skipped_missing.len().to_string());
     }
     if let Some(when) = &result.old_ca_removal_scheduled {
-        output::field("old_ca_removes_at", when);
+        print_field("old_ca_removes_at", when);
     } else if result.old_ca_uninstalled {
-        output::field("old_ca_uninstalled", "true");
+        print_field("old_ca_uninstalled", "true");
     }
     Ok(())
 }
@@ -338,15 +351,19 @@ fn run_reconcile(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
     }
 
     if extras.dry_run {
-        output::info("dry-run: no mutations performed");
+        install_ui::phase("dry-run: no mutations performed");
     } else {
-        output::success("reconcile complete");
+        install_ui::done("reconcile complete");
     }
-    output::field("grace_removed", &result.grace_removed.len().to_string());
-    output::field("grace_pending", &result.grace_pending.len().to_string());
-    output::field("stale_removed", &result.stale_removed.len().to_string());
+    print_field("grace_removed", &result.grace_removed.len().to_string());
+    print_field("grace_pending", &result.grace_pending.len().to_string());
+    print_field("stale_removed", &result.stale_removed.len().to_string());
     if result.reconcile_required_cleared {
-        output::field("reconcile_required_cleared", "true");
+        print_field("reconcile_required_cleared", "true");
     }
     Ok(())
+}
+
+fn print_field(label: &str, value: &str) {
+    println!("  {label:<10} {value}");
 }

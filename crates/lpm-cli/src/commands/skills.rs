@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -32,7 +32,7 @@ fn list_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     let skills_dir = project_dir.join(".lpm").join("skills");
     if !skills_dir.exists() {
         if !json_output {
-            output::info("No skills installed");
+            install_ui::warn("No skills installed");
         }
         return Ok(());
     }
@@ -85,26 +85,31 @@ fn list_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap()
         );
     } else if packages.is_empty() {
-        output::info("No skills installed");
+        install_ui::warn("No skills installed");
     } else {
         let total: usize = packages.iter().map(|(_, s)| s.len()).sum();
-        println!(
-            "  {} skill(s) across {} package(s):\n",
-            total.to_string().bold(),
-            packages.len()
-        );
         for (pkg_name, skills) in &packages {
-            println!(
-                "  {} ({} skill{}):",
-                format!("@lpm.dev/{pkg_name}").cyan(),
-                skills.len(),
-                if skills.len() == 1 { "" } else { "s" }
-            );
+            println!("{}", format!("@lpm.dev/{pkg_name}").cyan());
+            let width = skills
+                .iter()
+                .map(|(name, _)| name.len() + ".md".len())
+                .max()
+                .unwrap_or(0);
             for (name, size) in skills {
-                println!("    {} ({})", name, lpm_common::format_bytes(*size));
+                let file_name = format!("{name}.md");
+                println!(
+                    "  {file_name:<width$}  {}",
+                    lpm_common::format_bytes(*size).dimmed()
+                );
             }
             println!();
         }
+        install_ui::done(&format!(
+            "{total} {} installed across {} {}",
+            plural(total, "skill", "skills"),
+            packages.len(),
+            plural(packages.len(), "package", "packages"),
+        ));
     }
 
     Ok(())
@@ -119,14 +124,14 @@ async fn install_skills(
     let name = lpm_common::PackageName::parse(package)?;
 
     if !json_output {
-        output::info(&format!("Fetching skills for {}", name.scoped().bold()));
+        install_ui::phase(&format!("Fetching skills for {}", name.scoped().bold()));
     }
 
     let skills = client.get_skills(&name.short(), None).await?;
 
     if skills.skills.is_empty() {
         if !json_output {
-            output::info("Package has no skills");
+            install_ui::warn("Package has no skills");
         }
         return Ok(());
     }
@@ -168,9 +173,11 @@ async fn install_skills(
             .unwrap()
         );
     } else {
-        output::success(&format!("Installed {} skill(s)", installed));
-        println!("  {}", skills_dir.display().to_string().dimmed());
-        println!();
+        install_ui::done(&format!(
+            "Installed {installed} {}",
+            plural(installed, "skill", "skills"),
+        ));
+        eprintln!("  {}", skills_dir.display().to_string().dimmed());
     }
 
     Ok(())
@@ -180,7 +187,7 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
     let skills_dir = project_dir.join(".lpm").join("skills");
     if !skills_dir.exists() {
         if !json_output {
-            output::info("No .lpm/skills/ directory found");
+            install_ui::warn("No .lpm/skills/ directory found");
         }
         return Ok(());
     }
@@ -270,23 +277,28 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
         }
         return Ok(());
     } else if errors.is_empty() {
-        output::success(&format!("{valid} skill(s) valid"));
+        install_ui::done(&format!(
+            "{valid} {} valid",
+            plural(valid, "skill", "skills"),
+        ));
         if valid > 0 {
             let impact = if valid >= 3 {
                 "+7 pts (has-skills) +3 pts (comprehensive)"
             } else {
                 "+7 pts (has-skills)"
             };
-            eprintln!("  {} {}", "Quality impact:".dimmed(), impact.green());
+            install_ui::phase(&format!("Quality impact: {}", impact.green()));
         }
     } else {
         for err in &errors {
-            output::warn(err);
+            install_ui::warn(err);
         }
         if valid > 0 {
-            output::info(&format!(
-                "{valid} skill(s) valid, {} error(s)",
-                errors.len()
+            install_ui::phase(&format!(
+                "{valid} {} valid, {} {}",
+                plural(valid, "skill", "skills"),
+                errors.len(),
+                plural(errors.len(), "error", "errors"),
             ));
         }
     }
@@ -311,7 +323,7 @@ fn clean_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     let skills_dir = project_dir.join(".lpm").join("skills");
     if !skills_dir.exists() {
         if !json_output {
-            output::info("No skills to clean");
+            install_ui::warn("No skills to clean");
         }
         return Ok(());
     }
@@ -327,10 +339,17 @@ fn clean_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             serde_json::json!({"success": true, "cleaned": true, "files_removed": file_count})
         );
     } else {
-        output::success(&format!("Skills cleaned ({file_count} files removed)"));
+        install_ui::done(&format!(
+            "Skills cleaned · removed {file_count} {}",
+            plural(file_count, "file", "files"),
+        ));
     }
 
     Ok(())
+}
+
+fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
 }
 
 fn count_files_recursive(dir: &Path) -> usize {

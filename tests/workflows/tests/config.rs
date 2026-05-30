@@ -52,6 +52,33 @@ fn config_set_writes_value_into_isolated_home() {
 }
 
 #[test]
+fn config_set_human_uses_slim_success() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["config", "set", "registry", "https://registry.example.test"])
+        .output()
+        .expect("failed to run lpm config set");
+
+    assert!(
+        output.status.success(),
+        "lpm config set failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Set registry = https://registry.example.test"),
+        "config set must use a slim success line, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "config set must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+#[test]
 fn config_get_json_returns_existing_value() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
     seed_config(&project, "registry = \"https://registry.example.test\"\n");
@@ -153,4 +180,63 @@ fn config_list_json_reports_all_keys() {
     assert_eq!(envelope["color"], serde_json::json!("always"));
 
     insta::assert_json_snapshot!("config_list_json_envelope_two_keys", envelope);
+}
+
+#[test]
+fn config_list_human_keeps_values_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "registry = \"https://registry.example.test\"\ncolor = \"always\"\n",
+    );
+
+    let output = lpm(&project)
+        .args(["config", "list"])
+        .output()
+        .expect("failed to run lpm config list");
+
+    assert!(
+        output.status.success(),
+        "lpm config list failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("registry") && stdout.contains("https://registry.example.test"),
+        "config list must render config rows to stdout, got:\n{stdout}",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "config list must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn config_get_missing_key_uses_slim_warning() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["config", "get", "registry"])
+        .output()
+        .expect("failed to run lpm config get");
+
+    assert!(
+        output.status.success(),
+        "lpm config get missing key failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("! registry is not set"),
+        "missing config key must use a slim warning, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "config get must not use cliclack gutter output, got:\n{stderr}",
+    );
 }

@@ -29,7 +29,7 @@
 //! version. That's drift territory, handled by the strict-gate
 //! `BindingDrift` path at install time.
 
-use crate::output;
+use crate::install_ui;
 use crate::trust_snapshot::{self, SnapshotEntry, TrustSnapshot};
 use clap::Subcommand;
 use lpm_common::LpmError;
@@ -93,7 +93,7 @@ pub async fn run(cmd: &TrustCmd, project_dir: &Path) -> Result<(), LpmError> {
 
 /// Classification of a single binding's change between snapshot and
 /// current manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffKind {
     /// Entry present in current, absent in snapshot.
     Added,
@@ -186,6 +186,7 @@ async fn run_diff(project_dir: &Path, json: bool, assert_none: bool) -> Result<(
     if json {
         print_diff_json(&entries, snapshot.as_ref(), &current);
     } else {
+        install_ui::phase("Comparing trust ledger against last install snapshot");
         print_diff_human(&entries, snapshot.as_ref());
     }
 
@@ -235,27 +236,45 @@ fn diff_entry_json(e: &DiffEntry) -> serde_json::Value {
 fn print_diff_human(entries: &[DiffEntry], snapshot: Option<&TrustSnapshot>) {
     if entries.is_empty() {
         match snapshot {
-            Some(s) => output::success(&format!(
-                "trustedDependencies unchanged since last install ({})",
+            Some(s) => install_ui::done(&format!(
+                "Trust ledger unchanged since last install ({})",
                 s.captured_at,
             )),
-            None => output::info(
-                "no prior snapshot (this project hasn't been installed with LPM before)",
+            None => install_ui::warn(
+                "no prior snapshot found; this project has not been installed with LPM before",
             ),
         }
         return;
     }
 
-    if let Some(s) = snapshot {
-        output::info(&format!(
-            "trustedDependencies diff vs. snapshot from {}:",
-            s.captured_at
-        ));
+    print_diff_group(entries, DiffKind::Added, "added");
+    print_diff_group(entries, DiffKind::Removed, "removed");
+    print_diff_group(entries, DiffKind::Changed, "changed");
+
+    let entry_word = if entries.len() == 1 {
+        "entry"
     } else {
-        output::info("trustedDependencies (no prior snapshot to compare against):");
+        "entries"
+    };
+    let suffix = if snapshot.is_some() {
+        "differ from the last install snapshot"
+    } else {
+        "need review before the next install"
+    };
+    install_ui::warn(&format!(
+        "{} trust {entry_word} {suffix} — lpm trust review",
+        entries.len()
+    ));
+}
+
+fn print_diff_group(entries: &[DiffEntry], kind: DiffKind, label: &str) {
+    let matching: Vec<&DiffEntry> = entries.iter().filter(|e| e.kind == kind).collect();
+    if matching.is_empty() {
+        return;
     }
 
-    for e in entries {
+    println!("{label}");
+    for e in matching {
         match e.kind {
             DiffKind::Added => {
                 println!("  {} {}", "+".green(), e.key.bold());
@@ -272,6 +291,7 @@ fn print_diff_human(entries: &[DiffEntry], snapshot: Option<&TrustSnapshot>) {
             }
         }
     }
+    println!();
 }
 
 fn render_binding_delta(name: &str, prev: &Option<String>, curr: &Option<String>) {
@@ -280,7 +300,7 @@ fn render_binding_delta(name: &str, prev: &Option<String>, curr: &Option<String>
     }
     let prev_s = prev.as_deref().unwrap_or("<none>");
     let curr_s = curr.as_deref().unwrap_or("<none>");
-    println!("      {name}: {} → {}", prev_s.dimmed(), curr_s);
+    println!("      {name:<10} {} → {}", prev_s.dimmed(), curr_s);
 }
 
 // ─── lpm trust prune ───────────────────────────────────────────────
@@ -384,7 +404,7 @@ async fn run_prune(
         if json {
             print_prune_json(&stale, dry_run, false);
         } else {
-            output::success("No stale trust entries. package.json unchanged.");
+            install_ui::done("No stale trust entries · package.json unchanged");
         }
         return Ok(());
     }
@@ -400,9 +420,10 @@ async fn run_prune(
         if json {
             print_prune_json(&stale, dry_run, false);
         } else {
-            output::info(&format!(
-                "Dry run: {} stale entry/entries would be removed.",
-                stale.len()
+            install_ui::done(&format!(
+                "Dry run · {} stale trust {} would be removed",
+                stale.len(),
+                trust_entry_word(stale.len())
             ));
         }
         return Ok(());
@@ -426,7 +447,7 @@ async fn run_prune(
         .interact()
         .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
         if !confirmed {
-            output::info("Nothing pruned.");
+            install_ui::warn("Nothing pruned");
             return Ok(());
         }
     }
@@ -441,9 +462,10 @@ async fn run_prune(
     if json {
         print_prune_json(&stale, dry_run, true);
     } else {
-        output::success(&format!(
-            "Removed {} stale trust entry/entries.",
-            stale.len()
+        install_ui::done(&format!(
+            "Removed {} stale trust {}",
+            stale.len(),
+            trust_entry_word(stale.len())
         ));
     }
     Ok(())
@@ -517,13 +539,16 @@ fn write_manifest(path: &Path, manifest: &serde_json::Value) -> Result<(), LpmEr
 /// directly so JSON and human paths share exactly one terminal
 /// output per invocation (audit-v4 F1).
 fn print_prune_human_preview(stale: &[String]) {
-    output::info(&format!(
-        "{} stale trust entry/entries (no longer in the resolved tree):",
-        stale.len()
-    ));
+    install_ui::phase("Pruning stale trust entries");
+    println!("stale");
     for k in stale {
         println!("  {} {}", "-".red(), k.bold());
     }
+    println!();
+}
+
+fn trust_entry_word(count: usize) -> &'static str {
+    if count == 1 { "entry" } else { "entries" }
 }
 
 fn print_prune_json(stale: &[String], dry_run: bool, will_mutate: bool) {

@@ -40,6 +40,14 @@ async fn search_without_matches_warns_and_exits_zero() {
         combined.contains("No packages found for \"@lpm.dev/nothing-here\""),
         "expected empty-result warning, got:\n{combined}"
     );
+    assert!(
+        combined.contains("› Searching lpm.dev for \"@lpm.dev/nothing-here\""),
+        "search must use a slim phase line, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('●') && !combined.contains('│'),
+        "search empty-result output must not use cliclack gutter output, got:\n{combined}"
+    );
 }
 
 #[tokio::test]
@@ -88,6 +96,14 @@ async fn search_human_output_truncates_long_description_and_compacts_download_co
             "This description is intentionally long so the human output path must truncate..."
         ),
         "long descriptions must be truncated with an ellipsis, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("✓ Found 1 package"),
+        "search must report a slim result count, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('●') && !combined.contains('│'),
+        "search output must not use cliclack gutter output, got:\n{combined}"
     );
 }
 
