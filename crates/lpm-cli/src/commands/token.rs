@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::{RegistryClient, parse_capped_api_json};
@@ -10,7 +10,7 @@ pub async fn run_rotate(
     json_output: bool,
 ) -> Result<(), LpmError> {
     if !json_output {
-        output::info("Rotating token...");
+        install_ui::phase("Rotating lpm.dev token");
     }
 
     // The server handles rotation: POST creates new token and invalidates old
@@ -40,7 +40,7 @@ pub async fn run_rotate(
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            output::success("Token rotated successfully");
+            install_ui::done("Done · session token rotated successfully");
             if let Some(expires) = body.get("expiresAt").and_then(|e| e.as_str()) {
                 println!("  Expires: {}", expires.dimmed());
             }

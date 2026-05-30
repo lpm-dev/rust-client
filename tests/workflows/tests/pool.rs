@@ -57,7 +57,7 @@ async fn pool_human_output_formats_revenue_summary_and_package_rows() {
         "billing period missing, got:\n{combined}"
     );
     assert!(
-        combined.contains("3210"),
+        combined.contains("3,210"),
         "weighted downloads missing, got:\n{combined}"
     );
     assert!(
@@ -65,12 +65,18 @@ async fn pool_human_output_formats_revenue_summary_and_package_rows() {
         "earnings must be formatted as dollars, got:\n{combined}"
     );
     assert!(
-        combined.contains("@lpm.dev/neo.widget") && combined.contains("(2100 downloads)"),
+        combined.contains("@lpm.dev/neo.widget") && combined.contains("(2,100 downloads)"),
         "first package row missing, got:\n{combined}"
     );
     assert!(
-        combined.contains("@lpm.dev/neo.button") && combined.contains("(1110 downloads)"),
+        combined.contains("@lpm.dev/neo.button") && combined.contains("(1,110 downloads)"),
         "second package row missing, got:\n{combined}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "pool must not use cliclack gutter output, got:\n{stderr}",
     );
 }
 

@@ -1,5 +1,5 @@
+use crate::install_ui;
 use crate::npm_public_source::lockfile_source_is_npm_public;
-use crate::output;
 use crate::prompt::prompt_err;
 #[cfg(test)]
 use crate::upgrade_engine::PeerViolation;
@@ -12,6 +12,7 @@ use lpm_semver::Version;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::time::Instant;
 
 // ── Mode resolution ─────────────────────────────────────────────────
 
@@ -124,6 +125,7 @@ pub async fn run(
     yes: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let started_at = Instant::now();
     let pkg_json_path = project_dir.join("package.json");
     if !pkg_json_path.exists() {
         return Err(LpmError::NotFound("no package.json found".into()));
@@ -186,6 +188,10 @@ pub async fn run(
         })
         .collect();
     skipped_private.sort();
+
+    if !json_output {
+        install_ui::phase("Checking dependencies for newer matching versions");
+    }
 
     // Fetch all metadata concurrently
     let fetch_futures: Vec<_> = upgradeable_deps
@@ -367,7 +373,7 @@ pub async fn run(
 
     // Warn about fetch errors
     if fetch_errors > 0 && !json_output {
-        output::warn(&format!(
+        install_ui::warn(&format!(
             "Could not check {} package(s) (network errors)",
             fetch_errors
         ));
@@ -385,7 +391,7 @@ pub async fn run(
             attach_skipped_private(&mut json, &skipped_private);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            output::success("All checked package.json dependencies are up to date");
+            install_ui::done("All checked package.json dependencies are up to date");
             warn_skipped_private(&skipped_private);
         }
         return Ok(());
@@ -398,7 +404,7 @@ pub async fn run(
         ResolvedMode::Interactive => {
             let selection = select_candidates_interactively(&candidates)?;
             if selection.is_empty() {
-                output::info("No packages selected. package.json is unchanged.");
+                install_ui::phase("No packages selected. package.json is unchanged.");
                 return Ok(());
             }
             selection
@@ -429,7 +435,11 @@ pub async fn run(
             return Ok(());
         }
     } else {
-        println!();
+        install_ui::phase(&format!(
+            "Upgrading {} {}",
+            deduped.len(),
+            install_ui::packages_word(deduped.len())
+        ));
         for u in &deduped {
             let dev_tag = if u.is_dev { " (dev)" } else { "" };
             let class_label = format_class_label(u.semver_class);
@@ -439,8 +449,9 @@ pub async fn run(
             } else {
                 format!("  {}", hint.dimmed())
             };
-            println!(
-                "  {} {} → {} {}{}{}",
+            eprintln!(
+                "{} {:<24} {:>8} → {:<8} {}{}{}",
+                "↑".green(),
                 u.name.bold(),
                 u.from.dimmed(),
                 format_version_colored(&u.to, u.semver_class),
@@ -449,12 +460,12 @@ pub async fn run(
                 hint_suffix,
             );
         }
-        println!();
 
         if dry_run {
-            output::info(&format!(
-                "{} package(s) would be upgraded (dry run)",
-                deduped.len()
+            install_ui::done(&format!(
+                "Done · would upgrade {} {} (dry run)",
+                deduped.len(),
+                install_ui::packages_word(deduped.len())
             ));
             warn_skipped_private(&skipped_private);
             return Ok(());
@@ -476,17 +487,10 @@ pub async fn run(
     std::fs::rename(&tmp_path, &pkg_json_path)
         .map_err(|e| LpmError::Script(format!("failed to rename temp package.json: {e}")))?;
 
-    if !json_output {
-        output::success(&format!(
-            "updated {} package(s) in package.json",
-            deduped.len()
-        ));
-    }
-
     // ── Run install with backup-and-restore ──────────────────────────
 
     if !json_output {
-        output::info("running lpm install...");
+        install_ui::phase("Installing upgraded dependencies");
     }
 
     remove_optional_file(&project_dir.join("lpm.lock"))?;
@@ -537,7 +541,7 @@ pub async fn run(
                 restore_err
             );
         } else if !json_output {
-            output::warn("install failed — restored original package.json");
+            install_ui::warn("install failed — restored original package.json");
         }
 
         if let Err(restore_err) =
@@ -560,7 +564,13 @@ pub async fn run(
     }
 
     if !json_output {
-        output::success(&format!("{} package(s) upgraded", deduped.len()));
+        install_ui::done("Updated package.json, lpm.lock, node_modules");
+        install_ui::done(&format!(
+            "Done · upgraded {} {} in {}",
+            deduped.len(),
+            install_ui::packages_word(deduped.len()),
+            install_ui::format_duration(started_at.elapsed())
+        ));
         warn_skipped_private(&skipped_private);
     }
 
@@ -632,12 +642,12 @@ fn warn_skipped_private(skipped_private: &[String]) {
         return;
     }
 
-    output::warn(&format!(
+    install_ui::warn(&format!(
         "skipped {} package(s) without a recorded npm-public source to avoid leaking private names to registry.npmjs.org: {}",
         skipped_private.len(),
         skipped_private.join(", "),
     ));
-    output::info("run `lpm install` first to record sources in lpm.lock, then re-run.");
+    install_ui::phase("run `lpm install` first to record sources in lpm.lock, then re-run.");
 }
 
 // ── Interactive multiselect ─────────────────────────────────────────
@@ -645,7 +655,6 @@ fn warn_skipped_private(skipped_private: &[String]) {
 fn select_candidates_interactively(
     candidates: &[EnrichedCandidate],
 ) -> Result<Vec<EnrichedCandidate>, LpmError> {
-    println!();
     let pkg_count = {
         let mut names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
         names.dedup();
@@ -653,13 +662,12 @@ fn select_candidates_interactively(
     };
     let target_count = candidates.len();
     if target_count == pkg_count {
-        output::info(&format!("{pkg_count} package(s) can be upgraded."));
+        install_ui::phase(&format!("{pkg_count} package(s) can be upgraded."));
     } else {
-        output::info(&format!(
+        install_ui::phase(&format!(
             "{target_count} upgrade targets across {pkg_count} packages."
         ));
     }
-    println!();
 
     let mut ms =
         cliclack::multiselect("Select packages to upgrade  (space=toggle  a=all  enter=confirm)");

@@ -64,6 +64,15 @@ fn query_eval_selects_only_packages_with_eval_tag() {
         !stdout.contains("clean-pkg"),
         "stdout must NOT list clean-pkg (no eval), got:\n{stdout}"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("! 1 package matched :eval"),
+        "query must report a slim match summary, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('▲'),
+        "query status output must not use legacy/cliclack glyphs, got:\n{stderr}"
+    );
 }
 
 // ─── --json format ────────────────────────────────────────────────────
@@ -266,9 +275,13 @@ fn query_no_match_human_output_indicates_zero_packages() {
 
     assert!(output.status.success(), "empty match must exit 0");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("No packages match") || stdout.contains("0 package"),
-        "stdout must indicate zero matches, got:\n{stdout}",
+        stderr.contains("! No packages match :crypto"),
+        "stderr must indicate zero matches with slim UI, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('▲'),
+        "query empty-match status output must not use legacy/cliclack glyphs, got:\n{stderr}",
     );
 }

@@ -1285,7 +1285,7 @@ fn print_package_card(blocked: &BlockedPackage) {
     if blocked.binding_drift {
         println!(
             "    {} {}",
-            "⚠".yellow(),
+            "!".yellow(),
             "previously approved — script content has changed since approval".yellow()
         );
     }
@@ -1428,7 +1428,7 @@ fn tier_label_text(tier: lpm_security::triage::StaticTier) -> &'static str {
         StaticTier::Green => "green ✓",
         StaticTier::Amber => "amber — review required",
         StaticTier::AmberLlm => "amber (llm-advised) — review required",
-        StaticTier::Red => "red ✖ — hand-curated blocklist hit",
+        StaticTier::Red => "red ✗ — hand-curated blocklist hit",
     }
 }
 

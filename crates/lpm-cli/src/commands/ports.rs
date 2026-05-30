@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_runner::lpm_json;
@@ -44,7 +44,7 @@ fn run_list(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             if json_output {
                 println!("{{\"ports\":[]}}");
             } else {
-                output::info("no services defined in lpm.json");
+                install_ui::warn("No services defined in lpm.json");
             }
             return Ok(());
         }
@@ -71,27 +71,48 @@ fn run_list(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    output::header("Service Ports");
-    println!();
+    let rows: Vec<_> = services
+        .iter()
+        .filter_map(|(name, config)| {
+            config.port.map(|port| {
+                let status = match ports::check_port(port) {
+                    ports::PortStatus::Free => "free".green(),
+                    ports::PortStatus::InUse { pid, process_name } => {
+                        let owner = match (&pid, &process_name) {
+                            (Some(p), Some(n)) => format!("{n} (PID {p})"),
+                            (Some(p), None) => format!("PID {p}"),
+                            _ => "unknown".to_string(),
+                        };
+                        format!("{} ({})", "in use".red(), owner.dimmed())
+                    }
+                };
+                (name.as_str(), port, status)
+            })
+        })
+        .collect();
 
-    for (name, config) in services {
-        if let Some(port) = config.port {
-            let status = match ports::check_port(port) {
-                ports::PortStatus::Free => "free".green().to_string(),
-                ports::PortStatus::InUse { pid, process_name } => {
-                    let owner = match (&pid, &process_name) {
-                        (Some(p), Some(n)) => format!("{n} (PID {p})"),
-                        (Some(p), None) => format!("PID {p}"),
-                        _ => "unknown".to_string(),
-                    };
-                    format!("{} ({})", "in use".red(), owner.dimmed())
-                }
-            };
-            println!("  {} :{port}  {status}", name.bold());
-        }
+    if rows.is_empty() {
+        install_ui::warn("No declared service ports");
+        return Ok(());
     }
 
+    let service_width = rows
+        .iter()
+        .map(|(name, _, _)| name.len())
+        .chain(std::iter::once("Service".len()))
+        .max()
+        .unwrap_or("Service".len());
+
+    println!("{:<service_width$}  Port   Status", "Service");
+    for (name, port, status) in &rows {
+        println!("{name:<service_width$}  {port:<5}  {status}");
+    }
     println!();
+    install_ui::done(&format!(
+        "{} declared service {}",
+        rows.len(),
+        if rows.len() == 1 { "port" } else { "ports" }
+    ));
     Ok(())
 }
 
@@ -104,7 +125,7 @@ fn run_kill(port: u16, json_output: bool) -> Result<(), LpmError> {
                     serde_json::json!({ "success": true, "port": port, "status": "already_free" })
                 );
             } else {
-                output::info(&format!("port {port} is not in use"));
+                install_ui::done(&format!("Port {port} is not in use"));
             }
         }
         ports::PortStatus::InUse { pid, process_name } => {
@@ -122,7 +143,7 @@ fn run_kill(port: u16, json_output: bool) -> Result<(), LpmError> {
                     serde_json::json!({ "success": true, "port": port, "killed": owner })
                 );
             } else {
-                output::success(&format!("killed {owner} on port {port}"));
+                install_ui::done(&format!("Killed {owner} on port {port}"));
             }
         }
     }
@@ -135,6 +156,6 @@ fn run_reset(project_dir: &Path, json_output: bool) {
     if json_output {
         println!("{}", serde_json::json!({ "success": true, "reset": true }));
     } else {
-        output::success("port overrides cleared for this project");
+        install_ui::done("Port overrides cleared for this project");
     }
 }

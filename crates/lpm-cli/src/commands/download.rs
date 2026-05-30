@@ -1,5 +1,5 @@
 use crate::commands::registry_reads::{fetch_routed_package_metadata, prepare_routed_read_context};
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -20,14 +20,9 @@ pub async fn run(
         prepare_routed_read_context(client, project_dir, &[package.to_string()], json_output)?;
     let start = Instant::now();
 
-    // Step 1: Fetch metadata
-    let spinner = if !json_output {
-        let s = cliclack::spinner();
-        s.start(format!("Fetching metadata for {package}..."));
-        Some(s)
-    } else {
-        None
-    };
+    if !json_output {
+        install_ui::phase(&format!("Resolving {package}"));
+    }
 
     let (package_ref, metadata) = fetch_routed_package_metadata(&context, package).await?;
     let package_name = metadata.name.clone();
@@ -50,22 +45,9 @@ pub async fn run(
 
     let integrity_str = ver.integrity_or_shasum();
 
-    if let Some(s) = spinner {
-        s.stop(format!(
-            "Resolved {} {}",
-            package_name.bold(),
-            format!("v{version_key}").dimmed()
-        ));
+    if !json_output {
+        install_ui::phase(&format!("Downloading {package_name}@{version_key}"));
     }
-
-    // Step 2: Download tarball
-    let spinner = if !json_output {
-        let s = cliclack::spinner();
-        s.start("Downloading tarball...");
-        Some(s)
-    } else {
-        None
-    };
 
     let downloaded = context
         .client
@@ -73,14 +55,6 @@ pub async fn run(
         .await?;
     let tarball_data = std::fs::read(downloaded.file.path()).map_err(LpmError::Io)?;
     let size = tarball_data.len();
-
-    if let Some(s) = spinner {
-        s.stop(format!(
-            "Downloaded {} ({})",
-            format!("{package_name}@{version_key}").bold(),
-            format_bytes(size).dimmed()
-        ));
-    }
 
     // Step 3: Verify integrity. Refuse-by-default for the audit-use
     // posture: `lpm download` is documented as the tool for
@@ -98,23 +72,15 @@ pub async fn run(
         )));
     }
     let integrity_verified = if let Some(sri) = integrity_str.as_ref() {
-        let spinner = if !json_output {
-            let s = cliclack::spinner();
-            s.start("Verifying integrity...");
-            Some(s)
-        } else {
-            None
-        };
-
         lpm_extractor::verify_integrity(&tarball_data, sri.as_ref())?;
 
-        if let Some(s) = spinner {
-            s.stop("Integrity verified ✓");
+        if !json_output {
+            install_ui::done(&format!("Verified integrity {}", short_integrity(sri)));
         }
         true
     } else {
         if !json_output {
-            output::warn("No integrity hash available — skipping verification");
+            install_ui::warn("No integrity hash available — skipping verification");
         }
         false
     };
@@ -122,24 +88,7 @@ pub async fn run(
     // Step 4: Extract
     let target_dir = output_dir.map_or_else(|| PathBuf::from("."), PathBuf::from);
 
-    let spinner = if !json_output {
-        let s = cliclack::spinner();
-        s.start(format!("Extracting to {}...", target_dir.display()));
-        Some(s)
-    } else {
-        None
-    };
-
     let files = lpm_extractor::extract_tarball(&tarball_data, &target_dir)?;
-
-    if let Some(s) = spinner {
-        s.stop(format!(
-            "Extracted {} files to {} in {:.1}s",
-            files.len().to_string().bold(),
-            target_dir.display().to_string().bold(),
-            start.elapsed().as_secs_f64()
-        ));
-    }
 
     let elapsed = start.elapsed();
 
@@ -165,6 +114,11 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
+        eprintln!("    output:          {}", target_dir.display());
+        eprintln!("    files extracted: {}", files.len());
+        eprintln!("    size:            {}", format_bytes(size));
+        eprintln!();
+
         // Show extracted files summary
         if files.len() <= 20 {
             for f in &files {
@@ -181,9 +135,31 @@ pub async fn run(
         }
 
         println!();
+        let duration = install_ui::format_duration(elapsed);
+        install_ui::done(&format!(
+            "Done · tarball extracted in {}",
+            install_ui::green(&duration)
+        ));
     }
 
     Ok(())
+}
+
+fn short_integrity(integrity: &str) -> String {
+    const KEEP: usize = 10;
+    if integrity.chars().count() <= KEEP * 2 + 3 {
+        return integrity.to_string();
+    }
+    let prefix: String = integrity.chars().take(KEEP).collect();
+    let suffix: String = integrity
+        .chars()
+        .rev()
+        .take(KEEP)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}...{suffix}")
 }
 
 fn format_bytes(bytes: usize) -> String {

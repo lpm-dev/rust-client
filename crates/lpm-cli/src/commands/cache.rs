@@ -20,7 +20,7 @@
 //! `lpm cache clean && lpm store clean`. Keeping the command/directory
 //! mapping one-to-one is the whole point of the rename.
 
-use crate::output;
+use crate::install_ui;
 use lpm_common::{LpmError, LpmRoot, format_bytes, with_exclusive_lock};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -154,20 +154,24 @@ fn emit_clean_json(cleaned: &[CleanedEntry]) {
 }
 
 fn emit_clean_human(cleaned: &[CleanedEntry]) {
-    if cleaned.is_empty() {
-        output::info("Cache is already empty");
+    let total: u64 = cleaned.iter().map(|c| c.bytes_freed).sum();
+    if cleaned.is_empty() || total == 0 {
+        install_ui::done("Cache is already empty");
         return;
     }
-    for c in cleaned {
-        output::success(&format!(
-            "Cleared {} cache ({})",
-            c.category,
-            format_bytes(c.bytes_freed)
+    if cleaned.len() == 1 {
+        let entry = &cleaned[0];
+        install_ui::done(&format!(
+            "Cleared {} cache · freed {}",
+            entry.category,
+            format_bytes(total)
         ));
-    }
-    let total: u64 = cleaned.iter().map(|c| c.bytes_freed).sum();
-    if cleaned.len() > 1 {
-        output::info(&format!("Total freed: {}", format_bytes(total)));
+    } else {
+        install_ui::done(&format!(
+            "Cleared {} cache directories · freed {}",
+            cleaned.len(),
+            format_bytes(total)
+        ));
     }
 }
 

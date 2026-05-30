@@ -2428,7 +2428,7 @@ async fn vars_platform_push(
         if orphans > 0 && !clean {
             println!(
                 "  {} {orphans} orphan(s) on {platform} {}",
-                "⚠".yellow(),
+                "!".yellow(),
                 "(use --clean to remove)".dimmed()
             );
         }
@@ -2642,7 +2642,7 @@ async fn vars_platform_status(
 
                 println!(
                     "  {} {}  {} — +{added} ~{changed} -{removed}",
-                    "⚠".yellow(),
+                    "!".yellow(),
                     display_name.bold(),
                     "drifted".yellow()
                 );
@@ -3543,7 +3543,7 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
             let updated = v.updated_at.as_deref().unwrap_or("?");
             println!(
                 "  {} {} {} {}",
-                "●".cyan(),
+                "·".cyan(),
                 v.vault_id.bold(),
                 version.dimmed(),
                 format!("(updated {updated})").dimmed()
@@ -3593,7 +3593,7 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
         let updated = v.updated_at.as_deref().unwrap_or("?");
         println!(
             "  {} {} {} {}",
-            "●".cyan(),
+            "·".cyan(),
             v.vault_id.bold(),
             version.dimmed(),
             format!("(updated {updated})").dimmed()
@@ -4092,15 +4092,15 @@ fn vars_validate(
     println!();
 
     for key in &present {
-        println!("  {} {} {}", "✔".green(), key.bold(), "set".green());
+        println!("  {} {} {}", "✓".green(), key.bold(), "set".green());
     }
     for key in &missing {
-        println!("  {} {} {}", "✖".red(), key.bold(), "missing".red());
+        println!("  {} {} {}", "✗".red(), key.bold(), "missing".red());
     }
     for key in &extra {
         println!(
             "  {} {} {}",
-            "⚠".yellow(),
+            "!".yellow(),
             key.bold(),
             "not in .env.example (extra)".yellow()
         );

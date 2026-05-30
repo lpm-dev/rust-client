@@ -1,5 +1,5 @@
 use crate::commands::registry_reads::{fetch_routed_package_metadata, prepare_routed_read_context};
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -25,16 +25,7 @@ pub async fn run(
         return Ok(());
     }
 
-    // Package name header
-    println!();
-    println!("  {}", metadata.name.bold());
-
-    if let Some(desc) = &metadata.description
-        && !desc.is_empty()
-    {
-        println!("  {}", desc.dimmed());
-    }
-    println!();
+    println!("{}", metadata.name.bold());
 
     // Determine which version to show
     let version_key = version
@@ -44,10 +35,10 @@ pub async fn run(
     if let Some(ref vk) = version_key
         && let Some(ver) = metadata.version(vk)
     {
-        output::field("version", &ver.version);
+        print_field("version", &ver.version);
 
         if let Some(eco) = &ver.ecosystem {
-            output::field("ecosystem", eco);
+            print_field("ecosystem", eco);
         }
 
         if let Some(integrity) = ver.integrity_or_shasum() {
@@ -56,46 +47,48 @@ pub async fn run(
             } else {
                 integrity.to_string()
             };
-            output::field("integrity", &short);
+            print_field("integrity", &short);
+        }
+
+        if let Some(desc) = &metadata.description
+            && !desc.is_empty()
+        {
+            print_field("description", desc);
         }
 
         if !ver.dependencies.is_empty() {
-            output::header(&format!("dependencies ({})", ver.dependencies.len()));
-            for (dep, range) in &ver.dependencies {
-                println!("    {} {}", dep, range.dimmed());
-            }
+            println!();
+            println!("dependencies");
+            print_name_value_rows(&ver.dependencies);
         }
 
         if !ver.peer_dependencies.is_empty() {
-            output::header(&format!(
-                "peer dependencies ({})",
-                ver.peer_dependencies.len()
-            ));
-            for (dep, range) in &ver.peer_dependencies {
-                println!("    {} {}", dep, range.dimmed());
-            }
+            println!();
+            println!("peer dependencies");
+            print_name_value_rows(&ver.peer_dependencies);
         }
     }
 
     if let Some(mode) = &metadata.distribution_mode {
-        output::field("distribution", &output::mode_badge(mode));
+        print_field("distribution", &mode_badge(mode));
     }
 
     if let Some(downloads) = metadata.downloads {
-        output::field("downloads", &format!("{downloads}"));
+        print_field("downloads", &downloads.to_string());
     }
 
     // All versions
     let mut versions: Vec<&str> = metadata.version_list();
     versions.sort();
     if !versions.is_empty() {
-        output::header(&format!("versions ({})", versions.len()));
+        println!();
+        println!("versions ({})", versions.len());
         let latest = metadata.latest_version_tag().unwrap_or("");
         for v in &versions {
             if *v == latest {
-                println!("    {} {}", v, "(latest)".green());
+                println!("  {:<12} {}", v, "(latest)".green());
             } else {
-                println!("    {}", v.dimmed());
+                println!("  {}", v.dimmed());
             }
         }
     }
@@ -104,9 +97,32 @@ pub async fn run(
         && let Some(time) = metadata.time.get(tag.as_str())
     {
         println!();
-        output::field("published", time);
+        print_field("published", time);
     }
 
     println!();
+    install_ui::done("Loaded package metadata");
     Ok(())
+}
+
+fn print_field(label: &str, value: &str) {
+    println!("  {label:<12} {value}");
+}
+
+fn print_name_value_rows(values: &std::collections::HashMap<String, String>) {
+    let mut rows: Vec<_> = values.iter().collect();
+    rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    for (name, value) in rows {
+        println!("  {name:<width$}  {}", value.dimmed());
+    }
+}
+
+fn mode_badge(mode: &str) -> String {
+    match mode {
+        "pool" => "pool".cyan(),
+        "marketplace" => "marketplace".magenta(),
+        "private" => "private".yellow(),
+        _ => mode.dimmed(),
+    }
 }

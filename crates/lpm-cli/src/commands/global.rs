@@ -5,7 +5,7 @@
 //! `update [<pkg>[@<spec>]]` (with `--dry-run`).
 //! Read-only commands (`list`, `bin`, `path`) do not acquire a lock.
 
-use crate::output;
+use crate::install_ui;
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, format_bytes, sanitize_for_terminal};
 use lpm_global::{GlobalManifest, PackageEntry};
@@ -172,7 +172,7 @@ async fn run_list_outdated(
                 .unwrap()
             );
         } else {
-            output::info("No globally-installed packages.");
+            install_ui::warn("No globally-installed packages");
         }
         return Ok(());
     }
@@ -384,7 +384,7 @@ fn emit_outdated_human(
     verbose: bool,
 ) {
     if outdated.is_empty() && unresolved.is_empty() {
-        output::success(&format!(
+        install_ui::done(&format!(
             "All {} globally-installed package{} are up-to-date.",
             up_to_date.len(),
             if up_to_date.len() == 1 { "" } else { "s" },
@@ -413,14 +413,14 @@ fn emit_outdated_human(
             );
         }
         println!();
-        output::info(
+        install_ui::phase(
             "Run `lpm global update <pkg>` to upgrade one, or \
              `lpm global update` to upgrade every outdated install.",
         );
         println!();
     }
     if !unresolved.is_empty() {
-        output::warn(&format!(
+        install_ui::warn(&format!(
             "{} package{} could not be compared:",
             unresolved.len(),
             if unresolved.len() == 1 { "" } else { "s" },
@@ -437,7 +437,7 @@ fn emit_outdated_human(
             .iter()
             .map(|n| sanitize_for_terminal(n))
             .collect();
-        output::info(&format!(
+        install_ui::phase(&format!(
             "{} up-to-date: {}",
             up_to_date.len(),
             names_safe.join(", ").dimmed(),
@@ -487,9 +487,9 @@ fn package_to_json(
 
 fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
     if manifest.packages.is_empty() {
-        output::info("No globally-installed packages.");
+        install_ui::warn("No globally-installed packages");
         if !root.global_manifest().exists() {
-            output::info(&format!(
+            install_ui::phase(&format!(
                 "Run `lpm install -g <pkg>` to install one. Manifest lives at {}.",
                 root.global_manifest().display()
             ));
@@ -564,6 +564,15 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
         }
     }
     println!();
+    install_ui::done(&format!(
+        "{} global package{} installed",
+        manifest.packages.len(),
+        if manifest.packages.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    ));
 }
 
 /// Annotate command list with `(alias of X)` when an alias maps onto

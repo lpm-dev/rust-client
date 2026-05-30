@@ -32,9 +32,8 @@
 //!   documented as a limitation.
 
 use crate::commands::install_targets::{install_root_for, resolve_install_targets};
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -665,22 +664,20 @@ pub async fn run(
                 serde_json::to_string_pretty(&payload).unwrap_or_default()
             );
         } else {
-            eprintln!(
-                "[dry-run] would deploy {} ({}) to {}",
-                member_name.bold(),
-                plan.member_dir.display(),
-                plan.output_dir.display()
-            );
+            install_ui::phase(&format!(
+                "Materializing production closure for {member_name}"
+            ));
+            deploy_detail("output:", plan.output_dir.display());
+            deploy_detail("member:", plan.member_dir.display());
+            deploy_detail("dry run:", "yes");
+            install_ui::done("Done · dry run complete");
         }
         return Ok(());
     }
 
     if !json_output {
-        output::info(&format!(
-            "Deploying {} from {} to {}",
-            member_name.bold(),
-            plan.member_dir.display(),
-            plan.output_dir.display()
+        install_ui::phase(&format!(
+            "Materializing production closure for {member_name}"
         ));
     }
 
@@ -816,36 +813,21 @@ pub async fn run(
             serde_json::to_string_pretty(&payload).unwrap_or_default()
         );
     } else {
-        println!();
-        output::success(&format!(
-            "Deployed {} to {} ({} files, {}, {:.1}s)",
-            member_name.bold(),
-            plan.output_dir.display(),
-            copy_stats.files_copied.to_string().bold(),
-            lpm_common::format_bytes(copy_stats.bytes_copied),
-            elapsed.as_secs_f64(),
+        deploy_detail("output:", plan.output_dir.display());
+        deploy_detail("workspace deps rewritten:", rewritten_count);
+        deploy_detail("node_modules installed:", "yes");
+        install_ui::done("Copied source, lockfile, and production dependencies");
+        install_ui::done(&format!(
+            "Done · deploy tree ready at {}",
+            plan.output_dir.display()
         ));
-        if rewritten_count > 0 {
-            println!(
-                "  {}",
-                format!("rewrote {rewritten_count} workspace:* reference(s) to concrete versions")
-                    .dimmed()
-            );
-        }
-        if stripped_dev_deps > 0 {
-            println!(
-                "  {}",
-                format!(
-                    "stripped {stripped_dev_deps} devDependency entr{} (deploy is production-only)",
-                    if stripped_dev_deps == 1 { "y" } else { "ies" }
-                )
-                .dimmed()
-            );
-        }
-        println!();
     }
 
     Ok(())
+}
+
+fn deploy_detail(label: &str, value: impl std::fmt::Display) {
+    eprintln!("    {label:<25} {value}");
 }
 
 #[cfg(test)]

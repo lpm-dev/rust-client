@@ -1,4 +1,5 @@
-use crate::{CheckEngine, output};
+use super::tools_ui;
+use crate::CheckEngine;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::num::NonZeroUsize;
@@ -73,18 +74,20 @@ struct Captured {
 
 /// Run `lpm lint` — delegates to oxlint via plugin system.
 pub async fn lint(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
+    let start = std::time::Instant::now();
     let version = read_tool_version(project_dir, "oxlint");
     let bin = lpm_plugin::ensure_plugin("oxlint", version.as_deref(), false).await?;
 
     if !json_output {
-        output::info(&format!(
-            "lint (oxlint {})",
-            version.as_deref().unwrap_or("latest")
-        ));
+        let version_label = tools_ui::plugin_version_label(&bin, version.as_deref());
+        tools_ui::using_tool("Oxlint", &version_label);
     }
 
     let outcome = run_tool_binary(&bin, args, project_dir, StdioMode::Inherit)?;
-    outcome.into_result()
+    if outcome.success() && !json_output {
+        tools_ui::done_lint(start.elapsed());
+    }
+    finish_tool_outcome("lint", outcome, json_output)
 }
 
 /// Run `lpm fmt` — delegates to biome via plugin system.
@@ -98,20 +101,25 @@ pub async fn fmt(
     check: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let start = std::time::Instant::now();
     let version = read_tool_version(project_dir, "biome");
     let bin = lpm_plugin::ensure_plugin("biome", version.as_deref(), false).await?;
 
     if !json_output {
-        let mode = if check { "check" } else { "write" };
-        output::info(&format!(
-            "fmt ({mode}, biome {})",
-            version.as_deref().unwrap_or("latest")
-        ));
+        let version_label = tools_ui::plugin_version_label(&bin, version.as_deref());
+        tools_ui::using_tool("Biome", &version_label);
     }
 
     let biome_args = build_biome_args(args, check);
     let outcome = run_tool_binary(&bin, &biome_args, project_dir, StdioMode::Inherit)?;
-    outcome.into_result()
+    if outcome.success() && !json_output {
+        if check {
+            tools_ui::done_fmt_check(start.elapsed());
+        } else {
+            tools_ui::done_fmt_write_elapsed(start.elapsed());
+        }
+    }
+    finish_tool_outcome("fmt", outcome, json_output)
 }
 
 /// Build the biome args vector — extracted so the workspace path can call it
@@ -144,8 +152,9 @@ pub async fn check(
     engine: CheckEngine,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let start = std::time::Instant::now();
     if !json_output {
-        output::info(&format!("check ({} --noEmit)", check_engine_binary(engine)));
+        tools_ui::using_check_engine(check_engine_binary(engine));
     }
 
     if !user_targeted_explicit_input(args) {
@@ -153,7 +162,10 @@ pub async fn check(
     }
 
     let outcome = run_check_engine(project_dir, args, engine, StdioMode::Inherit).await?;
-    outcome.into_result()
+    if outcome.success() && !json_output {
+        tools_ui::done_typecheck(start.elapsed());
+    }
+    finish_tool_outcome("typecheck", outcome, json_output)
 }
 
 /// True when the user passed `-p` / `--project <path>` or any
@@ -218,7 +230,7 @@ pub async fn test(project_dir: &Path, args: &[String], json_output: bool) -> Res
     let runner_cmd = adjust_test_runner_for_watch(&runner_name, runner_cmd, args);
 
     if !json_output {
-        output::info(&format!("test ({runner_name})"));
+        tools_ui::detected_test_runner(&runner_name);
     }
 
     let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
@@ -230,6 +242,7 @@ pub async fn test(project_dir: &Path, args: &[String], json_output: bool) -> Res
         build_safe_command(&runner_name, &runner_cmd, args)
     };
 
+    let start = std::time::Instant::now();
     let status = lpm_runner::shell::spawn_shell(&lpm_runner::shell::ShellCommand {
         command: &full_cmd,
         cwd: project_dir,
@@ -238,7 +251,15 @@ pub async fn test(project_dir: &Path, args: &[String], json_output: bool) -> Res
     })?;
 
     if !status.success() {
-        return Err(LpmError::ExitCode(lpm_runner::shell::exit_code(&status)));
+        let code = lpm_runner::shell::exit_code(&status);
+        if !json_output {
+            tools_ui::failed("test", code);
+        }
+        return Err(LpmError::ExitCode(code));
+    }
+
+    if !json_output {
+        tools_ui::done_test(start.elapsed());
     }
 
     Ok(())
@@ -249,10 +270,7 @@ pub async fn bench(project_dir: &Path, args: &[String], json_output: bool) -> Re
     let (runner_name, cmd) = detect_bench_runner(project_dir)?;
 
     if !json_output {
-        output::info(&format!(
-            "bench ({})",
-            cmd.split_whitespace().next().unwrap_or("unknown")
-        ));
+        tools_ui::detected_bench_runner(&runner_name);
     }
 
     let path = lpm_runner::bin_path::build_path_with_bins(project_dir);
@@ -264,6 +282,7 @@ pub async fn bench(project_dir: &Path, args: &[String], json_output: bool) -> Re
         build_safe_command(&runner_name, &cmd, args)
     };
 
+    let start = std::time::Instant::now();
     let status = lpm_runner::shell::spawn_shell(&lpm_runner::shell::ShellCommand {
         command: &full_cmd,
         cwd: project_dir,
@@ -272,7 +291,15 @@ pub async fn bench(project_dir: &Path, args: &[String], json_output: bool) -> Re
     })?;
 
     if !status.success() {
-        return Err(LpmError::ExitCode(lpm_runner::shell::exit_code(&status)));
+        let code = lpm_runner::shell::exit_code(&status);
+        if !json_output {
+            tools_ui::failed("bench", code);
+        }
+        return Err(LpmError::ExitCode(code));
+    }
+
+    if !json_output {
+        tools_ui::done_bench(start.elapsed());
     }
 
     Ok(())
@@ -350,6 +377,20 @@ impl ToolOutcome {
             )),
         }
     }
+}
+
+fn finish_tool_outcome(
+    label: &str,
+    outcome: ToolOutcome,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if !json_output
+        && let Some(code) = outcome.exit_code
+        && code != 0
+    {
+        tools_ui::failed(label, code);
+    }
+    outcome.into_result()
 }
 
 /// Run a plugin binary with args. Returns the outcome rather than panicking
@@ -655,13 +696,10 @@ pub async fn tool_workspace(
             });
             println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         } else if affected_only {
-            output::success(&format!(
-                "no packages affected vs {} — nothing to {tool}",
-                affected_base.unwrap_or("main"),
-            ));
+            tools_ui::done_no_packages_affected(tool, affected_base.unwrap_or("main"));
         } else {
             let hint = crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
-            output::warn("No packages matched");
+            tools_ui::warn_no_packages_matched();
             if let Some(h) = hint {
                 eprintln!();
                 for line in h.lines() {
@@ -1277,10 +1315,7 @@ fn emit_human_summary(
     elapsed: std::time::Duration,
 ) {
     if failed == 0 {
-        output::success(&format!(
-            "{tool} passed in {total} packages ({:.1}s)",
-            elapsed.as_secs_f64()
-        ));
+        tools_ui::done_workspace(tool, total, elapsed);
         if targeted > total {
             // Some level filtering reduced the actual run set; surface that.
             eprintln!(
@@ -1290,10 +1325,7 @@ fn emit_human_summary(
             );
         }
     } else {
-        output::warn(&format!(
-            "{tool}: {succeeded} passed, {failed} failed out of {total} packages ({:.1}s)",
-            elapsed.as_secs_f64()
-        ));
+        tools_ui::failed_workspace(tool, succeeded, failed, total, elapsed);
     }
 }
 

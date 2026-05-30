@@ -262,6 +262,19 @@ fn bundle_uses_seeded_managed_rolldown_engine_with_lpm_flags() {
         output.status,
         String::from_utf8_lossy(&output.stderr),
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Using Rolldown 1.0.2"),
+        "bundle must use a slim phase line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · bundled in "),
+        "bundle must report a slim timed completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "bundle output must not use cliclack gutter output, got:\n{stderr}"
+    );
 
     let invocations = read_marker_lines(&marker_file);
     assert_eq!(invocations.len(), 1, "expected one rolldown invocation");
@@ -286,6 +299,85 @@ fn bundle_uses_seeded_managed_rolldown_engine_with_lpm_flags() {
             "--minify",
             "--sourcemap"
         ])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_workspace_human_reports_slim_summary() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    for member in ["packages/utils", "packages/core", "packages/app"] {
+        project.write_file(&format!("{member}/src/index.js"), "export default 1\n");
+    }
+
+    let marker_file = project.home().join("bundle-workspace-human.log");
+    seed_fake_rolldown_engine(&project, &marker_file);
+
+    let output = lpm(&project)
+        .args([
+            "bundle",
+            "--all",
+            "--entry",
+            "src/index.js",
+            "--out-dir",
+            "dist",
+        ])
+        .output()
+        .expect("failed to run lpm bundle --all");
+
+    assert!(
+        output.status.success(),
+        "workspace bundle must succeed, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ bundle passed in 3 packages in "),
+        "workspace bundle must report a slim timed summary, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "workspace bundle output must not use cliclack gutter output, got:\n{stderr}"
+    );
+
+    let invocations = read_marker_lines(&marker_file);
+    assert_eq!(
+        invocations.len(),
+        3,
+        "expected one rolldown invocation per member"
+    );
+}
+
+#[test]
+fn bundle_filter_typo_without_fail_flag_uses_slim_warning() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    let output = lpm(&project)
+        .args([
+            "bundle",
+            "--filter",
+            "this-package-does-not-exist",
+            "--entry",
+            "src/index.js",
+        ])
+        .output()
+        .expect("failed to run lpm bundle");
+
+    assert!(
+        output.status.success(),
+        "empty-match without --fail-if-no-match must exit 0, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No packages matched"),
+        "expected slim empty-match warning, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "empty-match bundle output must not use cliclack gutter output, got:\n{stderr}"
     );
 }
 

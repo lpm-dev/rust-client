@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_runner::bin_path::ManagedRuntimeHint;
@@ -9,6 +9,13 @@ use std::path::Path;
 /// Maximum size for captured task output before truncation ().
 /// Prevents unbounded memory usage from chatty tasks.
 const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024; // 10MB
+
+fn runtime_display_name(runtime: &str) -> &str {
+    match runtime {
+        "node" => "Node.js",
+        other => other,
+    }
+}
 
 /// Truncate captured output if it exceeds `MAX_CAPTURED_OUTPUT`, cutting at
 /// the last newline boundary to avoid splitting a line.
@@ -53,13 +60,12 @@ pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
                 source,
                 bin_dir,
             } => {
-                eprintln!(
-                    "  {} {} {} (from {})",
-                    "Using".dimmed(),
-                    runtime.as_str(),
-                    version.bold(),
-                    source.dimmed(),
-                );
+                install_ui::phase(&format!(
+                    "Using {} {} ({})",
+                    runtime_display_name(runtime.as_str()),
+                    install_ui::bold(&version),
+                    install_ui::dim(&format!("from {source}"))
+                ));
                 bin_dirs.push(bin_dir);
             }
             lpm_runtime::RuntimeStatus::Installed {
@@ -68,10 +74,10 @@ pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
                 source,
                 bin_dir,
             } => {
-                output::success(&format!(
+                install_ui::done(&format!(
                     "Auto-installed {} {} (from {})",
-                    runtime.as_str(),
-                    version.bold(),
+                    runtime_display_name(runtime.as_str()),
+                    install_ui::bold(&version),
                     source,
                 ));
                 bin_dirs.push(bin_dir);
@@ -81,12 +87,12 @@ pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
                 spec,
                 source,
             } => {
-                output::warn(&format!(
+                install_ui::warn(&format!(
                     "{} requires {} {}, but it's not installed. Using system {}.",
                     source,
-                    runtime.as_str(),
-                    spec.bold(),
-                    runtime.as_str(),
+                    runtime_display_name(runtime.as_str()),
+                    install_ui::bold(&spec),
+                    runtime_display_name(runtime.as_str()),
                 ));
                 eprintln!(
                     "    Run: {}",
@@ -144,15 +150,15 @@ pub async fn run(
         if !hit.stderr.is_empty() {
             eprint!("{}", hit.stderr);
         }
-        output::success(&format!(
+        install_ui::done(&format!(
             "{} restored from cache (originally {:.1}s)",
-            script_name.bold(),
+            install_ui::bold(script_name),
             hit.meta.duration_ms as f64 / 1000.0,
         ));
         return Ok(());
     }
 
-    output::info(&script_name.bold());
+    install_ui::phase(&format!("Running {script_name}"));
 
     // Check if caching is enabled — if so, use tee capture
     let caching_enabled = !no_cache && is_task_cached_with_config(script_name, lpm_config.as_ref());
@@ -210,7 +216,7 @@ pub async fn run_multi(
     let bin_hint = ensure_runtime(project_dir).await;
 
     if scripts.is_empty() {
-        output::warn("No scripts specified. Usage: lpm run <script> [scripts...]");
+        install_ui::warn("No scripts specified. Usage: lpm run <script> [scripts...]");
         return Ok(());
     }
     reject_direct_hidden_scripts(scripts)?;
@@ -522,7 +528,7 @@ async fn run_tasks_sequential(
             continue;
         }
 
-        output::info(&script.bold());
+        install_ui::phase(&format!("Running {script}"));
 
         let caching_enabled = !no_cache && is_task_cached_with_config(script, lpm_config);
         let task_start = std::time::Instant::now();
@@ -735,7 +741,7 @@ async fn run_tasks_parallel(
                 continue;
             }
 
-            output::info(&task_name.bold());
+            install_ui::phase(&format!("Running {task_name}"));
 
             // Use captured execution when caching is enabled ()
             let caching_enabled = !no_cache && is_task_cached_with_config(task_name, lpm_config);
@@ -1170,7 +1176,7 @@ pub async fn run_workspace(
             }));
         }
 
-        output::warn("No packages matched");
+        install_ui::warn("No packages matched");
         if let Some(h) = hint {
             eprintln!();
             for line in h.lines() {
@@ -1292,7 +1298,7 @@ pub async fn run_workspace(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        output::success(&format!(
+        install_ui::done(&format!(
             "{total} packages, {total_succeeded} succeeded ({:.1}s)",
             elapsed.as_secs_f64()
         ));
@@ -1477,12 +1483,11 @@ pub fn run_watch(
         .unwrap_or_default();
 
     if input_globs.is_empty() {
-        output::info(&format!("watching {} (Ctrl+C to stop)", script_name.bold()));
+        install_ui::phase(&format!("Watching {script_name} (Ctrl+C to stop)"));
     } else {
-        output::info(&format!(
-            "watching {} [{}] (Ctrl+C to stop)",
-            script_name.bold(),
-            input_globs.join(", ").dimmed(),
+        install_ui::phase(&format!(
+            "Watching {script_name} [{}] (Ctrl+C to stop)",
+            install_ui::dim(&input_globs.join(", ")),
         ));
     }
 
@@ -1508,12 +1513,12 @@ pub fn run_watch(
                 Ok(()) => {
                     println!(
                         "\n{} {} completed. Waiting for changes...",
-                        "✔".green(),
+                        "✓".green(),
                         script,
                     );
                 }
                 Err(e) => {
-                    eprintln!("\n{} {}: {}", "✖".red(), script, e,);
+                    eprintln!("\n{} {}: {}", "✗".red(), script, e,);
                     eprintln!("Waiting for changes...");
                 }
             }
@@ -1537,7 +1542,7 @@ pub async fn exec(
     // PATH so it can choose between native TS, `--experimental-strip-types`,
     // local `tsx`, and `npx tsx` using the actual `node` binary that will run.
     let _ = ensure_runtime(project_dir).await;
-    output::info(&format!("exec {}", file_path.bold()));
+    install_ui::phase(&format!("Executing {file_path}"));
     lpm_runner::exec::exec_file(project_dir, file_path, extra_args)
 }
 
@@ -1565,15 +1570,15 @@ pub async fn dlx(
 
     let was_ready = install.is_ready();
     let needs_install = refresh || !was_ready;
+    install_ui::phase(&format!("Resolving {package_spec}"));
     if !refresh && was_ready {
-        // Hit path: nothing to log, falls through to touch+exec.
+        install_ui::phase("Reusing dlx cache entry (fresh)");
     } else if !refresh && !install.root().join("node_modules/.bin").is_dir() {
         // First install or evicted entry — silent install (matches prior dlx behavior).
     } else if !refresh {
         // Markers present but TTL expired — be loud about the reinstall.
-        output::info(&format!(
-            "cache expired for {}, reinstalling...",
-            package_spec.bold()
+        install_ui::phase(&format!(
+            "Refreshing expired dlx cache entry for {package_spec}"
         ));
     }
 
@@ -1583,7 +1588,7 @@ pub async fn dlx(
         std::fs::write(install.root().join("package.json"), install.manifest_text())
             .map_err(|e| LpmError::Script(format!("failed to write dlx package.json: {e}")))?;
 
-        output::info(&format!("installing {}...", package_spec.bold()));
+        install_ui::phase(&format!("Installing {package_spec}"));
 
         // Step 6 fix: use the injected client. Pre-fix this
         // built a fresh `RegistryClient::new()` so any `@lpm.dev` deps
@@ -1636,7 +1641,7 @@ pub async fn dlx(
         "lpm dlx runs `{}` with no sandbox and no consent gate. Only invoke `lpm dlx` against packages you trust.",
         package_spec,
     );
-    output::warn(&format!(
+    install_ui::warn(&format!(
         "running `{package_spec}` with no sandbox — credential env vars are stripped, but cwd and ambient privileges are inherited"
     ));
 

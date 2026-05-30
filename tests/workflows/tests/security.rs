@@ -38,6 +38,41 @@ fn security_status_json_defaults_to_project_target() {
 }
 
 #[test]
+fn security_status_human_uses_slim_completion() {
+    let project = TempProject::empty(r#"{"name":"security-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["security", "status"])
+        .output()
+        .expect("failed to run lpm security status");
+
+    assert!(
+        output.status.success(),
+        "security status must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("target   project")
+            && stdout.contains("effective floor")
+            && stdout.contains("active unlocks"),
+        "security status must render the status sections to stdout, got:\n{stdout}",
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Security floor loaded"),
+        "security status must finish with a slim completion line, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "security status must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+#[test]
 fn security_lock_json_defaults_to_global_target() {
     let project = TempProject::empty(r#"{"name":"security-test","version":"1.0.0"}"#);
 
@@ -58,6 +93,33 @@ fn security_lock_json_defaults_to_global_target() {
     assert_eq!(envelope["target"], serde_json::json!("global"));
     assert_eq!(envelope["scope"], serde_json::json!("default"));
     assert_eq!(envelope["revocations"], serde_json::json!([]));
+}
+
+#[test]
+fn security_lock_human_reports_empty_revocation_as_slim_warning() {
+    let project = TempProject::empty(r#"{"name":"security-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["security", "lock", "default"])
+        .output()
+        .expect("failed to run lpm security lock default");
+
+    assert!(
+        output.status.success(),
+        "security lock must succeed when nothing matches\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("! No active global unlocks matched default."),
+        "security lock must report the no-op with a slim warning, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "security lock must not use cliclack gutter output, got:\n{stderr}",
+    );
 }
 
 #[test]

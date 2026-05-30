@@ -355,6 +355,72 @@ async fn outdated_reports_newer_version_for_outdated_lpm_dep() {
 }
 
 #[tokio::test]
+async fn outdated_human_output_uses_slim_completion() {
+    let pkg = "@lpm.dev/owner.human-outdated";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"outdated-human","version":"1.0.0","dependencies":{{"{pkg}":"^1.0.0"}}}}"#
+    ));
+    write_minimal_lockfile(&project, pkg, "1.0.0");
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        pkg,
+        "2.0.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "1.0.0")),
+            ),
+            (
+                "1.5.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "1.5.0")),
+            ),
+            (
+                "2.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(pkg, "2.0.0")),
+            ),
+        ],
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["outdated"])
+        .output()
+        .expect("spawn lpm outdated");
+
+    assert!(
+        output.status.success(),
+        "outdated should exit 0 even when packages are outdated\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Section")
+            && stdout.contains("Package")
+            && stdout.contains(pkg)
+            && stdout.contains("1.0.0")
+            && stdout.contains("1.5.0")
+            && stdout.contains("2.0.0"),
+        "outdated table must render to stdout, got:\n{stdout}",
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Found 1 outdated package"),
+        "outdated must report a slim completion line, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "outdated must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+#[tokio::test]
 async fn outdated_reports_zero_when_installed_matches_latest() {
     let pkg = "@lpm.dev/owner.up-to-date-pkg";
     let project = TempProject::empty(&format!(

@@ -1,5 +1,6 @@
-//! Terminal output helpers using cliclack for consistent, styled output.
+//! Slim terminal output helpers for non-interactive status lines.
 
+use crate::install_ui;
 use lpm_common::color::Painted;
 
 /// Suppress stdout for nested command execution when the outer command
@@ -28,51 +29,23 @@ pub fn suppress_stderr(enabled: bool) -> Result<Option<gag::Gag>, String> {
 
 /// Print a success message.
 pub fn success(msg: &str) {
-    let _ = cliclack::log::success(msg);
+    install_ui::done(msg);
 }
 
 /// Print a warning message.
 pub fn warn(msg: &str) {
-    let _ = cliclack::log::warning(msg);
+    install_ui::warn(msg);
 }
 
 /// Print an info message.
 pub fn info(msg: &str) {
-    let _ = cliclack::log::info(msg);
+    install_ui::phase(msg);
 }
 
 /// Print a label: value pair with the label dimmed.
 pub fn field(label: &str, value: &str) {
-    println!("  {}: {value}", label.dimmed());
-}
-
-/// Print a section header.
-pub fn header(title: &str) {
-    println!();
-    println!("  {}", title.bold());
-}
-
-/// Format a quality tier with appropriate color.
-pub fn tier_colored(tier: &str) -> String {
-    match tier.to_lowercase().as_str() {
-        "gold" => tier.yellow().bold(),
-        "silver" => tier.white().bold(),
-        "bronze" => tier.red(),
-        _ => tier.dimmed(),
-    }
-}
-
-/// Format a quality score with color based on value.
-pub fn score_colored(score: u32, max: u32) -> String {
-    let pct = (score * 100).checked_div(max).unwrap_or(0);
-    let text = format!("{score}/{max}");
-    if pct >= 80 {
-        text.green()
-    } else if pct >= 50 {
-        text.yellow()
-    } else {
-        text.red()
-    }
+    let label = format!("{label}:");
+    eprintln!("    {} {value}", format!("{label:<24}").dimmed());
 }
 
 /// Format a distribution mode badge.

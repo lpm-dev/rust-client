@@ -1240,7 +1240,7 @@ async fn publish_to_lpm(
         eprintln!();
         eprintln!(
             "  {} Publishing to non-default registry: {}",
-            "⚠".yellow().bold(),
+            "!".yellow().bold(),
             registry_url.bold()
         );
     }
@@ -1599,9 +1599,9 @@ fn print_quality_checks(result: &quality::QualityResult) {
             let icon = if check.server_only {
                 "~".dimmed().to_string()
             } else if check.passed {
-                "✔".green().to_string()
+                "✓".green().to_string()
             } else {
-                "✖".red().to_string()
+                "✗".red().to_string()
             };
             let pts_str = format!("{}/{}", check.points, check.max_points);
             let pts = pts_str.dimmed();

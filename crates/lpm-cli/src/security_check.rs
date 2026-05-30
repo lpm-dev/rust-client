@@ -12,7 +12,7 @@
 //!
 //! Uses batch metadata endpoint for @lpm.dev packages (1 request for all).
 
-use crate::output;
+use crate::{install_ui, output};
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::{self, PackageAnalysis};
@@ -54,23 +54,15 @@ pub async fn post_install_security_summary(
     // ── Client-side analysis (all packages) ──────────
 
     let show_progress = !json_output && packages.len() > 50;
-    let spinner = if show_progress {
-        let s = cliclack::spinner();
-        s.start(format!("Analyzing {} packages...", packages.len()));
-        Some(s)
-    } else {
-        None
-    };
+    if show_progress {
+        install_ui::phase(&format!("Analyzing {} packages", packages.len()));
+    }
 
     let mut tag_counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
 
     for (i, (name, version, _is_lpm)) in packages.iter().enumerate() {
-        if show_progress
-            && i % 50 == 0
-            && i > 0
-            && let Some(ref s) = spinner
-        {
-            s.start(format!("Analyzing... {}/{}", i, packages.len()));
+        if show_progress && i % 50 == 0 && i > 0 {
+            install_ui::phase(&format!("Analyzed {i}/{} packages", packages.len()));
         }
 
         let pkg_dir = store.package_dir(name, version);
@@ -83,8 +75,8 @@ pub async fn post_install_security_summary(
         collect_tags_from_analysis(&analysis, &pkg_id, &mut tag_counts);
     }
 
-    if let Some(s) = spinner {
-        s.stop(format!("Analyzed {} packages", packages.len()));
+    if show_progress {
+        install_ui::done(&format!("Analyzed {} packages", packages.len()));
     }
 
     // ── Registry-side enrichment (@lpm.dev only) ─────
@@ -191,7 +183,7 @@ pub async fn post_install_security_summary(
         };
         let reset = "\x1b[0m";
 
-        println!("\n  {color}● {label}{reset}");
+        println!("\n  {color}! {label}{reset}");
 
         for issue in tier_issues {
             let count = issue.packages.len();

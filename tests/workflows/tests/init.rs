@@ -3,11 +3,67 @@ mod support;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn blank_project_dir() -> TempProject {
     let project = TempProject::empty(r#"{"name":"placeholder","version":"1.0.0"}"#);
     std::fs::remove_file(project.path().join("package.json"))
         .expect("failed to remove placeholder package.json");
     project
+}
+
+#[tokio::test]
+async fn init_yes_human_output_uses_slim_success() {
+    let project = blank_project_dir();
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("neo", "neo@example.com").await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["init", "-y"])
+        .output()
+        .expect("failed to run lpm init -y");
+
+    assert!(
+        output.status.success(),
+        "lpm init -y failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ));
+    assert!(
+        combined.contains("✓ Created package.json"),
+        "init should use a slim success line, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("@lpm.dev/neo.package"),
+        "init should show the created package name, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('│') && !combined.contains('◇'),
+        "init output should not use bordered/cliclack glyphs, got:\n{combined}"
+    );
 }
 
 #[tokio::test]

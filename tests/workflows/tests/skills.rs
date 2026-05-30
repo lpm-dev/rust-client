@@ -36,6 +36,11 @@ fn skills_list_on_fresh_project_reports_no_skills_installed() {
         combined.contains("No skills installed"),
         "stdout/stderr must indicate no skills on a fresh project, got:\n{combined}",
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "skills list must not use cliclack gutter output, got:\n{stderr}",
+    );
 }
 
 #[test]
@@ -54,28 +59,33 @@ fn skills_list_groups_by_package_and_counts_files() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("alice.tools") && stdout.contains("bob.helpers"),
+        stdout.contains("@lpm.dev/alice.tools") && stdout.contains("@lpm.dev/bob.helpers"),
         "list must group by package, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("format-code")
-            && stdout.contains("lint-rules")
-            && stdout.contains("deploy"),
+        stdout.contains("format-code.md")
+            && stdout.contains("lint-rules.md")
+            && stdout.contains("deploy.md"),
         "list must show each skill name, got:\n{stdout}"
     );
-    // Total summary must render with the count adjacent to the unit text,
-    // not split by ANSI escapes — the harness sets `NO_COLOR=1` (see
-    // `support/mod.rs`), so the color policy disables every styling
-    // method. Pre-fix, `owo_colors::OwoColorize::bold` ignored NO_COLOR
-    // and emitted `\x1b[1m3\x1b[22m skill(s)…`; the Painted trait now
-    // returns plain text when disabled.
+    // The package/skill report is stdout; the total summary is slim
+    // status on stderr so callers can pipe the report without chatter.
     assert!(
-        stdout.contains("3 skill(s) across 2 package(s)"),
-        "summary must include the count contiguous with the unit text under NO_COLOR=1, got:\n{stdout}"
+        !stdout.contains("3 skills installed"),
+        "summary belongs on stderr so stdout stays report-only, got:\n{stdout}"
     );
     assert!(
         !stdout.contains('\x1b'),
         "stdout must contain no ANSI escape under NO_COLOR=1, got:\n{stdout:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ 3 skills installed across 2 packages"),
+        "summary must use a slim completion line, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "skills list must not use cliclack gutter output, got:\n{stderr}",
     );
 }
 
@@ -150,6 +160,16 @@ fn skills_validate_accepts_a_well_formed_skill() {
         output.status,
         String::from_utf8_lossy(&output.stderr),
     );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ 1 skill valid"),
+        "validate must report a slim success line, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "skills validate must not use cliclack gutter output, got:\n{stderr}",
+    );
 }
 
 #[test]
@@ -190,6 +210,11 @@ fn skills_validate_rejects_skill_exceeding_size_limit() {
     assert!(
         combined.contains("15KB") || combined.contains("exceed") || combined.contains("limit"),
         "validate output must surface the per-skill size-limit warning, got:\n{combined}",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "skills validate must not use cliclack gutter output, got:\n{stderr}",
     );
 }
 
@@ -259,6 +284,12 @@ fn skills_validate_with_no_skills_dir_succeeds_quietly() {
         output.status.success(),
         "validate on a project without .lpm/skills/ must succeed"
     );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("! No .lpm/skills/ directory found"),
+        "validate without a skills dir must use a slim warning, got:\n{stderr}",
+    );
 }
 
 // ─── clean ────────────────────────────────────────────────────────────
@@ -312,6 +343,39 @@ fn skills_clean_on_empty_project_is_idempotent() {
     assert!(
         output.status.success(),
         "clean with no skills dir must succeed",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("! No skills to clean"),
+        "clean with no skills dir must use a slim warning, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn skills_clean_human_removes_skills_directory_with_slim_completion() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_skill(&project, "alice.tools", "a", "# a\n");
+    seed_skill(&project, "alice.tools", "b", "# b\n");
+
+    let output = lpm(&project)
+        .args(["skills", "clean"])
+        .output()
+        .expect("failed to run lpm skills clean");
+
+    assert!(output.status.success(), "skills clean must succeed");
+    assert!(
+        !project.path().join(".lpm/skills").exists(),
+        ".lpm/skills/ must be removed after clean"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Skills cleaned · removed 2 files"),
+        "clean must report a slim completion line, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "skills clean must not use cliclack gutter output, got:\n{stderr}",
     );
 }
 

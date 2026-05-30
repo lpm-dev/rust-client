@@ -1,5 +1,5 @@
 use crate::graph_render::{self, DepGraph};
-use crate::output;
+use crate::install_ui;
 use crate::overrides_state;
 use lpm_common::LpmError;
 use std::collections::{HashSet, VecDeque};
@@ -26,7 +26,7 @@ pub async fn run(
     // flag has no effect in this configuration. Suppressed under --json
     // to keep the JSON contract clean.
     if no_open && format != "html" && !json_output {
-        output::warn(
+        install_ui::warn(
             "--no-open has no effect without `--format html` (other formats write to stdout).",
         );
     }
@@ -98,7 +98,7 @@ pub async fn run(
         // Check for empty result after pruning
         if graph.stats.total_packages == 0 {
             let dep_type = if prod_only { "production" } else { "dev" };
-            output::warn(&format!("no {dep_type} dependencies found."));
+            install_ui::warn(&format!("No {dep_type} dependencies found"));
             return Ok(());
         }
     }
@@ -125,7 +125,7 @@ pub async fn run(
             .values()
             .any(|n| !n.is_root && n.name.contains(f));
         if !has_match {
-            output::warn(&format!("no packages matching '{f}' in dependency tree."));
+            install_ui::warn(&format!("No packages matching '{f}' in dependency tree"));
             return Ok(());
         }
         graph_render::filter_graph(&mut graph, f);
@@ -186,6 +186,14 @@ pub async fn run(
         "tree" | "" => {
             let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
             print!("{}", graph_render::render_tree(&graph, use_color));
+            if !json_output {
+                match max_depth {
+                    Some(depth) => {
+                        install_ui::done(&format!("Rendered dependency tree (depth {depth})"));
+                    }
+                    None => install_ui::done("Rendered dependency tree"),
+                }
+            }
         }
         "dot" => {
             print!("{}", graph_render::render_dot(&graph));
@@ -208,15 +216,15 @@ pub async fn run(
             std::fs::write(&out_path, &html)
                 .map_err(|e| LpmError::Script(format!("failed to write graph.html: {e}")))?;
 
-            output::success(&format!(
-                "generated {} ({})",
+            install_ui::done(&format!(
+                "Generated {} ({})",
                 out_path.display(),
                 format_byte_size(html.len()),
             ));
 
             // Open in browser unless suppressed (headless / CI).
             if !no_open && open::that(&out_path).is_err() && !json_output {
-                output::warn("Could not open browser automatically.");
+                install_ui::warn("Could not open browser automatically");
                 println!("  Open this file manually: {}", out_path.display());
             }
         }

@@ -86,6 +86,51 @@ fn ports_list_json_reports_free_and_in_use_services() {
 }
 
 #[test]
+fn ports_list_human_renders_table_and_slim_completion() {
+    let project = TempProject::empty(r#"{"name":"ports-test","version":"1.0.0"}"#);
+    let (busy_port, _busy_listener) = bind_ephemeral_port();
+    let free_port = reserve_then_release_port();
+    project.write_file(
+        "lpm.json",
+        &format!(
+            "{{\n  \"services\": {{\n    \"web\": {{ \"command\": \"node web.js\", \"port\": {busy_port} }},\n    \"api\": {{ \"command\": \"node api.js\", \"port\": {free_port} }}\n  }}\n}}\n"
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["ports", "list"])
+        .output()
+        .expect("failed to run lpm ports list");
+
+    assert!(
+        output.status.success(),
+        "lpm ports list failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Service") && stdout.contains("Port") && stdout.contains("Status"),
+        "ports list must render a table header, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("web") && stdout.contains("api"),
+        "ports list must render service rows, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ 2 declared service ports"),
+        "ports list must report a slim service-port count, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "ports list status output must not use cliclack gutter output, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn ports_kill_json_reports_already_free_for_unused_port() {
     let project = TempProject::empty(r#"{"name":"ports-test","version":"1.0.0"}"#);
     let free_port = reserve_then_release_port();
@@ -113,6 +158,34 @@ fn ports_kill_json_reports_already_free_for_unused_port() {
             "port": free_port,
             "status": "already_free"
         })
+    );
+}
+
+#[test]
+fn ports_kill_human_reports_free_port_with_slim_completion() {
+    let project = TempProject::empty(r#"{"name":"ports-test","version":"1.0.0"}"#);
+    let free_port = reserve_then_release_port();
+
+    let output = lpm(&project)
+        .args(["ports", "kill", &free_port.to_string()])
+        .output()
+        .expect("failed to run lpm ports kill");
+
+    assert!(
+        output.status.success(),
+        "lpm ports kill failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("✓ Port {free_port} is not in use")),
+        "ports kill must report already-free ports with slim UI, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "ports kill output must not use cliclack gutter output, got:\n{stderr}"
     );
 }
 

@@ -1,7 +1,8 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
+use std::fmt::Display;
 use std::path::Path;
 
 /// Run the `lpm tunnel` command.
@@ -131,7 +132,7 @@ async fn run_start(
     if let Some(d) = domain
         && !d.contains('.')
     {
-        output::warn("Missing base domain.");
+        install_ui::warn("Missing base domain.");
         eprintln!("  Available: lpm.fyi, lpm.llc");
         eprintln!("  Example: lpm tunnel start --domain {d}.lpm.llc");
         return Err(LpmError::Tunnel("missing base domain".into()));
@@ -154,7 +155,7 @@ async fn run_start(
         Ok(db) => lpm_inspect::state::InspectorState::with_db(port, db),
         Err(e) => {
             if !json_output {
-                output::warn(&format!("inspector db failed: {e} — using in-memory only"));
+                install_ui::warn(&format!("inspector db failed: {e} — using in-memory only"));
             }
             lpm_inspect::state::InspectorState::new(port)
         }
@@ -175,7 +176,7 @@ async fn run_start(
             Err(e) if strict => return Err(e),
             Err(e) => {
                 if !json_output {
-                    output::warn(&format!("inspector failed to start: {e}"));
+                    install_ui::warn(&format!("inspector failed to start: {e}"));
                 }
                 None
             }
@@ -219,7 +220,7 @@ async fn run_start(
     };
 
     if !json_output {
-        output::info(&format!("connecting tunnel for localhost:{port}..."));
+        install_ui::phase(&format!("Opening tunnel for localhost:{port}"));
     }
 
     let tunnel_auth_display = tunnel_auth_token.clone();
@@ -257,53 +258,32 @@ async fn run_start(
                     })
                 );
             } else {
-                println!();
-                println!(
-                    "  {} {}",
-                    "●".green(),
-                    format!(
-                        "Tunnel: {} → localhost:{}",
-                        session.tunnel_url.bold(),
-                        session.local_port
-                    )
-                    .green()
-                );
+                install_ui::phase("Tunnel ready");
+                tunnel_detail("public URL", &session.tunnel_url);
                 if let Some(ref url) = inspector_url {
-                    println!(
-                        "  {} {}",
-                        "●".cyan(),
-                        format!("Inspector: {}", url.bold()).cyan()
-                    );
+                    tunnel_detail("inspector", url);
                 }
+                tunnel_detail("session", &session.session_id);
+                tunnel_detail("local", format!("localhost:{}", session.local_port));
                 if auto_ack {
-                    println!(
-                        "  {} {}",
-                        "●".yellow(),
-                        "Auto-ack: ON — 200 OK returned when server is down".yellow()
-                    );
+                    tunnel_detail("auto-ack", "on (200 OK returned when server is down)");
                 }
                 if let Some(ref auth) = tunnel_auth_display {
-                    println!(
-                        "  {} Auth required: add header {}",
-                        "🔒".dimmed(),
-                        format!("X-Tunnel-Auth: {auth}").bold()
-                    );
-                    println!(
-                        "  {} Browser: {}?__tunnel_auth={auth}",
-                        " ".dimmed(),
-                        session.tunnel_url,
+                    tunnel_detail("auth", format!("X-Tunnel-Auth: {auth}"));
+                    tunnel_detail(
+                        "browser",
+                        format!("{}?__tunnel_auth={auth}", session.tunnel_url),
                     );
                 }
-                println!();
-                output::field("domain", &session.domain);
-                output::field("session", &session.session_id);
-                println!("  {}", "Press Ctrl+C to stop the tunnel".dimmed());
-                println!();
+                tunnel_detail("domain", &session.domain);
+                eprintln!();
+                install_ui::done("Listening for requests");
+                eprintln!("press Ctrl+C to stop the tunnel");
             }
         },
         |msg| {
             if !json_output {
-                output::warn(msg);
+                install_ui::warn(msg);
             }
         },
     )
@@ -349,9 +329,9 @@ async fn run_claim(
         println!("{result}");
     } else {
         let url = result["url"].as_str().unwrap_or("");
-        output::success(&format!("claimed {}", url.bold()));
+        install_ui::done(&format!("claimed {url}"));
         if let Some(org_name) = org {
-            output::field("org", org_name);
+            tunnel_detail("org", org_name);
         }
     }
 
@@ -377,7 +357,7 @@ async fn run_unclaim(
             serde_json::json!({ "success": true, "released": true, "domain": domain })
         );
     } else {
-        output::success(&format!("released {}", domain.bold()));
+        install_ui::done(&format!("released {domain}"));
     }
 
     Ok(())
@@ -400,14 +380,13 @@ async fn run_list(
     let limit = result["limit"].as_u64().unwrap_or(0);
     let used = result["used"].as_u64().unwrap_or(0);
 
-    if let Some(org_name) = org {
-        output::header(&format!("Tunnel Domains — {org_name}"));
-    } else {
-        output::header("Tunnel Domains");
-    }
+    let heading = org.map_or_else(
+        || "Tunnel Domains".to_string(),
+        |org_name| format!("Tunnel Domains · {org_name}"),
+    );
+    install_ui::phase(&heading);
 
-    println!("  {} of {} used", used.to_string().bold(), limit);
-    println!();
+    eprintln!("    {:<11} {used} of {limit}", "used");
 
     match domains {
         Some(doms) if !doms.is_empty() => {
@@ -415,24 +394,18 @@ async fn run_list(
                 let _domain = d["domain"].as_str().unwrap_or("?");
                 let url = d["url"].as_str().unwrap_or("?");
                 let base = d["baseDomain"].as_str().unwrap_or("?");
-                println!(
-                    "  {} {} {}",
-                    "●".cyan(),
-                    url.bold(),
-                    format!("({base})").dimmed()
-                );
+                eprintln!("    {} {}", url.bold(), format!("({base})").dimmed());
             }
         }
         _ => {
-            println!("  {}", "No domains claimed".dimmed());
-            println!(
-                "  {}",
+            eprintln!("    {}", "No domains claimed".dimmed());
+            eprintln!(
+                "    {}",
                 "Claim one with: lpm tunnel claim <name>.lpm.llc".dimmed()
             );
         }
     }
 
-    println!();
     Ok(())
 }
 
@@ -445,8 +418,7 @@ async fn run_domains(client: &RegistryClient, json_output: bool) -> Result<(), L
         return Ok(());
     }
 
-    output::header("Available Tunnel Domains");
-    println!();
+    install_ui::phase("Available tunnel domains");
 
     if let Some(domains) = result["domains"].as_array() {
         for d in domains {
@@ -457,11 +429,10 @@ async fn run_domains(client: &RegistryClient, json_output: bool) -> Result<(), L
             } else {
                 "pro".cyan().to_string()
             };
-            println!("  {} {:<15} {}", "●".green(), domain, plan_badge);
+            eprintln!("    {:<15} {}", domain, plan_badge);
         }
     }
 
-    println!();
     Ok(())
 }
 
@@ -478,8 +449,8 @@ async fn run_inspect_ui(_project_dir: &Path, inspect_port: Option<u16>) -> Resul
     let state = lpm_inspect::state::InspectorState::new(0);
     let handle = lpm_inspect::start(state, inspect_port.unwrap_or(0)).await?;
 
-    output::success(&format!("Inspector: {}", handle.url.bold()));
-    println!("  {}", "Press Ctrl+C to stop".dimmed());
+    install_ui::done(&format!("Inspector: {}", handle.url));
+    eprintln!("  {}", "Press Ctrl+C to stop".dimmed());
 
     // Block until Ctrl+C
     tokio::signal::ctrl_c()
@@ -513,7 +484,7 @@ async fn run_inspect(
 
     if let Some(idx) = detail_index {
         if idx == 0 {
-            output::warn("--detail uses 1-based indexing. Use --detail 1 for the first entry.");
+            install_ui::warn("--detail uses 1-based indexing. Use --detail 1 for the first entry.");
             return Ok(());
         }
         // Detail mode: show full webhook by 1-based index
@@ -522,10 +493,10 @@ async fn run_inspect(
             if let Some(full) = logger.load_full(&entry.id) {
                 print_webhook_detail(&full, idx);
             } else {
-                output::warn("Webhook body data not found (may have been rotated)");
+                install_ui::warn("Webhook body data not found (may have been rotated)");
             }
         } else {
-            output::warn(&format!("Webhook #{idx} not found"));
+            install_ui::warn(&format!("Webhook #{idx} not found"));
         }
         return Ok(());
     }
@@ -535,7 +506,7 @@ async fn run_inspect(
     let entries = logger.read_recent(last, filter.as_ref());
 
     if entries.is_empty() {
-        output::info("No webhooks captured yet. Start a tunnel with: lpm dev --tunnel");
+        install_ui::phase("No webhooks captured yet. Start a tunnel with: lpm dev --tunnel");
         return Ok(());
     }
 
@@ -614,7 +585,7 @@ async fn run_replay(
     } else if let Some(n) = number {
         entries.get(n.saturating_sub(1))
     } else {
-        output::warn("Specify a webhook number or use --last");
+        install_ui::warn("Specify a webhook number or use --last");
         eprintln!("  Usage: lpm tunnel replay 3");
         eprintln!("         lpm tunnel replay --last");
         return Ok(());
@@ -645,7 +616,7 @@ async fn run_replay(
 
     // Compare with original response to give actionable feedback
     if result.status < 400 && webhook.response_status >= 400 {
-        output::success(&format!(
+        install_ui::done(&format!(
             "Fixed! Was {}, now {}.",
             webhook.response_status, result.status
         ));
@@ -672,7 +643,7 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
         logger
             .clear()
             .map_err(|e| LpmError::Tunnel(format!("failed to clear logs: {e}")))?;
-        output::success("Webhook logs cleared");
+        install_ui::done("Webhook logs cleared");
         return Ok(());
     }
 
@@ -692,7 +663,7 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
     }
 
     if entries.is_empty() {
-        output::info("No webhook events logged.");
+        install_ui::phase("No webhook events logged.");
         return Ok(());
     }
 
@@ -716,6 +687,14 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
 }
 
 // ── Helper functions ────────────────────────────────────────────────
+
+fn tunnel_detail(label: &str, value: impl Display) {
+    eprintln!("{}", format_tunnel_detail(label, value));
+}
+
+fn format_tunnel_detail(label: &str, value: impl Display) -> String {
+    format!("    {label:<11} {value}")
+}
 
 /// Parse a flag with a numeric value from the args list.
 ///
@@ -958,6 +937,22 @@ mod tests {
     fn invalid_tunnel_domain_single_level_base() {
         // "acme.com" — base is "com" which has no dot
         assert!(!is_valid_tunnel_domain("acme.com"));
+    }
+
+    #[test]
+    fn tunnel_detail_rows_match_slim_ready_block_spacing() {
+        assert_eq!(
+            format_tunnel_detail("public URL", "https://acme-api.lpm.fyi"),
+            "    public URL  https://acme-api.lpm.fyi"
+        );
+        assert_eq!(
+            format_tunnel_detail("inspector", "http://127.0.0.1:4512"),
+            "    inspector   http://127.0.0.1:4512"
+        );
+        assert_eq!(
+            format_tunnel_detail("session", "stripe-test"),
+            "    session     stripe-test"
+        );
     }
 
     // ── Flag parsing ──

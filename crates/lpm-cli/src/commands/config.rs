@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use crate::prompt::prompt_err;
 use crate::provenance_fetch::EnforceMode;
 use crate::sandbox_config::ResolvedSandboxMode;
@@ -64,7 +64,7 @@ pub async fn run(
                     println!("{val}");
                 }
             } else if !json_output {
-                output::info(&format!("{key} is not set"));
+                install_ui::warn(&format!("{key} is not set"));
             }
         }
         "set" => {
@@ -112,7 +112,7 @@ pub async fn run(
                     })
                 );
             } else {
-                output::success(&format!("Set {} = {}", key.bold(), value));
+                install_ui::done(&format!("Set {} = {}", key.bold(), value));
             }
         }
         "delete" | "unset" => {
@@ -150,7 +150,7 @@ pub async fn run(
                     })
                 );
             } else {
-                output::success(&format!("Deleted {}", key.bold()));
+                install_ui::done(&format!("Deleted {}", key.bold()));
             }
         }
         "list" | "ls" => {
@@ -164,10 +164,10 @@ pub async fn run(
             } else {
                 if let Some(table) = config.as_table() {
                     if table.is_empty() {
-                        output::info("No configuration set");
+                        install_ui::warn("No configuration set");
                     } else {
                         for (k, v) in table {
-                            output::field(k, &v.to_string());
+                            println!("  {k:<24} {v}");
                         }
                     }
                 }
@@ -623,9 +623,9 @@ fn announce_release_age_set(value: Option<u64>, json_output: bool) {
     }
 
     match value {
-        None => output::success("Using default minimum release age (1d)"),
-        Some(0) => output::success("Set minimum release age = off"),
-        Some(secs) => output::success(&format!(
+        None => install_ui::done("Using default minimum release age (1d)"),
+        Some(0) => install_ui::done("Set minimum release age = off"),
+        Some(secs) => install_ui::done(&format!(
             "Set minimum release age = {}",
             format_release_age_cli_value(secs).bold()
         )),
@@ -779,7 +779,7 @@ async fn run_triage_wizard(
             .map_err(prompt_err)?;
         if switch {
             persist_string(config_path, SCRIPT_POLICY_KEY, "triage")?;
-            output::success(&format!("Set {} = {}", SCRIPT_POLICY_KEY.bold(), "triage"));
+            install_ui::done(&format!("Set {} = {}", SCRIPT_POLICY_KEY.bold(), "triage"));
         } else {
             println!(
                 "  Leaving script-policy at {}. The triage-advisor value will be saved \
@@ -897,7 +897,7 @@ fn announce_set(key: &str, value: &str, json_output: bool) {
             .unwrap()
         );
     } else {
-        output::success(&format!("Set {} = {}", key.bold(), value));
+        install_ui::done(&format!("Set {} = {}", key.bold(), value));
     }
 }
 
@@ -1083,7 +1083,7 @@ fn announce_sandbox_set(value: &str, json_output: bool) {
             .unwrap()
         );
     } else {
-        output::success(&format!("Set [sandbox] mode = {}", value.bold()));
+        install_ui::done(&format!("Set [sandbox] mode = {}", value.bold()));
     }
 }
 
@@ -1255,7 +1255,7 @@ fn announce_sigstore_set(value: &str, json_output: bool) {
             .unwrap()
         );
     } else {
-        output::success(&format!("Set [sigstore] verify = {}", value.bold()));
+        install_ui::done(&format!("Set [sigstore] verify = {}", value.bold()));
     }
 }
 

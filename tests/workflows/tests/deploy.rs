@@ -100,6 +100,53 @@ fn deploy_dry_run_json_envelope_carries_resolved_plan() {
     );
 }
 
+#[test]
+fn deploy_dry_run_human_output_uses_slim_ui() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let out = external_output_dir();
+
+    let output = lpm(&project)
+        .args([
+            "deploy",
+            out.path().to_str().unwrap(),
+            "--filter",
+            "@test/utils",
+            "--dry-run",
+        ])
+        .output()
+        .expect("failed to run lpm deploy --dry-run");
+
+    assert!(
+        output.status.success(),
+        "deploy --dry-run must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "human status output must stay off stdout; got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("› Materializing production closure for @test/utils"),
+        "stderr must show the slim deploy phase; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("output:") && stderr.contains("dry run:"),
+        "stderr must show deploy details without a boxed prompt; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · dry run complete"),
+        "stderr must show the slim dry-run terminus; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('│') && !stderr.contains('◇'),
+        "dry-run status must not use cliclack's boxed gutter; got:\n{stderr}"
+    );
+}
+
 // ─── filter must match exactly one member ──────────────────────────────
 
 #[test]

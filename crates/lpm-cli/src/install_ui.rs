@@ -160,6 +160,53 @@ pub fn green(text: &str) -> String {
     text.green()
 }
 
+/// Compact quota meter used by account/cache status surfaces.
+pub fn usage_bar(used: u64, limit: u64, width: usize) -> String {
+    if width == 0 || limit == 0 {
+        return String::new();
+    }
+
+    let filled = usage_bar_filled_cells(used, limit, width);
+    let empty = width - filled;
+    let filled_segment = "█".repeat(filled);
+    let empty_segment = "░".repeat(empty);
+
+    if lpm_common::color::enabled() {
+        format!(
+            "{}{}",
+            filled_segment.green(),
+            empty_segment.green().dimmed()
+        )
+    } else {
+        format!("{filled_segment}{empty_segment}")
+    }
+}
+
+/// Yellow badge for compact role/status labels such as `admin`.
+pub fn yellow_badge(text: &str) -> String {
+    badge(text, "\x1b[1;33;48;5;236m")
+}
+
+fn badge(text: &str, open: &str) -> String {
+    let padded = format!(" {text} ");
+    if lpm_common::color::enabled() {
+        format!("{open}{padded}\x1b[0m")
+    } else {
+        padded
+    }
+}
+
+fn usage_bar_filled_cells(used: u64, limit: u64, width: usize) -> usize {
+    if width == 0 || used == 0 || limit == 0 {
+        return 0;
+    }
+
+    let numerator = (used as u128) * (width as u128);
+    let denominator = limit as u128;
+    let filled = numerator.div_ceil(denominator);
+    filled.min(width as u128) as usize
+}
+
 /// Red helper (for the vulnerability count in the audit advisory).
 pub fn red(text: &str) -> String {
     text.red()
@@ -206,4 +253,33 @@ pub fn format_audit_advisory(
     format!(
         "Audited {packages_audited} {pkg_word}, {vuln_segment}, {suspicious} suspicious in {elapsed_ms}ms {hint}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::usage_bar_filled_cells;
+
+    #[test]
+    fn usage_bar_rounds_visible_fraction_up_to_one_cell() {
+        assert_eq!(usage_bar_filled_cells(3, 100, 10), 1);
+    }
+
+    #[test]
+    fn usage_bar_matches_design_examples() {
+        assert_eq!(usage_bar_filled_cells(32, 100, 10), 4);
+        assert_eq!(usage_bar_filled_cells(28, 100, 10), 3);
+        assert_eq!(usage_bar_filled_cells(18, 100, 10), 2);
+    }
+
+    #[test]
+    fn usage_bar_clamps_over_limit_to_full_width() {
+        assert_eq!(usage_bar_filled_cells(125, 100, 10), 10);
+    }
+
+    #[test]
+    fn usage_bar_stays_empty_without_usage_or_limit() {
+        assert_eq!(usage_bar_filled_cells(0, 100, 10), 0);
+        assert_eq!(usage_bar_filled_cells(50, 0, 10), 0);
+        assert_eq!(usage_bar_filled_cells(50, 100, 0), 0);
+    }
 }
