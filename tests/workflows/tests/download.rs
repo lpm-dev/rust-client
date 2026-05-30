@@ -65,3 +65,62 @@ async fn download_json_accepts_version_flag_and_canonicalizes_output_dir() {
         "download must extract files into the canonicalized output directory"
     );
 }
+
+#[tokio::test]
+async fn download_human_output_uses_slim_progress_and_completion() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("@lpm.dev/owner.react", "1.0.0");
+    mock.with_package("@lpm.dev/owner.react", "1.0.0", &tarball)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "download",
+            "owner.react",
+            "--version",
+            "1.0.0",
+            "--output",
+            "download-human",
+        ])
+        .output()
+        .expect("failed to run lpm download");
+
+    assert!(
+        output.status.success(),
+        "lpm download failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Resolving owner.react"),
+        "download must use a slim resolve phase, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("› Downloading @lpm.dev/owner.react@1.0.0"),
+        "download must use a slim download phase, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Verified integrity"),
+        "download must report slim integrity verification, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · tarball extracted in "),
+        "download must report slim timed completion, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "download output must not use cliclack spinner/gutter output, got:\n{stderr}"
+    );
+
+    assert!(
+        project
+            .path()
+            .join("download-human")
+            .join("package.json")
+            .is_file(),
+        "download must extract files into the output directory"
+    );
+}

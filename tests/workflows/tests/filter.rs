@@ -49,13 +49,14 @@ fn filter_bare_name_does_not_fuzzy_match_scoped_member() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
     assert!(
         !stdout.lines().any(|line| line.trim() == "@test/core"),
         "strict exact-name matching must not fuzzy-match scoped members like @test/core\nfull stdout:\n{stdout}",
     );
     assert!(
-        stdout.contains("strict exact matches") || stdout.contains("design decision D2"),
-        "empty strict-name matches should keep the D2 migration hint\nfull stdout:\n{stdout}",
+        combined.contains("strict exact matches") || combined.contains("design decision D2"),
+        "empty strict-name matches should keep the D2 migration hint\nfull output:\n{combined}",
     );
 }
 
@@ -79,6 +80,15 @@ fn filter_glob_matches_multiple_members() {
         names,
         vec!["@test/app", "@test/core", "@test/utils"],
         "@test/* must select all three members, got: {names:?}",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ 3 workspace members matched"),
+        "filter must report a slim match count, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "filter status output must not use cliclack gutter output, got:\n{stderr}"
     );
 }
 
@@ -170,6 +180,15 @@ fn filter_no_match_without_fail_flag_exits_zero() {
     assert!(
         output.status.success(),
         "empty-match without --fail-if-no-match must exit 0",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("! Filter set produced no matches"),
+        "filter empty-match must use a slim warning, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "filter empty-match output must not use cliclack gutter output, got:\n{stderr}"
     );
 }
 

@@ -61,6 +61,7 @@ pub mod swift_registry;
 pub mod third_party_login;
 pub mod token;
 pub mod tools;
+pub mod tools_ui;
 pub mod trust;
 pub mod tunnel;
 pub mod uninstall;

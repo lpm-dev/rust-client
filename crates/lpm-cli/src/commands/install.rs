@@ -7750,8 +7750,8 @@ async fn run_with_options_under_store_lock(
 
             for warning in &warnings {
                 let icon = match warning.severity {
-                    crate::intelligence::WarningSeverity::Critical => "✖".to_string(),
-                    crate::intelligence::WarningSeverity::Warning => "⚠".to_string(),
+                    crate::intelligence::WarningSeverity::Critical => "✗".to_string(),
+                    crate::intelligence::WarningSeverity::Warning => "!".to_string(),
                     crate::intelligence::WarningSeverity::Info => "ℹ".to_string(),
                 };
                 println!(

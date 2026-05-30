@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -89,7 +89,7 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        output::success(&format!("Created {}", "package.json".bold()));
+        install_ui::done(&format!("Created {}", "package.json".bold()));
         println!("  {}", full_name.dimmed());
         println!();
     }

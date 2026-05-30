@@ -1,4 +1,4 @@
-use crate::{BundleFormat, BundlePlatform, output};
+use crate::{BundleFormat, BundlePlatform, install_ui};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::path::{Path, PathBuf};
@@ -213,10 +213,22 @@ pub async fn pack(
     json_output: bool,
 ) -> Result<(), LpmError> {
     if !json_output {
-        output::info("pack (tsdown)");
+        install_ui::phase("Using local tsdown");
     }
 
+    let start = std::time::Instant::now();
     let outcome = run_pack_process(project_dir, options, StdioMode::Inherit)?;
+    if !json_output {
+        if outcome.success() {
+            let duration = install_ui::format_duration(start.elapsed());
+            install_ui::done(&format!(
+                "Done · package build complete in {}",
+                install_ui::green(&duration)
+            ));
+        } else if let Some(code) = outcome.exit_code {
+            install_ui::failed(&format!("pack failed · exit code {code}"));
+        }
+    }
     outcome.into_result()
 }
 
@@ -403,13 +415,13 @@ async fn pack_workspace(
             });
             println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         } else if affected_only {
-            output::success(&format!(
+            install_ui::done(&format!(
                 "no packages affected vs {} — nothing to pack",
                 affected_base.unwrap_or("main"),
             ));
         } else {
             let hint = crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
-            output::warn("No packages matched");
+            install_ui::warn("No packages matched");
             if let Some(h) = hint {
                 eprintln!();
                 for line in h.lines() {
@@ -552,12 +564,9 @@ async fn run_one_member(
 
     if matches!(stdio, StdioMode::Inherit) && !success {
         if let Some(code) = exit_code {
-            eprintln!(
-                "  {} {member_name}: exit {code}",
-                "\u{2716}".to_string().red()
-            );
+            install_ui::failed(&format!("{member_name}: exit {code}"));
         } else if let Some(ref msg) = error {
-            eprintln!("  {} {member_name}: {msg}", "\u{2716}".to_string().red());
+            install_ui::failed(&format!("{member_name}: {msg}"));
         }
     }
 
@@ -656,9 +665,12 @@ fn emit_human_summary(
     elapsed: std::time::Duration,
 ) {
     if failed == 0 {
-        output::success(&format!(
-            "{tool} passed in {total} packages ({:.1}s)",
-            elapsed.as_secs_f64()
+        let duration = install_ui::format_duration(elapsed);
+        install_ui::done(&format!(
+            "{tool} passed in {} {} in {}",
+            install_ui::bold(&total.to_string()),
+            install_ui::packages_word(total),
+            install_ui::green(&duration)
         ));
         if targeted > total {
             eprintln!(
@@ -668,9 +680,9 @@ fn emit_human_summary(
             );
         }
     } else {
-        output::warn(&format!(
-            "{tool}: {succeeded} passed, {failed} failed out of {total} packages ({:.1}s)",
-            elapsed.as_secs_f64()
+        let duration = install_ui::format_duration(elapsed);
+        install_ui::failed(&format!(
+            "{tool}: {succeeded} passed, {failed} failed out of {total} packages in {duration}"
         ));
     }
 }

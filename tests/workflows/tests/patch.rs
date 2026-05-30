@@ -153,6 +153,65 @@ fn patch_extracts_to_temp_dir_with_breadcrumb() {
     let _ = std::fs::remove_dir_all(&staging);
 }
 
+#[test]
+fn patch_human_output_uses_slim_status_lines() {
+    let project = TempProject::empty(r#"{"name":"patch-human","version":"0.0.0"}"#);
+    seed_store_package(
+        &project,
+        "lodash",
+        "4.17.21",
+        &[("index.js", "module.exports = 'orig'")],
+    );
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch", "lodash@4.17.21"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(
+        out.status.success(),
+        "patch must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ));
+    assert!(
+        combined.contains("› Extracting pristine store entry for lodash@4.17.21"),
+        "human output must start with a slim phase line; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("source:"),
+        "must show source path:\n{combined}"
+    );
+    assert!(
+        combined.contains("staging:"),
+        "must show staging path:\n{combined}"
+    );
+    assert!(
+        combined.contains("✓ Ready · edit files in the staging directory, then run:"),
+        "must show slim ready line; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("lpm patch-commit"),
+        "must show next command; got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('│') && !combined.contains('◇'),
+        "patch output should not use bordered/cliclack glyphs; got:\n{combined}"
+    );
+
+    if let Some(staging) = combined
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("lpm patch-commit "))
+    {
+        let _ = std::fs::remove_dir_all(staging);
+    }
+}
+
 /// `lpm patch <key>` against a package not in the store hard-errors
 /// with a recovery hint pointing at `lpm install`.
 #[test]
@@ -327,6 +386,68 @@ fn patch_commit_writes_patch_file_and_updates_manifest() {
     );
 }
 
+#[test]
+fn patch_commit_human_output_uses_slim_status_lines() {
+    let project = TempProject::empty(r#"{"name":"patch-commit-human","version":"0.0.0"}"#);
+    seed_store_package(
+        &project,
+        "lodash",
+        "4.17.21",
+        &[("index.js", "module.exports = 'orig'\n")],
+    );
+
+    let extract = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch", "lodash@4.17.21"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(extract.status.success(), "extract must succeed");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&extract.stdout))).unwrap();
+    let staging = PathBuf::from(parsed["staging_dir"].as_str().unwrap());
+    std::fs::write(
+        staging.join("node_modules/lodash/index.js"),
+        "module.exports = 'PATCHED'\n",
+    )
+    .unwrap();
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn lpm patch-commit");
+    assert!(
+        out.status.success(),
+        "patch-commit failed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ));
+    assert!(
+        combined.contains("› Generating patch for lodash@4.17.21"),
+        "must show slim phase line; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("✓ Wrote patches/lodash@4.17.21.patch"),
+        "must show patch file write; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("✓ Updated package.json › lpm.patchedDependencies"),
+        "must show manifest update; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("✓ Done · patch registered for future installs"),
+        "must show final slim completion; got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('│') && !combined.contains('◇'),
+        "patch-commit output should not use bordered/cliclack glyphs; got:\n{combined}"
+    );
+}
+
 /// `lpm patch-remove <exact-pin> --json` removes the manifest entry
 /// and deletes the now-unreferenced patch file.
 #[test]
@@ -380,6 +501,55 @@ fn patch_remove_exact_pin_removes_manifest_entry_and_patch_file() {
     assert!(
         pkg.get("lpm").is_none(),
         "empty lpm section should be removed after the last patch entry"
+    );
+}
+
+#[test]
+fn patch_remove_human_output_uses_slim_status_lines() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "patch-remove-human",
+  "version": "0.0.0",
+  "lpm": {
+    "patchedDependencies": {
+      "lodash@4.17.21": {
+        "path": "patches/lodash@4.17.21.patch",
+        "originalIntegrity": "sha512-fixture"
+      }
+    }
+  }
+}"#,
+    );
+    project.write_file("patches/lodash@4.17.21.patch", "diff --git a/a b/a\n");
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-remove", "lodash@4.17.21"])
+        .output()
+        .expect("spawn lpm patch-remove");
+    assert!(
+        out.status.success(),
+        "patch-remove failed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ));
+    assert!(
+        combined.contains("› Removing patch registration for lodash@4.17.21"),
+        "must show slim phase line; got:\n{combined}"
+    );
+    assert!(combined.contains("manifest: package.json"));
+    assert!(combined.contains("file:"));
+    assert!(combined.contains("patches/lodash@4.17.21.patch"));
+    assert!(combined.contains("✓ Deleted patch file"));
+    assert!(combined.contains("✓ Done · re-run lpm install to refresh node_modules"));
+    assert!(
+        !combined.contains('│') && !combined.contains('◇'),
+        "patch-remove output should not use bordered/cliclack glyphs; got:\n{combined}"
     );
 }
 

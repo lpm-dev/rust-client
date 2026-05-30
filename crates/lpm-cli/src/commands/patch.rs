@@ -18,13 +18,12 @@
 //! Patches travel with the repo. The next `lpm install` automatically
 //! re-applies them after linking.
 
-use crate::output;
+use crate::install_ui;
 use crate::patch_engine::{
     GeneratedPatch, PatchSelector, STAGING_BREADCRUMB_FILE, copy_store_to_staging, generate_patch,
     parse_patch_selector, resolve_patch_selector,
 };
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_lockfile::Lockfile;
 use lpm_store::find_installed_package_baseline;
 use serde_json::json;
@@ -151,13 +150,14 @@ async fn run_patch_inner(name: String, version: String, json_output: bool) -> Re
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
     } else {
-        output::success(&format!("Extracted to {}", dest.display()));
-        output::info("Edit the files, then run:");
-        output::info(&format!(
-            "  {} {}",
-            "lpm patch-commit".bold(),
-            staging_path.display()
+        install_ui::phase(&format!(
+            "Extracting pristine store entry for {resolved_key}"
         ));
+        eprintln!("    {:<8} {}", "source:", store_path.display());
+        eprintln!("    {:<8} {}", "staging:", dest.display());
+        eprintln!();
+        install_ui::done("Ready · edit files in the staging directory, then run:");
+        eprintln!("  lpm patch-commit {}", staging_path.display());
     }
     Ok(())
 }
@@ -243,6 +243,9 @@ async fn run_patch_commit_inner(
     }
 
     // 3. Generate the unified diff.
+    if !json_output {
+        install_ui::phase(&format!("Generating patch for {key}"));
+    }
     let generated: GeneratedPatch = generate_patch(&store_path, &edited_dir)?;
     // Check binary files BEFORE the empty check — a staging dir whose
     // ONLY change is a binary edit produces an empty `diff` text but
@@ -309,19 +312,10 @@ async fn run_patch_commit_inner(
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
     } else {
-        let plural = if generated.files_changed == 1 {
-            ""
-        } else {
-            "s"
-        };
-        output::success(&format!(
-            "Wrote {} ({} file{plural} changed, {} insertions(+), {} deletions(-))",
-            patch_file_rel.bold(),
-            generated.files_changed,
-            generated.insertions,
-            generated.deletions,
-        ));
-        output::success("Updated package.json (lpm.patchedDependencies)");
+        install_ui::done(&format!("Wrote {}", install_ui::bold(&patch_file_rel)));
+        install_ui::done("Updated package.json › lpm.patchedDependencies");
+        eprintln!();
+        install_ui::done("Done · patch registered for future installs");
     }
 
     Ok(())
@@ -371,17 +365,33 @@ pub async fn run_patch_remove(
             .unwrap()
         );
     } else {
-        let verb = if dry_run { "Would remove" } else { "Removed" };
+        let target = if outcome.removed.len() == 1 {
+            outcome.removed[0].key.clone()
+        } else {
+            format!("{} patch registrations", outcome.removed.len())
+        };
+        let action = if dry_run {
+            "Previewing removal"
+        } else {
+            "Removing patch registration"
+        };
+        install_ui::phase(&format!("{action} for {target}"));
+        eprintln!("    {:<8} package.json", "manifest:");
         for removal in &outcome.removed {
-            output::success(&format!("{verb} {}", removal.key.bold()));
+            eprintln!("    {:<8} {}", "file:", removal.patch_file);
+        }
+        eprintln!();
+        for removal in &outcome.removed {
             if removal.deleted_patch_file {
-                output::info(&format!("Deleted {}", removal.patch_file));
+                install_ui::done("Deleted patch file");
             } else if let Some(reason) = &removal.retained_reason {
-                output::info(&format!("Kept {} ({reason})", removal.patch_file));
+                install_ui::warn(&format!("Kept {} ({reason})", removal.patch_file));
             }
         }
-        if !dry_run {
-            output::info("Run `lpm install` to refresh node_modules.");
+        if dry_run {
+            install_ui::done("Dry run · package.json unchanged");
+        } else {
+            install_ui::done("Done · re-run lpm install to refresh node_modules");
         }
     }
 

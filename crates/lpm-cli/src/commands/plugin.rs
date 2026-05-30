@@ -1,6 +1,5 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 
 /// Handle `lpm plugin` subcommands: list, update.
 pub async fn run(
@@ -46,9 +45,7 @@ async fn list(json_output: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    output::info("Plugins");
-
-    let mut any_installed = false;
+    let mut rows = Vec::new();
     for def in lpm_plugin::registry::list_plugins() {
         let installed = lpm_plugin::store::list_installed_versions(def.name)?;
         let latest = all_latest
@@ -56,37 +53,66 @@ async fn list(json_output: bool) -> Result<(), LpmError> {
             .cloned()
             .unwrap_or_else(|| def.latest_version.to_string());
 
-        if installed.is_empty() {
-            println!(
-                "  {} {} (not installed, latest: {})",
-                "○".dimmed(),
-                def.name,
-                latest.dimmed(),
-            );
-        } else {
-            any_installed = true;
-            for ver in &installed {
-                let is_latest = *ver == latest;
-                let status = if is_latest {
-                    "✓ up to date".green().to_string()
-                } else {
-                    format!("{} available", latest.bold())
-                };
-                println!("  {} {} {} ({})", "●".green(), def.name, ver.bold(), status,);
-            }
+        if !installed.is_empty() {
+            let current = installed.join(", ");
+            let status = if installed.iter().any(|version| version == &latest) {
+                "current".to_string()
+            } else {
+                "update available".to_string()
+            };
+            rows.push((def.name.to_string(), current, latest, status));
         }
     }
 
-    if !any_installed {
-        println!();
-        println!(
-            "  Run {} or {} to install plugins on first use",
-            "lpm lint".cyan(),
-            "lpm fmt".cyan(),
+    if rows.is_empty() {
+        install_ui::warn("No plugins installed");
+        eprintln!(
+            "  {}",
+            install_ui::dim("Run `lpm lint` or `lpm fmt` to install plugins on first use")
         );
+        return Ok(());
     }
 
+    print_plugin_table(&rows);
+    install_ui::done(&format!(
+        "{} {} installed",
+        rows.len(),
+        if rows.len() == 1 { "plugin" } else { "plugins" }
+    ));
+
     Ok(())
+}
+
+fn print_plugin_table(rows: &[(String, String, String, String)]) {
+    let plugin_width = rows
+        .iter()
+        .map(|(name, _, _, _)| name.len())
+        .chain(std::iter::once("Plugin".len()))
+        .max()
+        .unwrap_or("Plugin".len());
+    let current_width = rows
+        .iter()
+        .map(|(_, current, _, _)| current.len())
+        .chain(std::iter::once("Current".len()))
+        .max()
+        .unwrap_or("Current".len());
+    let latest_width = rows
+        .iter()
+        .map(|(_, _, latest, _)| latest.len())
+        .chain(std::iter::once("Latest".len()))
+        .max()
+        .unwrap_or("Latest".len());
+
+    println!(
+        "{:<plugin_width$}  {:<current_width$}  {:<latest_width$}  Status",
+        "Plugin", "Current", "Latest"
+    );
+    for (name, current, latest, status) in rows {
+        println!(
+            "{name:<plugin_width$}  {current:<current_width$}  {latest:<latest_width$}  {status}"
+        );
+    }
+    println!();
 }
 
 /// Remove a plugin (specific version or all versions).
@@ -113,9 +139,9 @@ fn remove(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> 
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if removed {
-            output::success(&format!("removed {}@{}", plugin.bold(), ver));
+            install_ui::done(&format!("Removed {plugin}@{ver}"));
         } else {
-            output::info(&format!("{}@{} not installed", plugin, ver));
+            install_ui::warn(&format!("{plugin}@{ver} not installed"));
         }
     } else {
         let count = lpm_plugin::store::remove_all(plugin)?;
@@ -127,14 +153,12 @@ fn remove(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> 
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if count > 0 {
-            output::success(&format!(
-                "removed {} ({} version{})",
-                plugin.bold(),
-                count,
-                if count == 1 { "" } else { "s" }
+            install_ui::done(&format!(
+                "Removed {plugin} ({count} {})",
+                if count == 1 { "version" } else { "versions" }
             ));
         } else {
-            output::info(&format!("{} not installed", plugin));
+            install_ui::warn(&format!("{plugin} not installed"));
         }
     }
 
@@ -145,6 +169,7 @@ fn remove(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> 
 async fn update(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> {
     if let Some(name) = plugin_name {
         // Update specific plugin
+        let previous = latest_installed_version(name)?;
         let version = lpm_plugin::update_plugin(name).await?;
         if json_output {
             let json = serde_json::json!({
@@ -154,7 +179,7 @@ async fn update(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmE
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            output::success(&format!("{} updated to {}", name.bold(), version.bold()));
+            install_ui::done(&format_update_message(name, previous.as_deref(), &version));
         }
     } else {
         // Update all plugins that are installed
@@ -165,9 +190,10 @@ async fn update(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmE
                 continue; // Skip plugins that aren't installed
             }
 
+            let previous = installed.last().map(String::as_str);
             let version = lpm_plugin::update_plugin(def.name).await?;
             if !json_output {
-                output::success(&format!("{} → {}", def.name.bold(), version.bold()));
+                install_ui::done(&format_update_message(def.name, previous, &version));
             }
             updated.push(serde_json::json!({
                 "plugin": def.name,
@@ -183,9 +209,27 @@ async fn update(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmE
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if updated.is_empty() {
-            output::info("No plugins installed to update. Run `lpm lint` or `lpm fmt` to install.");
+            install_ui::warn("No plugins installed to update");
+            eprintln!(
+                "  {}",
+                install_ui::dim("Run `lpm lint` or `lpm fmt` to install plugins on first use")
+            );
         }
     }
 
     Ok(())
+}
+
+fn latest_installed_version(plugin_name: &str) -> Result<Option<String>, LpmError> {
+    let installed = lpm_plugin::store::list_installed_versions(plugin_name)?;
+    Ok(installed.last().cloned())
+}
+
+fn format_update_message(plugin_name: &str, previous: Option<&str>, version: &str) -> String {
+    match previous {
+        Some(previous) if previous != version => {
+            format!("Updated {plugin_name} {previous} → {version}")
+        }
+        _ => format!("Updated {plugin_name} to {version}"),
+    }
 }

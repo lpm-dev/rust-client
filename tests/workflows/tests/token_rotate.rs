@@ -66,3 +66,52 @@ async fn token_rotate_json_replaces_stored_session_token_and_expiry_metadata() {
         serde_json::json!("2032-01-03")
     );
 }
+
+#[tokio::test]
+async fn token_rotate_human_output_uses_slim_progress_and_completion() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("old-session-token"),
+            ..Default::default()
+        }],
+    );
+
+    mock.with_token_rotate(
+        "old-session-token",
+        "new-session-token",
+        "2032-01-03T04:05:06Z",
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate"])
+        .output()
+        .expect("failed to run lpm token-rotate");
+
+    assert!(
+        output.status.success(),
+        "lpm token-rotate failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Rotating lpm.dev token"),
+        "token-rotate must use a slim phase line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · session token rotated successfully"),
+        "token-rotate must use a slim completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "token-rotate output must not use cliclack gutter output, got:\n{stderr}"
+    );
+}

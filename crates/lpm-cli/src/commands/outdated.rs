@@ -1,5 +1,5 @@
+use crate::install_ui;
 use crate::npm_public_source::lockfile_source_is_npm_public;
-use crate::output;
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
@@ -66,7 +66,7 @@ pub async fn run(
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            output::info("No dependencies to check.");
+            install_ui::warn("No dependencies to check");
         }
         return Ok(());
     }
@@ -189,11 +189,35 @@ pub async fn run(
             } else {
                 "All checked LPM dependency entries are up to date"
             };
-            output::success(message);
+            install_ui::done(message);
         } else {
-            println!();
+            let section_width = outdated
+                .iter()
+                .map(|result| result.section.len())
+                .max()
+                .unwrap_or(0)
+                .max("Section".len());
+            let package_width = outdated
+                .iter()
+                .map(|result| result.name.len())
+                .max()
+                .unwrap_or(0)
+                .max("Package".len());
+            let current_width = outdated
+                .iter()
+                .map(|result| result.current.len())
+                .max()
+                .unwrap_or(0)
+                .max("Current".len());
+            let wanted_width = outdated
+                .iter()
+                .map(|result| result.wanted.as_deref().unwrap_or("?").len())
+                .max()
+                .unwrap_or(0)
+                .max("Wanted".len());
+
             println!(
-                "  {:<18} {:<34} {:<12} {:<12} {}",
+                "{:<section_width$}  {:<package_width$}  {:<current_width$}  {:<wanted_width$}  {}",
                 "Section".bold(),
                 "Package".bold(),
                 "Current".bold(),
@@ -202,7 +226,7 @@ pub async fn run(
             );
             for result in &outdated {
                 println!(
-                    "  {:<18} {:<34} {:<12} {:<12} {}",
+                    "{:<section_width$}  {:<package_width$}  {:<current_width$}  {:<wanted_width$}  {}",
                     result.section.dimmed(),
                     result.name,
                     result.current.dimmed(),
@@ -211,18 +235,21 @@ pub async fn run(
                 );
             }
             println!();
-            output::info(&format!("{} package(s) can be updated", outdated.len()));
+            install_ui::done(&format!(
+                "Found {} outdated {}",
+                outdated.len(),
+                install_ui::packages_word(outdated.len()),
+            ));
         }
         if !skipped_private.is_empty() {
             let skipped_private_list = skipped_private.iter().cloned().collect::<Vec<_>>();
-            output::warn(&format!(
+            install_ui::warn(&format!(
                 "skipped {} package(s) without a recorded npm-public source to avoid leaking private names to registry.npmjs.org: {}",
                 skipped_private.len(),
                 skipped_private_list.join(", "),
             ));
-            output::info("run `lpm install` first to record sources in lpm.lock, then re-run.");
+            install_ui::phase("run `lpm install` first to record sources in lpm.lock, then re-run");
         }
-        println!();
     }
 
     Ok(())

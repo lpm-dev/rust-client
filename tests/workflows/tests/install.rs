@@ -41,6 +41,38 @@ fn install_without_package_json_fails() {
     );
 }
 
+#[test]
+fn install_without_dependencies_uses_slim_status_output() {
+    let project = TempProject::empty(r#"{"name":"empty-install","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        output.status.success(),
+        "empty install should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ No dependencies to install"),
+        "empty install should use the slim success glyph; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('│') && !stderr.contains('◇'),
+        "empty install status must not use cliclack's boxed gutter; got:\n{stderr}"
+    );
+}
+
 // ─── Auto-create + parent-dir walk for `lpm i <pkg>` ─────────────
 //
 // Match npm/pnpm/yarn/bun DX. `lpm i <pkg>` in a directory with no

@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
@@ -153,35 +153,39 @@ pub fn cache_status_json(status: &CacheStatus) -> serde_json::Value {
 }
 
 pub fn print_cache_status_human(status: &CacheStatus) {
-    output::info(&format!(
-        "Local task cache: {} ({})",
-        status.local_path.display(),
-        format_bytes(status.local_bytes),
-    ));
+    println!("Local cache");
+    println!("  path     {}", status.local_path.display());
+    println!("  size     {}", format_bytes(status.local_bytes));
+    println!();
 
-    if !status.remote.enabled {
-        output::info("Remote cache: disabled");
-        return;
+    println!("Remote cache");
+    println!("  enabled  {}", status.remote.enabled);
+    if status.remote.enabled {
+        println!(
+            "  status   {}",
+            status.remote.status.as_deref().unwrap_or("unknown")
+        );
+        if let Some(url) = &status.remote.url {
+            println!("  url      {url}");
+        }
+        if let (Some(usage), Some(limit)) = (status.remote.usage_bytes, status.remote.limit_bytes) {
+            let usage_display = format_bytes(usage);
+            let limit_display = format_bytes(limit);
+            let usage_bar = install_ui::usage_bar(usage, limit, 10);
+            let mut usage_line = format!("  usage    {usage_display} / {limit_display}");
+            if !usage_bar.is_empty() {
+                usage_line.push_str("  ");
+                usage_line.push_str(&usage_bar);
+            }
+            println!("{usage_line}");
+        }
     }
-
-    let label = status.remote.status.as_deref().unwrap_or("unknown");
-    let mut line = format!("Remote cache: {label}");
-    if let Some(url) = &status.remote.url {
-        line.push_str(&format!(" ({url})"));
-    }
-    output::info(&line);
-
-    if let (Some(usage), Some(limit)) = (status.remote.usage_bytes, status.remote.limit_bytes) {
-        output::info(&format!(
-            "Remote usage: {} / {}",
-            format_bytes(usage),
-            format_bytes(limit),
-        ));
-    }
+    println!();
 
     if let Some(error) = &status.remote.error {
-        output::warn(&format!("Remote status unavailable: {error}"));
+        install_ui::warn(&format!("Remote status unavailable: {error}"));
     }
+    install_ui::done("Cache status loaded");
 }
 
 impl RemoteCacheClient {
@@ -867,7 +871,7 @@ fn is_ci_environment() -> bool {
 
 fn warn_once(message: &str) {
     if !REMOTE_CACHE_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
-        output::warn(message);
+        install_ui::warn(message);
     }
 }
 

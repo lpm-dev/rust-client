@@ -175,6 +175,15 @@ async fn audit_empty_lockfile_reports_no_packages_and_exits_zero() {
         combined.to_lowercase().contains("no packages"),
         "expected 'no packages' wording on the empty-lockfile path; got:\n{combined}"
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("! No packages found to audit"),
+        "empty audit must use a slim warning, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('◇'),
+        "empty audit must not use cliclack spinner glyphs, got:\n{stderr}",
+    );
 }
 
 /// A project with one clean dep and an OSV response carrying zero vulns
@@ -557,9 +566,14 @@ fn audit_secrets_on_clean_node_modules_reports_no_findings_and_exits_zero() {
     );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("no hardcoded secrets found") || stdout.contains("Scanned"),
-        "human output must indicate the scan ran cleanly, got:\n{stdout}",
+        stdout.contains("Scanned") && stderr.contains("✓ no hardcoded secrets found"),
+        "human output must indicate the scan ran cleanly, got:\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('◇'),
+        "audit secrets must not use cliclack spinner glyphs, got:\n{stderr}",
     );
 }
 

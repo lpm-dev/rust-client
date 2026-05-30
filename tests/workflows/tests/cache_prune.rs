@@ -29,6 +29,25 @@ fn parse_json(stdout: &[u8]) -> Value {
     serde_json::from_str(&s).unwrap_or_else(|e| panic!("stdout is not valid JSON: {e}\n---\n{s}"))
 }
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Build a registry seed JSON with proper escaping for the path. Uses
 /// `serde_json::json!` so Windows backslashes (`C:\Users\…`) and other
 /// platform-specific quirks are escaped correctly. Returns the bytes
@@ -98,6 +117,37 @@ fn prune_dry_run_with_no_registry_succeeds_without_mutation() {
                 .read_dir()
                 .map_or(true, |mut d| d.next().is_none()),
         "dry-run must not create or populate the store"
+    );
+}
+
+#[test]
+fn prune_human_output_uses_slim_status_lines() {
+    let project = TempProject::empty(r#"{"name":"prune-human","version":"1.0.0"}"#);
+
+    let output = lpm_v2(&project)
+        .args(["cache", "prune"])
+        .output()
+        .expect("failed to run lpm cache prune");
+
+    assert!(
+        output.status.success(),
+        "dry-run prune failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ));
+    assert!(
+        combined.contains("! No project registry at ~/.lpm/known-projects.json"),
+        "missing-registry path should use a slim warning, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('│') && !combined.contains('◇'),
+        "cache prune output should not use bordered/cliclack glyphs, got:\n{combined}"
     );
 }
 

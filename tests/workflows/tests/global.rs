@@ -19,6 +19,25 @@ mod support;
 
 use support::{TempProject, lpm};
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn global_root(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("global")
 }
@@ -40,16 +59,24 @@ fn global_list_on_empty_manifest_succeeds_with_no_packages_message() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let combined = format!(
+    let combined = strip_ansi(&format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
-    );
+    ));
     assert!(
         combined.contains("No globally-installed")
             || combined.contains("no packages")
             || combined.contains("0 package"),
         "human output must indicate empty state, got:\n{combined}",
+    );
+    assert!(
+        combined.contains("! No globally-installed packages"),
+        "global list should use a slim warning for the empty state, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('│') && !combined.contains('◇'),
+        "global list output should not use bordered/cliclack glyphs, got:\n{combined}"
     );
 }
 

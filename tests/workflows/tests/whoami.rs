@@ -3,6 +3,8 @@ mod support;
 use support::auth_state::{SessionSeed, seed_sessions};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, ResponseTemplate};
 
 #[tokio::test]
 async fn whoami_human_output_uses_slim_logged_out_guidance() {
@@ -60,7 +62,33 @@ async fn whoami_human_output_uses_slim_logged_out_guidance() {
 async fn whoami_human_output_uses_slim_account_summary() {
     let project = TempProject::empty(r#"{"name":"whoami","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    mock.with_authenticated_whoami("access-primary", "testuser", "test@example.com")
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .and(header("authorization", "Bearer access-primary"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "test@example.com",
+            "profile_username": "testuser",
+            "email": "test@example.com",
+            "plan_tier": "pro",
+            "mfa_enabled": false,
+            "has_pool_access": true,
+            "usage": {
+                "storage_bytes": 1024 * 1024 * 50,
+                "private_packages": 3
+            },
+            "limits": {
+                "storageBytes": 1024 * 1024 * 500,
+                "privatePackages": 100
+            },
+            "organizations": [
+                {
+                    "slug": "acme",
+                    "name": "Acme",
+                    "role": "admin"
+                }
+            ]
+        })))
+        .mount(mock.server())
         .await;
 
     seed_sessions(
@@ -109,12 +137,12 @@ async fn whoami_human_output_uses_slim_account_summary() {
         "authenticated whoami should show 2FA status on a slim line, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("› Storage 50.00MB / 500MB"),
-        "authenticated whoami should show storage usage on a slim line, got:\n{stderr}"
+        stderr.contains("› Storage 50.00MB / 500MB  █░░░░░░░░░"),
+        "authenticated whoami should show storage usage with a quota bar, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("› Private Packages 3 / 100"),
-        "authenticated whoami should show package usage on a slim line, got:\n{stderr}"
+        stderr.contains("› Private Packages 3 / 100  █░░░░░░░░░"),
+        "authenticated whoami should show package usage with a quota bar, got:\n{stderr}"
     );
     assert!(
         stderr.contains("› Available Scopes"),
@@ -125,7 +153,33 @@ async fn whoami_human_output_uses_slim_account_summary() {
         "authenticated whoami should list the personal scope, got:\n{stderr}"
     );
     assert!(
+        stderr.contains("@lpm.dev/acme.*  admin "),
+        "authenticated whoami should render admin as a padded badge label, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("(admin)"),
+        "authenticated whoami should not render the admin role as the old parenthesized label, got:\n{stderr}"
+    );
+    assert!(
         !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
         "legacy cliclack glyphs must be gone from whoami stderr, got:\n{stderr}"
+    );
+
+    let colored_output = lpm_with_registry(&project, &mock.url())
+        .arg("whoami")
+        .env_remove("NO_COLOR")
+        .env("FORCE_COLOR", "1")
+        .output()
+        .expect("failed to run color-forced lpm whoami");
+    assert!(
+        colored_output.status.success(),
+        "color-forced whoami must exit 0, stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&colored_output.stdout),
+        String::from_utf8_lossy(&colored_output.stderr),
+    );
+    let colored_stderr = String::from_utf8_lossy(&colored_output.stderr);
+    assert!(
+        colored_stderr.contains("\u{1b}[1;33;48;5;236m admin \u{1b}[0m"),
+        "color-forced whoami should render admin with a badge background, got:\n{colored_stderr:?}"
     );
 }

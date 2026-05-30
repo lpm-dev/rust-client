@@ -88,6 +88,81 @@ fn cert_status_json_reports_absent_ca_and_project_cert() {
 }
 
 #[test]
+fn cert_status_human_uses_slim_status_for_absent_state() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+
+    let output = cert_command(&project)
+        .args(["cert", "status"])
+        .output()
+        .expect("failed to run lpm cert status");
+
+    assert_success(&output, "lpm cert status");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Root CA")
+            && stdout.contains("status     not installed")
+            && stdout.contains("Project cert")
+            && stdout.contains("status     not generated"),
+        "cert status must render the report to stdout, got:\n{stdout}",
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("! HTTPS certificates need setup"),
+        "cert status must finish with a slim warning for incomplete setup, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "cert status must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn cert_status_human_reports_ready_state_with_slim_completion() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+
+    let trust_output = cert_command(&project)
+        .args(["cert", "trust", "--json"])
+        .output()
+        .expect("failed to run lpm cert trust --json");
+    assert_success(&trust_output, "lpm cert trust --json");
+
+    let generate_output = cert_command(&project)
+        .args(["cert", "generate", "--json"])
+        .output()
+        .expect("failed to run lpm cert generate --json");
+    assert_success(&generate_output, "lpm cert generate --json");
+
+    let output = cert_command(&project)
+        .args(["cert", "status"])
+        .output()
+        .expect("failed to run lpm cert status");
+
+    assert_success(&output, "lpm cert status");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Root CA")
+            && stdout.contains("status     trusted")
+            && stdout.contains("Project cert")
+            && stdout.contains("status     valid")
+            && stdout.contains("hosts"),
+        "cert status must render ready certificate details to stdout, got:\n{stdout}",
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ HTTPS certificates are ready"),
+        "cert status must finish with a slim completion line, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
+        "cert status must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+#[test]
 fn cert_trust_json_generates_ca_and_installs_into_isolated_test_store() {
     let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
 

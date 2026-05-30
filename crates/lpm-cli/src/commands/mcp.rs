@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use serde_json::{Map, Value};
@@ -268,6 +268,9 @@ fn status_for_editors(editors: &[EditorConfig]) -> Result<Vec<Value>, LpmError> 
 async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmError> {
     let name = server_name.unwrap_or("lpm-registry");
     let editors = get_editors();
+    if !json_output {
+        install_ui::phase("Configuring MCP servers for supported editors");
+    }
     let configured = setup_editors(&editors, name, &default_server_config())?;
 
     // M43: the written editor config invokes `npx -y @lpm.dev/lpm-mcp-server`
@@ -300,22 +303,18 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
             .unwrap()
         );
     } else if configured.is_empty() {
-        output::warn("No supported editors detected");
+        install_ui::warn("No supported editors detected");
     } else {
-        output::success(&format!(
-            "MCP server \"{}\" configured in {} editor(s)",
-            name.bold(),
-            configured.len()
-        ));
         for editor in &configured {
-            println!("  {}", editor.dimmed());
+            install_ui::done(&format!("{editor} configured"));
         }
-        output::warn(
+        install_ui::done(&format!("Server name: {name}"));
+        install_ui::warn(
             "autostart resolves `@lpm.dev/lpm-mcp-server` from npm on every editor start. \
              Pin a version by editing the written config (replace the package spec with `@x.y.z`) \
              if you want a static dependency.",
         );
-        println!();
+        install_ui::done("Done · restart your editor to pick up the new MCP server");
     }
 
     Ok(())
@@ -336,17 +335,20 @@ async fn remove(name: &str, json_output: bool) -> Result<(), LpmError> {
             .unwrap()
         );
     } else if removed_from.is_empty() {
-        output::info(&format!("Server \"{name}\" not found in any editor config"));
+        install_ui::warn(&format!("Server \"{name}\" not found in any editor config"));
     } else {
-        output::success(&format!(
-            "Removed \"{}\" from {} editor(s)",
-            name.bold(),
-            removed_from.len()
-        ));
         for editor in &removed_from {
-            println!("  {}", editor.dimmed());
+            install_ui::done(&format!("Removed \"{name}\" from {editor}"));
         }
-        println!();
+        install_ui::done(&format!(
+            "Removed \"{name}\" from {} {}",
+            removed_from.len(),
+            if removed_from.len() == 1 {
+                "editor"
+            } else {
+                "editors"
+            }
+        ));
     }
 
     Ok(())
@@ -368,7 +370,7 @@ async fn status(json_output: bool) -> Result<(), LpmError> {
             let editor = r["editor"].as_str().unwrap_or("");
             let servers = r["servers"].as_array().map_or(0, |a| a.len());
             let icon = if servers > 0 {
-                "✔".green().to_string()
+                "✓".green().to_string()
             } else {
                 "·".dimmed().to_string()
             };
@@ -386,6 +388,7 @@ async fn status(json_output: bool) -> Result<(), LpmError> {
             }
         }
         println!();
+        install_ui::done("MCP status loaded");
     }
 
     Ok(())

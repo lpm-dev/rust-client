@@ -113,6 +113,35 @@ fn graph_format_dot_mermaid_stats_under_json_without_lockfile_emit_error_envelop
     }
 }
 
+#[test]
+fn graph_tree_human_uses_slim_completion() {
+    let project = graph_fixture();
+
+    let output = lpm(&project)
+        .args(["graph", "--depth", "2"])
+        .output()
+        .expect("failed to run lpm graph");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "lpm graph should succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("graph-project") || stdout.contains("express"),
+        "graph tree must render to stdout, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("✓ Rendered dependency tree (depth 2)"),
+        "graph tree must report a slim completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "graph status output must not use cliclack gutter output, got:\n{stderr}"
+    );
+}
+
 // ─── --format html writes to .lpm/graph.html ────────────────────────
 
 #[test]

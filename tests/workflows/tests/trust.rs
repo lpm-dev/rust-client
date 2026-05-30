@@ -43,6 +43,25 @@ fn write_lockfile(project: &TempProject, names_and_versions: &[(&str, &str)]) {
     project.write_file("lpm.lock", &toml);
 }
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ─── lpm trust diff ───────────────────────────────────────────────────
 
 #[test]
@@ -192,6 +211,60 @@ fn trust_diff_reports_changed_binding_when_integrity_drifts() {
 }
 
 #[test]
+fn trust_diff_human_output_uses_slim_sections() {
+    let project = TempProject::empty(r#"{}"#);
+
+    write_trust_snapshot(
+        &project,
+        json!({ "esbuild@0.25.1": { "integrity": "sha512-old", "scriptHash": "sha256-old" } }),
+    );
+    write_pkg_with_trust(
+        &project,
+        json!({
+            "esbuild@0.25.1": { "integrity": "sha512-new", "scriptHash": "sha256-new" },
+            "sharp@0.34.2": { "integrity": "sha512-s" }
+        }),
+    );
+
+    let output = lpm(&project)
+        .args(["trust", "diff"])
+        .output()
+        .expect("failed to run lpm trust diff");
+
+    assert!(
+        output.status.success(),
+        "trust diff human failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+    assert!(
+        combined.contains("› Comparing trust ledger against last install snapshot"),
+        "must show slim phase line; got:\n{combined}"
+    );
+    assert!(combined.contains("added\n  + sharp@0.34.2"));
+    assert!(combined.contains("changed\n  ~ esbuild@0.25.1"));
+    assert!(combined.contains("integrity"));
+    assert!(combined.contains("sha512-old → sha512-new"));
+    assert!(combined.contains("scriptHash"));
+    assert!(combined.contains("sha256-old → sha256-new"));
+    assert!(
+        combined
+            .contains("! 2 trust entries differ from the last install snapshot — lpm trust review"),
+        "must show slim warning summary; got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('│') && !combined.contains('◇'),
+        "trust diff output should not use bordered/cliclack glyphs; got:\n{combined}"
+    );
+}
+
+#[test]
 fn trust_diff_assert_none_exits_zero_when_diff_is_empty() {
     let project = TempProject::empty(r#"{}"#);
 
@@ -322,6 +395,51 @@ fn trust_prune_dry_run_reports_stale_but_does_not_mutate() {
     assert_eq!(
         before, after,
         "dry-run must leave package.json byte-equal\nbefore:\n{before}\nafter:\n{after}",
+    );
+}
+
+#[test]
+fn trust_prune_human_dry_run_uses_slim_status_lines() {
+    let project = TempProject::empty(r#"{}"#);
+
+    write_pkg_with_trust(
+        &project,
+        json!({
+            "esbuild@0.25.1": { "integrity": "sha512-e" },
+            "removed-pkg@1.0.0": { "integrity": "sha512-r" }
+        }),
+    );
+    write_lockfile(&project, &[("esbuild", "0.25.1")]);
+
+    let output = lpm(&project)
+        .args(["trust", "prune", "--dry-run"])
+        .output()
+        .expect("failed to run lpm trust prune --dry-run");
+
+    assert!(
+        output.status.success(),
+        "trust prune --dry-run failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+    assert!(
+        combined.contains("› Pruning stale trust entries"),
+        "must show slim phase line; got:\n{combined}"
+    );
+    assert!(combined.contains("stale\n  - removed-pkg@1.0.0"));
+    assert!(
+        combined.contains("✓ Dry run · 1 stale trust entry would be removed"),
+        "must show dry-run completion; got:\n{combined}"
+    );
+    assert!(
+        !combined.contains('│') && !combined.contains('◇'),
+        "trust prune output should not use bordered/cliclack glyphs; got:\n{combined}"
     );
 }
 

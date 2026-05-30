@@ -1,4 +1,4 @@
-use crate::output;
+use crate::install_ui;
 use crate::release_lookup::{
     FetchOutcome, LookupError, clear_cache_at, default_cache_path,
     fetch_github_release_published_at, github_release_download_url, is_newer_semver, probe_release,
@@ -50,13 +50,9 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         .and_then(read_cache_at)
         .unwrap_or_default();
 
-    let spinner = if !json_output {
-        let s = cliclack::spinner();
-        s.start("Checking for updates...");
-        Some(s)
-    } else {
-        None
-    };
+    if !json_output {
+        install_ui::phase("Checking for updates");
+    }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -82,9 +78,6 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         && now.saturating_sub(cache.last_failure_check) < FAILURE_BACKOFF.as_secs();
 
     if in_failure_backoff {
-        if let Some(s) = spinner {
-            s.stop("Update check skipped (recent failure)");
-        }
         let elapsed = now.saturating_sub(cache.last_failure_check);
         let remaining = FAILURE_BACKOFF.as_secs().saturating_sub(elapsed);
         // SelfUpdatePaused — not Network. The failure isn't a live
@@ -114,20 +107,14 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
                 if let Some(p) = cache_path.as_deref() {
                     let _ = write_cache_at(p, &cache);
                 }
-                if let Some(s) = spinner {
-                    s.stop("Update check failed");
-                }
                 return Err(lookup_error_to_lpm(e));
             }
         }
     };
 
-    if let Some(s) = spinner {
-        s.stop(format!(
-            "Current: {}  Latest: {}",
-            current.dimmed(),
-            latest.bold()
-        ));
+    if !json_output {
+        eprintln!("    current   {}", current.dimmed());
+        eprintln!("    latest    {}", latest.bold());
     }
 
     if latest == current || !is_newer_semver(&latest, current) {
@@ -141,13 +128,13 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if latest == current {
-            output::success(&format!(
-                "Already on the latest version ({})",
+            install_ui::done(&format!(
+                "Done · already on latest version {}",
                 current.bold()
             ));
         } else {
-            output::success(&format!(
-                "Current version ({}) is newer than latest release ({})",
+            install_ui::done(&format!(
+                "Done · current version {} is newer than latest release {}",
                 current.bold(),
                 latest.dimmed()
             ));
@@ -178,12 +165,9 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     }
 
     if !json_output {
-        output::info(&format!(
-            "Updating {} → {} via {}",
-            current.dimmed(),
-            latest.green().bold(),
-            method.name().cyan()
-        ));
+        eprintln!("    channel   {}", method.name().cyan());
+        install_ui::phase("Update command");
+        eprintln!("    {}", method.command(&latest));
     }
 
     let mut standalone_audit: Option<AttestationAudit> = None;
@@ -263,7 +247,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        output::success(&format!("Updated to {}", latest.bold()));
+        install_ui::done(&format!("Done · LPM updated to {}", latest.bold()));
     }
 
     Ok(())
@@ -811,13 +795,11 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
         .build()
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
 
-    let spinner = cliclack::spinner();
-    spinner.start(format!("Fetching signed checksums for v{version}..."));
+    install_ui::phase(&format!("Fetching signed checksums for v{version}"));
 
     let manifest_bytes = fetch_bounded(&client, &manifest_url, MANIFEST_MAX_BYTES)
         .await?
         .ok_or_else(|| {
-            spinner.stop("Signed checksums missing");
             LpmError::SelfUpdate(format!(
                 "release v{version} does not ship SHA256SUMS.txt — this release predates LPM's \
                  signed-install gate. Install manually from \
@@ -827,7 +809,6 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
     let bundle_bytes = fetch_bounded(&client, &bundle_url, BUNDLE_MAX_BYTES)
         .await?
         .ok_or_else(|| {
-            spinner.stop("Sigstore bundle missing");
             LpmError::SelfUpdate(format!(
                 "release v{version} ships SHA256SUMS.txt but not SHA256SUMS.txt.sigstore — \
                  cannot cryptographically verify the manifest. Install manually."
@@ -850,7 +831,7 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
             )),
         })?;
 
-    spinner.stop("Verifying Sigstore attestation");
+    install_ui::phase("Verifying Sigstore attestation");
 
     let asset_vec = fetch_bounded(&client, &asset_url, ASSET_MAX_BYTES)
         .await?
@@ -869,7 +850,7 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
         published_at,
     )?;
 
-    output::success(&format!(
+    install_ui::done(&format!(
         "Verified Sigstore attestation for {} ({}, integratedTime {})",
         binary_name,
         format_bytes(asset_vec.len()),

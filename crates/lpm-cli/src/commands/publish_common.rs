@@ -194,7 +194,7 @@ fn is_safe_entry(path: &Path, canonical_root: &Path) -> bool {
             if meta.file_type().is_symlink() {
                 eprintln!(
                     "  {} skipping symlink: {}",
-                    "⚠".yellow(),
+                    "!".yellow(),
                     path.strip_prefix(canonical_root).unwrap_or(path).display()
                 );
                 return false;
@@ -203,7 +203,7 @@ fn is_safe_entry(path: &Path, canonical_root: &Path) -> bool {
         Err(e) => {
             eprintln!(
                 "  {} skipping {} (cannot read metadata: {e})",
-                "⚠".yellow(),
+                "!".yellow(),
                 path.display()
             );
             return false;
@@ -216,7 +216,7 @@ fn is_safe_entry(path: &Path, canonical_root: &Path) -> bool {
             if !canonical.starts_with(canonical_root) {
                 eprintln!(
                     "  {} skipping {} (resolves outside project directory)",
-                    "⚠".yellow(),
+                    "!".yellow(),
                     path.strip_prefix(canonical_root).unwrap_or(path).display()
                 );
                 return false;
@@ -225,7 +225,7 @@ fn is_safe_entry(path: &Path, canonical_root: &Path) -> bool {
         Err(e) => {
             eprintln!(
                 "  {} skipping {} (cannot canonicalize: {e})",
-                "⚠".yellow(),
+                "!".yellow(),
                 path.display()
             );
             return false;

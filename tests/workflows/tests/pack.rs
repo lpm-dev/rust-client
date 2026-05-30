@@ -89,6 +89,19 @@ fn pack_runs_project_tsdown_with_lpm_flags() {
         output.status,
         String::from_utf8_lossy(&output.stderr),
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Using local tsdown"),
+        "pack must use a slim phase line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · package build complete in "),
+        "pack must report a slim timed completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "pack output must not use cliclack gutter output, got:\n{stderr}"
+    );
 
     let invocations = read_marker_lines(&marker_file);
     assert_eq!(invocations.len(), 1, "expected one tsdown invocation");
@@ -111,6 +124,86 @@ fn pack_runs_project_tsdown_with_lpm_flags() {
             "--minify".to_string(),
             "--sourcemap".to_string(),
         ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_workspace_human_reports_slim_summary() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    for member in ["packages/utils", "packages/core", "packages/app"] {
+        project.write_file(&format!("{member}/src/index.ts"), "export default 1\n");
+    }
+
+    let marker_file = project.home().join("pack-workspace-human.log");
+    seed_fake_tsdown(&project, &marker_file);
+
+    let output = lpm(&project)
+        .args([
+            "pack",
+            "--all",
+            "--entry",
+            "src/index.ts",
+            "--out-dir",
+            "dist",
+            "--dts",
+        ])
+        .output()
+        .expect("failed to run lpm pack --all");
+
+    assert!(
+        output.status.success(),
+        "workspace pack must succeed, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ pack passed in 3 packages in "),
+        "workspace pack must report a slim timed summary, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "workspace pack output must not use cliclack gutter output, got:\n{stderr}"
+    );
+
+    let invocations = read_marker_lines(&marker_file);
+    assert_eq!(
+        invocations.len(),
+        3,
+        "expected one tsdown invocation per member"
+    );
+}
+
+#[test]
+fn pack_filter_typo_without_fail_flag_uses_slim_warning() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+
+    let output = lpm(&project)
+        .args([
+            "pack",
+            "--filter",
+            "this-package-does-not-exist",
+            "--entry",
+            "src/index.ts",
+        ])
+        .output()
+        .expect("failed to run lpm pack");
+
+    assert!(
+        output.status.success(),
+        "empty-match without --fail-if-no-match must exit 0, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No packages matched"),
+        "expected slim empty-match warning, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "empty-match pack output must not use cliclack gutter output, got:\n{stderr}"
     );
 }
 

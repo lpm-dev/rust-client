@@ -17,7 +17,7 @@
 //! ```
 
 use crate::commands::audit::inventory::PackageInventory;
-use crate::output;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -122,7 +122,7 @@ pub async fn run(
         if json_output {
             println!("[]");
         } else {
-            output::info("No packages found.");
+            install_ui::warn("No packages found");
         }
         return Ok(());
     }
@@ -348,25 +348,8 @@ pub async fn run(
             serde_json::to_string_pretty(&json_results).unwrap_or_else(|_| "[]".into())
         );
     } else if matched.is_empty() {
-        println!(
-            "  {} No packages match {}",
-            "·".dimmed(),
-            selector_str.bold()
-        );
+        install_ui::warn(&format!("No packages match {selector_str}"));
     } else {
-        println!(
-            "  {} {} matching {}",
-            "●".green(),
-            format!(
-                "{} package{}",
-                matched.len(),
-                if matched.len() == 1 { "" } else { "s" }
-            )
-            .bold(),
-            selector_str.bold()
-        );
-        println!();
-
         for pkg in &matched {
             let mut extras = Vec::new();
 
@@ -399,6 +382,16 @@ pub async fn run(
                 };
             println!("    {}@{}{extra_str}{path_suffix}", pkg.name, pkg.version);
         }
+        println!();
+        install_ui::warn(&format!(
+            "{} {} matched {selector_str}",
+            matched.len(),
+            if matched.len() == 1 {
+                "package"
+            } else {
+                "packages"
+            }
+        ));
     }
 
     // --assert-none: exit 1 if ANY packages matched (CI gate)
@@ -462,7 +455,7 @@ fn run_count_mode(packages: &[PackageContext<'_>], json_output: bool) {
             continue;
         }
 
-        println!("  ● {}", colorize(label));
+        println!("  · {}", colorize(label));
 
         // Find max label length for alignment
         let max_label_len = tier_counts

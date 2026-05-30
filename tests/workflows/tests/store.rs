@@ -147,6 +147,38 @@ fn store_verify_passes_on_valid_v1_entry() {
 }
 
 #[test]
+fn store_verify_human_uses_slim_status_lines() {
+    let project = TempProject::empty(r#"{"name":"store-verify","version":"1.0.0"}"#);
+    seed_v1_entry(&project, "lodash", "4.17.21", true);
+
+    let output = lpm(&project)
+        .args(["store", "verify"])
+        .output()
+        .expect("failed to run lpm store verify");
+
+    assert!(
+        output.status.success(),
+        "verify on valid entry must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Verifying store integrity"),
+        "store verify must report a slim phase line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Store verified ·"),
+        "store verify must report a slim completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "store verify output must not use cliclack gutter output, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn store_verify_flags_corrupted_v1_entry_without_package_json() {
     let project = TempProject::empty(r#"{"name":"store-verify","version":"1.0.0"}"#);
     seed_v1_entry(&project, "broken-pkg", "1.0.0", false);
@@ -247,6 +279,34 @@ fn store_clean_wipes_v1_and_v2_directories() {
     assert!(
         envelope["v2_path"].is_string(),
         "envelope must surface v2_path"
+    );
+}
+
+#[test]
+fn store_clean_human_uses_slim_completion() {
+    let project = TempProject::empty(r#"{"name":"store-clean","version":"1.0.0"}"#);
+    seed_v1_entry(&project, "lodash", "4.17.21", true);
+
+    let output = lpm(&project)
+        .args(["store", "clean"])
+        .output()
+        .expect("failed to run lpm store clean");
+
+    assert!(
+        output.status.success(),
+        "store clean must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Wiped package store · freed "),
+        "store clean must report a slim completion line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains('●') && !stderr.contains('│'),
+        "store clean output must not use cliclack gutter output, got:\n{stderr}"
     );
 }
 

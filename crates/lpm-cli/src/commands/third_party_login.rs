@@ -1,5 +1,5 @@
 use crate::commands::web_auth;
-use crate::{auth, output};
+use crate::{auth, install_ui};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::io::IsTerminal;
@@ -58,7 +58,7 @@ pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), Lpm
     if json_output {
         print_success_json(NPM_DISPLAY, "npm-web", true);
     } else {
-        output::success(&format!(
+        install_ui::done(&format!(
             "Logged in to {} with npm web auth",
             NPM_DISPLAY.bold()
         ));
@@ -88,7 +88,7 @@ pub fn run_github(token: Option<String>, json_output: bool) -> Result<(), LpmErr
     if json_output {
         print_success_json(GITHUB_DISPLAY, "gh", false);
     } else {
-        output::success(
+        install_ui::done(
             "GitHub Packages auth is available through GitHub CLI; no LPM token was stored",
         );
     }
@@ -117,7 +117,7 @@ pub fn run_gitlab(token: Option<String>, json_output: bool) -> Result<(), LpmErr
     if json_output {
         print_success_json(GITLAB_DISPLAY, "glab", false);
     } else {
-        output::success(
+        install_ui::done(
             "GitLab Packages auth is available through GitLab CLI; no LPM token was stored",
         );
     }
@@ -143,7 +143,7 @@ pub fn run_custom(
             )));
         }
         None => {
-            eprintln!("  {}", "Provide the registry auth token".dimmed());
+            install_ui::phase("Provide the registry auth token");
             cliclack::password(format!("Paste {registry_url} token"))
                 .mask('*')
                 .interact()
@@ -193,7 +193,7 @@ fn store_builtin_token(
             } else {
                 ""
             };
-            output::success(&format!(
+            install_ui::done(&format!(
                 "Token stored for {} (reminder: {}{otp_note})",
                 registry_display.bold(),
                 expires_human.dimmed()
@@ -219,7 +219,7 @@ fn store_builtin_token(
         } else {
             ""
         };
-        output::success(&format!(
+        install_ui::done(&format!(
             "Token stored for {}{otp_note}",
             registry_display.bold()
         ));

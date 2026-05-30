@@ -1,3 +1,4 @@
+use crate::install_ui;
 use crate::security_approval::{self, ApprovalScope, UnlockTargetKind};
 use clap::Subcommand;
 use lpm_common::LpmError;
@@ -239,7 +240,7 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                     .unwrap()
                 );
             } else {
-                crate::output::success(&format!(
+                install_ui::done(&format!(
                     "Temporary {} unlock for {} is active for {}.",
                     grant.target.as_str(),
                     scope.as_str(),
@@ -289,13 +290,13 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
             }
 
             if revocations.is_empty() {
-                crate::output::warn(&format!(
+                install_ui::warn(&format!(
                     "No active {} unlocks matched {}.",
                     target.kind.as_str(),
                     scope.as_str(),
                 ));
             } else {
-                crate::output::success(&format!(
+                install_ui::done(&format!(
                     "Revoked {} from {} {} unlock{}.",
                     scope.as_str(),
                     revocations.len(),
@@ -329,100 +330,82 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 return Ok(());
             }
 
-            crate::output::header("Security Floor");
-            crate::output::field("target", status.target.as_str());
-            crate::output::field(
-                if status.target == security_approval::UnlockTargetKind::Global {
-                    "global-root"
-                } else {
-                    "project"
-                },
-                status.project_root.as_deref().unwrap_or("(none)"),
+            println!("target   {}", status.target.as_str());
+            println!(
+                "root     {}",
+                status.project_root.as_deref().unwrap_or("(none)")
             );
-            crate::output::field(
-                "script-policy",
-                &format!(
-                    "{} ({})",
-                    status.effective_floor.script_policy,
-                    source_name(status.floor_sources.script_policy),
-                ),
+            println!();
+            println!("effective floor");
+            println!(
+                "  script policy           {} ({})",
+                status.effective_floor.script_policy,
+                source_name(status.floor_sources.script_policy),
             );
-            crate::output::field(
-                "minimum-release-age",
-                &format!(
-                    "{} ({})",
-                    format_release_age(status.effective_floor.minimum_release_age_secs),
-                    source_name(status.floor_sources.minimum_release_age_secs),
-                ),
+            println!(
+                "  minimum release age     {} ({})",
+                format_release_age(status.effective_floor.minimum_release_age_secs),
+                source_name(status.floor_sources.minimum_release_age_secs),
             );
-            crate::output::field(
-                "sandbox.mode",
-                &format!(
-                    "{} ({})",
-                    status.effective_floor.sandbox_mode,
-                    source_name(status.floor_sources.sandbox_mode),
-                ),
+            println!(
+                "  sandbox mode            {} ({})",
+                status.effective_floor.sandbox_mode,
+                source_name(status.floor_sources.sandbox_mode),
             );
-            crate::output::field(
-                "sandbox.allow-degraded",
-                &format!(
-                    "{} ({})",
-                    status.effective_floor.sandbox_allow_degraded,
-                    source_name(status.floor_sources.sandbox_allow_degraded),
-                ),
+            println!(
+                "  sandbox allow degraded  {} ({})",
+                status.effective_floor.sandbox_allow_degraded,
+                source_name(status.floor_sources.sandbox_allow_degraded),
             );
-            crate::output::field(
-                "sigstore.verify",
-                &format!(
-                    "{} ({})",
-                    status.effective_floor.sigstore_verify,
-                    source_name(status.floor_sources.sigstore_verify),
-                ),
+            println!(
+                "  sigstore verify         {} ({})",
+                status.effective_floor.sigstore_verify,
+                source_name(status.floor_sources.sigstore_verify),
             );
 
-            crate::output::header("Policy Sources");
-            crate::output::field(
-                "approved-posture",
-                &format!(
-                    "{} ({})",
-                    status.approved_posture_path,
-                    source_name(status.approved_posture_source),
-                ),
+            println!();
+            println!("policy sources");
+            println!(
+                "  approved posture        {} ({})",
+                status.approved_posture_path,
+                source_name(status.approved_posture_source),
             );
             match status.managed_policy.as_ref() {
                 Some(policy) => {
-                    crate::output::field("managed-policy", &policy.path);
+                    println!("  managed policy          {}", policy.path);
                     if let Some(name) = policy.name.as_deref() {
-                        crate::output::field("policy-name", name);
+                        println!("  policy name             {name}");
                     }
                     if let Some(source) = policy.source.as_deref() {
-                        crate::output::field("policy-source", source);
+                        println!("  policy source           {source}");
                     }
                     if !policy.enforced_controls.is_empty() {
-                        crate::output::field(
-                            "enforced-controls",
-                            &policy.enforced_controls.join(", "),
+                        println!(
+                            "  enforced controls       {}",
+                            policy.enforced_controls.join(", "),
                         );
                     }
                 }
-                None => crate::output::field("managed-policy", "inactive"),
+                None => println!("  managed policy          inactive"),
             }
 
-            crate::output::header("Runtime Overrides");
+            println!();
+            println!("runtime overrides");
             if status.active_runtime_overrides.is_empty() {
-                crate::output::field("override", "none");
+                println!("  none");
             } else {
                 for override_row in &status.active_runtime_overrides {
-                    crate::output::field(
-                        &override_row.control,
-                        &format!("{} ({})", override_row.value, override_row.source),
+                    println!(
+                        "  {:<24} {} ({})",
+                        override_row.control, override_row.value, override_row.source,
                     );
                 }
             }
 
-            crate::output::header("Active Unlocks");
+            println!();
+            println!("active unlocks");
             if status.active_unlocks.is_empty() {
-                crate::output::field(status.target.as_str(), "none");
+                println!("  none");
             } else {
                 for grant in &status.active_unlocks {
                     let package_suffix = if grant.packages.is_empty() {
@@ -434,24 +417,24 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                         Some(secs) => format!(" | min-release-age >= {}", format_release_age(secs)),
                         None => String::new(),
                     };
-                    crate::output::field(
-                        &grant.id,
-                        &format!(
-                            "{} [{}] until {}{}{}",
-                            grant
-                                .scopes
-                                .iter()
-                                .map(|scope| scope.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            grant.target.as_str(),
-                            grant.expires_at.to_rfc3339(),
-                            package_suffix,
-                            limit_suffix,
-                        ),
+                    println!(
+                        "  {}  {} [{}] until {}{}{}",
+                        grant.id,
+                        grant
+                            .scopes
+                            .iter()
+                            .map(|scope| scope.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        grant.target.as_str(),
+                        grant.expires_at.to_rfc3339(),
+                        package_suffix,
+                        limit_suffix,
                     );
                 }
             }
+            println!();
+            install_ui::done("Security floor loaded");
             Ok(())
         }
     }
