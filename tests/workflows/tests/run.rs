@@ -14,6 +14,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 struct RemoteCacheState {
     artifact: Arc<Mutex<Option<Vec<u8>>>>,
     tag: Arc<Mutex<Option<String>>>,
+    sha: Arc<Mutex<Option<String>>>,
 }
 
 struct RemoteCacheGetResponder {
@@ -47,6 +48,15 @@ impl Respond for RemoteCacheGetResponder {
         {
             response = response.insert_header("x-artifact-tag", tag);
         }
+        if let Some(sha) = self
+            .state
+            .sha
+            .lock()
+            .expect("remote cache sha mutex poisoned")
+            .clone()
+        {
+            response = response.insert_header("x-artifact-sha", sha);
+        }
         response
     }
 }
@@ -69,6 +79,15 @@ impl Respond for RemoteCachePutResponder {
             .expect("remote cache tag mutex poisoned") = request
             .headers
             .get("x-artifact-tag")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        *self
+            .state
+            .sha
+            .lock()
+            .expect("remote cache sha mutex poisoned") = request
+            .headers
+            .get("x-artifact-sha")
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
 
@@ -127,6 +146,7 @@ fn remote_cache_project(server: &MockServer, extra_remote_config: &str) -> TempP
 fn run_build_with_remote_token(project: &TempProject) -> std::process::Output {
     lpm(project)
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "build"])
         .output()
         .expect("failed to run lpm run build")
@@ -923,6 +943,51 @@ async fn run_remote_cache_corrupt_artifact_is_treated_as_miss() {
     assert!(
         project.file_exists("executed-marker"),
         "corrupt remote artifact should be a miss and execute the script",
+    );
+}
+
+#[tokio::test]
+async fn run_remote_cache_artifact_failing_content_hash_is_rejected() {
+    // A remote cache hit must not be trusted unless the downloaded bytes match
+    // the advertised `x-artifact-sha`. Without that check the client extracts
+    // whatever the server returns under a valid key: the cache-poisoning path.
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_stateful_remote_cache(&server, state.clone()).await;
+    let project = remote_cache_project(&server, "");
+
+    // First run: real miss uploads a genuine artifact and its content hash.
+    let first = run_build_with_remote_token(&project);
+    assert!(
+        first.status.success(),
+        "first run should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    // Tamper with the advertised hash so the served bytes no longer match it,
+    // simulating a corrupted/poisoned object served under a legitimate key.
+    *state.sha.lock().expect("remote cache sha mutex poisoned") = Some("0".repeat(64));
+
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+    assert!(
+        second.status.success(),
+        "mismatched-hash artifact must fall back to local build:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert!(
+        project.file_exists("executed-marker"),
+        "artifact failing content-hash verification must be a miss and re-run the script",
+    );
+    assert_eq!(
+        project.read_file("dist/value.txt"),
+        "remote-hit",
+        "outputs must come from the real local build, not the unverified remote artifact",
     );
 }
 

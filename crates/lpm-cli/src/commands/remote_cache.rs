@@ -234,10 +234,26 @@ impl RemoteCacheClient {
             .get(ARTIFACT_TAG_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
+        let advertised_sha = response
+            .headers()
+            .get(ARTIFACT_SHA_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
         let mut temp = tempfile::NamedTempFile::new()
             .map_err(|e| format!("failed to create remote cache temp file: {e}"))?;
-        let computed_tag =
+        let digests =
             copy_response_to_temp(&mut response, &mut temp, self.signature_key.as_deref())?;
+
+        // A downloaded artifact is extracted into the project tree only after
+        // the advertised content hash passes. When a signing key is configured,
+        // the HMAC must pass too, so a cache host without the key can't forge
+        // restoreable bytes.
+        let Some(advertised_sha) = &advertised_sha else {
+            return Err(
+                "remote cache artifact is missing a content hash; treating it as a miss".into(),
+            );
+        };
+        verify_artifact_sha(advertised_sha, &digests.sha256_hex)?;
 
         if let Some(key) = &self.signature_key {
             let Some(tag) = tag else {
@@ -246,7 +262,7 @@ impl RemoteCacheClient {
                         .into(),
                 );
             };
-            verify_artifact_tag(key, &tag, &computed_tag)?;
+            verify_artifact_tag(key, &tag, &digests.hmac_tag)?;
         }
 
         lpm_task::cache::restore_remote_artifact(key, temp.path(), project_dir)
@@ -399,14 +415,30 @@ fn resolve_client(
 
     let config = lpm_config.and_then(|cfg| cfg.remote_cache.as_ref());
     let base_url = resolve_base_url(config.and_then(|cfg| cfg.url.as_deref()))?;
-    let token = std::env::var("LPM_REMOTE_CACHE_TOKEN")
+    let cache_matches_registry = cache_origin_matches_registry(&base_url);
+    let token = match std::env::var("LPM_REMOTE_CACHE_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
-        .or_else(|| lpm_auth::get_token(registry_origin_for_auth(&base_url).as_str()))
-        .ok_or_else(|| {
-            "remote cache is enabled but no token was found; set LPM_REMOTE_CACHE_TOKEN or run lpm login"
-                .to_string()
-        })?;
+    {
+        Some(token) => token,
+        // The ambient registry login token (keychain / LPM_TOKEN) is only sent
+        // when the cache lives on the LPM registry origin. A cache URL from a
+        // checked-in lpm.json that points elsewhere must carry its own
+        // LPM_REMOTE_CACHE_TOKEN, so a hostile config can't redirect the
+        // registry credential to an attacker-controlled host.
+        None if cache_matches_registry => {
+            lpm_auth::get_token(registry_origin_for_auth(&base_url).as_str()).ok_or_else(|| {
+                "remote cache is enabled but no token was found; set LPM_REMOTE_CACHE_TOKEN or run lpm login"
+                    .to_string()
+            })?
+        }
+        None => {
+            return Err(
+                "remote cache is configured for a host other than the LPM registry; set LPM_REMOTE_CACHE_TOKEN to authenticate (the registry login token is never sent to third-party cache hosts)"
+                    .to_string(),
+            );
+        }
+    };
 
     let signature_key = std::env::var("LPM_REMOTE_CACHE_SIGNATURE_KEY")
         .ok()
@@ -414,6 +446,12 @@ fn resolve_client(
     if config.is_some_and(|cfg| cfg.signature) && signature_key.is_none() {
         return Err(
             "remoteCache.signature is true but LPM_REMOTE_CACHE_SIGNATURE_KEY is not set".into(),
+        );
+    }
+    if !cache_matches_registry && signature_key.is_none() {
+        return Err(
+            "remote cache is configured for a host other than the LPM registry; set LPM_REMOTE_CACHE_SIGNATURE_KEY so third-party artifacts are signed before restore"
+                .into(),
         );
     }
 
@@ -591,6 +629,12 @@ fn resolve_base_url(config_url: Option<&str>) -> Result<String, String> {
     }
 }
 
+fn cache_origin_matches_registry(base_url: &str) -> bool {
+    let cache_origin = registry_origin_for_auth(base_url);
+    let registry_origin = registry_origin_for_auth(&lpm_common::resolve_lpm_registry_url());
+    cache_origin.eq_ignore_ascii_case(&registry_origin)
+}
+
 fn registry_origin_for_auth(base_url: &str) -> String {
     reqwest::Url::parse(base_url)
         .ok()
@@ -622,9 +666,10 @@ fn copy_response_to_temp(
     response: &mut impl Read,
     temp: &mut tempfile::NamedTempFile,
     signature_key: Option<&str>,
-) -> Result<Option<String>, String> {
+) -> Result<ArtifactDigests, String> {
     let mut total = 0u64;
     let mut buffer = [0u8; 64 * 1024];
+    let mut sha = Sha256::new();
     let mut mac = signature_key.map(new_hmac).transpose()?;
 
     loop {
@@ -643,6 +688,7 @@ fn copy_response_to_temp(
             ));
         }
 
+        sha.update(&buffer[..read]);
         if let Some(mac) = mac.as_mut() {
             mac.update(&buffer[..read]);
         }
@@ -653,7 +699,10 @@ fn copy_response_to_temp(
     temp.flush()
         .map_err(|e| format!("failed to flush remote cache artifact: {e}"))?;
 
-    Ok(mac.map(|mac| format_hmac_tag(&mac.finalize().into_bytes())))
+    Ok(ArtifactDigests {
+        sha256_hex: hex::encode(sha.finalize()),
+        hmac_tag: mac.map(|mac| format_hmac_tag(&mac.finalize().into_bytes())),
+    })
 }
 
 fn hash_artifact(path: &Path, signature_key: Option<&str>) -> Result<ArtifactDigests, String> {
@@ -689,6 +738,14 @@ fn new_hmac(key: &str) -> Result<HmacSha256, String> {
 
 fn format_hmac_tag(bytes: &[u8]) -> String {
     format!("sha256={}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn verify_artifact_sha(advertised: &str, computed: &str) -> Result<(), String> {
+    if advertised.trim().eq_ignore_ascii_case(computed) {
+        Ok(())
+    } else {
+        Err("remote cache artifact failed content-hash verification; treating it as a miss".into())
+    }
 }
 
 fn verify_artifact_tag(
@@ -840,6 +897,18 @@ mod tests {
 
         let err = verify_artifact_tag("secret-key", &received, &computed).unwrap_err();
         assert!(err.contains("invalid"));
+    }
+
+    #[test]
+    fn artifact_sha_accepts_matching_hash_case_insensitively() {
+        verify_artifact_sha("ABCDEF0123", "abcdef0123").unwrap();
+        verify_artifact_sha("  abcdef0123  ", "abcdef0123").unwrap();
+    }
+
+    #[test]
+    fn artifact_sha_rejects_mismatch() {
+        let err = verify_artifact_sha(&"0".repeat(64), &"1".repeat(64)).unwrap_err();
+        assert!(err.contains("content-hash"));
     }
 
     #[test]
