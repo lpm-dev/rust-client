@@ -1022,7 +1022,7 @@ enum Commands {
     /// pending global-install tombstones from prior `lpm uninstall -g`
     /// runs. For a blunt store wipe, use `lpm store clean`.
     Cache {
-        /// Action: clean, path, prune.
+        /// Action: clean, path, status, prune.
         action: String,
 
         /// Optional subcategory: metadata, tasks, or dlx.
