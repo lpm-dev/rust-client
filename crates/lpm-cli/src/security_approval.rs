@@ -1,11 +1,10 @@
 //! Signed security approvals for guarded posture changes.
 //!
-//! Phase 2 moves the *authoritative* approved machine posture out of
-//! ordinary config files and adds short-lived signed unlock grants for
-//! project-scoped weakeners. `package.json`, `lpm.toml`, and
-//! `~/.lpm/config.toml` remain the proposal layers; this module
-//! decides whether a weaker proposal is already authorized, needs an
-//! interactive approval, or must fail closed for automation.
+//! The signed approved machine posture and short-lived unlock grants
+//! are the authority for guarded weakeners. `package.json`, `lpm.toml`,
+//! and `~/.lpm/config.toml` remain proposal layers; this module decides
+//! whether a weaker proposal is already authorized, needs interactive
+//! approval, or must fail closed for automation.
 
 use crate::precedence::PurePolicyKnob;
 use crate::provenance_fetch::EnforceMode;
@@ -25,6 +24,7 @@ use std::process::Command;
 
 type HmacSha256 = Hmac<Sha256>;
 
+const SIGNING_SECRET_BYTES: usize = 32;
 const APPROVED_POSTURE_SCHEMA_VERSION: u32 = 1;
 const UNLOCK_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_UNLOCK_TTL_SECS: u64 = 10 * 60;
@@ -295,6 +295,19 @@ pub struct SecurityStatus {
     pub active_runtime_overrides: Vec<RuntimeOverride>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_unlocks: Vec<UnlockGrant>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct QuarantinedSecurityState {
+    pub original_path: String,
+    pub quarantine_path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SecurityRepairReport {
+    pub security_dir: String,
+    pub quarantined: Vec<QuarantinedSecurityState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -971,76 +984,192 @@ fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     }))
 }
 
-fn signing_secret() -> Result<Vec<u8>, LpmError> {
+#[derive(Debug)]
+enum SigningSecretReadError {
+    Missing,
+    Corrupt(String),
+    Unavailable(String),
+}
+
+impl SigningSecretReadError {
+    fn into_lpm_error(self) -> LpmError {
+        match self {
+            Self::Missing => security_store_error(
+                "security approval signing secret is missing; existing signed security state cannot be verified",
+            ),
+            Self::Corrupt(message) | Self::Unavailable(message) => security_store_error(message),
+        }
+    }
+}
+
+struct ParsedSignedJson {
+    parsed: serde_json::Value,
+    payload: serde_json::Value,
+    signature: String,
+}
+
+fn security_store_error(message: impl Into<String>) -> LpmError {
+    LpmError::SecurityApprovalStore(message.into())
+}
+
+fn signed_state_file_error(path: &Path, message: impl AsRef<str>) -> LpmError {
+    security_store_error(format!(
+        "signed security state file {} {}; run `lpm security repair` to quarantine unverified local approvals, or restore the original signing secret",
+        path.display(),
+        message.as_ref(),
+    ))
+}
+
+fn decode_signing_secret(
+    raw: &str,
+    source: &'static str,
+) -> Result<Vec<u8>, SigningSecretReadError> {
+    let secret = hex::decode(raw.trim()).map_err(|e| {
+        SigningSecretReadError::Corrupt(format!("{source} is corrupt; expected hex: {e}"))
+    })?;
+    if secret.len() != SIGNING_SECRET_BYTES {
+        return Err(SigningSecretReadError::Corrupt(format!(
+            "{source} is corrupt; expected {SIGNING_SECRET_BYTES} bytes, got {} bytes",
+            secret.len(),
+        )));
+    }
+    Ok(secret)
+}
+
+fn random_signing_secret() -> [u8; SIGNING_SECRET_BYTES] {
+    let mut secret = [0u8; SIGNING_SECRET_BYTES];
+    rand::thread_rng().fill_bytes(&mut secret);
+    secret
+}
+
+fn read_file_signing_secret(path: &Path) -> Result<Vec<u8>, SigningSecretReadError> {
+    if !path.exists() {
+        return Err(SigningSecretReadError::Missing);
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        SigningSecretReadError::Unavailable(format!(
+            "security approval signing secret {} could not be read: {e}",
+            path.display(),
+        ))
+    })?;
+    decode_signing_secret(&raw, "security approval file signing secret")
+}
+
+fn create_file_signing_secret(path: &Path) -> Result<Vec<u8>, LpmError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let secret = random_signing_secret();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    match options.open(path) {
+        Ok(mut file) => {
+            writeln!(file, "{}", hex::encode(secret))?;
+            Ok(secret.to_vec())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_file_signing_secret(path).map_err(SigningSecretReadError::into_lpm_error)
+        }
+        Err(e) => Err(LpmError::Io(e)),
+    }
+}
+
+fn stored_signing_secret() -> Result<Vec<u8>, SigningSecretReadError> {
     if let Some(raw) = test_secret_override() {
-        return hex::decode(raw.trim()).map_err(|e| {
-            LpmError::Registry(format!(
-                "test security secret override must be valid hex: {e}"
-            ))
-        });
+        return decode_signing_secret(&raw, "test security secret override");
     }
 
     if force_file_audit_head_backend() {
-        let path = signing_secret_path()?;
-        if path.exists() {
-            let raw = std::fs::read_to_string(&path)?;
-            return hex::decode(raw.trim()).map_err(|e| {
-                LpmError::Registry(format!(
-                    "security approval file secret is corrupt; remove it and retry: {e}"
-                ))
-            });
-        }
+        let path = signing_secret_path()
+            .map_err(|e| SigningSecretReadError::Unavailable(e.to_string()))?;
+        return read_file_signing_secret(&path);
+    }
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+    let account = keyring_account(KEYRING_ACCOUNT)
+        .map_err(|e| SigningSecretReadError::Unavailable(e.to_string()))?;
+    let entry = keyring::Entry::new(KEYRING_SERVICE, &account).map_err(|e| {
+        SigningSecretReadError::Unavailable(format!("security approval keyring error: {e}"))
+    })?;
 
-        let mut secret = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret);
-        std::fs::write(&path, format!("{}\n", hex::encode(secret)))?;
-        return Ok(secret.to_vec());
+    match entry.get_password() {
+        Ok(existing) => decode_signing_secret(&existing, "security approval keyring entry"),
+        Err(keyring::Error::NoEntry) => Err(SigningSecretReadError::Missing),
+        Err(e) => Err(SigningSecretReadError::Unavailable(format!(
+            "security approval keyring read error: {e}"
+        ))),
+    }
+}
+
+fn read_signing_secret() -> Result<Vec<u8>, LpmError> {
+    stored_signing_secret().map_err(SigningSecretReadError::into_lpm_error)
+}
+
+fn get_or_create_signing_secret() -> Result<Vec<u8>, LpmError> {
+    match stored_signing_secret() {
+        Ok(secret) => Ok(secret),
+        Err(SigningSecretReadError::Missing) => create_signing_secret(),
+        Err(e) => Err(e.into_lpm_error()),
+    }
+}
+
+fn create_signing_secret() -> Result<Vec<u8>, LpmError> {
+    if force_file_audit_head_backend() {
+        return create_file_signing_secret(&signing_secret_path()?);
     }
 
     let account = keyring_account(KEYRING_ACCOUNT)?;
     let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
-        .map_err(|e| LpmError::Registry(format!("security approval keyring error: {e}")))?;
+        .map_err(|e| security_store_error(format!("security approval keyring error: {e}")))?;
 
-    if let Ok(existing) = entry.get_password() {
-        return hex::decode(existing.trim()).map_err(|e| {
-            LpmError::Registry(format!(
-                "security approval keyring entry is corrupt; remove it and retry: {e}"
-            ))
-        });
-    }
-
-    let mut secret = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut secret);
+    let secret = random_signing_secret();
     entry
         .set_password(&hex::encode(secret))
-        .map_err(|e| LpmError::Registry(format!("security approval keyring write error: {e}")))?;
+        .map_err(|e| security_store_error(format!("security approval keyring write error: {e}")))?;
     Ok(secret.to_vec())
 }
 
-fn sign_payload_value(payload: &serde_json::Value) -> Result<String, LpmError> {
-    let secret = signing_secret()?;
+fn sign_payload_value_with_secret(
+    payload: &serde_json::Value,
+    secret: &[u8],
+) -> Result<String, LpmError> {
     let bytes = serde_json::to_vec(payload)?;
-    let mut mac = HmacSha256::new_from_slice(&secret)
+    let mut mac = HmacSha256::new_from_slice(secret)
         .map_err(|e| LpmError::Registry(format!("security approval signer init failed: {e}")))?;
     mac.update(&bytes);
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-fn verify_payload_value(payload: &serde_json::Value, signature: &str) -> Result<bool, LpmError> {
-    let secret = signing_secret()?;
+fn sign_payload_value(payload: &serde_json::Value) -> Result<String, LpmError> {
+    let secret = get_or_create_signing_secret()?;
+    sign_payload_value_with_secret(payload, &secret)
+}
+
+fn verify_payload_value_with_secret(
+    payload: &serde_json::Value,
+    signature: &str,
+    secret: &[u8],
+) -> Result<bool, LpmError> {
     let expected = match hex::decode(signature.trim()) {
         Ok(value) => value,
         Err(_) => return Ok(false),
     };
     let bytes = serde_json::to_vec(payload)?;
-    let mut mac = HmacSha256::new_from_slice(&secret)
+    let mut mac = HmacSha256::new_from_slice(secret)
         .map_err(|e| LpmError::Registry(format!("security approval signer init failed: {e}")))?;
     mac.update(&bytes);
     Ok(mac.verify_slice(&expected).is_ok())
+}
+
+fn verify_payload_value(payload: &serde_json::Value, signature: &str) -> Result<bool, LpmError> {
+    let secret = read_signing_secret()?;
+    verify_payload_value_with_secret(payload, signature, &secret)
 }
 
 fn write_signed_json<T: Serialize + Clone>(path: &Path, payload: &T) -> Result<(), LpmError> {
@@ -1057,40 +1186,267 @@ fn write_signed_json<T: Serialize + Clone>(path: &Path, payload: &T) -> Result<(
     Ok(())
 }
 
-fn read_signed_json<T>(path: &Path) -> Result<Option<T>, LpmError>
-where
-    T: for<'de> Deserialize<'de> + Serialize,
-{
+fn parse_signed_json_file(path: &Path) -> Result<Option<ParsedSignedJson>, LpmError> {
     if !path.exists() {
         return Ok(None);
     }
     let body = std::fs::read_to_string(path)?;
     let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| LpmError::Registry(format!("security approval file parse error: {e}")))?;
+        .map_err(|e| signed_state_file_error(path, format!("has invalid JSON: {e}")))?;
     let signature = parsed
         .get("signature")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            LpmError::Registry(format!(
-                "security approval file {} is missing a signature",
-                path.display()
-            ))
-        })?;
-    let payload = parsed.get("payload").cloned().ok_or_else(|| {
-        LpmError::Registry(format!(
-            "security approval file {} is missing a payload",
+        .ok_or_else(|| signed_state_file_error(path, "is missing a signature"))?
+        .to_string();
+    let payload = parsed
+        .get("payload")
+        .cloned()
+        .ok_or_else(|| signed_state_file_error(path, "is missing a payload"))?;
+    Ok(Some(ParsedSignedJson {
+        parsed,
+        payload,
+        signature,
+    }))
+}
+
+fn read_signed_json<T>(path: &Path) -> Result<Option<T>, LpmError>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    let Some(parsed) = parse_signed_json_file(path)? else {
+        return Ok(None);
+    };
+    if !verify_payload_value(&parsed.payload, &parsed.signature)? {
+        return Err(signed_state_file_error(
+            path,
+            "failed signature verification",
+        ));
+    }
+    let envelope: SignedEnvelope<T> = serde_json::from_value(parsed.parsed)
+        .map_err(|e| signed_state_file_error(path, format!("has invalid payload: {e}")))?;
+    Ok(Some(envelope.payload))
+}
+
+fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) -> Result<(), LpmError> {
+    if path.try_exists()? {
+        paths.push(path);
+    }
+    Ok(())
+}
+
+fn push_existing_json_files(paths: &mut Vec<PathBuf>, dir: PathBuf) -> Result<(), LpmError> {
+    if !dir.try_exists()? {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn signed_security_state_paths() -> Result<Vec<PathBuf>, LpmError> {
+    let mut paths = Vec::with_capacity(8);
+    push_existing_path(&mut paths, approved_posture_path()?)?;
+    push_existing_path(&mut paths, approved_global_trust_path()?)?;
+    push_existing_path(&mut paths, audit_head_path()?)?;
+    push_existing_json_files(&mut paths, approved_projects_dir()?)?;
+    push_existing_json_files(&mut paths, unlocks_dir()?)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn existing_nonempty_audit_log_path() -> Result<Option<PathBuf>, LpmError> {
+    let path = audit_log_path()?;
+    if !path.try_exists()? || path.metadata()?.len() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(path))
+}
+
+fn signed_json_unverified_reason(path: &Path, secret: &[u8]) -> Result<Option<String>, LpmError> {
+    let body = std::fs::read_to_string(path)?;
+    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(parsed) => parsed,
+        Err(e) => return Ok(Some(format!("invalid JSON: {e}"))),
+    };
+    let Some(signature) = parsed.get("signature").and_then(|value| value.as_str()) else {
+        return Ok(Some("missing signature".to_string()));
+    };
+    let Some(payload) = parsed.get("payload").cloned() else {
+        return Ok(Some("missing payload".to_string()));
+    };
+    if verify_payload_value_with_secret(&payload, signature, secret)? {
+        Ok(None)
+    } else {
+        Ok(Some("signature verification failed".to_string()))
+    }
+}
+
+fn audit_log_unverified_reason(path: &Path, secret: &[u8]) -> Result<Option<String>, LpmError> {
+    let body = std::fs::read_to_string(path)?;
+    let mut previous = None;
+    for (index, line) in body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        let line_number = index + 1;
+        let parsed: serde_json::Value = match serde_json::from_str(line) {
+            Ok(parsed) => parsed,
+            Err(e) => return Ok(Some(format!("line {line_number} has invalid JSON: {e}"))),
+        };
+
+        if parsed.get("entry_hash").is_some() || parsed.get("previous_entry_hash").is_some() {
+            let envelope: SignedAuditEnvelope = match serde_json::from_value(parsed) {
+                Ok(envelope) => envelope,
+                Err(e) => {
+                    return Ok(Some(format!(
+                        "line {line_number} has invalid audit entry: {e}"
+                    )));
+                }
+            };
+            if envelope.previous_entry_hash != previous {
+                return Ok(Some(format!(
+                    "line {line_number} breaks the audit hash chain"
+                )));
+            }
+            let payload_value =
+                audit_signature_payload(&envelope.payload, &envelope.previous_entry_hash);
+            if hash_json_value(&payload_value)? != envelope.entry_hash {
+                return Ok(Some(format!(
+                    "line {line_number} hash does not match its payload"
+                )));
+            }
+            if !verify_payload_value_with_secret(&payload_value, &envelope.signature, secret)? {
+                return Ok(Some(format!(
+                    "line {line_number} failed signature verification"
+                )));
+            }
+            previous = Some(envelope.entry_hash);
+        } else {
+            let Some(signature) = parsed.get("signature").and_then(|value| value.as_str()) else {
+                return Ok(Some(format!("line {line_number} is missing a signature")));
+            };
+            let Some(payload) = parsed.get("payload").cloned() else {
+                return Ok(Some(format!("line {line_number} is missing a payload")));
+            };
+            if !verify_payload_value_with_secret(&payload, signature, secret)? {
+                return Ok(Some(format!(
+                    "line {line_number} failed signature verification"
+                )));
+            }
+            let _: SignedEnvelope<AuditEvent> = match serde_json::from_value(parsed.clone()) {
+                Ok(envelope) => envelope,
+                Err(e) => {
+                    return Ok(Some(format!(
+                        "line {line_number} has invalid legacy audit entry: {e}"
+                    )));
+                }
+            };
+            previous = Some(hash_json_value(&parsed)?);
+        }
+    }
+    Ok(None)
+}
+
+fn quarantine_path_for(path: &Path) -> Result<PathBuf, LpmError> {
+    let parent = path.parent().ok_or_else(|| {
+        security_store_error(format!(
+            "signed security state file {} has no parent directory",
             path.display()
         ))
     })?;
-    if !verify_payload_value(&payload, signature)? {
-        return Err(LpmError::Registry(format!(
-            "security approval file {} failed signature verification",
-            path.display()
-        )));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            security_store_error(format!(
+                "signed security state file {} has a non-UTF-8 file name",
+                path.display()
+            ))
+        })?;
+    let stamp = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+    for index in 0..1000 {
+        let suffix = if index == 0 {
+            format!(".unverified-{stamp}")
+        } else {
+            format!(".unverified-{stamp}-{index}")
+        };
+        let candidate = parent.join(format!("{file_name}{suffix}"));
+        if !candidate.try_exists()? {
+            return Ok(candidate);
+        }
     }
-    let envelope: SignedEnvelope<T> = serde_json::from_value(parsed)
-        .map_err(|e| LpmError::Registry(format!("security approval file parse error: {e}")))?;
-    Ok(Some(envelope.payload))
+    Err(security_store_error(format!(
+        "could not find an unused quarantine name for {}",
+        path.display()
+    )))
+}
+
+fn quarantine_security_state_file(
+    path: &Path,
+    reason: impl Into<String>,
+) -> Result<QuarantinedSecurityState, LpmError> {
+    let reason = reason.into();
+    let quarantine_path = quarantine_path_for(path)?;
+    std::fs::rename(path, &quarantine_path)?;
+    Ok(QuarantinedSecurityState {
+        original_path: path.display().to_string(),
+        quarantine_path: quarantine_path.display().to_string(),
+        reason,
+    })
+}
+
+pub fn repair_security_state() -> Result<SecurityRepairReport, LpmError> {
+    let security_dir = security_dir()?;
+    let paths = signed_security_state_paths()?;
+    let audit_log_path = existing_nonempty_audit_log_path()?;
+    let mut quarantined = Vec::new();
+    if paths.is_empty() && audit_log_path.is_none() {
+        return Ok(SecurityRepairReport {
+            security_dir: security_dir.display().to_string(),
+            quarantined,
+        });
+    }
+
+    match stored_signing_secret() {
+        Ok(secret) => {
+            for path in paths {
+                if let Some(reason) = signed_json_unverified_reason(&path, &secret)? {
+                    quarantined.push(quarantine_security_state_file(&path, reason)?);
+                }
+            }
+            if let Some(path) = audit_log_path
+                && let Some(reason) = audit_log_unverified_reason(&path, &secret)?
+            {
+                quarantined.push(quarantine_security_state_file(&path, reason)?);
+            }
+        }
+        Err(SigningSecretReadError::Missing) => {
+            for path in paths {
+                quarantined.push(quarantine_security_state_file(
+                    &path,
+                    "signing secret missing",
+                )?);
+            }
+            if let Some(path) = audit_log_path {
+                quarantined.push(quarantine_security_state_file(
+                    &path,
+                    "signing secret missing",
+                )?);
+            }
+        }
+        Err(e) => return Err(e.into_lpm_error()),
+    }
+
+    Ok(SecurityRepairReport {
+        security_dir: security_dir.display().to_string(),
+        quarantined,
+    })
 }
 
 pub fn load_authorized_posture() -> Result<AuthorizedPosture, LpmError> {
@@ -3252,6 +3608,7 @@ mod tests {
             original_policy: Option<std::ffi::OsString>,
             original_secret: Option<std::ffi::OsString>,
             original_auth: Option<std::ffi::OsString>,
+            original_file_vault: Option<std::ffi::OsString>,
         }
         impl Drop for EnvRestore {
             fn drop(&mut self) {
@@ -3271,6 +3628,10 @@ mod tests {
                     Some(value) => unsafe { std::env::set_var(TEST_AUTH_RESULT_ENV, value) },
                     None => unsafe { std::env::remove_var(TEST_AUTH_RESULT_ENV) },
                 }
+                match self.original_file_vault.take() {
+                    Some(value) => unsafe { std::env::set_var("LPM_FORCE_FILE_VAULT", value) },
+                    None => unsafe { std::env::remove_var("LPM_FORCE_FILE_VAULT") },
+                }
             }
         }
         let _restore = EnvRestore {
@@ -3278,6 +3639,7 @@ mod tests {
             original_policy: std::env::var_os(SECURITY_POLICY_PATH_ENV),
             original_secret: std::env::var_os(TEST_SECRET_ENV),
             original_auth: std::env::var_os(TEST_AUTH_RESULT_ENV),
+            original_file_vault: std::env::var_os("LPM_FORCE_FILE_VAULT"),
         };
         let policy_path = dir.join("managed-security-policy.toml");
         // Test-only env mutation is isolated to this helper and
@@ -3292,6 +3654,16 @@ mod tests {
             std::env::set_var(TEST_AUTH_RESULT_ENV, "approve");
         }
         f()
+    }
+
+    fn with_file_secret_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        with_test_env(dir, || {
+            unsafe {
+                std::env::remove_var(TEST_SECRET_ENV);
+                std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+            }
+            f()
+        })
     }
 
     fn write_managed_policy(dir: &Path, body: &str) {
@@ -3314,6 +3686,98 @@ mod tests {
             assert_eq!(loaded.script_policy(), ScriptPolicy::Allow);
             assert_eq!(loaded.minimum_release_age_secs(), 0);
             assert_eq!(loaded.sandbox_mode(), ResolvedSandboxMode::None);
+        });
+    }
+
+    #[test]
+    fn load_authorized_posture_does_not_create_secret_when_existing_file_cannot_verify() {
+        let temp = tempdir().unwrap();
+        with_file_secret_env(temp.path(), || {
+            let path = approved_posture_path().unwrap();
+            let posture = AuthorizedPosture::default();
+            let envelope = SignedEnvelope {
+                payload: posture,
+                signature: "00".repeat(32),
+            };
+            std::fs::write(&path, serde_json::to_string_pretty(&envelope).unwrap()).unwrap();
+
+            let err = load_authorized_posture().unwrap_err();
+
+            assert_eq!(err.error_code(), "security_approval_store");
+            assert!(
+                err.to_string().contains("signature") || err.to_string().contains("signing secret"),
+                "unexpected error: {err}",
+            );
+            assert!(
+                !signing_secret_path().unwrap().exists(),
+                "verification must not create a replacement signing secret",
+            );
+        });
+    }
+
+    #[test]
+    fn persist_authorized_posture_creates_secret_for_new_signed_state() {
+        let temp = tempdir().unwrap();
+        with_file_secret_env(temp.path(), || {
+            assert!(!signing_secret_path().unwrap().exists());
+
+            persist_authorized_posture(&AuthorizedPosture::default()).unwrap();
+
+            assert!(
+                signing_secret_path().unwrap().exists(),
+                "signing new state must create the signing secret",
+            );
+            load_authorized_posture().unwrap();
+        });
+    }
+
+    #[test]
+    fn repair_security_state_quarantines_existing_state_when_secret_is_missing() {
+        let temp = tempdir().unwrap();
+        with_file_secret_env(temp.path(), || {
+            let path = approved_posture_path().unwrap();
+            let posture = AuthorizedPosture::default();
+            let envelope = SignedEnvelope {
+                payload: posture,
+                signature: "00".repeat(32),
+            };
+            std::fs::write(&path, serde_json::to_string_pretty(&envelope).unwrap()).unwrap();
+
+            let report = repair_security_state().unwrap();
+
+            assert_eq!(report.quarantined.len(), 1);
+            assert_eq!(
+                report.quarantined[0].original_path,
+                path.display().to_string()
+            );
+            assert_eq!(report.quarantined[0].reason, "signing secret missing");
+            assert!(!path.exists());
+            assert!(Path::new(&report.quarantined[0].quarantine_path).exists());
+            assert!(
+                !signing_secret_path().unwrap().exists(),
+                "repair must not create a replacement signing secret",
+            );
+        });
+    }
+
+    #[test]
+    fn repair_security_state_quarantines_audit_log_when_secret_is_missing() {
+        let temp = tempdir().unwrap();
+        with_file_secret_env(temp.path(), || {
+            let path = audit_log_path().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "{}\n").unwrap();
+
+            let report = repair_security_state().unwrap();
+
+            assert_eq!(report.quarantined.len(), 1);
+            assert_eq!(
+                report.quarantined[0].original_path,
+                path.display().to_string()
+            );
+            assert_eq!(report.quarantined[0].reason, "signing secret missing");
+            assert!(!path.exists());
+            assert!(Path::new(&report.quarantined[0].quarantine_path).exists());
         });
     }
 
