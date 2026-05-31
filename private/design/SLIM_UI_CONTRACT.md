@@ -364,22 +364,22 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [B3] keep the cert-trust prompt block (dev.rs:27-50) — color its labels.
 
 ### login — `commands/login.rs`  ([split] browser flow, keep)
-- [ ] [struct] Add `✓ Browser authentication complete` + `user:/registry:/
+- [x] [struct] Add `✓ Browser authentication complete` + `user:/registry:/
       storage:` detail block (not produced today, L39-206).
-- [ ] [color] URLs→`url`/blue, `registry:` value→`yellow`, labels→`dim`.
+- [x] [color] URLs→`url`/blue, `registry:` value→`yellow`, labels→`dim`.
 
 ### logout — `commands/logout.rs`
-- [ ] [struct] Phase `› Clearing stored lpm.dev session`; add `✓ Revoked
+- [x] [struct] Phase `› Clearing stored lpm.dev session`; add `✓ Revoked
       server-side token`; terminus `✓ Done · signed out of lpm.dev` (today
       `✓ Successfully logged out.`).
-- [ ] [color] `lpm.dev`→`yellow`.
+- [x] [color] `lpm.dev`→`yellow`.
 
 ### self-update — `commands/self_update.rs`  (struct ~MATCH)
-- [ ] [color] `latest`→`status_ok`/green, update command→`yellow`, target
+- [x] [color] `latest`→`status_ok`/green, update command→`yellow`, target
       version→`yellow`, labels→`dim`.
 
 ### upgrade — `commands/upgrade.rs`  (struct MATCH)
-- [ ] [color] `↑` minor→gold / patch→green, version target→`yellow`, ranges/
+- [x] [color] `↑` minor→gold / patch→green, version target→`yellow`, ranges/
       `→`→`dim`. (Arrow coloring partially present — verify minor=gold.)
 
 ### token-rotate — `commands/token.rs`

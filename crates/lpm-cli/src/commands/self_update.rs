@@ -113,8 +113,12 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     };
 
     if !json_output {
-        eprintln!("    current   {}", current.dimmed());
-        eprintln!("    latest    {}", latest.bold());
+        eprintln!("    {}   {}", install_ui::dim("current"), current.dimmed());
+        eprintln!(
+            "    {}    {}",
+            install_ui::dim("latest"),
+            install_ui::status_ok(&latest)
+        );
     }
 
     if latest == current || !is_newer_semver(&latest, current) {
@@ -129,14 +133,16 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else if latest == current {
             install_ui::done(&format!(
-                "Done · already on latest version {}",
-                current.bold()
+                "Done · already on {} version {}",
+                install_ui::status_ok("latest"),
+                install_ui::yellow(current)
             ));
         } else {
             install_ui::done(&format!(
-                "Done · current version {} is newer than latest release {}",
-                current.bold(),
-                latest.dimmed()
+                "Done · current version {} is newer than {} release {}",
+                install_ui::yellow(current),
+                install_ui::status_ok("latest"),
+                install_ui::dim(&latest)
             ));
         }
         return Ok(());
@@ -165,9 +171,13 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
     }
 
     if !json_output {
-        eprintln!("    channel   {}", method.name().cyan());
+        eprintln!(
+            "    {}   {}",
+            install_ui::dim("channel"),
+            method.name().cyan()
+        );
         install_ui::phase("Update command");
-        eprintln!("    {}", method.command(&latest));
+        eprintln!("    {}", install_ui::yellow(&method.command(&latest)));
     }
 
     let mut standalone_audit: Option<AttestationAudit> = None;
@@ -247,7 +257,10 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        install_ui::done(&format!("Done · LPM updated to {}", latest.bold()));
+        install_ui::done(&format!(
+            "Done · LPM updated to {}",
+            install_ui::yellow(&latest)
+        ));
     }
 
     Ok(())

@@ -1,6 +1,5 @@
 use crate::{auth, install_ui};
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 
 pub async fn run(
@@ -14,24 +13,31 @@ pub async fn run(
 
     if token.is_none() && !has_refresh {
         if !json_output {
-            install_ui::phase("Not currently logged in.");
+            install_ui::phase(&format!(
+                "No stored {} session",
+                install_ui::yellow("lpm.dev")
+            ));
         }
         return Ok(());
     }
 
+    if !json_output {
+        install_ui::phase(&format!(
+            "Clearing stored {} session",
+            install_ui::yellow("lpm.dev")
+        ));
+    }
+
     // Optionally revoke on server
     if revoke {
-        if !json_output {
-            install_ui::phase("Revoking token on server...");
-        }
         // Best-effort: don't fail logout if revocation fails
-        if let Err(e) = client.revoke_token().await
-            && !json_output
-        {
-            install_ui::warn(&format!(
+        match client.revoke_token().await {
+            Ok(()) if !json_output => install_ui::done("Revoked server-side token"),
+            Err(e) if !json_output => install_ui::warn(&format!(
                 "Token revocation failed: {}",
-                e.to_string().dimmed()
-            ));
+                install_ui::dim(&e.to_string())
+            )),
+            _ => {}
         }
     }
 
@@ -45,7 +51,7 @@ pub async fn run(
     {
         install_ui::warn(&format!(
             "Failed to revoke browser pairings: {}",
-            e.dimmed()
+            install_ui::dim(&e)
         ));
     }
 
@@ -60,7 +66,10 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        install_ui::done("Successfully logged out.");
+        install_ui::done(&format!(
+            "Done · signed out of {}",
+            install_ui::yellow("lpm.dev")
+        ));
     }
 
     Ok(())
