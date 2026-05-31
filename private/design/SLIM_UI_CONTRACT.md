@@ -533,10 +533,11 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [x] [color] generic.
 
 ### init — `commands/init.rs`  ([split] prompts stay cliclack)
-- [ ] [struct] `✓ Wrote package.json` (today `Created`); add `✓ Added lpm.lockb
+- [x] [struct] `✓ Wrote package.json` (today `Created`); add `✓ Added lpm.lockb
       binary to .gitattributes` (today silent, L79); add `✓ Done · initialized
       {full-name}` terminus.
-- [ ] [color] prompt answers green (cliclack), full name→`cyan`.
+- [x] [color] full name→`cyan`.
+- [ ] [verify] prompt answers green (cliclack).
 
 ### add — `commands/add.rs`  ([split] picker stays cliclack; MISS otherwise)
 - [ ] [struct] Build the designed flow: `› Downloading source package {pkg}`,
