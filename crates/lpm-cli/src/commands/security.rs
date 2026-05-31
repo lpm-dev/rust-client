@@ -187,6 +187,9 @@ pub enum SecurityCmd {
         #[arg(long)]
         global: bool,
     },
+
+    /// Quarantine signed local security state that can no longer be verified.
+    Repair,
 }
 
 pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
@@ -435,6 +438,40 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
             }
             println!();
             install_ui::done("Security floor loaded");
+            Ok(())
+        }
+        SecurityCmd::Repair => {
+            let report = security_approval::repair_security_state()?;
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": true,
+                        "repair": report,
+                    }))
+                    .unwrap()
+                );
+                return Ok(());
+            }
+
+            println!("security dir  {}", report.security_dir);
+            println!();
+            println!("quarantined files");
+            if report.quarantined.is_empty() {
+                println!("  none");
+                println!();
+                install_ui::done("Security state already clean");
+            } else {
+                for item in &report.quarantined {
+                    println!(
+                        "  {} -> {} ({})",
+                        item.original_path, item.quarantine_path, item.reason
+                    );
+                }
+                println!();
+                install_ui::done("Security state repaired");
+            }
             Ok(())
         }
     }
