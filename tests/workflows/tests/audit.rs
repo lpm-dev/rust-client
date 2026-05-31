@@ -10,6 +10,25 @@ mod support;
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_with_registry};
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[test]
 fn audit_help_lists_fail_on_policies_on_separate_lines() {
     let project = TempProject::empty(r#"{"name":"audit-help","version":"1.0.0"}"#);
@@ -207,6 +226,25 @@ async fn audit_clean_dep_with_empty_osv_response_exits_zero() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stdout.trim().is_empty(),
+        "human audit output must stay on stderr; stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("✓ Analyzed 1 package · lpm.lock")
+            && stderr.contains("✓ Checked against OSV database")
+            && stderr.contains("✓ No issues found · 1 scanned"),
+        "clean audit must use the slim compact summary, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("Scanning 1 package")
+            && !stderr.contains("lockfile")
+            && !stderr.contains("Run lpm audit --json"),
+        "clean audit must not render the old verbose body, got:\n{stderr}",
+    );
 }
 
 // ─── Fail-on policies ───────────────────────────────────────────────────
@@ -236,6 +274,23 @@ async fn audit_high_vuln_under_default_policy_exits_nonzero() {
          stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stdout.trim().is_empty(),
+        "human audit findings must stay on stderr; stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("Vulnerabilities")
+            && !stderr.contains("Vulnerabilities (OSV)")
+            && stderr.contains("! vuln-pkg@1.0.0  GHSA-xxxx-yyyy-zzzz  severity high"),
+        "vulnerability section must match the slim audit contract, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("vulnerability details"),
+        "audit must not print the old standalone OSV details hint, got:\n{stderr}",
     );
 }
 
@@ -565,10 +620,12 @@ fn audit_secrets_on_clean_node_modules_reports_no_findings_and_exits_zero() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     assert!(
-        stdout.contains("Scanned") && stderr.contains("✓ no hardcoded secrets found"),
+        stdout.trim().is_empty()
+            && stderr.contains("Scanned")
+            && stderr.contains("✓ no hardcoded secrets found"),
         "human output must indicate the scan ran cleanly, got:\nstdout:\n{stdout}\nstderr:\n{stderr}",
     );
     assert!(
@@ -607,16 +664,21 @@ fn audit_secrets_detects_stripe_live_key_in_node_modules() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     assert!(
-        stdout.contains("leaky-pkg"),
-        "human output must list the offending package, got:\n{stdout}",
+        stdout.trim().is_empty(),
+        "human audit secrets output must stay on stderr; stdout:\n{stdout}\nstderr:\n{stderr}",
     );
     assert!(
-        stdout.contains("Stripe live")
-            || stdout.contains("stripe_live_secret")
-            || stdout.contains("critical"),
-        "human output must mention the detected pattern, got:\n{stdout}",
+        stderr.contains("leaky-pkg"),
+        "human output must list the offending package, got:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("Stripe live")
+            || stderr.contains("stripe_live_secret")
+            || stderr.contains("critical"),
+        "human output must mention the detected pattern, got:\n{stderr}",
     );
 }
 
