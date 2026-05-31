@@ -10,7 +10,9 @@ fn sample_search_package(description: &str, download_count: u64) -> serde_json::
         "description": description,
         "distributionMode": "pool",
         "downloadCount": download_count,
-        "latestVersion": "1.2.3"
+        "latestVersion": "1.2.3",
+        "qualityScore": 91,
+        "ecosystem": "js"
     })
 }
 
@@ -51,7 +53,7 @@ async fn search_without_matches_warns_and_exits_zero() {
 }
 
 #[tokio::test]
-async fn search_human_output_truncates_long_description_and_compacts_download_count() {
+async fn search_human_output_truncates_long_description_and_prints_metadata_line() {
     let project = TempProject::empty(r#"{"name":"search-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     let long_description = "This description is intentionally long so the human output path must truncate it before rendering to the terminal.";
@@ -84,12 +86,12 @@ async fn search_human_output_truncates_long_description_and_compacts_download_co
         "package name must be rendered, got:\n{combined}"
     );
     assert!(
-        combined.contains("v1.2.3"),
-        "latest version must be rendered, got:\n{combined}"
+        combined.contains("latest 1.2.3 · quality 91 · ecosystem js"),
+        "metadata line must include latest version, quality, and ecosystem, got:\n{combined}"
     );
     assert!(
-        combined.contains("12K"),
-        "download count must use compact K formatting, got:\n{combined}"
+        !combined.contains("↓") && !combined.contains("12K") && !combined.contains(" pool"),
+        "search results should drop mode badges and download rows, got:\n{combined}"
     );
     assert!(
         combined.contains(

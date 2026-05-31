@@ -346,6 +346,24 @@ pub fn minus(name: &str, version: Option<&str>, hint: Option<&str>) {
     diff_entry(&"-".red(), name, version, hint);
 }
 
+/// Removal diff entry where the removed target version is the acted-on
+/// subject, not low-priority metadata.
+pub fn minus_target(name: &str, version: Option<&str>, hint: Option<&str>) {
+    settle_any_active_spinner();
+
+    let mut suffix = String::new();
+    if let Some(version) = version {
+        suffix.push_str(&"@".dimmed());
+        suffix.push_str(&version.yellow());
+    }
+    if let Some(hint) = hint {
+        suffix.push(' ');
+        suffix.push_str(&hint.dimmed());
+    }
+
+    eprintln!("{}{} {name}{suffix}", reset_prefix(), "-".red());
+}
+
 /// Render a Duration as a short human string suitable for inlining in
 /// the "Done · installed N packages in {dur}" line.
 ///

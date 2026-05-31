@@ -263,12 +263,12 @@ fn uninstall_human_output_uses_slim_ui_diff_and_done_lines() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("› Removing 2 packages from 1 target manifest"),
+        stderr.contains("› Resolving dependency graph (2 packages)"),
         "expected slim phase line, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("- diff") && stderr.contains("- husky"),
-        "expected removal diff rows, got:\n{stderr}"
+        stderr.contains("- diff@1.0.0") && stderr.contains("- husky@9.0.0"),
+        "expected versioned removal diff rows, got:\n{stderr}"
     );
     assert!(
         stderr.contains("✓ Done · removed 2 packages in "),

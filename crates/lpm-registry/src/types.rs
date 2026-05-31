@@ -795,6 +795,18 @@ pub struct SearchPackage {
     #[serde(default, rename = "latestVersion")]
     pub latest_version: Option<String>,
 
+    #[serde(default, alias = "_ecosystem", skip_serializing)]
+    pub ecosystem: Option<String>,
+
+    #[serde(
+        default,
+        rename = "_qualityScore",
+        alias = "qualityScore",
+        alias = "quality_score",
+        skip_serializing
+    )]
+    pub quality_score: Option<u32>,
+
     #[serde(default)]
     pub category: Option<String>,
 

@@ -241,7 +241,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [B2] Compute orphaned transitives → print dimmed `- pkg@ver (orphaned)`
       list; `+N pruned`, `audited N packages`, `✓ Freed X on disk`, `✓ found 0
       vulnerabilities (was N)` (uninstall_ui.rs:49-57). All currently absent.
-- [ ] [struct] First phase line `› Resolving dependency graph (N packages)`;
+- [x] [struct] First phase line `› Resolving dependency graph (N packages)`;
       `-` lines must carry `@version` (currently `minus(name, None, None)`).
 - [ ] [color] target version → `yellow`, removed names → plain, `(orphaned)` →
       `dim`, terminus duration → green.
@@ -397,7 +397,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [color] version→`yellow`, sha→`dim`.
 
 ### global — `commands/global.rs`  (SETTLED: build the table)
-- [ ] [B2/struct] Build the `Package/Current/Wanted/Latest/Bins` table
+- [x] [B2/struct] Build the `Package/Current/Wanted/Latest/Bins` table
       (`emit_outdated_human` L380+ currently prints `N outdated:` + rows).
       Data work: `OutdatedRow.latest` is today the **within-range** value
       (= the mockup's **Wanted**) — rename/repurpose it as Wanted, and add a
@@ -405,7 +405,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
       independent of `saved_spec`) plus the **Bins** column (bin names from the
       global manifest, as `lpm global bin` already knows). Dynamic column
       widths like `lpm outdated`.
-- [ ] [color] Wanted→`status_ok`/green, Latest major-bump→red / ==Wanted→gold,
+- [x] [color] Wanted→`status_ok`/green, Latest major-bump→red / ==Wanted→gold,
       Current/Bins→`dim`, header row→`dim`.
 
 ## Group E — env / cache / infra
@@ -484,11 +484,11 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [color] `output:`/`files extracted:` labels→`dim`, target→`yellow`.
 
 ### search — `commands/search.rs`  (PARTIAL)
-- [ ] [struct] Drop the `N package(s) for "query":` header; per-result =
+- [x] [struct] Drop the `N package(s) for "query":` header; per-result =
       name line + indented description + metadata line `latest 1.4.2 · quality
       91 · ecosystem js`; drop `v` prefix + inline mode badge + `↓ downloads`
       (L45-95).
-- [ ] [color] query→`cyan`, pkg name→`cyan`, desc→`dim`, `quality NN`→green/
+- [x] [color] query→`cyan`, pkg name→`cyan`, desc→`dim`, `quality NN`→green/
       gold by score, `·`→`dim`.
 
 ### skills list — `commands/skills.rs`  (PARTIAL)
