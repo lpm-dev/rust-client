@@ -4,6 +4,7 @@ use lpm_common::{
     LpmError, LpmRoot, format_bytes, sanitize_for_terminal, with_exclusive_lock, with_shared_lock,
 };
 use lpm_store::PackageStore;
+use std::collections::HashSet;
 
 /// Manage the global content-addressable package store.
 ///
@@ -162,6 +163,13 @@ struct StoreVerifyEntry {
     version: String,
     dir: std::path::PathBuf,
     inline_integrity: Option<String>,
+    object_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StoreVerifyCounts {
+    links: usize,
+    objects: usize,
 }
 
 /// Verify presence and lockfile-marker consistency of every store
@@ -201,13 +209,20 @@ fn run_verify(
 ) -> Result<(), LpmError> {
     let mut packages: Vec<StoreVerifyEntry> = list_v1_verify_entries(store)?;
     let (v2_entries, mut sidecar_issues) = list_v2_verify_entries(lpm_root)?;
+    let v2_link_count = v2_entries.len() + sidecar_issues.len();
     packages.extend(v2_entries);
+    let v2_object_paths = list_v2_object_paths(lpm_root)?;
+    let verify_counts = StoreVerifyCounts {
+        links: v2_link_count,
+        objects: v2_object_paths.len(),
+    };
 
     if !json_output {
         install_ui::phase("Verifying store integrity");
+        print_verify_counts(verify_counts);
     }
 
-    if packages.is_empty() && sidecar_issues.is_empty() {
+    if packages.is_empty() && sidecar_issues.is_empty() && verify_counts.objects == 0 {
         if json_output {
             // F4: empty-store envelope mirrors the populated-store
             // shape so downstream consumers don't need to special-case
@@ -264,6 +279,8 @@ fn run_verify(
     corrupted.append(&mut sidecar_issues);
     let mut security_mismatches = 0u32;
     let mut security_reanalyzed = 0u32;
+    let mut referenced_objects_ok = true;
+    let v2_paths = lpm_store::v2::StoreV2Paths::from_lpm_root(lpm_root);
 
     for entry in &packages {
         let StoreVerifyEntry {
@@ -271,6 +288,7 @@ fn run_verify(
             version,
             dir,
             inline_integrity,
+            object_path,
         } = entry;
         // L59: every state-derived field that may carry sidecar / dir
         // / package.json control bytes goes through sanitize_for_terminal
@@ -278,6 +296,44 @@ fn run_verify(
         // ESC/BEL/OSC sequences into the human emitter.
         let safe_name = sanitize_for_terminal(name);
         let safe_version = sanitize_for_terminal(version);
+
+        if let Some(object_path) = object_path {
+            let safe_object_path = sanitize_for_terminal(object_path);
+            let Some(source_sri) = inline_integrity.as_deref() else {
+                referenced_objects_ok = false;
+                corrupted.push(format!(
+                    "{safe_name}@{safe_version} — v2 link missing source integrity for {safe_object_path}"
+                ));
+                continue;
+            };
+            let expected_object_path = match v2_paths.relative_object_path(source_sri) {
+                Ok(path) => path,
+                Err(e) => {
+                    referenced_objects_ok = false;
+                    corrupted.push(format!(
+                        "{safe_name}@{safe_version} — invalid referenced object hash: {}",
+                        sanitize_for_terminal(&e.to_string())
+                    ));
+                    continue;
+                }
+            };
+            if *object_path != expected_object_path {
+                referenced_objects_ok = false;
+                corrupted.push(format!(
+                    "{safe_name}@{safe_version} — object path mismatch: sidecar '{}' != hash '{}'",
+                    safe_object_path,
+                    sanitize_for_terminal(&expected_object_path)
+                ));
+                continue;
+            }
+            if !v2_object_paths.contains(object_path) {
+                referenced_objects_ok = false;
+                corrupted.push(format!(
+                    "{safe_name}@{safe_version} — referenced object missing: {safe_object_path}"
+                ));
+                continue;
+            }
+        }
 
         // Check 1: directory exists
         if !dir.exists() {
@@ -491,6 +547,9 @@ fn run_verify(
         );
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
     } else if corrupted.is_empty() {
+        if referenced_objects_ok {
+            install_ui::done("Checked every referenced object hash");
+        }
         // F4: noun is "store entries" (truthful for v1+v2 merged
         // walks); secondary `(N unique packages)` parenthetical when
         // the two counts differ — almost always during a v1→v2
@@ -561,6 +620,16 @@ fn run_verify(
     }
 
     Ok(())
+}
+
+fn print_verify_counts(counts: StoreVerifyCounts) {
+    eprintln!(
+        "  {} {} {} {}",
+        install_ui::dim("links"),
+        counts.links,
+        install_ui::dim("/ objects"),
+        counts.objects
+    );
 }
 
 /// derive the
@@ -677,6 +746,7 @@ fn list_v1_verify_entries(store: &PackageStore) -> Result<Vec<StoreVerifyEntry>,
             version,
             dir,
             inline_integrity: None,
+            object_path: None,
         });
     }
 
@@ -712,6 +782,7 @@ fn list_v2_verify_entries(
                     version: meta.version,
                     dir: pkg_dir,
                     inline_integrity: Some(meta.source_sri),
+                    object_path: Some(meta.object_path),
                 });
             }
             Err(e) => {
@@ -742,6 +813,15 @@ fn list_v2_verify_entries(
     Ok((packages, sidecar_issues))
 }
 
+fn list_v2_object_paths(lpm_root: &LpmRoot) -> Result<HashSet<String>, LpmError> {
+    let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
+    let mut object_paths = HashSet::new();
+    for (_, segment) in store_v2.iter_object_dirs()? {
+        object_paths.insert(format!("objects/{segment}"));
+    }
+    Ok(object_paths)
+}
+
 /// Compare two behavioral analyses for equivalence (ignoring timestamps and metadata).
 ///
 /// Returns `true` if the actual tag values match. Differences in `analyzedAt`,
@@ -770,6 +850,63 @@ mod tests {
             manifest: lpm_security::behavioral::manifest::ManifestTags::default(),
             meta: lpm_security::behavioral::AnalysisMeta::default(),
         }
+    }
+
+    fn seed_v2_verify_entry(
+        lpm_root: &LpmRoot,
+        name: &str,
+        version: &str,
+        create_object: bool,
+    ) -> (String, String) {
+        use lpm_store::v2::link_meta::{LinkMeta, LinkMetaPlatform};
+
+        let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
+        let sri = lpm_store::compute_sri_hash(format!("{name}@{version}").as_bytes());
+        let object_path = store_v2.paths().relative_object_path(&sri).unwrap();
+
+        if create_object {
+            let object_dir = store_v2.paths().object_dir(&sri).unwrap();
+            std::fs::create_dir_all(&object_dir).unwrap();
+            std::fs::write(
+                object_dir.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+            )
+            .unwrap();
+            std::fs::write(object_dir.join(".integrity"), &sri).unwrap();
+        }
+
+        let link_key = format!("{name}@{version}+0123456789abcdef");
+        let link_dir = store_v2.paths().links_root().join(&link_key);
+        let pkg_dir = link_dir.join("node_modules").join(name);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(pkg_dir.join("index.js"), "// nothing").unwrap();
+
+        let meta = LinkMeta {
+            schema: 1,
+            graph_key: link_key,
+            graph_key_digest_hex:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            source_sri: sri.clone(),
+            object_path: object_path.clone(),
+            deps: vec![],
+            platform: std::sync::Arc::new(LinkMetaPlatform {
+                os: "darwin".to_string(),
+                cpu: "arm64".to_string(),
+                libc: None,
+            }),
+            created_at: chrono::Utc::now(),
+            last_referenced_at: chrono::Utc::now(),
+        };
+        meta.write_to(&link_dir).unwrap();
+
+        (sri, object_path)
     }
 
     #[test]
@@ -919,50 +1056,10 @@ mod tests {
     /// pins the contract `iter_link_entries` consumes.
     #[test]
     fn verify_walks_v2_link_entries() {
-        use lpm_store::v2::link_meta::LinkMeta;
-
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = LpmRoot::from_dir(dir.path());
         let store = PackageStore::at(dir.path().join("store"));
-
-        // Synthesize a v2 link entry on disk. `iter_link_entries`
-        // walks `<lpm_root>/store/v2/links/<key>/` and reads the
-        // `.lpm-link-meta.json` sidecar; the package dir lives at
-        // `links/<key>/node_modules/<name>/`.
-        let v2_links_root = dir.path().join("store").join("v2").join("links");
-        let link_dir = v2_links_root.join("test-pkg@1.0.0+0123456789abcdef");
-        let pkg_dir = link_dir.join("node_modules").join("test-pkg");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-        std::fs::write(
-            pkg_dir.join("package.json"),
-            r#"{"name":"test-pkg","version":"1.0.0"}"#,
-        )
-        .unwrap();
-        std::fs::write(pkg_dir.join("index.js"), "// nothing").unwrap();
-
-        // Write a sidecar matching the on-disk layout. `write_to`
-        // serializes via the public LinkMeta JSON schema; the
-        // arbitrary `graph_key` / digest values here don't matter for
-        // verify — only `name` / `version` / `source_sri` are read.
-        let meta = LinkMeta {
-            schema: 1,
-            graph_key: "test-pkg@1.0.0+0123456789abcdef".to_string(),
-            graph_key_digest_hex:
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
-            name: "test-pkg".to_string(),
-            version: "1.0.0".to_string(),
-            source_sri: "sha512-test-fake".to_string(),
-            object_path: "objects/sha512-test-fake".to_string(),
-            deps: vec![],
-            platform: std::sync::Arc::new(lpm_store::v2::link_meta::LinkMetaPlatform {
-                os: "darwin".to_string(),
-                cpu: "arm64".to_string(),
-                libc: None,
-            }),
-            created_at: chrono::Utc::now(),
-            last_referenced_at: chrono::Utc::now(),
-        };
-        meta.write_to(&link_dir).unwrap();
+        let (sri, object_path) = seed_v2_verify_entry(&lpm_root, "test-pkg", "1.0.0", true);
 
         // Step 1: the v2 walker enumerates the entry.
         let (entries, sidecar_issues) = list_v2_verify_entries(&lpm_root).unwrap();
@@ -974,9 +1071,10 @@ mod tests {
         );
         assert_eq!(entries[0].name, "test-pkg");
         assert_eq!(entries[0].version, "1.0.0");
+        assert_eq!(entries[0].inline_integrity.as_deref(), Some(sri.as_str()));
         assert_eq!(
-            entries[0].inline_integrity.as_deref(),
-            Some("sha512-test-fake")
+            entries[0].object_path.as_deref(),
+            Some(object_path.as_str())
         );
         assert!(entries[0].dir.ends_with("node_modules/test-pkg"));
 
@@ -997,8 +1095,6 @@ mod tests {
     /// under v2) sees both walked.
     #[test]
     fn verify_walks_v1_and_v2_entries_concurrently() {
-        use lpm_store::v2::link_meta::LinkMeta;
-
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = LpmRoot::from_dir(dir.path());
         let store = PackageStore::at(dir.path().join("store"));
@@ -1014,38 +1110,7 @@ mod tests {
         std::fs::write(v1_pkg_dir.join(".integrity"), "sha512-v1-test").unwrap();
 
         // Seed a v2 entry.
-        let v2_link_dir = dir
-            .path()
-            .join("store")
-            .join("v2")
-            .join("links")
-            .join("v2-pkg@2.0.0+abcdef0123456789");
-        let v2_pkg_dir = v2_link_dir.join("node_modules").join("v2-pkg");
-        std::fs::create_dir_all(&v2_pkg_dir).unwrap();
-        std::fs::write(
-            v2_pkg_dir.join("package.json"),
-            r#"{"name":"v2-pkg","version":"2.0.0"}"#,
-        )
-        .unwrap();
-        let meta = LinkMeta {
-            schema: 1,
-            graph_key: "v2-pkg@2.0.0+abcdef0123456789".to_string(),
-            graph_key_digest_hex:
-                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
-            name: "v2-pkg".to_string(),
-            version: "2.0.0".to_string(),
-            source_sri: "sha512-v2-test".to_string(),
-            object_path: "objects/sha512-v2-test".to_string(),
-            deps: vec![],
-            platform: std::sync::Arc::new(lpm_store::v2::link_meta::LinkMetaPlatform {
-                os: "darwin".to_string(),
-                cpu: "arm64".to_string(),
-                libc: None,
-            }),
-            created_at: chrono::Utc::now(),
-            last_referenced_at: chrono::Utc::now(),
-        };
-        meta.write_to(&v2_link_dir).unwrap();
+        seed_v2_verify_entry(&lpm_root, "v2-pkg", "2.0.0", true);
 
         let v1_entries = list_v1_verify_entries(&store).unwrap();
         let (v2_entries, v2_issues) = list_v2_verify_entries(&lpm_root).unwrap();
@@ -1062,6 +1127,19 @@ mod tests {
 
         run_verify(&lpm_root, &store, true, false, true)
             .expect("verify must walk both v1 and v2 entries");
+    }
+
+    #[test]
+    fn verify_returns_exit_code_when_v2_referenced_object_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = LpmRoot::from_dir(dir.path());
+        let store = PackageStore::at(dir.path().join("store"));
+
+        seed_v2_verify_entry(&lpm_root, "missing-object", "1.0.0", false);
+
+        let err = run_verify(&lpm_root, &store, false, false, true)
+            .expect_err("missing referenced v2 object must surface as Err");
+        assert!(matches!(err, LpmError::ExitCode(1)), "got: {err:?}");
     }
 
     /// L56: corrupted entries must surface as `LpmError::ExitCode(1)`
@@ -1243,6 +1321,7 @@ mod tests {
             version: version.to_string(),
             dir: std::path::PathBuf::from(format!("/tmp/{name}@{version}")),
             inline_integrity: None,
+            object_path: None,
         }
     }
 

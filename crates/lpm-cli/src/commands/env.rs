@@ -1,4 +1,4 @@
-use crate::output;
+use crate::{install_ui, output};
 use futures::StreamExt;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
@@ -1678,6 +1678,7 @@ fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmEr
     }
 
     let mut rows: Vec<EnvRow> = Vec::new();
+    let sync_summary = lpm_vault::vault_id::read_sync_summary(project_dir);
 
     for env in &all_envs {
         // Replicate the actual loader fallback behavior from dotenv.rs:79-88:
@@ -1745,55 +1746,70 @@ fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmEr
         .max()
         .unwrap_or(11)
         .max(11);
-    let alias_width = rows
+    let updated_width = rows
         .iter()
-        .filter_map(|r| r.alias.as_ref().map(|a| a.len()))
+        .filter(|r| sync_summary.synced && r.var_count > 0)
+        .filter_map(|_| sync_summary.synced_at.as_ref().map(|t| t.len()))
         .max()
-        .unwrap_or(5)
-        .max(5);
+        .unwrap_or(7)
+        .max(7);
 
     println!();
-    // Header
     println!(
-        "  {:<name_width$}  {:>9}  {:>10}  {:<alias_width$}",
-        "Environment", "Variables", "Required", "Alias",
-    );
-    println!(
-        "  {:<name_width$}  {:>9}  {:>10}  {:<alias_width$}",
-        "-".repeat(name_width),
-        "-".repeat(9),
-        "-".repeat(10),
-        "-".repeat(alias_width),
+        "  {:<name_width$}  {:>9}  {:>6}  {:<updated_width$}",
+        "Environment", "Variables", "Synced", "Updated",
     );
 
     for row in &rows {
-        let schema_str = match row.schema_status {
+        let schema_suffix = match row.schema_status {
             Some((valid, total)) if total > 0 => {
                 if valid == total {
-                    format!("{valid}/{total} {}", "ok".green())
+                    format!(" {}", install_ui::status_ok(&format!("{valid}/{total} ok")))
                 } else {
-                    format!("{valid}/{total} {}", "!!".red())
+                    format!(" {}", install_ui::red(&format!("{valid}/{total} !!")))
                 }
             }
-            _ => "-".dimmed().to_string(),
-        };
-
-        let alias_str = row.alias.as_deref().unwrap_or("-").dimmed().to_string();
-
-        let source_indicator = match row.source {
-            lpm_env::EnvSource::Legacy => format!(" {}", "legacy".yellow()),
             _ => String::new(),
         };
 
+        let row_synced = sync_summary.synced && row.var_count > 0;
+        let synced_raw = if row_synced { "yes" } else { "no" };
+        let synced_padded = format!("{synced_raw:>6}");
+        let synced_str = if row_synced {
+            install_ui::status_ok(&synced_padded)
+        } else {
+            install_ui::dim(&synced_padded)
+        };
+
+        let updated_raw = if row_synced {
+            sync_summary.synced_at.as_deref().unwrap_or("-")
+        } else {
+            "-"
+        };
+        let updated_str = install_ui::dim(&format!("{updated_raw:<updated_width$}"));
+
+        let source_indicator = match row.source {
+            lpm_env::EnvSource::Legacy => format!(" {}", install_ui::yellow("legacy")),
+            _ => String::new(),
+        };
+
+        let var_count = install_ui::dim(&format!("{:>9}", row.var_count));
+
         println!(
-            "  {:<name_width$}  {:>9}  {:>10}  {:<alias_width$}{}",
-            row.canonical.bold(),
-            row.var_count,
-            schema_str,
-            alias_str,
-            source_indicator,
+            "  {:<name_width$}  {}  {}  {}{}{}",
+            row.canonical, var_count, synced_str, updated_str, schema_suffix, source_indicator,
         );
     }
+    println!();
+    println!(
+        "  {} {}",
+        install_ui::dim("Active environment:"),
+        install_ui::status_ok("default")
+    );
+    println!(
+        "  {}",
+        install_ui::dim("Use lpm env list --env <name> to inspect secrets.")
+    );
     println!();
     Ok(())
 }

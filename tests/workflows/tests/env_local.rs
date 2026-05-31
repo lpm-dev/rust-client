@@ -14,6 +14,24 @@ fn write_dotenv(project: &TempProject, file: &str, content: &str) {
     project.write_file(file, content);
 }
 
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code in chars.by_ref() {
+                if code.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 // ─── set / get / list / delete ────────────────────────────────────────
 
 #[test]
@@ -138,6 +156,98 @@ fn env_list_json_envelope_carries_keys() {
     }, {
         insta::assert_json_snapshot!("env_list_json_envelope_three_keys", envelope);
     });
+}
+
+#[test]
+fn env_ls_human_renders_sync_columns_and_active_environment_footer() {
+    let project = TempProject::empty(r#"{"name":"env-ls","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{
+  "vault": "vault-123",
+  "vaultSync": {
+    "personalVersion": 7,
+    "personalSyncedAt": "2026-05-31T08:00:00Z"
+  },
+  "environments": {
+    "production": ".env.production"
+  }
+}"#,
+    );
+
+    lpm(&project)
+        .args(["env", "set", "API_URL=https://dev.example"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "--env=production",
+            "API_URL=https://prod.example",
+        ])
+        .assert()
+        .success();
+
+    let out = lpm(&project)
+        .args(["env", "ls"])
+        .output()
+        .expect("failed to run lpm env ls");
+    assert!(
+        out.status.success(),
+        "env ls failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+
+    assert!(
+        stdout.contains("Environment"),
+        "env ls should render the Environment column, got:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("Variables"),
+        "env ls should render the Variables column, got:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("Synced"),
+        "env ls should render the Synced column, got:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("Updated"),
+        "env ls should render the Updated column, got:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains("Required") && !stdout.contains("Alias"),
+        "env ls should use the slim sync columns, got:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains("---"),
+        "env ls should not render the old dashed separator, got:\n{stdout}",
+    );
+    assert!(stdout.contains("default"));
+    assert!(stdout.contains("production"));
+    assert!(stdout.contains("yes"));
+    assert!(stdout.contains("2026-05-31T08:00:00Z"));
+    assert!(stdout.contains("Active environment: default"));
+    assert!(stdout.contains("Use lpm env list --env <name> to inspect secrets."));
+
+    let json_out = lpm(&project)
+        .args(["--json", "env", "ls"])
+        .output()
+        .expect("failed to run lpm env ls --json");
+    assert!(json_out.status.success(), "env ls --json failed");
+    let json_stdout = String::from_utf8_lossy(&json_out.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&json_stdout)
+        .unwrap_or_else(|e| panic!("env ls --json must be valid JSON: {e}\n---\n{json_stdout}"));
+    let row = envelope["environments"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .expect("env ls --json must include at least one environment");
+    assert!(
+        row.get("synced").is_none() && row.get("updated").is_none(),
+        "env ls --json contract should not grow sync-only human fields: {envelope}",
+    );
 }
 
 // ─── set with usage error ─────────────────────────────────────────────
