@@ -3,8 +3,16 @@
 //! Also stores optional project-local sync metadata used for vault CAS:
 //! - `vaultSync.personalVersion`: last known personal cloud vault version
 //! - `vaultSync.orgVersions.{slug}`: last known shared org vault version
+//! - `vaultSync.personalSyncedAt` / `vaultSync.orgSyncedAt.{slug}`:
+//!   RFC 3339 timestamp of the last successful sync observed by this checkout
 
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultSyncSummary {
+    pub synced: bool,
+    pub synced_at: Option<String>,
+}
 
 /// Read the vault ID from lpm.json, or generate one if it doesn't exist.
 ///
@@ -97,8 +105,26 @@ pub fn read_personal_sync_version(project_dir: &Path) -> Option<i32> {
         .and_then(|v| i32::try_from(v).ok())
 }
 
+pub fn read_personal_sync_synced_at(project_dir: &Path) -> Option<String> {
+    let (_, config) = read_lpm_json_value(project_dir).ok()??;
+
+    config
+        .get("vaultSync")
+        .and_then(|v| v.get("personalSyncedAt"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 /// Persist the last known personal cloud vault version in `lpm.json`.
 pub fn write_personal_sync_version(project_dir: &Path, version: i32) -> Result<(), String> {
+    write_personal_sync_version_at(project_dir, version, &rfc3339_now())
+}
+
+pub fn write_personal_sync_version_at(
+    project_dir: &Path,
+    version: i32,
+    synced_at: &str,
+) -> Result<(), String> {
     let (lpm_json_path, mut config) =
         read_lpm_json_value(project_dir)?.unwrap_or_else(|| empty_lpm_json(project_dir));
 
@@ -108,6 +134,10 @@ pub fn write_personal_sync_version(project_dir: &Path, version: i32) -> Result<(
 
     let sync = ensure_object_entry(root, "vaultSync");
     sync.insert("personalVersion".into(), serde_json::json!(version));
+    sync.insert(
+        "personalSyncedAt".into(),
+        serde_json::json!(synced_at.to_string()),
+    );
 
     write_lpm_json_value(&lpm_json_path, &config)
 }
@@ -124,11 +154,31 @@ pub fn read_org_sync_version(project_dir: &Path, org_slug: &str) -> Option<i32> 
         .and_then(|v| i32::try_from(v).ok())
 }
 
+pub fn read_org_sync_synced_at(project_dir: &Path, org_slug: &str) -> Option<String> {
+    let (_, config) = read_lpm_json_value(project_dir).ok()??;
+
+    config
+        .get("vaultSync")
+        .and_then(|v| v.get("orgSyncedAt"))
+        .and_then(|v| v.get(org_slug))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 /// Persist the last known org-shared cloud vault version for an org slug.
 pub fn write_org_sync_version(
     project_dir: &Path,
     org_slug: &str,
     version: i32,
+) -> Result<(), String> {
+    write_org_sync_version_at(project_dir, org_slug, version, &rfc3339_now())
+}
+
+pub fn write_org_sync_version_at(
+    project_dir: &Path,
+    org_slug: &str,
+    version: i32,
+    synced_at: &str,
 ) -> Result<(), String> {
     let (lpm_json_path, mut config) =
         read_lpm_json_value(project_dir)?.unwrap_or_else(|| empty_lpm_json(project_dir));
@@ -140,8 +190,52 @@ pub fn write_org_sync_version(
     let sync = ensure_object_entry(root, "vaultSync");
     let org_versions = ensure_object_entry(sync, "orgVersions");
     org_versions.insert(org_slug.to_string(), serde_json::json!(version));
+    let org_synced_at = ensure_object_entry(sync, "orgSyncedAt");
+    org_synced_at.insert(org_slug.to_string(), serde_json::json!(synced_at));
 
     write_lpm_json_value(&lpm_json_path, &config)
+}
+
+pub fn read_sync_summary(project_dir: &Path) -> VaultSyncSummary {
+    let Some((_, config)) = read_lpm_json_value(project_dir).ok().flatten() else {
+        return VaultSyncSummary {
+            synced: false,
+            synced_at: None,
+        };
+    };
+    let Some(sync) = config.get("vaultSync") else {
+        return VaultSyncSummary {
+            synced: false,
+            synced_at: None,
+        };
+    };
+
+    let personal_synced = sync
+        .get("personalVersion")
+        .and_then(|v| v.as_i64())
+        .is_some();
+    let org_synced = sync
+        .get("orgVersions")
+        .and_then(|v| v.as_object())
+        .is_some_and(|versions| versions.values().any(|version| version.as_i64().is_some()));
+
+    let synced_at = sync
+        .get("personalSyncedAt")
+        .and_then(|v| v.as_str())
+        .into_iter()
+        .chain(
+            sync.get("orgSyncedAt")
+                .and_then(|v| v.as_object())
+                .into_iter()
+                .flat_map(|entries| entries.values().filter_map(|v| v.as_str())),
+        )
+        .max()
+        .map(str::to_string);
+
+    VaultSyncSummary {
+        synced: personal_synced || org_synced,
+        synced_at,
+    }
 }
 
 /// Get the project name from package.json or lpm.json.
@@ -249,6 +343,36 @@ fn ensure_object_entry<'a>(
         .expect("vault sync metadata entries should always be objects")
 }
 
+fn rfc3339_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    format_rfc3339(secs)
+}
+
+fn format_rfc3339(epoch_secs: u64) -> String {
+    const SECS_PER_DAY: u64 = 86_400;
+    let days = epoch_secs / SECS_PER_DAY;
+    let time_of_day = epoch_secs % SECS_PER_DAY;
+    let h = (time_of_day / 3600) as u32;
+    let m = ((time_of_day % 3600) / 60) as u32;
+    let s = (time_of_day % 60) as u32;
+
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m_civil = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y_civil = if m_civil <= 2 { y + 1 } else { y };
+
+    format!("{y_civil:04}-{m_civil:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,15 +472,23 @@ mod tests {
         )
         .unwrap();
 
-        write_personal_sync_version(dir.path(), 7).unwrap();
+        write_personal_sync_version_at(dir.path(), 7, "2026-05-31T08:00:00Z").unwrap();
 
         assert_eq!(read_personal_sync_version(dir.path()), Some(7));
+        assert_eq!(
+            read_personal_sync_synced_at(dir.path()).as_deref(),
+            Some("2026-05-31T08:00:00Z")
+        );
 
         let content = std::fs::read_to_string(dir.path().join("lpm.json")).unwrap();
         let config: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(config["runtime"]["node"], "22");
         assert_eq!(config["vault"], "vault-123");
         assert_eq!(config["vaultSync"]["personalVersion"], 7);
+        assert_eq!(
+            config["vaultSync"]["personalSyncedAt"],
+            "2026-05-31T08:00:00Z"
+        );
         assert!(content.ends_with('\n'));
     }
 
@@ -365,12 +497,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
 
-        write_org_sync_version(dir.path(), "acme", 4).unwrap();
-        write_org_sync_version(dir.path(), "umbrella", 9).unwrap();
+        write_org_sync_version_at(dir.path(), "acme", 4, "2026-05-31T08:00:00Z").unwrap();
+        write_org_sync_version_at(dir.path(), "umbrella", 9, "2026-05-31T08:01:00Z").unwrap();
 
         assert_eq!(read_org_sync_version(dir.path(), "acme"), Some(4));
         assert_eq!(read_org_sync_version(dir.path(), "umbrella"), Some(9));
         assert_eq!(read_org_sync_version(dir.path(), "missing"), None);
+        assert_eq!(
+            read_org_sync_synced_at(dir.path(), "acme").as_deref(),
+            Some("2026-05-31T08:00:00Z")
+        );
+        assert_eq!(
+            read_org_sync_synced_at(dir.path(), "umbrella").as_deref(),
+            Some("2026-05-31T08:01:00Z")
+        );
     }
 
     /// M31: standard UUIDs and slug-shaped IDs pass; path-traversal
@@ -431,11 +571,11 @@ mod tests {
         )
         .unwrap();
 
-        write_org_sync_version(dir.path(), "acme", 9).unwrap();
+        write_org_sync_version_at(dir.path(), "acme", 9, "2026-05-31T08:00:00Z").unwrap();
         assert_eq!(read_personal_sync_version(dir.path()), Some(5));
         assert_eq!(read_org_sync_version(dir.path(), "acme"), Some(9));
 
-        write_personal_sync_version(dir.path(), 11).unwrap();
+        write_personal_sync_version_at(dir.path(), 11, "2026-05-31T08:02:00Z").unwrap();
         assert_eq!(read_personal_sync_version(dir.path()), Some(11));
         assert_eq!(read_org_sync_version(dir.path(), "acme"), Some(9));
 
@@ -444,7 +584,47 @@ mod tests {
         assert_eq!(config["runtime"]["node"], "22");
         assert_eq!(config["vault"], "vault-123");
         assert_eq!(config["vaultSync"]["personalVersion"], 11);
+        assert_eq!(
+            config["vaultSync"]["personalSyncedAt"],
+            "2026-05-31T08:02:00Z"
+        );
         assert_eq!(config["vaultSync"]["orgVersions"]["acme"], 9);
+        assert_eq!(
+            config["vaultSync"]["orgSyncedAt"]["acme"],
+            "2026-05-31T08:00:00Z"
+        );
         assert!(content.ends_with('\n'));
+    }
+
+    #[test]
+    fn sync_summary_reports_any_synced_vault_and_latest_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+
+        assert_eq!(
+            read_sync_summary(dir.path()),
+            VaultSyncSummary {
+                synced: false,
+                synced_at: None
+            }
+        );
+
+        write_personal_sync_version_at(dir.path(), 2, "2026-05-31T08:00:00Z").unwrap();
+        write_org_sync_version_at(dir.path(), "acme", 4, "2026-05-31T08:03:00Z").unwrap();
+
+        assert_eq!(
+            read_sync_summary(dir.path()),
+            VaultSyncSummary {
+                synced: true,
+                synced_at: Some("2026-05-31T08:03:00Z".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn format_rfc3339_known_epoch() {
+        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339(946_684_800), "2000-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339(1_775_910_896), "2026-04-11T12:34:56Z");
     }
 }
