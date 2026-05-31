@@ -272,18 +272,18 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `yellow` (currently plain, tools_ui:18-24).
 
 ### run — `commands/run.rs`
-- [ ] [time/struct] Single-task path: add `✓ build · success in 4.82s`
-      terminus + the `cache miss / command next build` metadata block — neither
-      emitted today (run.rs ~127-193; `print_task_result` is multi-task only).
-- [ ] [color] script name → `yellow`, `cache`/`command` labels → `dim`.
+- [x] [time/struct] Single-task path: add `✓ build · success in 4.82s`
+      terminus + the `cache miss / command next build` metadata block (run.rs
+      ~127-193; `print_task_result` is multi-task only).
+- [x] [color] script name → `yellow`, `cache`/`command` labels → `dim`.
 
 ### exec — `commands/run.rs`
-- [ ] [time] add `✓ Done · exited 0 in 412ms` terminus — `exec_file` returns
-      with no completion line.
-- [ ] [color] runtime (`Node.js 22.12.0`) → `yellow`, file → plain.
+- [x] [time] add `✓ Done · exited 0 in 412ms` terminus — `exec_file` returns
+      through the CLI wrapper, which now owns the completion line.
+- [x] [color] runtime (`Node.js 22.12.0`) → `yellow`, file → plain.
 
 ### dlx — `commands/run.rs`  (struct MATCH, design has no terminus)
-- [ ] [color] `cowsay` target → `yellow`, `(fresh)`→green, `0`/`168ms`→green.
+- [x] [color] `cowsay` target → `yellow`, `(fresh)`→green, `0`/`168ms`→green.
 
 ### quality — `commands/quality.rs`  (struct MATCH)
 - [ ] [color] pkg name → `cyan`, `score`/`tier` values → `status_ok`,
@@ -304,19 +304,19 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `✓ Registry is reachable`.
 - [x] [color] `Registry` url → `url`/blue, `●`+`healthy` → green, labels→`dim`.
 
-### sbom — `commands/sbom.rs`  (MISS — no progress today)
-- [ ] [struct] Add `› Generating CycloneDX SBOM from lpm.lock`, the
+### sbom — `commands/sbom.rs`  (DONE)
+- [x] [struct] Add `› Generating CycloneDX SBOM from lpm.lock`, the
       `packages/format/output` block, `✓ Included patch and provenance
       metadata`, `✓ Done · wrote SBOM in {elapsed}` (emit_sbom L1103-1117).
-- [ ] [time] add elapsed (no `Instant` today).
-- [ ] [color] `CycloneDX` → `yellow`, labels → `dim`, path → `dim`.
+- [x] [time] add elapsed.
+- [x] [color] `CycloneDX` → `yellow`, labels → `dim`, path → `dim`.
 
-### rebuild — `commands/rebuild.rs`  (MISS)
-- [ ] [struct] Collapse per-package to one line `✓ esbuild@0.25.1 postinstall`;
+### rebuild — `commands/rebuild.rs`  (DONE)
+- [x] [struct] Collapse per-package to one line `✓ esbuild@0.25.1 postinstall`;
       drop the `→ phase: cmd` chatter (Rule 6); add `skipped: N blocked
       package` + `hint: run lpm approve-scripts` lines (L1065-1181).
-- [ ] [time] add `✓ Done · rebuild finished in {elapsed}` (no timing today).
-- [ ] [color] pkg→plain, script phase→`dim`, `skipped:` value→gold.
+- [x] [time] add `✓ Done · rebuild finished in {elapsed}`.
+- [x] [color] pkg→plain, script phase→`dim`, `skipped:` value→gold.
 
 ### store verify — `commands/store.rs`  (B2 DONE)
 - [x] [B2/struct] Add `links N / objects N` count block + `✓ Checked every

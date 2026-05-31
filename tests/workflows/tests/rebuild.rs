@@ -528,6 +528,46 @@ fn rebuild_deny_skips_all_packages_and_keeps_legacy_pointer() {
     );
 }
 
+#[test]
+fn rebuild_human_output_collapses_lifecycle_scripts_to_slim_rows() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-slim-output", None, &[]);
+    let store_pkg = seed_scripted_package(&project, "green-native", "1.0.0", "echo lifecycle-ok");
+    seed_wrapper(&project, &store_pkg, "green-native", "1.0.0");
+    write_lockfile_for_packages(&project, &[("green-native", "1.0.0")]);
+
+    let out = lpm(&project)
+        .args(["rebuild", "--all"])
+        .output()
+        .expect("spawn lpm rebuild --all");
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "rebuild --all should succeed; stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("› Rebuilding lifecycle scripts for trusted packages"),
+        "must show slim rebuild phase; stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("✓ green-native@1.0.0  postinstall"),
+        "must collapse successful lifecycle script to one slim row; stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("✓ Completed 1 script"),
+        "must summarize completed script count; stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("✓ Done · rebuild finished in"),
+        "must show elapsed rebuild terminus; stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("→ postinstall:") && !stderr.contains("postinstall completed"),
+        "must drop per-step command chatter; stderr:\n{stderr}",
+    );
+}
+
 /// `--json` triage errors are still valid JSON and carry the security
 /// approval code instead of human pointer text.
 #[test]

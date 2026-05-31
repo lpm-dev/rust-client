@@ -239,8 +239,20 @@ fn run_human_output_uses_slim_status_lines() {
         "must show slim run phase; got:\n{combined}"
     );
     assert!(
+        combined.contains("cache") && combined.contains("miss"),
+        "must show cache metadata; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("command") && combined.contains("echo 'built'"),
+        "must show command metadata; got:\n{combined}"
+    );
+    assert!(
         combined.contains("built"),
         "must preserve script output; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("✓ build · success in"),
+        "must show slim success terminus with elapsed time; got:\n{combined}"
     );
     assert!(
         !combined.contains('│') && !combined.contains('◇'),
@@ -511,15 +523,12 @@ fn run_aborts_if_pre_hook_fails() {
 
     assert!(!output.status.success());
 
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Main script should NOT have run since pre-hook failed
+    // Main script stdout should NOT appear since pre-hook failed. The
+    // human metadata block may still name the command that would have run.
     assert!(
-        !combined.contains("should-not-run"),
+        !stdout.contains("should-not-run"),
         "main script should not run after pre-hook failure"
     );
 }

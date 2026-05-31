@@ -13,6 +13,24 @@ use lpm_common::LpmError;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+#[derive(Debug, Clone)]
+pub struct ExecTargetDescription {
+    pub runtime_label: String,
+}
+
+pub fn describe_exec_target(
+    project_dir: &Path,
+    file_path: &str,
+) -> Result<ExecTargetDescription, LpmError> {
+    let resolved = resolve_exec_path(project_dir, file_path)?;
+    let ext = resolved.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let runtime_info = detect_runtime(ext, project_dir)?;
+
+    Ok(ExecTargetDescription {
+        runtime_label: runtime_info.display_label(project_dir),
+    })
+}
+
 /// Execute a file directly, auto-detecting the runtime.
 ///
 /// Uses direct process spawn (no shell intermediary) for lower overhead.
@@ -26,22 +44,7 @@ pub fn exec_file(
     file_path: &str,
     extra_args: &[String],
 ) -> Result<(), LpmError> {
-    let file = Path::new(file_path);
-
-    // Verify file exists
-    let resolved = if file.is_absolute() {
-        file.to_path_buf()
-    } else {
-        project_dir.join(file)
-    };
-
-    if !resolved.exists() {
-        return Err(LpmError::Script(format!(
-            "file not found: {}",
-            resolved.display()
-        )));
-    }
-
+    let resolved = resolve_exec_path(project_dir, file_path)?;
     let ext = resolved.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     let runtime_info = detect_runtime(ext, project_dir)?;
@@ -108,6 +111,24 @@ pub fn exec_file(
     Ok(())
 }
 
+fn resolve_exec_path(project_dir: &Path, file_path: &str) -> Result<std::path::PathBuf, LpmError> {
+    let file = Path::new(file_path);
+    let resolved = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        project_dir.join(file)
+    };
+
+    if !resolved.exists() {
+        return Err(LpmError::Script(format!(
+            "file not found: {}",
+            resolved.display()
+        )));
+    }
+
+    Ok(resolved)
+}
+
 /// Runtime detection result — binary to invoke and any flags needed.
 #[derive(Debug)]
 struct RuntimeInfo {
@@ -115,6 +136,19 @@ struct RuntimeInfo {
     binary: String,
     /// Extra flags before the file path (e.g., ["--experimental-strip-types"])
     flags: Vec<String>,
+}
+
+impl RuntimeInfo {
+    fn display_label(&self, project_dir: &Path) -> String {
+        match self.binary.as_str() {
+            "node" => detect_effective_node_version(project_dir).map_or_else(
+                || "Node.js".to_string(),
+                |version| format!("Node.js {version}"),
+            ),
+            "npx" if self.flags.first().is_some_and(|flag| flag == "tsx") => "npx tsx".into(),
+            runtime => runtime.to_string(),
+        }
+    }
 }
 
 /// Detect which runtime to use based on file extension.

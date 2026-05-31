@@ -1,4 +1,5 @@
 use crate::commands::registry_reads::{fetch_routed_package_metadata, prepare_routed_read_context};
+use crate::install_ui;
 use crate::provenance_fetch;
 use clap::ValueEnum;
 use lpm_common::provenance::{ProvenanceSnapshot, ProvenanceStatus};
@@ -9,6 +10,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const CYCLONEDX_SPEC_VERSION: &str = "1.7";
 const SPDX_SPEC_VERSION: &str = "SPDX-2.3";
@@ -95,6 +97,12 @@ pub async fn run(
     output: Option<&Path>,
     registry: bool,
 ) -> Result<(), LpmError> {
+    let start = Instant::now();
+    install_ui::phase(&format!(
+        "Generating {} SBOM from lpm.lock",
+        install_ui::yellow(sbom_format_title(format)),
+    ));
+
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     if !lockfile_path.exists() {
         return Err(LpmError::NotFound(
@@ -107,11 +115,83 @@ pub async fn run(
     let package_json_path = project_dir.join("package.json");
     let root_json = read_json_file(&package_json_path)?;
     let document = build_document(client, project_dir, root_json, lockfile, registry).await?;
+    print_sbom_summary(project_dir, &document, format, output);
     let value = match format {
         SbomFormat::Cyclonedx => render_cyclonedx(&document),
         SbomFormat::Spdx => render_spdx(&document),
     };
-    emit_sbom(&value, output)
+    emit_sbom(&value, output)?;
+
+    install_ui::done(metadata_inclusion_line(&document));
+    let verb = if output.is_some() { "wrote" } else { "printed" };
+    install_ui::done(&format!(
+        "Done · {verb} SBOM in {}",
+        install_ui::green(&install_ui::format_duration(start.elapsed())),
+    ));
+    Ok(())
+}
+
+fn sbom_format_title(format: SbomFormat) -> &'static str {
+    match format {
+        SbomFormat::Cyclonedx => "CycloneDX",
+        SbomFormat::Spdx => "SPDX",
+    }
+}
+
+fn sbom_format_id(format: SbomFormat) -> &'static str {
+    match format {
+        SbomFormat::Cyclonedx => "cyclonedx",
+        SbomFormat::Spdx => "spdx",
+    }
+}
+
+fn print_sbom_summary(
+    project_dir: &Path,
+    document: &SbomDocument,
+    format: SbomFormat,
+    output: Option<&Path>,
+) {
+    install_ui::detail(&format!(
+        "    {} {}",
+        install_ui::dim(&format!("{:<8}", "packages")),
+        document.components.len(),
+    ));
+    install_ui::detail(&format!(
+        "    {} {}",
+        install_ui::dim(&format!("{:<8}", "format")),
+        sbom_format_id(format),
+    ));
+    if let Some(path) = output {
+        let display_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_dir.join(path)
+        };
+        install_ui::detail(&format!(
+            "    {} {}",
+            install_ui::dim(&format!("{:<8}", "output")),
+            install_ui::dim(&display_path.display().to_string()),
+        ));
+    }
+    install_ui::detail("");
+}
+
+fn metadata_inclusion_line(document: &SbomDocument) -> &'static str {
+    let has_patch = document
+        .components
+        .iter()
+        .any(|component| component.patch.is_some());
+    let has_provenance = document
+        .components
+        .iter()
+        .any(|component| component.provenance.is_some());
+
+    match (has_patch, has_provenance) {
+        (true, true) => "Included patch and provenance metadata",
+        (true, false) => "Included patch metadata",
+        (false, true) => "Included provenance metadata",
+        (false, false) => "Included lockfile metadata",
+    }
 }
 
 async fn build_document(
