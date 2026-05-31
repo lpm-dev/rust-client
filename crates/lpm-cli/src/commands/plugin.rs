@@ -180,7 +180,12 @@ async fn update(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmE
     if let Some(name) = plugin_name {
         // Update specific plugin
         let previous = latest_installed_version(name)?;
-        let version = lpm_plugin::update_plugin(name).await?;
+        let version = if json_output {
+            lpm_plugin::update_plugin(name).await?
+        } else {
+            let mut observer = render_plugin_update_event;
+            lpm_plugin::update_plugin_with_observer(name, &mut observer).await?
+        };
         if json_output {
             let json = serde_json::json!({
                 "success": true,
@@ -201,7 +206,12 @@ async fn update(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmE
             }
 
             let previous = installed.last().map(String::as_str);
-            let version = lpm_plugin::update_plugin(def.name).await?;
+            let version = if json_output {
+                lpm_plugin::update_plugin(def.name).await?
+            } else {
+                let mut observer = render_plugin_update_event;
+                lpm_plugin::update_plugin_with_observer(def.name, &mut observer).await?
+            };
             if !json_output {
                 install_ui::done(&format_update_message(def.name, previous, &version));
             }
@@ -235,11 +245,55 @@ fn latest_installed_version(plugin_name: &str) -> Result<Option<String>, LpmErro
     Ok(installed.last().cloned())
 }
 
+fn render_plugin_update_event(event: lpm_plugin::PluginInstallEvent) {
+    match event {
+        lpm_plugin::PluginInstallEvent::Downloading { plugin, version } => {
+            install_ui::phase(&format!(
+                "Downloading {plugin} {}",
+                install_ui::yellow(&version)
+            ));
+        }
+        lpm_plugin::PluginInstallEvent::VerifiedChecksum { .. } => {
+            install_ui::done("Verified SHA-256 checksum");
+        }
+    }
+}
+
 fn format_update_message(plugin_name: &str, previous: Option<&str>, version: &str) -> String {
     match previous {
         Some(previous) if previous != version => {
-            format!("Updated {plugin_name} {previous} → {version}")
+            format!(
+                "Updated {plugin_name} {} {} {}",
+                install_ui::yellow(previous),
+                install_ui::dim("→"),
+                install_ui::yellow(version),
+            )
         }
-        _ => format!("Updated {plugin_name} to {version}"),
+        _ => format!("Updated {plugin_name} to {}", install_ui::yellow(version)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_update_message;
+    use std::sync::Mutex;
+
+    static COLOR_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn plugin_update_message_colors_versions_and_arrow() {
+        let _guard = COLOR_LOCK.lock().unwrap();
+        let previous_color = lpm_common::color::enabled();
+        lpm_common::color::set_enabled(true);
+
+        let message = format_update_message("oxlint", Some("1.57.0"), "1.58.0");
+
+        lpm_common::color::set_enabled(previous_color);
+        assert!(
+            message.contains("\x1b[33m1.57.0\x1b[39m")
+                && message.contains("\x1b[2m→\x1b[22m")
+                && message.contains("\x1b[33m1.58.0\x1b[39m"),
+            "update message must color both versions yellow and dim the arrow, got: {message:?}"
+        );
     }
 }

@@ -50,6 +50,19 @@ use std::path::{Path, PathBuf};
 
 pub use engine::{ensure_engine, get_engine};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginInstallEvent {
+    Downloading {
+        plugin: String,
+        version: String,
+    },
+    VerifiedChecksum {
+        plugin: String,
+        version: String,
+        source: sidecar::VerificationSource,
+    },
+}
+
 /// Ensure a plugin is installed for the current platform and return
 /// the path to its binary.
 ///
@@ -109,7 +122,7 @@ pub async fn ensure_plugin(
     // helper. Acquires the per-version install lock, re-validates the
     // cache (sibling installer may have populated it while we waited),
     // and only downloads if the second check still misses.
-    install_under_lock(def, &version, &platform, plugin_name, force, quiet).await
+    install_under_lock(def, &version, &platform, plugin_name, force, quiet, None).await
 }
 
 /// Acquire the per-version install lock and run the install body. The
@@ -131,6 +144,7 @@ async fn install_under_lock(
     plugin_name: &str,
     force: bool,
     quiet: bool,
+    observer: Option<&mut (dyn FnMut(PluginInstallEvent) + Send)>,
 ) -> Result<PathBuf, LpmError> {
     let platform_str = platform.to_string();
     let bin_path = store::plugin_binary_path(def.name, version, &platform_str, def.binary_name)?;
@@ -147,6 +161,7 @@ async fn install_under_lock(
         plugin_name,
         force,
         quiet,
+        observer,
     );
     lpm_common::with_exclusive_lock_async(lock_path, body).await
 }
@@ -166,6 +181,7 @@ async fn run_install_locked_body(
     plugin_name: &str,
     force: bool,
     quiet: bool,
+    mut observer: Option<&mut (dyn FnMut(PluginInstallEvent) + Send)>,
 ) -> Result<PathBuf, LpmError> {
     // Double-checked locking: another process may have completed the
     // install while we were waiting on the lock. Return the now-valid
@@ -208,7 +224,21 @@ async fn run_install_locked_body(
         );
     }
 
-    download::download_plugin(def, version, platform).await?;
+    emit_install_event(
+        &mut observer,
+        PluginInstallEvent::Downloading {
+            plugin: plugin_name.to_string(),
+            version: version.to_string(),
+        },
+    );
+
+    let report = download::download_plugin(def, version, platform).await?;
+    emit_verified_checksum_event(
+        &mut observer,
+        plugin_name,
+        version,
+        report.verification_source,
+    );
 
     if bin_path.exists() {
         Ok(bin_path.to_path_buf())
@@ -221,6 +251,36 @@ async fn run_install_locked_body(
              The platform directory has been cleaned. Try again or check the plugin version.",
             bin_path.display()
         )))
+    }
+}
+
+fn emit_install_event(
+    observer: &mut Option<&mut (dyn FnMut(PluginInstallEvent) + Send)>,
+    event: PluginInstallEvent,
+) {
+    if let Some(observer) = observer.as_deref_mut() {
+        observer(event);
+    }
+}
+
+fn emit_verified_checksum_event(
+    observer: &mut Option<&mut (dyn FnMut(PluginInstallEvent) + Send)>,
+    plugin_name: &str,
+    version: &str,
+    source: sidecar::VerificationSource,
+) {
+    if matches!(
+        source,
+        sidecar::VerificationSource::Bundled | sidecar::VerificationSource::Upstream
+    ) {
+        emit_install_event(
+            observer,
+            PluginInstallEvent::VerifiedChecksum {
+                plugin: plugin_name.to_string(),
+                version: version.to_string(),
+                source,
+            },
+        );
     }
 }
 
@@ -240,6 +300,20 @@ async fn run_install_locked_body(
 /// available, otherwise upstream sidecar, otherwise refuse unless
 /// `LPM_ALLOW_UNVERIFIED_PLUGINS=1`.
 pub async fn update_plugin(plugin_name: &str) -> Result<String, LpmError> {
+    update_plugin_with_optional_observer(plugin_name, None).await
+}
+
+pub async fn update_plugin_with_observer(
+    plugin_name: &str,
+    observer: &mut (dyn FnMut(PluginInstallEvent) + Send),
+) -> Result<String, LpmError> {
+    update_plugin_with_optional_observer(plugin_name, Some(observer)).await
+}
+
+async fn update_plugin_with_optional_observer(
+    plugin_name: &str,
+    observer: Option<&mut (dyn FnMut(PluginInstallEvent) + Send)>,
+) -> Result<String, LpmError> {
     let def = registry::get_plugin(plugin_name)
         .ok_or_else(|| LpmError::Plugin(format!("unknown plugin: '{plugin_name}'")))?;
 
@@ -252,10 +326,13 @@ pub async fn update_plugin(plugin_name: &str) -> Result<String, LpmError> {
     // other's resolved version. The per-name scope makes the entire
     // resolve-and-record atomic for that plugin.
     let lock_path = store::plugin_update_lock_path(def.name)?;
-    lpm_common::with_exclusive_lock_async(lock_path, run_update_under_lock(def)).await
+    lpm_common::with_exclusive_lock_async(lock_path, run_update_under_lock(def, observer)).await
 }
 
-async fn run_update_under_lock(def: &registry::PluginDef) -> Result<String, LpmError> {
+async fn run_update_under_lock(
+    def: &registry::PluginDef,
+    observer: Option<&mut (dyn FnMut(PluginInstallEvent) + Send)>,
+) -> Result<String, LpmError> {
     let target = match versions::peek_latest_from_github(def).await {
         Ok(v) => v,
         Err(e) => {
@@ -284,7 +361,7 @@ async fn run_update_under_lock(def: &registry::PluginDef) -> Result<String, LpmE
     // banner doesn't fire — `lpm plugin update` is an explicit
     // user-initiated install and the command's own surface owns the
     // user-facing progress text.
-    install_under_lock(def, &target, &platform, def.name, false, true).await?;
+    install_under_lock(def, &target, &platform, def.name, false, true, observer).await?;
 
     // Install succeeded (or the locked body short-circuited on a
     // valid cache hit) — only NOW persist the cache. A download or
@@ -452,6 +529,35 @@ mod tests {
             false,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn verified_checksum_event_omits_unverified_override_installs() {
+        let mut events = Vec::new();
+        let mut observer = |event| events.push(event);
+        let mut observer: Option<&mut (dyn FnMut(PluginInstallEvent) + Send)> = Some(&mut observer);
+
+        emit_verified_checksum_event(
+            &mut observer,
+            "oxlint",
+            "1.58.0",
+            sidecar::VerificationSource::Bundled,
+        );
+        emit_verified_checksum_event(
+            &mut observer,
+            "oxlint",
+            "1.59.0",
+            sidecar::VerificationSource::UnverifiedOverride,
+        );
+
+        assert_eq!(
+            events,
+            vec![PluginInstallEvent::VerifiedChecksum {
+                plugin: "oxlint".to_string(),
+                version: "1.58.0".to_string(),
+                source: sidecar::VerificationSource::Bundled,
+            }]
+        );
     }
 
     #[test]

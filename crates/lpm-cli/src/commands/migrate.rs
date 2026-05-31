@@ -10,6 +10,7 @@
 //! 7. Optionally generate CI template
 //! 8. Print summary
 
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_lockfile::LOCKFILE_NAME;
@@ -36,16 +37,6 @@ pub async fn run(
         return run_rollback(cwd, json);
     }
 
-    // Step 1: Pre-flight checks
-    if !json {
-        eprintln!(
-            "\n{}  {}",
-            "lpm migrate".bold(),
-            "Migrating to LPM...".dimmed()
-        );
-        eprintln!();
-    }
-
     // Check package.json exists
     let pkg_json_path = cwd.join("package.json");
     if !pkg_json_path.exists() {
@@ -63,50 +54,27 @@ pub async fn run(
         ));
     }
 
-    // Calculate total steps dynamically
-    let total_steps = count_steps(no_npmrc, no_install, skip_verify);
-
-    // Step 1: Detect, parse, convert
     if !json {
-        eprint!(
-            "  {} Detecting package manager...",
-            step_num(1, total_steps)
-        );
+        install_ui::phase("Detecting current package manager");
     }
 
     let result = lpm_migrate::migrate(cwd)?;
 
     if !json {
-        let workspace_info = if result.workspace_members > 0 {
-            format!(", {} workspace members", result.workspace_members)
-        } else {
-            String::new()
-        };
-        eprintln!(
-            " {} ({} v{}, {} packages{})",
-            "done".green(),
-            result.source.kind,
-            result.source.version,
-            result.package_count,
-            workspace_info,
-        );
+        render_detected_source(&result, dry_run);
     }
 
     // Print skipped packages
     if !json && !result.skipped.is_empty() {
         eprintln!();
-        eprintln!(
-            "  {} {} skipped:",
-            "!".yellow().bold(),
-            result.skipped.len()
-        );
+        install_ui::warn(&format!("{} packages skipped", result.skipped.len()));
         for skip in &result.skipped {
-            eprintln!(
-                "    {} {} ({})",
+            install_ui::detail(&format!(
+                "  {} {} ({})",
                 "-".dimmed(),
                 skip.name,
                 skip.reason.dimmed()
-            );
+            ));
         }
     }
 
@@ -114,7 +82,7 @@ pub async fn run(
     if !json && !result.warnings.is_empty() {
         eprintln!();
         for w in &result.warnings {
-            eprintln!("  {} {}", "warn".yellow().bold(), w);
+            install_ui::warn(w);
         }
     }
 
@@ -228,11 +196,6 @@ pub async fn run(
         return Ok(());
     }
 
-    // Step 2: Write lockfile (with backup)
-    if !json {
-        eprint!("  {} Writing lpm.lock...", step_num(2, total_steps));
-    }
-
     let mut migration_backup = MigrationBackup::new();
 
     // Back up the source lockfile (package-lock.json, yarn.lock, etc.)
@@ -311,7 +274,9 @@ pub async fn run(
     }
 
     if !json {
-        eprintln!(" {}", "done".green());
+        install_ui::done("Converted lockfile");
+        render_written_file(LOCKFILE_NAME);
+        render_written_file("lpm.lockb");
     }
 
     // #34 — apply the validated `pnpm.overrides` translation
@@ -434,20 +399,14 @@ pub async fn run(
         }
     }
 
-    // Step 3: Configure .npmrc (optional)
-    let mut current_step: u32 = 3;
     if !no_npmrc {
-        configure_npmrc(cwd, current_step, total_steps, json, &mut migration_backup)?;
-        current_step += 1;
+        configure_npmrc(cwd, json, &mut migration_backup)?;
     }
 
     // Step N: Install (optional, default on)
     if !no_install {
         if !json {
-            eprint!(
-                "  {} Installing packages...",
-                step_num(current_step, total_steps)
-            );
+            install_ui::phase(&format!("Running {}…", install_ui::yellow("lpm install")));
         }
 
         match super::install::run_with_options(
@@ -492,27 +451,25 @@ pub async fn run(
                     eprintln!(
                         "  {} The lockfile was written successfully. Run {} manually to retry.",
                         "info".blue().bold(),
-                        "lpm install".bold()
+                        install_ui::yellow("lpm install")
                     );
                 }
                 // Install failure is non-fatal for migration — the lockfile is still valid.
                 // The user can retry install separately.
             }
         }
-        current_step += 1;
     }
 
     // Step N: Verify build+test (optional)
     if !skip_verify {
-        run_verification(cwd, current_step, total_steps, json).await?;
-        current_step += 1;
+        run_verification(cwd, json).await?;
     }
 
     // CI template (optional)
     if !no_ci {
         if ci {
             // --ci flag: actually generate the template file
-            generate_ci_template(cwd, current_step, total_steps, json, &mut migration_backup)?;
+            generate_ci_template(cwd, json, &mut migration_backup)?;
         } else if let Some(platform) = lpm_migrate::ci::detect_ci_platform(cwd)
             && !json
         {
@@ -531,7 +488,6 @@ pub async fn run(
     migration_backup.write_manifest(cwd)?;
 
     // Summary
-    let _ = current_step; // suppress unused warning
     if json {
         let output = serde_json::json!({
             "success": true,
@@ -545,72 +501,58 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        eprintln!();
-        eprintln!(
-            "  {} Migrated {} packages from {} ({} with integrity hashes)",
-            "done".green().bold(),
-            result.package_count.to_string().bold(),
-            result.source.kind.to_string().bold(),
-            result.integrity_count,
-        );
         if !result.skipped.is_empty() {
-            eprintln!(
-                "  {} {} packages skipped (file:/git:/link: deps)",
-                "note".dimmed(),
-                result.skipped.len(),
-            );
+            install_ui::skipped(&format!(
+                "{} packages skipped (file:/git:/link: deps)",
+                result.skipped.len()
+            ));
         }
-        eprintln!();
-        eprintln!("  Next steps:");
-        eprintln!("    {} Commit lpm.lock to version control", "1.".dimmed());
-        eprintln!(
-            "    {} Remove old lockfile when ready: {}",
-            "2.".dimmed(),
-            format!(
-                "git rm {}",
-                result
-                    .source
-                    .path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("lockfile")
-            )
-            .dimmed(),
-        );
-        eprintln!(
-            "    {} Need to undo? Run {}",
-            "3.".dimmed(),
-            "lpm migrate --rollback".bold(),
-        );
-        eprintln!();
+        install_ui::done("Done · migration completed successfully");
     }
 
     Ok(())
 }
 
-/// Count the total number of steps for progress display.
-fn count_steps(no_npmrc: bool, no_install: bool, skip_verify: bool) -> u32 {
-    let mut steps: u32 = 2; // detect + write lockfile
-    if !no_npmrc {
-        steps += 1;
+fn render_detected_source(result: &lpm_migrate::MigrateResult, dry_run: bool) {
+    let lockfile = result
+        .source
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("lockfile");
+    let mut source = format!(
+        "{} v{} · {}",
+        result.source.kind,
+        result.source.version,
+        install_ui::yellow(lockfile),
+    );
+    if result.workspace_members > 0 {
+        source.push_str(&format!(
+            " · {} workspace members",
+            result.workspace_members
+        ));
     }
-    if !no_install {
-        steps += 1;
-    }
-    if !skip_verify {
-        steps += 1;
-    }
-    steps
+
+    render_migrate_detail("source:", &source);
+    let backups = if dry_run {
+        "not written in dry-run"
+    } else {
+        ".backup files kept for lpm migrate --rollback"
+    };
+    render_migrate_detail("backups:", backups);
+}
+
+fn render_written_file(path: &str) {
+    render_migrate_detail("wrote:", path);
+}
+
+fn render_migrate_detail(label: &str, value: &str) {
+    let label = format!("{label:<8}");
+    install_ui::detail(&format!("  {} {value}", install_ui::dim(&label)));
 }
 
 /// Configure .npmrc with the LPM registry scope.
-fn configure_npmrc(
-    cwd: &Path,
-    step: u32,
-    total: u32,
-    json: bool,
-    backup: &mut MigrationBackup,
-) -> Result<(), LpmError> {
+fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Result<(), LpmError> {
     let npmrc_path = cwd.join(".npmrc");
 
     if npmrc_path.exists() {
@@ -619,16 +561,13 @@ fn configure_npmrc(
 
         if content.contains("@lpm.dev:registry") {
             if !json {
-                eprintln!(
-                    "  {} .npmrc already has @lpm.dev:registry scope",
-                    "info".blue().bold()
-                );
+                install_ui::skipped(".npmrc already has @lpm.dev:registry scope");
             }
             return Ok(());
         }
 
         if !json {
-            eprint!("  {} Updating .npmrc...", step_num(step, total));
+            install_ui::phase("Updating .npmrc");
         }
 
         backup.backup_file(&npmrc_path)?;
@@ -649,14 +588,11 @@ fn configure_npmrc(
         }
 
         if !json {
-            eprintln!(
-                " {} (added @lpm.dev:registry scope, original backed up)",
-                "done".green()
-            );
+            install_ui::done("Updated .npmrc");
         }
     } else {
         if !json {
-            eprint!("  {} Configuring .npmrc...", step_num(step, total));
+            install_ui::phase("Configuring .npmrc");
         }
 
         backup.backup_file(&npmrc_path)?;
@@ -671,7 +607,7 @@ fn configure_npmrc(
         }
 
         if !json {
-            eprintln!(" {}", "done".green());
+            install_ui::done("Configured .npmrc");
         }
     }
 
@@ -683,9 +619,9 @@ fn configure_npmrc(
 /// Returns `Err` if any script fails — the migration lockfile is valid but the
 /// project does not build/test cleanly, so the user should investigate before
 /// committing. Use `--skip-verify` to bypass.
-async fn run_verification(cwd: &Path, step: u32, total: u32, json: bool) -> Result<(), LpmError> {
+async fn run_verification(cwd: &Path, json: bool) -> Result<(), LpmError> {
     if !json {
-        eprint!("  {} Verifying migration...", step_num(step, total));
+        install_ui::phase("Verifying migration");
     }
 
     // Read package.json to find available scripts
@@ -707,10 +643,7 @@ async fn run_verification(cwd: &Path, step: u32, total: u32, json: bool) -> Resu
 
     if !has_build && !has_test {
         if !json {
-            eprintln!(
-                " {} (no build/test scripts in package.json)",
-                "skipped".dimmed()
-            );
+            install_ui::skipped("No build/test scripts in package.json");
         }
         return Ok(());
     }
@@ -726,13 +659,13 @@ async fn run_verification(cwd: &Path, step: u32, total: u32, json: bool) -> Resu
         match super::run::run(cwd, "build", &[], None, false, &bin_hint).await {
             Ok(()) => {
                 if !json {
-                    eprint!(" build {}", "ok".green());
+                    install_ui::done("build script passed");
                 }
             }
             Err(e) => {
                 failures.push(format!("build: {e}"));
                 if !json {
-                    eprint!(" build {}", "failed".red());
+                    install_ui::failed("build script failed");
                 }
             }
         }
@@ -743,22 +676,19 @@ async fn run_verification(cwd: &Path, step: u32, total: u32, json: bool) -> Resu
         match super::run::run(cwd, "test", &[], None, false, &bin_hint).await {
             Ok(()) => {
                 if !json {
-                    eprint!(" test {}", "ok".green());
+                    install_ui::done("test script passed");
                 }
             }
             Err(e) => {
                 failures.push(format!("test: {e}"));
                 if !json {
-                    eprint!(" test {}", "failed".red());
+                    install_ui::failed("test script failed");
                 }
             }
         }
     }
 
     if failures.is_empty() {
-        if !json {
-            eprintln!(" {}", "done".green());
-        }
         Ok(())
     } else {
         if !json {
@@ -800,8 +730,6 @@ async fn run_verification(cwd: &Path, step: u32, total: u32, json: bool) -> Resu
 /// Generate a CI workflow template for the detected platform.
 fn generate_ci_template(
     cwd: &Path,
-    _step: u32,
-    _total: u32,
     json: bool,
     backup: &mut MigrationBackup,
 ) -> Result<(), LpmError> {
@@ -834,15 +762,13 @@ fn generate_ci_template(
     })?;
 
     if !json {
-        eprintln!(
-            "  {} Generated {} CI template: {}",
-            "done".green().bold(),
-            platform,
+        install_ui::done(&format!(
+            "Generated {platform} CI template: {}",
             output_path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("ci template"),
-        );
+        ));
     }
 
     Ok(())
@@ -887,10 +813,6 @@ fn run_rollback(cwd: &Path, json: bool) -> Result<(), LpmError> {
     }
 
     Ok(())
-}
-
-fn step_num(n: u32, total: u32) -> String {
-    format!("[{}/{}]", n, total)
 }
 
 /// Render a structured `pnpm.overrides` translation-plan failure to

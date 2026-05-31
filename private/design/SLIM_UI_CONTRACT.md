@@ -388,11 +388,11 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [x] [color] `lpm.dev`→`yellow`, `Keychain`→plain.
 
 ### migrate — `commands/migrate.rs`  (MISS — untouched, still old `[n/total]` UI)
-- [ ] [struct] Full rewrite to slim: `› Detecting current package manager`
+- [x] [struct] Full rewrite to slim: `› Detecting current package manager`
       + `source:/backups:` block, `✓ Converted lockfile` + `wrote:` rows,
       `› Running lpm install…`, `✓ Done · migration completed successfully`.
       Remove the bold banner + step counters + "Next steps:" footer.
-- [ ] [color] `pnpm-lock.yaml`/`lpm install`→`yellow`, labels→`dim`.
+- [x] [color] `pnpm-lock.yaml`/`lpm install`→`yellow`, labels→`dim`.
 
 ### use — `commands/use.rs` + `use_ui.rs`  (mdx says "should be" — aspirational)
 - [x] [B2/struct] Build: `› Resolving node@22 → 22.12.0 (lts/jod)`, download
@@ -444,10 +444,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [B2/struct] Add `· region {x}` suffix on opening phase. Needs region
       fetch; **deferred** with backend/API extension.
 - [x] [B2/struct] Live `→ METHOD path STATUS {ms}` request stream on the start path.
-- [ ] [B2/struct] `press o to open inspector, q to quit` footer (today
+- [x] [B2/struct] `press o to open inspector, q to quit` footer (today
       `Ctrl+C`, L281). Needs keypress shutdown wiring.
 - [x] [color] `localhost:3000`→`yellow`, public URL/inspector→`url`/blue,
-      method (POST gold / GET blue), status (2xx green / 4xx red), `o`/`Ctrl+C`→
+      method (POST gold / GET blue), status (2xx green / 4xx red), `o`/`q`→
       `yellow`, `ms`/`→`→`dim`.
 
 ### env ls — `commands/env.rs`
@@ -466,20 +466,20 @@ slim/cliclack. File:line are approximate — confirm before editing.
 ## Group F — publish / registry / misc
 
 ### publish — `commands/publish.rs`  (heavy chatter)
-- [ ] [struct] Replace narrate-every-step (`Publishing as…`, `Packing
+- [x] [struct] Replace narrate-every-step (`Publishing as…`, `Packing
       tarball…`, `Uploading…`, `Preparing Sigstore…`) per Rule 6; add
       `✓ Secret scan passed` (today debug-only L443), `✓ Quality score: 91/100`
       (today a category table), `› Uploading tarball to lpm.dev` +
       `target/visibility/dist-tag` block; terminus `✓ Done · published … in
       2.41s` (today `✓ Published … (2.4s)` L848-853).
-- [ ] [struct] (SETTLED: one line + failing checks) On success print the
+- [x] [struct] (SETTLED: one line + failing checks) On success print the
       single `✓ Quality score: 91/100` line; do NOT print the full per-category
       table (`print_quality_checks` L1585) on the publish path. If the score is
       below threshold or any check fails/misses, list ONLY the failing checks
       beneath the score line (`! License present  missing`). The full
       per-category breakdown stays in `lpm quality`, not publish.
-- [ ] [color] target pkg→`yellow`, `visibility: private`→gold, elapsed→green.
-- [ ] [split] confirm + 2FA prompts stay cliclack (correct).
+- [x] [color] target pkg→`yellow`, `visibility: private`→gold, elapsed→green.
+- [x] [split] confirm + 2FA prompts stay cliclack (correct).
 
 ### pack — `commands/pack.rs`  (struct MATCH, tsdown passthrough)
 - [x] [color] `tsdown`→`yellow`, terminus elapsed green (already).
@@ -518,10 +518,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `current`→`status_ok`, labels→`dim`.
 
 ### plugin update — `commands/plugin.rs` + `lpm-plugin` crate
-- [ ] [struct] Add `› Downloading {tool} {ver}` phase + `✓ Verified SHA-256
+- [x] [struct] Add `› Downloading {tool} {ver}` phase + `✓ Verified SHA-256
       checksum` line (today only the `✓ Updated …` terminus; checksum is
       `tracing`-level in `download.rs:150`).
-- [ ] [color] version→`yellow`, `→`→`dim`.
+- [x] [color] version→`yellow`, `→`→`dim`.
 
 ### patch / patch-commit — `commands/patch.rs`  (struct MATCH)
 - [x] [color] target `lodash@4.17.21`→`yellow`, `source:/staging:` paths→
@@ -540,14 +540,14 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [verify] prompt answers green (cliclack).
 
 ### add — `commands/add.rs`  ([split] picker stays cliclack; MISS otherwise)
-- [ ] [struct] Build the designed flow: `› Downloading source package {pkg}`,
+- [x] [struct] Build the designed flow: `› Downloading source package {pkg}`,
       `› Detecting project structure` + aligned `Framework:/Install path:/
       Import alias:` block, `✓ Files copied` + `+ file` list, `› Installing
       declared dependencies` + `+ pkg@version` list, `✓ Done · added N files
       and M dependencies in {elapsed}`.
-- [ ] [time] add elapsed (none today).
-- [ ] [struct] file-conflict warning uses `⚠` (L1392) → change to `!`.
-- [ ] [color] target→`yellow`, `+`→green, paths→`dim`.
+- [x] [time] add elapsed (none today).
+- [x] [struct] file-conflict warning uses `⚠` (L1392) → change to `!`.
+- [x] [color] target→`yellow`, `+`→green, paths→`dim`.
 
 ### filter — `commands/filter.rs`
 - [x] [struct] Prefix each member with `● ` (now sanctioned) — today bare name
@@ -585,5 +585,5 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] No `println!` for human progress remains except the sanctioned
       table/tree "answer" surfaces (outdated/graph/query/pool/quality).
 - [x] `SLIM_UI.md` glyph/color tables updated to match Rule 1 + `●`.
-- [ ] Run the full CI gate (clippy `--workspace --all-targets`, fmt, nextest)
+- [x] Run the full CI gate (clippy `--workspace --all-targets`, fmt, nextest)
       per CLAUDE.md pre-merge checklist.
