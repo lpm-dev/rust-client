@@ -1,0 +1,17 @@
+---
+source: tests/workflows/tests/security.rs
+expression: snapshot
+---
+{
+  "success": true,
+  "repair": {
+    "security_dir": "[SECURITY_DIR]",
+    "quarantined": [
+      {
+        "original_path": "[ORIGINAL_PATH]",
+        "quarantine_path": "[QUARANTINE_PATH]",
+        "reason": "signing secret missing"
+      }
+    ]
+  }
+}

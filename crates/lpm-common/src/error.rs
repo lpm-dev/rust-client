@@ -287,6 +287,16 @@ pub enum LpmError {
     )]
     SecurityFloor(String),
 
+    #[error("security approval store refused: {0}")]
+    #[diagnostic(
+        code(lpm::security_approval_store),
+        help(
+            "The local signed security state could not be verified. If this is stale local state, \
+             run `lpm security repair` to quarantine unverified approvals, or restore the original keyring secret."
+        )
+    )]
+    SecurityApprovalStore(String),
+
     #[error("security approval required: {message}")]
     #[diagnostic(
         code(lpm::security_approval_required),
@@ -343,6 +353,7 @@ impl LpmError {
             LpmError::ProvenanceVerification(_) => "provenance_verification",
             LpmError::SelfUpdate(_) => "self_update",
             LpmError::SecurityFloor(_) => "security_floor",
+            LpmError::SecurityApprovalStore(_) => "security_approval_store",
             LpmError::SecurityApprovalRequired { .. } => "security_approval_required",
         }
     }
@@ -499,6 +510,7 @@ mod tests {
             LpmError::SelfUpdatePaused("x".into()),
             LpmError::SelfUpdateRateLimited("x".into()),
             LpmError::SecurityFloor("x".into()),
+            LpmError::SecurityApprovalStore("x".into()),
         ];
 
         for variant in &variants {
