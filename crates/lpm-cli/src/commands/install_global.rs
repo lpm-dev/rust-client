@@ -1955,7 +1955,7 @@ fn emit_post_install_blocked_warning(root: &LpmRoot, prep: &PrepResult, json_out
         return;
     }
 
-    println!();
+    eprintln!();
     output::warn(&format!(
         "{} package{} in this global install have lifecycle scripts blocked pending review.",
         remaining.len().to_string().bold(),
@@ -1985,7 +1985,7 @@ fn emit_post_install_blocked_warning(root: &LpmRoot, prep: &PrepResult, json_out
         ));
     }
     output::info("   Run `lpm approve-scripts --global` to review and approve.");
-    println!();
+    eprintln!();
 }
 
 #[cfg(test)]

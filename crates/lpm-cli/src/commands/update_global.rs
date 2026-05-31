@@ -1183,7 +1183,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                 let name_safe = sanitize_for_terminal(&prep.name);
                 let current_safe = sanitize_for_terminal(&prep.current_version);
                 let new_safe = sanitize_for_terminal(&prep.new_version.to_string());
-                println!(
+                eprintln!(
                     "  {} {} \u{2192} {}",
                     name_safe.bold(),
                     current_safe.dimmed(),
@@ -1202,7 +1202,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
                 let version_safe = sanitize_for_terminal(version);
                 let old_safe = sanitize_for_terminal(old_saved_spec);
                 let new_safe = sanitize_for_terminal(new_saved_spec);
-                println!(
+                eprintln!(
                     "  {} {} (saved_spec {} \u{2192} {})",
                     package_safe.bold(),
                     format!("@{version_safe}").dimmed(),
@@ -1213,7 +1213,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
             UpgradePlan::AlreadyCurrent { package, version } => {
                 let package_safe = sanitize_for_terminal(package);
                 let version_safe = sanitize_for_terminal(version);
-                println!(
+                eprintln!(
                     "  {} {} (already current)",
                     package_safe.dimmed(),
                     format!("@{version_safe}").dimmed()
@@ -1222,7 +1222,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
             UpgradePlan::PlanError { package, reason } => {
                 let package_safe = sanitize_for_terminal(package);
                 let reason_safe = sanitize_for_terminal(reason);
-                println!(
+                eprintln!(
                     "  {} {} {}",
                     package_safe.bold(),
                     "could not plan:".red(),
