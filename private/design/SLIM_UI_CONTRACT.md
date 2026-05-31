@@ -416,7 +416,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
 ## Group E — env / cache / infra
 
 ### cache status — `commands/remote_cache.rs`  (struct MATCH, usage_bar wired)
-- [ ] [color] section headers `Local cache`/`Remote cache`→`section`,
+- [x] [color] section headers `Local cache`/`Remote cache`→`section`,
       `enabled`/`status` values→`status_ok`, bar→green (already), labels→`dim`.
 
 ### ci env — `commands/ci.rs`
@@ -428,11 +428,11 @@ slim/cliclack. File:line are approximate — confirm before editing.
       by shells and CI env files.
 
 ### deploy — `commands/deploy.rs`  (struct MATCH)
-- [ ] [color] `api` filter target→`yellow`, `/prod/api`→`yellow`,
+- [x] [color] `api` filter target→`yellow`, `/prod/api`→`yellow`,
       `node_modules installed: yes`→`status_ok`, labels→`dim`.
 
 ### pool — `commands/pool.rs`  (struct MATCH)
-- [ ] [color] `Pool Revenue Stats`/`packages (N):`→`section`/green, scopes→
+- [x] [color] `Pool Revenue Stats`/`packages (N):`→`section`/green, scopes→
       `cyan` (already), `$18.42`→green, download counts→plain, labels→`dim`.
 
 ### ports — `commands/ports.rs`

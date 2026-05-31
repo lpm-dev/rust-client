@@ -1,3 +1,4 @@
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -18,25 +19,28 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         );
     } else {
         println!();
-        println!("  {}", "Pool Revenue Stats".bold());
+        println!("  {}", install_ui::section("Pool Revenue Stats"));
         println!();
 
         if let Some(period) = &stats.billing_period {
-            print_field("billing period", period);
+            print_field("billing period", period.to_string());
         }
         if let Some(downloads) = stats.total_weighted_downloads {
-            print_field("weighted downloads", &format_count(downloads));
+            print_field("weighted downloads", format_count(downloads));
         }
         if let Some(earnings) = stats.estimated_earnings_cents {
             print_field(
                 "estimated earnings",
-                &format!("${:.2}", earnings as f64 / 100.0),
+                install_ui::green(&format!("${:.2}", earnings as f64 / 100.0)),
             );
         }
 
         if !stats.packages.is_empty() {
             println!();
-            println!("  packages ({}):", stats.packages.len());
+            println!(
+                "  {}",
+                install_ui::section(&format!("packages ({}):", stats.packages.len()))
+            );
             let width = stats
                 .packages
                 .iter()
@@ -45,9 +49,10 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 .unwrap_or(0);
             for pkg in &stats.packages {
                 let downloads = pkg.weighted_downloads.unwrap_or(0);
+                let name = install_ui::cyan(&format!("{:<width$}", pkg.name));
                 println!(
-                    "    {:<width$}   {}",
-                    pkg.name,
+                    "    {}   {}",
+                    name,
                     format!("({} downloads)", format_count(downloads)).dimmed()
                 );
             }
@@ -59,8 +64,8 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     Ok(())
 }
 
-fn print_field(label: &str, value: &str) {
-    println!("  {label:<20} {value}");
+fn print_field(label: &str, value: String) {
+    println!("  {} {value}", install_ui::dim(&format!("{label:<20}")));
 }
 
 fn format_count(value: u64) -> String {
