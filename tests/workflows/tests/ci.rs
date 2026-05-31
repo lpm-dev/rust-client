@@ -44,6 +44,48 @@ fn ci_env_github_actions_masks_secret_values_and_emits_github_env_commands() {
         ),
         "GitHub Actions output must mask secrets before writing deterministic env commands"
     );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Emitted 2 environment variables for GitHub Actions"),
+        "ci env must report a slim terminus on stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn ci_env_shell_output_reports_generic_ci_terminus_on_stderr() {
+    let project = TempProject::empty(r#"{"name":"ci-test","version":"1.0.0"}"#);
+    project.write_file(
+        ".env",
+        "PUBLIC_URL=https://example.test\nAPI_KEY=local-key\n",
+    );
+
+    let output = lpm(&project)
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("VERCEL")
+        .args(["ci", "env"])
+        .output()
+        .expect("failed to run lpm ci env");
+
+    assert!(
+        output.status.success(),
+        "lpm ci env failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("export API_KEY=local-key")
+            && stdout.contains("export PUBLIC_URL=https://example.test"),
+        "shell output must stay machine-consumable on stdout, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✓ Emitted 2 environment variables for generic CI"),
+        "ci env shell path must report the generic CI terminus, got:\n{stderr}"
+    );
 }
 
 #[test]

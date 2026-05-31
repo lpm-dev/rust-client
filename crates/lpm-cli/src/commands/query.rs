@@ -351,26 +351,19 @@ pub async fn run(
         install_ui::warn(&format!("No packages match {selector_str}"));
     } else {
         for pkg in &matched {
-            let mut extras = Vec::new();
+            let mut state_labels = Vec::new();
 
             if pkg.has_scripts {
-                extras.push("scripts".to_string());
+                state_labels.push("scripts".to_string());
             }
             if pkg.is_built {
-                extras.push("built".to_string());
+                state_labels.push("built".to_string());
             }
 
-            if verbose && let Some(analysis) = pkg.analysis {
-                let tags = collect_active_tags(analysis);
-                if !tags.is_empty() {
-                    extras.push(tags.join(", "));
-                }
-            }
-
-            let extra_str = if extras.is_empty() {
+            let state_str = if state_labels.is_empty() {
                 String::new()
             } else {
-                format!(" {}", format!("({})", extras.join(", ")).dimmed())
+                format!(" {}", format!("({})", state_labels.join(", ")).dimmed())
             };
 
             // Show path when it differs from the default (indicates a nested instance)
@@ -380,7 +373,16 @@ pub async fn run(
                 } else {
                     String::new()
                 };
-            println!("    {}@{}{extra_str}{path_suffix}", pkg.name, pkg.version);
+            println!("    {}@{}{state_str}{path_suffix}", pkg.name, pkg.version);
+
+            let tags = pkg.analysis.map(collect_active_tags).unwrap_or_default();
+            if !tags.is_empty() {
+                println!(
+                    "      {} {}",
+                    install_ui::dim("tags:"),
+                    install_ui::dim(&tags.join(", "))
+                );
+            }
         }
         println!();
         install_ui::warn(&format!(

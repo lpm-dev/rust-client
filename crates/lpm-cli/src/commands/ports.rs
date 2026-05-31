@@ -76,14 +76,25 @@ fn run_list(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         .filter_map(|(name, config)| {
             config.port.map(|port| {
                 let status = match ports::check_port(port) {
-                    ports::PortStatus::Free => "free".green(),
+                    ports::PortStatus::Free => {
+                        format!(
+                            "{} {}",
+                            install_ui::bullet(true),
+                            install_ui::status_ok("ready")
+                        )
+                    }
                     ports::PortStatus::InUse { pid, process_name } => {
                         let owner = match (&pid, &process_name) {
                             (Some(p), Some(n)) => format!("{n} (PID {p})"),
                             (Some(p), None) => format!("PID {p}"),
                             _ => "unknown".to_string(),
                         };
-                        format!("{} ({})", "in use".red(), owner.dimmed())
+                        format!(
+                            "{} {} ({})",
+                            install_ui::bullet(true),
+                            install_ui::status_ok("listening"),
+                            owner.dimmed()
+                        )
                     }
                 };
                 (name.as_str(), port, status)
@@ -103,9 +114,17 @@ fn run_list(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         .max()
         .unwrap_or("Service".len());
 
-    println!("{:<service_width$}  Port   Status", "Service");
+    println!(
+        "{}  {}   {}",
+        install_ui::dim(&format!("{:<service_width$}", "Service")),
+        install_ui::dim("Port"),
+        install_ui::dim("Status")
+    );
     for (name, port, status) in &rows {
-        println!("{name:<service_width$}  {port:<5}  {status}");
+        println!(
+            "{name:<service_width$}  {}  {status}",
+            install_ui::yellow(&format!("{port:<5}"))
+        );
     }
     println!();
     install_ui::done(&format!(
