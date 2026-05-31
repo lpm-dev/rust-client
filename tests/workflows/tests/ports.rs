@@ -118,6 +118,10 @@ fn ports_list_human_renders_table_and_slim_completion() {
         stdout.contains("web") && stdout.contains("api"),
         "ports list must render service rows, got:\n{stdout}"
     );
+    assert!(
+        stdout.contains("● ready") && stdout.contains("● listening"),
+        "ports list must render slim status dots for ready and listening services, got:\n{stdout}"
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

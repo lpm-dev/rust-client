@@ -61,6 +61,10 @@ fn query_eval_selects_only_packages_with_eval_tag() {
         "stdout must list eval-pkg, got:\n{stdout}"
     );
     assert!(
+        stdout.contains("tags: eval"),
+        "stdout must render package tags on a second line, got:\n{stdout}"
+    );
+    assert!(
         !stdout.contains("clean-pkg"),
         "stdout must NOT list clean-pkg (no eval), got:\n{stdout}"
     );

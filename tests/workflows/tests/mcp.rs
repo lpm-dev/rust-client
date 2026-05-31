@@ -1,9 +1,9 @@
 //! Workflow tests for `lpm mcp setup / remove / status`.
 //!
-//! MCP setup writes server entries into well-known editor config files
-//! (Claude Code: `~/.claude.json`, Cursor: `~/.cursor/mcp.json`, etc.).
-//! Tests run under an isolated HOME so they don't touch the developer's
-//! real editor config.
+//! MCP setup writes server entries into existing well-known editor config
+//! files (Claude Code: `~/.claude.json`, Cursor: `~/.cursor/mcp.json`,
+//! etc.). Tests run under an isolated HOME so they don't touch the
+//! developer's real editor config.
 
 mod support;
 
@@ -80,6 +80,8 @@ fn mcp_remove_without_name_fails_with_helpful_message() {
 #[test]
 fn mcp_setup_and_remove_use_slim_human_status() {
     let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+    std::fs::write(project.home().join(".claude.json"), "{}")
+        .expect("failed to seed Claude Code MCP config");
 
     let setup = lpm(&project)
         .args(["mcp", "setup", "test-server"])
@@ -97,6 +99,14 @@ fn mcp_setup_and_remove_use_slim_human_status() {
     assert!(
         setup_stderr.contains("› Configuring MCP servers for supported editors"),
         "mcp setup must start with a slim phase line, got:\n{setup_stderr}",
+    );
+    assert!(
+        setup_stderr.contains("✓ Claude Code") && setup_stderr.contains("configured"),
+        "mcp setup must report configured editors, got:\n{setup_stderr}",
+    );
+    assert!(
+        setup_stderr.contains("○") && setup_stderr.contains("skipped (config not found)"),
+        "mcp setup must report skipped editor configs, got:\n{setup_stderr}",
     );
     assert!(
         setup_stderr.contains("✓ Server name: test-server"),
