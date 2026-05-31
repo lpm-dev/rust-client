@@ -2,6 +2,7 @@ use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 fn manifest_lookup_keys(package: &str) -> Vec<String> {
     let mut keys = vec![package.to_string()];
@@ -45,11 +46,12 @@ fn legacy_candidate_dir_hints(package: &str) -> Vec<String> {
     hints
 }
 
-fn prune_empty_parent_dirs(project_dir: &Path, start: &Path) -> Result<(), LpmError> {
+fn prune_empty_parent_dirs(project_dir: &Path, start: &Path) -> Result<usize, LpmError> {
     let mut current = start.to_path_buf();
+    let mut removed = 0;
     while current.starts_with(project_dir) && current != project_dir {
         match std::fs::remove_dir(&current) {
-            Ok(()) => {}
+            Ok(()) => removed += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
             Err(error) => return Err(LpmError::Io(error)),
@@ -61,14 +63,23 @@ fn prune_empty_parent_dirs(project_dir: &Path, start: &Path) -> Result<(), LpmEr
         current = parent.to_path_buf();
     }
 
-    Ok(())
+    Ok(removed)
 }
 
 /// Remove a source-delivered package (reverse of `lpm add`).
 ///
 /// Removes files that were copied by `lpm add` and cleans up the target directory.
 pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result<(), LpmError> {
+    let start = Instant::now();
     let mut removed_paths = Vec::new();
+    let mut cleaned_dirs = 0;
+
+    if !json_output {
+        install_ui::phase(&format!(
+            "Removing tracked source files for {}",
+            install_ui::yellow(package)
+        ));
+    }
 
     let mut added_sources_state = crate::added_sources_state::load_state(project_dir)?;
     let manifest_key = manifest_lookup_keys(package)
@@ -104,7 +115,7 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
             let absolute_path =
                 crate::added_sources_state::resolve_manifest_path(project_dir, tracked_path);
             if let Some(parent) = absolute_path.parent() {
-                prune_empty_parent_dirs(project_dir, parent)?;
+                cleaned_dirs += prune_empty_parent_dirs(project_dir, parent)?;
             }
         }
 
@@ -150,13 +161,21 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
     } else if removed_paths.is_empty() {
         install_ui::warn(&format!(
             "No files found for {} — it may not have been added, or was added to a custom path",
-            package.bold()
+            install_ui::yellow(package)
         ));
     } else {
-        install_ui::done(&format!("Removed {}", package.bold()));
         for path in &removed_paths {
-            eprintln!("  {}", path.dimmed());
+            eprintln!("  {} {}", "-".red(), path.dimmed());
         }
+        if cleaned_dirs > 0 || removed_paths.iter().any(|path| path.ends_with('/')) {
+            install_ui::done("Cleaned empty directories");
+        }
+        let duration = install_ui::format_duration(start.elapsed());
+        install_ui::done(&format!(
+            "Done · removed {} files in {}",
+            install_ui::green(&removed_paths.len().to_string()),
+            install_ui::green(&duration)
+        ));
     }
 
     Ok(())

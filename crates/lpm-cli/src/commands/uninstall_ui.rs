@@ -13,6 +13,10 @@ pub fn minus_package(name: &str, version: Option<&str>) {
     install_ui::minus_target(name, version, None);
 }
 
+pub fn minus_orphaned_package(name: &str, version: &str) {
+    install_ui::minus_target(name, Some(version), Some("(orphaned)"));
+}
+
 pub fn minus_command(name: &str) {
     install_ui::minus(name, None, Some("(command)"));
 }
@@ -44,6 +48,17 @@ pub fn done_removed(removed_count: usize, elapsed: Duration) {
         install_ui::packages_word(removed_count),
         install_ui::green(&duration_str),
     ));
+}
+
+pub fn done_cleaned_empty_dirs(cleaned_count: usize) {
+    if cleaned_count == 1 {
+        install_ui::done("Cleaned empty directories");
+    } else {
+        install_ui::done(&format!(
+            "Cleaned {} empty directories",
+            install_ui::bold(&cleaned_count.to_string())
+        ));
+    }
 }
 
 pub fn done_global(package: &str, version: &str) {

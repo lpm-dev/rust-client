@@ -207,10 +207,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [x] [B3] keep dependency-confusion + `--secrets` sections, colored.
 
 ### resolve — `commands/resolve.rs`
-- [ ] [B2/struct] Render `└─` transitive **tree** (nest e.g. scheduler under
+- [x] [B2/struct] Render `└─` transitive **tree** (nest e.g. scheduler under
       react), `name@version` form, drop the `v` prefix + `npm`/`lpm` kind
-      label + leading indent (L79-99). Needs the resolver to expose edges.
-- [ ] [color] version target → `yellow`, tree glyphs/`@` → `dim`. Terminus
+      label + leading indent (L79-99).
+- [x] [color] version target → `yellow`, tree glyphs/`@` → `dim`. Terminus
       `✓ Resolved N in 0.83s` already correct.
 
 ### query — `commands/query.rs`
@@ -220,50 +220,55 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [x] [color] pkg→plain, tags→`dim`. Terminus `!` already gold-correct (L386).
 
 ### outdated — `commands/outdated.rs`  (struct MATCH)
-- [ ] [color] generic — Wanted→`status_ok`/green, Latest(major)→red, section
+- [x] [color] generic — Wanted→`status_ok`/green, Latest(major)→red, section
       label→`dim` (L219-238).
 
 ### graph — `commands/graph.rs`  (struct MATCH)
-- [ ] [color] root version → `yellow`, tree glyphs/`@` → `dim` (L185-196).
+- [x] [color] root version → `yellow`, tree glyphs/`@` → `dim` (L185-196).
 
 ### info — `commands/info.rs`
-- [ ] [struct] integrity ellipsis: `…` (not ASCII `...`) and preserve tail
+- [x] [struct] integrity ellipsis: `…` (not ASCII `...`) and preserve tail
       `…mQ=` (L45-49).
-- [ ] [B3] keep distribution/downloads/versions/published sections — color
+- [x] [B3] keep distribution/downloads/versions/published sections — color
       them; do not trim to the mockup (L72-101).
-- [ ] [color] field labels→`dim`, values→plain, dep names aligned (already).
+- [x] [color] field labels→`dim`, values→plain, dep names aligned (already).
 
 ### install — `commands/install.rs` + `install_ui.rs`  (reference, struct MATCH)
 - [ ] [color] registry host in phase → `yellow`, `+` diff now green (Rule 4),
       `(vX available)` hint → `dim` (already), terminus elapsed green (already).
 
 ### uninstall — `commands/uninstall.rs` + `uninstall_ui.rs`
-- [ ] [B2] Compute orphaned transitives → print dimmed `- pkg@ver (orphaned)`
-      list; `+N pruned`, `audited N packages`, `✓ Freed X on disk`, `✓ found 0
-      vulnerabilities (was N)` (uninstall_ui.rs:49-57). All currently absent.
+- [x] [B2] Compute orphaned transitives → print `- pkg@ver (orphaned)`
+      list; remove orphaned `node_modules` entries too.
+- [x] [B2] Pruned dir line `✓ Cleaned empty directories`.
+- [ ] [B2] Security line `✓ found 0 vulnerabilities (was N)`. Needs a
+      persisted vulnerability count or an explicit audit pass; not part of the
+      client-only uninstall cleanup.
+- [ ] [B2] Disk freed line `✓ Freed X on disk`. Needs deletion-size accounting
+      before removal.
 - [x] [struct] First phase line `› Resolving dependency graph (N packages)`;
       `-` lines must carry `@version` (currently `minus(name, None, None)`).
-- [ ] [color] target version → `yellow`, removed names → plain, `(orphaned)` →
+- [x] [color] target version → `yellow`, removed names → plain, `(orphaned)` →
       `dim`, terminus duration → green.
 
 ### remove — `commands/remove.rs`  (redesign not applied at all)
-- [ ] [struct] Add `› Removing tracked source files for {pkg}` phase, `-`
+- [x] [struct] Add `› Removing tracked source files for {pkg}` phase, `-`
       (red) per removed file, `✓ Cleaned empty directories`, `✓ Done · removed
       N files in {elapsed}` (L156-159 currently bare `✓ Removed` + dim paths).
-- [ ] [time] add elapsed (no timing today).
-- [ ] [color] pkg→`yellow`, file paths→`dim`, `-`→red.
+- [x] [time] add elapsed (no timing today).
+- [x] [color] pkg→`yellow`, file paths→`dim`, `-`→red.
 
 ## Group B — tool runners
 
 ### bench — `commands/tools.rs` + `tools_ui.rs`  (DONE, reference for [time])
-- [ ] [color] `Vitest bench runner` → `yellow` (currently plain, tools_ui:38).
+- [x] [color] `Vitest bench runner` → `yellow` (currently plain, tools_ui:38).
 
 ### test — `tools.rs`/`tools_ui.rs`
-- [ ] [color] `Vitest` → `yellow`. Terminus `done_test` retained intentionally
+- [x] [color] `Vitest` → `yellow`. Terminus `done_test` retained intentionally
       (Rule 7 / runner-uniform) — leave.
 
 ### fmt / lint / check  — `tools.rs`/`tools_ui.rs`  ([time] DONE, glyph swaps DONE)
-- [ ] [color] tool name (`Biome 2.4.8`/`Oxlint 1.57.0`/`tsc --noEmit`) →
+- [x] [color] tool name (`Biome 2.4.8`/`Oxlint 1.57.0`/`tsc --noEmit`) →
       `yellow` (currently plain, tools_ui:18-24).
 
 ### run — `commands/run.rs`
@@ -287,10 +292,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
 ## Group C — security / doctor
 
 ### doctor — `commands/doctor.rs`  (glyphs+terminus DONE)
-- [ ] [struct] Column-align detail to the longest check name — L934 prints
+- [x] [struct] Column-align detail to the longest check name — L934 prints
       `{name} {detail}` with a single space, no width pad. (Compute max name
       width once.)
-- [ ] [color] check names → plain, detail → `dim` (already), terminus counts:
+- [x] [color] check names → plain, detail → `dim` (already), terminus counts:
       failures→red, warnings→gold.
 
 ### health — `commands/health.rs`  (B2 DONE)
@@ -338,19 +343,19 @@ slim/cliclack. File:line are approximate — confirm before editing.
 ## Group D — auth / identity
 
 ### whoami — `commands/whoami.rs` + `whoami_ui.rs`  (showcase, most divergent)
-- [ ] [struct] `whoami_ui::detail` routes through `install_ui::phase` → every
+- [x] [struct] `whoami_ui::detail` routes through `install_ui::phase` → every
       label row gets a stray `›` (whoami_ui.rs:19-21). Change `detail` to an
       aligned `  {label:<W}  {value}` with NO glyph.
-- [ ] [struct] Bare `tolga` header (not `✓ Logged in as …`); labels
+- [x] [struct] Bare `tolga` header (not `✓ Logged in as …`); labels
       `email/plan/mfa/pool access` (not `Plan/Pool/2FA`); add `✓ Identity
       loaded` terminus.
-- [ ] [struct] Registries: `● {name}` green bullets (currently `list_item`
+- [x] [struct] Registries: `● {name}` green bullets (currently `list_item`
       with no bullet); include lpm.dev in the **human** path (today it's
       JSON-only — `build_registries_json` L201 vs human L182-189).
-- [ ] [color] section headers `usage/scopes/registries`→`section` (gold),
+- [x] [color] section headers `usage/scopes/registries`→`section` (gold),
       `enabled`/`yes`→`status_ok`, scopes→`cyan` (already), `admin`→
       `yellow_badge` (already), bars→green (already).
-- [ ] [B3] keep over-limit + token-expiry warnings.
+- [x] [B3] keep over-limit + token-expiry warnings.
 
 ### dev — `commands/dev.rs` + `dev_ui.rs`
 - [ ] [struct] Readiness rows use `dev_ui::detail`→`install_ui::phase` (`›`);
@@ -378,9 +383,9 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `→`→`dim`. (Arrow coloring partially present — verify minor=gold.)
 
 ### token-rotate — `commands/token.rs`
-- [ ] [struct] Add the two middle `✓ Old token invalidated` + `✓ New token
+- [x] [struct] Add the two middle `✓ Old token invalidated` + `✓ New token
       stored in Keychain` lines (today jumps phase→terminus, L14-46).
-- [ ] [color] `lpm.dev`→`yellow`, `Keychain`→plain.
+- [x] [color] `lpm.dev`→`yellow`, `Keychain`→plain.
 
 ### migrate — `commands/migrate.rs`  (MISS — untouched, still old `[n/total]` UI)
 - [ ] [struct] Full rewrite to slim: `› Detecting current package manager`
@@ -394,7 +399,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
       progress bar + `sha256:`, `✓ Extracting/Linking/Pinning`, `✓ Now using
       node 22.12.0 · {elapsed}`, PATH advisory. Needs download-progress +
       timing wiring.
-- [ ] [color] version→`yellow`, sha→`dim`.
+- [x] [color] version→`yellow`, sha→`dim`.
 
 ### global — `commands/global.rs`  (SETTLED: build the table)
 - [x] [B2/struct] Build the `Package/Current/Wanted/Latest/Bins` table
@@ -436,12 +441,13 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [x] [color] port number→`yellow`, `●`+`listening`/`ready`→green, labels→`dim`.
 
 ### tunnel — `commands/tunnel.rs`  (PARTIAL)
-- [ ] [B2/struct] Add `· region {x}` suffix on opening phase; the live
-      `→ METHOD path STATUS {ms}` request stream on the start path; `press o
-      to open inspector, q to quit` footer (today `Ctrl+C`, L281). Needs region
-      fetch + per-request feed wiring.
-- [ ] [color] `localhost:3000`→`yellow`, public URL/inspector→`url`/blue,
-      method (POST gold / GET blue), status (2xx green / 4xx red), `o`/`q`→
+- [ ] [B2/struct] Add `· region {x}` suffix on opening phase. Needs region
+      fetch; **deferred** with backend/API extension.
+- [x] [B2/struct] Live `→ METHOD path STATUS {ms}` request stream on the start path.
+- [ ] [B2/struct] `press o to open inspector, q to quit` footer (today
+      `Ctrl+C`, L281). Needs keypress shutdown wiring.
+- [x] [color] `localhost:3000`→`yellow`, public URL/inspector→`url`/blue,
+      method (POST gold / GET blue), status (2xx green / 4xx red), `o`/`Ctrl+C`→
       `yellow`, `ms`/`→`→`dim`.
 
 ### env ls — `commands/env.rs`
@@ -453,9 +459,9 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `Active environment:` value→green.
 
 ### config scripts — `commands/config.rs`  ([split] cliclack — correct)
-- [ ] [struct] Terminus wording `✓ Done · script-policy = "triage"` (today
+- [x] [struct] Terminus wording `✓ Done · script-policy = "triage"` (today
       `✓ Set script-policy = triage`, no `Done ·`, no quotes, L889-901).
-- [ ] [color] quoted value→gold.
+- [x] [color] quoted value→gold.
 
 ## Group F — publish / registry / misc
 
@@ -479,9 +485,9 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [color] `tsdown`→`yellow`, terminus elapsed green (already).
 
 ### download — `commands/download.rs`
-- [ ] [stream] file list prints to stdout (L125-131) — move to stderr.
-- [ ] [struct] integrity ellipsis `…` not `...` (short_integrity L153).
-- [ ] [color] `output:`/`files extracted:` labels→`dim`, target→`yellow`.
+- [x] [stream] file list prints to stdout (L125-131) — move to stderr.
+- [x] [struct] integrity ellipsis `…` not `...` (short_integrity L153).
+- [x] [color] `output:`/`files extracted:` labels→`dim`, target→`yellow`.
 
 ### search — `commands/search.rs`  (PARTIAL)
 - [x] [struct] Drop the `N package(s) for "query":` header; per-result =

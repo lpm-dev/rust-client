@@ -270,7 +270,7 @@ pub async fn run(
                 use_ui::done(&format!(
                     "Pinned {}@{} in lpm.json",
                     runtime.as_str(),
-                    pinned_version.bold()
+                    install_ui::yellow(&pinned_version)
                 ));
             }
         }
@@ -453,7 +453,7 @@ fn print_already_installed(runtime: RuntimeKind, version: &str, json_output: boo
         use_ui::done(&format!(
             "{} {} already installed",
             runtime.display_name(),
-            version.bold()
+            install_ui::yellow(version)
         ));
     }
 }

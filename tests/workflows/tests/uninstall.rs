@@ -284,6 +284,66 @@ fn uninstall_human_output_uses_slim_ui_diff_and_done_lines() {
     );
 }
 
+#[test]
+fn uninstall_human_output_reports_orphaned_transitives_and_empty_scope_cleanup() {
+    let project = TempProject::empty(
+        r#"{"name":"ui-orphan-test","version":"1.0.0","dependencies":{"@scope/root":"^1.0.0"}}"#,
+    );
+    project.write_file(
+        "lpm.lock",
+        r#"[metadata]
+lockfile-version = 2
+resolved-with = "greedy-fusion"
+
+[[packages]]
+name = "@scope/root"
+version = "1.0.0"
+dependencies = ["@scope/leaf@1.0.0"]
+
+[[packages]]
+name = "@scope/leaf"
+version = "1.0.0"
+"#,
+    );
+    project.write_file(
+        "node_modules/@scope/root/package.json",
+        r#"{"name":"@scope/root","version":"1.0.0"}"#,
+    );
+    project.write_file(
+        "node_modules/@scope/leaf/package.json",
+        r#"{"name":"@scope/leaf","version":"1.0.0"}"#,
+    );
+
+    let out = lpm(&project)
+        .args(["uninstall", "@scope/root"])
+        .output()
+        .expect("spawn lpm uninstall orphan slim-ui test");
+
+    assert!(
+        out.status.success(),
+        "uninstall must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("- @scope/root@1.0.0"),
+        "direct removal row must include the removed scoped package, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("- @scope/leaf@1.0.0 (orphaned)"),
+        "orphaned transitive row must be reported, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Cleaned empty directories"),
+        "empty scope cleanup must be reported, got:\n{stderr}"
+    );
+    assert!(
+        !project.path().join("node_modules/@scope").exists(),
+        "empty node_modules scope directory should be pruned"
+    );
+}
+
 // ─── Real install round-trip ────────────────────────────────────────────
 
 /// Round-trip sanity: install a real package, uninstall it, observe the

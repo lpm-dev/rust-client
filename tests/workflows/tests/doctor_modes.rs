@@ -275,6 +275,15 @@ fn doctor_default_human_output_suppresses_passes_except_linker_mode_when_fails_p
         "fast-mode human output must show the Lockfile warn row. \
          stdout:\n{stdout}"
     );
+    let lockfile_row = stdout
+        .lines()
+        .find(|line| line.contains("Lockfile"))
+        .expect("Lockfile row must be present");
+    assert!(
+        lockfile_row.contains("Lockfile     "),
+        "doctor detail rows must align to the widest visible check name. \
+         row: {lockfile_row:?}\nstdout:\n{stdout}"
+    );
 
     // The `package.json` pass row must be SUPPRESSED — broken rows
     // should not be buried below healthy ones.

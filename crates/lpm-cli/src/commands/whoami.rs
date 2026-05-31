@@ -55,39 +55,36 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         return Ok(());
     }
 
+    whoami_ui::header(display_name);
     if let Some(email_str) = email {
-        whoami_ui::done(&format!(
-            "Logged in as {} — {}",
-            display_name.bold(),
-            email_str.dimmed()
-        ));
-    } else {
-        whoami_ui::done(&format!("Logged in as {}", display_name.bold()));
+        whoami_ui::detail("email", email_str);
     }
 
     // Plan & Pool
     if let Some(tier) = &user.plan_tier {
-        whoami_ui::detail("Plan", &tier.to_uppercase());
+        whoami_ui::detail("plan", &format_plan_tier(tier));
 
         if user.has_pool_access == Some(true) {
-            whoami_ui::detail("Pool", "Active");
+            whoami_ui::detail("pool access", &install_ui::status_ok("yes"));
         } else {
-            whoami_ui::detail("Pool", "Not subscribed");
+            whoami_ui::detail("pool access", "no");
         }
     }
 
     // 2FA
     if let Some(mfa) = user.mfa_enabled {
         let status = if mfa {
-            "enabled".green()
+            install_ui::status_ok("yes")
         } else {
-            "disabled".yellow()
+            install_ui::section("no")
         };
-        whoami_ui::detail("2FA", &status);
+        whoami_ui::detail("mfa", &status);
     }
 
     // Usage & Limits
     if let Some(usage) = &user.usage {
+        whoami_ui::blank_line();
+        whoami_ui::section("usage");
         let storage_mb = usage.storage_bytes as f64 / (1024.0 * 1024.0);
 
         if let Some(limits) = &user.limits {
@@ -102,17 +99,17 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 if usage.storage_bytes > limit_bytes {
                     whoami_ui::warn(&format!("Storage: {} (OVER LIMIT)", storage_msg));
                 } else {
-                    whoami_ui::detail("Storage", &storage_msg);
+                    whoami_ui::detail("storage", &storage_msg);
                 }
             } else {
-                whoami_ui::detail("Storage", &format!("{:.2}MB", storage_mb));
+                whoami_ui::detail("storage", &format!("{:.2}MB", storage_mb));
             }
 
             // Package count
             if let Some(limit_pkgs) = limits.private_packages {
                 if limit_pkgs == 0 || limit_pkgs == u32::MAX {
                     whoami_ui::detail(
-                        "Private Packages",
+                        "private pkgs",
                         &format!("{} (Unlimited)", usage.private_packages),
                     );
                 } else {
@@ -124,11 +121,11 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                     if usage.private_packages > limit_pkgs {
                         whoami_ui::warn(&format!("Private Packages: {} (OVER LIMIT)", pkg_msg));
                     } else {
-                        whoami_ui::detail("Private Packages", &pkg_msg);
+                        whoami_ui::detail("private pkgs", &pkg_msg);
                     }
                 }
             } else {
-                whoami_ui::detail("Private Packages", &format!("{}", usage.private_packages));
+                whoami_ui::detail("private pkgs", &format!("{}", usage.private_packages));
             }
 
             // Over-limit warning
@@ -145,25 +142,25 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 whoami_ui::warn("Upgrade your plan: https://lpm.dev/dashboard/settings/billing");
             }
         } else {
-            whoami_ui::detail("Storage", &format!("{:.2}MB", storage_mb));
-            whoami_ui::detail("Private Packages", &format!("{}", usage.private_packages));
+            whoami_ui::detail("storage", &format!("{:.2}MB", storage_mb));
+            whoami_ui::detail("private pkgs", &format!("{}", usage.private_packages));
         }
     }
 
     // Available Scopes
     whoami_ui::blank_line();
-    whoami_ui::phase("Available Scopes");
+    whoami_ui::section("scopes");
     if let Some(profile) = &user.profile_username {
         whoami_ui::list_item(&format!(
-            "Personal: {}",
+            "personal {}",
             format!("@lpm.dev/{profile}.*").cyan()
         ));
     } else {
-        whoami_ui::warn("Personal: Not set (https://lpm.dev/dashboard/settings)");
+        whoami_ui::warn("personal scope not set (https://lpm.dev/dashboard/settings)");
     }
 
     if !user.organizations.is_empty() {
-        whoami_ui::list_item("Organizations:");
+        whoami_ui::list_item("organizations");
         for org in &user.organizations {
             let role = org.role.as_deref().unwrap_or("member");
             let role_label = if role.eq_ignore_ascii_case("admin") {
@@ -180,13 +177,12 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     }
 
     // B4: Show external registries with stored tokens
+    whoami_ui::blank_line();
+    whoami_ui::section("registries");
+    whoami_ui::registry("lpm.dev", "authenticated", true);
     let external_registries = auth::list_stored_registries();
-    if !external_registries.is_empty() {
-        whoami_ui::blank_line();
-        whoami_ui::phase("External Registries");
-        for (name, status) in &external_registries {
-            whoami_ui::list_item(&format!("{name} {}", status.dimmed()));
-        }
+    for (name, status) in &external_registries {
+        whoami_ui::registry(name, status, true);
     }
 
     // Show token expiry warnings
@@ -194,6 +190,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     for warning in &expiry_warnings {
         whoami_ui::warn(warning);
     }
+    whoami_ui::done("Identity loaded");
     Ok(())
 }
 
@@ -215,6 +212,14 @@ fn login_command_for_registry(registry_url: &str) -> String {
         "`lpm login`".to_string()
     } else {
         format!("`lpm login --registry {registry_url}`")
+    }
+}
+
+fn format_plan_tier(tier: &str) -> String {
+    let mut chars = tier.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
