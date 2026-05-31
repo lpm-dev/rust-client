@@ -1,4 +1,5 @@
 use crate::install_ui;
+use lpm_common::format_bytes;
 use std::time::Duration;
 
 pub fn phase_resolving_graph(package_count: usize) {
@@ -59,6 +60,13 @@ pub fn done_cleaned_empty_dirs(cleaned_count: usize) {
             install_ui::bold(&cleaned_count.to_string())
         ));
     }
+}
+
+pub fn done_freed_disk(freed_bytes: u64) {
+    install_ui::done(&format!(
+        "Freed {} on disk",
+        install_ui::green(&format_bytes(freed_bytes))
+    ));
 }
 
 pub fn done_global(package: &str, version: &str) {

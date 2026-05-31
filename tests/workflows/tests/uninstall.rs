@@ -271,6 +271,10 @@ fn uninstall_human_output_uses_slim_ui_diff_and_done_lines() {
         "expected versioned removal diff rows, got:\n{stderr}"
     );
     assert!(
+        stderr.contains("✓ Freed ") && stderr.contains(" on disk"),
+        "expected freed-disk line, got:\n{stderr}"
+    );
+    assert!(
         stderr.contains("✓ Done · removed 2 packages in "),
         "expected slim completion line, got:\n{stderr}"
     );

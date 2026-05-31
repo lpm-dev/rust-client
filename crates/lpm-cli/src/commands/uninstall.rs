@@ -17,6 +17,7 @@ struct UninstallResult {
 struct CleanupReport {
     orphaned: Vec<PackageVersion>,
     cleaned_empty_dirs: usize,
+    freed_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -73,11 +74,13 @@ fn cleanup_removed_packages(
     }
 
     let node_modules = project_dir.join("node_modules");
+    let mut freed_bytes = 0u64;
     for name in removed {
-        remove_node_modules_entry(&node_modules, name)?;
+        freed_bytes = freed_bytes.saturating_add(remove_node_modules_entry(&node_modules, name)?);
     }
     for package in &orphaned {
-        remove_node_modules_entry(&node_modules, &package.name)?;
+        freed_bytes =
+            freed_bytes.saturating_add(remove_node_modules_entry(&node_modules, &package.name)?);
     }
 
     let cleaned_empty_dirs = cleanup_empty_scope_dirs(&node_modules, removed, &orphaned)?;
@@ -85,28 +88,45 @@ fn cleanup_removed_packages(
     Ok(CleanupReport {
         orphaned,
         cleaned_empty_dirs,
+        freed_bytes,
     })
 }
 
-fn remove_node_modules_entry(node_modules: &Path, name: &str) -> Result<(), LpmError> {
+fn remove_node_modules_entry(node_modules: &Path, name: &str) -> Result<u64, LpmError> {
     let link = node_modules.join(name);
     let Ok(metadata) = link.symlink_metadata() else {
-        return Ok(());
+        return Ok(0);
     };
+    let freed_bytes = removable_path_size(&link, &metadata);
 
     if metadata.file_type().is_symlink() {
         #[cfg(unix)]
         std::fs::remove_file(&link).or_else(|_| std::fs::remove_dir(&link))?;
         #[cfg(windows)]
         std::fs::remove_dir(&link).or_else(|_| std::fs::remove_file(&link))?;
-        return Ok(());
+        return Ok(freed_bytes);
     }
 
     if metadata.is_dir() {
         std::fs::remove_dir_all(&link)?;
+        return Ok(freed_bytes);
     }
 
-    Ok(())
+    if metadata.is_file() {
+        std::fs::remove_file(&link)?;
+    }
+
+    Ok(freed_bytes)
+}
+
+fn removable_path_size(path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return metadata.len();
+    }
+    if metadata.is_dir() {
+        return crate::commands::cache::dir_size(path).unwrap_or(0);
+    }
+    0
 }
 
 fn cleanup_empty_scope_dirs(
@@ -529,6 +549,7 @@ pub async fn run(
     let mut removed_versions: HashMap<String, String> = HashMap::new();
     let mut all_orphaned: Vec<PackageVersion> = Vec::new();
     let mut cleaned_empty_dirs = 0usize;
+    let mut freed_bytes = 0u64;
     for manifest_path in &targets.member_manifests {
         let per_member = uninstall_from_manifest(manifest_path, packages, json_output)?;
 
@@ -542,6 +563,7 @@ pub async fn run(
                 cleanup_removed_packages(member_dir, &per_member.removed, &per_member_versions)?;
             all_orphaned.extend(cleanup.orphaned);
             cleaned_empty_dirs += cleanup.cleaned_empty_dirs;
+            freed_bytes = freed_bytes.saturating_add(cleanup.freed_bytes);
         }
 
         all_removed.extend(per_member.removed);
@@ -598,6 +620,7 @@ pub async fn run(
             eprintln!();
             uninstall_ui::done_cleaned_empty_dirs(cleaned_empty_dirs);
         }
+        uninstall_ui::done_freed_disk(freed_bytes);
         eprintln!();
         uninstall_ui::done_removed(all_removed.len(), uninstall_start.elapsed());
     }

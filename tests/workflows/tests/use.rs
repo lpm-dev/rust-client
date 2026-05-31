@@ -646,6 +646,11 @@ async fn use_install_node_supported_specs_install_and_pin_from_mocked_dist() {
             "lpm use {spec} should pin the resolved Node version, got:\n{stderr}"
         );
         assert!(
+            stderr.contains("Downloaded Node 22.12.0 ·")
+                && stderr.contains("Verified SHA-256 sha256:"),
+            "lpm use {spec} should report the download and checksum, got:\n{stderr}"
+        );
+        assert!(
             stderr.contains("Now using Node 22.12.0 ·") && stderr.contains("PATH "),
             "lpm use {spec} should print the final runtime status and PATH hint, got:\n{stderr}"
         );
@@ -1211,8 +1216,10 @@ async fn use_install_bun_from_cached_release_and_mocked_asset() {
         "lpm use bun@1.3.14 should pin the resolved Bun version, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("Now using Bun 1.3.14 ·") && stderr.contains("sha256:"),
-        "lpm use bun@1.3.14 should print final status and checksum hint, got:\n{stderr}"
+        stderr.contains("Downloaded Bun 1.3.14 ·")
+            && stderr.contains("Verified SHA-256 sha256:")
+            && stderr.contains("Now using Bun 1.3.14 ·"),
+        "lpm use bun@1.3.14 should print download, checksum, and final status, got:\n{stderr}"
     );
     assert!(managed_bun_dir(&project, version).exists());
     assert_eq!(

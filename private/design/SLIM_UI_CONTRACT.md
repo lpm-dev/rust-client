@@ -244,7 +244,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [B2] Security line `✓ found 0 vulnerabilities (was N)`. Needs a
       persisted vulnerability count or an explicit audit pass; not part of the
       client-only uninstall cleanup.
-- [ ] [B2] Disk freed line `✓ Freed X on disk`. Needs deletion-size accounting
+- [x] [B2] Disk freed line `✓ Freed X on disk`. Needs deletion-size accounting
       before removal.
 - [x] [struct] First phase line `› Resolving dependency graph (N packages)`;
       `-` lines must carry `@version` (currently `minus(name, None, None)`).
@@ -395,7 +395,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [color] `pnpm-lock.yaml`/`lpm install`→`yellow`, labels→`dim`.
 
 ### use — `commands/use.rs` + `use_ui.rs`  (mdx says "should be" — aspirational)
-- [ ] [B2/struct] Build: `› Resolving node@22 → 22.12.0 (lts/jod)`, download
+- [x] [B2/struct] Build: `› Resolving node@22 → 22.12.0 (lts/jod)`, download
       progress bar + `sha256:`, `✓ Extracting/Linking/Pinning`, `✓ Now using
       node 22.12.0 · {elapsed}`, PATH advisory. Needs download-progress +
       timing wiring.
