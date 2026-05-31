@@ -234,7 +234,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [x] [color] field labels→`dim`, values→plain, dep names aligned (already).
 
 ### install — `commands/install.rs` + `install_ui.rs`  (reference, struct MATCH)
-- [ ] [color] registry host in phase → `yellow`, `+` diff now green (Rule 4),
+- [x] [color] registry host in phase → `yellow`, `+` diff now green (Rule 4),
       `(vX available)` hint → `dim` (already), terminus elapsed green (already).
 
 ### uninstall — `commands/uninstall.rs` + `uninstall_ui.rs`
@@ -358,10 +358,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [x] [B3] keep over-limit + token-expiry warnings.
 
 ### dev — `commands/dev.rs` + `dev_ui.rs`
-- [ ] [struct] Readiness rows use `dev_ui::detail`→`install_ui::phase` (`›`);
+- [x] [struct] Readiness rows use `dev_ui::detail`→`install_ui::phase` (`›`);
       design wants `● Node / ● Deps / ● Env` green bullets. Switch to `bullet`.
-- [ ] [color] values→plain, `(from .nvmrc)`/`(2ms)`→`dim`.
-- [ ] [B3] keep the cert-trust prompt block (dev.rs:27-50) — color its labels.
+- [x] [color] values→plain, `(from .nvmrc)`/`(2ms)`→`dim`.
+- [x] [B3] keep the cert-trust prompt block (dev.rs:27-50) — color its labels.
 
 ### login — `commands/login.rs`  ([split] browser flow, keep)
 - [x] [struct] Add `✓ Browser authentication complete` + `user:/registry:/
@@ -550,25 +550,25 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [color] target→`yellow`, `+`→green, paths→`dim`.
 
 ### filter — `commands/filter.rs`
-- [ ] [struct] Prefix each member with `● ` (now sanctioned) — today bare name
+- [x] [struct] Prefix each member with `● ` (now sanctioned) — today bare name
       for piping (L316-319). Keep bare form under `--json`/non-TTY pipe; `●`
       for human TTY.
-- [ ] [color] `●`→green, member→plain.
+- [x] [color] `●`→green, member→plain.
 
 ### remove/uninstall/resolve/query  — see Group A.
 
 ## Group G — passthrough / low-touch (color pass + verify)
 
-- [ ] bundle — `commands/bundle.rs` — HTML truncated; Rolldown passthrough.
+- [x] bundle — `commands/bundle.rs` — HTML truncated; Rolldown passthrough.
       Verify phase `› Bundling …` + `✓ Done · … in {elapsed}`; [color] generic.
-- [ ] schema — `commands/schema.rs` — (SETTLED: TTY-gated colorizer) Build a
+- [x] schema — `commands/schema.rs` — (SETTLED: TTY-gated colorizer) Build a
       small JSON syntax-colorizer over `serde_json::Value` (keys→`cyan`, string
       values→gold, numbers/bools→plain, punctuation→`dim`). Output is stdout
       (the pipeable "answer", L42) so **gate on `stdout` being a TTY** — piped /
       redirected / non-TTY / `NO_COLOR` → emit plain `to_string_pretty` bytes,
       unchanged. Write it as a reusable helper (other JSON-answer surfaces can
       reuse it); add a non-TTY byte-identical test.
-- [ ] completions — `commands/completions.rs` — shell-script output is consumed
+- [x] completions — `commands/completions.rs` — shell-script output is consumed
       by the shell; the design coloring is illustrative only. Leave as plain
       script output. [verify] no human-facing terminus needed.
 - [x] setup local — `commands/setup.rs` — struct ~MATCH; [color] `.npmrc`→
@@ -584,6 +584,6 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `lpm_common::color::enabled()`).
 - [ ] No `println!` for human progress remains except the sanctioned
       table/tree "answer" surfaces (outdated/graph/query/pool/quality).
-- [ ] `SLIM_UI.md` glyph/color tables updated to match Rule 1 + `●`.
+- [x] `SLIM_UI.md` glyph/color tables updated to match Rule 1 + `●`.
 - [ ] Run the full CI gate (clippy `--workspace --all-targets`, fmt, nextest)
       per CLAUDE.md pre-merge checklist.

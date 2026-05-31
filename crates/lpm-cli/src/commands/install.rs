@@ -4409,15 +4409,17 @@ async fn run_with_options_under_store_lock(
             // No top-level registry deps (workspace-only or empty
             // install). Fall back to the configured worker host so the
             // line isn't empty in the user's terminal.
-            install_ui::short_registry_host(client.base_url())
+            install_ui::yellow(&install_ui::short_registry_host(client.base_url()))
         } else {
             eager_origins
                 .iter()
                 .map(|o| {
-                    o.host_lower
+                    let host = o
+                        .host_lower
                         .strip_prefix("registry.")
                         .unwrap_or(&o.host_lower)
-                        .to_owned()
+                        .to_owned();
+                    install_ui::yellow(&host)
                 })
                 .collect::<Vec<_>>()
                 .join(", ")

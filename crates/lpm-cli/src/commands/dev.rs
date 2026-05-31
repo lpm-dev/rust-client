@@ -34,10 +34,10 @@ fn build_consent(yes: bool) -> lpm_cert::TrustStoreConsent<'static> {
             "system trust store to serve trusted HTTPS for development.".bold()
         );
         println!();
-        println!("    Subject:     LPM Local Development CA");
-        println!("    Fingerprint: {}", req.fingerprint);
-        println!("    Expires:     {}", req.expires);
-        println!("    Permitted:   {}", req.permitted_names.join(", "));
+        print_cert_prompt_field("Subject:", "LPM Local Development CA");
+        print_cert_prompt_field("Fingerprint:", &req.fingerprint);
+        print_cert_prompt_field("Expires:", &req.expires);
+        print_cert_prompt_field("Permitted:", &req.permitted_names.join(", "));
         if !req.name_constraints_enabled {
             println!(
                 "    {}",
@@ -59,6 +59,14 @@ fn build_consent(yes: bool) -> lpm_cert::TrustStoreConsent<'static> {
         }
         Ok(true)
     }))
+}
+
+fn print_cert_prompt_field(label: &str, value: &str) {
+    println!("{}", format_cert_prompt_field(label, value));
+}
+
+fn format_cert_prompt_field(label: &str, value: &str) -> String {
+    format!("    {} {value}", install_ui::dim(&format!("{label:<12}")))
 }
 
 /// Run the `lpm dev` command with zero-config detection.
@@ -856,9 +864,9 @@ struct StartupBannerLine {
 
 fn node_source_hint(project_dir: &Path) -> &'static str {
     if project_dir.join(".nvmrc").exists() {
-        ".nvmrc"
+        "from .nvmrc"
     } else if project_dir.join(".node-version").exists() {
-        ".node-version"
+        "from .node-version"
     } else {
         "system"
     }
@@ -872,22 +880,36 @@ fn normalize_env_banner_status(status: &str) -> (String, Option<String>) {
     }
 }
 
+fn split_trailing_parenthetical(status: &str) -> (String, Option<String>) {
+    let Some(open_index) = status.rfind(" (") else {
+        return (status.to_string(), None);
+    };
+    if !status.ends_with(')') {
+        return (status.to_string(), None);
+    }
+    (
+        status[..open_index].to_string(),
+        Some(status[open_index + 1..].to_string()),
+    )
+}
+
 fn startup_banner_lines(info: &StartupInfo, project_dir: &Path) -> Vec<StartupBannerLine> {
     let mut lines = Vec::new();
 
     if let Some(ref version) = info.node_version {
         lines.push(StartupBannerLine {
-            label: "Using Node",
+            label: "Node",
             value: version.clone(),
             hint: Some(format!("({})", node_source_hint(project_dir))),
         });
     }
 
     if !info.deps_status.is_empty() {
+        let (value, hint) = split_trailing_parenthetical(&info.deps_status);
         lines.push(StartupBannerLine {
-            label: "Dependencies",
-            value: info.deps_status.clone(),
-            hint: None,
+            label: "Deps",
+            value,
+            hint,
         });
     }
 
@@ -943,9 +965,9 @@ fn print_startup_banner(info: &StartupInfo, project_dir: &Path) {
 
     for line in startup_banner_lines(info, project_dir) {
         if let Some(hint) = line.hint {
-            dev_ui::detail_with_hint(line.label, &line.value, &hint);
+            dev_ui::readiness_with_hint(line.label, &line.value, &hint);
         } else {
-            dev_ui::detail(line.label, &line.value);
+            dev_ui::readiness(line.label, &line.value);
         }
     }
 
@@ -1331,12 +1353,12 @@ mod tests {
             startup_banner_lines(&info, dir.path()),
             vec![
                 StartupBannerLine {
-                    label: "Using Node",
+                    label: "Node",
                     value: "v22.22.1".to_string(),
-                    hint: Some("(.nvmrc)".to_string()),
+                    hint: Some("(from .nvmrc)".to_string()),
                 },
                 StartupBannerLine {
-                    label: "Dependencies",
+                    label: "Deps",
                     value: "installed in 11ms".to_string(),
                     hint: None,
                 },
@@ -1388,14 +1410,14 @@ mod tests {
             startup_banner_lines(&info, dir.path()),
             vec![
                 StartupBannerLine {
-                    label: "Using Node",
+                    label: "Node",
                     value: "v20.11.0".to_string(),
                     hint: Some("(system)".to_string()),
                 },
                 StartupBannerLine {
-                    label: "Dependencies",
-                    value: "up to date (2ms)".to_string(),
-                    hint: None,
+                    label: "Deps",
+                    value: "up to date".to_string(),
+                    hint: Some("(2ms)".to_string()),
                 },
                 StartupBannerLine {
                     label: "Env",
@@ -1408,6 +1430,16 @@ mod tests {
                     hint: Some("(--domain)".to_string()),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn cert_prompt_field_keeps_label_and_value_on_one_aligned_line() {
+        let line = format_cert_prompt_field("Fingerprint:", "sha256:abc");
+
+        assert!(
+            line.contains("Fingerprint:") && line.contains("sha256:abc"),
+            "cert prompt field must include label and value: {line:?}"
         );
     }
 

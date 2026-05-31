@@ -42,6 +42,30 @@ fn schema_lpm_json_emits_valid_json_schema_to_stdout() {
 }
 
 #[test]
+fn schema_color_always_keeps_non_tty_stdout_byte_identical() {
+    let project = TempProject::empty(r#"{"name":"schema","version":"1.0.0"}"#);
+
+    let plain = lpm(&project)
+        .args(["schema", "lpm.config.json"])
+        .output()
+        .expect("failed to run plain lpm schema");
+    let forced_color = lpm(&project)
+        .args(["--color=always", "schema", "lpm.config.json"])
+        .output()
+        .expect("failed to run color-forced lpm schema");
+
+    assert!(plain.status.success(), "plain schema must succeed");
+    assert!(
+        forced_color.status.success(),
+        "color-forced schema must succeed"
+    );
+    assert_eq!(
+        forced_color.stdout, plain.stdout,
+        "non-TTY schema stdout must remain pipe-safe even with --color=always"
+    );
+}
+
+#[test]
 fn schema_lpm_config_json_emits_hand_authored_schema_with_id() {
     let project = TempProject::empty(r#"{"name":"schema","version":"1.0.0"}"#);
 

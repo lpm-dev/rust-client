@@ -20,6 +20,11 @@ fn completions_zsh_stdout_uses_lpm_bin_name_and_lists_live_commands() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
+        output.stderr.is_empty(),
+        "completions is a pipeable script surface and must not print human progress, got:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
         stdout.contains("#compdef lpm"),
         "zsh completions must target the user-facing `lpm` bin name, got:\n{stdout}"
     );
