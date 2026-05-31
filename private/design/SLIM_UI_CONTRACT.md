@@ -286,7 +286,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [x] [color] `cowsay` target → `yellow`, `(fresh)`→green, `0`/`168ms`→green.
 
 ### quality — `commands/quality.rs`  (struct MATCH)
-- [ ] [color] pkg name → `cyan`, `score`/`tier` values → `status_ok`,
+- [x] [color] pkg name → `cyan`, `score`/`tier` values → `status_ok`,
       `checks` header → `section`, `+NN` points → green, `✓` per-check green.
 
 ## Group C — security / doctor
@@ -324,16 +324,16 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [x] [color] labels→`dim`, counts→plain, terminus green/red.
 
 ### security status — `commands/security.rs`  (struct ~MATCH)
-- [ ] [color] section headers (`effective floor`,`active unlocks`)→`section`,
+- [x] [color] section headers (`effective floor`,`active unlocks`)→`section`,
       policy values (`deny`,`false`)→gold, labels→`dim`.
-- [ ] [B3] keep policy-sources + runtime-overrides sections, colored.
+- [x] [B3] keep policy-sources + runtime-overrides sections, colored.
 
 ### cert status — `commands/cert.rs`  (struct MATCH)
-- [ ] [color] `Root CA`/`Project cert`→`section`, `trusted`/`valid`→
+- [x] [color] `Root CA`/`Project cert`→`section`, `trusted`/`valid`→
       `status_ok`, labels→`dim`.
 
 ### trust diff — `commands/trust.rs`  (struct MATCH)
-- [ ] [color] `added`/`changed`→`section`, `+`→green, `~`→gold, new hash
+- [x] [color] `added`/`changed`→`section`, `+`→green, `~`→gold, new hash
       (`sha…new`)→`yellow`, old hash/`→`→`dim`, terminus `!`→gold.
 
 ### approve-scripts — `commands/approve_scripts.rs`  ([split] correct — cliclack)
