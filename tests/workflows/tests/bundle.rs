@@ -264,7 +264,7 @@ fn bundle_uses_seeded_managed_rolldown_engine_with_lpm_flags() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("› Using Rolldown 1.0.2"),
+        stderr.contains("› Bundling with Rolldown 1.0.2"),
         "bundle must use a slim phase line, got:\n{stderr}"
     );
     assert!(

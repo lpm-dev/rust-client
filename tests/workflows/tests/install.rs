@@ -73,6 +73,37 @@ fn install_without_dependencies_uses_slim_status_output() {
     );
 }
 
+#[test]
+fn install_resolver_phase_colors_registry_host_when_color_is_forced() {
+    let project = TempProject::empty(r#"{"name":"empty-install","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "--color=always",
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        output.status.success(),
+        "empty install should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Resolving dependencies from")
+            && stderr.contains("\u{1b}[33m")
+            && stderr.contains("\u{1b}[39m"),
+        "resolver phase must color the registry host under --color=always, got:\n{stderr}"
+    );
+}
+
 // ─── Auto-create + parent-dir walk for `lpm i <pkg>` ─────────────
 //
 // Match npm/pnpm/yarn/bun DX. `lpm i <pkg>` in a directory with no

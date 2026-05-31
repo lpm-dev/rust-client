@@ -23,6 +23,7 @@
 //! - Otherwise pretty-prints to stdout.
 
 use lpm_common::LpmError;
+use serde_json::Value;
 
 /// Hand-authored `lpm.config.json` schema, baked into the binary at
 /// compile time. Source of truth; the copy under
@@ -32,14 +33,17 @@ pub const LPM_CONFIG_SCHEMA: &str = include_str!("../../schemas/lpm.config.schem
 
 /// Run the `lpm schema <kind>` subcommand.
 pub fn run(kind: &str, out: Option<&str>) -> Result<(), LpmError> {
-    let schema_text = render(kind)?;
     match out {
         Some(path) => {
+            let schema_text = render(kind)?;
             std::fs::write(path, &schema_text)
                 .map_err(|e| LpmError::Script(format!("could not write {path}: {e}")))?;
         }
         None => {
-            println!("{schema_text}");
+            let schema_value = render_value(kind)?;
+            let answer = crate::output::format_json_answer(&schema_value)
+                .map_err(|e| LpmError::Script(format!("could not serialize schema: {e}")))?;
+            println!("{answer}");
         }
     }
     Ok(())
@@ -50,20 +54,27 @@ pub fn run(kind: &str, out: Option<&str>) -> Result<(), LpmError> {
 /// Public so the drift-guard test (and any future external consumer)
 /// can produce the canonical bytes without going through the CLI.
 pub fn render(kind: &str) -> Result<String, LpmError> {
+    let value = render_value(kind)?;
+    render_pretty(&value)
+}
+
+fn render_value(kind: &str) -> Result<Value, LpmError> {
     let value = match kind {
         "lpm.json" => lpm_runner::lpm_json::generate_schema(),
-        "lpm.config.json" => {
-            serde_json::from_str::<serde_json::Value>(LPM_CONFIG_SCHEMA).map_err(|e| {
-                LpmError::Script(format!("baked-in lpm.config.json schema is invalid: {e}"))
-            })?
-        }
+        "lpm.config.json" => serde_json::from_str::<Value>(LPM_CONFIG_SCHEMA).map_err(|e| {
+            LpmError::Script(format!("baked-in lpm.config.json schema is invalid: {e}"))
+        })?,
         other => {
             return Err(LpmError::Script(format!(
                 "unknown schema '{other}' — expected one of: lpm.json, lpm.config.json"
             )));
         }
     };
-    serde_json::to_string_pretty(&value)
+    Ok(value)
+}
+
+fn render_pretty(value: &Value) -> Result<String, LpmError> {
+    serde_json::to_string_pretty(value)
         .map_err(|e| LpmError::Script(format!("could not serialize schema: {e}")))
 }
 

@@ -204,7 +204,11 @@ pub async fn bundle(
     json_output: bool,
 ) -> Result<(), LpmError> {
     if !json_output {
-        install_ui::phase(&format!("Using Rolldown {}", rolldown_version()));
+        install_ui::phase(&format!(
+            "Bundling with {} {}",
+            install_ui::yellow("Rolldown"),
+            rolldown_version()
+        ));
     }
 
     let engine_entry = lpm_plugin::ensure_engine("rolldown", None, false).await?;
