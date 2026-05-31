@@ -1,4 +1,4 @@
-use crate::output;
+use crate::{install_ui, output};
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::{RegistryClient, RouteTable};
@@ -156,6 +156,7 @@ pub async fn run(
     alias_override: Option<&str>,
     swift_target: Option<&str>,
 ) -> Result<(), LpmError> {
+    let add_started = std::time::Instant::now();
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
     // Step 1: Resolve package reference into AddTarget.
@@ -173,10 +174,6 @@ pub async fn run(
             "'{}' is similar to popular package '{}'. Did you mean '{}'?",
             warning.input, warning.similar, warning.similar
         ));
-    }
-
-    if !json_output {
-        output::info(&format!("Adding {}", target.display().bold()));
     }
 
     // Step 2: `.npmrc` setup (— mirrors install.rs:3295-3445).
@@ -268,10 +265,9 @@ pub async fn run(
         .ok_or_else(|| LpmError::NotFound(format!("version {version} not found")))?;
 
     if !json_output {
-        output::info(&format!(
-            "Downloading {}@{}",
-            target.display(),
-            version.bold()
+        install_ui::phase(&format!(
+            "Downloading source package {}",
+            install_ui::yellow(&format!("{}@{version}", target.display()))
         ));
     }
 
@@ -305,9 +301,6 @@ pub async fn run(
                 target.display(),
                 version
             )));
-        }
-        if !json_output {
-            output::info("Integrity verified");
         }
     } else {
         tracing::debug!(
@@ -507,14 +500,6 @@ pub async fn run(
         resolve_target_dir(project_dir, target_path, ecosystem, swift_target)
     };
 
-    if !json_output {
-        let rel = target_dir.strip_prefix(project_dir).unwrap_or(&target_dir);
-        output::info(&format!(
-            "Installing to {}",
-            rel.display().to_string().bold()
-        ));
-    }
-
     // Step 6: Build file list (config-based or lpm.source fallback or all files)
     let files = if let Some(config) = &lpm_config {
         if let Some(files_arr) = config.get("files").and_then(|f| f.as_array()) {
@@ -628,6 +613,10 @@ pub async fn run(
             detected
         }
     };
+
+    if !json_output {
+        print_add_project_structure(project_dir, &target_dir, &buyer_alias, ecosystem);
+    }
 
     // Build src->dest map and file sets for import resolution
     let src_to_dest: HashMap<String, String> = files.iter().cloned().collect();
@@ -817,6 +806,18 @@ pub async fn run(
         ));
     }
 
+    if !json_output {
+        install_ui::done("Files copied");
+        for (_, dest_rel, action) in &file_actions {
+            if action != "skip" {
+                print_add_file(dest_rel);
+            }
+        }
+        if skipped > 0 {
+            install_ui::skipped(&format!("{} {} unchanged", skipped, files_word(skipped)));
+        }
+    }
+
     // Step 9: Handle dependencies.
     //
     // Gate: only when `lpm.config.json` is present. Pre-the
@@ -829,7 +830,7 @@ pub async fn run(
     // (no `lpm.config.json`) keeps the download-manager contract:
     // copy bytes, surface external imports, let the user install deps
     // themselves.
-    let dep_count = if !no_install_deps && lpm_config.is_some() {
+    let installed_deps = if !no_install_deps && lpm_config.is_some() {
         handle_dependencies(
             client,
             &route_table,
@@ -846,17 +847,20 @@ pub async fn run(
     } else if !no_install_deps && lpm_config.is_none() {
         // Simple path → no auto-install. The bare-imports notice
         // below surfaces what the user should add themselves.
-        0
+        Vec::new()
     } else {
         let count = count_dependencies(&lpm_config, &inline_config, temp_dir.path())?;
         if count > 0 && !json_output {
-            output::info(&format!(
-                "Skipped {} dependencies (--no-install-deps)",
-                count
-            ));
+            install_ui::skipped(&format!("Skipped {count} dependencies (--no-install-deps)"));
         }
-        0
+        Vec::new()
     };
+    let dep_count = installed_deps.len();
+    if !json_output {
+        for (name, spec) in &installed_deps {
+            install_ui::plus(name, spec, None);
+        }
+    }
 
     // Step 9.1: Bare-imports notice — D4.
     //
@@ -975,31 +979,17 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        println!();
-        output::success(&format!(
-            "Added {}@{} ({} files)",
-            target.display().bold(),
-            version,
-            copied,
-        ));
-        if skipped > 0 {
-            println!(
-                "  {} files unchanged (skipped)",
-                skipped.to_string().dimmed()
-            );
-        }
-        if dep_count > 0 {
-            println!(
-                "  {} dependencies installed",
-                dep_count.to_string().dimmed()
-            );
-        }
-
-        // Security check for source delivery too
         if ver_meta.has_security_issues() {
             print_security_warnings(&target.display(), &version, ver_meta);
         }
-        println!();
+        let elapsed = install_ui::green(&install_ui::format_duration(add_started.elapsed()));
+        install_ui::done(&format!(
+            "Done · added {} {} and {} {} in {elapsed}",
+            copied,
+            files_word(copied),
+            dep_count,
+            dependencies_word(dep_count)
+        ));
     }
 
     // Step 12: Install skills if this is an LPM package (respects --no-skills).
@@ -1389,7 +1379,7 @@ fn handle_file_conflict(
         |n| n.to_string_lossy().to_string(),
     );
 
-    eprintln!("\n  {} File exists: {}", "\u{26a0}".yellow(), rel_display);
+    eprintln!("{}", format_file_conflict_header(&rel_display));
 
     // Show a brief line-count diff summary
     if let Some(new_text) = new_content {
@@ -1460,6 +1450,10 @@ fn handle_file_conflict(
         }
         _ => Ok(ConflictAction::Skip),
     }
+}
+
+fn format_file_conflict_header(rel_display: &str) -> String {
+    format!("\n  {} File exists: {}", "!".yellow(), rel_display)
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,6 +1558,67 @@ fn handle_dry_run(
     }
 
     Ok(())
+}
+
+fn print_add_project_structure(
+    project_dir: &Path,
+    target_dir: &Path,
+    buyer_alias: &Option<String>,
+    ecosystem: &str,
+) {
+    install_ui::phase("Detecting project structure");
+    add_detail("Framework:", &framework_label(project_dir, ecosystem));
+    let install_path = target_dir
+        .strip_prefix(project_dir)
+        .unwrap_or(target_dir)
+        .display()
+        .to_string();
+    add_detail("Install path:", &install_ui::dim(&install_path));
+    let alias = buyer_alias.as_ref().map_or_else(
+        || install_ui::dim("relative imports"),
+        |value| install_ui::cyan(value),
+    );
+    add_detail("Import alias:", &alias);
+}
+
+fn add_detail(label: &str, value: &str) {
+    let label = format!("{label:<13}");
+    install_ui::detail(&format!("    {} {}", install_ui::dim(&label), value));
+}
+
+fn framework_label(project_dir: &Path, ecosystem: &str) -> String {
+    if ecosystem == "swift" {
+        return "Swift".to_string();
+    }
+
+    match detect_framework(project_dir).as_str() {
+        "next-app" => "Next.js app router",
+        "next-pages" => "Next.js pages router",
+        "vite" => "Vite",
+        "remix" => "Remix",
+        _ => "unknown",
+    }
+    .to_string()
+}
+
+fn print_add_file(path: &str) {
+    install_ui::detail(&format!(
+        "{} {}",
+        install_ui::green("+"),
+        install_ui::dim(path)
+    ));
+}
+
+fn files_word(count: usize) -> &'static str {
+    if count == 1 { "file" } else { "files" }
+}
+
+fn dependencies_word(count: usize) -> &'static str {
+    if count == 1 {
+        "dependency"
+    } else {
+        "dependencies"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2359,15 +2414,15 @@ async fn handle_dependencies(
     _yes: bool,
     json_output: bool,
     effective_pm: &str,
-) -> Result<usize, LpmError> {
+) -> Result<Vec<(String, String)>, LpmError> {
     let entries = collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?;
 
     if entries.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     if !json_output {
-        output::info(&format!("Installing {} dependencies...", entries.len()));
+        install_ui::phase("Installing declared dependencies");
     }
 
     // Resolve latest version for each Bare / DistTag entry up-front,
@@ -2446,7 +2501,7 @@ async fn handle_dependencies(
             "no package.json found -- dependencies not installed. Run `lpm install` manually.",
         );
         let _ = ecosystem;
-        return Ok(entries.len());
+        return Ok(Vec::new());
     }
 
     // Mutate `package.json` with the resolved specs. The caller's
@@ -2541,9 +2596,6 @@ async fn handle_dependencies(
             })?;
         }
         pm_name @ ("npm" | "pnpm" | "yarn" | "bun") => {
-            if !json_output {
-                output::info(&format!("Running {pm_name} install..."));
-            }
             let status = std::process::Command::new(pm_name)
                 .arg("install")
                 .current_dir(project_dir)
@@ -2572,7 +2624,7 @@ async fn handle_dependencies(
     // the wider tx after Step 9.1.
     let _ = ecosystem; // Ecosystem used for future per-ecosystem dep handling
 
-    Ok(entries.len())
+    Ok(decisions)
 }
 
 /// Lockfile paths to snapshot for the selected package manager.
@@ -2807,6 +2859,16 @@ mod tests {
         let result = should_warn_typosquatting("loadash", dir.path());
         assert!(result.is_some(), "should warn when package not in lockfile");
         assert_eq!(result.unwrap().similar, "lodash");
+    }
+
+    #[test]
+    fn file_conflict_header_uses_slim_warning_glyph() {
+        lpm_common::color::set_enabled(false);
+
+        assert_eq!(
+            format_file_conflict_header("button.tsx"),
+            "\n  ! File exists: button.tsx"
+        );
     }
 
     #[test]

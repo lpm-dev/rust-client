@@ -8,6 +8,25 @@ mod support;
 use support::assertions;
 use support::{TempProject, lpm};
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ─── npm Migration ───────────────────────────────────────────────
 
 #[test]
@@ -81,6 +100,63 @@ fn migrate_pnpm_creates_lockfile() {
     );
 
     assertions::assert_both_lockfiles_exist(project.path());
+}
+
+#[test]
+fn migrate_human_output_uses_slim_contract() {
+    let project = TempProject::from_fixture("migrate-pnpm");
+
+    let output = lpm(&project)
+        .args([
+            "--color=always",
+            "migrate",
+            "--no-install",
+            "--force",
+            "--skip-verify",
+            "--no-npmrc",
+        ])
+        .output()
+        .expect("failed to run lpm migrate");
+
+    assert!(
+        output.status.success(),
+        "lpm migrate failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr_raw = String::from_utf8_lossy(&output.stderr);
+    let stderr = strip_ansi(&stderr_raw);
+
+    for expected in [
+        "› Detecting current package manager",
+        "source:",
+        "pnpm-lock.yaml",
+        "backups:",
+        "✓ Converted lockfile",
+        "wrote:",
+        "lpm.lock",
+        "lpm.lockb",
+        "✓ Done · migration completed successfully",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "migrate slim output missing {expected:?}, got:\n{stderr}"
+        );
+    }
+
+    assert!(
+        stderr_raw.contains("\u{1b}[2msource:")
+            && stderr_raw.contains("\u{1b}[2mbackups:")
+            && stderr_raw.contains("\u{1b}[33mpnpm-lock.yaml"),
+        "migrate slim output must dim labels and color the source lockfile, got:\n{stderr_raw:?}"
+    );
+    assert!(
+        !stderr.contains("Migrating to LPM")
+            && !stderr.contains("[1/")
+            && !stderr.contains("Next steps:"),
+        "migrate output must drop the old banner, step counters, and next-steps footer, got:\n{stderr}"
+    );
 }
 
 // ─── pnpm.overrides translation ──────────────────

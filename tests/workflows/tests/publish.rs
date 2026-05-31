@@ -202,8 +202,21 @@ async fn publish_to_mock_registry_succeeds() {
 
     let combined = format!("{stdout}{stderr}");
     assert!(
-        combined.contains("Published") || combined.contains("Package published"),
+        combined.contains("Done · published @lpm.dev/testuser.mock-publish@1.0.0"),
         "expected publish success output, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("✓ Secret scan passed")
+            && combined.contains("✓ Quality score:")
+            && combined.contains("› Uploading tarball to lpm.dev")
+            && combined.contains("target     @lpm.dev/testuser.mock-publish@1.0.0"),
+        "publish human output should use the slim contract, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Packing tarball")
+            && !combined.contains("Publishing as")
+            && !combined.contains("Uploading..."),
+        "publish human output should not include old chatter, got:\n{combined}"
     );
 }
 

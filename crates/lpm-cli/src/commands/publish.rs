@@ -1,6 +1,6 @@
 use crate::commands::publish_common::{self, TarballFile};
 use crate::commands::publish_npm;
-use crate::{auth, oidc, output, provenance, quality, sigstore};
+use crate::{auth, install_ui, oidc, output, provenance, quality, sigstore};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
@@ -206,6 +206,8 @@ pub async fn run(
     cli_registry: Option<&str>,
     provenance_flag: bool,
 ) -> Result<(), LpmError> {
+    let publish_started = std::time::Instant::now();
+
     // Step 1: Read package.json
     let pkg_json_path = project_dir.join("package.json");
     if !pkg_json_path.exists() {
@@ -440,10 +442,7 @@ pub async fn run(
             ));
         }
         if !json_output {
-            tracing::debug!(
-                "secret scan passed ({} files scanned)",
-                secret_scan.files_scanned
-            );
+            install_ui::done("Secret scan passed");
         }
     }
 
@@ -460,7 +459,7 @@ pub async fn run(
         );
 
         if !json_output {
-            print_quality_checks(&qr);
+            print_publish_quality_result(&qr);
         }
 
         // Enforce --min-score if provided
@@ -477,48 +476,6 @@ pub async fn run(
     } else {
         None
     };
-
-    // Now print the action messages
-    if !json_output {
-        let target_str = targets
-            .iter()
-            .map(|t| t.display_name())
-            .collect::<Vec<_>>()
-            .join(" + ");
-
-        // Show per-target names so the user sees what goes where
-        if target_names.is_empty() {
-            output::info(&format!(
-                "Publishing {}@{} → {target_str}",
-                name.bold(),
-                version
-            ));
-        } else {
-            let names_display = targets
-                .iter()
-                .map(|t| {
-                    let key = t.key();
-                    if let Some(target_name) = target_names.get(&key) {
-                        format!("{}: {target_name}", t.display_name())
-                    } else {
-                        format!("{}: {name}", t.display_name())
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            output::info(&format!("Publishing {}@{}", name.bold(), version));
-            output::info(&format!("Targets: {names_display}"));
-        }
-        output::info(&format!(
-            "Packing tarball... {} files ({}) → tarball {}",
-            tarball_files.len(),
-            lpm_common::format_bytes(tarball_files.iter().map(|f| f.size).sum::<u64>()),
-            lpm_common::format_bytes(tarball_size as u64),
-        ));
-        if let Some(ref qr) = quality_result {
-            print_quality_summary(qr);
-        }
-    }
 
     // Step 4b: Skills validation (LPM target only)
     let skills_dir = project_dir.join(".lpm").join("skills");
@@ -757,9 +714,6 @@ pub async fn run(
     // after tarball rewriting so the SHA-512 in the SLSA statement matches the
     // bytes actually uploaded.
     let provenance_context = if provenance_flag {
-        if !json_output {
-            output::info("Preparing Sigstore provenance...");
-        }
         let (ci, jwt) = oidc::resolve_provenance_jwt().await?;
         Some((ci, jwt))
     } else {
@@ -821,6 +775,16 @@ pub async fn run(
                         lpm_version_data["_npmProvenanceAttestations"] = bundle_json;
                     }
 
+                    if !json_output {
+                        print_upload_phase(
+                            "lpm.dev",
+                            lpm_name,
+                            version,
+                            lpm_visibility(&pkg_json),
+                            "latest",
+                        );
+                    }
+
                     publish_to_lpm(
                         client,
                         project_dir,
@@ -844,18 +808,11 @@ pub async fn run(
                 match lpm_result {
                     Ok(resp) => {
                         if !json_output {
-                            println!();
-                            output::success(&format!(
-                                "Published {}@{} → LPM ({:.1}s)",
-                                lpm_name.bold(),
-                                version.bold(),
-                                duration.as_secs_f64()
-                            ));
                             let owner_pkg = lpm_name.strip_prefix("@lpm.dev/").unwrap_or(lpm_name);
                             if let Some((owner, pkg)) = owner_pkg.split_once('.') {
-                                eprintln!(
-                                    "  {}",
-                                    format!("https://lpm.dev/{owner}/{pkg}").dimmed()
+                                publish_detail(
+                                    "url",
+                                    &install_ui::url(&format!("https://lpm.dev/{owner}/{pkg}")),
                                 );
                             }
                             if let Some(warnings) = resp.get("warnings").and_then(|w| w.as_array())
@@ -865,9 +822,6 @@ pub async fn run(
                                         output::warn(msg);
                                     }
                                 }
-                            }
-                            if let Some(ref qr) = quality_result {
-                                println!("  Quality: {}/{}", qr.score, qr.max_score);
                             }
                         }
                         results.push(PublishResult {
@@ -996,6 +950,15 @@ pub async fn run(
                         _ => publish_npm::resolve_npm_access(npm_name_str, npm_config),
                     };
                     let npm_tag = publish_npm::resolve_npm_tag(npm_config);
+                    if !json_output {
+                        print_upload_phase(
+                            display,
+                            npm_name_str,
+                            version,
+                            visibility_from_access(&npm_access),
+                            &npm_tag,
+                        );
+                    }
 
                     // OTP preemption
                     let registry_key_for_otp = match target {
@@ -1008,16 +971,6 @@ pub async fn run(
                         .and_then(|c| c.otp_required)
                         .unwrap_or(false)
                         || auth::is_otp_required(registry_key_for_otp);
-
-                    if !json_output {
-                        output::info(&format!(
-                            "Publishing {}@{} → {} ({})",
-                            npm_name_str.bold(),
-                            version,
-                            display,
-                            registry_url.dimmed()
-                        ));
-                    }
 
                     // Rewrite tarball name if needed
                     let target_tarball = if npm_name_str != name {
@@ -1078,14 +1031,6 @@ pub async fn run(
 
                     if npm_result.success {
                         if !json_output {
-                            output::success(&format!(
-                                "Published {}@{} → {} ({:.1}s)",
-                                npm_name_str.bold(),
-                                version.bold(),
-                                display,
-                                npm_result.duration.as_secs_f64()
-                            ));
-
                             let package_url = match target {
                                 PublishTarget::Npm => {
                                     Some(format!(
@@ -1111,7 +1056,7 @@ pub async fn run(
                                 _ => None,
                             };
                             if let Some(url) = package_url {
-                                eprintln!("  {}", url.dimmed());
+                                publish_detail("url", &install_ui::url(&url));
                             }
                         }
                     } else if !json_output {
@@ -1165,9 +1110,8 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if targets.len() > 1 {
-        println!();
         if any_failed {
-            output::warn(&format!(
+            install_ui::warn(&format!(
                 "Published to {succeeded} of {} registries.",
                 targets.len()
             ));
@@ -1181,11 +1125,22 @@ pub async fn run(
                 }
             }
         } else {
-            output::success(&format!("Published to {} registries.", targets.len()));
+            let elapsed =
+                install_ui::green(&install_ui::format_duration(publish_started.elapsed()));
+            install_ui::done(&format!(
+                "Done · published to {} registries in {elapsed}",
+                targets.len()
+            ));
         }
-        println!();
     } else if !any_failed {
-        println!();
+        let target = &targets[0];
+        let key = target.key();
+        let published_name = target_names.get(&key).map_or(name, |s| s.as_str());
+        let elapsed = install_ui::green(&install_ui::format_duration(publish_started.elapsed()));
+        install_ui::done(&format!(
+            "Done · published {} in {elapsed}",
+            install_ui::yellow(&format!("{published_name}@{version}"))
+        ));
     }
 
     if any_failed {
@@ -1250,16 +1205,6 @@ async fn publish_to_lpm(
         .whoami()
         .await
         .map_err(|e| LpmError::Registry(format!("authentication failed: {e}")))?;
-
-    let username = whoami
-        .profile_username
-        .as_deref()
-        .or(whoami.username.as_deref())
-        .unwrap_or("unknown");
-
-    if !json_output {
-        output::info(&format!("Publishing as {}", username.bold()));
-    }
 
     // 2FA check — prompt before uploading
     let otp_code: Option<String> = if whoami.mfa_enabled == Some(true) {
@@ -1362,10 +1307,6 @@ async fn publish_to_lpm(
             }
         },
     });
-
-    if !json_output {
-        output::info("Uploading...");
-    }
 
     let encoded_name = urlencoding::encode(name);
     client
@@ -1565,58 +1506,66 @@ fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Print the quality score summary line.
-fn print_quality_summary(result: &quality::QualityResult) {
-    let tier = match result.score {
-        90..=100 => "Excellent".green(),
-        70..=89 => "Good".blue(),
-        50..=69 => "Fair".yellow(),
-        _ => "Needs Work".dimmed(),
-    };
-    output::info(&format!(
-        "Quality: {}/{} ({})",
-        result.score.to_string().bold(),
-        result.max_score,
-        tier,
+fn print_upload_phase(
+    registry: &str,
+    target_name: &str,
+    version: &str,
+    visibility: &str,
+    dist_tag: &str,
+) {
+    install_ui::phase(&format!(
+        "Uploading tarball to {}",
+        install_ui::yellow(registry)
     ));
+    publish_detail(
+        "target",
+        &install_ui::yellow(&format!("{target_name}@{version}")),
+    );
+    publish_detail("visibility", &format_publish_visibility(visibility));
+    publish_detail("dist-tag", &install_ui::yellow(dist_tag));
 }
 
-/// Print the detailed quality checks table.
-fn print_quality_checks(result: &quality::QualityResult) {
-    println!();
-    let mut categories: std::collections::BTreeMap<&str, Vec<&quality::QualityCheck>> =
-        std::collections::BTreeMap::new();
-    for check in &result.checks {
-        categories.entry(&check.category).or_default().push(check);
-    }
+fn publish_detail(label: &str, value: &str) {
+    let label = format!("{label:<10}");
+    install_ui::detail(&format!("    {} {}", install_ui::dim(&label), value));
+}
 
-    for (category, checks) in &categories {
-        let cat_score: u32 = checks.iter().map(|c| c.points).sum();
-        let cat_max: u32 = checks.iter().map(|c| c.max_points).sum();
-        println!("  {} ({}/{})", category.bold(), cat_score, cat_max);
+fn lpm_visibility(_pkg_json: &serde_json::Value) -> &'static str {
+    "private"
+}
 
-        for check in checks {
-            let icon = if check.server_only {
-                "~".dimmed().to_string()
-            } else if check.passed {
-                "✓".green().to_string()
-            } else {
-                "✗".red().to_string()
-            };
-            let pts_str = format!("{}/{}", check.points, check.max_points);
-            let pts = pts_str.dimmed();
-            print!("    {icon} {} {pts}", check.id);
-            if !check.passed && !check.server_only {
-                let tip = format!("← +{} pts", check.max_points);
-                print!(" {}", tip.dimmed());
-            }
-            if let Some(detail) = &check.detail {
-                print!(" {}", detail.dimmed());
-            }
-            println!();
-        }
+fn visibility_from_access(access: &str) -> &str {
+    if access == "restricted" {
+        "private"
+    } else {
+        access
     }
-    println!();
+}
+
+fn format_publish_visibility(visibility: &str) -> String {
+    match visibility {
+        "public" => install_ui::status_ok("public"),
+        other => install_ui::yellow(other),
+    }
+}
+
+fn print_publish_quality_result(result: &quality::QualityResult) {
+    install_ui::done(&format!(
+        "Quality score: {}/{}",
+        result.score, result.max_score
+    ));
+    for check in result.checks.iter().filter(|check| !check.passed) {
+        install_ui::warn(&format_publish_quality_issue(check));
+    }
+}
+
+fn format_publish_quality_issue(check: &quality::QualityCheck) -> String {
+    let detail = check.detail.as_deref().unwrap_or(if check.server_only {
+        "pending"
+    } else {
+        "missing"
+    });
+    format!("{}  {}", check.label, install_ui::dim(detail))
 }
 
 /// Extract and normalize Swift manifest metadata from raw `swift package dump-package` output.
