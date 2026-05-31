@@ -504,7 +504,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
       helper), file→plain, size→`dim`.
 
 ### swift-registry — `commands/swift_registry.rs`  (struct MATCH, has copy test)
-- [ ] [color] `lpmdev` scope target→`yellow`; keep the pinned-copy test green.
+- [x] [color] `lpmdev` scope target→`yellow`; keep the pinned-copy test green.
 
 ### mcp setup — `commands/mcp.rs`
 - [x] [B2/struct] List ALL editors incl. unconfigured with `○ {name} skipped
@@ -514,7 +514,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `Server name:` value (`lpm-registry`)→`yellow`.
 
 ### plugin list — `commands/plugin.rs`  (struct MATCH)
-- [ ] [color] `Latest` when newer→`yellow`, `update available`→gold,
+- [x] [color] `Latest` when newer→`yellow`, `update available`→gold,
       `current`→`status_ok`, labels→`dim`.
 
 ### plugin update — `commands/plugin.rs` + `lpm-plugin` crate
@@ -524,13 +524,13 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [color] version→`yellow`, `→`→`dim`.
 
 ### patch / patch-commit — `commands/patch.rs`  (struct MATCH)
-- [ ] [color] target `lodash@4.17.21`→`yellow`, `source:/staging:` paths→
+- [x] [color] target `lodash@4.17.21`→`yellow`, `source:/staging:` paths→
       `dim`, the `lpm patch-commit …` hint→`yellow`, `package.json › lpm.
       patchedDependencies` key→`cyan`.
 
 ### patch-remove — `commands/patch.rs`  (PARTIAL — HTML truncated, use mdx)
-- [ ] [struct] Align `manifest:`/`file:` labels (mixed `{:<8}` overflow).
-- [ ] [color] generic.
+- [x] [struct] Align `manifest:`/`file:` labels (mixed `{:<8}` overflow).
+- [x] [color] generic.
 
 ### init — `commands/init.rs`  ([split] prompts stay cliclack)
 - [ ] [struct] `✓ Wrote package.json` (today `Created`); add `✓ Added lpm.lockb
