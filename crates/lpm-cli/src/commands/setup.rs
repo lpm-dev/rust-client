@@ -116,7 +116,7 @@ pub async fn run(
             let _ = std::fs::set_permissions(&npmrc_path, std::fs::Permissions::from_mode(0o600));
         }
 
-        install_ui::done(&format!("Generated {}", install_ui::bold(".npmrc")));
+        install_ui::done("Generated .npmrc");
         hint_line(&npmrc_path.display().to_string());
 
         if use_oidc && token.is_some() {
@@ -130,7 +130,7 @@ pub async fn run(
             install_ui::warn("No token found — .npmrc uses ${LPM_TOKEN} placeholder.");
             hint_line(&format!(
                 "Set {} in your CI environment.",
-                install_ui::bold("LPM_TOKEN")
+                install_ui::cyan("LPM_TOKEN")
             ));
         }
     }

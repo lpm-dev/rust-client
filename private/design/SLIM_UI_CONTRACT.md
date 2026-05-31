@@ -570,10 +570,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] completions — `commands/completions.rs` — shell-script output is consumed
       by the shell; the design coloring is illustrative only. Leave as plain
       script output. [verify] no human-facing terminus needed.
-- [ ] setup local — `commands/setup.rs` — struct ~MATCH; [color] `.npmrc`→
+- [x] setup local — `commands/setup.rs` — struct ~MATCH; [color] `.npmrc`→
       plain, `30 days`→`yellow`, labels→`dim`.
-- [ ] setup ci — `commands/setup.rs` — HTML truncated; use mdx; [color] generic.
-- [ ] cache prune — `commands/cache_prune.rs` — [color] generic + verify
+- [x] setup ci — `commands/setup.rs` — HTML truncated; use mdx; [color] generic.
+- [x] cache prune — `commands/cache_prune.rs` — [color] generic + verify
       `✓ Done · … in {elapsed}`.
 
 ## Cross-cutting verification (after all command rows)

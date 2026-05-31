@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use std::path::Path;
 
@@ -118,11 +117,12 @@ pub async fn run(
                         install_ui::warn("Proxy mode routes all npm traffic through lpm.dev.");
                         install_ui::warn(&format!(
                             "This is designed for Pro/Org accounts. Your plan: {}.",
-                            tier.bold()
+                            install_ui::yellow(tier)
                         ));
-                        install_ui::phase(
-                            "Upgrade at https://lpm.dev/pricing for dependency analytics and org audit.",
-                        );
+                        install_ui::phase(&format!(
+                            "Upgrade at {} for dependency analytics and org audit.",
+                            install_ui::url("https://lpm.dev/pricing")
+                        ));
                     }
                 }
                 Err(_) => {
@@ -231,10 +231,23 @@ pub async fn run(
             install_ui::phase("Only @lpm.dev packages will route through lpm.dev.");
         }
         if !expires_at.is_empty() {
-            install_ui::phase(&format!("Token expires: {}", expires_at.dimmed()));
+            install_ui::phase(&format!(
+                "{} {} ({})",
+                install_ui::dim("Token expires:"),
+                expires_at,
+                install_ui::yellow(&format_days_label(days))
+            ));
         }
         install_ui::phase("Run `lpm setup local` again to refresh when expired.");
     }
 
     Ok(())
+}
+
+fn format_days_label(days: u32) -> String {
+    if days == 1 {
+        "1 day".to_string()
+    } else {
+        format!("{days} days")
+    }
 }
