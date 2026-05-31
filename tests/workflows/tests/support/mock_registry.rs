@@ -1235,11 +1235,7 @@ impl MockRegistry {
 
         Mock::given(method("POST"))
             .and(path("/api/registry/batch-metadata"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(ndjson)
-                    .insert_header("content-type", "application/x-ndjson"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_raw(ndjson, "application/x-ndjson"))
             .mount(&self.server)
             .await;
         self

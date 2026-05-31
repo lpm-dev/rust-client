@@ -2971,6 +2971,8 @@ impl RegistryClient {
                     distribution_mode: Some("npm".to_string()),
                     download_count: None,
                     latest_version: Some(object.package.version),
+                    ecosystem: Some("js".to_string()),
+                    quality_score: None,
                     category: None,
                     avatar_url: None,
                     is_org: None,

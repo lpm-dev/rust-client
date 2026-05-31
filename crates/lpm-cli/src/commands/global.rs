@@ -249,11 +249,14 @@ async fn run_list_outdated(
         if latest == entry.resolved {
             up_to_date.push(name.clone());
         } else {
+            let absolute_latest = pick_absolute_latest(meta).unwrap_or_else(|| latest.clone());
             outdated.push(OutdatedRow {
                 package: name.clone(),
                 current: entry.resolved.clone(),
-                latest,
+                wanted: latest,
+                latest: absolute_latest,
                 saved_spec: entry.saved_spec.clone(),
+                bins: enrich_commands(name, entry, manifest),
             });
         }
     }
@@ -275,8 +278,10 @@ async fn run_list_outdated(
 struct OutdatedRow {
     package: String,
     current: String,
+    wanted: String,
     latest: String,
     saved_spec: String,
+    bins: Vec<String>,
 }
 
 /// A globally-installed package that could not be compared — missing
@@ -340,6 +345,16 @@ fn pick_latest_matching(
         .ok_or_else(|| format!("no version of '{}' satisfies '{}'", meta.name, saved_spec))
 }
 
+fn pick_absolute_latest(meta: &lpm_registry::PackageMetadata) -> Option<String> {
+    meta.dist_tags.get("latest").cloned().or_else(|| {
+        meta.versions
+            .keys()
+            .filter_map(|s| lpm_semver::Version::parse(s).ok())
+            .max()
+            .map(|v| v.to_string())
+    })
+}
+
 // Step 6 fix: removed `build_registry` — all callers now
 // receive the injected `&RegistryClient` from `main.rs` so the
 // `--registry` flag and the shared `SessionManager` are honored.
@@ -355,7 +370,7 @@ fn emit_outdated_json(
             serde_json::json!({
                 "package": r.package,
                 "current": r.current,
-                "latest": r.latest,
+                "latest": r.wanted,
                 "saved_spec": r.saved_spec,
             })
         })
@@ -395,21 +410,40 @@ fn emit_outdated_human(
     if !outdated.is_empty() {
         println!();
         println!("  {} outdated:", outdated.len().to_string().bold(),);
+        let widths = OutdatedTableWidths::for_rows(outdated);
+        println!(
+            "  {}  {}  {}  {}  {}",
+            format!("{:<width$}", "Package", width = widths.package).dimmed(),
+            format!("{:<width$}", "Current", width = widths.current).dimmed(),
+            format!("{:<width$}", "Wanted", width = widths.wanted).dimmed(),
+            format!("{:<width$}", "Latest", width = widths.latest).dimmed(),
+            "Bins".dimmed()
+        );
         for r in outdated {
             let package_safe = sanitize_for_terminal(&r.package);
             let current_safe = sanitize_for_terminal(&r.current);
+            let wanted_safe = sanitize_for_terminal(&r.wanted);
             let latest_safe = sanitize_for_terminal(&r.latest);
+            let bins_safe = format_bins(&r.bins);
+            let package_col = format!("{package_safe:<width$}", width = widths.package);
+            let current_col = format!("{current_safe:<width$}", width = widths.current).dimmed();
+            let wanted_col = format!("{wanted_safe:<width$}", width = widths.wanted).green();
+            let latest_raw = format!("{latest_safe:<width$}", width = widths.latest);
+            let latest_col = style_latest_version(&latest_raw, &r.wanted, &r.latest);
+            let spec_suffix = if verbose {
+                let spec_safe = sanitize_for_terminal(&r.saved_spec);
+                format!("  (spec: {})", spec_safe.dimmed())
+            } else {
+                String::new()
+            };
             println!(
-                "    {} {} \u{2192} {}{}",
-                package_safe.bold(),
-                current_safe.dimmed(),
-                latest_safe.green(),
-                if verbose {
-                    let spec_safe = sanitize_for_terminal(&r.saved_spec);
-                    format!("  (spec: {})", spec_safe.dimmed())
-                } else {
-                    String::new()
-                },
+                "  {}  {}  {}  {}  {}{}",
+                package_col,
+                current_col,
+                wanted_col,
+                latest_col,
+                bins_safe.dimmed(),
+                spec_suffix,
             );
         }
         println!();
@@ -442,6 +476,58 @@ fn emit_outdated_human(
             up_to_date.len(),
             names_safe.join(", ").dimmed(),
         ));
+    }
+}
+
+struct OutdatedTableWidths {
+    package: usize,
+    current: usize,
+    wanted: usize,
+    latest: usize,
+}
+
+impl OutdatedTableWidths {
+    fn for_rows(rows: &[OutdatedRow]) -> Self {
+        let mut widths = Self {
+            package: "Package".len(),
+            current: "Current".len(),
+            wanted: "Wanted".len(),
+            latest: "Latest".len(),
+        };
+        for row in rows {
+            widths.package = widths
+                .package
+                .max(sanitize_for_terminal(&row.package).len());
+            widths.current = widths
+                .current
+                .max(sanitize_for_terminal(&row.current).len());
+            widths.wanted = widths.wanted.max(sanitize_for_terminal(&row.wanted).len());
+            widths.latest = widths.latest.max(sanitize_for_terminal(&row.latest).len());
+        }
+        widths
+    }
+}
+
+fn format_bins(bins: &[String]) -> String {
+    if bins.is_empty() {
+        return "-".to_string();
+    }
+    bins.iter()
+        .map(|bin| sanitize_for_terminal(bin))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn style_latest_version(padded_latest: &str, wanted: &str, latest: &str) -> String {
+    if latest == wanted {
+        return padded_latest.yellow();
+    }
+    let wanted_major = lpm_semver::Version::parse(wanted).ok().map(|v| v.major());
+    let latest_major = lpm_semver::Version::parse(latest).ok().map(|v| v.major());
+    if matches!((wanted_major, latest_major), (Some(wanted), Some(latest)) if latest > wanted) {
+        padded_latest.red()
+    } else {
+        padded_latest.yellow()
     }
 }
 

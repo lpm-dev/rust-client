@@ -47,13 +47,3 @@ pub fn field(label: &str, value: &str) {
     let label = format!("{label}:");
     eprintln!("    {} {value}", format!("{label:<24}").dimmed());
 }
-
-/// Format a distribution mode badge.
-pub fn mode_badge(mode: &str) -> String {
-    match mode {
-        "pool" => "pool".cyan(),
-        "marketplace" => "marketplace".magenta(),
-        "private" => "private".yellow(),
-        _ => mode.dimmed(),
-    }
-}

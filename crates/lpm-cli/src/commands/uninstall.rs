@@ -3,7 +3,7 @@ use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -142,6 +142,43 @@ fn select_locked_package_for_requested_spec<'a>(
 fn split_locked_dependency(entry: &str) -> Option<(&str, &str)> {
     let at = entry.rfind('@')?;
     (at > 0).then(|| (&entry[..at], &entry[at + 1..]))
+}
+
+fn locked_package_versions(project_dir: &Path, packages: &[String]) -> HashMap<String, String> {
+    let mut versions = HashMap::with_capacity(packages.len());
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    if let Ok(lockfile) = lpm_lockfile::Lockfile::read_fast(&lockfile_path) {
+        let package_names: HashSet<&str> = packages.iter().map(String::as_str).collect();
+        for pkg in &lockfile.packages {
+            if package_names.contains(pkg.name.as_str()) {
+                versions.insert(pkg.name.clone(), pkg.version.clone());
+            }
+        }
+    }
+
+    for name in packages {
+        if versions.contains_key(name) {
+            continue;
+        }
+        if let Some(version) = node_modules_package_version(project_dir, name) {
+            versions.insert(name.clone(), version);
+        }
+    }
+
+    versions
+}
+
+fn node_modules_package_version(project_dir: &Path, package: &str) -> Option<String> {
+    let manifest_path = project_dir
+        .join("node_modules")
+        .join(package)
+        .join("package.json");
+    let content = std::fs::read_to_string(manifest_path).ok()?;
+    let manifest: Value = serde_json::from_str(&content).ok()?;
+    manifest
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<(), LpmError> {
@@ -375,7 +412,7 @@ pub async fn run(
 
     let uninstall_start = Instant::now();
     if !json_output {
-        uninstall_ui::phase_removing(packages.len(), targets.member_manifests.len());
+        uninstall_ui::phase_resolving_graph(packages.len());
     }
 
     // Run uninstall against every target manifest. Aggregate results so we
@@ -387,6 +424,7 @@ pub async fn run(
     // clean each member's own state — not the workspace root's.
     let mut all_removed: Vec<String> = Vec::new();
     let mut all_not_found: Vec<String> = Vec::new();
+    let mut removed_versions: HashMap<String, String> = HashMap::new();
     for manifest_path in &targets.member_manifests {
         let per_member = uninstall_from_manifest(manifest_path, packages, json_output)?;
 
@@ -394,6 +432,7 @@ pub async fn run(
             // Clean THIS member's lockfile and node_modules. install_root_for
             // returns the manifest's parent directory.
             let member_dir = crate::commands::install_targets::install_root_for(manifest_path);
+            removed_versions.extend(locked_package_versions(member_dir, &per_member.removed));
             cleanup_removed_packages(member_dir, &per_member.removed)?;
         }
 
@@ -436,7 +475,7 @@ pub async fn run(
     } else {
         eprintln!();
         for name in &all_removed {
-            uninstall_ui::minus_package(name);
+            uninstall_ui::minus_package(name, removed_versions.get(name).map(String::as_str));
         }
         if !all_not_found.is_empty() {
             eprintln!();

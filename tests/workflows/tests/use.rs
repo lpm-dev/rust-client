@@ -636,16 +636,18 @@ async fn use_install_node_supported_specs_install_and_pin_from_mocked_dist() {
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("Installed Node 22.12.0"),
-            "lpm use {spec} should report the installed Node version, got:\n{stderr}"
+            stderr.contains("Resolving node@")
+                && stderr.contains("→ 22.12.0")
+                && stderr.contains("(lts/jod)"),
+            "lpm use {spec} should report the resolved Node version, got:\n{stderr}"
         );
         assert!(
             stderr.contains("Pinned node@22.12.0 in lpm.json"),
             "lpm use {spec} should pin the resolved Node version, got:\n{stderr}"
         );
         assert!(
-            stderr.contains("installed at"),
-            "lpm use {spec} should print the runtime install location, got:\n{stderr}"
+            stderr.contains("Now using Node 22.12.0 ·") && stderr.contains("PATH "),
+            "lpm use {spec} should print the final runtime status and PATH hint, got:\n{stderr}"
         );
 
         assert!(
@@ -1201,12 +1203,16 @@ async fn use_install_bun_from_cached_release_and_mocked_asset() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Installed Bun 1.3.14"),
-        "lpm use bun@1.3.14 should report the installed Bun version, got:\n{stderr}"
+        stderr.contains("Resolving bun@1.3.14") && stderr.contains("→ 1.3.14"),
+        "lpm use bun@1.3.14 should report the resolved Bun version, got:\n{stderr}"
     );
     assert!(
         stderr.contains("Pinned bun@1.3.14 in lpm.json"),
         "lpm use bun@1.3.14 should pin the resolved Bun version, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Now using Bun 1.3.14 ·") && stderr.contains("sha256:"),
+        "lpm use bun@1.3.14 should print final status and checksum hint, got:\n{stderr}"
     );
     assert!(managed_bun_dir(&project, version).exists());
     assert_eq!(

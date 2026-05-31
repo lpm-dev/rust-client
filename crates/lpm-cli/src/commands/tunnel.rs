@@ -193,8 +193,12 @@ async fn run_start(
 
     // Spawn webhook consumer: pushes to inspector state for real-time SSE streaming
     let inspector_state_consumer = inspector_state.clone();
+    let print_request_stream = !json_output;
     tokio::spawn(async move {
         while let Some(webhook) = webhook_rx.recv().await {
+            if print_request_stream {
+                print_tunnel_request(&webhook);
+            }
             inspector_state_consumer.push(webhook).await;
         }
     });
@@ -220,7 +224,10 @@ async fn run_start(
     };
 
     if !json_output {
-        install_ui::phase(&format!("Opening tunnel for localhost:{port}"));
+        install_ui::phase(&format!(
+            "Opening tunnel for {}",
+            install_ui::yellow(&format!("localhost:{port}"))
+        ));
     }
 
     let tunnel_auth_display = tunnel_auth_token.clone();
@@ -278,7 +285,15 @@ async fn run_start(
                 tunnel_detail("domain", &session.domain);
                 eprintln!();
                 install_ui::done("Listening for requests");
-                eprintln!("press Ctrl+C to stop the tunnel");
+                if inspector_url.is_some() {
+                    eprintln!(
+                        "  press {} to open inspector, {} to stop",
+                        install_ui::yellow("o"),
+                        install_ui::yellow("Ctrl+C")
+                    );
+                } else {
+                    eprintln!("  press {} to stop", install_ui::yellow("Ctrl+C"));
+                }
             }
         },
         |msg| {
@@ -693,7 +708,48 @@ fn tunnel_detail(label: &str, value: impl Display) {
 }
 
 fn format_tunnel_detail(label: &str, value: impl Display) -> String {
-    format!("    {label:<11} {value}")
+    let value = style_tunnel_detail_value(label, &value.to_string());
+    format!("    {} {value}", format!("{label:<11}").dimmed())
+}
+
+fn style_tunnel_detail_value(label: &str, value: &str) -> String {
+    match label {
+        "public URL" | "inspector" | "browser" => install_ui::url(value),
+        "local" => install_ui::yellow(value),
+        _ => value.to_string(),
+    }
+}
+
+fn print_tunnel_request(webhook: &lpm_tunnel::webhook::CapturedWebhook) {
+    eprintln!("{}", format_tunnel_request(webhook));
+}
+
+fn format_tunnel_request(webhook: &lpm_tunnel::webhook::CapturedWebhook) -> String {
+    format!(
+        "  {} {} {} {} {}",
+        "→".dimmed(),
+        style_http_method(&webhook.method),
+        webhook.path,
+        style_http_status(webhook.response_status),
+        format!("{}ms", webhook.duration_ms).dimmed(),
+    )
+}
+
+fn style_http_method(method: &str) -> String {
+    match method {
+        "GET" => method.blue(),
+        "POST" => method.yellow(),
+        _ => method.to_string(),
+    }
+}
+
+fn style_http_status(status: u16) -> String {
+    let status = status.to_string();
+    match status.as_bytes().first() {
+        Some(b'2') | Some(b'3') => status.green(),
+        Some(b'4') | Some(b'5') => status.red(),
+        _ => status.yellow(),
+    }
 }
 
 /// Parse a flag with a numeric value from the args list.
@@ -880,10 +936,8 @@ fn is_valid_tunnel_domain(domain: &str) -> bool {
 
 /// Return ANSI color escape code for HTTP status codes.
 fn status_ansi_color(status: u16) -> &'static str {
-    if status >= 500 {
+    if status >= 400 {
         "\x1b[31m" // red
-    } else if status >= 400 {
-        "\x1b[33m" // yellow
     } else {
         "\x1b[32m" // green
     }
@@ -918,6 +972,32 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_request_line_renders_method_path_status_and_duration() {
+        lpm_common::color::set_enabled(false);
+        let webhook = lpm_tunnel::webhook::CapturedWebhook {
+            id: "req_1".to_string(),
+            timestamp: "2026-05-31T00:00:00Z".to_string(),
+            method: "POST".to_string(),
+            path: "/hooks/stripe".to_string(),
+            request_headers: std::collections::HashMap::new(),
+            request_body: Vec::new(),
+            response_status: 201,
+            response_headers: std::collections::HashMap::new(),
+            response_body: Vec::new(),
+            duration_ms: 42,
+            provider: None,
+            summary: String::new(),
+            signature_diagnostic: None,
+            auto_acked: false,
+        };
+
+        assert_eq!(
+            format_tunnel_request(&webhook),
+            "  → POST /hooks/stripe 201 42ms"
+        );
+    }
+
+    #[test]
     fn invalid_tunnel_domain_too_short() {
         assert!(!is_valid_tunnel_domain("ab.lpm.llc"));
     }
@@ -941,6 +1021,8 @@ mod tests {
 
     #[test]
     fn tunnel_detail_rows_match_slim_ready_block_spacing() {
+        lpm_common::color::set_enabled(false);
+
         assert_eq!(
             format_tunnel_detail("public URL", "https://acme-api.lpm.fyi"),
             "    public URL  https://acme-api.lpm.fyi"

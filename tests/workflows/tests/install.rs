@@ -1209,7 +1209,7 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
                 "version": "2.1.3",
                 "dist": {
                     "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
-                    "integrity": "sha512-placeholder",
+                    "integrity": compute_integrity(&tarball),
                 },
                 "dependencies": {}
             }
@@ -1355,7 +1355,7 @@ async fn install_json_output_contains_package_list() {
                 "version": "2.1.3",
                 "dist": {
                     "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
-                    "integrity": "sha512-placeholder",
+                    "integrity": compute_integrity(&tarball),
                 },
                 "dependencies": {}
             }
