@@ -88,13 +88,13 @@ fn list_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         install_ui::warn("No skills installed");
     } else {
         let total: usize = packages.iter().map(|(_, s)| s.len()).sum();
+        let width = packages
+            .iter()
+            .flat_map(|(_, skills)| skills.iter().map(|(name, _)| name.len() + ".md".len()))
+            .max()
+            .unwrap_or(0);
         for (pkg_name, skills) in &packages {
-            println!("{}", format!("@lpm.dev/{pkg_name}").cyan());
-            let width = skills
-                .iter()
-                .map(|(name, _)| name.len() + ".md".len())
-                .max()
-                .unwrap_or(0);
+            println!("{}", install_ui::cyan(&format!("@lpm.dev/{pkg_name}")));
             for (name, size) in skills {
                 let file_name = format!("{name}.md");
                 println!(

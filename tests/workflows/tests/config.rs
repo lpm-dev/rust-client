@@ -69,7 +69,7 @@ fn config_set_human_uses_slim_success() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✓ Set registry = https://registry.example.test"),
+        stderr.contains("✓ Done · registry = \"https://registry.example.test\""),
         "config set must use a slim success line, got:\n{stderr}",
     );
     assert!(

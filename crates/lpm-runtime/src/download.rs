@@ -6,6 +6,29 @@ use crate::platform::Platform;
 use lpm_common::LpmError;
 use std::path::Path;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeInstallReport {
+    /// Installed runtime version without a leading `v`.
+    pub version: String,
+    /// Number of compressed archive bytes read from the network.
+    pub downloaded_bytes: Option<u64>,
+    /// Declared compressed archive size from `Content-Length`, when present.
+    pub total_bytes: Option<u64>,
+    /// SHA-256 checksum that was verified for the downloaded archive.
+    pub sha256: Option<String>,
+}
+
+impl RuntimeInstallReport {
+    fn already_installed(version: &str) -> Self {
+        Self {
+            version: version.to_string(),
+            downloaded_bytes: None,
+            total_bytes: None,
+            sha256: None,
+        }
+    }
+}
+
 /// Download and install a Node.js release.
 ///
 /// 1. Download the tarball from nodejs.org
@@ -16,6 +39,18 @@ pub async fn install_node(
     release: &NodeRelease,
     platform: &Platform,
 ) -> Result<String, LpmError> {
+    Ok(install_node_with_report(client, release, platform)
+        .await?
+        .version)
+}
+
+/// Download, verify, extract, and install a Node.js release, returning
+/// the facts useful for human progress output.
+pub async fn install_node_with_report(
+    client: &reqwest::Client,
+    release: &NodeRelease,
+    platform: &Platform,
+) -> Result<RuntimeInstallReport, LpmError> {
     let version = release.version_bare();
     let target_dir = node::node_version_dir(version)?;
 
@@ -24,7 +59,7 @@ pub async fn install_node(
             "node {version} already installed at {}",
             target_dir.display()
         );
-        return Ok(version.to_string());
+        return Ok(RuntimeInstallReport::already_installed(version));
     }
 
     let url = release.download_url(platform);
@@ -44,24 +79,16 @@ pub async fn install_node(
         });
     }
 
-    // Check Content-Length header for early rejection of oversized downloads
-    if let Some(content_length) = resp.content_length() {
-        validate_download_size(content_length as usize)?;
-    }
+    let (bytes, total_size) = read_download_body(resp, "node", version).await?;
 
-    let total_size = resp.content_length().unwrap_or(0);
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Network(format!("failed to read node download: {e}")))?;
-
-    // Also validate actual size (Content-Length can lie or be absent)
-    validate_download_size(bytes.len())?;
-
-    tracing::debug!("downloaded {} bytes (expected {})", bytes.len(), total_size);
+    tracing::debug!(
+        "downloaded {} bytes (expected {:?})",
+        bytes.len(),
+        total_size
+    );
 
     // Verify SHA-256 checksum — hard failure on mismatch
-    verify_checksum(client, release, platform, &bytes).await?;
+    let sha256 = verify_checksum(client, release, platform, &bytes).await?;
 
     // Extract tarball
     let parent = target_dir
@@ -96,7 +123,12 @@ pub async fn install_node(
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     tracing::debug!("installed node {version} to {}", target_dir.display());
-    Ok(version.to_string())
+    Ok(RuntimeInstallReport {
+        version: version.to_string(),
+        downloaded_bytes: Some(bytes.len() as u64),
+        total_bytes: total_size,
+        sha256: Some(sha256),
+    })
 }
 
 /// Download and install a Bun release.
@@ -108,6 +140,18 @@ pub async fn install_bun(
     release: &BunRelease,
     asset: &BunAsset,
 ) -> Result<String, LpmError> {
+    Ok(install_bun_with_report(client, release, asset)
+        .await?
+        .version)
+}
+
+/// Download, verify, extract, and install a Bun release, returning the
+/// facts useful for human progress output.
+pub async fn install_bun_with_report(
+    client: &reqwest::Client,
+    release: &BunRelease,
+    asset: &BunAsset,
+) -> Result<RuntimeInstallReport, LpmError> {
     let version = release.version_bare();
     let target_dir = bun::bun_version_dir(version)?;
 
@@ -116,7 +160,7 @@ pub async fn install_bun(
             "bun {version} already installed at {}",
             target_dir.display()
         );
-        return Ok(version.to_string());
+        return Ok(RuntimeInstallReport::already_installed(version));
     }
 
     tracing::debug!(
@@ -140,17 +184,9 @@ pub async fn install_bun(
         });
     }
 
-    if let Some(content_length) = resp.content_length() {
-        validate_download_size(content_length as usize)?;
-    }
+    let (bytes, total_size) = read_download_body(resp, "bun", version).await?;
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Network(format!("failed to read bun download: {e}")))?;
-    validate_download_size(bytes.len())?;
-
-    verify_bun_checksum(client, release, asset, &bytes).await?;
+    let sha256 = verify_bun_checksum(client, release, asset, &bytes).await?;
 
     let parent = target_dir
         .parent()
@@ -197,7 +233,50 @@ pub async fn install_bun(
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     tracing::debug!("installed bun {version} to {}", target_dir.display());
-    Ok(version.to_string())
+    Ok(RuntimeInstallReport {
+        version: version.to_string(),
+        downloaded_bytes: Some(bytes.len() as u64),
+        total_bytes: total_size,
+        sha256: Some(sha256),
+    })
+}
+
+async fn read_download_body(
+    mut resp: reqwest::Response,
+    runtime: &str,
+    version: &str,
+) -> Result<(Vec<u8>, Option<u64>), LpmError> {
+    let total_size = resp.content_length();
+    let capacity = match total_size {
+        Some(content_length) => checked_download_size(content_length)?,
+        None => 0,
+    };
+
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut downloaded = 0u64;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| LpmError::Network(format!("failed to read {runtime} download: {e}")))?
+    {
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        checked_download_size(downloaded)?;
+        bytes.extend_from_slice(&chunk);
+    }
+
+    tracing::debug!("read {runtime} {version} download ({} bytes)", bytes.len());
+    Ok((bytes, total_size))
+}
+
+fn checked_download_size(size: u64) -> Result<usize, LpmError> {
+    let size = usize::try_from(size).map_err(|_| {
+        LpmError::Script(format!(
+            "download size {size} bytes exceeds maximum allowed size of {MAX_DOWNLOAD_SIZE} bytes ({}MB)",
+            MAX_DOWNLOAD_SIZE / (1024 * 1024)
+        ))
+    })?;
+    validate_download_size(size)?;
+    Ok(size)
 }
 
 /// Max decompressed bytes across all entries. Real Node distributions
@@ -399,12 +478,13 @@ fn compare_checksum(expected_hex: &str, actual_bytes: &[u8]) -> Result<(), LpmEr
     let mut hasher = Sha256::new();
     hasher.update(actual_bytes);
     let actual_hex = format!("{:x}", hasher.finalize());
+    let expected_hex = expected_hex.to_ascii_lowercase();
 
     if actual_hex == expected_hex {
         Ok(())
     } else {
         Err(LpmError::IntegrityMismatch {
-            expected: expected_hex.to_string(),
+            expected: expected_hex,
             actual: actual_hex,
         })
     }
@@ -487,13 +567,13 @@ fn rename_with_fallback(source: &Path, target: &Path) -> Result<(), LpmError> {
 /// Verify downloaded tarball against nodejs.org SHASUMS256.txt.
 ///
 /// Fetches the checksum file, computes SHA-256 of the downloaded bytes,
-/// and compares. Returns Ok(()) if match, Err if mismatch or fetch failure.
+/// and compares. Returns the verified hash on match.
 async fn verify_checksum(
     client: &reqwest::Client,
     release: &node::NodeRelease,
     platform: &Platform,
     data: &[u8],
-) -> Result<(), LpmError> {
+) -> Result<String, LpmError> {
     let shasums_url = release.shasums_url();
 
     let resp = client
@@ -534,6 +614,7 @@ async fn verify_checksum(
         })?;
 
     compare_checksum(expected_hash, data)?;
+    let expected_hash = expected_hash.to_ascii_lowercase();
 
     // M20: surface the trust posture on every successful verify.
     // SHASUMS256.txt is fetched over HTTPS from nodejs.org but the
@@ -550,7 +631,7 @@ async fn verify_checksum(
         "Node runtime SHASUMS256 verified via upstream HTTPS only — no GPG signature check (M20). Trust is anchored on nodejs.org TLS; a CA-trusted MITM or mirror operator can substitute the asset + checksum together.",
     );
 
-    Ok(())
+    Ok(expected_hash)
 }
 
 async fn verify_bun_checksum(
@@ -558,8 +639,8 @@ async fn verify_bun_checksum(
     release: &BunRelease,
     asset: &BunAsset,
     data: &[u8],
-) -> Result<(), LpmError> {
-    let mut verified = false;
+) -> Result<String, LpmError> {
+    let mut verified_hash = None;
 
     if let Some(expected_hash) = asset
         .digest
@@ -569,7 +650,7 @@ async fn verify_bun_checksum(
         .transpose()?
     {
         compare_checksum(&expected_hash, data)?;
-        verified = true;
+        verified_hash = Some(expected_hash);
     }
 
     if let Some(shasums_url) = release.shasums_url() {
@@ -599,17 +680,15 @@ async fn verify_bun_checksum(
             ))
         })?;
         compare_checksum(&expected_hash, data)?;
-        verified = true;
+        verified_hash = Some(expected_hash);
     }
 
-    if !verified {
-        return Err(LpmError::Network(format!(
+    verified_hash.ok_or_else(|| {
+        LpmError::Network(format!(
             "no SHA-256 checksum available for Bun asset {}",
             asset.name
-        )));
-    }
-
-    Ok(())
+        ))
+    })
 }
 
 fn parse_github_sha256_digest(digest: &str) -> Result<String, LpmError> {

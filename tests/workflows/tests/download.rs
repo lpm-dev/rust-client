@@ -94,6 +94,11 @@ async fn download_human_output_uses_slim_progress_and_completion() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.is_empty(),
+        "human download must keep the extracted file list on stderr, got stdout:\n{stdout}"
+    );
     assert!(
         stderr.contains("› Resolving owner.react"),
         "download must use a slim resolve phase, got:\n{stderr}"
@@ -105,6 +110,14 @@ async fn download_human_output_uses_slim_progress_and_completion() {
     assert!(
         stderr.contains("✓ Verified integrity"),
         "download must report slim integrity verification, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains('…') && !stderr.contains("..."),
+        "download must abbreviate integrity and overflow rows with a unicode ellipsis, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("output:") && stderr.contains("files extracted:"),
+        "download must report extraction details on stderr, got:\n{stderr}"
     );
     assert!(
         stderr.contains("✓ Done · tarball extracted in "),

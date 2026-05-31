@@ -308,6 +308,12 @@ pub fn skipped(msg: &str) {
     emit_line(LineKind::Skipped, msg);
 }
 
+/// Plain detail row that belongs to the slim transcript.
+pub fn detail(msg: &str) {
+    settle_any_active_spinner();
+    eprintln!("{}{}", reset_prefix(), msg);
+}
+
 fn diff_entry(glyph: &str, name: &str, version: Option<&str>, hint: Option<&str>) {
     settle_any_active_spinner();
     let mut suffix = String::new();

@@ -732,9 +732,17 @@ async fn run_under_store_lock(
         }
     }
 
+    let rebuild_start = std::time::Instant::now();
+
     // Execute scripts
     let mut successes = 0usize;
     let mut failures = 0usize;
+    let mut completed_scripts = 0usize;
+    let package_label_width = to_build
+        .iter()
+        .map(|pkg| rebuild_package_label(pkg).len())
+        .max()
+        .unwrap_or(0);
 
     // rework  + follow-up
     // : resolve the full sandbox-mode precedence chain
@@ -1063,14 +1071,6 @@ async fn run_under_store_lock(
     }
 
     for pkg in &to_build {
-        if !json_output {
-            println!(
-                "\n  {} {}",
-                pkg.name.bold(),
-                format!("({})", pkg.version).dimmed(),
-            );
-        }
-
         let mut pkg_success = true;
 
         // fix: lifecycle scripts must run from the LIVE
@@ -1100,7 +1100,11 @@ async fn run_under_store_lock(
             Ok(d) => d,
             Err(e) => {
                 if !json_output {
-                    println!("    {} {e}", "✗".red());
+                    let label = rebuild_package_label(pkg);
+                    install_ui::detail(&format!(
+                        "  {} {label:<package_label_width$}  {e}",
+                        install_ui::red("✗"),
+                    ));
                 }
                 // Always to stderr so JSON consumers (parsing stdout)
                 // still see the failure; the summary `failed` count
@@ -1116,10 +1120,6 @@ async fn run_under_store_lock(
                 Some(c) => c,
                 None => continue,
             };
-
-            if !json_output {
-                println!("    {} {phase}: {}", "→".dimmed(), cmd.dimmed());
-            }
 
             match execute_script(
                 cmd,
@@ -1139,13 +1139,24 @@ async fn run_under_store_lock(
             ) {
                 Ok(()) => {
                     if !json_output {
-                        println!("    {} {phase} completed", "✓".green());
+                        let label = rebuild_package_label(pkg);
+                        install_ui::detail(&format!(
+                            "  {} {label:<package_label_width$}  {}",
+                            install_ui::green("✓"),
+                            install_ui::dim(phase),
+                        ));
                     }
+                    completed_scripts += 1;
                 }
                 Err(e) => {
                     pkg_success = false;
                     if !json_output {
-                        println!("    {} {phase} failed: {e}", "✗".red());
+                        let label = rebuild_package_label(pkg);
+                        install_ui::detail(&format!(
+                            "  {} {label:<package_label_width$}  {} failed: {e}",
+                            install_ui::red("✗"),
+                            install_ui::dim(phase),
+                        ));
                     }
                     break; // Don't run subsequent phases if one fails
                 }
@@ -1165,7 +1176,6 @@ async fn run_under_store_lock(
     }
 
     // Summary
-    println!();
     if json_output {
         let mut json = serde_json::json!({
             "success": failures == 0,
@@ -1175,8 +1185,36 @@ async fn run_under_store_lock(
         crate::security_floor::attach_security_posture(&mut json, force_security_floor);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if failures == 0 {
-        install_ui::done(&format!("{successes} package(s) built successfully"));
+        eprintln!();
+        install_ui::done(&format!(
+            "Completed {completed_scripts} {}",
+            scripts_word(completed_scripts),
+        ));
+        if untrusted_unbuilt_count > 0
+            && !all
+            && specific_packages.is_empty()
+            && effective_policy != ScriptPolicy::Allow
+        {
+            let package_word = install_ui::packages_word(untrusted_unbuilt_count);
+            install_ui::detail(&format!(
+                "  {} {} blocked {package_word}",
+                install_ui::dim("skipped:"),
+                install_ui::section(&untrusted_unbuilt_count.to_string()),
+            ));
+            let hint = if effective_policy == ScriptPolicy::Triage {
+                "run lpm approve-scripts"
+            } else {
+                "add trustedDependencies or run lpm rebuild --all"
+            };
+            install_ui::detail(&format!("  {} {hint}", install_ui::dim("hint:")));
+        }
+        eprintln!();
+        install_ui::done(&format!(
+            "Done · rebuild finished in {}",
+            install_ui::green(&install_ui::format_duration(rebuild_start.elapsed())),
+        ));
     } else {
+        eprintln!();
         install_ui::warn(&format!("{successes} succeeded, {failures} failed"));
     }
 
@@ -2135,6 +2173,14 @@ struct ScriptablePackage {
     /// most call sites only care about the boolean and splitting the
     /// read avoids threading [`TrustReason`] through downstream code.
     trust_reason: TrustReason,
+}
+
+fn rebuild_package_label(pkg: &ScriptablePackage) -> String {
+    format!("{}@{}", pkg.name, pkg.version)
+}
+
+fn scripts_word(count: usize) -> &'static str {
+    if count == 1 { "script" } else { "scripts" }
 }
 
 /// Why a scripted package was (or was not) trusted to execute its

@@ -64,7 +64,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
     let is_https = registry_url.starts_with("https://");
 
     if !json_output {
-        install_ui::phase("Configuring Swift Package Manager for lpmdev");
+        install_ui::phase(&swift_package_manager_phase());
     }
 
     // Step 1: Set the registry for the lpmdev scope
@@ -316,7 +316,7 @@ pub async fn ensure_configured(
     }
 
     if !json_output {
-        install_ui::phase("Configuring Swift Package Manager for lpmdev");
+        install_ui::phase(&swift_package_manager_phase());
     }
 
     // Step 1: Set the registry scope
@@ -633,8 +633,18 @@ fn configure_signing_trust(json_output: bool) -> Result<TrustOutcome, LpmError> 
     Ok(TrustOutcome::Configured)
 }
 
+fn swift_package_manager_phase() -> String {
+    format!(
+        "Configuring Swift Package Manager for {}",
+        install_ui::yellow("lpmdev")
+    )
+}
+
 fn scope_set_message(swift_registry_url: &str) -> String {
-    format!("Scope set: lpmdev → {swift_registry_url}")
+    format!(
+        "Scope set: {} → {swift_registry_url}",
+        install_ui::yellow("lpmdev")
+    )
 }
 
 fn signing_certificate_installed_message(cert_path: &Path) -> String {
@@ -723,6 +733,25 @@ mod tests {
         LOCK.get_or_init(|| AsyncMutex::new(()))
     }
 
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for cc in chars.by_ref() {
+                    let cb = cc as u32;
+                    if (0x40..=0x7e).contains(&cb) {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     /// RAII override of `HOME`. Drop restores the prior value (or removes
     /// the var if there was none). Must be held alongside `home_env_lock()`.
     struct HomeOverride {
@@ -801,11 +830,24 @@ mod tests {
         let home = std::path::PathBuf::from("/Users/example");
         let cert_path = home.join(".swiftpm/security/trusted-root-certs/lpm.der");
         let config_path = home.join(".swiftpm/configuration/registries.json");
+        let scope_message = scope_set_message("https://lpm.dev/api/swift-registry");
+        let phase_message = swift_package_manager_phase();
 
         assert_eq!(
-            scope_set_message("https://lpm.dev/api/swift-registry"),
+            strip_ansi(&phase_message),
+            "Configuring Swift Package Manager for lpmdev"
+        );
+        assert_eq!(
+            strip_ansi(&scope_message),
             "Scope set: lpmdev → https://lpm.dev/api/swift-registry"
         );
+        if lpm_common::color::enabled() {
+            assert!(
+                phase_message.contains("\u{1b}[33mlpmdev\u{1b}[39m")
+                    && scope_message.contains("\u{1b}[33mlpmdev\u{1b}[39m"),
+                "swift-registry must color the lpmdev scope target, got phase={phase_message:?}, scope={scope_message:?}"
+            );
+        }
         assert_eq!(
             display_home_relative_with(&cert_path, Some(&home)),
             "~/.swiftpm/security/trusted-root-certs/lpm.der"

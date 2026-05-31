@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 
 pub async fn run(
@@ -19,7 +18,7 @@ pub async fn run(
         return Ok(());
     }
 
-    println!("{}", report.name.bold());
+    println!("{}", install_ui::cyan(&report.name));
 
     if let Some(score) = report.score {
         let max = report.max_score.unwrap_or(100);
@@ -34,7 +33,7 @@ pub async fn run(
 
     if !report.checks.is_empty() {
         println!();
-        println!("checks");
+        println!("{}", install_ui::section("checks"));
 
         let label_width = report
             .checks
@@ -46,20 +45,25 @@ pub async fn run(
         for check in &report.checks {
             let passed = check.passed.unwrap_or(false);
             let icon = if passed {
-                "✓".green().to_string()
+                install_ui::green("✓")
             } else {
-                "✗".red().to_string()
+                install_ui::red("✗")
             };
             let label = check.label.as_deref().unwrap_or(&check.id);
             let points = format_points(passed, check.points.unwrap_or(0), check.max_points);
 
-            println!("  {icon} {label:<label_width$}  {}", points.dimmed());
+            let points = if passed {
+                install_ui::green(&points)
+            } else {
+                install_ui::dim(&points)
+            };
+            println!("  {icon} {label:<label_width$}  {points}");
 
             if let Some(detail) = &check.detail
                 && !detail.is_empty()
                 && !passed
             {
-                println!("    {}", detail.dimmed());
+                println!("    {}", install_ui::dim(detail));
             }
         }
     }
@@ -70,28 +74,15 @@ pub async fn run(
 }
 
 fn print_field(label: &str, value: &str) {
-    println!("  {label:<10} {value}");
+    println!("  {} {value}", install_ui::dim(&format!("{label:<10}")));
 }
 
 fn score_colored(score: u32, max: u32) -> String {
-    let pct = (score * 100).checked_div(max).unwrap_or(0);
-    let text = format!("{score}/{max}");
-    if pct >= 80 {
-        text.green()
-    } else if pct >= 50 {
-        text.yellow()
-    } else {
-        text.red()
-    }
+    install_ui::status_ok(&format!("{score}/{max}"))
 }
 
 fn tier_colored(tier: &str) -> String {
-    match tier.to_lowercase().as_str() {
-        "gold" | "excellent" => tier.green().bold(),
-        "silver" | "good" => tier.yellow().bold(),
-        "bronze" => tier.red(),
-        _ => tier.dimmed(),
-    }
+    install_ui::status_ok(tier)
 }
 
 fn format_points(passed: bool, points: u32, max_points: Option<u32>) -> String {

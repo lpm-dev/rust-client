@@ -81,6 +81,40 @@ async fn pool_human_output_formats_revenue_summary_and_package_rows() {
 }
 
 #[tokio::test]
+async fn pool_human_output_applies_slim_color_roles_when_forced() {
+    let project = TempProject::empty(r#"{"name":"pool-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_pool_stats("pool-session-token", sample_pool_stats())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "pool-session-token")
+        .args(["--color=always", "pool"])
+        .output()
+        .expect("failed to run colored lpm pool");
+
+    assert!(
+        output.status.success(),
+        "colored lpm pool failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("\x1b[33mPool Revenue Stats")
+            && combined.contains("\x1b[2mbilling period")
+            && combined.contains("\x1b[32m$123.45")
+            && combined.contains("\x1b[36m@lpm.dev/neo.widget"),
+        "pool should color sections, labels, earnings, and package scopes, got:\n{combined:?}",
+    );
+}
+
+#[tokio::test]
 async fn pool_json_envelope_matches_snapshot() {
     let project = TempProject::empty(r#"{"name":"pool-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

@@ -184,7 +184,8 @@ pub async fn run(
     // receives the same pruned graph.
     match format {
         "tree" | "" => {
-            let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
+            let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout())
+                && lpm_common::color::enabled();
             print!("{}", graph_render::render_tree(&graph, use_color));
             if !json_output {
                 match max_depth {

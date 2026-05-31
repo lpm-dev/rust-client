@@ -442,6 +442,11 @@ pub async fn run(
         ));
         for u in &deduped {
             let dev_tag = if u.is_dev { " (dev)" } else { "" };
+            let glyph = format_upgrade_glyph(u.semver_class);
+            let name = format!("{:<24}", u.name).bold();
+            let from = format!("{:>8}", u.from).dimmed();
+            let arrow = "→".dimmed();
+            let to = format!("{:<8}", u.to).yellow();
             let class_label = format_class_label(u.semver_class);
             let hint = format_candidate_hint(u);
             let hint_suffix = if hint.is_empty() {
@@ -450,12 +455,7 @@ pub async fn run(
                 format!("  {}", hint.dimmed())
             };
             eprintln!(
-                "{} {:<24} {:>8} → {:<8} {}{}{}",
-                "↑".green(),
-                u.name.bold(),
-                u.from.dimmed(),
-                format_version_colored(&u.to, u.semver_class),
-                class_label,
+                "{glyph} {name} {from} {arrow} {to} {class_label}{}{}",
                 dev_tag.dimmed(),
                 hint_suffix,
             );
@@ -785,13 +785,12 @@ fn format_class_label(class: SemverClass) -> String {
     }
 }
 
-fn format_version_colored(version: &str, class: SemverClass) -> String {
+fn format_upgrade_glyph(class: SemverClass) -> String {
     match class {
-        SemverClass::Patch => version.green(),
-        SemverClass::Minor => version.yellow(),
-        SemverClass::Major => version.red(),
-        SemverClass::Prerelease => version.dimmed(),
-        SemverClass::Unknown => version.dimmed(),
+        SemverClass::Patch => "↑".green(),
+        SemverClass::Minor => "↑".yellow(),
+        SemverClass::Major => "↑".red(),
+        SemverClass::Prerelease | SemverClass::Unknown => "↑".dimmed(),
     }
 }
 

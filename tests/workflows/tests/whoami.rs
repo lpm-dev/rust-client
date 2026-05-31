@@ -121,32 +121,34 @@ async fn whoami_human_output_uses_slim_account_summary() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✓ Logged in as testuser") && stderr.contains("test@example.com"),
-        "authenticated whoami should use the slim summary line, got:\n{stderr}"
+        stderr.contains("testuser")
+            && stderr.contains("email          test@example.com")
+            && !stderr.contains("Logged in as"),
+        "authenticated whoami should render the bare identity header and email detail, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("› Plan PRO"),
-        "authenticated whoami should show the plan on a slim line, got:\n{stderr}"
+        stderr.contains("plan           Pro"),
+        "authenticated whoami should show the plan as an aligned detail row, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("› Pool Active"),
-        "authenticated whoami should show pool access on a slim line, got:\n{stderr}"
+        stderr.contains("pool access    yes"),
+        "authenticated whoami should show pool access as an aligned detail row, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("› 2FA disabled"),
-        "authenticated whoami should show 2FA status on a slim line, got:\n{stderr}"
+        stderr.contains("mfa            no"),
+        "authenticated whoami should show MFA status as an aligned detail row, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("› Storage 50.00MB / 500MB  █░░░░░░░░░"),
+        stderr.contains("usage") && stderr.contains("storage        50.00MB / 500MB  █░░░░░░░░░"),
         "authenticated whoami should show storage usage with a quota bar, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("› Private Packages 3 / 100  █░░░░░░░░░"),
+        stderr.contains("private pkgs   3 / 100  █░░░░░░░░░"),
         "authenticated whoami should show package usage with a quota bar, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("› Available Scopes"),
-        "authenticated whoami should show the scopes header on a slim line, got:\n{stderr}"
+        stderr.contains("scopes"),
+        "authenticated whoami should show the scopes section, got:\n{stderr}"
     );
     assert!(
         stderr.contains("@lpm.dev/testuser.*"),
@@ -157,11 +159,19 @@ async fn whoami_human_output_uses_slim_account_summary() {
         "authenticated whoami should render admin as a padded badge label, got:\n{stderr}"
     );
     assert!(
+        stderr.contains("registries") && stderr.contains("● lpm.dev authenticated"),
+        "authenticated whoami should include lpm.dev in the human registries list, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Identity loaded"),
+        "authenticated whoami should finish with the identity-loaded terminus, got:\n{stderr}"
+    );
+    assert!(
         !stderr.contains("(admin)"),
         "authenticated whoami should not render the admin role as the old parenthesized label, got:\n{stderr}"
     );
     assert!(
-        !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
+        !stderr.contains("◆") && !stderr.contains("│"),
         "legacy cliclack glyphs must be gone from whoami stderr, got:\n{stderr}"
     );
 

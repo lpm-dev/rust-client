@@ -218,20 +218,21 @@ pub async fn run(
 
             println!(
                 "{:<section_width$}  {:<package_width$}  {:<current_width$}  {:<wanted_width$}  {}",
-                "Section".bold(),
-                "Package".bold(),
-                "Current".bold(),
-                "Wanted".bold(),
-                "Latest".bold()
+                "Section".dimmed(),
+                "Package".dimmed(),
+                "Current".dimmed(),
+                "Wanted".dimmed(),
+                "Latest".dimmed()
             );
             for result in &outdated {
+                let wanted = result.wanted.as_deref().unwrap_or("?");
                 println!(
                     "{:<section_width$}  {:<package_width$}  {:<current_width$}  {:<wanted_width$}  {}",
                     result.section.dimmed(),
                     result.name,
                     result.current.dimmed(),
-                    result.wanted.as_deref().unwrap_or("?").yellow(),
-                    result.latest.green(),
+                    install_ui::status_ok(wanted),
+                    style_latest_version(&result.latest, wanted),
                 );
             }
             println!();
@@ -253,4 +254,14 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn style_latest_version(latest: &str, wanted: &str) -> String {
+    let latest_major = lpm_semver::Version::parse(latest).ok().map(|v| v.major());
+    let wanted_major = lpm_semver::Version::parse(wanted).ok().map(|v| v.major());
+    if matches!((wanted_major, latest_major), (Some(wanted), Some(latest)) if latest > wanted) {
+        latest.red()
+    } else {
+        latest.yellow()
+    }
 }

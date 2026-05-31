@@ -112,7 +112,10 @@ pub async fn run(
                     })
                 );
             } else {
-                install_ui::done(&format!("Set {} = {}", key.bold(), value));
+                install_ui::done(&format!(
+                    "Done · {key} = {}",
+                    install_ui::section(&format!("\"{value}\""))
+                ));
             }
         }
         "delete" | "unset" => {
@@ -779,7 +782,10 @@ async fn run_triage_wizard(
             .map_err(prompt_err)?;
         if switch {
             persist_string(config_path, SCRIPT_POLICY_KEY, "triage")?;
-            install_ui::done(&format!("Set {} = {}", SCRIPT_POLICY_KEY.bold(), "triage"));
+            install_ui::done(&format!(
+                "Done · {SCRIPT_POLICY_KEY} = {}",
+                install_ui::section("\"triage\"")
+            ));
         } else {
             println!(
                 "  Leaving script-policy at {}. The triage-advisor value will be saved \
@@ -897,7 +903,10 @@ fn announce_set(key: &str, value: &str, json_output: bool) {
             .unwrap()
         );
     } else {
-        install_ui::done(&format!("Set {} = {}", key.bold(), value));
+        install_ui::done(&format!(
+            "Done · {key} = {}",
+            install_ui::section(&format!("\"{value}\""))
+        ));
     }
 }
 

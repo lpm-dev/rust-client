@@ -1,4 +1,5 @@
 use crate::install_ui;
+use lpm_common::format_bytes;
 use std::time::Duration;
 
 pub fn phase_resolving_graph(package_count: usize) {
@@ -11,6 +12,10 @@ pub fn phase_resolving_graph(package_count: usize) {
 
 pub fn minus_package(name: &str, version: Option<&str>) {
     install_ui::minus_target(name, version, None);
+}
+
+pub fn minus_orphaned_package(name: &str, version: &str) {
+    install_ui::minus_target(name, Some(version), Some("(orphaned)"));
 }
 
 pub fn minus_command(name: &str) {
@@ -43,6 +48,24 @@ pub fn done_removed(removed_count: usize, elapsed: Duration) {
         install_ui::bold(&removed_count.to_string()),
         install_ui::packages_word(removed_count),
         install_ui::green(&duration_str),
+    ));
+}
+
+pub fn done_cleaned_empty_dirs(cleaned_count: usize) {
+    if cleaned_count == 1 {
+        install_ui::done("Cleaned empty directories");
+    } else {
+        install_ui::done(&format!(
+            "Cleaned {} empty directories",
+            install_ui::bold(&cleaned_count.to_string())
+        ));
+    }
+}
+
+pub fn done_freed_disk(freed_bytes: u64) {
+    install_ui::done(&format!(
+        "Freed {} on disk",
+        install_ui::green(&format_bytes(freed_bytes))
     ));
 }
 

@@ -33,7 +33,6 @@ use crate::install_ui;
 use crate::trust_snapshot::{self, SnapshotEntry, TrustSnapshot};
 use clap::Subcommand;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_workspace::{TrustedDependencies, TrustedDependencyBinding};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -273,17 +272,21 @@ fn print_diff_group(entries: &[DiffEntry], kind: DiffKind, label: &str) {
         return;
     }
 
-    println!("{label}");
+    println!("{}", install_ui::section(label));
     for e in matching {
         match e.kind {
             DiffKind::Added => {
-                println!("  {} {}", "+".green(), e.key.bold());
+                println!("  {} {}", install_ui::green("+"), install_ui::cyan(&e.key));
             }
             DiffKind::Removed => {
-                println!("  {} {}", "-".red(), e.key.bold());
+                println!("  {} {}", install_ui::red("-"), install_ui::cyan(&e.key));
             }
             DiffKind::Changed => {
-                println!("  {} {}", "~".yellow(), e.key.bold());
+                println!(
+                    "  {} {}",
+                    install_ui::section("~"),
+                    install_ui::cyan(&e.key)
+                );
                 if let (Some(prev), Some(curr)) = (&e.previous, &e.current) {
                     render_binding_delta("integrity", &prev.integrity, &curr.integrity);
                     render_binding_delta("scriptHash", &prev.script_hash, &curr.script_hash);
@@ -300,7 +303,13 @@ fn render_binding_delta(name: &str, prev: &Option<String>, curr: &Option<String>
     }
     let prev_s = prev.as_deref().unwrap_or("<none>");
     let curr_s = curr.as_deref().unwrap_or("<none>");
-    println!("      {name:<10} {} → {}", prev_s.dimmed(), curr_s);
+    println!(
+        "      {} {} {} {}",
+        install_ui::dim(&format!("{name:<10}")),
+        install_ui::dim(prev_s),
+        install_ui::dim("→"),
+        install_ui::yellow(curr_s),
+    );
 }
 
 // ─── lpm trust prune ───────────────────────────────────────────────
@@ -540,9 +549,9 @@ fn write_manifest(path: &Path, manifest: &serde_json::Value) -> Result<(), LpmEr
 /// output per invocation (audit-v4 F1).
 fn print_prune_human_preview(stale: &[String]) {
     install_ui::phase("Pruning stale trust entries");
-    println!("stale");
+    println!("{}", install_ui::section("stale"));
     for k in stale {
-        println!("  {} {}", "-".red(), k.bold());
+        println!("  {} {}", install_ui::red("-"), install_ui::cyan(k));
     }
     println!();
 }

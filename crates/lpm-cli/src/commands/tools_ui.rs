@@ -16,11 +16,17 @@ pub fn plugin_version_label(bin: &Path, configured_version: Option<&str>) -> Str
 }
 
 pub fn using_tool(name: &str, version: &str) {
-    install_ui::phase(&format!("Using {name} {version}"));
+    install_ui::phase(&format!(
+        "Using {}",
+        install_ui::yellow(&format!("{name} {version}"))
+    ));
 }
 
 pub fn using_check_engine(binary: &str) {
-    install_ui::phase(&format!("Using {binary} --noEmit"));
+    install_ui::phase(&format!(
+        "Using {}",
+        install_ui::yellow(&format!("{binary} --noEmit"))
+    ));
 }
 
 pub fn detected_test_runner(runner_name: &str) {
@@ -28,18 +34,24 @@ pub fn detected_test_runner(runner_name: &str) {
         "scripts.test" => install_ui::phase("Using package.json test script"),
         _ => install_ui::phase(&format!(
             "Auto-detected {}",
-            runner_display_name(runner_name)
+            install_ui::yellow(&runner_display_name(runner_name))
         )),
     }
 }
 
 pub fn detected_bench_runner(runner_name: &str) {
     match runner_name {
-        "vitest" => install_ui::phase("Auto-detected Vitest bench runner"),
+        "vitest" => install_ui::phase(&format!(
+            "Auto-detected {}",
+            install_ui::yellow("Vitest bench runner")
+        )),
         "scripts.bench" => install_ui::phase("Using package.json bench script"),
         _ => install_ui::phase(&format!(
-            "Auto-detected {} bench runner",
-            runner_display_name(runner_name)
+            "Auto-detected {}",
+            install_ui::yellow(&format!(
+                "{} bench runner",
+                runner_display_name(runner_name)
+            ))
         )),
     }
 }

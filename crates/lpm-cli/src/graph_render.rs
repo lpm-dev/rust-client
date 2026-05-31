@@ -352,26 +352,21 @@ fn render_tree_node(
         None => return,
     };
 
-    let label = format!("{}@{}", node.name, node.version);
-    let colored_label = if use_color {
-        if node.is_duplicate {
-            format!("\x1b[33m{label}\x1b[0m") // yellow for duplicates
-        } else if node.registry == Registry::Lpm {
-            format!("\x1b[32m{label}\x1b[0m") // green for LPM
-        } else {
-            label
-        }
-    } else {
-        label
-    };
+    let colored_label = render_tree_label(node, use_color);
 
     let circular = if visited.contains(key) {
-        " (circular)"
+        color_tree_meta(" (circular)", use_color)
     } else {
-        ""
+        String::new()
     };
 
-    output.push_str(&format!("{prefix}{connector}{colored_label}{circular}\n"));
+    output.push_str(&format!(
+        "{}{}{}{}\n",
+        color_tree_meta(prefix, use_color),
+        color_tree_meta(connector, use_color),
+        colored_label,
+        circular
+    ));
 
     if visited.contains(key) {
         return;
@@ -402,6 +397,31 @@ fn render_tree_node(
     }
 
     visited.remove(key);
+}
+
+fn render_tree_label(node: &DepNode, use_color: bool) -> String {
+    format!(
+        "{}{}{}",
+        node.name,
+        color_tree_meta("@", use_color),
+        color_tree_version(&node.version, use_color)
+    )
+}
+
+fn color_tree_meta(text: &str, use_color: bool) -> String {
+    if use_color && !text.is_empty() {
+        format!("\x1b[2m{text}\x1b[22m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn color_tree_version(text: &str, use_color: bool) -> String {
+    if use_color {
+        format!("\x1b[33m{text}\x1b[39m")
+    } else {
+        text.to_string()
+    }
 }
 
 // ── Graph-level filter ────────────────────────────────────────────
@@ -1877,6 +1897,10 @@ mod tests {
         assert!(
             tree.contains("\x1b["),
             "should have ANSI codes when use_color=true: {tree}"
+        );
+        assert!(
+            tree.contains("\x1b[2m@\x1b[22m") && tree.contains("\x1b[33m1.0.0\x1b[39m"),
+            "tree color should dim @ separators and color version targets yellow: {tree}"
         );
     }
 

@@ -109,8 +109,18 @@ fn remove_human_output_uses_slim_done_line_and_stderr_only_paths() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✓ Removed owner.widget"),
-        "remove should use the slim done line, got:\n{stderr}"
+        stderr.contains("› Removing tracked source files for owner.widget"),
+        "remove should start with the slim removal phase, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("- .lpm/skills/owner.widget/")
+            && stderr.contains("- components/widget/")
+            && stderr.contains("✓ Cleaned empty directories"),
+        "remove should report removed paths and directory cleanup on stderr, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · removed 2 files in "),
+        "remove should use the timed slim terminus, got:\n{stderr}"
     );
     assert!(
         stderr.contains(".lpm/skills/owner.widget/") && stderr.contains("components/widget/"),

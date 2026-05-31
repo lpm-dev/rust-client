@@ -151,13 +151,26 @@ async fn run_patch_inner(name: String, version: String, json_output: bool) -> Re
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
     } else {
         install_ui::phase(&format!(
-            "Extracting pristine store entry for {resolved_key}"
+            "Extracting pristine store entry for {}",
+            install_ui::yellow(&resolved_key)
         ));
-        eprintln!("    {:<8} {}", "source:", store_path.display());
-        eprintln!("    {:<8} {}", "staging:", dest.display());
-        eprintln!();
+        let label_width = "staging:".len();
+        install_ui::detail(&format!(
+            "    {} {}",
+            install_ui::dim(&format!("{:<label_width$}", "source:")),
+            install_ui::dim(&store_path.display().to_string())
+        ));
+        install_ui::detail(&format!(
+            "    {} {}",
+            install_ui::dim(&format!("{:<label_width$}", "staging:")),
+            install_ui::dim(&dest.display().to_string())
+        ));
+        install_ui::detail("");
         install_ui::done("Ready · edit files in the staging directory, then run:");
-        eprintln!("  lpm patch-commit {}", staging_path.display());
+        install_ui::detail(&format!(
+            "  {}",
+            install_ui::yellow(&format!("lpm patch-commit {}", staging_path.display()))
+        ));
     }
     Ok(())
 }
@@ -244,7 +257,7 @@ async fn run_patch_commit_inner(
 
     // 3. Generate the unified diff.
     if !json_output {
-        install_ui::phase(&format!("Generating patch for {key}"));
+        install_ui::phase(&format!("Generating patch for {}", install_ui::yellow(key)));
     }
     let generated: GeneratedPatch = generate_patch(&store_path, &edited_dir)?;
     // Check binary files BEFORE the empty check — a staging dir whose
@@ -312,9 +325,12 @@ async fn run_patch_commit_inner(
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
     } else {
-        install_ui::done(&format!("Wrote {}", install_ui::bold(&patch_file_rel)));
-        install_ui::done("Updated package.json › lpm.patchedDependencies");
-        eprintln!();
+        install_ui::done(&format!("Wrote {}", install_ui::dim(&patch_file_rel)));
+        install_ui::done(&format!(
+            "Updated {}",
+            install_ui::cyan("package.json › lpm.patchedDependencies")
+        ));
+        install_ui::detail("");
         install_ui::done("Done · patch registered for future installs");
     }
 
@@ -366,7 +382,7 @@ pub async fn run_patch_remove(
         );
     } else {
         let target = if outcome.removed.len() == 1 {
-            outcome.removed[0].key.clone()
+            install_ui::yellow(&outcome.removed[0].key)
         } else {
             format!("{} patch registrations", outcome.removed.len())
         };
@@ -376,16 +392,29 @@ pub async fn run_patch_remove(
             "Removing patch registration"
         };
         install_ui::phase(&format!("{action} for {target}"));
-        eprintln!("    {:<8} package.json", "manifest:");
+        let label_width = "manifest:".len();
+        install_ui::detail(&format!(
+            "    {} {}",
+            install_ui::dim(&format!("{:<label_width$}", "manifest:")),
+            install_ui::dim("package.json")
+        ));
         for removal in &outcome.removed {
-            eprintln!("    {:<8} {}", "file:", removal.patch_file);
+            install_ui::detail(&format!(
+                "    {} {}",
+                install_ui::dim(&format!("{:<label_width$}", "file:")),
+                install_ui::dim(&removal.patch_file)
+            ));
         }
-        eprintln!();
+        install_ui::detail("");
         for removal in &outcome.removed {
             if removal.deleted_patch_file {
                 install_ui::done("Deleted patch file");
             } else if let Some(reason) = &removal.retained_reason {
-                install_ui::warn(&format!("Kept {} ({reason})", removal.patch_file));
+                install_ui::warn(&format!(
+                    "Kept {} {}",
+                    install_ui::dim(&removal.patch_file),
+                    install_ui::dim(&format!("({reason})"))
+                ));
             }
         }
         if dry_run {

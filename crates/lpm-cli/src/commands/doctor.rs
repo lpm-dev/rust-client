@@ -918,25 +918,40 @@ pub async fn run(
         // `--all` keeps today's "render every row in emission order"
         // behavior — the full sweep already groups related rows
         // (Infrastructure → Project → Runtime → Tunnel → ...).
+        let visible_checks: Vec<_> = checks
+            .iter()
+            .filter(|check| {
+                all || !matches!(check.severity, Severity::Pass)
+                    || check.code() == doctor_catalog::LINKER_MODE_RESOLVED.code
+            })
+            .collect();
+        let name_width = visible_checks
+            .iter()
+            .map(|check| check.name().len())
+            .max()
+            .unwrap_or(0);
+
         println!();
-        for check in &checks {
-            if !all
-                && matches!(check.severity, Severity::Pass)
-                && check.code() != doctor_catalog::LINKER_MODE_RESOLVED.code
-            {
-                continue;
-            }
+        for check in visible_checks {
             let icon = match check.severity {
                 Severity::Pass => "✓".green().to_string(),
                 Severity::Fail => "✗".red().to_string(),
                 Severity::Warn => "!".yellow().to_string(),
             };
-            println!("  {icon} {} {}", check.name().bold(), check.detail.dimmed());
+            println!(
+                "  {icon} {:<name_width$} {}",
+                check.name(),
+                check.detail.dimmed()
+            );
         }
         println!();
 
         if failed == 0 && warned == 0 {
-            println!("  {} All {total} checks passed", "✓".green());
+            println!(
+                "  {} All {} checks passed",
+                "✓".green(),
+                install_ui::green(&total.to_string())
+            );
             if !all {
                 println!(
                     "\n  Run {} for registry, auth, tunnel, tooling, plugin, global,\n  \
@@ -948,13 +963,13 @@ pub async fn run(
             println!(
                 "  {} doctor found {}",
                 "!".yellow(),
-                format_doctor_issue_summary(0, warned)
+                format_doctor_issue_summary_colored(0, warned)
             );
         } else {
             println!(
                 "  {} doctor found {}",
                 "✗".red(),
-                format_doctor_issue_summary(failed, warned)
+                format_doctor_issue_summary_colored(failed, warned)
             );
         }
         println!();
@@ -969,10 +984,21 @@ pub async fn run(
     Ok(())
 }
 
+#[cfg(test)]
 fn format_doctor_issue_summary(failed: usize, warned: usize) -> String {
     let failure_word = if failed == 1 { "failure" } else { "failures" };
     let warning_word = if warned == 1 { "warning" } else { "warnings" };
     format!("{failed} {failure_word} and {warned} {warning_word}")
+}
+
+fn format_doctor_issue_summary_colored(failed: usize, warned: usize) -> String {
+    let failure_word = if failed == 1 { "failure" } else { "failures" };
+    let warning_word = if warned == 1 { "warning" } else { "warnings" };
+    format!(
+        "{} {failure_word} and {} {warning_word}",
+        install_ui::red(&failed.to_string()),
+        install_ui::section(&warned.to_string())
+    )
 }
 
 fn vault_storage_check(backend: lpm_vault::VaultStorageBackend) -> Check {

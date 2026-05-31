@@ -42,12 +42,7 @@ pub async fn run(
         }
 
         if let Some(integrity) = ver.integrity_or_shasum() {
-            let short = if integrity.len() > 30 {
-                format!("{}...", &integrity[..30])
-            } else {
-                integrity.to_string()
-            };
-            print_field("integrity", &short);
+            print_field("integrity", &short_integrity(integrity.as_ref()));
         }
 
         if let Some(desc) = &metadata.description
@@ -58,19 +53,19 @@ pub async fn run(
 
         if !ver.dependencies.is_empty() {
             println!();
-            println!("dependencies");
+            println!("{}", install_ui::section("dependencies"));
             print_name_value_rows(&ver.dependencies);
         }
 
         if !ver.peer_dependencies.is_empty() {
             println!();
-            println!("peer dependencies");
+            println!("{}", install_ui::section("peer dependencies"));
             print_name_value_rows(&ver.peer_dependencies);
         }
     }
 
     if let Some(mode) = &metadata.distribution_mode {
-        print_field("distribution", &mode_badge(mode));
+        print_field("distribution", mode);
     }
 
     if let Some(downloads) = metadata.downloads {
@@ -82,11 +77,14 @@ pub async fn run(
     versions.sort();
     if !versions.is_empty() {
         println!();
-        println!("versions ({})", versions.len());
+        println!(
+            "{}",
+            install_ui::section(&format!("versions ({})", versions.len()))
+        );
         let latest = metadata.latest_version_tag().unwrap_or("");
         for v in &versions {
             if *v == latest {
-                println!("  {:<12} {}", v, "(latest)".green());
+                println!("  {:<12} {}", v, install_ui::status_ok("(latest)"));
             } else {
                 println!("  {}", v.dimmed());
             }
@@ -106,7 +104,7 @@ pub async fn run(
 }
 
 fn print_field(label: &str, value: &str) {
-    println!("  {label:<12} {value}");
+    println!("  {} {value}", format!("{label:<12}").dimmed());
 }
 
 fn print_name_value_rows(values: &std::collections::HashMap<String, String>) {
@@ -118,11 +116,19 @@ fn print_name_value_rows(values: &std::collections::HashMap<String, String>) {
     }
 }
 
-fn mode_badge(mode: &str) -> String {
-    match mode {
-        "pool" => "pool".cyan(),
-        "marketplace" => "marketplace".magenta(),
-        "private" => "private".yellow(),
-        _ => mode.dimmed(),
+fn short_integrity(integrity: &str) -> String {
+    const MAX_CHARS: usize = 30;
+    const TAIL_CHARS: usize = 6;
+
+    if integrity.chars().count() <= MAX_CHARS {
+        return integrity.to_string();
     }
+
+    let head_chars = MAX_CHARS - TAIL_CHARS - 1;
+    let mut short = String::with_capacity(MAX_CHARS);
+    short.extend(integrity.chars().take(head_chars));
+    short.push('…');
+    let tail_start = integrity.chars().count().saturating_sub(TAIL_CHARS);
+    short.extend(integrity.chars().skip(tail_start));
+    short
 }

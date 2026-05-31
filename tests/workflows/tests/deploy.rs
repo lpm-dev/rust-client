@@ -147,6 +147,40 @@ fn deploy_dry_run_human_output_uses_slim_ui() {
     );
 }
 
+#[test]
+fn deploy_dry_run_human_output_applies_slim_color_roles_when_forced() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let out = external_output_dir();
+
+    let output = lpm(&project)
+        .args([
+            "--color=always",
+            "deploy",
+            out.path().to_str().unwrap(),
+            "--filter",
+            "@test/utils",
+            "--dry-run",
+        ])
+        .output()
+        .expect("failed to run colored lpm deploy --dry-run");
+
+    assert!(
+        output.status.success(),
+        "colored deploy --dry-run must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\x1b[33m@test/utils")
+            && stderr.contains("\x1b[2moutput:")
+            && stderr.contains("\x1b[33m/")
+            && stderr.contains("\x1b[32myes"),
+        "deploy dry-run should color target/path/status and dim labels, got:\n{stderr:?}",
+    );
+}
+
 // ─── filter must match exactly one member ──────────────────────────────
 
 #[test]

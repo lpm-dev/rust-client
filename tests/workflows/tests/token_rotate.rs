@@ -102,13 +102,27 @@ async fn token_rotate_human_output_uses_slim_progress_and_completion() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.is_empty(),
+        "human token-rotate must keep expiry details on stderr, got stdout:\n{stdout}"
+    );
     assert!(
         stderr.contains("› Rotating lpm.dev token"),
         "token-rotate must use a slim phase line, got:\n{stderr}"
     );
     assert!(
+        stderr.contains("✓ Old token invalidated")
+            && stderr.contains("✓ New token stored in Keychain"),
+        "token-rotate must show the middle token rotation steps, got:\n{stderr}"
+    );
+    assert!(
         stderr.contains("✓ Done · session token rotated successfully"),
         "token-rotate must use a slim completion line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Expires:") && stderr.contains("2032-01-03T04:05:06Z"),
+        "token-rotate must keep expiry detail on stderr, got:\n{stderr}"
     );
     assert!(
         !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),

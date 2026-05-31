@@ -1,7 +1,6 @@
 use crate::commands::registry_reads::{prepare_routed_read_context, search_route_for_query};
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use std::path::Path;
 
@@ -53,13 +52,13 @@ pub async fn run(
             None => pkg.name.clone(),
         };
 
-        println!("  {}", package_name.cyan());
+        println!("  {}", install_ui::cyan(&package_name));
 
         if let Some(desc) = &pkg.description
             && !desc.is_empty()
         {
             let short = truncate_description(desc, 80);
-            println!("    {}", short.dimmed());
+            println!("    {}", install_ui::dim(&short));
         }
 
         println!(
@@ -96,13 +95,13 @@ fn format_search_metadata(
     ecosystem: Option<&str>,
 ) -> String {
     let mut parts = Vec::with_capacity(3);
-    parts.push(format!("latest {}", version.yellow()));
+    parts.push(format!("latest {}", install_ui::yellow(version)));
     if let Some(score) = quality_score {
         let score_text = score.to_string();
         let colored = if score >= 80 {
-            score_text.green()
+            install_ui::status_ok(&score_text)
         } else {
-            score_text.yellow()
+            install_ui::yellow(&score_text)
         };
         parts.push(format!("quality {colored}"));
     }
@@ -115,7 +114,7 @@ fn format_search_metadata(
     if parts.len() == 1 {
         parts.remove(0)
     } else {
-        parts.join(&format!(" {} ", "·".dimmed()))
+        parts.join(&format!(" {} ", install_ui::dim("·")))
     }
 }
 

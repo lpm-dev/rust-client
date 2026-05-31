@@ -1,8 +1,9 @@
 use super::use_ui;
 use crate::install_ui;
-use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use lpm_common::{LpmError, format_bytes};
 use lpm_runtime::detect::RuntimeKind;
+use lpm_runtime::download::RuntimeInstallReport;
 use std::str::FromStr;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -270,7 +271,7 @@ pub async fn run(
                 use_ui::done(&format!(
                     "Pinned {}@{} in lpm.json",
                     runtime.as_str(),
-                    pinned_version.bold()
+                    install_ui::yellow(&pinned_version)
                 ));
             }
         }
@@ -296,12 +297,6 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
         .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
 
     let platform = lpm_runtime::platform::Platform::current()?;
-    use_ui::phase(&format!(
-        "Resolving {}@{} for {}",
-        runtime.as_str(),
-        install_ui::yellow(&version_spec),
-        platform
-    ));
 
     let installed = match runtime {
         RuntimeKind::Node => {
@@ -328,11 +323,14 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
                 return Ok(InstalledRuntime { runtime, version });
             }
 
-            use_ui::phase(&format!(
-                "Downloading Node.js {}",
-                install_ui::yellow(&version)
-            ));
-            lpm_runtime::download::install_node(&http_client, &release, &platform).await?
+            let report = install_runtime_with_spinner(runtime, &version, json_output, || {
+                lpm_runtime::download::install_node_with_report(&http_client, &release, &platform)
+            })
+            .await?;
+            if !json_output {
+                print_verified_checksum(&report);
+            }
+            report.version
         }
         RuntimeKind::Bun => {
             let releases = lpm_runtime::bun::fetch_releases(&http_client).await?;
@@ -361,13 +359,14 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
                     platform, release.tag_name
                 ))
             })?;
-            use_ui::phase(&format!("Downloading Bun {}", install_ui::yellow(&version)));
-            if let Some(digest) = asset.digest.as_deref()
-                && !digest.is_empty()
-            {
-                use_ui::hint_line(digest);
+            let report = install_runtime_with_spinner(runtime, &version, json_output, || {
+                lpm_runtime::download::install_bun_with_report(&http_client, &release, &asset)
+            })
+            .await?;
+            if !json_output {
+                print_verified_checksum(&report);
             }
-            lpm_runtime::download::install_bun(&http_client, &release, &asset).await?
+            report.version
         }
     };
 
@@ -394,6 +393,71 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
         runtime,
         version: installed,
     })
+}
+
+async fn install_runtime_with_spinner<F, Fut>(
+    runtime: RuntimeKind,
+    version: &str,
+    json_output: bool,
+    install: F,
+) -> Result<RuntimeInstallReport, LpmError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<RuntimeInstallReport, LpmError>>,
+{
+    if json_output {
+        return install().await;
+    }
+
+    let spinner = install_ui::spin(&format!(
+        "Downloading {} {}",
+        runtime.display_name(),
+        install_ui::yellow(version)
+    ));
+    match install().await {
+        Ok(report) => {
+            spinner.done(&format!(
+                "Downloaded {} {} · {}",
+                runtime.display_name(),
+                install_ui::yellow(&report.version),
+                format_download_report(&report),
+            ));
+            Ok(report)
+        }
+        Err(err) => {
+            spinner.failed(&format!(
+                "Failed to install {} {}",
+                runtime.display_name(),
+                install_ui::yellow(version)
+            ));
+            Err(err)
+        }
+    }
+}
+
+fn format_download_report(report: &RuntimeInstallReport) -> String {
+    let Some(downloaded) = report.downloaded_bytes else {
+        return install_ui::dim("cached");
+    };
+    let bytes = format_bytes(downloaded);
+    match report.total_bytes.filter(|total| *total > 0) {
+        Some(total) => format!(
+            "{} {} {}",
+            install_ui::usage_bar(downloaded, total, 12),
+            install_ui::dim(&bytes),
+            install_ui::dim("100%")
+        ),
+        None => install_ui::dim(&bytes),
+    }
+}
+
+fn print_verified_checksum(report: &RuntimeInstallReport) {
+    if let Some(sha256) = &report.sha256 {
+        use_ui::done(&format!(
+            "Verified SHA-256 {}",
+            install_ui::dim(&format!("sha256:{sha256}"))
+        ));
+    }
 }
 
 fn format_node_lts_suffix(release: &lpm_runtime::node::NodeRelease) -> String {
@@ -453,7 +517,7 @@ fn print_already_installed(runtime: RuntimeKind, version: &str, json_output: boo
         use_ui::done(&format!(
             "{} {} already installed",
             runtime.display_name(),
-            version.bold()
+            install_ui::yellow(version)
         ));
     }
 }
