@@ -5,6 +5,9 @@
 
 mod support;
 
+use base64::Engine as _;
+use base64::engine::general_purpose;
+use sha2::{Digest, Sha512};
 use support::{TempProject, lpm};
 
 fn store_root(project: &TempProject) -> std::path::PathBuf {
@@ -13,6 +16,13 @@ fn store_root(project: &TempProject) -> std::path::PathBuf {
 
 fn store_v1(project: &TempProject) -> std::path::PathBuf {
     store_root(project).join("v1")
+}
+
+fn v2_sri_and_segment(seed: &[u8]) -> (String, String) {
+    let digest: [u8; 64] = Sha512::digest(seed).into();
+    let sri = format!("sha512-{}", general_purpose::STANDARD.encode(digest));
+    let segment = format!("sha512-{}", hex::encode(digest));
+    (sri, segment)
 }
 
 /// Seed a single v1 store entry with a minimal package.json + one stub file.
@@ -35,6 +45,56 @@ fn seed_v1_entry(project: &TempProject, name: &str, version: &str, valid: bool) 
     }
     // !valid → directory exists but no package.json. Verify should flag
     // it as corrupted via the "missing package.json" branch.
+}
+
+fn seed_v2_entry(project: &TempProject, name: &str, version: &str) {
+    let (sri, segment) = v2_sri_and_segment(format!("{name}@{version}").as_bytes());
+    let v2 = store_root(project).join("v2");
+    let object_path = format!("objects/{segment}");
+    let object_dir = v2.join(&object_path);
+    std::fs::create_dir_all(&object_dir).expect("failed to create v2 object dir");
+    std::fs::write(
+        object_dir.join("package.json"),
+        format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+    )
+    .expect("failed to write v2 object package.json");
+    std::fs::write(object_dir.join(".integrity"), &sri)
+        .expect("failed to write v2 object integrity");
+
+    let link_key = format!("{name}@{version}+0123456789abcdef");
+    let link_dir = v2.join("links").join(&link_key);
+    let pkg_dir = link_dir.join("node_modules").join(name);
+    std::fs::create_dir_all(&pkg_dir).expect("failed to create v2 link package dir");
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+    )
+    .expect("failed to write v2 link package.json");
+    std::fs::write(pkg_dir.join("index.js"), "module.exports = {}\n")
+        .expect("failed to write v2 link index.js");
+
+    let sidecar = serde_json::json!({
+        "schema": 1,
+        "graph_key": link_key,
+        "graph_key_digest_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "name": name,
+        "version": version,
+        "source_sri": sri,
+        "object_path": object_path,
+        "deps": [],
+        "platform": {
+            "os": "darwin",
+            "cpu": "arm64",
+            "libc": null
+        },
+        "created_at": "2026-05-31T08:00:00Z",
+        "last_referenced_at": "2026-05-31T08:00:00Z"
+    });
+    std::fs::write(
+        link_dir.join(".lpm-link-meta.json"),
+        serde_json::to_vec_pretty(&sidecar).expect("sidecar JSON must serialize"),
+    )
+    .expect("failed to write v2 sidecar");
 }
 
 // ─── path subcommand ──────────────────────────────────────────────────
@@ -149,7 +209,7 @@ fn store_verify_passes_on_valid_v1_entry() {
 #[test]
 fn store_verify_human_uses_slim_status_lines() {
     let project = TempProject::empty(r#"{"name":"store-verify","version":"1.0.0"}"#);
-    seed_v1_entry(&project, "lodash", "4.17.21", true);
+    seed_v2_entry(&project, "lodash", "4.17.21");
 
     let output = lpm(&project)
         .args(["store", "verify"])
@@ -167,6 +227,14 @@ fn store_verify_human_uses_slim_status_lines() {
     assert!(
         stderr.contains("› Verifying store integrity"),
         "store verify must report a slim phase line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("links 1 / objects 1"),
+        "store verify must report v2 link/object counts, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Checked every referenced object hash"),
+        "store verify must report the referenced-object check, got:\n{stderr}"
     );
     assert!(
         stderr.contains("✓ Store verified ·"),

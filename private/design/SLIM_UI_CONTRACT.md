@@ -293,11 +293,11 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [color] check names → plain, detail → `dim` (already), terminus counts:
       failures→red, warnings→gold.
 
-### health — `commands/health.rs`  (MISS — only 1 line today)
-- [ ] [B2/struct] Build the `Registry {url} / Status ● healthy / Response
+### health — `commands/health.rs`  (B2 DONE)
+- [x] [B2/struct] Build the `Registry {url} / Status ● healthy / Response
       87 ms` table; measure round-trip for the `Response` value; terminus
-      `✓ Registry is reachable` (L25-37 today: single `✓ Registry is healthy`).
-- [ ] [color] `Registry` url → `url`/blue, `●`+`healthy` → green, labels→`dim`.
+      `✓ Registry is reachable`.
+- [x] [color] `Registry` url → `url`/blue, `●`+`healthy` → green, labels→`dim`.
 
 ### sbom — `commands/sbom.rs`  (MISS — no progress today)
 - [ ] [struct] Add `› Generating CycloneDX SBOM from lpm.lock`, the
@@ -313,10 +313,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [time] add `✓ Done · rebuild finished in {elapsed}` (no timing today).
 - [ ] [color] pkg→plain, script phase→`dim`, `skipped:` value→gold.
 
-### store verify — `commands/store.rs`  (PARTIAL)
-- [ ] [B2/struct] Add `links N / objects N` count block + `✓ Checked every
+### store verify — `commands/store.rs`  (B2 DONE)
+- [x] [B2/struct] Add `links N / objects N` count block + `✓ Checked every
       referenced object hash` intermediate line (L195-545).
-- [ ] [color] labels→`dim`, counts→plain, terminus green/red.
+- [x] [color] labels→`dim`, counts→plain, terminus green/red.
 
 ### security status — `commands/security.rs`  (struct ~MATCH)
 - [ ] [color] section headers (`effective floor`,`active unlocks`)→`section`,
@@ -443,11 +443,11 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `yellow`, `ms`/`→`→`dim`.
 
 ### env ls — `commands/env.rs`
-- [ ] [B2/struct] Replace `Required/Alias` columns with `Synced/Updated`
-      (needs last-sync timestamp data); add `Active environment: default`
+- [x] [B2/struct] Replace `Required/Alias` columns with `Synced/Updated`
+      (using vault sync timestamp data); add `Active environment: default`
       footer + `Use lpm env list --env <name>…` hint; drop the `---` dashed
       separator (L1646-1799).
-- [ ] [color] env names→plain, `yes`→`status_ok`, counts/times→`dim`,
+- [x] [color] env names→plain, `yes`→`status_ok`, counts/times→`dim`,
       `Active environment:` value→green.
 
 ### config scripts — `commands/config.rs`  ([split] cliclack — correct)
