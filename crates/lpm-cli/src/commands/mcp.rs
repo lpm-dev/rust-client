@@ -33,6 +33,27 @@ struct EditorConfig {
     server_key: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorSetupState {
+    Configured,
+    SkippedConfigNotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EditorSetupResult {
+    name: &'static str,
+    state: EditorSetupState,
+}
+
+impl EditorSetupResult {
+    fn configured_name(self) -> Option<&'static str> {
+        match self.state {
+            EditorSetupState::Configured => Some(self.name),
+            EditorSetupState::SkippedConfigNotFound => None,
+        }
+    }
+}
+
 fn get_editors() -> Vec<EditorConfig> {
     let home = dirs::home_dir().unwrap_or_default();
 
@@ -199,22 +220,31 @@ fn setup_editors(
     editors: &[EditorConfig],
     name: &str,
     server_config: &Value,
-) -> Result<Vec<&'static str>, LpmError> {
-    let mut configured = Vec::new();
+) -> Result<Vec<EditorSetupResult>, LpmError> {
+    let mut results = Vec::with_capacity(editors.len());
 
     for editor in editors {
         let path = match &editor.global_path {
-            Some(path) => path,
-            None => continue,
+            Some(path) if path.exists() => path,
+            _ => {
+                results.push(EditorSetupResult {
+                    name: editor.name,
+                    state: EditorSetupState::SkippedConfigNotFound,
+                });
+                continue;
+            }
         };
 
         let mut config = load_config(path)?;
         add_server_to_config(&mut config, editor.server_key, name, server_config)?;
         write_config(path, &config)?;
-        configured.push(editor.name);
+        results.push(EditorSetupResult {
+            name: editor.name,
+            state: EditorSetupState::Configured,
+        });
     }
 
-    Ok(configured)
+    Ok(results)
 }
 
 fn remove_from_editors(
@@ -271,7 +301,11 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
     if !json_output {
         install_ui::phase("Configuring MCP servers for supported editors");
     }
-    let configured = setup_editors(&editors, name, &default_server_config())?;
+    let setup_results = setup_editors(&editors, name, &default_server_config())?;
+    let configured: Vec<&'static str> = setup_results
+        .iter()
+        .filter_map(|result| result.configured_name())
+        .collect();
 
     // M43: the written editor config invokes `npx -y @lpm.dev/lpm-mcp-server`
     // with no version pin. Every editor restart re-resolves the package
@@ -302,13 +336,31 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
             }))
             .unwrap()
         );
-    } else if configured.is_empty() {
-        install_ui::warn("No supported editors detected");
     } else {
-        for editor in &configured {
-            install_ui::done(&format!("{editor} configured"));
+        let editor_name_width = setup_results
+            .iter()
+            .map(|result| result.name.len())
+            .max()
+            .unwrap_or(0);
+        for result in &setup_results {
+            let name = format!("{:<editor_name_width$}", result.name);
+            match result.state {
+                EditorSetupState::Configured => {
+                    install_ui::done(&format!("{name} {}", install_ui::status_ok("configured")))
+                }
+                EditorSetupState::SkippedConfigNotFound => install_ui::skipped(&format!(
+                    "{name} {}",
+                    install_ui::yellow("skipped (config not found)")
+                )),
+            }
         }
-        install_ui::done(&format!("Server name: {name}"));
+
+        if configured.is_empty() {
+            install_ui::warn("No supported editors detected");
+            return Ok(());
+        }
+
+        install_ui::done(&format!("Server name: {}", install_ui::yellow(name)));
         install_ui::warn(
             "autostart resolves `@lpm.dev/lpm-mcp-server` from npm on every editor start. \
              Pin a version by editing the written config (replace the package spec with `@x.y.z`) \
@@ -407,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_editors_creates_missing_config_and_preserves_existing_keys() {
+    fn setup_editors_updates_existing_configs_and_preserves_existing_keys() {
         let dir = tempfile::tempdir().unwrap();
         let claude_path = dir.path().join("claude.json");
         let vscode_path = dir.path().join("vscode.json");
@@ -426,13 +478,19 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        std::fs::write(&vscode_path, "{}").unwrap();
 
         let editors = vec![
             test_editor("Claude", claude_path.clone(), "mcpServers"),
             test_editor("VS Code", vscode_path.clone(), "servers"),
         ];
 
-        let configured = setup_editors(&editors, "lpm-registry", &default_server_config()).unwrap();
+        let setup_results =
+            setup_editors(&editors, "lpm-registry", &default_server_config()).unwrap();
+        let configured: Vec<_> = setup_results
+            .iter()
+            .filter_map(|result| result.configured_name())
+            .collect();
 
         assert_eq!(configured, vec!["Claude", "VS Code"]);
 
@@ -527,10 +585,7 @@ mod tests {
     // ── gap-filling additions ────────────────────────
 
     #[test]
-    fn setup_editors_creates_parent_directories_for_nested_config_path() {
-        // Some editors store config under nested paths that may not exist yet
-        // (e.g., ~/.cursor/mcp.json on a fresh install). The writer must
-        // create the parent tree, not error.
+    fn setup_editors_skips_missing_config_path() {
         let dir = tempfile::tempdir().unwrap();
         let nested_path = dir
             .path()
@@ -540,10 +595,39 @@ mod tests {
             .join("config.json");
         let editors = vec![test_editor("Cursor", nested_path.clone(), "mcpServers")];
 
-        let configured = setup_editors(&editors, "lpm-registry", &default_server_config())
-            .expect("nested-path config must be created");
+        let results = setup_editors(&editors, "lpm-registry", &default_server_config())
+            .expect("missing config must be reported, not treated as fatal");
 
-        assert_eq!(configured, vec!["Cursor"]);
+        assert_eq!(
+            results,
+            vec![EditorSetupResult {
+                name: "Cursor",
+                state: EditorSetupState::SkippedConfigNotFound
+            }]
+        );
+        assert!(
+            !nested_path.exists(),
+            "setup must not create config files for absent editors"
+        );
+    }
+
+    #[test]
+    fn write_config_creates_parent_directories_for_nested_config_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested_path = dir
+            .path()
+            .join("never")
+            .join("created")
+            .join("yet")
+            .join("config.json");
+        let config = serde_json::json!({
+            "mcpServers": {
+                "lpm-registry": default_server_config()
+            }
+        });
+
+        write_config(&nested_path, &config).expect("nested config path must be writable");
+
         assert!(nested_path.exists(), "config file should now exist");
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&nested_path).unwrap()).unwrap();
@@ -687,16 +771,22 @@ mod tests {
     }
 
     #[test]
-    fn setup_editors_skips_editors_with_no_global_path() {
+    fn setup_editors_reports_skipped_for_editors_with_no_global_path() {
         let editors = vec![EditorConfig {
             name: "Phantom",
             global_path: None,
             server_key: "mcpServers",
         }];
 
-        let configured = setup_editors(&editors, "lpm-registry", &default_server_config()).unwrap();
+        let results = setup_editors(&editors, "lpm-registry", &default_server_config()).unwrap();
 
-        assert!(configured.is_empty());
+        assert_eq!(
+            results,
+            vec![EditorSetupResult {
+                name: "Phantom",
+                state: EditorSetupState::SkippedConfigNotFound
+            }]
+        );
     }
 
     #[test]

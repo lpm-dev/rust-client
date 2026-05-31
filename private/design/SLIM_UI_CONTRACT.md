@@ -214,10 +214,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `✓ Resolved N in 0.83s` already correct.
 
 ### query — `commands/query.rs`
-- [ ] [B2/struct] Add per-package `tags:` second line (`tags: eval,
+- [x] [B2/struct] Add per-package `tags:` second line (`tags: eval,
       child-process, …`) — currently folded into `(…)` parenthetical, never a
       2nd line (L383).
-- [ ] [color] pkg→plain, tags→`dim`. Terminus `!` already gold-correct (L386).
+- [x] [color] pkg→plain, tags→`dim`. Terminus `!` already gold-correct (L386).
 
 ### outdated — `commands/outdated.rs`  (struct MATCH)
 - [ ] [color] generic — Wanted→`status_ok`/green, Latest(major)→red, section
@@ -415,10 +415,12 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `enabled`/`status` values→`status_ok`, bar→green (already), labels→`dim`.
 
 ### ci env — `commands/ci.rs`
-- [ ] [struct] Add `✓ Emitted N environment variables for generic CI` terminus
+- [x] [struct] Add `✓ Emitted N environment variables for generic CI` terminus
       on the stdout-print path (today only `--output=file` has a `✓`, diff
       wording, L88).
 - [ ] [color] `export`→purple, var name→`cyan`, value→`yellow`/gold, `***`→red.
+      Deferred for stdout formats because `ci env` output is machine-consumed
+      by shells and CI env files.
 
 ### deploy — `commands/deploy.rs`  (struct MATCH)
 - [ ] [color] `api` filter target→`yellow`, `/prod/api`→`yellow`,
@@ -429,9 +431,9 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `cyan` (already), `$18.42`→green, download counts→plain, labels→`dim`.
 
 ### ports — `commands/ports.rs`
-- [ ] [struct] Add `●` status dot before each status (now sanctioned)
+- [x] [struct] Add `●` status dot before each status (now sanctioned)
       (status built L78-88 without glyph).
-- [ ] [color] port number→`yellow`, `●`+`listening`/`ready`→green, labels→`dim`.
+- [x] [color] port number→`yellow`, `●`+`listening`/`ready`→green, labels→`dim`.
 
 ### tunnel — `commands/tunnel.rs`  (PARTIAL)
 - [ ] [B2/struct] Add `· region {x}` suffix on opening phase; the live
@@ -499,10 +501,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [color] `lpmdev` scope target→`yellow`; keep the pinned-copy test green.
 
 ### mcp setup — `commands/mcp.rs`
-- [ ] [B2/struct] List ALL editors incl. unconfigured with `○ {name} skipped
+- [x] [B2/struct] List ALL editors incl. unconfigured with `○ {name} skipped
       (config not found)` rows (today only configured editors, L305-318);
       align name↔status.
-- [ ] [color] `✓` green configured / `○` dim skipped, `skipped (…)`→gold,
+- [x] [color] `✓` green configured / `○` dim skipped, `skipped (…)`→gold,
       `Server name:` value (`lpm-registry`)→`yellow`.
 
 ### plugin list — `commands/plugin.rs`  (struct MATCH)

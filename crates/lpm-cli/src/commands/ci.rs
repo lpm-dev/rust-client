@@ -3,6 +3,7 @@
 //! - `lpm ci env` — output env vars in CI-native format (auto-detects platform)
 //! - `lpm ci setup github-actions` — generate OIDC workflow YAML
 
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::path::Path;
@@ -89,9 +90,22 @@ fn ci_env(args: &[&str], project_dir: &Path, _json_output: bool) -> Result<(), L
     } else {
         // Print to stdout in CI-native format
         println!("{output}");
+        install_ui::done(&format!(
+            "Emitted {} environment variables for {}",
+            env_vars.len(),
+            ci_format_label(format)
+        ));
     }
 
     Ok(())
+}
+
+fn ci_format_label(format: lpm_env::PrintFormat) -> &'static str {
+    match format {
+        lpm_env::PrintFormat::GithubActions => "GitHub Actions",
+        lpm_env::PrintFormat::Dotenv => "dotenv",
+        _ => "generic CI",
+    }
 }
 
 /// Auto-detect CI platform from environment variables.

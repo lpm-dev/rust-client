@@ -63,6 +63,7 @@ enum LineKind {
     Done,
     Failed,
     Warn,
+    Skipped,
 }
 
 /// Handle returned by [`spin`].
@@ -195,6 +196,7 @@ fn glyph(kind: LineKind) -> String {
         LineKind::Done => "✓".green(),
         LineKind::Failed => "✗".red(),
         LineKind::Warn => "!".yellow(),
+        LineKind::Skipped => "○".dimmed(),
     }
 }
 
@@ -300,6 +302,10 @@ pub fn failed(msg: &str) {
 /// any other non-fatal but operator-relevant signal.
 pub fn warn(msg: &str) {
     emit_line(LineKind::Warn, msg);
+}
+
+pub fn skipped(msg: &str) {
+    emit_line(LineKind::Skipped, msg);
 }
 
 fn diff_entry(glyph: &str, name: &str, version: Option<&str>, hint: Option<&str>) {
