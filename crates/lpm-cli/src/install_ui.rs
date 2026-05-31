@@ -7,13 +7,17 @@
 //! need it, so this module bypasses cliclack entirely and prints plain
 //! lines with single-glyph prefixes.
 //!
-//! Color palette (consistent across the install surface):
+//! Color palette (consistent across slim UI surfaces):
 //!   * `›` blue   — phase / progress line
-//!   * `✓` green  — success terminus or per-package verified
+//!   * `⠦⠴⠇⠸` blue — live spinner frames, settling to `›` / `✓` / `✗` / `!`
+//!   * `✓` green  — success terminus, per-package verified, status values
 //!   * `✗` red    — failure terminus
 //!   * `!` yellow — warning / advisory line (e.g. audit summary)
-//!   * `+` plain  — direct-dep change in the post-install diff list
-//!   * `-` plain  — removed entry in an uninstall / prune diff list
+//!   * `+` green  — direct-dep change in the post-install diff list
+//!   * `-` red    — removed entry in an uninstall / prune diff list
+//!   * `●` green/dim — active/inactive status bullet
+//!   * body roles — section yellow+bold, subject yellow, path/key cyan,
+//!     URL blue, label/hint dimmed, shell keyword magenta, masked secret red
 //!
 //! Caller is responsible for `if json_output { … } else { install_ui::… }`
 //! gating; this module never inspects `--json`.
@@ -34,6 +38,87 @@
 //! color attribute from a warning printed above it.
 
 use lpm_common::color::Painted;
+use std::io::{IsTerminal, Write as _};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+const SPINNER_FRAMES: [&str; 4] = ["⠦", "⠴", "⠇", "⠸"];
+const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+
+static ACTIVE_SPINNER: OnceLock<Mutex<Option<ActiveSpinner>>> = OnceLock::new();
+static NEXT_SPINNER_ID: AtomicU64 = AtomicU64::new(1);
+
+struct ActiveSpinner {
+    id: u64,
+    message: String,
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy)]
+enum LineKind {
+    Phase,
+    Done,
+    Failed,
+    Warn,
+}
+
+/// Handle returned by [`spin`].
+///
+/// Dropping a live spinner settles it to a persisted `›` phase line. Prefer
+/// calling [`Spinner::done`], [`Spinner::failed`], [`Spinner::warn`], or
+/// [`Spinner::settle`] so the transcript records the intended outcome.
+pub struct Spinner {
+    id: Option<u64>,
+    message: String,
+}
+
+impl Spinner {
+    /// Settle the spinner to `› {message}`.
+    pub fn settle(mut self) {
+        self.settle_as(LineKind::Phase, None);
+    }
+
+    /// Settle the spinner to `✓ {message}`.
+    pub fn done(mut self, message: &str) {
+        self.settle_as(LineKind::Done, Some(message));
+    }
+
+    /// Settle the spinner to `✗ {message}`.
+    pub fn failed(mut self, message: &str) {
+        self.settle_as(LineKind::Failed, Some(message));
+    }
+
+    /// Settle the spinner to `! {message}`.
+    pub fn warn(mut self, message: &str) {
+        self.settle_as(LineKind::Warn, Some(message));
+    }
+
+    fn settle_as(&mut self, kind: LineKind, replacement: Option<&str>) {
+        let Some(id) = self.id.take() else {
+            if let Some(message) = replacement {
+                emit_line(kind, message);
+            }
+            return;
+        };
+
+        let message = replacement.unwrap_or(&self.message);
+        if !settle_active_spinner(Some(id), kind, message) {
+            emit_line(kind, message);
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let message = self.message.clone();
+            let _ = settle_active_spinner(Some(id), LineKind::Phase, &message);
+        }
+    }
+}
 
 /// ANSI full-reset (`SGR 0`) prefix, gated on the global color policy.
 ///
@@ -50,13 +135,138 @@ fn reset_prefix() -> &'static str {
     }
 }
 
+#[inline]
+fn active_spinner() -> &'static Mutex<Option<ActiveSpinner>> {
+    ACTIVE_SPINNER.get_or_init(|| Mutex::new(None))
+}
+
+fn take_active_spinner(id: Option<u64>) -> Option<ActiveSpinner> {
+    let mut active = active_spinner()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match (id, active.as_ref()) {
+        (Some(expected), Some(spinner)) if spinner.id != expected => None,
+        _ => active.take(),
+    }
+}
+
+fn settle_active_spinner(id: Option<u64>, kind: LineKind, message: &str) -> bool {
+    let Some(spinner) = take_active_spinner(id) else {
+        return false;
+    };
+
+    spinner.stop.store(true, Ordering::Release);
+    let _ = spinner.thread.join();
+    eprintln!("\r\x1b[2K{}", format_line(kind, message));
+    true
+}
+
+fn settle_any_active_spinner() {
+    let message = {
+        let active = active_spinner()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.as_ref().map(|spinner| spinner.message.clone())
+    };
+    if let Some(message) = message {
+        let _ = settle_active_spinner(None, LineKind::Phase, &message);
+    }
+}
+
+#[inline]
+fn spinner_animation_enabled(stderr_is_terminal: bool, color_enabled: bool) -> bool {
+    stderr_is_terminal && color_enabled
+}
+
+fn should_animate_spinner() -> bool {
+    spinner_animation_enabled(
+        std::io::stderr().is_terminal(),
+        lpm_common::color::enabled(),
+    )
+}
+
+fn format_line(kind: LineKind, msg: &str) -> String {
+    format!("{}{} {msg}", reset_prefix(), glyph(kind))
+}
+
+fn glyph(kind: LineKind) -> String {
+    match kind {
+        LineKind::Phase => "›".blue(),
+        LineKind::Done => "✓".green(),
+        LineKind::Failed => "✗".red(),
+        LineKind::Warn => "!".yellow(),
+    }
+}
+
+fn emit_line(kind: LineKind, msg: &str) {
+    settle_any_active_spinner();
+    eprintln!("{}", format_line(kind, msg));
+}
+
+fn static_spin_fallback_line(msg: &str) -> String {
+    format_line(LineKind::Phase, msg)
+}
+
+/// Start a TTY-gated slim spinner for long-running work.
+///
+/// Non-interactive stderr, disabled color, and test pipes degrade to the same
+/// static `› {msg}` line as [`phase`], preserving byte-for-byte pipe output.
+pub fn spin(msg: &str) -> Spinner {
+    settle_any_active_spinner();
+
+    if !should_animate_spinner() {
+        eprintln!("{}", static_spin_fallback_line(msg));
+        return Spinner {
+            id: None,
+            message: msg.to_owned(),
+        };
+    }
+
+    let id = NEXT_SPINNER_ID.fetch_add(1, Ordering::Relaxed);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let message = msg.to_owned();
+    let thread_message = message.clone();
+
+    let thread = thread::spawn(move || {
+        let mut frame_index = 0usize;
+        let mut stderr = std::io::stderr();
+        while !thread_stop.load(Ordering::Acquire) {
+            let frame = SPINNER_FRAMES[frame_index % SPINNER_FRAMES.len()].blue();
+            let _ = write!(
+                stderr,
+                "\r\x1b[2K{}{} {thread_message}",
+                reset_prefix(),
+                frame
+            );
+            let _ = stderr.flush();
+            frame_index = frame_index.wrapping_add(1);
+            thread::sleep(SPINNER_INTERVAL);
+        }
+    });
+
+    *active_spinner()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveSpinner {
+        id,
+        message: message.clone(),
+        stop,
+        thread,
+    });
+
+    Spinner {
+        id: Some(id),
+        message,
+    }
+}
+
 /// Phase / progress line: `› {msg}`.
 ///
-/// Persistent (stays on screen after the next phase fires). Use one
-/// `phase` line per logical step so the transcript narrates what the
-/// install is doing without spinners.
+/// Persistent (stays on screen after the next phase fires). Calling `phase`
+/// while a [`spin`] handle is active settles that spinner to a `›` transcript
+/// line before printing this one.
 pub fn phase(msg: &str) {
-    eprintln!("{}{} {msg}", reset_prefix(), "›".blue());
+    emit_line(LineKind::Phase, msg);
 }
 
 /// Short, user-facing form of a registry URL. Strips the `registry.`
@@ -76,12 +286,12 @@ pub fn short_registry_host(url: &str) -> String {
 
 /// Success terminus: `✓ {msg}`.
 pub fn done(msg: &str) {
-    eprintln!("{}{} {msg}", reset_prefix(), "✓".green());
+    emit_line(LineKind::Done, msg);
 }
 
 /// Failure terminus: `✗ {msg}`.
 pub fn failed(msg: &str) {
-    eprintln!("{}{} {msg}", reset_prefix(), "✗".red());
+    emit_line(LineKind::Failed, msg);
 }
 
 /// Advisory / warning line: `! {msg}`.
@@ -89,10 +299,11 @@ pub fn failed(msg: &str) {
 /// Used for the audit summary, peer-dependency mismatch notices, and
 /// any other non-fatal but operator-relevant signal.
 pub fn warn(msg: &str) {
-    eprintln!("{}{} {msg}", reset_prefix(), "!".yellow());
+    emit_line(LineKind::Warn, msg);
 }
 
 fn diff_entry(glyph: &str, name: &str, version: Option<&str>, hint: Option<&str>) {
+    settle_any_active_spinner();
     let mut suffix = String::new();
     if let Some(version) = version {
         suffix.push('@');
@@ -117,7 +328,7 @@ fn diff_entry(glyph: &str, name: &str, version: Option<&str>, hint: Option<&str>
 /// `hint` is for "(v6.0.3 available)" / "(deprecated)" / "(offline)" —
 /// caller passes the parenthesized suffix verbatim.
 pub fn plus(name: &str, version: &str, hint: Option<&str>) {
-    diff_entry("+", name, Some(version), hint);
+    diff_entry(&"+".green(), name, Some(version), hint);
 }
 
 /// Removal diff entry: `- {name}{?@version}{?hint}`.
@@ -126,7 +337,7 @@ pub fn plus(name: &str, version: &str, hint: Option<&str>) {
 /// optional `@{version}` and optional `hint` render dimmed so the removed
 /// thing remains the visual anchor of the line.
 pub fn minus(name: &str, version: Option<&str>, hint: Option<&str>) {
-    diff_entry("-", name, version, hint);
+    diff_entry(&"-".red(), name, version, hint);
 }
 
 /// Render a Duration as a short human string suitable for inlining in
@@ -155,9 +366,48 @@ pub fn bold(text: &str) -> String {
     text.bold()
 }
 
-/// Green helper (for the timing in the "Done" line).
+/// Yellow helper for the subject/tool/target role.
+pub fn yellow(text: &str) -> String {
+    text.yellow()
+}
+
+/// Section-header helper: yellow + bold.
+pub fn section(text: &str) -> String {
+    text.yellow().bold()
+}
+
+/// Cyan helper for path/scope/identifier/key/flag roles.
+pub fn cyan(text: &str) -> String {
+    text.cyan()
+}
+
+/// URL helper: blue for `http(s)://…` values.
+pub fn url(text: &str) -> String {
+    text.blue()
+}
+
+/// Green helper for success/status-value roles.
 pub fn green(text: &str) -> String {
     text.green()
+}
+
+/// Named status-value helper for grep-able call sites.
+pub fn status_ok(text: &str) -> String {
+    green(text)
+}
+
+/// Status bullet: green when active, dim when inactive.
+pub fn bullet(active: bool) -> String {
+    if active {
+        "●".green()
+    } else {
+        "●".dimmed()
+    }
+}
+
+/// Magenta helper for shell keywords such as `export` and `local`.
+pub fn magenta(text: &str) -> String {
+    text.magenta()
 }
 
 /// Compact quota meter used by account/cache status surfaces.
@@ -257,7 +507,10 @@ pub fn format_audit_advisory(
 
 #[cfg(test)]
 mod tests {
-    use super::usage_bar_filled_cells;
+    use super::{
+        LineKind, format_line, spinner_animation_enabled, static_spin_fallback_line,
+        usage_bar_filled_cells,
+    };
 
     #[test]
     fn usage_bar_rounds_visible_fraction_up_to_one_cell() {
@@ -281,5 +534,19 @@ mod tests {
         assert_eq!(usage_bar_filled_cells(0, 100, 10), 0);
         assert_eq!(usage_bar_filled_cells(50, 0, 10), 0);
         assert_eq!(usage_bar_filled_cells(50, 100, 0), 0);
+    }
+
+    #[test]
+    fn spinner_animation_requires_tty_and_color() {
+        assert!(spinner_animation_enabled(true, true));
+        assert!(!spinner_animation_enabled(false, true));
+        assert!(!spinner_animation_enabled(true, false));
+    }
+
+    #[test]
+    fn spinner_non_tty_line_matches_static_phase_line() {
+        let phase_line = format_line(LineKind::Phase, "Resolving dependencies");
+        let fallback_line = static_spin_fallback_line("Resolving dependencies");
+        assert_eq!(fallback_line, phase_line);
     }
 }

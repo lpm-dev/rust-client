@@ -32,22 +32,49 @@ CLI stays coherent.
 
 | Glyph | Color  | Meaning                                                 | Helper               |
 | ----- | ------ | ------------------------------------------------------- | -------------------- |
-| `›`   | blue   | Phase / progress line (persistent, stays on screen)     | `install_ui::phase`  |
+| `›`   | blue   | Phase line — animates as a spinner while the step runs, settles to `›` (see Spinner lifecycle) | `install_ui::phase` / `install_ui::spin` |
 | `✓`   | green  | Success terminus or per-item verified                   | `install_ui::done`   |
 | `✗`   | red    | Failure terminus                                        | `install_ui::failed` |
 | `!`   | yellow | Advisory / warning (informational, never fails the cmd) | `install_ui::warn`   |
-| `+`   | plain  | Diff entry (added / changed)                            | `install_ui::plus`   |
-| `-`   | plain  | Diff entry (removed)                                    | `install_ui::minus`  |
+| `+`   | green  | Diff entry (added / changed)                            | `install_ui::plus`   |
+| `-`   | red    | Diff entry (removed)                                    | `install_ui::minus`  |
+| `●`   | green / dim | Status bullet: active/healthy/listening or inactive | `install_ui::bullet` |
 
 Within message bodies:
 
-| Element                                | Style                         |
-| -------------------------------------- | ----------------------------- |
-| Project / package name                 | **bold** (`install_ui::bold`) |
-| Resolved duration in a terminus line   | green (`install_ui::green`)   |
-| Vulnerability / failure count when > 0 | red (`install_ui::red`)       |
-| Hints, suffix metadata, parentheticals | dimmed (`install_ui::dim`)    |
-| Plain text                             | unstyled                      |
+| Element                                | Style                                      |
+| -------------------------------------- | ------------------------------------------ |
+| Section header                         | yellow + bold (`install_ui::section`)      |
+| Subject / tool / acted-on target       | yellow (`install_ui::yellow`)              |
+| Path / scope / identifier / key / flag | cyan (`install_ui::cyan`)                  |
+| URL                                    | blue (`install_ui::url`)                   |
+| Status value / terminus count          | green (`install_ui::status_ok` / `green`)  |
+| Vulnerability / failure count when > 0 | red (`install_ui::red`)                    |
+| Shell keyword                          | magenta (`install_ui::magenta`)            |
+| Hints, suffix metadata, parentheticals | dimmed (`install_ui::dim`)                 |
+| Plain text                             | unstyled                                   |
+
+## Spinner lifecycle
+
+A phase that represents in-progress work renders as an animated braille
+spinner (blue) at the glyph position while the work runs, then **settles**:
+
+- to `›` (blue) if it is an informational phase that persists in the
+  transcript, or
+- to `✓` / `✗` / `!` if it is the terminus that reports the outcome.
+
+The same line is a spinner while busy and a static glyph once done —
+matching the design captures (`⠦ Using Biome 2.4.8` live → `› Using Biome
+2.4.8` settled).
+
+**TTY-gated — this preserves the piping guarantee.** Animate only when
+stderr is an interactive TTY with color enabled. When piped, redirected,
+`NO_COLOR`, `--color=never`, non-TTY, or under `--json`: do **not** animate —
+print the static `›`/`✓` line immediately, byte-identical to the
+non-spinner output. The spinner uses carriage-return + clear-line on
+**stderr only**; it never emits cursor / escape codes into a pipe and never
+touches stdout. Instantaneous steps (<~100 ms, e.g. "Auto-detected Vitest")
+may skip animation and print static immediately.
 
 ## Reusable helpers in `install_ui`
 
@@ -57,7 +84,8 @@ reimplement:
 - `phase(msg)` / `done(msg)` / `failed(msg)` / `warn(msg)` — the five
   line shapes.
 - `plus(name, version, hint)` / `minus(name, version, hint)` — the diff entry shapes.
-- `bold` / `dim` / `green` / `red` — color helpers that honor
+- `bold` / `dim` / `green` / `red` / `yellow` / `section` / `cyan` /
+  `url` / `status_ok` / `bullet` / `magenta` — color helpers that honor
   `NO_COLOR` / `--color` via `lpm_common::color`.
 - `format_duration(Duration)` — sub-second → `"Xms"`, else `"X.XXs"`.
 - `packages_word(count)` — pluralization for "package(s)".
@@ -98,8 +126,11 @@ surfaces from it — never re-derive in two places.
   diff / done / advisory at the end already conveys the state, the
   per-step "Adding X to Y", "Resolved in Nms", "Linked in Nms" lines
   are noise. The slim-UI rewrite of install dropped 8 of those.
-- **Don't use spinners (`cliclack::spinner()`).** A persistent
-  `phase()` line carries the same intent and survives piping.
+- **Spinners animate on a TTY, never leak into pipes.** In-progress phases
+  spin (braille, blue) and settle to `›`/`✓` (see *Spinner lifecycle*).
+  Don't reach for `cliclack::spinner()` — its box gutter is wrong here; use
+  the `install_ui` spinner primitive, which degrades to a static line when
+  stderr isn't an interactive TTY, so piped output is unchanged.
 - **Don't print to stdout** — that stream is for `--json` and pipes.
 - **Don't add per-item progress lines** ("Downloaded ms@2.1.3",
   "Linked react@18", "...") for items in a large set. Aggregate at
