@@ -219,8 +219,6 @@ pub async fn run(
         return Ok(());
     }
 
-    let total_count = discovery.packages.len();
-
     // Separate LPM and non-LPM packages
     let lpm_packages: Vec<(String, String)> = discovery
         .packages
@@ -228,12 +226,6 @@ pub async fn run(
         .filter(|p| p.name.starts_with("@lpm.dev/"))
         .map(|p| (p.name.clone(), p.version.clone()))
         .collect();
-    let lpm_count = lpm_packages.len();
-    let npm_count = total_count - lpm_count;
-
-    if !json_output {
-        print_discovery_header(&discovery, lpm_count, npm_count);
-    }
 
     let mut results: Vec<AuditResult> = Vec::new();
     let mut checked_lpm = 0usize;
@@ -321,6 +313,8 @@ pub async fn run(
         );
     } else {
         // Human-readable output — three-tier separation
+        print_discovery_summary(&discovery);
+        print_osv_status(osv_degraded_reason.as_deref());
 
         // Section 1: LPM quality scores
         print_lpm_results(&results, &lpm_packages);
@@ -335,16 +329,16 @@ pub async fn run(
         if !lpm_packages.is_empty() {
             let confusion_warnings = check_dependency_confusion(&lpm_packages);
             if !confusion_warnings.is_empty() {
-                println!("  {}", "Dependency confusion warnings".bold());
+                eprintln!();
+                eprintln!("  {}", install_ui::section("Dependency confusion warnings"));
                 for w in &confusion_warnings {
-                    println!(
-                        "    {} {} shares name with npm package '{}'",
+                    eprintln!(
+                        "  {} {} shares name with npm package {}",
                         "!".yellow(),
-                        w.lpm_package,
-                        w.npm_name,
+                        install_ui::yellow(&w.lpm_package),
+                        install_ui::cyan(&w.npm_name),
                     );
                 }
-                println!();
             }
         }
 
@@ -698,7 +692,7 @@ fn run_behavioral_analysis(
     discovery: &DiscoveryResult,
     results: &mut Vec<AuditResult>,
     lpm_packages: &[(String, String)],
-    json_output: bool,
+    _json_output: bool,
     level: Option<&str>,
 ) -> BehavioralSummary {
     let scannable: Vec<&DiscoveredPackage> = discovery
@@ -745,12 +739,6 @@ fn run_behavioral_analysis(
     // so reading from the baseline-resolved path picks up the
     // pre-computed analysis written at install time.
     let lpm_root = lpm_common::LpmRoot::from_env().ok();
-
-    // Progress indicator for large scans
-    let show_progress = !json_output && scannable.len() > 50;
-    if show_progress {
-        install_ui::phase(&format!("Analyzing {} packages", scannable.len()));
-    }
 
     let mut scanned = 0usize;
     let mut with_findings = 0usize;
@@ -999,7 +987,7 @@ pub(crate) struct OsvScanOutcome {
 /// Query OSV for all non-@lpm.dev packages, deduplicating by (name, version).
 async fn run_osv_scan(
     packages: &[DiscoveredPackage],
-    json_output: bool,
+    _json_output: bool,
     level: Option<&str>,
 ) -> OsvScanOutcome {
     // Collect non-@lpm.dev packages eligible for OSV
@@ -1032,32 +1020,15 @@ async fn run_osv_scan(
         };
     }
 
-    if !json_output {
-        install_ui::phase(&format!(
-            "Checking {} packages against OSV vulnerability database",
-            osv_queries.len()
-        ));
-    }
-
     let vulns = match query_osv_batch(&osv_queries).await {
         Ok(v) => v,
         Err(e) => {
             let reason = e.to_string();
             // Promote to `warn` (was `debug`) so a degraded audit
-            // never hides in default tracing output. Print to
-            // stderr-shaped human channel even in JSON mode so the
-            // operator sees it directly; the JSON envelope ALSO
-            // carries the structured `osv_degraded` field for
-            // machine consumption.
+            // never hides in default tracing output. The human renderer
+            // prints the warning once; the JSON envelope carries the
+            // structured `osv_degraded` field for machine consumption.
             tracing::warn!("OSV query failed: {reason}");
-            if !json_output {
-                println!(
-                    "  {} OSV database unavailable; vulnerability scan is INCOMPLETE — \
-                     a green result does NOT mean no vulnerabilities exist.",
-                    "!".yellow()
-                );
-                println!("    reason: {reason}");
-            }
             return OsvScanOutcome {
                 vulns: Vec::new(),
                 degraded_reason: Some(reason),
@@ -1082,48 +1053,128 @@ async fn run_osv_scan(
 
 // ─── Report rendering ──────────────────────────────────────────────
 
-fn print_discovery_header(discovery: &DiscoveryResult, lpm_count: usize, npm_count: usize) {
+fn print_discovery_summary(discovery: &DiscoveryResult) {
     let total = discovery.packages.len();
-    install_ui::phase(&format!("Scanning {total} packages"));
-
-    // Show lockfile info
+    let mut message = format!("Analyzed {total} {}", install_ui::packages_word(total));
     if let Some(ref lockfile_path) = discovery.lockfile_path {
-        let lockfile_name = lockfile_path
+        if let Some(lockfile_name) = lockfile_path
             .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
-        println!(
-            "  lockfile  {} ({})",
-            lockfile_name.bold(),
-            discovery.manager,
-        );
+            .and_then(|f| f.to_str())
+            .filter(|name| !name.is_empty())
+        {
+            message.push_str(" · ");
+            message.push_str(&install_ui::dim(lockfile_name));
+        }
     } else {
-        println!(
-            "  {}",
-            "No lockfile found — scanning node_modules directly (degraded mode)".yellow(),
-        );
+        message.push_str(" · ");
+        message.push_str(&install_ui::dim("node_modules"));
     }
 
+    install_ui::done(&message);
+
+    if discovery.lockfile_path.is_none() {
+        install_ui::warn("No lockfile found; scanning node_modules directly");
+    }
     if discovery.is_yarn_pnp {
-        println!(
-            "  {}",
-            "Yarn PnP detected — source scanning unavailable (packages are zipped)".yellow(),
-        );
-        println!("  Running vulnerability scan only (OSV)...");
+        install_ui::warn("Yarn PnP detected; source scanning unavailable");
     }
+}
 
-    if lpm_count > 0 {
-        println!("  LPM packages: {} (with registry metadata)", lpm_count);
+fn print_osv_status(osv_degraded_reason: Option<&str>) {
+    if let Some(reason) = osv_degraded_reason {
+        install_ui::warn(&format!(
+            "{} database unavailable; vulnerability scan incomplete",
+            install_ui::yellow("OSV")
+        ));
+        eprintln!("  {} {reason}", install_ui::dim("reason:"));
+    } else {
+        install_ui::done(&format!(
+            "Checked against {} database",
+            install_ui::yellow("OSV")
+        ));
     }
-    if npm_count > 0 {
-        let label = if discovery.is_yarn_pnp {
-            "OSV-only"
-        } else {
-            "client-side analysis"
-        };
-        println!("  npm packages: {} ({})", npm_count, label,);
+}
+
+fn format_osv_severity(severity: &str) -> String {
+    install_ui::dim(&format!("severity {}", severity.to_lowercase()))
+}
+
+fn package_name_without_version(pkg_id: &str) -> String {
+    pkg_id
+        .rsplit_once('@')
+        .filter(|(name, _)| !name.is_empty())
+        .map_or_else(|| pkg_id.to_string(), |(name, _)| name.to_string())
+}
+
+fn preview_versioned_packages(packages: &[String], limit: usize) -> String {
+    let mut preview: Vec<String> = packages
+        .iter()
+        .take(limit)
+        .map(|pkg| lpm_common::sanitize_for_terminal(pkg))
+        .collect();
+    if packages.len() > limit {
+        preview.push(format!("+{}", packages.len() - limit));
     }
-    println!();
+    install_ui::dim(&preview.join(", "))
+}
+
+fn preview_package_names(packages: &[String], limit: usize) -> String {
+    let mut preview: Vec<String> = packages
+        .iter()
+        .take(limit)
+        .map(|pkg| lpm_common::sanitize_for_terminal(&package_name_without_version(pkg)))
+        .collect();
+    if packages.len() > limit {
+        preview.push(format!("+{}", packages.len() - limit));
+    }
+    install_ui::dim(&preview.join(", "))
+}
+
+fn behavior_token_label(token: &str) -> &str {
+    match token {
+        "dynamic require" => "dyn-require",
+        other => other,
+    }
+}
+
+fn format_behavior_message(message: &str) -> String {
+    let body = message.strip_prefix("uses ").unwrap_or(message);
+    let tokens: Vec<String> = body
+        .split(", ")
+        .filter(|part| !part.is_empty())
+        .map(|part| behavior_token_label(part).to_string())
+        .collect();
+    if tokens.len() == 2 && tokens[0] == "eval()" && tokens[1] == "dyn-require" {
+        return "eval() / dynamic require (misc)".to_string();
+    }
+    if tokens.is_empty() {
+        lpm_common::sanitize_for_terminal(message)
+    } else {
+        let separator = format!(" {} ", install_ui::dim("·"));
+        tokens.join(&separator)
+    }
+}
+
+fn info_tag_label(tag: &str, count: usize) -> String {
+    match tag {
+        "high-entropy strings detected" => "high-entropy strings".to_string(),
+        "wildcard dep" if count != 1 => "wildcard deps".to_string(),
+        "native bindings" if count == 1 => "native binding".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn count_phrase(count: usize, singular: &str, plural: &str) -> String {
+    let noun = if count == 1 { singular } else { plural };
+    format!("{} {noun}", install_ui::yellow(&count.to_string()))
+}
+
+fn info_tag_phrase(tag: &str, count: usize) -> String {
+    format!(
+        "{} {}",
+        install_ui::yellow(&count.to_string()),
+        info_tag_label(tag, count)
+    )
 }
 
 /// Print LPM package quality scores and registry-only issues.
@@ -1151,7 +1202,7 @@ fn print_lpm_results(results: &[AuditResult], lpm_packages: &[(String, String)])
             .collect();
 
         if registry_issues.is_empty() {
-            println!(
+            eprintln!(
                 "  {} {}{}",
                 "✓".green(),
                 format!("{}@{}", result.name, result.version).dimmed(),
@@ -1160,9 +1211,9 @@ fn print_lpm_results(results: &[AuditResult], lpm_packages: &[(String, String)])
             continue;
         }
 
-        println!(
+        eprintln!(
             "\n  {} {}",
-            result.name.bold(),
+            install_ui::yellow(&result.name),
             format!("({}){}", result.version, score_str).dimmed(),
         );
 
@@ -1172,7 +1223,7 @@ fn print_lpm_results(results: &[AuditResult], lpm_packages: &[(String, String)])
                 "moderate" => "!".yellow().to_string(),
                 _ => "ℹ".blue().to_string(),
             };
-            println!(
+            eprintln!(
                 "    {icon} {} {} {}",
                 format_severity(&issue.severity),
                 issue.message,
@@ -1188,38 +1239,22 @@ fn print_osv_results(osv_vulns: &[OsvVulnerability]) {
         return;
     }
 
-    println!();
-    println!("  {}", "Vulnerabilities (OSV)".bold());
+    eprintln!();
+    eprintln!("  {}", install_ui::section("Vulnerabilities"));
 
     for vuln in osv_vulns {
-        let icon = match vuln.severity.as_str() {
-            "HIGH" | "CRITICAL" => "✗".red().to_string(),
-            "MODERATE" | "MEDIUM" => "!".yellow().to_string(),
-            _ => "ℹ".cyan().to_string(),
-        };
-        let summary_text = lpm_common::sanitize_for_terminal(&vuln.summary);
-        let summary = if summary_text.is_empty() {
-            String::new()
-        } else {
-            format!(" — {summary_text}")
-        };
         let package_safe = lpm_common::sanitize_for_terminal(&vuln.package);
         let version_safe = lpm_common::sanitize_for_terminal(&vuln.version);
         let id_safe = lpm_common::sanitize_for_terminal(&vuln.id);
-        println!(
-            "    {icon} {}@{} {} [{}]{summary}",
+        eprintln!(
+            "  {} {}@{}  {}  {}",
+            "!".yellow(),
             package_safe,
             version_safe,
-            id_safe.bold(),
-            format_severity(&vuln.severity),
+            install_ui::cyan(&id_safe),
+            format_osv_severity(&vuln.severity),
         );
     }
-
-    println!(
-        "\n  {} vulnerability details: {}",
-        "ℹ".blue(),
-        "https://osv.dev/vulnerability/VULN_ID".dimmed()
-    );
 }
 
 /// Print behavioral analysis findings grouped by severity tier.
@@ -1262,54 +1297,36 @@ fn print_behavioral_results(results: &[AuditResult], lpm_packages: &[(String, St
         return;
     }
 
-    println!();
+    eprintln!();
 
     // Critical tier — show individual packages (these are truly suspicious)
     if has_critical {
-        println!("  {}", "Suspicious packages".bold());
-        for (message, packages) in &critical_tags {
-            let count = packages.len();
-            let preview: Vec<&str> = packages.iter().take(3).map(|s| s.as_str()).collect();
-            let suffix = if count > 3 {
-                format!(", +{} more", count - 3)
-            } else {
-                String::new()
-            };
-            println!(
-                "    {} {} {} — {}{}",
-                "✗".red(),
-                format_severity("critical"),
-                message,
-                preview.join(", "),
-                suffix,
-            );
+        eprintln!("  {}", install_ui::section("Suspicious packages"));
+        let mut sorted: Vec<(&String, &Vec<String>)> = critical_tags.iter().collect();
+        sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+        for (message, packages) in sorted {
+            eprintln!("  {} {}  {}", "✗".red(), "CRITICAL".red().bold(), message,);
+            eprintln!("              {}", preview_versioned_packages(packages, 4),);
         }
-        println!();
+        eprintln!();
     }
 
     // Moderate tier — show counts with a few examples
     if has_moderate {
-        println!("  {}", "Behavioral flags".bold());
+        eprintln!("  {}", install_ui::section("Behavioral flags"));
         // Sort by count descending
         let mut sorted: Vec<(&String, &Vec<String>)> = moderate_tags.iter().collect();
-        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.len()));
-        for (message, packages) in &sorted {
+        sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+        for (message, packages) in sorted {
             let count = packages.len();
-            let preview: Vec<&str> = packages.iter().take(3).map(|s| s.as_str()).collect();
-            let suffix = if count > 3 {
-                format!(", +{} more", count - 3)
-            } else {
-                String::new()
-            };
-            println!(
-                "    {} {count:<4} {:<40} {}{}",
+            eprintln!(
+                "  {} {count:<3} {}  {}",
                 "!".yellow(),
-                message,
-                preview.join(", "),
-                suffix,
+                format_behavior_message(message),
+                preview_package_names(packages, 2),
             );
         }
-        println!();
+        eprintln!();
     }
 
     // Info tier — aggregate counts only, no package names
@@ -1328,12 +1345,17 @@ fn print_behavioral_results(results: &[AuditResult], lpm_packages: &[(String, St
         }
         if !tag_counts.is_empty() {
             let mut sorted: Vec<(&&str, &usize)> = tag_counts.iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(a.1));
+            sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
             let summary_parts: Vec<String> = sorted
-                .iter()
-                .map(|(tag, count)| format!("{count} {tag}"))
+                .into_iter()
+                .map(|(tag, count)| info_tag_phrase(tag, *count))
                 .collect();
-            println!("  {} {}", "ℹ".blue(), summary_parts.join(", ").dimmed(),);
+            let separator = format!(" {} ", install_ui::dim("·"));
+            eprintln!(
+                "  {} {}",
+                install_ui::dim("also:"),
+                summary_parts.join(&separator),
+            );
         }
     }
 }
@@ -1346,7 +1368,7 @@ fn print_summary(
     discovery: &DiscoveryResult,
     checked_lpm: usize,
 ) {
-    println!();
+    eprintln!();
 
     let total_scanned = discovery.packages.len();
     let vuln_count = osv_vulns.len();
@@ -1356,60 +1378,34 @@ fn print_summary(
         .map(|r| r.issues.len())
         .sum();
 
-    let lpm_count = discovery
-        .packages
-        .iter()
-        .filter(|p| p.name.starts_with("@lpm.dev/"))
-        .count();
-    let npm_count = total_scanned - lpm_count;
-
     if vuln_count == 0 && lpm_issues == 0 && behavioral.packages_with_findings == 0 {
-        install_ui::done(&format!(
-            "No issues found ({total_scanned} packages scanned{}{})",
-            if checked_lpm > 0 {
-                format!(", {checked_lpm} LPM audited")
-            } else {
-                String::new()
-            },
-            if behavioral.packages_scanned > 0 {
-                format!(", {} analyzed", behavioral.packages_scanned)
-            } else {
-                String::new()
-            },
-        ));
+        let mut parts = vec![format!("{total_scanned} scanned")];
+        if checked_lpm > 0 {
+            parts.push(format!("{checked_lpm} LPM audited"));
+        }
+        if behavioral.packages_scanned > 0 {
+            parts.push(format!("{} analyzed", behavioral.packages_scanned));
+        }
+        install_ui::done(&format!("No issues found · {}", parts.join(" · ")));
     } else {
         let mut parts = Vec::new();
         if vuln_count > 0 {
-            parts.push(format!(
-                "{vuln_count} vulnerabilit{}",
-                if vuln_count == 1 { "y" } else { "ies" }
-            ));
+            parts.push(count_phrase(vuln_count, "vulnerability", "vulnerabilities"));
         }
         if behavioral.packages_with_findings > 0 {
-            parts.push(format!("{} suspicious", behavioral.packages_with_findings));
-        }
-        if lpm_issues > 0 {
-            parts.push(format!(
-                "{lpm_issues} LPM issue{}",
-                if lpm_issues == 1 { "" } else { "s" }
+            parts.push(count_phrase(
+                behavioral.packages_with_findings,
+                "suspicious",
+                "suspicious",
             ));
         }
+        if lpm_issues > 0 {
+            parts.push(count_phrase(lpm_issues, "LPM issue", "LPM issues"));
+        }
+        parts.push(format!("{total_scanned} scanned"));
 
-        install_ui::warn(&format!(
-            "{} ({} LPM + {} npm scanned)",
-            parts.join(", "),
-            lpm_count,
-            npm_count,
-        ));
+        install_ui::warn(&parts.join(" · "));
     }
-
-    // Helpful commands
-    println!();
-    println!(
-        "  Run {} for machine-readable output.",
-        "lpm audit --json".bold()
-    );
-    println!();
 }
 
 /// Print JSON output for machine consumption.
@@ -1842,12 +1838,12 @@ pub async fn run_secrets(
         return Ok(());
     }
 
-    println!();
-    println!(
+    eprintln!();
+    eprintln!(
         "  Scanned {} package(s) for hardcoded secrets",
         total_packages
     );
-    println!();
+    eprintln!();
 
     if packages_with_secrets.is_empty() {
         install_ui::done("no hardcoded secrets found");
@@ -1859,10 +1855,10 @@ pub async fn run_secrets(
         let high = result.high_count();
         let total = result.matches.len();
 
-        println!(
+        eprintln!(
             "  {} {}  {} finding(s) ({} critical, {} high)",
             "!".yellow(),
-            pkg_name.bold(),
+            install_ui::yellow(pkg_name),
             total,
             critical.to_string().red(),
             high.to_string().yellow(),
@@ -1874,7 +1870,7 @@ pub async fn run_secrets(
             } else {
                 String::new()
             };
-            println!(
+            eprintln!(
                 "    {} {}{}  {}",
                 match m.severity.as_str() {
                     "critical" => "·".red().to_string(),
@@ -1886,14 +1882,14 @@ pub async fn run_secrets(
                 m.description
             );
         }
-        println!();
+        eprintln!();
     }
 
-    println!(
+    eprintln!(
         "  {} package(s) contain potential hardcoded secrets",
         packages_with_secrets.len().to_string().red()
     );
-    println!();
+    eprintln!();
 
     if should_fail_secrets(fail_policy, true) {
         return Err(LpmError::ExitCode(1));
