@@ -388,11 +388,11 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [x] [color] `lpm.dev`→`yellow`, `Keychain`→plain.
 
 ### migrate — `commands/migrate.rs`  (MISS — untouched, still old `[n/total]` UI)
-- [ ] [struct] Full rewrite to slim: `› Detecting current package manager`
+- [x] [struct] Full rewrite to slim: `› Detecting current package manager`
       + `source:/backups:` block, `✓ Converted lockfile` + `wrote:` rows,
       `› Running lpm install…`, `✓ Done · migration completed successfully`.
       Remove the bold banner + step counters + "Next steps:" footer.
-- [ ] [color] `pnpm-lock.yaml`/`lpm install`→`yellow`, labels→`dim`.
+- [x] [color] `pnpm-lock.yaml`/`lpm install`→`yellow`, labels→`dim`.
 
 ### use — `commands/use.rs` + `use_ui.rs`  (mdx says "should be" — aspirational)
 - [x] [B2/struct] Build: `› Resolving node@22 → 22.12.0 (lts/jod)`, download
@@ -518,10 +518,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
       `current`→`status_ok`, labels→`dim`.
 
 ### plugin update — `commands/plugin.rs` + `lpm-plugin` crate
-- [ ] [struct] Add `› Downloading {tool} {ver}` phase + `✓ Verified SHA-256
+- [x] [struct] Add `› Downloading {tool} {ver}` phase + `✓ Verified SHA-256
       checksum` line (today only the `✓ Updated …` terminus; checksum is
       `tracing`-level in `download.rs:150`).
-- [ ] [color] version→`yellow`, `→`→`dim`.
+- [x] [color] version→`yellow`, `→`→`dim`.
 
 ### patch / patch-commit — `commands/patch.rs`  (struct MATCH)
 - [x] [color] target `lodash@4.17.21`→`yellow`, `source:/staging:` paths→

@@ -33,6 +33,12 @@ use lpm_common::LpmError;
 use lpm_runtime::platform::Platform;
 use sha2::{Digest, Sha256};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadReport {
+    pub asset_sha256: String,
+    pub verification_source: VerificationSource,
+}
+
 /// Maximum download size: 150 MB. 3x safety margin over largest known plugin (~50 MB biome).
 const MAX_PLUGIN_DOWNLOAD_SIZE: usize = 150 * 1024 * 1024;
 
@@ -78,7 +84,7 @@ pub async fn download_plugin(
     def: &PluginDef,
     version: &str,
     platform: &Platform,
-) -> Result<(), LpmError> {
+) -> Result<DownloadReport, LpmError> {
     let platform_str = platform.to_string();
     let asset_name = registry::resolve_platform_asset(def, &platform_str).ok_or_else(|| {
         LpmError::Plugin(format!(
@@ -253,7 +259,10 @@ pub async fn download_plugin(
         binary_sha256,
     );
 
-    Ok(())
+    Ok(DownloadReport {
+        asset_sha256,
+        verification_source: verification,
+    })
 }
 
 /// Decide how this download is verified — bundled, upstream-fetched, or
