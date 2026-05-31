@@ -180,6 +180,19 @@ async fn lpm_add_with_mixed_registry_deps_installs_and_writes_resolved_specs() {
         output.status.success(),
         "lpm add failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
+    assert!(
+        stderr.contains("› Downloading source package source-pkg@1.0.0")
+            && stderr.contains("› Detecting project structure")
+            && stderr.contains("Framework:")
+            && stderr.contains("Install path:")
+            && stderr.contains("✓ Files copied")
+            && stderr.contains("+ Foo.tsx")
+            && stderr.contains("› Installing declared dependencies")
+            && stderr.contains("+ lucide-react@^0.400.0")
+            && stderr.contains("+ lodash@4.17.21")
+            && stderr.contains("✓ Done · added 1 file and 2 dependencies in"),
+        "lpm add human output should follow the slim contract; stderr:\n{stderr}"
+    );
 
     // Source file copied to the default install dir. `lpm add` picks
     // `components/` as the default install dir for a JS project with

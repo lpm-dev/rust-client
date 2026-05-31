@@ -3,7 +3,9 @@ use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use std::fmt::Display;
+use std::io::IsTerminal;
 use std::path::Path;
+use std::time::Duration;
 
 /// Run the `lpm tunnel` command.
 ///
@@ -232,10 +234,11 @@ async fn run_start(
 
     let tunnel_auth_display = tunnel_auth_token.clone();
     let inspector_url = inspector_handle.as_ref().map(|h| h.url.clone());
+    let control_inspector_url = inspector_url.clone();
     let inspector_state_for_connect = inspector_state.clone();
     let session_name_owned = session_name.map(|s| s.to_string());
 
-    lpm_tunnel::client::connect(
+    let connect = lpm_tunnel::client::connect(
         &options,
         move |session| {
             // Update inspector state with the tunnel URL and start a session
@@ -286,13 +289,9 @@ async fn run_start(
                 eprintln!();
                 install_ui::done("Listening for requests");
                 if inspector_url.is_some() {
-                    eprintln!(
-                        "  press {} to open inspector, {} to stop",
-                        install_ui::yellow("o"),
-                        install_ui::yellow("Ctrl+C")
-                    );
+                    eprintln!("{}", format_tunnel_footer(true));
                 } else {
-                    eprintln!("  press {} to stop", install_ui::yellow("Ctrl+C"));
+                    eprintln!("{}", format_tunnel_footer(false));
                 }
             }
         },
@@ -301,8 +300,17 @@ async fn run_start(
                 install_ui::warn(msg);
             }
         },
-    )
-    .await?;
+    );
+
+    if json_output {
+        connect.await?;
+    } else {
+        tokio::pin!(connect);
+        tokio::select! {
+            result = &mut connect => result?,
+            result = wait_for_tunnel_controls(control_inspector_url) => result?,
+        }
+    }
 
     // End the session and gracefully shut down the inspector
     inspector_state.end_session().await;
@@ -720,6 +728,109 @@ fn style_tunnel_detail_value(label: &str, value: &str) -> String {
     }
 }
 
+fn format_tunnel_footer(has_inspector: bool) -> String {
+    if has_inspector {
+        format!(
+            "  press {} to open inspector, {} to quit",
+            install_ui::yellow("o"),
+            install_ui::yellow("q")
+        )
+    } else {
+        format!("  press {} to quit", install_ui::yellow("q"))
+    }
+}
+
+async fn wait_for_tunnel_controls(inspector_url: Option<String>) -> Result<(), LpmError> {
+    if !std::io::stdin().is_terminal() {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|e| LpmError::Tunnel(format!("signal error: {e}")))?;
+        return Ok(());
+    }
+
+    let _raw_mode = TunnelRawModeGuard::enter()?;
+    loop {
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(|e| LpmError::Tunnel(format!("signal error: {e}")))?;
+                return Ok(());
+            }
+            control = read_tunnel_control() => {
+                match control? {
+                    TunnelControl::Quit => return Ok(()),
+                    TunnelControl::OpenInspector => {
+                        if let Some(url) = inspector_url.as_deref()
+                            && let Err(e) = open::that(url)
+                        {
+                            install_ui::warn(&format!("failed to open inspector: {e}"));
+                        }
+                    }
+                    TunnelControl::Ignore => {}
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TunnelControl {
+    Quit,
+    OpenInspector,
+    Ignore,
+}
+
+struct TunnelRawModeGuard;
+
+impl TunnelRawModeGuard {
+    fn enter() -> Result<Self, LpmError> {
+        crossterm::terminal::enable_raw_mode()
+            .map_err(|e| LpmError::Tunnel(format!("terminal input error: {e}")))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TunnelRawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+async fn read_tunnel_control() -> Result<TunnelControl, LpmError> {
+    tokio::task::spawn_blocking(|| {
+        if !crossterm::event::poll(Duration::from_millis(100))
+            .map_err(|e| LpmError::Tunnel(format!("terminal input error: {e}")))?
+        {
+            return Ok(TunnelControl::Ignore);
+        }
+
+        match crossterm::event::read()
+            .map_err(|e| LpmError::Tunnel(format!("terminal input error: {e}")))?
+        {
+            crossterm::event::Event::Key(event) => Ok(tunnel_control_from_key(event)),
+            _ => Ok(TunnelControl::Ignore),
+        }
+    })
+    .await
+    .map_err(|e| LpmError::Tunnel(format!("terminal input task failed: {e}")))?
+}
+
+fn tunnel_control_from_key(event: crossterm::event::KeyEvent) -> TunnelControl {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    if event.kind != KeyEventKind::Press {
+        return TunnelControl::Ignore;
+    }
+
+    match event.code {
+        KeyCode::Char('q' | 'Q') => TunnelControl::Quit,
+        KeyCode::Char('c' | 'C') if event.modifiers.contains(KeyModifiers::CONTROL) => {
+            TunnelControl::Quit
+        }
+        KeyCode::Char('o' | 'O') => TunnelControl::OpenInspector,
+        _ => TunnelControl::Ignore,
+    }
+}
+
 fn print_tunnel_request(webhook: &lpm_tunnel::webhook::CapturedWebhook) {
     eprintln!("{}", format_tunnel_request(webhook));
 }
@@ -994,6 +1105,39 @@ mod tests {
         assert_eq!(
             format_tunnel_request(&webhook),
             "  → POST /hooks/stripe 201 42ms"
+        );
+    }
+
+    #[test]
+    fn tunnel_footer_names_open_and_quit_keys() {
+        lpm_common::color::set_enabled(false);
+
+        assert_eq!(
+            format_tunnel_footer(true),
+            "  press o to open inspector, q to quit"
+        );
+        assert_eq!(format_tunnel_footer(false), "  press q to quit");
+    }
+
+    #[test]
+    fn tunnel_controls_map_keys_to_actions() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert_eq!(
+            tunnel_control_from_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            TunnelControl::Quit
+        );
+        assert_eq!(
+            tunnel_control_from_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            TunnelControl::OpenInspector
+        );
+        assert_eq!(
+            tunnel_control_from_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            TunnelControl::Quit
+        );
+        assert_eq!(
+            tunnel_control_from_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            TunnelControl::Ignore
         );
     }
 
