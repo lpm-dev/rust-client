@@ -1,26 +1,16 @@
 use crate::install_ui;
 use std::time::Duration;
 
-fn target_manifest_words(count: usize) -> &'static str {
-    if count == 1 {
-        "target manifest"
-    } else {
-        "target manifests"
-    }
-}
-
-pub fn phase_removing(package_count: usize, target_count: usize) {
+pub fn phase_resolving_graph(package_count: usize) {
     install_ui::phase(&format!(
-        "Removing {} {} from {} {}",
+        "Resolving dependency graph ({} {})",
         install_ui::bold(&package_count.to_string()),
         install_ui::packages_word(package_count),
-        install_ui::bold(&target_count.to_string()),
-        target_manifest_words(target_count),
     ));
 }
 
-pub fn minus_package(name: &str) {
-    install_ui::minus(name, None, None);
+pub fn minus_package(name: &str, version: Option<&str>) {
+    install_ui::minus_target(name, version, None);
 }
 
 pub fn minus_command(name: &str) {

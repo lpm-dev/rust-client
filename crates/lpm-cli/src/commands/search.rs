@@ -1,6 +1,5 @@
 use crate::commands::registry_reads::{prepare_routed_read_context, search_route_for_query};
 use crate::install_ui;
-use crate::output;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -17,7 +16,10 @@ pub async fn run(
         prepare_routed_read_context(client, project_dir, &[query.to_string()], json_output)?;
     let route = search_route_for_query(&context.route_table, query);
     if !json_output {
-        install_ui::phase(&format!("Searching lpm.dev for \"{query}\""));
+        install_ui::phase(&format!(
+            "Searching lpm.dev for \"{}\"",
+            install_ui::cyan(query)
+        ));
     }
     let results = context
         .client
@@ -43,48 +45,27 @@ pub async fn run(
     }
 
     println!();
-    println!(
-        "  {} package(s) for \"{}\":",
-        results.packages.len().to_string().bold(),
-        query.bold()
-    );
-    println!();
 
     for pkg in &results.packages {
         let version = pkg.latest_version.as_deref().unwrap_or("?");
-        let mode = pkg
-            .distribution_mode
-            .as_deref()
-            .map(output::mode_badge)
-            .unwrap_or_default();
         let package_name = match pkg.owner.as_deref() {
             Some(owner) => format!("@lpm.dev/{owner}.{}", pkg.name),
             None => pkg.name.clone(),
         };
 
-        println!(
-            "  {}  {}  {mode}",
-            package_name.bold(),
-            format!("v{version}").dimmed(),
-        );
+        println!("  {}", package_name.cyan());
 
         if let Some(desc) = &pkg.description
             && !desc.is_empty()
         {
-            let short = if desc.len() > 80 {
-                format!("{}...", &desc[..77])
-            } else {
-                desc.clone()
-            };
+            let short = truncate_description(desc, 80);
             println!("    {}", short.dimmed());
         }
 
-        if let Some(downloads) = pkg.download_count
-            && downloads > 0
-        {
-            let dl = format_downloads(downloads);
-            println!("    {}", format!("↓ {dl}").green());
-        }
+        println!(
+            "    {}",
+            format_search_metadata(version, pkg.quality_score, pkg.ecosystem.as_deref())
+        );
         println!();
     }
 
@@ -97,12 +78,68 @@ pub async fn run(
     Ok(())
 }
 
-fn format_downloads(count: u64) -> String {
-    if count >= 1_000_000 {
-        format!("{}M", count / 1_000_000)
-    } else if count >= 1_000 {
-        format!("{}K", count / 1_000)
+fn truncate_description(description: &str, max_chars: usize) -> String {
+    if description.chars().count() <= max_chars {
+        return description.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated = String::with_capacity(max_chars);
+    truncated.extend(description.chars().take(keep));
+    truncated.push_str("...");
+    truncated
+}
+
+fn format_search_metadata(
+    version: &str,
+    quality_score: Option<u32>,
+    ecosystem: Option<&str>,
+) -> String {
+    let mut parts = Vec::with_capacity(3);
+    parts.push(format!("latest {}", version.yellow()));
+    if let Some(score) = quality_score {
+        let score_text = score.to_string();
+        let colored = if score >= 80 {
+            score_text.green()
+        } else {
+            score_text.yellow()
+        };
+        parts.push(format!("quality {colored}"));
+    }
+    if let Some(ecosystem) = ecosystem
+        && !ecosystem.is_empty()
+    {
+        parts.push(format!("ecosystem {ecosystem}"));
+    }
+
+    if parts.len() == 1 {
+        parts.remove(0)
     } else {
-        count.to_string()
+        parts.join(&format!(" {} ", "·".dimmed()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_search_metadata, truncate_description};
+
+    #[test]
+    fn search_metadata_includes_latest_quality_and_ecosystem() {
+        lpm_common::color::set_enabled(false);
+
+        assert_eq!(
+            format_search_metadata("1.2.3", Some(91), Some("js")),
+            "latest 1.2.3 · quality 91 · ecosystem js"
+        );
+    }
+
+    #[test]
+    fn search_description_truncation_preserves_char_boundaries() {
+        assert_eq!(
+            truncate_description("é".repeat(81).as_str(), 80)
+                .chars()
+                .count(),
+            80
+        );
     }
 }

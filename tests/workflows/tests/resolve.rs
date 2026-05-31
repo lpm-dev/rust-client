@@ -88,12 +88,12 @@ async fn resolve_bare_scoped_package_defaults_to_latest_version_in_human_output(
         "resolved package name must be shown, got:\n{combined}"
     );
     assert!(
-        combined.contains(&format!("v{version}")),
-        "resolved version must be shown, got:\n{combined}"
+        combined.contains(&format!("{package}@{version}")),
+        "resolved package must be rendered in name@version form, got:\n{combined}"
     );
     assert!(
-        combined.contains("lpm"),
-        "resolved LPM package must be labeled as lpm, got:\n{combined}"
+        !combined.contains(&format!("v{version}")) && !combined.contains(" lpm"),
+        "resolve output must drop the v prefix and registry-kind label, got:\n{combined}"
     );
     assert!(
         !combined.contains('●') && !combined.contains('│'),

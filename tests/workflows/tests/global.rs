@@ -17,7 +17,10 @@
 
 mod support;
 
-use support::{TempProject, lpm};
+use chrono::Utc;
+use lpm_global::{GlobalManifest, PackageEntry, PackageSource};
+use support::mock_registry::MockRegistry;
+use support::{TempProject, lpm, lpm_with_registry};
 
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -40,6 +43,24 @@ fn strip_ansi(s: &str) -> String {
 
 fn global_root(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("global")
+}
+
+fn seed_global_package(project: &TempProject, package: &str, commands: Vec<String>) {
+    let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
+    let mut manifest = GlobalManifest::default();
+    manifest.packages.insert(
+        package.to_string(),
+        PackageEntry {
+            saved_spec: "^1".to_string(),
+            resolved: "1.0.0".to_string(),
+            integrity: "sha512-test".to_string(),
+            source: PackageSource::UpstreamNpm,
+            installed_at: Utc::now(),
+            root: format!("installs/{package}@1.0.0"),
+            commands,
+        },
+    );
+    lpm_global::write_for(&root, &manifest).expect("write global manifest fixture");
 }
 
 // ─── list (empty) ─────────────────────────────────────────────────────
@@ -138,6 +159,58 @@ fn global_list_outdated_on_empty_manifest_succeeds_with_empty_set() {
     if let Some(packages) = envelope["packages"].as_array() {
         assert!(packages.is_empty(), "empty manifest expected: {envelope}");
     }
+}
+
+#[tokio::test]
+async fn global_list_outdated_human_output_uses_current_wanted_latest_bins_table() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    seed_global_package(&project, "demo-cli", vec!["demo".to_string()]);
+
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "demo-cli",
+        "dist-tags": { "latest": "2.0.0" },
+        "versions": {
+            "1.0.0": { "name": "demo-cli", "version": "1.0.0" },
+            "1.5.0": { "name": "demo-cli", "version": "1.5.0" },
+            "2.0.0": { "name": "demo-cli", "version": "2.0.0" }
+        }
+    })])
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["global", "list", "--outdated"])
+        .output()
+        .expect("failed to run lpm global list --outdated");
+
+    assert!(
+        output.status.success(),
+        "global list --outdated must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+    assert!(
+        combined.contains("Package")
+            && combined.contains("Current")
+            && combined.contains("Wanted")
+            && combined.contains("Latest")
+            && combined.contains("Bins"),
+        "outdated output must render the table header, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("demo-cli")
+            && combined.contains("1.0.0")
+            && combined.contains("1.5.0")
+            && combined.contains("2.0.0")
+            && combined.contains("demo"),
+        "outdated table must include current, wanted, absolute latest, and bins, got:\n{combined}"
+    );
 }
 
 // ─── bin ──────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 use super::use_ui;
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_runtime::detect::RuntimeKind;
@@ -285,6 +286,7 @@ pub async fn run(
 }
 
 async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRuntime, LpmError> {
+    let install_start = std::time::Instant::now();
     let (runtime, version_spec) = parse_runtime_spec(spec)?;
     validate_runtime_spec(runtime, &version_spec)?;
 
@@ -295,9 +297,9 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
 
     let platform = lpm_runtime::platform::Platform::current()?;
     use_ui::phase(&format!(
-        "resolving {}@{} for {}...",
+        "Resolving {}@{} for {}",
         runtime.as_str(),
-        version_spec,
+        install_ui::yellow(&version_spec),
         platform
     ));
 
@@ -311,6 +313,15 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
                     ))
                 })?;
             let version = release.version_bare().to_string();
+            if !json_output {
+                use_ui::phase(&format!(
+                    "Resolving node@{} {} {}{}",
+                    install_ui::yellow(&version_spec),
+                    install_ui::dim("→"),
+                    install_ui::yellow(&version),
+                    format_node_lts_suffix(&release),
+                ));
+            }
 
             if lpm_runtime::node::is_installed(&version) {
                 print_already_installed(runtime, &version, json_output);
@@ -318,8 +329,8 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
             }
 
             use_ui::phase(&format!(
-                "downloading Node.js {}...",
-                release.version.bold()
+                "Downloading Node.js {}",
+                install_ui::yellow(&version)
             ));
             lpm_runtime::download::install_node(&http_client, &release, &platform).await?
         }
@@ -330,6 +341,14 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
                     LpmError::Script(format!("no Bun release found matching '{version_spec}'"))
                 })?;
             let version = release.version_bare().to_string();
+            if !json_output {
+                use_ui::phase(&format!(
+                    "Resolving bun@{} {} {}",
+                    install_ui::yellow(&version_spec),
+                    install_ui::dim("→"),
+                    install_ui::yellow(&version),
+                ));
+            }
 
             if lpm_runtime::bun::is_installed(&version) {
                 print_already_installed(runtime, &version, json_output);
@@ -342,7 +361,12 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
                     platform, release.tag_name
                 ))
             })?;
-            use_ui::phase(&format!("downloading Bun {}...", release.tag_name.bold()));
+            use_ui::phase(&format!("Downloading Bun {}", install_ui::yellow(&version)));
+            if let Some(digest) = asset.digest.as_deref()
+                && !digest.is_empty()
+            {
+                use_ui::hint_line(digest);
+            }
             lpm_runtime::download::install_bun(&http_client, &release, &asset).await?
         }
     };
@@ -353,18 +377,31 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
             serde_json::json!({"success": true, "status": "installed", "runtime": runtime.as_str(), "version": installed})
         );
     } else {
+        use_ui::done(&format!("Extracted {}", runtime.display_name()));
+        use_ui::done(&format!("Linked {}", runtime.display_name()));
+        let duration = install_ui::format_duration(install_start.elapsed());
         use_ui::done(&format!(
-            "Installed {} {}",
+            "Now using {} {} · {}",
             runtime.display_name(),
-            installed.bold()
+            install_ui::yellow(&installed),
+            install_ui::green(&duration)
         ));
         let bin_dir = runtime_bin_dir(runtime, &installed)?;
-        use_ui::hint_line(&format!("installed at {}", bin_dir.display()));
+        use_ui::hint_line(&format!("PATH {}", bin_dir.display()));
     }
 
     Ok(InstalledRuntime {
         runtime,
         version: installed,
+    })
+}
+
+fn format_node_lts_suffix(release: &lpm_runtime::node::NodeRelease) -> String {
+    release.lts.name().map_or_else(String::new, |name| {
+        format!(
+            " ({})",
+            format!("lts/{}", name.to_ascii_lowercase()).dimmed()
+        )
     })
 }
 

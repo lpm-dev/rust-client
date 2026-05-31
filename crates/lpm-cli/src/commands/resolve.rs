@@ -1,7 +1,6 @@
 use crate::commands::registry_reads::prepare_routed_read_context;
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_resolver::resolve_dependencies_routed;
 use std::collections::HashMap;
@@ -77,16 +76,11 @@ pub async fn run(
             println!();
 
             for r in resolved {
-                let kind = if r.package.is_lpm() {
-                    "lpm".cyan().to_string()
-                } else {
-                    "npm".dimmed().to_string()
-                };
                 println!(
-                    "  {} {} {}",
-                    r.package.to_string().bold(),
-                    format!("v{}", r.version).dimmed(),
-                    kind
+                    "{}{}{}",
+                    r.package,
+                    install_ui::dim("@"),
+                    install_ui::yellow(&r.version.to_string())
                 );
             }
             println!();
