@@ -243,11 +243,34 @@ async fn cli_global_update_upgrades_exact_install_and_preserves_user_range() {
         &cwd,
         &lpm_home,
         Some(&server.uri()),
+        &["global", "update", "tool@^1.0.0", "--dry-run"],
+    );
+    assert!(
+        status.success(),
+        "global update --dry-run failed. stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "global update --dry-run human output must stay off stdout. stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("tool 1.0.0 → 1.1.0"),
+        "global update --dry-run should print the plan on stderr. stderr={stderr:?}"
+    );
+
+    let (status, stdout, stderr) = common::run_lpm(
+        &cwd,
+        &lpm_home,
+        Some(&server.uri()),
         &["global", "update", "tool@^1.0.0"],
     );
     assert!(
         status.success(),
         "global update failed. stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "global update human output must stay off stdout. stdout={stdout:?} stderr={stderr:?}"
     );
 
     let updated = read_package_row(&root, "tool");

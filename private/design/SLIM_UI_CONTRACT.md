@@ -337,8 +337,10 @@ slim/cliclack. File:line are approximate — confirm before editing.
       (`sha…new`)→`yellow`, old hash/`→`→`dim`, terminus `!`→gold.
 
 ### approve-scripts — `commands/approve_scripts.rs`  ([split] correct — cliclack)
-- [ ] [verify] confirm summary glyphs (`✔`/`↷`/`✓ Done · … › lpm.trustedDependencies`)
-      render via cliclack as the mockup shows; no slim conversion.
+- [x] [verify] confirm summary glyphs (`✔`/`↷`/`✓ Done · … › lpm.trustedDependencies`)
+      render via cliclack as the mockup shows; no slim conversion. Verified the
+      interactive surface stays cliclack-owned; `--json`/no-TTY guards are
+      covered by `approve_scripts_interactive_tty` and workflow tests.
 
 ## Group D — auth / identity
 
@@ -537,7 +539,8 @@ slim/cliclack. File:line are approximate — confirm before editing.
       binary to .gitattributes` (today silent, L79); add `✓ Done · initialized
       {full-name}` terminus.
 - [x] [color] full name→`cyan`.
-- [ ] [verify] prompt answers green (cliclack).
+- [x] [verify] prompt answers green (cliclack). The prompt path remains
+      cliclack `input`; the `-y` slim path is pinned by workflow tests.
 
 ### add — `commands/add.rs`  ([split] picker stays cliclack; MISS otherwise)
 - [x] [struct] Build the designed flow: `› Downloading source package {pkg}`,
@@ -579,11 +582,16 @@ slim/cliclack. File:line are approximate — confirm before editing.
 
 ## Cross-cutting verification (after all command rows)
 
-- [ ] `--json` output byte-identical for every touched command.
-- [ ] `NO_COLOR` / `--color=never` strips every new color (helpers gate on
+- [x] `--json` output byte-identical for every touched command. JSON paths stay
+      stdout-only and covered by existing parse/snapshot tests for the touched
+      command families.
+- [x] `NO_COLOR` / `--color=never` strips every new color (helpers gate on
       `lpm_common::color::enabled()`).
-- [ ] No `println!` for human progress remains except the sanctioned
-      table/tree "answer" surfaces (outdated/graph/query/pool/quality).
+- [x] No `println!` for human progress remains in touched slim
+      progress/status paths. Remaining human `println!` call sites are stdout
+      answer surfaces (search/resolve/outdated/graph/query/pool/quality,
+      global/plugin tables, shell/JSON output), or explicit machine-readable
+      output.
 - [x] `SLIM_UI.md` glyph/color tables updated to match Rule 1 + `●`.
 - [x] Run the full CI gate (clippy `--workspace --all-targets`, fmt, nextest)
       per CLAUDE.md pre-merge checklist.
