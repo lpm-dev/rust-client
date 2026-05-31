@@ -498,9 +498,9 @@ slim/cliclack. File:line are approximate — confirm before editing.
       gold by score, `·`→`dim`.
 
 ### skills list — `commands/skills.rs`  (PARTIAL)
-- [ ] [struct] Align filenames to a **global** column (today per-package max,
+- [x] [struct] Align filenames to a **global** column (today per-package max,
       L93-97).
-- [ ] [color] package name→`cyan` (currently `.cyan()` ad-hoc — route through
+- [x] [color] package name→`cyan` (currently `.cyan()` ad-hoc — route through
       helper), file→plain, size→`dim`.
 
 ### swift-registry — `commands/swift_registry.rs`  (struct MATCH, has copy test)
