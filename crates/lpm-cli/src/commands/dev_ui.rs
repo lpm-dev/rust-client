@@ -17,6 +17,23 @@ pub fn detail_with_hint(label: &str, value: &str, hint: &str) {
     install_ui::phase(&format!("{label} {value} {}", install_ui::dim(hint)));
 }
 
+pub fn readiness(label: &str, value: &str) {
+    eprintln!("{}", format_readiness_line(label, value, None));
+}
+
+pub fn readiness_with_hint(label: &str, value: &str, hint: &str) {
+    eprintln!("{}", format_readiness_line(label, value, Some(hint)));
+}
+
+fn format_readiness_line(label: &str, value: &str, hint: Option<&str>) -> String {
+    let suffix = hint.map_or_else(String::new, |hint| format!(" {}", install_ui::dim(hint)));
+    format!(
+        "  {} {:<7} {value}{suffix}",
+        install_ui::bullet(true),
+        label
+    )
+}
+
 pub fn done(msg: &str) {
     install_ui::done(msg);
 }
@@ -41,5 +58,28 @@ pub fn raw_block(block: &str) {
     eprint!("{block}");
     if !block.ends_with('\n') {
         eprintln!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_line_uses_status_bullet_without_phase_glyph() {
+        let line = format_readiness_line("Node", "v22.12.0", Some("(.nvmrc)"));
+
+        assert!(
+            line.contains('●'),
+            "readiness line must use a status bullet: {line:?}"
+        );
+        assert!(
+            !line.contains('›'),
+            "readiness line must not use a phase glyph: {line:?}"
+        );
+        assert!(
+            line.contains("Node") && line.contains("v22.12.0") && line.contains("(.nvmrc)"),
+            "readiness line must include label, value, and hint: {line:?}"
+        );
     }
 }

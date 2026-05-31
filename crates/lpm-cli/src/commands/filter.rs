@@ -15,6 +15,7 @@ use lpm_common::color::Painted;
 use lpm_task::filter::{FilterEngine, FilterExpr, MatchKind, TraceReason};
 use lpm_task::graph::WorkspaceGraph;
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::Path;
 
 /// Format the D2 substring → glob migration hint when a filter set returns
@@ -313,9 +314,10 @@ fn render_human_terse(graph: &WorkspaceGraph, explain: &lpm_task::filter::Filter
         render_no_match(explain);
         return;
     }
+    let show_bullet = std::io::stdout().is_terminal();
     for &id in &explain.selected {
         if let Some(member) = graph.members.get(id) {
-            println!("{}", member.name);
+            println!("{}", format_terse_member_line(&member.name, show_bullet));
         }
     }
     let member_word = if explain.selected.len() == 1 {
@@ -365,6 +367,14 @@ fn render_human_explain(graph: &WorkspaceGraph, explain: &lpm_task::filter::Filt
         install_ui::bold(&explain.selected.len().to_string()),
         graph.len()
     ));
+}
+
+fn format_terse_member_line(name: &str, show_bullet: bool) -> String {
+    if show_bullet {
+        format!("{} {name}", install_ui::bullet(true))
+    } else {
+        name.to_string()
+    }
 }
 
 fn describe_reason(graph: &WorkspaceGraph, reason: &TraceReason) -> String {
@@ -425,6 +435,25 @@ fn trace_reason_to_json(reason: &TraceReason) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terse_member_line_stays_bare_for_non_tty_stdout() {
+        assert_eq!(format_terse_member_line("@test/app", false), "@test/app");
+    }
+
+    #[test]
+    fn terse_member_line_uses_status_bullet_for_tty_stdout() {
+        let line = format_terse_member_line("@test/app", true);
+
+        assert!(
+            line.contains('●'),
+            "TTY line must include status bullet: {line:?}"
+        );
+        assert!(
+            line.ends_with(" @test/app"),
+            "TTY line must keep the member name plain: {line:?}"
+        );
+    }
 
     // ── D2 no-match migration hint regressions ─────────────────────────────
 
