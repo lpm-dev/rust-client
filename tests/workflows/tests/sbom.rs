@@ -175,6 +175,31 @@ fn sbom_output_writes_file_without_stdout_payload() {
         output.stdout.is_empty(),
         "--output should not duplicate the SBOM JSON to stdout"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Generating CycloneDX SBOM from lpm.lock"),
+        "sbom should show slim generation phase; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("packages") && stderr.contains("2"),
+        "sbom should summarize package count; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("format") && stderr.contains("cyclonedx"),
+        "sbom should summarize output format; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("output") && stderr.contains("bom.json"),
+        "sbom should summarize output path; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Included patch metadata"),
+        "sbom should report included metadata; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · wrote SBOM in"),
+        "sbom should show elapsed write terminus; stderr:\n{stderr}"
+    );
 
     let written: serde_json::Value =
         serde_json::from_str(&project.read_file("bom.json")).expect("bom.json must be valid JSON");

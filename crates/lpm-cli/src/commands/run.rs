@@ -17,6 +17,41 @@ fn runtime_display_name(runtime: &str) -> &str {
     }
 }
 
+fn script_command_for_display(
+    project_dir: &Path,
+    script_name: &str,
+    lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Result<Option<String>, LpmError> {
+    let pkg_json_path = project_dir.join("package.json");
+    if pkg_json_path.exists() {
+        let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+            .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
+        if let Some(command) = pkg.scripts.get(script_name) {
+            return Ok(Some(command.clone()));
+        }
+    }
+
+    Ok(lpm_config
+        .and_then(|config| config.tasks.get(script_name))
+        .and_then(|task| task.command.clone()))
+}
+
+fn print_run_metadata(cache_status: &str, command: Option<&str>) {
+    install_ui::detail(&format!(
+        "    {} {}",
+        install_ui::dim(&format!("{:<8}", "cache")),
+        cache_status,
+    ));
+    if let Some(command) = command {
+        install_ui::detail(&format!(
+            "    {} {}",
+            install_ui::dim(&format!("{:<8}", "command")),
+            command,
+        ));
+    }
+    install_ui::detail("");
+}
+
 /// Truncate captured output if it exceeds `MAX_CAPTURED_OUTPUT`, cutting at
 /// the last newline boundary to avoid splitting a line.
 fn truncate_output(output: String) -> String {
@@ -137,6 +172,8 @@ pub async fn run(
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
         .ok()
         .flatten();
+    let command = script_command_for_display(project_dir, script_name, lpm_config.as_ref())?;
+    let caching_enabled = !no_cache && is_task_cached_with_config(script_name, lpm_config.as_ref());
 
     // Check if caching is enabled for this task
     if !no_cache
@@ -151,17 +188,25 @@ pub async fn run(
             eprint!("{}", hit.stderr);
         }
         install_ui::done(&format!(
-            "{} restored from cache (originally {:.1}s)",
-            install_ui::bold(script_name),
-            hit.meta.duration_ms as f64 / 1000.0,
+            "{} · restored from {} (originally {})",
+            install_ui::yellow(script_name),
+            install_ui::dim("cache"),
+            install_ui::green(&install_ui::format_duration(
+                std::time::Duration::from_millis(hit.meta.duration_ms)
+            )),
         ));
         return Ok(());
     }
 
-    install_ui::phase(&format!("Running {script_name}"));
-
-    // Check if caching is enabled — if so, use tee capture
-    let caching_enabled = !no_cache && is_task_cached_with_config(script_name, lpm_config.as_ref());
+    install_ui::phase(&format!("Running {}", install_ui::yellow(script_name)));
+    let cache_status = if no_cache {
+        "disabled"
+    } else if caching_enabled {
+        "miss"
+    } else {
+        "disabled"
+    };
+    print_run_metadata(cache_status, command.as_deref());
 
     let start = std::time::Instant::now();
 
@@ -188,6 +233,12 @@ pub async fn run(
         // Run normally (inherited stdio, no capture)
         lpm_runner::script::run_script(project_dir, script_name, extra_args, env_mode, bin_hint)?;
     }
+
+    install_ui::done(&format!(
+        "{} · success in {}",
+        install_ui::yellow(script_name),
+        install_ui::green(&install_ui::format_duration(start.elapsed())),
+    ));
 
     Ok(())
 }
@@ -1542,8 +1593,18 @@ pub async fn exec(
     // PATH so it can choose between native TS, `--experimental-strip-types`,
     // local `tsx`, and `npx tsx` using the actual `node` binary that will run.
     let _ = ensure_runtime(project_dir).await;
-    install_ui::phase(&format!("Executing {file_path}"));
-    lpm_runner::exec::exec_file(project_dir, file_path, extra_args)
+    let target = lpm_runner::exec::describe_exec_target(project_dir, file_path)?;
+    install_ui::phase(&format!(
+        "Executing {file_path} with {}",
+        install_ui::yellow(&target.runtime_label)
+    ));
+    let start = std::time::Instant::now();
+    lpm_runner::exec::exec_file(project_dir, file_path, extra_args)?;
+    install_ui::done(&format!(
+        "Done · exited 0 in {}",
+        install_ui::green(&install_ui::format_duration(start.elapsed())),
+    ));
+    Ok(())
 }
 
 /// Run a package binary without installing it into the project.
@@ -1570,15 +1631,19 @@ pub async fn dlx(
 
     let was_ready = install.is_ready();
     let needs_install = refresh || !was_ready;
-    install_ui::phase(&format!("Resolving {package_spec}"));
+    install_ui::phase(&format!("Resolving {}", install_ui::yellow(package_spec)));
     if !refresh && was_ready {
-        install_ui::phase("Reusing dlx cache entry (fresh)");
+        install_ui::phase(&format!(
+            "Reusing dlx cache entry ({})",
+            install_ui::status_ok("fresh"),
+        ));
     } else if !refresh && !install.root().join("node_modules/.bin").is_dir() {
         // First install or evicted entry — silent install (matches prior dlx behavior).
     } else if !refresh {
         // Markers present but TTL expired — be loud about the reinstall.
         install_ui::phase(&format!(
-            "Refreshing expired dlx cache entry for {package_spec}"
+            "Refreshing expired dlx cache entry for {}",
+            install_ui::yellow(package_spec),
         ));
     }
 
@@ -1588,7 +1653,7 @@ pub async fn dlx(
         std::fs::write(install.root().join("package.json"), install.manifest_text())
             .map_err(|e| LpmError::Script(format!("failed to write dlx package.json: {e}")))?;
 
-        install_ui::phase(&format!("Installing {package_spec}"));
+        install_ui::phase(&format!("Installing {}", install_ui::yellow(package_spec)));
 
         // Step 6 fix: use the injected client. Pre-fix this
         // built a fresh `RegistryClient::new()` so any `@lpm.dev` deps

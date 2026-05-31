@@ -164,7 +164,7 @@ fn patch_human_output_uses_slim_status_lines() {
     );
 
     let out = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["patch", "lodash@4.17.21"])
+        .args(["--color=always", "patch", "lodash@4.17.21"])
         .output()
         .expect("spawn lpm patch");
     assert!(
@@ -174,11 +174,12 @@ fn patch_human_output_uses_slim_status_lines() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let combined = strip_ansi(&format!(
+    let raw = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
-    ));
+    );
+    let combined = strip_ansi(&raw);
     assert!(
         combined.contains("› Extracting pristine store entry for lodash@4.17.21"),
         "human output must start with a slim phase line; got:\n{combined}"
@@ -198,6 +199,13 @@ fn patch_human_output_uses_slim_status_lines() {
     assert!(
         combined.contains("lpm patch-commit"),
         "must show next command; got:\n{combined}"
+    );
+    assert!(
+        raw.contains("\u{1b}[33mlodash@4.17.21\u{1b}[39m")
+            && raw.contains("\u{1b}[2msource: \u{1b}[22m")
+            && raw.contains("\u{1b}[2mstaging:\u{1b}[22m")
+            && raw.contains("\u{1b}[33mlpm patch-commit"),
+        "patch output must apply slim color roles, got:\n{raw:?}"
     );
     assert!(
         !combined.contains('│') && !combined.contains('◇'),
@@ -411,7 +419,7 @@ fn patch_commit_human_output_uses_slim_status_lines() {
     .unwrap();
 
     let out = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["patch-commit", staging.to_str().unwrap()])
+        .args(["--color=always", "patch-commit", staging.to_str().unwrap()])
         .output()
         .expect("spawn lpm patch-commit");
     assert!(
@@ -421,11 +429,12 @@ fn patch_commit_human_output_uses_slim_status_lines() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let combined = strip_ansi(&format!(
+    let raw = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
-    ));
+    );
+    let combined = strip_ansi(&raw);
     assert!(
         combined.contains("› Generating patch for lodash@4.17.21"),
         "must show slim phase line; got:\n{combined}"
@@ -437,6 +446,12 @@ fn patch_commit_human_output_uses_slim_status_lines() {
     assert!(
         combined.contains("✓ Updated package.json › lpm.patchedDependencies"),
         "must show manifest update; got:\n{combined}"
+    );
+    assert!(
+        raw.contains("\u{1b}[33mlodash@4.17.21\u{1b}[39m")
+            && raw.contains("\u{1b}[2mpatches/lodash@4.17.21.patch\u{1b}[22m")
+            && raw.contains("\u{1b}[36mpackage.json › lpm.patchedDependencies\u{1b}[39m"),
+        "patch-commit output must apply slim color roles, got:\n{raw:?}"
     );
     assert!(
         combined.contains("✓ Done · patch registered for future installs"),
@@ -523,7 +538,7 @@ fn patch_remove_human_output_uses_slim_status_lines() {
     project.write_file("patches/lodash@4.17.21.patch", "diff --git a/a b/a\n");
 
     let out = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["patch-remove", "lodash@4.17.21"])
+        .args(["--color=always", "patch-remove", "lodash@4.17.21"])
         .output()
         .expect("spawn lpm patch-remove");
     assert!(
@@ -533,11 +548,12 @@ fn patch_remove_human_output_uses_slim_status_lines() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let combined = strip_ansi(&format!(
+    let raw = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
-    ));
+    );
+    let combined = strip_ansi(&raw);
     assert!(
         combined.contains("› Removing patch registration for lodash@4.17.21"),
         "must show slim phase line; got:\n{combined}"
@@ -545,6 +561,13 @@ fn patch_remove_human_output_uses_slim_status_lines() {
     assert!(combined.contains("manifest: package.json"));
     assert!(combined.contains("file:"));
     assert!(combined.contains("patches/lodash@4.17.21.patch"));
+    assert!(
+        raw.contains("\u{1b}[33mlodash@4.17.21\u{1b}[39m")
+            && raw.contains("\u{1b}[2mmanifest:\u{1b}[22m")
+            && raw.contains("\u{1b}[2mfile:    \u{1b}[22m")
+            && raw.contains("\u{1b}[2mpatches/lodash@4.17.21.patch\u{1b}[22m"),
+        "patch-remove output must align labels and apply slim color roles, got:\n{raw:?}"
+    );
     assert!(combined.contains("✓ Deleted patch file"));
     assert!(combined.contains("✓ Done · re-run lpm install to refresh node_modules"));
     assert!(

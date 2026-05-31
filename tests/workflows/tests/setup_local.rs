@@ -152,6 +152,10 @@ async fn setup_local_non_json_output_uses_current_command_name() {
         "human setup local should keep the expiry line on a slim info line, got:\n{stderr}"
     );
     assert!(
+        stderr.contains("(30 days)"),
+        "human setup local should show the token lifetime, got:\n{stderr}"
+    );
+    assert!(
         stderr.contains("› Run `lpm setup local` again to refresh when expired."),
         "human setup local should mention the current command name on the slim info line, got:\n{stderr}"
     );
@@ -172,5 +176,33 @@ async fn setup_local_non_json_output_uses_current_command_name() {
     assert!(
         !combined.contains("Run `lpm npmrc` again"),
         "legacy command name must not leak into output, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn setup_local_color_output_dims_expiry_label_and_highlights_lifetime() {
+    let project = TempProject::empty(r#"{"name":"web app","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_create(30, "lpm_read_only_token", "2030-01-02T03:04:05Z")
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--color=always", "setup", "local"])
+        .output()
+        .expect("failed to run colored lpm setup local");
+
+    assert!(
+        output.status.success(),
+        "colored setup local failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\x1b[2mToken expires:")
+            && stderr.contains("\x1b[33m30 days")
+            && stderr.contains(".npmrc configured"),
+        "setup local should dim the expiry label, highlight the lifetime, and keep .npmrc plain, got:\n{stderr:?}",
     );
 }

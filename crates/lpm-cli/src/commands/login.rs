@@ -1,6 +1,5 @@
 use crate::{auth, install_ui};
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -26,7 +25,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
             if !json_output {
                 install_ui::done(&format!(
                     "Already logged in as {}. Use {} to log out first.",
-                    install_ui::bold(name),
+                    install_ui::cyan(name),
                     install_ui::dim("lpm logout")
                 ));
             }
@@ -76,11 +75,11 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
     );
     if open::that(&login_url).is_err() && !json_output {
         install_ui::warn("Could not open browser automatically");
-        println!("  Open this URL manually: {}", login_url.bold());
+        install_ui::detail(&login_detail_row("url:", &install_ui::url(&login_url)));
     }
 
     if !json_output {
-        println!("  Waiting for authentication at {}", login_url.dimmed());
+        install_ui::detail(&login_detail_row("browser:", &install_ui::url(&login_url)));
     }
 
     // Handle the callback
@@ -192,22 +191,35 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        // Server returns email in `username` field (npm compat) and display name in `profile_username`
         let email_str = info.username.as_deref().unwrap_or("");
-        println!();
-        if email_str.is_empty() || email_str == username {
-            install_ui::done(&format!("Logged in as {}", install_ui::bold(&username)));
-        } else {
-            install_ui::done(&format!(
-                "Logged in as {} - {}",
-                install_ui::bold(&username),
-                install_ui::dim(email_str)
-            ));
-        }
-        println!();
+        emit_browser_login_success(&username, email_str, registry_url);
     }
 
     Ok(())
+}
+
+fn emit_browser_login_success(username: &str, email: &str, registry_url: &str) {
+    install_ui::done("Browser authentication complete");
+    install_ui::detail(&login_detail_row(
+        "user:",
+        &login_user_value(username, email),
+    ));
+    install_ui::detail(&login_detail_row(
+        "registry:",
+        &install_ui::yellow(&install_ui::short_registry_host(registry_url)),
+    ));
+    install_ui::detail(&login_detail_row("storage:", "local secure store"));
+}
+
+fn login_user_value(username: &str, email: &str) -> String {
+    if email.is_empty() || email == username {
+        return install_ui::cyan(username);
+    }
+    format!("{} {}", install_ui::cyan(username), install_ui::dim(email))
+}
+
+fn login_detail_row(label: &str, value: &str) -> String {
+    format!("    {} {}", install_ui::dim(&format!("{label:<9}")), value)
 }
 
 /// Handle the OAuth callback HTTP request.
@@ -628,5 +640,19 @@ mod tests {
         // Fresh CSPRNG verifier each call.
         let (verifier2, _) = generate_pkce_pair();
         assert_ne!(verifier, verifier2);
+    }
+
+    #[test]
+    fn login_user_value_keeps_display_name_and_email_when_they_differ() {
+        let value = login_user_value("alice", "alice@example.com");
+        assert!(value.contains("alice"));
+        assert!(value.contains("alice@example.com"));
+    }
+
+    #[test]
+    fn login_detail_row_keeps_aligned_label_and_value() {
+        let row = login_detail_row("registry:", "lpm.dev");
+        assert!(row.contains("registry:"));
+        assert!(row.ends_with("lpm.dev"));
     }
 }

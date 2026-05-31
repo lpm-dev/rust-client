@@ -114,27 +114,39 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        eprintln!("    output:          {}", target_dir.display());
-        eprintln!("    files extracted: {}", files.len());
-        eprintln!("    size:            {}", format_bytes(size));
+        eprintln!(
+            "    {} {}",
+            format!("{:<16}", "output:").dimmed(),
+            install_ui::yellow(&target_dir.display().to_string())
+        );
+        eprintln!(
+            "    {} {}",
+            format!("{:<16}", "files extracted:").dimmed(),
+            files.len()
+        );
+        eprintln!(
+            "    {} {}",
+            format!("{:<16}", "size:").dimmed(),
+            format_bytes(size)
+        );
         eprintln!();
 
         // Show extracted files summary
         if files.len() <= 20 {
             for f in &files {
-                println!("    {}", f.display().to_string().dimmed());
+                eprintln!("    {}", f.display().to_string().dimmed());
             }
         } else {
             for f in files.iter().take(15) {
-                println!("    {}", f.display().to_string().dimmed());
+                eprintln!("    {}", f.display().to_string().dimmed());
             }
-            println!(
+            eprintln!(
                 "    {}",
-                format!("... and {} more files", files.len() - 15).dimmed()
+                format!("… and {} more files", files.len() - 15).dimmed()
             );
         }
 
-        println!();
+        eprintln!();
         let duration = install_ui::format_duration(elapsed);
         install_ui::done(&format!(
             "Done · tarball extracted in {}",
@@ -159,7 +171,7 @@ fn short_integrity(integrity: &str) -> String {
         .into_iter()
         .rev()
         .collect();
-    format!("{prefix}...{suffix}")
+    format!("{prefix}…{suffix}")
 }
 
 fn format_bytes(bytes: usize) -> String {

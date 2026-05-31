@@ -103,14 +103,24 @@ fn print_plugin_table(rows: &[(String, String, String, String)]) {
         .max()
         .unwrap_or("Latest".len());
 
-    println!(
+    let header = format!(
         "{:<plugin_width$}  {:<current_width$}  {:<latest_width$}  Status",
         "Plugin", "Current", "Latest"
     );
+    println!("{}", install_ui::dim(&header));
     for (name, current, latest, status) in rows {
-        println!(
-            "{name:<plugin_width$}  {current:<current_width$}  {latest:<latest_width$}  {status}"
-        );
+        let current_col = install_ui::dim(&format!("{current:<current_width$}"));
+        let latest_col = if status == "update available" {
+            install_ui::yellow(&format!("{latest:<latest_width$}"))
+        } else {
+            format!("{latest:<latest_width$}")
+        };
+        let status_col = match status.as_str() {
+            "current" => install_ui::status_ok(status),
+            "update available" => install_ui::yellow(status),
+            _ => status.clone(),
+        };
+        println!("{name:<plugin_width$}  {current_col}  {latest_col}  {status_col}");
     }
     println!();
 }

@@ -113,6 +113,40 @@ fn self_update_human_cache_hit_uses_slim_status() {
     );
 }
 
+#[test]
+fn self_update_human_cache_hit_applies_slim_color_roles_when_forced() {
+    let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+    let current = read_current_version(&project);
+
+    std::fs::create_dir_all(cache_path(&project).parent().unwrap()).expect("mkdir ~/.lpm");
+    let payload = serde_json::json!({
+        "latest": current,
+        "lastCheck": now_secs(),
+    });
+    std::fs::write(cache_path(&project), payload.to_string()).expect("seed cache");
+
+    let output = lpm(&project)
+        .args(["--color=always", "self-update"])
+        .output()
+        .expect("failed to run colored lpm self-update");
+
+    assert!(
+        output.status.success(),
+        "colored cache-hit self-update must exit 0\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\x1b[2mcurrent\x1b[22m")
+            && stderr.contains("\x1b[2mlatest\x1b[22m")
+            && stderr.contains("\x1b[32m")
+            && stderr.contains("\x1b[33m"),
+        "self-update should dim labels, green latest status, and yellow version targets, got:\n{stderr:?}",
+    );
+}
+
 // ─── failure-backoff path ─────────────────────────────────────────────
 
 #[test]

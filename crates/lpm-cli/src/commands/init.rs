@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use std::path::Path;
 use std::time::Duration;
@@ -76,9 +75,13 @@ pub async fn run(
     std::fs::write(&pkg_json_path, format!("{content}\n"))?;
 
     // Pre-create .gitattributes so lpm.lockb is marked as binary from the start
-    if let Err(e) = lpm_lockfile::ensure_gitattributes(project_dir) {
-        tracing::warn!("failed to ensure .gitattributes: {e}");
-    }
+    let gitattributes_ready = match lpm_lockfile::ensure_gitattributes(project_dir) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("failed to ensure .gitattributes: {e}");
+            false
+        }
+    };
 
     if json_output {
         let json = serde_json::json!({
@@ -89,9 +92,16 @@ pub async fn run(
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        install_ui::done(&format!("Created {}", "package.json".bold()));
-        println!("  {}", full_name.dimmed());
-        println!();
+        install_ui::done("Wrote package.json");
+        if gitattributes_ready {
+            install_ui::done("Added lpm.lockb binary to .gitattributes");
+        } else {
+            install_ui::warn("Could not update .gitattributes");
+        }
+        install_ui::done(&format!(
+            "Done · initialized {}",
+            install_ui::cyan(&full_name)
+        ));
     }
 
     Ok(())

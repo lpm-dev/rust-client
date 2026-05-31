@@ -665,11 +665,15 @@ pub async fn run(
             );
         } else {
             install_ui::phase(&format!(
-                "Materializing production closure for {member_name}"
+                "Materializing production closure for {}",
+                install_ui::yellow(&member_name)
             ));
-            deploy_detail("output:", plan.output_dir.display());
+            deploy_detail_colored(
+                "output:",
+                install_ui::yellow(&plan.output_dir.display().to_string()),
+            );
             deploy_detail("member:", plan.member_dir.display());
-            deploy_detail("dry run:", "yes");
+            deploy_detail_colored("dry run:", install_ui::status_ok("yes"));
             install_ui::done("Done · dry run complete");
         }
         return Ok(());
@@ -677,7 +681,8 @@ pub async fn run(
 
     if !json_output {
         install_ui::phase(&format!(
-            "Materializing production closure for {member_name}"
+            "Materializing production closure for {}",
+            install_ui::yellow(&member_name)
         ));
     }
 
@@ -813,13 +818,16 @@ pub async fn run(
             serde_json::to_string_pretty(&payload).unwrap_or_default()
         );
     } else {
-        deploy_detail("output:", plan.output_dir.display());
+        deploy_detail_colored(
+            "output:",
+            install_ui::yellow(&plan.output_dir.display().to_string()),
+        );
         deploy_detail("workspace deps rewritten:", rewritten_count);
-        deploy_detail("node_modules installed:", "yes");
+        deploy_detail_colored("node_modules installed:", install_ui::status_ok("yes"));
         install_ui::done("Copied source, lockfile, and production dependencies");
         install_ui::done(&format!(
             "Done · deploy tree ready at {}",
-            plan.output_dir.display()
+            install_ui::yellow(&plan.output_dir.display().to_string())
         ));
     }
 
@@ -827,7 +835,11 @@ pub async fn run(
 }
 
 fn deploy_detail(label: &str, value: impl std::fmt::Display) {
-    eprintln!("    {label:<25} {value}");
+    deploy_detail_colored(label, value.to_string());
+}
+
+fn deploy_detail_colored(label: &str, value: String) {
+    eprintln!("    {} {value}", install_ui::dim(&format!("{label:<25}")));
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ pub async fn run_rotate(
     json_output: bool,
 ) -> Result<(), LpmError> {
     if !json_output {
-        install_ui::phase("Rotating lpm.dev token");
+        install_ui::phase(&format!("Rotating {} token", install_ui::yellow("lpm.dev")));
     }
 
     // The server handles rotation: POST creates new token and invalidates old
@@ -40,11 +40,13 @@ pub async fn run_rotate(
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
+            install_ui::done("Old token invalidated");
+            install_ui::done("New token stored in Keychain");
             install_ui::done("Done · session token rotated successfully");
             if let Some(expires) = body.get("expiresAt").and_then(|e| e.as_str()) {
-                println!("  Expires: {}", expires.dimmed());
+                eprintln!("  {} {}", "Expires:".dimmed(), expires.dimmed());
             }
-            println!();
+            eprintln!();
         }
     } else {
         let error = body

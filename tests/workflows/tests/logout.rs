@@ -29,8 +29,8 @@ async fn logout_human_output_uses_slim_logged_out_notice() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("› Not currently logged in."),
-        "logged-out logout should use the slim notice line, got:\n{stderr}"
+        stderr.contains("› No stored lpm.dev session"),
+        "logged-out logout should use the slim session notice, got:\n{stderr}"
     );
     assert!(
         !stderr.contains("●") && !stderr.contains("◆") && !stderr.contains("│"),
@@ -84,7 +84,8 @@ async fn logout_human_output_uses_slim_done_line_and_clears_state() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✓ Successfully logged out."),
+        stderr.contains("› Clearing stored lpm.dev session")
+            && stderr.contains("✓ Done · signed out of lpm.dev"),
         "logout should use the slim done line, got:\n{stderr}"
     );
     assert!(
@@ -144,9 +145,10 @@ async fn logout_revoke_human_output_uses_slim_phase_then_done() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("› Revoking token on server...")
-            && stderr.contains("✓ Successfully logged out."),
-        "logout --revoke should show the slim revoke phase then the done line, got:\n{stderr}"
+        stderr.contains("› Clearing stored lpm.dev session")
+            && stderr.contains("✓ Revoked server-side token")
+            && stderr.contains("✓ Done · signed out of lpm.dev"),
+        "logout --revoke should show the slim clear/revoke/done lines, got:\n{stderr}"
     );
     assert!(
         !stderr.contains("Token revoked on server"),

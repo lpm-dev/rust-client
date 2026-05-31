@@ -14,6 +14,25 @@ fn seed_skill(project: &TempProject, pkg: &str, name: &str, body: &str) {
     project.write_file(&format!(".lpm/skills/{pkg}/{name}.md"), body);
 }
 
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ─── list ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -86,6 +105,42 @@ fn skills_list_groups_by_package_and_counts_files() {
     assert!(
         !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
         "skills list must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn skills_list_aligns_files_globally_and_applies_color_roles_when_forced() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    seed_skill(&project, "alice.tools", "a", "x");
+    seed_skill(&project, "bob.helpers", "very-long-skill", "hello");
+
+    let output = lpm(&project)
+        .args(["--color=always", "skills", "list"])
+        .output()
+        .expect("failed to run colored lpm skills list");
+
+    assert!(output.status.success(), "skills list must succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\x1b[36m@lpm.dev/alice.tools") && stdout.contains("\x1b[2m1 B"),
+        "skills list should color package names and dim sizes, got:\n{stdout:?}",
+    );
+
+    let normalized = strip_ansi(&stdout);
+    let short = normalized
+        .lines()
+        .find(|line| line.contains("a.md"))
+        .expect("short skill row must be present");
+    let long = normalized
+        .lines()
+        .find(|line| line.contains("very-long-skill.md"))
+        .expect("long skill row must be present");
+    let short_size_col = short.find("1 B").expect("short row must include size");
+    let long_size_col = long.find("5 B").expect("long row must include size");
+    assert_eq!(
+        short_size_col, long_size_col,
+        "skill file names should align to one global width, got:\n{normalized}"
     );
 }
 

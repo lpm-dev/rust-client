@@ -13,6 +13,19 @@ struct UninstallResult {
     not_found: Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct CleanupReport {
+    orphaned: Vec<PackageVersion>,
+    cleaned_empty_dirs: usize,
+    freed_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PackageVersion {
+    name: String,
+    version: String,
+}
+
 fn remove_from_manifest(doc: &mut Value, packages: &[String]) -> UninstallResult {
     let mut removed = Vec::new();
     let mut not_found = Vec::new();
@@ -39,8 +52,21 @@ fn remove_from_manifest(doc: &mut Value, packages: &[String]) -> UninstallResult
     UninstallResult { removed, not_found }
 }
 
-fn cleanup_removed_packages(project_dir: &Path, removed: &[String]) -> Result<(), LpmError> {
-    prune_lockfile_to_current_manifest(project_dir)?;
+fn cleanup_removed_packages(
+    project_dir: &Path,
+    removed: &[String],
+    direct_versions: &HashMap<String, String>,
+) -> Result<CleanupReport, LpmError> {
+    let pruned = prune_lockfile_to_current_manifest(project_dir)?;
+    let orphaned: Vec<PackageVersion> = pruned
+        .removed_packages
+        .into_iter()
+        .filter(|package| {
+            direct_versions
+                .get(&package.name)
+                .is_none_or(|version| version != &package.version)
+        })
+        .collect();
 
     let install_hash_path = project_dir.join(".lpm").join("install-hash");
     if install_hash_path.exists() {
@@ -48,26 +74,98 @@ fn cleanup_removed_packages(project_dir: &Path, removed: &[String]) -> Result<()
     }
 
     let node_modules = project_dir.join("node_modules");
+    let mut freed_bytes = 0u64;
     for name in removed {
-        let link = node_modules.join(name);
-        let Ok(metadata) = link.symlink_metadata() else {
+        freed_bytes = freed_bytes.saturating_add(remove_node_modules_entry(&node_modules, name)?);
+    }
+    for package in &orphaned {
+        freed_bytes =
+            freed_bytes.saturating_add(remove_node_modules_entry(&node_modules, &package.name)?);
+    }
+
+    let cleaned_empty_dirs = cleanup_empty_scope_dirs(&node_modules, removed, &orphaned)?;
+
+    Ok(CleanupReport {
+        orphaned,
+        cleaned_empty_dirs,
+        freed_bytes,
+    })
+}
+
+fn remove_node_modules_entry(node_modules: &Path, name: &str) -> Result<u64, LpmError> {
+    let link = node_modules.join(name);
+    let Ok(metadata) = link.symlink_metadata() else {
+        return Ok(0);
+    };
+    let freed_bytes = removable_path_size(&link, &metadata);
+
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        std::fs::remove_file(&link).or_else(|_| std::fs::remove_dir(&link))?;
+        #[cfg(windows)]
+        std::fs::remove_dir(&link).or_else(|_| std::fs::remove_file(&link))?;
+        return Ok(freed_bytes);
+    }
+
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(&link)?;
+        return Ok(freed_bytes);
+    }
+
+    if metadata.is_file() {
+        std::fs::remove_file(&link)?;
+    }
+
+    Ok(freed_bytes)
+}
+
+fn removable_path_size(path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return metadata.len();
+    }
+    if metadata.is_dir() {
+        return crate::commands::cache::dir_size(path).unwrap_or(0);
+    }
+    0
+}
+
+fn cleanup_empty_scope_dirs(
+    node_modules: &Path,
+    removed: &[String],
+    orphaned: &[PackageVersion],
+) -> Result<usize, LpmError> {
+    let mut scopes: Vec<&str> = removed
+        .iter()
+        .filter_map(|name| npm_scope_name(name))
+        .chain(
+            orphaned
+                .iter()
+                .filter_map(|package| npm_scope_name(&package.name)),
+        )
+        .collect();
+    scopes.sort_unstable();
+    scopes.dedup();
+
+    let mut cleaned = 0usize;
+    for scope in scopes {
+        let scope_dir = node_modules.join(scope);
+        let Ok(mut entries) = std::fs::read_dir(&scope_dir) else {
             continue;
         };
-
-        if metadata.file_type().is_symlink() {
-            #[cfg(unix)]
-            std::fs::remove_file(&link).or_else(|_| std::fs::remove_dir(&link))?;
-            #[cfg(windows)]
-            std::fs::remove_dir(&link).or_else(|_| std::fs::remove_file(&link))?;
-            continue;
-        }
-
-        if metadata.is_dir() {
-            std::fs::remove_dir_all(&link)?;
+        if entries.next().is_none() {
+            std::fs::remove_dir(&scope_dir)?;
+            cleaned += 1;
         }
     }
 
-    Ok(())
+    Ok(cleaned)
+}
+
+fn npm_scope_name(name: &str) -> Option<&str> {
+    if !name.starts_with('@') {
+        return None;
+    }
+    name.split_once('/').map(|(scope, _)| scope)
 }
 
 fn collect_manifest_dependency_specs(doc: &Value) -> HashMap<String, String> {
@@ -181,10 +279,15 @@ fn node_modules_package_version(project_dir: &Path, package: &str) -> Option<Str
         .map(str::to_string)
 }
 
-fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<(), LpmError> {
+#[derive(Debug, Default)]
+struct LockfilePruneReport {
+    removed_packages: Vec<PackageVersion>,
+}
+
+fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePruneReport, LpmError> {
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
     if !lockfile_path.exists() {
-        return Ok(());
+        return Ok(LockfilePruneReport::default());
     }
 
     let manifest_path = project_dir.join("package.json");
@@ -194,7 +297,7 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<(), LpmError
     let direct_specs = collect_manifest_dependency_specs(&manifest);
 
     let Ok(mut lockfile) = lpm_lockfile::Lockfile::read_fast(&lockfile_path) else {
-        return Ok(());
+        return Ok(LockfilePruneReport::default());
     };
 
     let package_key = |name: &str, version: &str| -> String {
@@ -206,13 +309,21 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<(), LpmError
     };
 
     if direct_specs.is_empty() {
+        let removed_packages = lockfile
+            .packages
+            .iter()
+            .map(|pkg| PackageVersion {
+                name: pkg.name.clone(),
+                version: pkg.version.clone(),
+            })
+            .collect();
         lockfile.packages.clear();
         lockfile.root_aliases.clear();
         lockfile.ambient_peer_installs.clear();
         lockfile
             .write_all(&lockfile_path)
             .map_err(|e| LpmError::Registry(e.to_string()))?;
-        return Ok(());
+        return Ok(LockfilePruneReport { removed_packages });
     }
 
     let package_index: HashMap<String, &lpm_lockfile::LockedPackage> = lockfile
@@ -260,6 +371,16 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<(), LpmError
         }
     }
 
+    let removed_packages = lockfile
+        .packages
+        .iter()
+        .filter(|pkg| !reachable.contains(&package_key(&pkg.name, &pkg.version)))
+        .map(|pkg| PackageVersion {
+            name: pkg.name.clone(),
+            version: pkg.version.clone(),
+        })
+        .collect();
+
     lockfile
         .packages
         .retain(|pkg| reachable.contains(&package_key(&pkg.name, &pkg.version)));
@@ -280,7 +401,7 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<(), LpmError
         .write_all(&lockfile_path)
         .map_err(|e| LpmError::Registry(e.to_string()))?;
 
-    Ok(())
+    Ok(LockfilePruneReport { removed_packages })
 }
 
 /// per-manifest uninstall helper.
@@ -330,7 +451,8 @@ fn uninstall_from_project(
     let pkg_json_path = project_dir.join("package.json");
     let result = uninstall_from_manifest(&pkg_json_path, packages, json_output)?;
     if !result.removed.is_empty() {
-        cleanup_removed_packages(project_dir, &result.removed)?;
+        let direct_versions = locked_package_versions(project_dir, &result.removed);
+        cleanup_removed_packages(project_dir, &result.removed, &direct_versions)?;
     }
     Ok(result)
 }
@@ -425,6 +547,9 @@ pub async fn run(
     let mut all_removed: Vec<String> = Vec::new();
     let mut all_not_found: Vec<String> = Vec::new();
     let mut removed_versions: HashMap<String, String> = HashMap::new();
+    let mut all_orphaned: Vec<PackageVersion> = Vec::new();
+    let mut cleaned_empty_dirs = 0usize;
+    let mut freed_bytes = 0u64;
     for manifest_path in &targets.member_manifests {
         let per_member = uninstall_from_manifest(manifest_path, packages, json_output)?;
 
@@ -432,8 +557,13 @@ pub async fn run(
             // Clean THIS member's lockfile and node_modules. install_root_for
             // returns the manifest's parent directory.
             let member_dir = crate::commands::install_targets::install_root_for(manifest_path);
-            removed_versions.extend(locked_package_versions(member_dir, &per_member.removed));
-            cleanup_removed_packages(member_dir, &per_member.removed)?;
+            let per_member_versions = locked_package_versions(member_dir, &per_member.removed);
+            removed_versions.extend(per_member_versions.clone());
+            let cleanup =
+                cleanup_removed_packages(member_dir, &per_member.removed, &per_member_versions)?;
+            all_orphaned.extend(cleanup.orphaned);
+            cleaned_empty_dirs += cleanup.cleaned_empty_dirs;
+            freed_bytes = freed_bytes.saturating_add(cleanup.freed_bytes);
         }
 
         all_removed.extend(per_member.removed);
@@ -451,6 +581,8 @@ pub async fn run(
     all_removed.dedup();
     all_not_found.sort();
     all_not_found.dedup();
+    all_orphaned.sort();
+    all_orphaned.dedup();
 
     if all_removed.is_empty() {
         if !json_output {
@@ -477,10 +609,18 @@ pub async fn run(
         for name in &all_removed {
             uninstall_ui::minus_package(name, removed_versions.get(name).map(String::as_str));
         }
+        for package in &all_orphaned {
+            uninstall_ui::minus_orphaned_package(&package.name, &package.version);
+        }
         if !all_not_found.is_empty() {
             eprintln!();
             uninstall_ui::warn_not_found(&all_not_found);
         }
+        if cleaned_empty_dirs > 0 {
+            eprintln!();
+            uninstall_ui::done_cleaned_empty_dirs(cleaned_empty_dirs);
+        }
+        uninstall_ui::done_freed_disk(freed_bytes);
         eprintln!();
         uninstall_ui::done_removed(all_removed.len(), uninstall_start.elapsed());
     }

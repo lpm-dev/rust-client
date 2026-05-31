@@ -34,6 +34,15 @@ fn exec_js_file_loads_dotenv_and_forwards_args() {
         stdout.contains(r#"{"env":"hello-from-dotenv","args":["--flag","value"]}"#),
         "exec must load .env vars and forward args to the script, got:\n{stdout}"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Executing scripts/echo.js with Node.js"),
+        "exec must name the selected runtime in the slim phase line, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("✓ Done · exited 0 in"),
+        "exec must show the slim elapsed-time terminus, got:\n{stderr}"
+    );
 }
 
 #[test]

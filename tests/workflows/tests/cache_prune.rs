@@ -146,6 +146,10 @@ fn prune_human_output_uses_slim_status_lines() {
         "missing-registry path should use a slim warning, got:\n{combined}"
     );
     assert!(
+        combined.contains("✓ Done · checked cache in "),
+        "cache prune dry-run should finish with elapsed done line, got:\n{combined}"
+    );
+    assert!(
         !combined.contains('│') && !combined.contains('◇'),
         "cache prune output should not use bordered/cliclack glyphs, got:\n{combined}"
     );
@@ -231,6 +235,39 @@ fn prune_apply_with_explicit_project_succeeds_with_no_v2_store() {
     );
     assert_eq!(json["link_entries_total"], 0);
     assert_eq!(json["object_entries_total"], 0);
+}
+
+#[test]
+fn prune_apply_human_output_uses_done_line_with_elapsed() {
+    let project = TempProject::empty(r#"{"name":"prune-apply-human","version":"1.0.0"}"#);
+
+    let output = lpm_v2(&project)
+        .args([
+            "cache",
+            "prune",
+            "--apply",
+            "--project",
+            project.path().to_str().expect("project path utf-8"),
+        ])
+        .output()
+        .expect("failed to run lpm cache prune --apply --project");
+
+    assert!(
+        output.status.success(),
+        "--apply --project on empty store must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ));
+    assert!(
+        combined.contains("✓ Done · pruned 0 link entries + 0 objects (0 B) in "),
+        "cache prune apply should finish with elapsed done line, got:\n{combined}"
+    );
 }
 
 #[test]

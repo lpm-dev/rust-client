@@ -36,7 +36,7 @@ async fn init_yes_human_output_uses_slim_success() {
     mock.with_whoami("neo", "neo@example.com").await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["init", "-y"])
+        .args(["--color=always", "init", "-y"])
         .output()
         .expect("failed to run lpm init -y");
 
@@ -47,18 +47,27 @@ async fn init_yes_human_output_uses_slim_success() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let combined = strip_ansi(&format!(
+    let raw = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    ));
+    );
+    let combined = strip_ansi(&raw);
     assert!(
-        combined.contains("✓ Created package.json"),
+        combined.contains("✓ Wrote package.json"),
         "init should use a slim success line, got:\n{combined}"
     );
     assert!(
-        combined.contains("@lpm.dev/neo.package"),
-        "init should show the created package name, got:\n{combined}"
+        combined.contains("✓ Added lpm.lockb binary to .gitattributes"),
+        "init should report the binary lockfile git attribute, got:\n{combined}"
+    );
+    assert!(
+        combined.contains("✓ Done · initialized @lpm.dev/neo.package"),
+        "init should show the initialized package name, got:\n{combined}"
+    );
+    assert!(
+        raw.contains("\u{1b}[36m@lpm.dev/neo.package\u{1b}[39m"),
+        "init should color the full package name as an identifier, got:\n{raw:?}"
     );
     assert!(
         !combined.contains('│') && !combined.contains('◇'),

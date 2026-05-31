@@ -70,6 +70,34 @@ fn setup_ci_default_writes_scoped_registry_line_to_dot_npmrc() {
 }
 
 #[test]
+fn setup_ci_color_output_uses_plain_file_and_cyan_env_var() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "--color=always",
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+        ])
+        .output()
+        .expect("failed to run lpm setup ci --color=always");
+
+    assert!(output.status.success(), "lpm setup ci failed");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Generated .npmrc") && !stderr.contains("Generated \u{1b}[1m.npmrc"),
+        ".npmrc should remain plain in setup ci output, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\u{1b}[36mLPM_TOKEN"),
+        "LPM_TOKEN should use the env-var color role, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn setup_ci_proxy_flag_writes_non_scoped_registry_line() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
 

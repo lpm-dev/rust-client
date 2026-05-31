@@ -35,6 +35,8 @@ async fn info_human_output_uses_slim_completion_and_stdout_report() {
     assert!(
         stdout.contains("@lpm.dev/owner.react")
             && stdout.contains("version      1.0.0")
+            && stdout.contains("integrity    sha512-")
+            && stdout.contains('…')
             && stdout.contains("dependencies")
             && stdout.contains("@radix-ui/react-dialog")
             && stdout.contains("react"),

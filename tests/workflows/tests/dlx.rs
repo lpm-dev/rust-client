@@ -115,6 +115,15 @@ fn dlx_cache_hit_executes_cached_binary_and_refreshes_ttl() {
         stdout.contains("args:--loud hello"),
         "dlx must forward extra args to the cached binary, got:\n{stdout}"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Resolving npm-check-updates@1.0.0"),
+        "dlx should show slim resolve phase for the target package; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("› Reusing dlx cache entry (fresh)"),
+        "dlx should mark the fresh cache-hit path; stderr:\n{stderr}"
+    );
 
     let after = std::fs::metadata(&package_json)
         .expect("package.json must still exist")

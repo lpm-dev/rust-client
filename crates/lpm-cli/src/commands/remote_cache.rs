@@ -153,26 +153,44 @@ pub fn cache_status_json(status: &CacheStatus) -> serde_json::Value {
 }
 
 pub fn print_cache_status_human(status: &CacheStatus) {
-    println!("Local cache");
-    println!("  path     {}", status.local_path.display());
-    println!("  size     {}", format_bytes(status.local_bytes));
+    println!("{}", install_ui::section("Local cache"));
+    println!(
+        "  {} {}",
+        cache_status_label("path"),
+        status.local_path.display()
+    );
+    println!(
+        "  {} {}",
+        cache_status_label("size"),
+        format_bytes(status.local_bytes)
+    );
     println!();
 
-    println!("Remote cache");
-    println!("  enabled  {}", status.remote.enabled);
+    println!("{}", install_ui::section("Remote cache"));
+    let enabled_value = if status.remote.enabled {
+        install_ui::status_ok("true")
+    } else {
+        install_ui::dim("false")
+    };
+    println!("  {} {}", cache_status_label("enabled"), enabled_value);
     if status.remote.enabled {
-        println!(
-            "  status   {}",
-            status.remote.status.as_deref().unwrap_or("unknown")
-        );
+        let status_value = status
+            .remote
+            .status
+            .as_deref()
+            .map_or_else(|| install_ui::dim("unknown"), install_ui::status_ok);
+        println!("  {} {}", cache_status_label("status"), status_value);
         if let Some(url) = &status.remote.url {
-            println!("  url      {url}");
+            println!("  {} {url}", cache_status_label("url"));
         }
         if let (Some(usage), Some(limit)) = (status.remote.usage_bytes, status.remote.limit_bytes) {
             let usage_display = format_bytes(usage);
             let limit_display = format_bytes(limit);
             let usage_bar = install_ui::usage_bar(usage, limit, 10);
-            let mut usage_line = format!("  usage    {usage_display} / {limit_display}");
+            let mut usage_line = format!(
+                "  {} {usage_display} / {limit_display}",
+                cache_status_label("usage")
+            );
             if !usage_bar.is_empty() {
                 usage_line.push_str("  ");
                 usage_line.push_str(&usage_bar);
@@ -186,6 +204,10 @@ pub fn print_cache_status_human(status: &CacheStatus) {
         install_ui::warn(&format!("Remote status unavailable: {error}"));
     }
     install_ui::done("Cache status loaded");
+}
+
+fn cache_status_label(label: &str) -> String {
+    install_ui::dim(&format!("{label:<8}"))
 }
 
 impl RemoteCacheClient {

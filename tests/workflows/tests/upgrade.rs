@@ -331,6 +331,35 @@ async fn upgrade_dry_run_human_output_uses_slim_ui() {
     );
 }
 
+#[tokio::test]
+async fn upgrade_patch_dry_run_human_output_applies_slim_color_roles_when_forced() {
+    let pkg = "@lpm.dev/owner.patch-color";
+    let project = TempProject::empty("");
+    seed_pinned_dep(&project, pkg, "^1.0.0", "1.0.0");
+
+    let mock = MockRegistry::start().await;
+    mount_lpm_pkg(&mock, pkg, "1.0.1").await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["--color=always", "upgrade", "-y", "--dry-run"])
+        .output()
+        .expect("spawn colored lpm upgrade --dry-run");
+    assert!(
+        out.status.success(),
+        "colored upgrade --dry-run must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("\x1b[32m↑\x1b[39m")
+            && stderr.contains("\x1b[2m→\x1b[22m")
+            && stderr.contains("\x1b[33m1.0.1"),
+        "patch upgrade row should color glyph green, arrow dim, and target version yellow, got:\n{stderr:?}",
+    );
+}
+
 /// Without `--dry-run`, upgrade rewrites the manifest range and runs
 /// install end-to-end. Asserts the new range lands and the lockfile
 /// reflects the upgraded version.

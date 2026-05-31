@@ -138,6 +138,58 @@ async fn cache_status_human_renders_tables_and_slim_completion() {
 }
 
 #[tokio::test]
+async fn cache_status_human_applies_slim_color_roles_when_forced() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "enabled",
+            "usageBytes": 1024,
+            "limitBytes": 2048
+        })))
+        .mount(&server)
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["--color=always", "cache", "status"])
+        .output()
+        .expect("failed to run colored lpm cache status");
+
+    assert!(
+        output.status.success(),
+        "colored cache status failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\x1b[33mLocal cache")
+            && stdout.contains("\x1b[2menabled")
+            && stdout.contains("\x1b[32mtrue")
+            && stdout.contains("\x1b[32m")
+            && stdout.contains('█'),
+        "cache status should color section headers, labels, status values, and the usage bar, got:\n{stdout:?}",
+    );
+}
+
+#[tokio::test]
 async fn cache_status_does_not_send_registry_token_to_third_party_host() {
     // A checked-in lpm.json must not be able to redirect the ambient registry
     // token (LPM_TOKEN) to an arbitrary cache host. With no cache-specific

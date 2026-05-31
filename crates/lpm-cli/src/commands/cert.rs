@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
@@ -78,12 +77,12 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    println!("Root CA");
+    println!("{}", install_ui::section("Root CA"));
     if status.ca_exists {
         let trust_status = if status.ca_trusted {
-            "trusted".green()
+            install_ui::status_ok("trusted")
         } else {
-            "not trusted".red()
+            install_ui::red("not trusted")
         };
         print_field("status", &trust_status);
 
@@ -96,44 +95,44 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
         if let Some(days) = days_remaining {
             let txt = format!("{days} days");
             let colored = if days < 30 {
-                txt.red()
+                install_ui::red(&txt)
             } else if days < 60 {
-                txt.yellow()
+                install_ui::section(&txt)
             } else {
-                txt.green()
+                install_ui::status_ok(&txt)
             };
             print_field("remaining", &colored);
             if days < 60 {
                 println!(
                     "  {}",
-                    "Run `lpm cert rotate` to roll the CA before it expires.".dimmed()
+                    install_ui::dim("Run `lpm cert rotate` to roll the CA before it expires.")
                 );
             }
         }
     } else {
-        print_field("status", &"not installed".red());
+        print_field("status", &install_ui::red("not installed"));
         println!(
             "  {}",
-            "Run `lpm cert trust` to generate and install the CA".dimmed()
+            install_ui::dim("Run `lpm cert trust` to generate and install the CA")
         );
     }
 
     if !drifts.is_empty() {
         println!();
-        println!("Permission drift");
+        println!("{}", install_ui::section("Permission drift"));
         for d in &drifts {
-            print_field(d.role, &d.summary().red().to_string());
-            println!("  {}", format!("fix: {}", d.chmod_hint()).dimmed());
+            print_field(d.role, &install_ui::red(&d.summary()));
+            println!("  {}", install_ui::dim(&format!("fix: {}", d.chmod_hint())));
         }
     }
 
     println!();
-    println!("Project cert");
+    println!("{}", install_ui::section("Project cert"));
     if status.project_cert_exists {
         if status.project_cert_needs_renewal {
-            print_field("status", &"needs renewal".yellow());
+            print_field("status", &install_ui::section("needs renewal"));
         } else {
-            print_field("status", &"valid".green());
+            print_field("status", &install_ui::status_ok("valid"));
         }
         if !status.project_cert_hostnames.is_empty() {
             print_field("hosts", &status.project_cert_hostnames.join(", "));
@@ -142,10 +141,10 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
             print_field("expires", expires);
         }
     } else {
-        print_field("status", &"not generated".dimmed());
+        print_field("status", &install_ui::dim("not generated"));
         println!(
             "  {}",
-            "Run `lpm dev --https` or `lpm cert generate` to create".dimmed()
+            install_ui::dim("Run `lpm dev --https` or `lpm cert generate` to create")
         );
     }
 
@@ -365,5 +364,5 @@ fn run_reconcile(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
 }
 
 fn print_field(label: &str, value: &str) {
-    println!("  {label:<10} {value}");
+    println!("  {} {value}", install_ui::dim(&format!("{label:<10}")));
 }

@@ -4,9 +4,34 @@ use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
 
 async fn mount_lpm_package(mock: &MockRegistry, package: &str, version: &str) {
+    mount_lpm_package_with_deps(mock, package, version, serde_json::json!({})).await;
+}
+
+async fn mount_lpm_package_with_deps(
+    mock: &MockRegistry,
+    package: &str,
+    version: &str,
+    dependencies: serde_json::Value,
+) {
     let tarball = make_tarball(package, version);
     mock.with_package(package, version, &tarball).await;
-    mock.with_batch_metadata(vec![serde_json::json!({
+    mock.with_batch_metadata(vec![lpm_package_metadata(
+        mock,
+        package,
+        version,
+        dependencies,
+    )])
+    .await;
+}
+
+fn lpm_package_metadata(
+    mock: &MockRegistry,
+    package: &str,
+    version: &str,
+    dependencies: serde_json::Value,
+) -> serde_json::Value {
+    let tarball = make_tarball(package, version);
+    serde_json::json!({
         "name": package,
         "dist-tags": { "latest": version },
         "versions": {
@@ -17,12 +42,11 @@ async fn mount_lpm_package(mock: &MockRegistry, package: &str, version: &str) {
                     "tarball": format!("{}/tarballs/{package}/-/{package}-{version}.tgz", mock.url()),
                     "integrity": compute_integrity(&tarball),
                 },
-                "dependencies": {}
+                "dependencies": dependencies
             }
         },
         "time": { version: "2025-01-01T00:00:00.000Z" }
-    })])
-    .await;
+    })
 }
 
 #[test]
@@ -98,6 +122,78 @@ async fn resolve_bare_scoped_package_defaults_to_latest_version_in_human_output(
     assert!(
         !combined.contains('●') && !combined.contains('│'),
         "resolve output must not use cliclack gutter output, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_human_output_nests_transitive_dependencies_as_tree() {
+    let project = TempProject::empty(r#"{"name":"resolve-tree-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let root = "@lpm.dev/owner.react";
+    let child = "@lpm.dev/owner.scheduler";
+    mock.with_full_package_metadata(
+        root,
+        "19.0.0",
+        &[(
+            "19.0.0",
+            serde_json::json!({ child: "^0.25.0" }),
+            Some(make_tarball(root, "19.0.0")),
+        )],
+    )
+    .await;
+    mock.with_full_package_metadata(
+        child,
+        "0.25.0",
+        &[(
+            "0.25.0",
+            serde_json::json!({}),
+            Some(make_tarball(child, "0.25.0")),
+        )],
+    )
+    .await;
+    mock.with_batch_metadata(vec![
+        lpm_package_metadata(
+            &mock,
+            root,
+            "19.0.0",
+            serde_json::json!({ child: "^0.25.0" }),
+        ),
+        lpm_package_metadata(&mock, child, "0.25.0", serde_json::json!({})),
+    ])
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["resolve", root])
+        .output()
+        .expect("failed to run lpm resolve");
+
+    assert!(
+        output.status.success(),
+        "lpm resolve failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("@lpm.dev/owner.react@19.0.0"),
+        "root package must render in the resolve tree, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("└─ @lpm.dev/owner.scheduler@0.25.0")
+            || stdout.contains("├─ @lpm.dev/owner.scheduler@0.25.0"),
+        "transitive dependency must render under the root as a tree edge, got:\n{stdout}"
+    );
+
+    let scheduler_pos = stdout
+        .find("@lpm.dev/owner.scheduler@0.25.0")
+        .expect("scheduler line should be present");
+    let react_pos = stdout
+        .find("@lpm.dev/owner.react@19.0.0")
+        .expect("react line should be present");
+    assert!(
+        react_pos < scheduler_pos,
+        "transitive dependency must appear after its parent, got:\n{stdout}"
     );
 }
 

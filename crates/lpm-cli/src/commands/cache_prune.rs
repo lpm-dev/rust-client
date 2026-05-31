@@ -54,6 +54,7 @@ use lpm_common::{
 use lpm_store::v2::Store as V2Store;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::cache::PruneFlags;
 
@@ -149,6 +150,7 @@ pub struct PruneSummary {
 /// finishes. The locking model is documented at
 /// [`lpm store` — Locking model](https://cli.lpm.dev/docs/infra/store#locking-model).
 pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Result<(), LpmError> {
+    let start = Instant::now();
     let v2_store = V2Store::from_lpm_root(root);
     let max_age = match flags.max_age {
         Some(s) => Some(parse_duration(s)?),
@@ -168,7 +170,7 @@ pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Re
     if json_output {
         emit_json(&summary);
     } else {
-        emit_human(&summary, flags.apply);
+        emit_human(&summary, flags.apply, start.elapsed());
     }
 
     Ok(())
@@ -607,8 +609,9 @@ fn dir_size(dir: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-fn emit_human(summary: &PruneSummary, applied: bool) {
+fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
     use lpm_common::format_bytes;
+    let elapsed = install_ui::green(&install_ui::format_duration(elapsed));
 
     if summary.registry_corrupt {
         // Corruption path: registry file exists but parses as
@@ -638,7 +641,7 @@ fn emit_human(summary: &PruneSummary, applied: bool) {
         );
     } else if applied {
         install_ui::done(&format!(
-            "Pruned {} link entr{} + {} object{} ({})",
+            "Done · pruned {} link entr{} + {} object{} ({}) in {}",
             summary.link_entries_orphaned.len(),
             if summary.link_entries_orphaned.len() == 1 {
                 "y"
@@ -652,6 +655,7 @@ fn emit_human(summary: &PruneSummary, applied: bool) {
                 "s"
             },
             format_bytes(summary.bytes_freed_or_eligible),
+            elapsed,
         ));
     } else {
         install_ui::phase(&format!(
@@ -725,6 +729,9 @@ fn emit_human(summary: &PruneSummary, applied: bool) {
                 sanitize_for_terminal(&dir.display().to_string())
             );
         }
+    }
+    if !applied {
+        install_ui::done(&format!("Done · checked cache in {elapsed}"));
     }
 }
 
