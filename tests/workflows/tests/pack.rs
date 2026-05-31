@@ -16,6 +16,26 @@ fn normalize_test_path(path: &str) -> String {
 }
 
 #[cfg(unix)]
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for cc in chars.by_ref() {
+                let cb = cc as u32;
+                if (0x40..=0x7e).contains(&cb) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
 fn write_unix_executable(path: &std::path::Path, content: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("failed to create executable parent dir");
@@ -67,6 +87,7 @@ fn pack_runs_project_tsdown_with_lpm_flags() {
 
     let output = lpm(&project)
         .args([
+            "--color=always",
             "pack",
             "--entry",
             "src/index.ts",
@@ -89,10 +110,15 @@ fn pack_runs_project_tsdown_with_lpm_flags() {
         output.status,
         String::from_utf8_lossy(&output.stderr),
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr_raw = String::from_utf8_lossy(&output.stderr);
+    let stderr = strip_ansi(&stderr_raw);
     assert!(
         stderr.contains("› Using local tsdown"),
         "pack must use a slim phase line, got:\n{stderr}"
+    );
+    assert!(
+        stderr_raw.contains("\u{1b}[33mtsdown\u{1b}[39m"),
+        "pack must color the local tool name, got:\n{stderr_raw:?}"
     );
     assert!(
         stderr.contains("✓ Done · package build complete in "),

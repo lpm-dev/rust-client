@@ -482,7 +482,7 @@ slim/cliclack. File:line are approximate — confirm before editing.
 - [ ] [split] confirm + 2FA prompts stay cliclack (correct).
 
 ### pack — `commands/pack.rs`  (struct MATCH, tsdown passthrough)
-- [ ] [color] `tsdown`→`yellow`, terminus elapsed green (already).
+- [x] [color] `tsdown`→`yellow`, terminus elapsed green (already).
 
 ### download — `commands/download.rs`
 - [x] [stream] file list prints to stdout (L125-131) — move to stderr.

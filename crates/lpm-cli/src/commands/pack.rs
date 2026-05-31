@@ -213,7 +213,7 @@ pub async fn pack(
     json_output: bool,
 ) -> Result<(), LpmError> {
     if !json_output {
-        install_ui::phase("Using local tsdown");
+        install_ui::phase(&format!("Using local {}", install_ui::yellow("tsdown")));
     }
 
     let start = std::time::Instant::now();
