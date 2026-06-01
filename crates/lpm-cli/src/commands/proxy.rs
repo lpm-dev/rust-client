@@ -313,6 +313,7 @@ async fn ensure_detached_started_with_options(
         .stderr(Stdio::null());
     detach_background_command(&mut command);
     append_listener_args(&mut command, options);
+    #[cfg(windows)]
     prepare_detached_spawn_handles().map_err(|err| {
         LpmError::Script(format!(
             "failed to prepare detached proxy daemon handles: {err}"
@@ -357,15 +358,9 @@ fn append_listener_args(command: &mut Command, options: lpm_proxy::ProxyDaemonOp
     command.args(listener_args(options));
 }
 
+#[cfg(windows)]
 fn prepare_detached_spawn_handles() -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        clear_standard_handle_inheritance()
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(())
-    }
+    clear_standard_handle_inheritance()
 }
 
 #[cfg(windows)]
