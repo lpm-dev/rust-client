@@ -302,8 +302,7 @@ fn find_port_owner_from_list(port: u16) -> (Option<u32>, Option<String>) {
     list_listening_ports()
         .into_iter()
         .find(|row| row.port == port)
-        .map(|row| (row.pid, row.process))
-        .unwrap_or((None, None))
+        .map_or((None, None), |row| (row.pid, row.process))
 }
 
 #[cfg(target_os = "linux")]
