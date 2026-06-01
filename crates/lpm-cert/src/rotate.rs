@@ -243,14 +243,25 @@ fn stage_and_run(
         }
 
         let existing_sans = preserved_extra_hostnames(&leaf_cert).unwrap_or_default();
+        let existing_dns_constraints =
+            cert::read_project_dns_constraints(&leaf_cert).unwrap_or_default();
         let (cert_pem, key_pem) =
-            cert::generate_project_cert(&staged_cert_pem, &staged_key_pem, &existing_sans)
-                .map_err(|e| {
-                    LpmError::Cert(format!(
-                        "failed to reissue cert at {}: {e}",
-                        leaf_cert.display()
-                    ))
-                })?;
+            if existing_sans.is_empty() && existing_dns_constraints.is_empty() {
+                cert::generate_project_cert(&staged_cert_pem, &staged_key_pem, &existing_sans)
+            } else {
+                cert::generate_project_cert_with_constrained_intermediate(
+                    &staged_cert_pem,
+                    &staged_key_pem,
+                    &existing_sans,
+                    &existing_dns_constraints,
+                )
+            }
+            .map_err(|e| {
+                LpmError::Cert(format!(
+                    "failed to reissue cert at {}: {e}",
+                    leaf_cert.display()
+                ))
+            })?;
 
         if let Err(e) = crate::create_dir_secure(&leaf_dir) {
             return rotate_abort_after_staged_install(
@@ -283,7 +294,7 @@ fn stage_and_run(
             );
         }
 
-        if !cert::leaf_signed_by(&leaf_cert, staged_cert).unwrap_or(false) {
+        if !cert::project_cert_chains_to_root(&leaf_cert, staged_cert).unwrap_or(false) {
             return rotate_abort_after_staged_install(
                 staged_cert,
                 staged_key,

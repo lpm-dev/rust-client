@@ -4,6 +4,14 @@ use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+type ProxyLeaseSlot = Arc<Mutex<Option<lpm_proxy::RouteLease>>>;
+
+struct DevCertSetup {
+    setup: lpm_cert::HttpsSetup,
+    inject_env: bool,
+}
 
 /// Build the consent value for `ensure_https_with_consent` based on the dev flags.
 ///
@@ -116,6 +124,30 @@ pub async fn run(
 
     let mut extra_env: Vec<(String, String)> = Vec::new();
 
+    let lpm_config = if let Some(cfg) = pre_parsed_config {
+        Some(cfg)
+    } else {
+        lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?
+    };
+    let local_domain_hostnames = lpm_config
+        .as_ref()
+        .map(lpm_runner::local_domains::configured_hostnames)
+        .unwrap_or_default();
+    let cert_extra_permitted_dns = lpm_config
+        .as_ref()
+        .map(lpm_runner::lpm_json::validated_cert_extra_permitted_dns)
+        .transpose()
+        .map_err(LpmError::Script)?
+        .map(|entries| lpm_cert::name_constraints::dns_subtrees_from_entries(&entries))
+        .unwrap_or_default();
+    let startup_proxy_lines = lpm_config
+        .as_ref()
+        .map(|config| startup_proxy_lines_from_config(config, port))
+        .unwrap_or_default();
+    if !local_domain_hostnames.is_empty() {
+        ensure_local_proxy_running(project_dir).await?;
+    }
+
     // ── Collect startup info for banner ─────────────────────────────
     let mut startup = StartupInfo {
         deps_status: String::new(),
@@ -126,6 +158,7 @@ pub async fn run(
         network_addr: None,
         node_version: None,
         inspector_url: None,
+        proxy_lines: startup_proxy_lines,
     };
 
     // ── Run independent detection steps in parallel ──────────────────
@@ -153,6 +186,8 @@ pub async fn run(
 
     // Clone for the spawn_blocking closure (cert SANs need the IP list)
     let network_info_for_cert = network_info.clone();
+    let local_domain_hostnames_for_cert = local_domain_hostnames.clone();
+    let cert_extra_permitted_dns_for_cert = cert_extra_permitted_dns.clone();
 
     let node_version_handle = tokio::task::spawn_blocking(|| {
         std::process::Command::new("node")
@@ -184,29 +219,39 @@ pub async fn run(
                 .unwrap_or(None)
         },
         async {
-            if https {
+            if https || !local_domain_hostnames_for_cert.is_empty() {
                 let dir = https_dir.clone();
                 let host_clone = host_owned.clone();
                 let net_info = network_info_for_cert;
                 let yes_local = yes;
+                let inject_env = https;
                 let setup = tokio::task::spawn_blocking(move || {
                     let mut extra_hostnames: Vec<String> = Vec::new();
-                    if let Some(h) = host_clone {
-                        extra_hostnames.push(h);
+                    if inject_env && let Some(h) = host_clone {
+                        push_unique_hostname(&mut extra_hostnames, h);
                     }
-                    if let Some(ref info) = net_info {
+                    extend_unique_hostnames(&mut extra_hostnames, local_domain_hostnames_for_cert);
+                    if inject_env && let Some(ref info) = net_info {
                         for addr in &info.addresses {
                             if !addr.is_ipv6 {
-                                extra_hostnames.push(addr.ip.clone());
+                                push_unique_hostname(&mut extra_hostnames, addr.ip.clone());
                             }
                         }
                     }
                     let consent = build_consent(yes_local);
-                    lpm_cert::ensure_https_with_consent(&dir, &extra_hostnames, consent)
+                    lpm_cert::ensure_https_with_consent_and_permitted_dns(
+                        &dir,
+                        &extra_hostnames,
+                        &cert_extra_permitted_dns_for_cert,
+                        consent,
+                    )
                 })
                 .await
                 .map_err(|e| LpmError::Script(format!("HTTPS setup panicked: {e}")))?;
-                Ok::<_, LpmError>(Some(setup?))
+                Ok::<_, LpmError>(Some(DevCertSetup {
+                    setup: setup?,
+                    inject_env,
+                }))
             } else {
                 Ok::<_, LpmError>(None)
             }
@@ -220,16 +265,19 @@ pub async fn run(
     startup.env_status = env_result;
     startup.node_version = node_version_result;
 
-    let https_setup: Option<lpm_cert::HttpsSetup> = https_result?;
-    if let Some(setup) = https_setup {
+    let https_setup: Option<DevCertSetup> = https_result?;
+    if let Some(cert_setup) = https_setup {
+        let setup = cert_setup.setup;
         if setup.ca_freshly_installed {
             dev_ui::done("root CA generated and installed to trust store");
         }
         if setup.cert_freshly_generated {
             dev_ui::done("project certificate generated");
         }
-        extra_env.extend(setup.env_vars);
-        startup.https_active = true;
+        if cert_setup.inject_env {
+            extra_env.extend(setup.env_vars);
+            startup.https_active = true;
+        }
     }
 
     // ── Network info (reuse pre-computed result) ────────────────────
@@ -593,13 +641,6 @@ pub async fn run(
     print_startup_banner(&startup, project_dir);
 
     // ── Check for multi-service orchestration ──────────────────────────
-    // Reuse pre-parsed config from main.rs if available, avoiding a second file read
-    let lpm_config = if let Some(cfg) = pre_parsed_config {
-        Some(cfg)
-    } else {
-        lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?
-    };
-
     let has_services = lpm_config.as_ref().is_some_and(|c| !c.services.is_empty());
 
     if has_services {
@@ -654,12 +695,21 @@ pub async fn run(
             (None, None)
         };
 
+        let proxy_lease = Arc::new(Mutex::new(None));
+        let on_ports_assigned = build_proxy_ports_assigned_callback(
+            lpm_config.as_ref().unwrap(),
+            project_dir,
+            Arc::clone(&proxy_lease),
+            tokio::runtime::Handle::current(),
+        );
+
         let options = lpm_runner::orchestrator::OrchestratorOptions {
             https,
             filter: extra_args.to_vec(), // lpm dev web api → filter to web + api
             extra_envs: extra_env.clone(),
             event_tx: orchestrator_event_tx,
             command_rx: orch_cmd_rx,
+            on_ports_assigned,
             on_all_ready: if open_browser {
                 Some(Box::new(move || {
                     let _ = open::that(&open_url);
@@ -668,6 +718,8 @@ pub async fn run(
                 None
             },
         };
+
+        let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
 
         if dashboard {
             // Dashboard mode: run orchestrator in a background thread,
@@ -723,6 +775,7 @@ pub async fn run(
                     lpm_dashboard::ServiceState {
                         name: (*name).clone(),
                         port: svc.port,
+                        hosts: dashboard_service_hosts(lpm_config.as_ref().unwrap(), name),
                         status: lpm_dashboard::ServiceStatus::Starting,
                         logs: lpm_dashboard::LogBuffer::new(5000),
                     }
@@ -763,6 +816,9 @@ pub async fn run(
                 Ok(())
             };
 
+            let result = release_proxy_lease_after(result, &proxy_lease).await;
+            let result = release_hosts_file_after(result, hosts_file_lease);
+
             // Clean shutdown: tunnel task, then inspector. Inspector last so
             // any in-flight push from the webhook consumer can drain.
             if let Some(handle) = tunnel_handle {
@@ -775,10 +831,25 @@ pub async fn run(
             return result;
         }
 
-        return lpm_runner::orchestrator::run_services(project_dir, services, options);
+        let result = lpm_runner::orchestrator::run_services(project_dir, services, options);
+        let result = release_proxy_lease_after(result, &proxy_lease).await;
+        return release_hosts_file_after(result, hosts_file_lease);
     }
 
     // ── Single service: start dev server ────────────────────────────
+    let proxy_lease = Arc::new(Mutex::new(None));
+    let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
+    let route_registration = if let Some(config) = lpm_config.as_ref()
+        && let Some(plan) = lpm_runner::local_domains::plan_single_service_route(config, port)
+    {
+        register_proxy_route_plan(project_dir, plan.routes, Arc::clone(&proxy_lease)).await
+    } else {
+        Ok(())
+    };
+    if let Err(err) = route_registration {
+        return release_hosts_file_after(Err(err), hosts_file_lease);
+    }
+
     let scheme = if https { "https" } else { "http" };
     let url = format!("{scheme}://localhost:{port}");
     dev_ui::detail("Local", &install_ui::bold(&url));
@@ -811,14 +882,16 @@ pub async fn run(
 
     // Run the "dev" script with extra env vars injected safely (no unsafe set_var).
     // `runtime_hint` was resolved during the parallel-startup join above.
-    lpm_runner::script::run_script_with_envs(
+    let script_result = lpm_runner::script::run_script_with_envs(
         project_dir,
         "dev",
         extra_args,
         env_mode,
         &extra_env,
         &runtime_hint,
-    )?;
+    );
+    let result = release_proxy_lease_after(script_result, &proxy_lease).await;
+    let result = release_hosts_file_after(result, hosts_file_lease);
 
     // Clean shutdown: tunnel first, then inspector (lets in-flight webhook
     // pushes drain into the inspector state before the server closes).
@@ -829,7 +902,415 @@ pub async fn run(
         handle.shutdown();
     }
 
+    result
+}
+
+fn startup_proxy_lines_from_config(
+    config: &lpm_runner::lpm_json::LpmJsonConfig,
+    single_service_port: u16,
+) -> Vec<StartupProxyLine> {
+    let mut lines = Vec::new();
+
+    if config.services.is_empty() {
+        if let Some(host) = config.proxy.as_ref().and_then(|proxy| proxy.host.as_ref()) {
+            push_startup_proxy_line(&mut lines, host, Some(single_service_port), None);
+        }
+        return lines;
+    }
+
+    let mut service_names: Vec<&String> = config.services.keys().collect();
+    service_names.sort();
+    for service_name in service_names {
+        let service = &config.services[service_name];
+        if let Some(host) = service.host.as_ref() {
+            push_startup_proxy_line(&mut lines, host, service.port, Some(service_name.clone()));
+        }
+    }
+
+    if let Some(host) = config.proxy.as_ref().and_then(|proxy| proxy.host.as_ref()) {
+        match primary_proxy_service_for_display(config) {
+            Some(service_name) => {
+                if let Some(service) = config.services.get(service_name) {
+                    push_startup_proxy_line(
+                        &mut lines,
+                        host,
+                        service.port,
+                        Some(service_name.to_string()),
+                    );
+                }
+            }
+            None => lines.push(StartupProxyLine {
+                host: host.clone(),
+                target: "primary service required".to_string(),
+                service: None,
+            }),
+        }
+    }
+
+    lines
+}
+
+fn dashboard_service_hosts(
+    config: &lpm_runner::lpm_json::LpmJsonConfig,
+    service_name: &str,
+) -> Vec<String> {
+    let mut hosts = Vec::new();
+    if let Some(service) = config.services.get(service_name)
+        && let Some(host) = service.host.as_ref()
+    {
+        push_unique_hostname(&mut hosts, host.clone());
+    }
+    if let Some(proxy_host) = config.proxy.as_ref().and_then(|proxy| proxy.host.as_ref())
+        && primary_proxy_service_for_display(config) == Some(service_name)
+    {
+        push_unique_hostname(&mut hosts, proxy_host.clone());
+    }
+    hosts
+}
+
+fn primary_proxy_service_for_display(config: &lpm_runner::lpm_json::LpmJsonConfig) -> Option<&str> {
+    let mut primary = config
+        .services
+        .iter()
+        .filter(|(_, service)| service.primary)
+        .map(|(name, _)| name.as_str());
+    if let Some(name) = primary.next() {
+        return primary.next().is_none().then_some(name);
+    }
+
+    if config.services.len() == 1 {
+        return config.services.keys().next().map(String::as_str);
+    }
+
+    None
+}
+
+fn push_startup_proxy_line(
+    lines: &mut Vec<StartupProxyLine>,
+    host: &str,
+    port: Option<u16>,
+    service: Option<String>,
+) {
+    if lines
+        .iter()
+        .any(|line| line.host.eq_ignore_ascii_case(host))
+    {
+        return;
+    }
+    let target = port.map_or_else(
+        || "auto port".to_string(),
+        |port| format!("localhost:{port}"),
+    );
+    lines.push(StartupProxyLine {
+        host: host.to_string(),
+        target,
+        service,
+    });
+}
+
+fn build_proxy_ports_assigned_callback(
+    config: &lpm_runner::lpm_json::LpmJsonConfig,
+    project_dir: &Path,
+    proxy_lease: ProxyLeaseSlot,
+    runtime_handle: tokio::runtime::Handle,
+) -> Option<lpm_runner::orchestrator::PortsAssignedCallback> {
+    if lpm_runner::local_domains::configured_hostnames(config).is_empty() {
+        return None;
+    }
+
+    let config = config.clone();
+    let project_dir = project_dir.to_path_buf();
+    Some(Box::new(move |ports| {
+        let plan = lpm_runner::local_domains::plan_multi_service_routes(&config, ports)
+            .map_err(LpmError::Script)?;
+        register_proxy_route_plan_on_runtime(
+            &project_dir,
+            plan.routes,
+            Arc::clone(&proxy_lease),
+            runtime_handle.clone(),
+        )
+    }))
+}
+
+async fn ensure_local_proxy_running(project_dir: &Path) -> Result<(), LpmError> {
+    let status = match lpm_proxy::status().await {
+        Ok(status) if status.running => status,
+        Ok(_) => {
+            let start = crate::commands::proxy::ensure_detached_started_for_project(project_dir)
+                .await
+                .map_err(|err| {
+                    LpmError::Script(format!(
+                        "local proxy auto-start failed: {err}. Start it with `{}` before using `host` in lpm.json.",
+                        local_proxy_https_start_command()
+                    ))
+                })?;
+            if start.started {
+                dev_ui::done("local proxy control daemon started in the background");
+            }
+            start.status
+        }
+        Err(err) => {
+            return Err(LpmError::Script(format!(
+                "local proxy status check failed: {err}"
+            )));
+        }
+    };
+
+    if status.running && status.tls_addr.is_some() {
+        return Ok(());
+    }
+
+    let listener_hint = if status.http_addr.is_some() {
+        " A plain HTTP listener is not enough for the HTTPS local-domain front door."
+    } else {
+        ""
+    };
+    Err(LpmError::Script(format!(
+        "local proxy is running without an HTTPS listener.{listener_hint} Restart it with `{}` before using `host` in lpm.json.",
+        local_proxy_https_start_command()
+    )))
+}
+
+fn prepare_local_hosts_file(
+    project_dir: &Path,
+    hostnames: &[String],
+    yes: bool,
+) -> Result<Option<lpm_runner::local_domains::ManagedHostsFile>, LpmError> {
+    let Some(plan) = lpm_runner::local_domains::plan_hosts_file_update(project_dir, hostnames)
+        .map_err(|err| LpmError::Script(format!("local hosts file planning failed: {err}")))?
+    else {
+        return Ok(None);
+    };
+
+    confirm_hosts_file_update(&plan, yes)?;
+    let lease = crate::commands::hosts::apply_hosts_file_plan_with_permission(&plan).map_err(|err| {
+        LpmError::Script(format!(
+            "local hosts file update failed for {}: {err}. Run `lpm dev` with permission to edit the hosts file (sudo on Unix, Administrator on Windows), or use `.localhost` hosts that do not need a hosts-file entry.",
+            plan.path.display()
+        ))
+    })?;
+    if lease.changed() {
+        dev_ui::done("hosts file updated for local domains");
+    }
+    Ok(Some(lease))
+}
+
+fn confirm_hosts_file_update(
+    plan: &lpm_runner::local_domains::HostsFilePlan,
+    yes: bool,
+) -> Result<(), LpmError> {
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(LpmError::Script(format!(
+            "non-interactive shell: pass `--yes` to consent to updating the hosts file for local domains ({})",
+            plan.hosts.join(", ")
+        )));
+    }
+
+    println!();
+    println!(
+        "  {}",
+        "LPM needs to update your hosts file for local domains.".bold()
+    );
+    println!();
+    print_cert_prompt_field("Hosts file:", &plan.path.display().to_string());
+    print_cert_prompt_field("Backup:", &plan.backup_path.display().to_string());
+    print_cert_prompt_field("Hosts:", &plan.hosts.join(", "));
+    println!();
+    let answer = cliclack::confirm("Update hosts file now?")
+        .initial_value(false)
+        .interact()
+        .map_err(crate::prompt::prompt_err)?;
+    if !answer {
+        return Err(LpmError::Script(
+            "hosts file update declined; aborting `lpm dev`. Use `.localhost` hosts, or pass `--yes` when you're ready.".into(),
+        ));
+    }
     Ok(())
+}
+
+async fn register_proxy_route_plan(
+    project_dir: &Path,
+    routes: Vec<lpm_runner::local_domains::LocalDomainRoute>,
+    proxy_lease: ProxyLeaseSlot,
+) -> Result<(), LpmError> {
+    if routes.is_empty() {
+        return Ok(());
+    }
+
+    let proxy_routes: Vec<lpm_proxy::Route> = routes
+        .into_iter()
+        .map(|route| lpm_proxy::Route {
+            host: route.host,
+            upstream_port: route.upstream_port,
+            project_dir: project_dir.to_path_buf(),
+            service: route.service,
+        })
+        .collect();
+    let lease = register_proxy_routes(proxy_routes.clone()).await?;
+    store_proxy_lease(proxy_lease, lease)?;
+    print_registered_proxy_routes(&proxy_routes);
+    Ok(())
+}
+
+fn register_proxy_route_plan_on_runtime(
+    project_dir: &Path,
+    routes: Vec<lpm_runner::local_domains::LocalDomainRoute>,
+    proxy_lease: ProxyLeaseSlot,
+    runtime_handle: tokio::runtime::Handle,
+) -> Result<(), LpmError> {
+    if routes.is_empty() {
+        return Ok(());
+    }
+
+    let proxy_routes: Vec<lpm_proxy::Route> = routes
+        .into_iter()
+        .map(|route| lpm_proxy::Route {
+            host: route.host,
+            upstream_port: route.upstream_port,
+            project_dir: project_dir.to_path_buf(),
+            service: route.service,
+        })
+        .collect();
+    let lease = register_proxy_routes_blocking(proxy_routes.clone(), runtime_handle)?;
+    store_proxy_lease(proxy_lease, lease)?;
+    print_registered_proxy_routes(&proxy_routes);
+    Ok(())
+}
+
+fn store_proxy_lease(
+    proxy_lease: ProxyLeaseSlot,
+    lease: lpm_proxy::RouteLease,
+) -> Result<(), LpmError> {
+    let mut guard = proxy_lease
+        .lock()
+        .map_err(|_| LpmError::Script("local proxy lease state is poisoned".into()))?;
+    *guard = Some(lease);
+    Ok(())
+}
+
+async fn register_proxy_routes(
+    routes: Vec<lpm_proxy::Route>,
+) -> Result<lpm_proxy::RouteLease, LpmError> {
+    lpm_proxy::register(routes)
+        .await
+        .map_err(map_proxy_register_error)
+}
+
+fn register_proxy_routes_blocking(
+    routes: Vec<lpm_proxy::Route>,
+    runtime_handle: tokio::runtime::Handle,
+) -> Result<lpm_proxy::RouteLease, LpmError> {
+    let worker = std::thread::Builder::new()
+        .name("lpm-proxy-register".to_string())
+        .spawn(move || runtime_handle.block_on(register_proxy_routes(routes)))
+        .map_err(|err| LpmError::Script(format!("start local proxy registration thread: {err}")))?;
+    worker
+        .join()
+        .map_err(|_| LpmError::Script("local proxy registration thread panicked".into()))?
+}
+
+fn map_proxy_register_error(err: lpm_proxy::ProxyError) -> LpmError {
+    match err {
+        lpm_proxy::ProxyError::IpcUnavailable(_) | lpm_proxy::ProxyError::IpcUnsupported => {
+            LpmError::Script(format!(
+                "local proxy is not running. Start it with `{}` before using `host` in lpm.json.",
+                local_proxy_https_start_command()
+            ))
+        }
+        other => LpmError::Script(format!("local proxy route registration failed: {other}")),
+    }
+}
+
+fn local_proxy_https_start_command() -> String {
+    install_ui::bold("lpm proxy start --tls-port 9443")
+}
+
+async fn release_proxy_lease_after(
+    result: Result<(), LpmError>,
+    proxy_lease: &ProxyLeaseSlot,
+) -> Result<(), LpmError> {
+    let release_result = release_proxy_lease(proxy_lease).await;
+    match (result, release_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(release_err)) => Err(release_err),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(release_err)) => {
+            dev_ui::warn(&format!("local proxy route cleanup failed: {release_err}"));
+            Err(primary)
+        }
+    }
+}
+
+fn release_hosts_file_after(
+    result: Result<(), LpmError>,
+    hosts_file: Option<lpm_runner::local_domains::ManagedHostsFile>,
+) -> Result<(), LpmError> {
+    let release_result = release_hosts_file(hosts_file);
+    match (result, release_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(release_err)) => Err(release_err),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(release_err)) => {
+            dev_ui::warn(&format!("local hosts file cleanup failed: {release_err}"));
+            Err(primary)
+        }
+    }
+}
+
+fn release_hosts_file(
+    hosts_file: Option<lpm_runner::local_domains::ManagedHostsFile>,
+) -> Result<(), LpmError> {
+    if let Some(hosts_file) = hosts_file {
+        crate::commands::hosts::release_hosts_file_with_permission(hosts_file)
+            .map_err(|err| LpmError::Script(format!("local hosts file cleanup failed: {err}")))?;
+    }
+    Ok(())
+}
+
+async fn release_proxy_lease(proxy_lease: &ProxyLeaseSlot) -> Result<(), LpmError> {
+    let mut lease = {
+        let mut guard = proxy_lease
+            .lock()
+            .map_err(|_| LpmError::Script("local proxy lease state is poisoned".into()))?;
+        guard.take()
+    };
+    if let Some(ref mut lease) = lease {
+        lease
+            .release()
+            .await
+            .map_err(|err| LpmError::Script(format!("local proxy route release failed: {err}")))?;
+    }
+    Ok(())
+}
+
+fn print_registered_proxy_routes(routes: &[lpm_proxy::Route]) {
+    for route in routes {
+        let target = format!("{} -> localhost:{}", route.host, route.upstream_port);
+        if let Some(ref service) = route.service {
+            dev_ui::detail_with_hint("Proxy", &install_ui::bold(&target), service);
+        } else {
+            dev_ui::detail("Proxy", &install_ui::bold(&target));
+        }
+    }
+    dev_ui::blank_line();
+}
+
+fn extend_unique_hostnames(hostnames: &mut Vec<String>, extra: impl IntoIterator<Item = String>) {
+    for hostname in extra {
+        push_unique_hostname(hostnames, hostname);
+    }
+}
+
+fn push_unique_hostname(hostnames: &mut Vec<String>, hostname: String) {
+    if !hostnames
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&hostname))
+    {
+        hostnames.push(hostname);
+    }
 }
 
 // ── Startup info ────────────────────────────────────────────────────
@@ -853,6 +1334,14 @@ struct StartupInfo {
     /// `--tunnel` started one. Printed in the banner so the user can
     /// copy-paste it; the dashboard's `o` key opens the same URL.
     inspector_url: Option<String>,
+    proxy_lines: Vec<StartupProxyLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupProxyLine {
+    host: String,
+    target: String,
+    service: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -927,6 +1416,14 @@ fn startup_banner_lines(info: &StartupInfo, project_dir: &Path) -> Vec<StartupBa
             label: "HTTPS",
             value: "enabled".to_string(),
             hint: Some("(trusted local certificate)".to_string()),
+        });
+    }
+
+    for proxy in &info.proxy_lines {
+        lines.push(StartupBannerLine {
+            label: "Proxy",
+            value: format!("https://{} -> {}", proxy.host, proxy.target),
+            hint: proxy.service.as_ref().map(|service| format!("({service})")),
         });
     }
 
@@ -1250,6 +1747,7 @@ async fn serve_ca_cert(port: u16, ca_cert_data: Vec<u8>) {
 mod tests {
     use super::*;
     use crate::install_state::compute_install_hash;
+    use std::collections::HashMap;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1347,6 +1845,11 @@ mod tests {
             network_addr: Some("192.168.1.42:3000".to_string()),
             node_version: Some("v22.22.1".to_string()),
             inspector_url: Some("http://127.0.0.1:53412".to_string()),
+            proxy_lines: vec![StartupProxyLine {
+                host: "web.localhost".to_string(),
+                target: "localhost:3000".to_string(),
+                service: Some("web".to_string()),
+            }],
         };
 
         assert_eq!(
@@ -1371,6 +1874,11 @@ mod tests {
                     label: "HTTPS",
                     value: "enabled".to_string(),
                     hint: Some("(trusted local certificate)".to_string()),
+                },
+                StartupBannerLine {
+                    label: "Proxy",
+                    value: "https://web.localhost -> localhost:3000".to_string(),
+                    hint: Some("(web)".to_string()),
                 },
                 StartupBannerLine {
                     label: "Tunnel",
@@ -1404,6 +1912,7 @@ mod tests {
             network_addr: None,
             node_version: Some("v20.11.0".to_string()),
             inspector_url: None,
+            proxy_lines: Vec::new(),
         };
 
         assert_eq!(
@@ -1430,6 +1939,105 @@ mod tests {
                     hint: Some("(--domain)".to_string()),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn startup_proxy_lines_map_service_hosts_to_configured_or_auto_ports() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            services: HashMap::from([
+                (
+                    "api".to_string(),
+                    lpm_runner::lpm_json::ServiceConfig {
+                        command: "node api.js".to_string(),
+                        port: Some(4000),
+                        host: Some("api.localhost".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "web".to_string(),
+                    lpm_runner::lpm_json::ServiceConfig {
+                        command: "next dev".to_string(),
+                        host: Some("web.localhost".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            startup_proxy_lines_from_config(&config, 3000),
+            vec![
+                StartupProxyLine {
+                    host: "api.localhost".to_string(),
+                    target: "localhost:4000".to_string(),
+                    service: Some("api".to_string()),
+                },
+                StartupProxyLine {
+                    host: "web.localhost".to_string(),
+                    target: "auto port".to_string(),
+                    service: Some("web".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_proxy_lines_map_top_level_host_to_single_script_port() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            proxy: Some(lpm_runner::lpm_json::ProxyConfig {
+                host: Some("app.localhost".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            startup_proxy_lines_from_config(&config, 5173),
+            vec![StartupProxyLine {
+                host: "app.localhost".to_string(),
+                target: "localhost:5173".to_string(),
+                service: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn dashboard_service_hosts_include_service_and_primary_proxy_hosts() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            proxy: Some(lpm_runner::lpm_json::ProxyConfig {
+                host: Some("app.localhost".to_string()),
+                ..Default::default()
+            }),
+            services: HashMap::from([
+                (
+                    "api".to_string(),
+                    lpm_runner::lpm_json::ServiceConfig {
+                        command: "node api.js".to_string(),
+                        port: Some(4000),
+                        host: Some("api.localhost".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "web".to_string(),
+                    lpm_runner::lpm_json::ServiceConfig {
+                        command: "next dev".to_string(),
+                        port: Some(3000),
+                        host: Some("web.localhost".to_string()),
+                        primary: true,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            dashboard_service_hosts(&config, "web"),
+            vec!["web.localhost".to_string(), "app.localhost".to_string()]
         );
     }
 

@@ -1,0 +1,41 @@
+[package]
+name = "lpm-proxy"
+description = "Shared local-domain proxy route registry for LPM dev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = { version = "0.8" }
+hyper = { version = "1" }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+lpm-cert = { workspace = true }
+lpm-common = { workspace = true }
+pem = "3"
+rustls = "0.23"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = "0.26"
+x509-parser = "0.16"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true

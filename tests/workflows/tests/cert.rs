@@ -354,3 +354,29 @@ fn cert_generate_json_regenerates_when_requested_host_is_missing() {
         "generate --host must regenerate the cert so the requested SAN is present, got: {hostnames:?}"
     );
 }
+
+#[test]
+fn cert_generate_uses_lpm_json_extra_permitted_dns_for_constrained_chain() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"cert":{"extraPermittedDns":["myapp.local"]}}"#,
+    );
+
+    let output = cert_command(&project)
+        .args(["cert", "generate", "--json"])
+        .output()
+        .expect("failed to run lpm cert generate --json");
+
+    assert_success(&output, "lpm cert generate --json");
+    let envelope = json_envelope(&output, "lpm cert generate --json");
+    assert_eq!(envelope["success"], serde_json::json!(true));
+
+    let cert_pem = std::fs::read_to_string(project_cert_path(&project))
+        .expect("generate must write project cert");
+    let cert_blocks = cert_pem.matches("-----BEGIN CERTIFICATE-----").count();
+    assert_eq!(
+        cert_blocks, 2,
+        "extraPermittedDns should force a leaf + constrained intermediate chain"
+    );
+}

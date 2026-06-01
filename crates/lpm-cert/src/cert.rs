@@ -4,10 +4,14 @@
 //! Default SANs: localhost, 127.0.0.1, ::1 — plus any user-specified hostnames.
 
 use lpm_common::LpmError;
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, CidrSubnet, DistinguishedName, DnType,
+    GeneralSubtree, IsCa, KeyPair, KeyUsagePurpose, NameConstraints, SanType,
+};
 use sha1::Digest as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+use std::str::FromStr;
 use time::{Duration, OffsetDateTime};
 use x509_parser::extensions::GeneralName;
 
@@ -47,6 +51,20 @@ fn read_cert_der(path: &Path) -> Result<Vec<u8>, LpmError> {
     let pem = pem::parse(&pem_str)
         .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
     Ok(pem.into_contents())
+}
+
+fn read_cert_chain_der(path: &Path) -> Result<Vec<Vec<u8>>, LpmError> {
+    let pem_str = std::fs::read_to_string(path)
+        .map_err(|e| LpmError::Cert(format!("failed to read cert at {}: {e}", path.display())))?;
+    let pems = pem::parse_many(&pem_str)
+        .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
+    if pems.is_empty() {
+        return Err(LpmError::Cert(format!(
+            "no certificate PEM blocks found at {}",
+            path.display()
+        )));
+    }
+    Ok(pems.into_iter().map(pem::Pem::into_contents).collect())
 }
 
 /// A `cert.pem` SAN entry, decoded from the X.509 extension into a form callers can
@@ -131,6 +149,116 @@ pub fn leaf_signed_by(leaf_path: &Path, ca_path: &Path) -> Result<bool, LpmError
     Ok(leaf.verify_signature(Some(ca.public_key())).is_ok())
 }
 
+/// Verify that the project certificate at `cert_path` chains to the root CA at
+/// `root_path`. Accepts the legacy direct root-signed leaf format and the newer
+/// leaf-plus-project-intermediate PEM chain format.
+pub fn project_cert_chains_to_root(cert_path: &Path, root_path: &Path) -> Result<bool, LpmError> {
+    let cert_chain = read_cert_chain_der(cert_path)?;
+    let root_der = read_cert_der(root_path)?;
+    let (_, leaf) = x509_parser::parse_x509_certificate(&cert_chain[0])
+        .map_err(|e| LpmError::Cert(format!("invalid leaf X.509: {e}")))?;
+    let (_, root) = x509_parser::parse_x509_certificate(&root_der)
+        .map_err(|e| LpmError::Cert(format!("invalid root X.509: {e}")))?;
+
+    if leaf.issuer() == root.subject() {
+        return Ok(leaf.verify_signature(Some(root.public_key())).is_ok());
+    }
+
+    let Some(intermediate_der) = cert_chain.get(1) else {
+        return Ok(false);
+    };
+    let (_, intermediate) = x509_parser::parse_x509_certificate(intermediate_der)
+        .map_err(|e| LpmError::Cert(format!("invalid intermediate X.509: {e}")))?;
+
+    let Some(basic_constraints) = intermediate
+        .basic_constraints()
+        .map_err(|e| LpmError::Cert(format!("failed to parse intermediate constraints: {e}")))?
+    else {
+        return Ok(false);
+    };
+
+    if !basic_constraints.value.ca
+        || leaf.issuer() != intermediate.subject()
+        || intermediate.issuer() != root.subject()
+    {
+        return Ok(false);
+    }
+    if leaf
+        .verify_signature(Some(intermediate.public_key()))
+        .is_err()
+    {
+        return Ok(false);
+    }
+
+    Ok(intermediate
+        .verify_signature(Some(root.public_key()))
+        .is_ok())
+}
+
+/// True when `cert_path` contains a leaf plus at least one intermediate cert.
+pub fn project_cert_has_intermediate(cert_path: &Path) -> Result<bool, LpmError> {
+    Ok(read_cert_chain_der(cert_path)?.len() > 1)
+}
+
+/// Return DNS permitted-subtree entries from the project intermediate in
+/// `cert_path`. Direct root-signed leaf files return an empty list.
+pub fn read_project_dns_constraints(cert_path: &Path) -> Result<Vec<String>, LpmError> {
+    let cert_chain = read_cert_chain_der(cert_path)?;
+    let Some(intermediate_der) = cert_chain.get(1) else {
+        return Ok(Vec::new());
+    };
+    let (_, intermediate) = x509_parser::parse_x509_certificate(intermediate_der)
+        .map_err(|e| LpmError::Cert(format!("invalid intermediate X.509: {e}")))?;
+    let Some(constraints) = intermediate
+        .name_constraints()
+        .map_err(|e| LpmError::Cert(format!("failed to parse intermediate constraints: {e}")))?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(permitted) = constraints.value.permitted_subtrees.as_ref() else {
+        return Ok(Vec::new());
+    };
+
+    let mut dns_constraints = Vec::with_capacity(permitted.len());
+    for subtree in permitted {
+        if let GeneralName::DNSName(name) = &subtree.base {
+            dns_constraints.push(name.to_ascii_lowercase());
+        }
+    }
+    Ok(dns_constraints)
+}
+
+/// Check whether an existing project certificate's intermediate permits the
+/// requested DNS names and configured extra DNS subtrees.
+pub fn project_cert_constraints_cover_dns(
+    cert_path: &Path,
+    requested_hostnames: &[String],
+    extra_permitted_dns_subtrees: &[String],
+) -> Result<bool, LpmError> {
+    let mut required =
+        Vec::with_capacity(requested_hostnames.len() + extra_permitted_dns_subtrees.len());
+    for hostname in requested_hostnames {
+        if hostname.parse::<IpAddr>().is_err() {
+            push_unique_string(&mut required, hostname.to_ascii_lowercase());
+        }
+    }
+    for subtree in extra_permitted_dns_subtrees {
+        push_unique_string(&mut required, subtree.to_ascii_lowercase());
+    }
+    if required.is_empty() {
+        return Ok(true);
+    }
+
+    let constraints = read_project_dns_constraints(cert_path)?;
+    if constraints.is_empty() {
+        return Ok(false);
+    }
+
+    Ok(required
+        .iter()
+        .all(|required| constraints.iter().any(|actual| actual == required)))
+}
+
 /// Certificate info extracted from an existing cert file.
 #[derive(Debug, Clone)]
 pub struct CertInfo {
@@ -153,12 +281,54 @@ pub fn generate_project_cert(
     ca_key_pem: &str,
     extra_hostnames: &[String],
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
-    // Parse the CA certificate and key
+    let (ca_cert, ca_key_pair) = issuer_from_ca_pem(ca_cert_pem, ca_key_pem)?;
+    let params = project_leaf_params(extra_hostnames)?;
+    let project_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+    let project_cert = params.signed_by(&project_key, &ca_cert, &ca_key_pair)?;
+
+    Ok((project_cert.pem(), project_key.serialize_pem()))
+}
+
+/// Generate a leaf certificate chain signed by a project-scoped constrained
+/// intermediate CA.
+///
+/// The returned cert PEM is ordered for TLS servers: leaf first, then the
+/// intermediate certificate. The root CA remains the trust anchor and is not
+/// appended to the chain.
+pub fn generate_project_cert_with_constrained_intermediate(
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+    extra_hostnames: &[String],
+    extra_permitted_dns_subtrees: &[String],
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let (ca_cert, ca_key_pair) = issuer_from_ca_pem(ca_cert_pem, ca_key_pem)?;
+    let intermediate_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+    let intermediate_params =
+        project_intermediate_params(extra_hostnames, extra_permitted_dns_subtrees)?;
+    let intermediate_cert =
+        intermediate_params.signed_by(&intermediate_key, &ca_cert, &ca_key_pair)?;
+
+    let project_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+    let leaf_params = project_leaf_params(extra_hostnames)?;
+    let leaf_cert = leaf_params.signed_by(&project_key, &intermediate_cert, &intermediate_key)?;
+    let chain_pem = format!("{}{}", leaf_cert.pem(), intermediate_cert.pem());
+
+    Ok((chain_pem, project_key.serialize_pem()))
+}
+
+fn issuer_from_ca_pem(
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+) -> Result<(Certificate, KeyPair), Box<dyn std::error::Error>> {
     let ca_key_pair = KeyPair::from_pem(ca_key_pem)?;
     let ca_cert_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)?;
     let ca_cert = ca_cert_params.self_signed(&ca_key_pair)?;
+    Ok((ca_cert, ca_key_pair))
+}
 
-    // Build the project cert params
+fn project_leaf_params(
+    extra_hostnames: &[String],
+) -> Result<CertificateParams, Box<dyn std::error::Error>> {
     let mut params = CertificateParams::default();
 
     let mut dn = DistinguishedName::new();
@@ -166,26 +336,57 @@ pub fn generate_project_cert(
     dn.push(DnType::OrganizationName, "LPM");
     params.distinguished_name = dn;
 
-    // Not a CA
-    params.is_ca = rcgen::IsCa::NoCa;
-    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    params.use_authority_key_identifier_extension = true;
 
-    // 1-year validity
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now;
+    params.not_after = now + Duration::days(365);
+    params.subject_alt_names = project_subject_alt_names(extra_hostnames)?;
+
+    Ok(params)
+}
+
+fn project_intermediate_params(
+    extra_hostnames: &[String],
+    extra_permitted_dns_subtrees: &[String],
+) -> Result<CertificateParams, Box<dyn std::error::Error>> {
+    let mut params = CertificateParams::default();
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "LPM Project Development CA");
+    dn.push(DnType::OrganizationName, "LPM");
+    params.distinguished_name = dn;
+
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.name_constraints = Some(NameConstraints {
+        permitted_subtrees: project_permitted_subtrees(
+            extra_hostnames,
+            extra_permitted_dns_subtrees,
+        )?,
+        excluded_subtrees: Vec::new(),
+    });
+    params.use_authority_key_identifier_extension = true;
+
     let now = OffsetDateTime::now_utc();
     params.not_before = now;
     params.not_after = now + Duration::days(365);
 
-    // Subject Alternative Names
-    let mut sans = vec![
-        SanType::DnsName("localhost".try_into()?),
-        SanType::IpAddress(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
-        SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-    ];
+    Ok(params)
+}
 
-    // Add extra hostnames
+fn project_subject_alt_names(
+    extra_hostnames: &[String],
+) -> Result<Vec<SanType>, Box<dyn std::error::Error>> {
+    let mut sans = Vec::with_capacity(3 + extra_hostnames.len());
+    sans.push(SanType::DnsName("localhost".try_into()?));
+    sans.push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+    sans.push(SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
     for hostname in extra_hostnames {
-        // Try parsing as IP first
         if let Ok(ip) = hostname.parse::<IpAddr>() {
             sans.push(SanType::IpAddress(ip));
         } else {
@@ -193,15 +394,92 @@ pub fn generate_project_cert(
         }
     }
 
-    params.subject_alt_names = sans;
+    Ok(sans)
+}
 
-    // Generate new key pair for the project cert
-    let project_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+fn project_permitted_subtrees(
+    extra_hostnames: &[String],
+    extra_permitted_dns_subtrees: &[String],
+) -> Result<Vec<GeneralSubtree>, Box<dyn std::error::Error>> {
+    let mut subtrees =
+        Vec::with_capacity(3 + extra_hostnames.len() + extra_permitted_dns_subtrees.len());
+    push_dns_subtree_unique(&mut subtrees, "localhost")?;
+    subtrees.push(cidr_subtree("127.0.0.1/32")?);
+    subtrees.push(cidr_subtree("::1/128")?);
 
-    // Sign with the CA
-    let project_cert = params.signed_by(&project_key, &ca_cert, &ca_key_pair)?;
+    for hostname in extra_hostnames {
+        if let Ok(ip) = hostname.parse::<IpAddr>() {
+            subtrees.push(ip_subtree(ip)?);
+        } else {
+            push_dns_subtree_unique(&mut subtrees, hostname)?;
+        }
+    }
+    for subtree in extra_permitted_dns_subtrees {
+        push_dns_subtree_unique(&mut subtrees, subtree)?;
+    }
 
-    Ok((project_cert.pem(), project_key.serialize_pem()))
+    Ok(subtrees)
+}
+
+fn push_dns_subtree_unique(
+    subtrees: &mut Vec<GeneralSubtree>,
+    subtree: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let normalized = normalize_dns_constraint_subtree(subtree)?;
+    if !subtrees
+        .iter()
+        .any(|existing| matches!(existing, GeneralSubtree::DnsName(name) if name == &normalized))
+    {
+        subtrees.push(GeneralSubtree::DnsName(normalized));
+    }
+    Ok(())
+}
+
+fn normalize_dns_constraint_subtree(subtree: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let normalized = subtree.trim().to_ascii_lowercase();
+    let bare = normalized.strip_prefix('.').unwrap_or(&normalized);
+    let invalid = normalized.is_empty()
+        || bare.is_empty()
+        || (bare != "localhost" && !bare.contains('.'))
+        || bare.contains("..")
+        || bare.ends_with('.')
+        || bare.starts_with('-')
+        || bare.ends_with('-')
+        || bare.contains(char::is_whitespace)
+        || bare
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-'));
+    if invalid {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid DNS name-constraint subtree {subtree:?}"),
+        )));
+    }
+    Ok(normalized)
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn ip_subtree(ip: IpAddr) -> Result<GeneralSubtree, Box<dyn std::error::Error>> {
+    let cidr = match ip {
+        IpAddr::V4(ip) => format!("{ip}/32"),
+        IpAddr::V6(ip) => format!("{ip}/128"),
+    };
+    cidr_subtree(&cidr)
+}
+
+fn cidr_subtree(cidr: &str) -> Result<GeneralSubtree, Box<dyn std::error::Error>> {
+    let subnet = CidrSubnet::from_str(cidr).map_err(|()| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid IP name-constraint CIDR {cidr}"),
+        )
+    })?;
+    Ok(GeneralSubtree::IpAddress(subnet))
 }
 
 /// Check if a certificate file needs renewal (within 30 days of expiry or invalid).
@@ -410,6 +688,126 @@ mod tests {
             san_strs.iter().any(|s| s.contains("c0:a8:01:2a")),
             "missing custom IP: {san_strs:?}"
         );
+    }
+
+    #[test]
+    fn constrained_project_cert_contains_leaf_and_intermediate_chain() {
+        let (ca_cert_pem, ca_key_pem) = ca::generate_ca().unwrap();
+        let extras = vec!["myapp.test".to_string(), "192.168.1.42".to_string()];
+        let (cert_pem, key_pem) = generate_project_cert_with_constrained_intermediate(
+            &ca_cert_pem,
+            &ca_key_pem,
+            &extras,
+            &[],
+        )
+        .unwrap();
+
+        assert!(key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+        let chain = pem::parse_many(&cert_pem).unwrap();
+        assert_eq!(chain.len(), 2, "TLS chain should be leaf + intermediate");
+
+        let (_, leaf) = x509_parser::parse_x509_certificate(chain[0].contents()).unwrap();
+        let (_, intermediate) = x509_parser::parse_x509_certificate(chain[1].contents()).unwrap();
+        let leaf_issuer = leaf
+            .issuer()
+            .iter_common_name()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(leaf_issuer, "LPM Project Development CA");
+
+        let intermediate_bc = intermediate.basic_constraints().unwrap().unwrap();
+        assert!(intermediate_bc.value.ca);
+        assert_eq!(intermediate_bc.value.path_len_constraint, Some(0));
+    }
+
+    #[test]
+    fn constrained_project_intermediate_permits_only_leaf_sans() {
+        let (ca_cert_pem, ca_key_pem) = ca::generate_ca().unwrap();
+        let extras = vec!["myapp.test".to_string(), "192.168.1.42".to_string()];
+        let (cert_pem, _) = generate_project_cert_with_constrained_intermediate(
+            &ca_cert_pem,
+            &ca_key_pem,
+            &extras,
+            &[],
+        )
+        .unwrap();
+
+        let chain = pem::parse_many(&cert_pem).unwrap();
+        let (_, intermediate) = x509_parser::parse_x509_certificate(chain[1].contents()).unwrap();
+        let constraints = intermediate.name_constraints().unwrap().unwrap();
+        let permitted = constraints
+            .value
+            .permitted_subtrees
+            .as_ref()
+            .expect("project intermediate must have permitted subtrees");
+        let dns_names: Vec<&str> = permitted
+            .iter()
+            .filter_map(|subtree| match &subtree.base {
+                GeneralName::DNSName(name) => Some(*name),
+                _ => None,
+            })
+            .collect();
+
+        assert!(dns_names.contains(&"localhost"));
+        assert!(dns_names.contains(&"myapp.test"));
+        assert!(
+            !dns_names.contains(&".test"),
+            "project intermediate must not broaden to the whole .test suffix"
+        );
+    }
+
+    #[test]
+    fn constrained_project_intermediate_includes_extra_permitted_dns_subtrees() {
+        let (ca_cert_pem, ca_key_pem) = ca::generate_ca().unwrap();
+        let extras = vec!["web.myapp.local".to_string()];
+        let extra_constraints = vec!["myapp.local".to_string(), ".myapp.local".to_string()];
+        let (cert_pem, _) = generate_project_cert_with_constrained_intermediate(
+            &ca_cert_pem,
+            &ca_key_pem,
+            &extras,
+            &extra_constraints,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        std::fs::write(&cert_path, cert_pem).unwrap();
+
+        let constraints = read_project_dns_constraints(&cert_path).unwrap();
+        assert!(constraints.contains(&"web.myapp.local".to_string()));
+        assert!(constraints.contains(&"myapp.local".to_string()));
+        assert!(constraints.contains(&".myapp.local".to_string()));
+        assert!(
+            project_cert_constraints_cover_dns(&cert_path, &extras, &extra_constraints).unwrap()
+        );
+    }
+
+    #[test]
+    fn project_cert_chains_to_root_accepts_direct_and_intermediate_formats() {
+        let (ca_cert_pem, ca_key_pem) = ca::generate_ca().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("rootCA.pem");
+        let direct_path = dir.path().join("direct.pem");
+        let chain_path = dir.path().join("chain.pem");
+        std::fs::write(&ca_path, &ca_cert_pem).unwrap();
+
+        let (direct_pem, _) = generate_project_cert(&ca_cert_pem, &ca_key_pem, &[]).unwrap();
+        std::fs::write(&direct_path, direct_pem).unwrap();
+        assert!(project_cert_chains_to_root(&direct_path, &ca_path).unwrap());
+        assert!(!project_cert_has_intermediate(&direct_path).unwrap());
+
+        let (chain_pem, _) = generate_project_cert_with_constrained_intermediate(
+            &ca_cert_pem,
+            &ca_key_pem,
+            &["myapp.test".to_string()],
+            &[],
+        )
+        .unwrap();
+        std::fs::write(&chain_path, chain_pem).unwrap();
+        assert!(project_cert_chains_to_root(&chain_path, &ca_path).unwrap());
+        assert!(project_cert_has_intermediate(&chain_path).unwrap());
     }
 
     #[test]
