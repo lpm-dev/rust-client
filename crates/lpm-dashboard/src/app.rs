@@ -40,6 +40,7 @@ impl ServiceStatus {
 pub struct ServiceState {
     pub name: String,
     pub port: Option<u16>,
+    pub hosts: Vec<String>,
     pub status: ServiceStatus,
     pub logs: LogBuffer,
 }
@@ -184,6 +185,7 @@ mod tests {
         DashboardApp::new(vec![ServiceState {
             name: "test".into(),
             port: Some(3000),
+            hosts: Vec::new(),
             status: ServiceStatus::Ready,
             logs,
         }])

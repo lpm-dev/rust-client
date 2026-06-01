@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/hosts.rs
+expression: envelope
+---
+{
+  "success": true,
+  "cleaned": true,
+  "removedBlocks": 2,
+  "hostsFile": "[HOSTS_FILE]",
+  "backupPath": "[BACKUP_PATH]"
+}

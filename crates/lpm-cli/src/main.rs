@@ -2,6 +2,7 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use miette::{IntoDiagnostic, Result};
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 
 mod added_sources_state;
 mod auth;
@@ -2269,13 +2270,60 @@ enum Commands {
         no_open: bool,
     },
 
-    /// Manage dev service ports (list, kill, reset).
+    /// Manage dev service ports and inspect listening processes.
     Ports {
-        /// Action: list (default), kill, reset.
+        /// Action: list (default), all, inspect, kill, reset, or a port number to inspect.
         #[arg(default_value = "list")]
         action: String,
-        /// Port number (for kill).
-        port: Option<u16>,
+        /// Port, range, or other action target.
+        target: Option<String>,
+        /// Show all listening TCP ports, not just the current project.
+        #[arg(long)]
+        all: bool,
+        /// Confirm destructive range kills without prompting.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Kill this PID explicitly. Bare numeric kill targets are ports.
+        #[arg(long)]
+        pid: Option<u32>,
+    },
+
+    /// Manage LPM hosts-file entries.
+    Hosts {
+        /// Action: clean.
+        #[arg(default_value = "clean")]
+        action: String,
+        /// Confirm hosts-file cleanup without prompting.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Manage the local-domain proxy daemon.
+    Proxy {
+        /// Action: status, list, start, stop, install, uninstall.
+        #[arg(default_value = "status")]
+        action: String,
+        /// Start the daemon in the background. Only valid with `start`.
+        #[arg(long)]
+        detach: bool,
+        /// Install/remove the Unix low-port forwarder for 80/443 alongside the user service.
+        #[arg(long = "privileged-ports")]
+        privileged_ports: bool,
+        /// Replace an existing privileged low-port forwarder owned by another UID.
+        #[arg(long = "replace")]
+        replace: bool,
+        /// Also bind a plain HTTP listener on 127.0.0.1:<PORT>. Valid with `start` and `install`.
+        #[arg(long = "http-port")]
+        http_port: Option<u16>,
+        /// Also bind a plain HTTP redirect listener on 127.0.0.1:<PORT>. Valid with `start` and `install`; requires `--tls-port`.
+        #[arg(long = "http-redirect-port")]
+        http_redirect_port: Option<u16>,
+        /// Also bind a HTTPS listener on 127.0.0.1:<PORT>. Valid with `start` and `install`.
+        #[arg(long = "tls-port")]
+        tls_port: Option<u16>,
+        /// Root-forwarder runtime config path. Internal service entrypoint.
+        #[arg(long = "forwarder-config", hide = true)]
+        forwarder_config: Option<PathBuf>,
     },
 
     /// Expose a local port to the internet via LPM tunnel.
@@ -2405,6 +2453,19 @@ enum Commands {
     /// Spawned as a detached child process by the parent — never user-facing.
     #[command(name = "internal-update-check", hide = true)]
     InternalUpdateCheck,
+
+    /// Hidden sudo helper for hosts-file mutation.
+    #[command(name = "internal-hosts-file", hide = true)]
+    InternalHostsFile {
+        /// Action: upsert, remove, or clean.
+        action: String,
+        /// Managed block id for upsert/remove.
+        #[arg(long = "block-id")]
+        block_id: Option<String>,
+        /// Hostname to place in the managed block. Repeat for multiple hosts.
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+    },
 
     /// Generate a shell completion script.
     ///
@@ -5003,10 +5064,47 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Ports { action, port } => {
+        Commands::Ports {
+            action,
+            target,
+            all,
+            yes,
+            pid,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::ports::run(&action, port, &cwd, cli.json).await
+            commands::ports::run(&action, target.as_deref(), &cwd, cli.json, all, yes, pid).await
         }
+        Commands::Hosts { action, yes } => commands::hosts::run(&action, cli.json, yes),
+        Commands::Proxy {
+            action,
+            detach,
+            privileged_ports,
+            replace,
+            http_port,
+            http_redirect_port,
+            tls_port,
+            forwarder_config,
+        } => {
+            let project_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::proxy::run(commands::proxy::ProxyRunOptions {
+                action: &action,
+                project_dir: &project_dir,
+                json_output: cli.json,
+                detach,
+                privileged_ports,
+                replace,
+                http_port,
+                http_redirect_port,
+                tls_port,
+                forwarder_config: forwarder_config.as_deref(),
+            })
+            .await
+        }
+        Commands::InternalHostsFile {
+            action,
+            block_id,
+            hosts,
+        } => commands::hosts::run_internal_hosts_file(&action, block_id.as_deref(), &hosts),
         Commands::Tunnel {
             action,
             domain,

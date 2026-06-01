@@ -21,7 +21,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 143;
+pub const EXPECTED_SURFACE_COUNT: usize = 145;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -82,6 +82,8 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Cert",
     "Graph",
     "Ports",
+    "Hosts",
+    "Proxy",
     "Tunnel",
     "Migrate",
     "Vault",
@@ -1405,13 +1407,17 @@ pub const SURFACES: &[SurfaceBaseline] = &[
     },
     SurfaceBaseline {
         id: 117,
-        name: "`lpm ports list / kill / reset`",
-        unit: false,
+        name: "`lpm ports list / all / inspect / kill / reset`",
+        unit: true,
         integration: false,
         workflow: true,
         cli_binary: false,
         json_contract: true,
-        references: &["tests/workflows/tests/ports.rs"],
+        references: &[
+            "crates/lpm-cli/src/commands/ports.rs",
+            "crates/lpm-runner/src/ports.rs",
+            "tests/workflows/tests/ports.rs",
+        ],
     },
     SurfaceBaseline {
         id: 118,
@@ -1727,6 +1733,35 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/sbom.rs",
             "tests/workflows/tests/sbom.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 144,
+        name: "`lpm proxy status / list / start / stop`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: true,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/proxy.rs",
+            "crates/lpm-cli/tests/proxy_status_contract.rs",
+            "crates/lpm-proxy/src/lib.rs",
+            "tests/workflows/tests/local_domains.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 145,
+        name: "`lpm hosts clean`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/hosts.rs",
+            "crates/lpm-runner/src/local_domains.rs",
+            "tests/workflows/tests/hosts.rs",
         ],
     },
 ];

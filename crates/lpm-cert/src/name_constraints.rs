@@ -36,6 +36,17 @@ pub struct AcceptedDnsEntry {
     pub suffix_subtree: String,
 }
 
+/// Convert accepted config entries into the DNS subtree strings rcgen expects
+/// for a NameConstraints extension.
+pub fn dns_subtrees_from_entries(entries: &[AcceptedDnsEntry]) -> Vec<String> {
+    let mut subtrees = Vec::with_capacity(entries.len() * 2);
+    for entry in entries {
+        push_unique(&mut subtrees, entry.exact_subtree.clone());
+        push_unique(&mut subtrees, entry.suffix_subtree.clone());
+    }
+    subtrees
+}
+
 /// Validate a list of `cert.extra_permitted_dns` entries.
 ///
 /// On success, returns one `AcceptedDnsEntry` per input entry, deduplicated and in input
@@ -146,6 +157,12 @@ fn is_already_covered_by_builtins(host: &str) -> bool {
     BUILTIN_DNS_SUFFIXES.contains(&host)
 }
 
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +255,18 @@ mod tests {
         .unwrap();
         assert_eq!(accepted.len(), 1);
         assert_eq!(accepted[0].host, "myapp.local");
+    }
+
+    #[test]
+    fn dns_subtrees_from_entries_emits_exact_and_suffix_without_duplicates() {
+        let accepted =
+            validate_extra_permitted_dns(&["myapp.local".into(), "MyApp.local".into()], false)
+                .unwrap();
+
+        assert_eq!(
+            dns_subtrees_from_entries(&accepted),
+            vec!["myapp.local".to_string(), ".myapp.local".to_string()]
+        );
     }
 
     #[test]

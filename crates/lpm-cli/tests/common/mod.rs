@@ -76,6 +76,33 @@ pub fn run_lpm_with_env(
     extra_env: &[(&str, &str)],
     args: &[&str],
 ) -> (ExitStatus, String, String) {
+    let mut command = lpm_command_with_env(cwd, lpm_home, registry_url, extra_env, args);
+    let output = command.output().expect("failed to spawn lpm-rs");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (output.status, stdout, stderr)
+}
+
+/// Build a real `lpm-rs` command with the standard isolated env. Use this
+/// for tests that need to keep the subprocess alive across assertions.
+pub fn lpm_command(
+    cwd: &Path,
+    lpm_home: &Path,
+    registry_url: Option<&str>,
+    args: &[&str],
+) -> Command {
+    lpm_command_with_env(cwd, lpm_home, registry_url, &[], args)
+}
+
+/// Same as [`lpm_command`] but accepts additional env-var pairs to set after
+/// the standard isolation env is applied.
+pub fn lpm_command_with_env(
+    cwd: &Path,
+    lpm_home: &Path,
+    registry_url: Option<&str>,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> Command {
     let exe = env!("CARGO_BIN_EXE_lpm-rs");
     let mut path_entries = vec![lpm_home.join("bin")];
     path_entries.extend(std::env::split_paths(
@@ -110,10 +137,7 @@ pub fn run_lpm_with_env(
         command.env(key, value);
     }
 
-    let output = command.output().expect("failed to spawn lpm-rs");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    (output.status, stdout, stderr)
+    command
 }
 
 /// Best-effort ANSI escape stripping for stdout/stderr assertions.

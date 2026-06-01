@@ -53,6 +53,19 @@ pub struct PortReassignment {
     pub reason: String,
 }
 
+pub type ServicePortMap = HashMap<String, u16>;
+pub type PortsAssignedCallback = Box<dyn Fn(&ServicePortMap) -> Result<(), LpmError> + Send>;
+
+type PortReassignments = HashMap<String, PortReassignment>;
+
+const HOST_ONLY_DEFAULT_PORT_START: u16 = 3000;
+
+#[derive(Debug, Default)]
+struct AssignedServicePorts {
+    port_map: ServicePortMap,
+    reassignments: PortReassignments,
+}
+
 /// Command sent from the dashboard (or external controller) to the orchestrator.
 #[derive(Debug)]
 pub enum OrchestratorCommand {
@@ -83,6 +96,8 @@ pub struct OrchestratorOptions {
     /// Called once after ALL initial services pass readiness checks.
     /// Used by dev.rs to open the browser at the right time.
     pub on_all_ready: Option<Box<dyn FnOnce() + Send>>,
+    /// Called once after declared ports are checked and final service ports are assigned.
+    pub on_ports_assigned: Option<PortsAssignedCallback>,
 }
 
 /// Maximum number of restart attempts before marking a service as permanently failed.
@@ -281,6 +296,96 @@ fn wait_for_service_readiness(
     }
 }
 
+fn service_ready_port(config: &ServiceConfig, assigned_port: Option<u16>) -> Option<u16> {
+    config.ready_port.or(assigned_port).or(config.port)
+}
+
+fn port_conflict_reason(port: u16, reserved_ports: &HashMap<u16, String>) -> Option<String> {
+    if let Some(service_name) = reserved_ports.get(&port) {
+        return Some(format!("service '{service_name}'"));
+    }
+
+    match ports::check_port(port) {
+        ports::PortStatus::Free => None,
+        ports::PortStatus::InUse { pid, process_name } => match (&pid, &process_name) {
+            (Some(p), Some(n)) => Some(format!("{n} (PID {p})")),
+            (Some(p), None) => Some(format!("PID {p}")),
+            _ => Some("unknown process".to_string()),
+        },
+    }
+}
+
+fn find_available_service_port(start: u16, reserved_ports: &HashMap<u16, String>) -> Option<u16> {
+    let mut candidate = start;
+    loop {
+        if port_conflict_reason(candidate, reserved_ports).is_none() {
+            return Some(candidate);
+        }
+        if candidate == u16::MAX {
+            return None;
+        }
+        candidate += 1;
+    }
+}
+
+fn assign_service_ports(
+    project_dir: &Path,
+    active_services: &HashMap<String, ServiceConfig>,
+) -> Result<AssignedServicePorts, LpmError> {
+    let port_overrides = ports::read_port_overrides(project_dir);
+    let mut port_map: ServicePortMap = HashMap::with_capacity(active_services.len());
+    let mut reassignments: PortReassignments = HashMap::new();
+    let mut reserved_ports: HashMap<u16, String> = HashMap::with_capacity(active_services.len());
+
+    let mut service_names: Vec<&String> = active_services.keys().collect();
+    service_names.sort_unstable();
+    for name in service_names {
+        let config = &active_services[name];
+        let requested_port = port_overrides.get(name).copied().or(config.port);
+        let Some(port) =
+            requested_port.or_else(|| config.host.as_ref().map(|_| HOST_ONLY_DEFAULT_PORT_START))
+        else {
+            continue;
+        };
+
+        if let Some(reason) = port_conflict_reason(port, &reserved_ports) {
+            let next = port
+                .checked_add(1)
+                .and_then(|start| find_available_service_port(start, &reserved_ports))
+                .ok_or_else(|| {
+                    LpmError::Script(format!(
+                        "no available port found near {port} for service '{name}'"
+                    ))
+                })?;
+
+            if requested_port.is_some() {
+                reassignments.insert(
+                    name.clone(),
+                    PortReassignment {
+                        original: port,
+                        new: next,
+                        reason,
+                    },
+                );
+            }
+            port_map.insert(name.clone(), next);
+            reserved_ports.insert(next, name.clone());
+            ports::write_port_override(project_dir, name, next);
+        } else {
+            port_map.insert(name.clone(), port);
+            reserved_ports.insert(port, name.clone());
+            if requested_port.is_none() {
+                ports::write_port_override(project_dir, name, port);
+            }
+        }
+    }
+
+    Ok(AssignedServicePorts {
+        port_map,
+        reassignments,
+    })
+}
+
 /// Run multiple services with dependency ordering.
 ///
 /// This function blocks until all services exit or Ctrl+C is pressed.
@@ -348,49 +453,13 @@ pub fn run_services(
     // Topological sort
     let groups = service_graph::topological_sort(&active_services).map_err(LpmError::Script)?;
 
-    // Read persisted port overrides from previous sessions
-    let port_overrides = ports::read_port_overrides(project_dir);
+    let AssignedServicePorts {
+        port_map,
+        reassignments: port_reassignments,
+    } = assign_service_ports(project_dir, &active_services)?;
 
-    // Check ports for conflicts (use persisted overrides if available)
-    let mut port_map: HashMap<String, u16> = HashMap::new();
-    let mut port_reassignments: HashMap<String, PortReassignment> = HashMap::new();
-
-    for (name, config) in &active_services {
-        // Use persisted override if available, otherwise use config port
-        let base_port = port_overrides.get(name).copied().or(config.port);
-
-        if let Some(port) = base_port {
-            match ports::check_port(port) {
-                ports::PortStatus::Free => {
-                    port_map.insert(name.clone(), port);
-                }
-                ports::PortStatus::InUse { pid, process_name } => {
-                    let reason = match (&pid, &process_name) {
-                        (Some(p), Some(n)) => format!("{n} (PID {p})"),
-                        (Some(p), None) => format!("PID {p}"),
-                        _ => "unknown process".to_string(),
-                    };
-
-                    if let Some(next) = ports::find_available_port(port + 1) {
-                        port_reassignments.insert(
-                            name.clone(),
-                            PortReassignment {
-                                original: port,
-                                new: next,
-                                reason: reason.clone(),
-                            },
-                        );
-                        port_map.insert(name.clone(), next);
-                        // Persist the override for next session
-                        ports::write_port_override(project_dir, name, next);
-                    } else {
-                        return Err(LpmError::Script(format!(
-                            "no available port found near {port} for service '{name}'"
-                        )));
-                    }
-                }
-            }
-        }
+    if let Some(ref callback) = options.on_ports_assigned {
+        callback(&port_map)?;
     }
 
     // Build cross-service env
@@ -563,7 +632,7 @@ pub fn run_services(
             );
 
             // Wait for readiness (in a background thread)
-            let ready_port = config.effective_ready_port();
+            let ready_port = service_ready_port(config, port_map.get(name).copied());
             let ready_url = config.ready_url.clone();
             let timeout = config.ready_timeout;
 
@@ -924,7 +993,7 @@ pub fn run_services(
 
                         let ready_result = wait_for_service_readiness(
                             config.ready_url.clone(),
-                            config.effective_ready_port(),
+                            service_ready_port(config, port_map.get(&name).copied()),
                             config.ready_timeout,
                         );
 
@@ -1397,6 +1466,129 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let result = run_services(dir.path(), &services, options);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn service_ready_port_uses_final_assigned_port_before_config_port() {
+        let config = ServiceConfig {
+            command: "true".to_string(),
+            port: Some(3000),
+            ..Default::default()
+        };
+
+        assert_eq!(service_ready_port(&config, Some(3001)), Some(3001));
+    }
+
+    #[test]
+    fn service_ready_port_keeps_explicit_ready_port_over_assigned_port() {
+        let config = ServiceConfig {
+            command: "true".to_string(),
+            port: Some(3000),
+            ready_port: Some(8080),
+            ..Default::default()
+        };
+
+        assert_eq!(service_ready_port(&config, Some(3001)), Some(8080));
+    }
+
+    #[test]
+    fn port_conflict_reason_reports_same_run_service_reservation() {
+        let mut reserved_ports = HashMap::new();
+        reserved_ports.insert(3000, "api".to_string());
+
+        assert_eq!(
+            port_conflict_reason(3000, &reserved_ports),
+            Some("service 'api'".to_string())
+        );
+    }
+
+    #[test]
+    fn assign_service_ports_keeps_available_declared_port() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut services = HashMap::new();
+        services.insert(
+            "web".to_string(),
+            ServiceConfig {
+                command: "true".to_string(),
+                port: Some(port),
+                ..Default::default()
+            },
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let assigned_ports = assign_service_ports(dir.path(), &services).unwrap();
+
+        assert_eq!(assigned_ports.port_map.get("web"), Some(&port));
+        assert!(assigned_ports.reassignments.is_empty());
+    }
+
+    #[test]
+    fn assign_service_ports_reassigns_conflicting_declared_port() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let mut services = HashMap::new();
+        services.insert(
+            "web".to_string(),
+            ServiceConfig {
+                command: "true".to_string(),
+                port: Some(port),
+                ..Default::default()
+            },
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let assigned_ports = assign_service_ports(dir.path(), &services).unwrap();
+
+        let assigned = assigned_ports.port_map["web"];
+        assert_ne!(assigned, port);
+        assert_eq!(assigned_ports.reassignments["web"].original, port);
+        assert_eq!(assigned_ports.reassignments["web"].new, assigned);
+    }
+
+    #[test]
+    fn run_services_calls_on_ports_assigned_before_spawning_services() {
+        let mut services = HashMap::new();
+        services.insert("worker".to_string(), simple_service("true"));
+
+        let observed_ports = Arc::new(Mutex::new(None));
+        let captured_ports = Arc::clone(&observed_ports);
+        let options = OrchestratorOptions {
+            on_ports_assigned: Some(Box::new(move |ports| {
+                *captured_ports.lock() = Some(ports.clone());
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let _ = run_services(dir.path(), &services, options);
+
+        assert_eq!(*observed_ports.lock(), Some(HashMap::new()));
+    }
+
+    #[test]
+    fn run_services_stops_before_spawning_when_ports_assigned_callback_fails() {
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let marker_path = marker.path().to_path_buf();
+        let mut services = HashMap::new();
+        services.insert(
+            "worker".to_string(),
+            simple_service(&format!("touch {}", marker_path.display())),
+        );
+        let options = OrchestratorOptions {
+            on_ports_assigned: Some(Box::new(|_| Err(LpmError::Script("proxy failed".into())))),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let err = run_services(dir.path(), &services, options).unwrap_err();
+
+        assert!(err.to_string().contains("proxy failed"), "got {err}");
+        assert_eq!(std::fs::read_to_string(marker.path()).unwrap(), "");
     }
 
     #[test]

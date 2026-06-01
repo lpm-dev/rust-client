@@ -21,6 +21,7 @@ members = [
     "crates/lpm-vault",
     "crates/lpm-cert",
     "crates/lpm-network",
+    "crates/lpm-proxy",
     "crates/lpm-tunnel",
     "crates/lpm-dashboard",
     "crates/lpm-inspect",
@@ -64,6 +65,7 @@ lpm-plugin = { path = "crates/lpm-plugin" }
 lpm-vault = { path = "crates/lpm-vault" }
 lpm-cert = { path = "crates/lpm-cert" }
 lpm-network = { path = "crates/lpm-network" }
+lpm-proxy = { path = "crates/lpm-proxy" }
 lpm-tunnel = { path = "crates/lpm-tunnel" }
 lpm-dashboard = { path = "crates/lpm-dashboard" }
 lpm-inspect = { path = "crates/lpm-inspect" }
