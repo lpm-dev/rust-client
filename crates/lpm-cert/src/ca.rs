@@ -86,6 +86,34 @@ pub fn cert_has_name_constraints(path: &Path) -> Result<bool, LpmError> {
         .is_some())
 }
 
+/// True iff the PEM-encoded root CA at `path` is allowed to sign a project
+/// intermediate CA.
+pub fn cert_allows_project_intermediates(path: &Path) -> Result<bool, LpmError> {
+    let pem_str = std::fs::read_to_string(path).map_err(|e| {
+        LpmError::Cert(format!("failed to read CA cert at {}: {e}", path.display()))
+    })?;
+    let pem = pem::parse(&pem_str)
+        .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
+        .map_err(|e| LpmError::Cert(format!("invalid X.509 at {}: {e}", path.display())))?;
+
+    let Some(basic_constraints) = cert
+        .basic_constraints()
+        .map_err(|e| LpmError::Cert(format!("failed to parse basic constraints: {e}")))?
+    else {
+        return Ok(false);
+    };
+
+    if !basic_constraints.value.ca {
+        return Ok(false);
+    }
+
+    Ok(basic_constraints
+        .value
+        .path_len_constraint
+        .is_none_or(|path_len| path_len >= 1))
+}
+
 /// Options for `generate_ca_with_options`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CaOptions {
@@ -119,8 +147,7 @@ pub fn generate_ca_with_options(
     dn.push(DnType::OrganizationName, "LPM");
     params.distinguished_name = dn;
 
-    // `Constrained(0)` forbids this CA from signing intermediates that themselves issue.
-    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
     if opts.name_constraints {
@@ -175,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn ca_cert_has_path_length_constraint_zero() {
+    fn ca_cert_allows_exactly_one_intermediate_ca() {
         let (cert_pem, _) = generate_ca_with_options(CaOptions::default()).unwrap();
 
         let pem = pem::parse(&cert_pem).unwrap();
@@ -185,9 +212,38 @@ mod tests {
         assert!(bc.value.ca, "certificate should be a CA");
         assert_eq!(
             bc.value.path_len_constraint,
-            Some(0),
-            "CA pathLenConstraint should be 0 (only sign leaf certs, no intermediates)"
+            Some(1),
+            "CA pathLenConstraint should allow one project-scoped intermediate"
         );
+    }
+
+    #[test]
+    fn cert_allows_project_intermediates_rejects_path_length_zero_roots() {
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "Legacy LPM Local Development CA");
+        dn.push(DnType::OrganizationName, "LPM");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rootCA.pem");
+        std::fs::write(&path, cert.pem()).unwrap();
+
+        assert!(!cert_allows_project_intermediates(&path).unwrap());
+    }
+
+    #[test]
+    fn cert_allows_project_intermediates_accepts_new_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rootCA.pem");
+        let (cert_pem, _) = generate_ca_with_options(CaOptions::default()).unwrap();
+        std::fs::write(&path, cert_pem).unwrap();
+
+        assert!(cert_allows_project_intermediates(&path).unwrap());
     }
 
     #[test]

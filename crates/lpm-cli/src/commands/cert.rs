@@ -277,9 +277,20 @@ fn run_generate(
     extra_hosts: &[String],
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let setup = lpm_cert::ensure_https_with_consent(
+    let extra_permitted_dns = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .map_err(LpmError::Script)?
+        .map(|config| {
+            lpm_runner::lpm_json::validated_cert_extra_permitted_dns(&config)
+                .map(|entries| lpm_cert::name_constraints::dns_subtrees_from_entries(&entries))
+        })
+        .transpose()
+        .map_err(LpmError::Script)?
+        .unwrap_or_default();
+
+    let setup = lpm_cert::ensure_https_with_consent_and_permitted_dns(
         project_dir,
         extra_hosts,
+        &extra_permitted_dns,
         lpm_cert::TrustStoreConsent::Decline,
     )?;
 

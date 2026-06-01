@@ -350,6 +350,17 @@ pub fn ensure_https_with_consent(
     extra_hostnames: &[String],
     consent: TrustStoreConsent<'_>,
 ) -> Result<HttpsSetup, LpmError> {
+    ensure_https_with_consent_and_permitted_dns(project_dir, extra_hostnames, &[], consent)
+}
+
+/// Full-control variant of `ensure_https` that also permits validated
+/// project DNS subtrees on the constrained intermediate.
+pub fn ensure_https_with_consent_and_permitted_dns(
+    project_dir: &Path,
+    extra_hostnames: &[String],
+    extra_permitted_dns_subtrees: &[String],
+    consent: TrustStoreConsent<'_>,
+) -> Result<HttpsSetup, LpmError> {
     let ca_dir = paths::ca_dir()?;
     let project_cert_dir = paths::project_cert_dir(project_dir)?;
 
@@ -463,18 +474,43 @@ pub fn ensure_https_with_consent(
     let active_ca_cert = paths::ca_cert_path()?;
     let proj_cert_path = project_cert_dir.join("cert.pem");
     let proj_key_path = project_cert_dir.join("key.pem");
+    let needs_project_intermediate =
+        !extra_hostnames.is_empty() || !extra_permitted_dns_subtrees.is_empty();
 
     let needs_reissue_chain_mismatch = proj_cert_path.exists()
-        && !cert::leaf_signed_by(&proj_cert_path, &active_ca_cert).unwrap_or(false);
+        && !cert::project_cert_chains_to_root(&proj_cert_path, &active_ca_cert).unwrap_or(false);
+    let needs_reissue_for_project_intermediate = needs_project_intermediate
+        && proj_cert_path.exists()
+        && !cert::project_cert_has_intermediate(&proj_cert_path).unwrap_or(false);
+    let needs_reissue_for_project_constraints = needs_project_intermediate
+        && proj_cert_path.exists()
+        && !cert::project_cert_constraints_cover_dns(
+            &proj_cert_path,
+            extra_hostnames,
+            extra_permitted_dns_subtrees,
+        )
+        .unwrap_or(false);
 
     let cert_freshly_generated = if !proj_cert_path.exists()
         || needs_reissue_chain_mismatch
+        || needs_reissue_for_project_intermediate
+        || needs_reissue_for_project_constraints
         || cert::needs_renewal(&proj_cert_path)?
         || !cert::covers_requested_hostnames(&proj_cert_path, extra_hostnames)?
     {
         if needs_reissue_chain_mismatch {
             tracing::info!(
                 "project leaf at {} no longer chains to the active CA; re-issuing",
+                proj_cert_path.display()
+            );
+        } else if needs_reissue_for_project_intermediate {
+            tracing::info!(
+                "project leaf at {} needs a constrained project intermediate for custom hostnames; re-issuing",
+                proj_cert_path.display()
+            );
+        } else if needs_reissue_for_project_constraints {
+            tracing::info!(
+                "project leaf at {} needs updated project DNS constraints; re-issuing",
                 proj_cert_path.display()
             );
         } else {
@@ -488,9 +524,24 @@ pub fn ensure_https_with_consent(
         let ca_key_pem = std::fs::read_to_string(paths::ca_key_path()?)
             .map_err(|e| LpmError::Cert(format!("failed to read CA key: {e}")))?;
 
-        let (cert_pem, key_pem) =
+        let (cert_pem, key_pem) = if needs_project_intermediate {
+            if !ca::cert_allows_project_intermediates(&active_ca_cert)? {
+                return Err(LpmError::Cert(
+                    "active LPM root CA cannot sign project-scoped constrained intermediates \
+                     because its pathLenConstraint is 0. Run `lpm cert rotate`, then retry."
+                        .into(),
+                ));
+            }
+            cert::generate_project_cert_with_constrained_intermediate(
+                &ca_cert_pem,
+                &ca_key_pem,
+                extra_hostnames,
+                extra_permitted_dns_subtrees,
+            )
+        } else {
             cert::generate_project_cert(&ca_cert_pem, &ca_key_pem, extra_hostnames)
-                .map_err(|e| LpmError::Cert(format!("failed to generate project cert: {e}")))?;
+        }
+        .map_err(|e| LpmError::Cert(format!("failed to generate project cert: {e}")))?;
 
         std::fs::write(&proj_cert_path, &cert_pem)
             .map_err(|e| LpmError::Cert(format!("failed to write project cert: {e}")))?;

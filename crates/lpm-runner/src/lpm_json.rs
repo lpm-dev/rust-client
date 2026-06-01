@@ -44,6 +44,10 @@ pub struct LpmJsonConfig {
     #[serde(default)]
     pub services: HashMap<String, ServiceConfig>,
 
+    /// Dev reverse-proxy configuration for friendly local hostnames.
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
+
     /// Enable local HTTPS for `lpm dev`.
     /// When `true`, `lpm dev` auto-generates and trusts a local certificate.
     /// Overridden by `--no-https` CLI flag.
@@ -73,11 +77,8 @@ pub struct LpmJsonConfig {
 
     /// Local-HTTPS certificate configuration.
     ///
-    /// Currently only `extra_permitted_dns` is honored — and only validated at
-    /// parse time. The validated entries do not yet flow into any CA-generation
-    /// code path; the consumer (project-scoped CA) ships in a follow-up. The
-    /// validator runs now to prevent future code from quietly broadening attack
-    /// surface by treating arbitrary strings from `lpm.json` as trustworthy.
+    /// `extra_permitted_dns` entries are validated at parse time and can be
+    /// consumed by project-scoped certificate-chain generation.
     #[serde(default)]
     pub cert: Option<CertBlock>,
 }
@@ -132,9 +133,9 @@ pub struct RemoteCacheEnvConfig {
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CertBlock {
-    /// Additional DNS subtrees the (future) project-scoped CA should be permitted
-    /// to issue for. Each entry must be a bare multi-label hostname. Wildcards,
-    /// leading dots, and non-local TLDs are rejected at parse time.
+    /// Additional DNS subtrees the project-scoped intermediate may permit.
+    /// Each entry must be a bare multi-label hostname. Wildcards, leading dots,
+    /// and non-local TLDs are rejected at parse time.
     #[serde(default, rename = "extraPermittedDns")]
     pub extra_permitted_dns: Vec<String>,
 
@@ -152,6 +153,23 @@ pub struct TunnelConfig {
     /// Pro/Org only — free users get ephemeral random domains.
     #[serde(default)]
     pub domain: Option<String>,
+}
+
+/// Dev reverse-proxy configuration in `lpm.json`.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyConfig {
+    /// Top-level host routed by the local dev proxy.
+    #[serde(default)]
+    pub host: Option<String>,
+
+    /// Listen port for the HTTPS proxy. Defaults to 443.
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// Also listen on :80 and redirect to HTTPS. Defaults to true.
+    #[serde(default, rename = "httpRedirect")]
+    pub http_redirect: Option<bool>,
 }
 
 /// Publish configuration in `lpm.json`.
@@ -256,7 +274,7 @@ pub struct ServiceConfig {
     /// Shell command to run.
     pub command: String,
 
-    /// Port this service listens on (used for env injection, display, and readiness).
+    /// Port this service listens on; omitted host-only services get a stable auto-assigned port.
     #[serde(default)]
     pub port: Option<u16>,
 
@@ -287,6 +305,10 @@ pub struct ServiceConfig {
     /// This is the primary service (receives --https/--tunnel/--network).
     #[serde(default)]
     pub primary: bool,
+
+    /// Friendly local hostname routed to this service by the dev proxy.
+    #[serde(default)]
+    pub host: Option<String>,
 
     /// Working directory relative to project root.
     #[serde(default)]
@@ -409,8 +431,8 @@ pub fn generate_schema() -> serde_json::Value {
         serde_json::Value::String(
             "Project-level LPM configuration. Sits alongside package.json and \
              provides runtime pinning, env file mapping, task runner config, \
-             hosted task cache settings, dev services, publish targets, and \
-             tunnel/HTTPS settings."
+             hosted task cache settings, dev services, local-domain proxy \
+             settings, publish targets, and tunnel/HTTPS settings."
                 .to_string(),
         ),
     );
@@ -430,20 +452,102 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("failed to read lpm.json: {e}"))?;
 
-    let config: LpmJsonConfig =
+    let mut config: LpmJsonConfig =
         serde_json::from_str(&content).map_err(|e| format!("failed to parse lpm.json: {e}"))?;
 
-    if let Some(ref cert) = config.cert
-        && !cert.extra_permitted_dns.is_empty()
-    {
-        lpm_cert::name_constraints::validate_extra_permitted_dns(
-            &cert.extra_permitted_dns,
-            cert.allow_public_dns,
-        )
-        .map_err(|e| format!("lpm.json `cert.extraPermittedDns` rejected: {e}"))?;
-    }
+    validated_cert_extra_permitted_dns(&config)?;
+
+    validate_and_normalize_local_domain_hosts(&mut config)?;
 
     Ok(Some(config))
+}
+
+pub fn validated_cert_extra_permitted_dns(
+    config: &LpmJsonConfig,
+) -> Result<Vec<lpm_cert::name_constraints::AcceptedDnsEntry>, String> {
+    let Some(cert) = config.cert.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if cert.extra_permitted_dns.is_empty() {
+        return Ok(Vec::new());
+    }
+    lpm_cert::name_constraints::validate_extra_permitted_dns(
+        &cert.extra_permitted_dns,
+        cert.allow_public_dns,
+    )
+    .map_err(|e| format!("lpm.json `cert.extraPermittedDns` rejected: {e}"))
+}
+
+fn validate_and_normalize_local_domain_hosts(config: &mut LpmJsonConfig) -> Result<(), String> {
+    let allow_public_dns = config
+        .cert
+        .as_ref()
+        .is_some_and(|cert| cert.allow_public_dns);
+    let mut seen: HashMap<String, String> = HashMap::new();
+
+    let mut service_names: Vec<String> = config.services.keys().cloned().collect();
+    service_names.sort();
+    for service_name in service_names {
+        let Some(raw_host) = config
+            .services
+            .get(&service_name)
+            .and_then(|service| service.host.as_deref())
+        else {
+            continue;
+        };
+        let field = format!("services.{service_name}.host");
+        let normalized = validate_local_domain_host_field(&field, raw_host, allow_public_dns)?;
+        let service = config
+            .services
+            .get_mut(&service_name)
+            .expect("service key collected from same map");
+        service.host = Some(normalized.clone());
+        insert_unique_local_domain_host(&mut seen, &normalized, &field)?;
+    }
+
+    if let Some(proxy) = config.proxy.as_mut()
+        && let Some(raw_host) = proxy.host.as_deref()
+    {
+        let field = "proxy.host";
+        let normalized = validate_local_domain_host_field(field, raw_host, allow_public_dns)?;
+        proxy.host = Some(normalized.clone());
+        insert_unique_local_domain_host(&mut seen, &normalized, field)?;
+    }
+
+    Ok(())
+}
+
+fn validate_local_domain_host_field(
+    field: &str,
+    host: &str,
+    allow_public_dns: bool,
+) -> Result<String, String> {
+    let entries = [host.to_string()];
+    let accepted =
+        lpm_cert::name_constraints::validate_extra_permitted_dns(&entries, allow_public_dns)
+            .map_err(|e| {
+                e.to_string()
+                    .replace("cert.extra_permitted_dns", field)
+                    .replace("cert.extraPermittedDns", field)
+            })?;
+    let accepted = accepted
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("{field} entry is empty"))?;
+    Ok(accepted.host)
+}
+
+fn insert_unique_local_domain_host(
+    seen: &mut HashMap<String, String>,
+    host: &str,
+    field: &str,
+) -> Result<(), String> {
+    if let Some(existing) = seen.insert(host.to_string(), field.to_string()) {
+        return Err(format!(
+            "lpm.json local domain host {host:?} is declared by both `{existing}` and `{field}`"
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the `.env` file path for a given script name.
@@ -495,11 +599,20 @@ mod tests {
         )
         .unwrap();
         let cfg = read_lpm_json(dir.path()).unwrap().unwrap();
-        let entries = cfg.cert.expect("cert block parsed").extra_permitted_dns;
+        let entries = cfg
+            .cert
+            .as_ref()
+            .expect("cert block parsed")
+            .extra_permitted_dns
+            .clone();
         assert_eq!(
             entries,
             vec!["myapp.local".to_string(), "api.test".to_string()]
         );
+        let accepted = validated_cert_extra_permitted_dns(&cfg).unwrap();
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(accepted[0].exact_subtree, "myapp.local");
+        assert_eq!(accepted[0].suffix_subtree, ".myapp.local");
     }
 
     #[test]
@@ -578,6 +691,7 @@ mod tests {
             tasks: HashMap::new(),
             tools: HashMap::new(),
             services: HashMap::new(),
+            proxy: None,
             remote_cache: None,
             https: None,
             tunnel: None,
@@ -748,6 +862,136 @@ mod tests {
         assert_eq!(db.ready_port, Some(5432));
         assert_eq!(db.ready_timeout, 60);
         assert_eq!(db.effective_ready_port(), Some(5432));
+    }
+
+    #[test]
+    fn read_lpm_json_accepts_and_normalizes_local_domain_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "services": {
+                    "web": {
+                        "command": "next dev",
+                        "port": 3000,
+                        "host": "Web.App.Localhost"
+                    }
+                },
+                "proxy": {
+                    "host": "App.Localhost",
+                    "port": 443,
+                    "httpRedirect": false
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = read_lpm_json(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            config.services["web"].host.as_deref(),
+            Some("web.app.localhost")
+        );
+        let proxy = config.proxy.unwrap();
+        assert_eq!(proxy.host.as_deref(), Some("app.localhost"));
+        assert_eq!(proxy.port, Some(443));
+        assert_eq!(proxy.http_redirect, Some(false));
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_duplicate_service_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "services": {
+                    "api": { "command": "node api.js", "port": 4000, "host": "app.localhost" },
+                    "web": { "command": "next dev", "port": 3000, "host": "APP.localhost" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let err = read_lpm_json(dir.path()).unwrap_err();
+        assert!(err.contains("app.localhost"), "got {err}");
+        assert!(err.contains("services.api.host"), "got {err}");
+        assert!(err.contains("services.web.host"), "got {err}");
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_duplicate_service_and_proxy_host() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "services": {
+                    "web": { "command": "next dev", "port": 3000, "host": "app.localhost" }
+                },
+                "proxy": { "host": "app.localhost" }
+            }"#,
+        )
+        .unwrap();
+
+        let err = read_lpm_json(dir.path()).unwrap_err();
+        assert!(err.contains("services.web.host"), "got {err}");
+        assert!(err.contains("proxy.host"), "got {err}");
+    }
+
+    #[test]
+    fn read_lpm_json_accepts_service_host_without_port_for_auto_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "services": {
+                    "web": { "command": "next dev", "host": "web.app.localhost" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = read_lpm_json(dir.path()).unwrap().unwrap();
+        let web = &config.services["web"];
+        assert_eq!(web.host.as_deref(), Some("web.app.localhost"));
+        assert_eq!(web.port, None);
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_public_local_domain_host_without_allow_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "services": {
+                    "web": { "command": "next dev", "port": 3000, "host": "staging.example.com" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let err = read_lpm_json(dir.path()).unwrap_err();
+        assert!(err.contains("non-local TLD"), "got {err}");
+        assert!(err.contains("services.web.host"), "got {err}");
+    }
+
+    #[test]
+    fn read_lpm_json_permits_public_local_domain_host_with_allow_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "cert": { "allowPublicDns": true },
+                "services": {
+                    "web": { "command": "next dev", "port": 3000, "host": "staging.example.com" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = read_lpm_json(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            config.services["web"].host.as_deref(),
+            Some("staging.example.com")
+        );
     }
 
     #[test]

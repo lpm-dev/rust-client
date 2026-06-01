@@ -205,6 +205,18 @@ impl LpmRoot {
         self.home.join("ports.toml")
     }
 
+    /// Machine-global local proxy daemon state at `~/.lpm/proxy.json`.
+    pub fn proxy_state(&self) -> PathBuf {
+        self.home.join("proxy.json")
+    }
+
+    /// Local proxy control socket at `~/.lpm/proxy.sock` on Unix platforms.
+    /// Windows control uses an owner-restricted named pipe derived by
+    /// `lpm-proxy` from the LPM root.
+    pub fn proxy_socket(&self) -> PathBuf {
+        self.home.join("proxy.sock")
+    }
+
     // ─── Global install tree ────────────────────────────────────────
 
     pub fn global_root(&self) -> PathBuf {

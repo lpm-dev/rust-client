@@ -5,6 +5,9 @@
 //! other tests.
 
 use lpm_cert::{audit, cert, paths, projects, rotate, trust};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
+};
 use std::path::{Path, PathBuf};
 
 /// All tests in this binary share process-wide env (`HOME`, etc.), so they
@@ -43,6 +46,27 @@ fn seed_root_ca() -> (PathBuf, PathBuf) {
     let (cert_pem, key_pem) = lpm_cert::ca::generate_ca().unwrap();
     std::fs::write(&cert_path, &cert_pem).unwrap();
     lpm_cert::write_key_file(&key_path, key_pem.as_bytes()).unwrap();
+    trust::install_ca(&cert_path).unwrap();
+    (cert_path, key_path)
+}
+
+fn seed_legacy_path_len_zero_root_ca() -> (PathBuf, PathBuf) {
+    let cert_path = paths::ca_cert_path().unwrap();
+    let key_path = paths::ca_key_path().unwrap();
+    lpm_cert::create_dir_secure(cert_path.parent().unwrap()).unwrap();
+
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "Legacy LPM Local Development CA");
+    dn.push(DnType::OrganizationName, "LPM");
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    lpm_cert::write_key_file(&key_path, key_pair.serialize_pem().as_bytes()).unwrap();
     trust::install_ca(&cert_path).unwrap();
     (cert_path, key_path)
 }
@@ -263,6 +287,57 @@ fn ensure_https_reissues_leaf_when_chain_breaks() {
     assert!(cert::leaf_signed_by(&leaf_path, &active_cert).unwrap());
 }
 
+#[test]
+fn ensure_https_writes_constrained_intermediate_chain_for_custom_hostnames() {
+    let (_tmp, _g) = setup_home();
+    let (active_cert, _active_key) = seed_root_ca();
+    let project = tempfile::tempdir().unwrap();
+    let extra = vec!["web.app.localhost".to_string()];
+
+    let setup = lpm_cert::ensure_https(project.path(), &extra).unwrap();
+    let cert_path = PathBuf::from(&setup.cert_path);
+
+    assert!(cert::project_cert_has_intermediate(&cert_path).unwrap());
+    assert!(cert::project_cert_chains_to_root(&cert_path, &active_cert).unwrap());
+}
+
+#[test]
+fn ensure_https_writes_extra_permitted_dns_to_project_intermediate() {
+    let (_tmp, _g) = setup_home();
+    seed_root_ca();
+    let project = tempfile::tempdir().unwrap();
+    let extra_permitted_dns = vec!["myapp.local".to_string(), ".myapp.local".to_string()];
+
+    let setup = lpm_cert::ensure_https_with_consent_and_permitted_dns(
+        project.path(),
+        &[],
+        &extra_permitted_dns,
+        lpm_cert::TrustStoreConsent::PreApproved,
+    )
+    .unwrap();
+    let cert_path = PathBuf::from(&setup.cert_path);
+
+    assert!(cert::project_cert_has_intermediate(&cert_path).unwrap());
+    assert!(
+        cert::project_cert_constraints_cover_dns(&cert_path, &[], &extra_permitted_dns).unwrap()
+    );
+}
+
+#[test]
+fn ensure_https_rejects_legacy_root_when_custom_hostnames_need_intermediate() {
+    let (_tmp, _g) = setup_home();
+    seed_legacy_path_len_zero_root_ca();
+    let project = tempfile::tempdir().unwrap();
+    let extra = vec!["web.app.localhost".to_string()];
+
+    let err = lpm_cert::ensure_https(project.path(), &extra).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("pathLenConstraint is 0") && msg.contains("lpm cert rotate"),
+        "expected rotate guidance for legacy root, got {msg}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn ensure_https_refuses_to_sign_with_world_readable_key() {
@@ -353,6 +428,32 @@ fn rotate_preserves_custom_dns_and_ip_sans_through_reissue() {
             .iter()
             .any(|s| matches!(s, cert::SanEntry::Ip(ip) if ip.to_string() == "192.168.1.42")),
         "rotation must preserve custom IP SAN, got {after_sans:?}"
+    );
+}
+
+#[test]
+fn rotate_preserves_project_intermediate_extra_dns_constraints() {
+    let (tmp, _g) = setup_home();
+    let (_active_cert, _active_key) = seed_root_ca();
+    let project = tmp.path().join("proj-extra-constraints");
+    std::fs::create_dir_all(&project).unwrap();
+    let extras = vec!["web.myapp.local".to_string()];
+    let extra_constraints = vec!["myapp.local".to_string(), ".myapp.local".to_string()];
+    let setup = lpm_cert::ensure_https_with_consent_and_permitted_dns(
+        &project,
+        &extras,
+        &extra_constraints,
+        lpm_cert::TrustStoreConsent::PreApproved,
+    )
+    .unwrap();
+    let leaf = PathBuf::from(setup.cert_path);
+
+    rotate::rotate(rotate::RotateOptions::default()).unwrap();
+
+    let constraints = cert::read_project_dns_constraints(&leaf).unwrap();
+    assert!(
+        constraints.contains(&".myapp.local".to_string()),
+        "rotation must preserve configured DNS suffix constraints, got {constraints:?}"
     );
 }
 

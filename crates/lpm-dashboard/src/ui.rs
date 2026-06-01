@@ -112,7 +112,7 @@ fn render_sidebar(frame: &mut Frame, app: &DashboardApp, area: Rect) {
                 ServiceStatus::Stopped => Color::DarkGray,
             };
 
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!(" {icon} "), Style::default().fg(status_color)),
                 Span::styled(format!("{:<10}", svc.name), style),
                 Span::styled(
@@ -120,7 +120,12 @@ fn render_sidebar(frame: &mut Frame, app: &DashboardApp, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(svc.status.label(), Style::default().fg(status_color)),
-            ]);
+            ];
+            if let Some(hosts) = service_hosts_label(&svc.hosts) {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(hosts, Style::default().fg(Color::Cyan)));
+            }
+            let line = Line::from(spans);
 
             ListItem::new(line)
         })
@@ -527,6 +532,23 @@ fn truncate_path(path: &str, max: usize) -> String {
     }
 }
 
+fn service_hosts_label(hosts: &[String]) -> Option<String> {
+    if hosts.is_empty() {
+        return None;
+    }
+
+    let total_host_len: usize = hosts.iter().map(String::len).sum();
+    let mut label = String::with_capacity(total_host_len + hosts.len().saturating_mul(11));
+    for host in hosts {
+        if !label.is_empty() {
+            label.push_str(", ");
+        }
+        label.push_str("https://");
+        label.push_str(host);
+    }
+    Some(label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +604,20 @@ mod tests {
         // Edge case: max is 3 or less, truncate_at would be 0
         let result = truncate_path("/api/test", 3);
         assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn service_hosts_label_prefixes_hosts_with_https() {
+        let hosts = vec!["web.localhost".to_string(), "app.localhost".to_string()];
+
+        assert_eq!(
+            service_hosts_label(&hosts),
+            Some("https://web.localhost, https://app.localhost".to_string())
+        );
+    }
+
+    #[test]
+    fn service_hosts_label_returns_none_for_service_without_hosts() {
+        assert_eq!(service_hosts_label(&[]), None);
     }
 }
