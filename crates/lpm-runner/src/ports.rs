@@ -1383,7 +1383,7 @@ fn windows_process_uptime_from_creation_ticks(creation_ticks: u64) -> Option<Str
     Some(format_elapsed_secs(now.saturating_sub(creation_secs)))
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn filetime_to_unix_secs(filetime: windows_sys::Win32::Foundation::FILETIME) -> Option<u64> {
     windows_ticks_to_unix_secs(filetime_ticks(filetime))
 }
@@ -1852,11 +1852,28 @@ nTCP 127.0.0.1:6379 (LISTEN)
         let port = listener.local_addr().unwrap().port();
 
         let rows = list_listening_ports_windows();
+        let row = rows
+            .iter()
+            .find(|row| row.port == port && row.pid == Some(std::process::id()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Windows IP Helper backend must include the current test listener on port {port}; rows: {rows:?}"
+                )
+            });
 
+        assert_eq!(row.address.as_deref(), Some("127.0.0.1"));
         assert!(
-            rows.iter()
-                .any(|row| row.port == port && row.pid == Some(std::process::id())),
-            "Windows IP Helper backend must include the current test listener on port {port}; rows: {rows:?}"
+            row.process.as_deref().is_some_and(|name| {
+                name.eq_ignore_ascii_case("lpm_runner.exe")
+                    || name.to_ascii_lowercase().starts_with("lpm_runner-")
+            }),
+            "Windows process metadata should include current-user process name for port {port}; row: {row:?}"
+        );
+        assert!(
+            row.command
+                .as_deref()
+                .is_some_and(|command| command.to_ascii_lowercase().contains("lpm_runner")),
+            "Windows process metadata should include current-user command path for port {port}; row: {row:?}"
         );
     }
 

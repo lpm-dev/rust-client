@@ -5,6 +5,8 @@
 
 mod common;
 
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Stdio;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -22,6 +24,44 @@ fn isolated_dirs() -> (TempDir, TempDir) {
     let project = TempDir::new().expect("create temp project");
     let lpm_home = TempDir::new().expect("create temp LPM_HOME");
     (project, lpm_home)
+}
+
+struct ProxyDaemonCleanup {
+    project: PathBuf,
+    lpm_home: PathBuf,
+    armed: bool,
+}
+
+impl ProxyDaemonCleanup {
+    fn new(project: PathBuf, lpm_home: PathBuf) -> Self {
+        Self {
+            project,
+            lpm_home,
+            armed: true,
+        }
+    }
+
+    fn stop(mut self) -> (std::process::ExitStatus, String, String) {
+        self.armed = false;
+        self.stop_inner()
+    }
+
+    fn stop_inner(&self) -> (std::process::ExitStatus, String, String) {
+        common::run_lpm(
+            &self.project,
+            &self.lpm_home,
+            None,
+            &["--json", "proxy", "stop"],
+        )
+    }
+}
+
+impl Drop for ProxyDaemonCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.stop_inner();
+        }
+    }
 }
 
 #[test]
@@ -105,6 +145,8 @@ fn proxy_stop_json_reports_not_stopped_when_daemon_is_absent() {
 fn proxy_start_detach_starts_background_control_daemon() {
     let _guard = proxy_daemon_test_guard();
     let (project, lpm_home) = isolated_dirs();
+    let cleanup =
+        ProxyDaemonCleanup::new(project.path().to_path_buf(), lpm_home.path().to_path_buf());
 
     let (status, stdout, stderr) = common::run_lpm(
         project.path(),
@@ -127,12 +169,7 @@ fn proxy_start_detach_starts_background_control_daemon() {
         "detached proxy should report a bound HTTP listener, got {status}"
     );
 
-    let (status, stdout, stderr) = common::run_lpm(
-        project.path(),
-        lpm_home.path(),
-        None,
-        &["--json", "proxy", "stop"],
-    );
+    let (status, stdout, stderr) = cleanup.stop();
     assert!(status.success(), "stderr={stderr}");
     assert_eq!(stderr, "");
     let json = common::parse_json_stdout(&stdout);
@@ -143,6 +180,8 @@ fn proxy_start_detach_starts_background_control_daemon() {
 fn proxy_start_detach_json_reports_running_daemon_with_clean_stderr() {
     let _guard = proxy_daemon_test_guard();
     let (project, lpm_home) = isolated_dirs();
+    let cleanup =
+        ProxyDaemonCleanup::new(project.path().to_path_buf(), lpm_home.path().to_path_buf());
 
     let (status, stdout, stderr) = common::run_lpm(
         project.path(),
@@ -162,12 +201,7 @@ fn proxy_start_detach_json_reports_running_daemon_with_clean_stderr() {
         "detached proxy should report a bound HTTP listener, got {json}"
     );
 
-    let (status, stdout, stderr) = common::run_lpm(
-        project.path(),
-        lpm_home.path(),
-        None,
-        &["--json", "proxy", "stop"],
-    );
+    let (status, stdout, stderr) = cleanup.stop();
     assert!(status.success(), "stderr={stderr}");
     assert_eq!(stderr, "");
     assert_eq!(common::parse_json_stdout(&stdout)["stopped"], true);

@@ -313,6 +313,11 @@ async fn ensure_detached_started_with_options(
         .stderr(Stdio::null());
     detach_background_command(&mut command);
     append_listener_args(&mut command, options);
+    prepare_detached_spawn_handles().map_err(|err| {
+        LpmError::Script(format!(
+            "failed to prepare detached proxy daemon handles: {err}"
+        ))
+    })?;
     let mut child = command
         .spawn()
         .map_err(|err| LpmError::Script(format!("failed to start detached proxy daemon: {err}")))?;
@@ -350,6 +355,47 @@ fn detach_background_command(command: &mut std::process::Command) {
 
 fn append_listener_args(command: &mut Command, options: lpm_proxy::ProxyDaemonOptions) {
     command.args(listener_args(options));
+}
+
+fn prepare_detached_spawn_handles() -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        clear_standard_handle_inheritance()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn clear_standard_handle_inheritance() -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for handle_id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe {
+            // SAFETY: `handle_id` is one of the documented standard-handle
+            // constants accepted by GetStdHandle.
+            GetStdHandle(handle_id)
+        };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        let ok = unsafe {
+            // SAFETY: `handle` is a process-owned standard handle. Clearing
+            // only the inherit flag does not close or replace it.
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn listener_args(options: lpm_proxy::ProxyDaemonOptions) -> Vec<String> {
@@ -686,6 +732,7 @@ impl ProxyServicePlan {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(windows, allow(dead_code))]
 struct ProxyServiceSpec {
     label: &'static str,
     exe: PathBuf,
@@ -725,6 +772,7 @@ impl ProxyServiceSpec {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(windows, allow(dead_code))]
 struct PrivilegedForwarderSpec {
     label: &'static str,
     exe: PathBuf,
@@ -879,6 +927,7 @@ struct PrivilegedForwarderConfig {
 }
 
 impl PrivilegedForwarderConfig {
+    #[cfg_attr(windows, allow(dead_code))]
     fn new(
         target_uid: u32,
         state_path: PathBuf,
@@ -930,6 +979,7 @@ struct PrivilegedForwarderRuleConfig {
 }
 
 impl PrivilegedForwarderRuleConfig {
+    #[cfg_attr(windows, allow(dead_code))]
     fn new(name: &str, listen_port: u16, target_port: u16) -> Self {
         Self {
             name: name.to_string(),
@@ -939,6 +989,7 @@ impl PrivilegedForwarderRuleConfig {
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn privileged_external_options(
     requested_options: lpm_proxy::ProxyDaemonOptions,
     listener_flags_explicit: bool,
@@ -973,6 +1024,7 @@ fn privileged_external_options(
     Ok(requested_options)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn validate_privileged_external_options(
     options: lpm_proxy::ProxyDaemonOptions,
 ) -> Result<(), LpmError> {
@@ -998,6 +1050,7 @@ fn validate_privileged_external_options(
     Ok(())
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn privileged_backend_options(
     external_options: lpm_proxy::ProxyDaemonOptions,
 ) -> Result<lpm_proxy::ProxyDaemonOptions, LpmError> {
@@ -1019,6 +1072,7 @@ fn privileged_backend_options(
     })
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn find_available_backend_port(start: u16, reserved: &mut Vec<u16>) -> Result<u16, LpmError> {
     for port in start..=u16::MAX {
         if reserved.contains(&port) {
@@ -1037,6 +1091,7 @@ fn find_available_backend_port(start: u16, reserved: &mut Vec<u16>) -> Result<u1
     )))
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn reject_conflicting_privileged_forwarder_owner(
     config_path: &Path,
     target_uid: u32,
@@ -1054,6 +1109,7 @@ fn reject_conflicting_privileged_forwarder_owner(
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn reject_removing_foreign_privileged_forwarder(
     config_path: &Path,
     target_uid: u32,
@@ -1067,6 +1123,7 @@ fn reject_removing_foreign_privileged_forwarder(
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn read_existing_privileged_forwarder_config(
     config_path: &Path,
 ) -> Result<Option<PrivilegedForwarderConfig>, LpmError> {
@@ -1088,6 +1145,7 @@ fn read_existing_privileged_forwarder_config(
     })
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn loopback_socket_addr(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }

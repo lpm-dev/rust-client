@@ -17,6 +17,7 @@ use std::time::Duration;
 const IPC_LINE_CAP_BYTES: usize = 1024 * 1024;
 const HTTP_HEAD_CAP_BYTES: usize = 64 * 1024;
 const EMPTY_CONTROL_FRAME_MESSAGE: &str = "empty control frame";
+const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_CONNECTION_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 type HttpHeaderPair = (axum::http::HeaderName, axum::http::HeaderValue);
 type ParsedHttpResponseHead = (axum::http::StatusCode, Vec<HttpHeaderPair>);
@@ -1838,10 +1839,32 @@ async fn connect_named_pipe_client(
     pipe_name: &str,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, ProxyError> {
     use tokio::net::windows::named_pipe::ClientOptions;
-    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 
     let mut attempts = 0u8;
+    let pipe_name_wide = wide_null(pipe_name);
     loop {
+        let ready = unsafe {
+            // SAFETY: `pipe_name_wide` is a nul-terminated UTF-16 string that
+            // remains alive for the duration of the call.
+            WaitNamedPipeW(pipe_name_wide.as_ptr(), 250)
+        };
+        if ready == 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error().map(|code| code as u32) {
+                Some(ERROR_FILE_NOT_FOUND | ERROR_SEM_TIMEOUT | ERROR_PIPE_BUSY)
+                    if attempts < 40 =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                _ => return Err(ipc_pipe_connect_error(err, pipe_name)),
+            }
+        }
         match ClientOptions::new().open(pipe_name) {
             Ok(client) => return Ok(client),
             Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) && attempts < 40 => {
@@ -1851,6 +1874,11 @@ async fn connect_named_pipe_client(
             Err(err) => return Err(ipc_pipe_connect_error(err, pipe_name)),
         }
     }
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(unix)]
@@ -2152,10 +2180,6 @@ async fn serve_named_pipe_listener(
         tokio::select! {
             connected = server.connect() => {
                 connected.map_err(|err| ProxyError::Ipc(format!("accept control pipe connection: {err}")))?;
-                if validate_windows_pipe_client(&server, &expected_client_sid).is_err() {
-                    server = create_named_pipe_server(pipe_name, false, &expected_client_sid)?;
-                    continue;
-                }
                 let stream = server;
                 server = create_named_pipe_server(pipe_name, false, &expected_client_sid)?;
                 let context = ControlStreamContext {
@@ -2167,11 +2191,13 @@ async fn serve_named_pipe_listener(
                     tls_cert_store: tls_cert_store.clone(),
                 };
                 let stop_tx = stop_tx.clone();
+                let expected_client_sid = expected_client_sid.clone();
                 tokio::spawn(async move {
                     if matches!(
-                        handle_control_stream(
+                        handle_windows_control_stream(
                             stream,
                             context,
+                            expected_client_sid,
                         )
                         .await,
                         Ok(true)
@@ -2214,6 +2240,24 @@ fn create_named_pipe_server(
     }
 }
 
+#[cfg(windows)]
+async fn handle_windows_control_stream(
+    mut stream: tokio::net::windows::named_pipe::NamedPipeServer,
+    context: ControlStreamContext,
+    expected_client_sid: String,
+) -> Result<bool, ProxyError> {
+    let request = match read_proxy_request(&mut stream).await {
+        Ok(request) => request,
+        Err(ProxyError::IpcProtocol(message)) if message == EMPTY_CONTROL_FRAME_MESSAGE => {
+            return Ok(false);
+        }
+        Err(err) => return Err(err),
+    };
+    validate_windows_pipe_client(&stream, &expected_client_sid)?;
+    handle_control_request(&mut stream, request, context).await
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 async fn handle_control_stream<S>(
     mut stream: S,
     context: ControlStreamContext,
@@ -2228,9 +2272,19 @@ where
         }
         Err(err) => return Err(err),
     };
+    handle_control_request(&mut stream, request, context).await
+}
+
+async fn handle_control_request<S>(
+    stream: &mut S,
+    request: ProxyRequest,
+    context: ControlStreamContext,
+) -> Result<bool, ProxyError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     if let ProxyRequest::RegisterLease { owner_pid, routes } = request {
-        return handle_connection_backed_lease_stream(&mut stream, owner_pid, routes, context)
-            .await;
+        return handle_connection_backed_lease_stream(stream, owner_pid, routes, context).await;
     }
     let (response, should_stop) = handle_request(
         &context.registry,
@@ -2250,7 +2304,7 @@ where
         )
         .await?;
     }
-    write_response(&mut stream, &response).await?;
+    write_response(stream, &response).await?;
     Ok(should_stop)
 }
 
@@ -2569,10 +2623,18 @@ async fn send_request_on_stream_ref<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    write_request(stream, &request).await?;
-    let response_line = read_ipc_line(stream).await?;
-    serde_json::from_slice::<ProxyResponse>(&response_line)
-        .map_err(|err| ProxyError::IpcProtocol(err.to_string()))
+    tokio::time::timeout(IPC_REQUEST_TIMEOUT, async {
+        write_request(stream, &request).await?;
+        let response_line = read_ipc_line(stream).await?;
+        serde_json::from_slice::<ProxyResponse>(&response_line)
+            .map_err(|err| ProxyError::IpcProtocol(err.to_string()))
+    })
+    .await
+    .map_err(|_| {
+        ProxyError::Ipc(format!(
+            "control request timed out after {IPC_REQUEST_TIMEOUT:?}"
+        ))
+    })?
 }
 
 async fn read_proxy_request<R>(reader: &mut R) -> Result<ProxyRequest, ProxyError>
@@ -3313,6 +3375,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn route_for_project(host: &str, upstream_port: u16, project_dir: &Path) -> Route {
         Route {
             host: host.to_string(),
