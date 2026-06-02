@@ -11399,22 +11399,7 @@ async fn verify_registry_signature_if_present(
         )));
     };
 
-    let (keys_base_url, auth): (&str, Option<&lpm_registry::RegistryAuth>) = match &route {
-        UpstreamRoute::Custom { target, auth } => (target.base_url.as_ref(), auth.as_ref()),
-        UpstreamRoute::LpmWorker | UpstreamRoute::NpmDirect => (client.npm_registry_url(), None),
-    };
-    let mut keys = client
-        .get_registry_signing_keys(keys_base_url, auth)
-        .await?;
-    if matches!(&route, UpstreamRoute::Custom { .. })
-        && !registry_signatures_have_matching_key(signatures, &keys)
-    {
-        keys.extend(
-            client
-                .get_registry_signing_keys(client.npm_registry_url(), None)
-                .await?,
-        );
-    }
+    let keys = registry_signing_keys_for_route(client, &route, signatures).await?;
     let verification = lpm_registry::verify_registry_signatures(
         &package.name,
         &package.version,
@@ -11433,6 +11418,62 @@ async fn verify_registry_signature_if_present(
         );
     }
     Ok(())
+}
+
+async fn registry_signing_keys_for_route(
+    client: &Arc<RegistryClient>,
+    route: &UpstreamRoute,
+    signatures: &[lpm_registry::RegistrySignature],
+) -> Result<Vec<lpm_registry::RegistrySigningKey>, LpmError> {
+    match route {
+        UpstreamRoute::Custom { target, auth } => {
+            match client
+                .get_registry_signing_keys(&target.base_url, auth.as_ref())
+                .await
+            {
+                Ok(mut keys) => {
+                    if !registry_signatures_have_matching_key(signatures, &keys) {
+                        keys.extend(
+                            client
+                                .get_registry_signing_keys(client.npm_registry_url(), None)
+                                .await?,
+                        );
+                    }
+                    Ok(keys)
+                }
+                Err(custom_error) => {
+                    let npm_keys = match client
+                        .get_registry_signing_keys(client.npm_registry_url(), None)
+                        .await
+                    {
+                        Ok(keys) => keys,
+                        Err(npm_error) => {
+                            return Err(LpmError::Registry(format!(
+                                "custom registry signing keys unavailable ({custom_error}); \
+                                 npm signing-key fallback failed ({npm_error})"
+                            )));
+                        }
+                    };
+                    if registry_signatures_have_matching_key(signatures, &npm_keys) {
+                        tracing::debug!(
+                            target: "lpm_cli::install",
+                            custom_registry = %target.base_url,
+                            error = %custom_error,
+                            "custom registry signing keys unavailable; using npm public keys for npm registry signatures"
+                        );
+                        Ok(npm_keys)
+                    } else {
+                        Err(custom_error)
+                    }
+                }
+            }
+        }
+        UpstreamRoute::LpmWorker | UpstreamRoute::NpmDirect => {
+            client
+                .get_registry_signing_keys(client.npm_registry_url(), None)
+                .await
+        }
+    }
 }
 
 fn registry_signatures_have_matching_key(
@@ -15683,6 +15724,108 @@ mod tests {
             &signatures,
             &npm_keys
         ));
+    }
+
+    #[tokio::test]
+    async fn registry_signing_keys_for_route_falls_back_to_npm_keys_on_custom_endpoint_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let custom_registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/-/npm/v1/keys"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("custom keys unavailable"))
+            .expect(1)
+            .mount(&custom_registry)
+            .await;
+
+        let npm_registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/-/npm/v1/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{
+                    "expires": null,
+                    "keyid": "SHA256:npm",
+                    "keytype": "ecdsa-sha2-nistp256",
+                    "scheme": "ecdsa-sha2-nistp256",
+                    "key": ""
+                }]
+            })))
+            .expect(1)
+            .mount(&npm_registry)
+            .await;
+
+        let client = Arc::new(RegistryClient::new().with_npm_registry_url(npm_registry.uri()));
+        let route = UpstreamRoute::Custom {
+            target: lpm_registry::RegistryTarget {
+                base_url: Arc::from(custom_registry.uri()),
+                kind: lpm_registry::RegistryKind::NpmCompatible,
+            },
+            auth: None,
+        };
+        let signatures = vec![lpm_registry::RegistrySignature {
+            keyid: Some("SHA256:npm".to_string()),
+            sig: Some("MEUCIQD".to_string()),
+        }];
+
+        let keys = registry_signing_keys_for_route(&client, &route, &signatures)
+            .await
+            .expect("npm keyid match should allow npm key fallback");
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].keyid, "SHA256:npm");
+    }
+
+    #[tokio::test]
+    async fn registry_signing_keys_for_route_preserves_custom_error_when_npm_keys_do_not_match() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let custom_registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/-/npm/v1/keys"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("custom keys unavailable"))
+            .expect(1)
+            .mount(&custom_registry)
+            .await;
+
+        let npm_registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/-/npm/v1/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [{
+                    "expires": null,
+                    "keyid": "SHA256:other",
+                    "keytype": "ecdsa-sha2-nistp256",
+                    "scheme": "ecdsa-sha2-nistp256",
+                    "key": ""
+                }]
+            })))
+            .expect(1)
+            .mount(&npm_registry)
+            .await;
+
+        let client = Arc::new(RegistryClient::new().with_npm_registry_url(npm_registry.uri()));
+        let route = UpstreamRoute::Custom {
+            target: lpm_registry::RegistryTarget {
+                base_url: Arc::from(custom_registry.uri()),
+                kind: lpm_registry::RegistryKind::NpmCompatible,
+            },
+            auth: None,
+        };
+        let signatures = vec![lpm_registry::RegistrySignature {
+            keyid: Some("SHA256:npm".to_string()),
+            sig: Some("MEUCIQD".to_string()),
+        }];
+
+        let error = registry_signing_keys_for_route(&client, &route, &signatures)
+            .await
+            .expect_err("non-matching npm keys must not hide the custom registry error");
+
+        assert!(
+            matches!(error, LpmError::Http { status: 400, .. }),
+            "expected original custom-registry HTTP 400, got {error:?}"
+        );
     }
 
     /// Transitive-only packages are EXCLUDED from the map entirely.
