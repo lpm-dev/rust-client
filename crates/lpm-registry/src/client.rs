@@ -331,15 +331,12 @@ pub async fn parse_capped_api_json<T: serde::de::DeserializeOwned>(
 /// but the buffer is now bounded.
 async fn read_capped_error_text(response: reqwest::Response) -> String {
     match read_capped_body(response, MAX_API_RESPONSE_BYTES, "error body").await {
-        Ok(buf) => {
-            let body = String::from_utf8_lossy(&buf).into_owned();
-            format_lpm_worker_error_body(&body).unwrap_or(body)
-        }
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
         Err(_) => String::new(),
     }
 }
 
-fn format_lpm_worker_error_body(body: &str) -> Option<String> {
+fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     let error = json_string_field(&value, "error")?;
 
@@ -349,36 +346,30 @@ fn format_lpm_worker_error_body(body: &str) -> Option<String> {
             let verdict = json_string_field(&value, "verdict").unwrap_or("unknown");
             let reason = json_string_field(&value, "reason")
                 .unwrap_or("the registry policy refused this download");
-            let mut message =
-                format!("LPM firewall blocked {package} (verdict: {verdict}): {reason}");
-
-            if let Some(decision_id) = json_string_field(&value, "decisionId") {
-                message.push_str(&format!(". Decision ID: {decision_id}"));
-            }
-            if let Some(match_source) = json_string_field(&value, "matchSource") {
-                message.push_str(&format!(". Match source: {match_source}"));
-            }
-            message.push_str(". The package was not downloaded.");
-            Some(message)
+            Some(LpmError::NpmFirewallBlocked {
+                package: package.to_owned(),
+                verdict: verdict.to_owned(),
+                reason: reason.to_owned(),
+                decision_id: json_string_field(&value, "decisionId").map(str::to_owned),
+                match_source: json_string_field(&value, "matchSource").map(str::to_owned),
+            })
         }
         "upstream_proxy_entitlement_required" => {
-            let detail = json_string_field(&value, "message")
+            let message = json_string_field(&value, "message")
                 .unwrap_or("A Pro account or active org membership is required.");
-            let mut message = format!("LPM upstream npm proxy access denied: {detail}");
-
-            if let Some(reason) = json_string_field(&value, "reason") {
-                message.push_str(&format!(" Reason: {reason}."));
-            }
-            if let Some(entitlement_source) = json_string_field(&value, "entitlementSource") {
-                message.push_str(&format!(" Entitlement source: {entitlement_source}."));
-            }
-            message.push_str(
-                " Use a Pro/org token for standalone npm proxy usage, or route standalone npm packages directly to npm.",
-            );
-            Some(message)
+            Some(LpmError::UpstreamProxyEntitlementRequired {
+                message: message.to_owned(),
+                reason: json_string_field(&value, "reason").map(str::to_owned),
+                entitlement_source: json_string_field(&value, "entitlementSource")
+                    .map(str::to_owned),
+            })
         }
         _ => None,
     }
+}
+
+fn forbidden_error_from_body(body: String) -> LpmError {
+    parse_lpm_worker_error_body(&body).unwrap_or(LpmError::Forbidden(body))
 }
 
 fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -4025,7 +4016,7 @@ impl RegistryClient {
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
                             let body = read_capped_error_text(response).await;
-                            return Err(LpmError::Forbidden(body));
+                            return Err(forbidden_error_from_body(body));
                         }
                         404 => {
                             let body = read_capped_error_text(response).await;
@@ -4162,7 +4153,7 @@ impl RegistryClient {
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
                             let body = read_capped_error_text(response).await;
-                            return Err(LpmError::Forbidden(body));
+                            return Err(forbidden_error_from_body(body));
                         }
                         404 => {
                             let body = read_capped_error_text(response).await;
@@ -6583,7 +6574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_tarball_formats_firewall_block_error() {
+    async fn download_tarball_maps_firewall_block_error() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -6608,18 +6599,25 @@ mod tests {
         let result = client.download_tarball_to_file(&url).await;
 
         match result {
-            Err(LpmError::Forbidden(message)) => {
-                assert!(message.contains("LPM firewall blocked is-number@7.0.0"));
-                assert!(message.contains("verdict: malicious"));
-                assert!(message.contains("Decision ID: decision-1"));
-                assert!(message.contains("The package was not downloaded."));
+            Err(LpmError::NpmFirewallBlocked {
+                package,
+                verdict,
+                reason,
+                decision_id,
+                match_source,
+            }) => {
+                assert_eq!(package, "is-number@7.0.0");
+                assert_eq!(verdict, "malicious");
+                assert_eq!(reason, "product_default policy maps malicious to block");
+                assert_eq!(decision_id.as_deref(), Some("decision-1"));
+                assert_eq!(match_source.as_deref(), Some("package"));
             }
-            other => panic!("expected formatted firewall forbidden error, got {other:?}"),
+            other => panic!("expected typed firewall block error, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn whoami_formats_upstream_proxy_entitlement_denial() {
+    async fn whoami_maps_upstream_proxy_entitlement_denial() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -6641,13 +6639,19 @@ mod tests {
         let result = client.whoami().await;
 
         match result {
-            Err(LpmError::Forbidden(message)) => {
-                assert!(message.contains("LPM upstream npm proxy access denied"));
-                assert!(message.contains("Pro account or active org membership"));
-                assert!(message.contains("Reason: personal_plan_not_eligible."));
-                assert!(message.contains("route standalone npm packages directly to npm"));
+            Err(LpmError::UpstreamProxyEntitlementRequired {
+                message,
+                reason,
+                entitlement_source,
+            }) => {
+                assert_eq!(
+                    message,
+                    "A Pro account or active org membership is required."
+                );
+                assert_eq!(reason.as_deref(), Some("personal_plan_not_eligible"));
+                assert_eq!(entitlement_source, None);
             }
-            other => panic!("expected formatted entitlement forbidden error, got {other:?}"),
+            other => panic!("expected typed entitlement error, got {other:?}"),
         }
     }
 

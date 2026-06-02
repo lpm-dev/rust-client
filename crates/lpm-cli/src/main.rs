@@ -5289,6 +5289,10 @@ async fn async_main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         }
 
+        if !cli.json && render_slim_error(e) {
+            std::process::exit(1);
+        }
+
         // Preserve existing side effects before exiting
         match e {
             lpm_common::LpmError::ExitCode(code) => {
@@ -5311,6 +5315,102 @@ async fn async_main() -> Result<()> {
     result.into_diagnostic()
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum SlimErrorLine {
+    Failed(String),
+    Detail(String),
+}
+
+fn render_slim_error(error: &lpm_common::LpmError) -> bool {
+    let Some(lines) = slim_error_lines(error) else {
+        return false;
+    };
+
+    for line in lines {
+        match line {
+            SlimErrorLine::Failed(message) => install_ui::failed(&message),
+            SlimErrorLine::Detail(message) => install_ui::detail(&message),
+        }
+    }
+
+    true
+}
+
+fn slim_error_lines(error: &lpm_common::LpmError) -> Option<Vec<SlimErrorLine>> {
+    match error {
+        lpm_common::LpmError::NpmFirewallBlocked {
+            package,
+            verdict,
+            reason,
+            decision_id,
+            match_source,
+        } => {
+            let mut lines = vec![
+                SlimErrorLine::Failed(format!("Firewall blocked {}", install_ui::yellow(package))),
+                SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("verdict"),
+                    install_ui::yellow(verdict)
+                )),
+                SlimErrorLine::Detail(format!("  {} {reason}", install_ui::dim("reason"))),
+            ];
+            if let Some(decision_id) = decision_id {
+                lines.push(SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("decision"),
+                    install_ui::cyan(decision_id)
+                )));
+            }
+            if let Some(match_source) = match_source {
+                lines.push(SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("match"),
+                    install_ui::cyan(match_source)
+                )));
+            }
+            lines.push(SlimErrorLine::Detail(format!(
+                "  {} {}",
+                install_ui::dim("hint"),
+                install_ui::dim("The package was not downloaded.")
+            )));
+            Some(lines)
+        }
+        lpm_common::LpmError::UpstreamProxyEntitlementRequired {
+            message,
+            reason,
+            entitlement_source,
+        } => {
+            let mut lines = vec![
+                SlimErrorLine::Failed("Upstream npm proxy access denied".to_owned()),
+                SlimErrorLine::Detail(format!("  {} {message}", install_ui::dim("reason"))),
+            ];
+            if let Some(reason) = reason {
+                lines.push(SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("policy"),
+                    install_ui::cyan(reason)
+                )));
+            }
+            if let Some(entitlement_source) = entitlement_source {
+                lines.push(SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("entitlement"),
+                    install_ui::cyan(entitlement_source)
+                )));
+            }
+            lines.push(SlimErrorLine::Detail(format!(
+                "  {} {}",
+                install_ui::dim("hint"),
+                install_ui::dim(
+                    "Use a Pro/org token, or route standalone npm packages directly to npm."
+                )
+            )));
+            Some(lines)
+        }
+        _ => None,
+    }
+}
+
 fn tunnel_action_requires_session(action: &str) -> bool {
     !matches!(action, "inspect" | "replay" | "log" | "logs")
 }
@@ -5319,6 +5419,60 @@ fn tunnel_action_requires_session(action: &str) -> bool {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    fn plain_slim_line(line: &SlimErrorLine) -> String {
+        let raw = match line {
+            SlimErrorLine::Failed(message) | SlimErrorLine::Detail(message) => message,
+        };
+        console::strip_ansi_codes(raw).into_owned()
+    }
+
+    #[test]
+    fn slim_error_lines_render_firewall_block_as_contract_rows() {
+        let error = lpm_common::LpmError::NpmFirewallBlocked {
+            package: "is-number@7.0.0".into(),
+            verdict: "malicious".into(),
+            reason: "product_default policy maps malicious to block".into(),
+            decision_id: Some("decision-1".into()),
+            match_source: Some("package".into()),
+        };
+
+        let lines = slim_error_lines(&error).expect("firewall error should render in slim UI");
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(plain[0], "Firewall blocked is-number@7.0.0");
+        assert_eq!(plain[1], "  verdict malicious");
+        assert_eq!(
+            plain[2],
+            "  reason product_default policy maps malicious to block"
+        );
+        assert_eq!(plain[3], "  decision decision-1");
+        assert_eq!(plain[4], "  match package");
+        assert_eq!(plain[5], "  hint The package was not downloaded.");
+    }
+
+    #[test]
+    fn slim_error_lines_render_entitlement_denial_as_contract_rows() {
+        let error = lpm_common::LpmError::UpstreamProxyEntitlementRequired {
+            message: "A Pro account or active org membership is required.".into(),
+            reason: Some("personal_plan_not_eligible".into()),
+            entitlement_source: None,
+        };
+
+        let lines = slim_error_lines(&error).expect("entitlement error should render in slim UI");
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(plain[0], "Upstream npm proxy access denied");
+        assert_eq!(
+            plain[1],
+            "  reason A Pro account or active org membership is required."
+        );
+        assert_eq!(plain[2], "  policy personal_plan_not_eligible");
+        assert_eq!(
+            plain[3],
+            "  hint Use a Pro/org token, or route standalone npm packages directly to npm."
+        );
+    }
 
     // ─── audit follow-up: -v / -V / --version + verbose ───
     //

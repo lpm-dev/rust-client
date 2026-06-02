@@ -88,6 +88,32 @@ pub enum LpmError {
     )]
     Forbidden(String),
 
+    #[error("LPM firewall blocked {package} (verdict: {verdict}): {reason}")]
+    #[diagnostic(
+        code(lpm::npm_firewall_blocked),
+        help("Review the package security report or contact LPM support with the decision ID.")
+    )]
+    NpmFirewallBlocked {
+        package: String,
+        verdict: String,
+        reason: String,
+        decision_id: Option<String>,
+        match_source: Option<String>,
+    },
+
+    #[error("LPM upstream npm proxy access denied: {message}")]
+    #[diagnostic(
+        code(lpm::upstream_proxy_entitlement_required),
+        help(
+            "Use a Pro/org token for standalone npm proxy usage, or route standalone npm packages directly to npm."
+        )
+    )]
+    UpstreamProxyEntitlementRequired {
+        message: String,
+        reason: Option<String>,
+        entitlement_source: Option<String>,
+    },
+
     #[error("not found: {0}")]
     #[diagnostic(
         code(lpm::not_found),
@@ -329,6 +355,10 @@ impl LpmError {
             LpmError::AuthRequired => "auth_required",
             LpmError::SessionExpired => "session_expired",
             LpmError::Forbidden(_) => "forbidden",
+            LpmError::NpmFirewallBlocked { .. } => "npm_firewall_blocked",
+            LpmError::UpstreamProxyEntitlementRequired { .. } => {
+                "upstream_proxy_entitlement_required"
+            }
             LpmError::NotFound(_) => "not_found",
             LpmError::RateLimited { .. } => "rate_limited",
             LpmError::Script(_) => "script",
@@ -475,6 +505,18 @@ mod tests {
             LpmError::AuthRequired,
             LpmError::SessionExpired,
             LpmError::Forbidden("x".into()),
+            LpmError::NpmFirewallBlocked {
+                package: "is-number@7.0.0".into(),
+                verdict: "malicious".into(),
+                reason: "product_default policy maps malicious to block".into(),
+                decision_id: Some("decision-1".into()),
+                match_source: Some("package".into()),
+            },
+            LpmError::UpstreamProxyEntitlementRequired {
+                message: "A Pro account or active org membership is required.".into(),
+                reason: Some("personal_plan_not_eligible".into()),
+                entitlement_source: None,
+            },
             LpmError::NotFound("x".into()),
             LpmError::RateLimited {
                 retry_after_secs: 5,
@@ -576,6 +618,26 @@ mod tests {
         assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
         assert_eq!(LpmError::NotFound("x".into()).error_code(), "not_found");
         assert_eq!(LpmError::Forbidden("x".into()).error_code(), "forbidden");
+        assert_eq!(
+            LpmError::NpmFirewallBlocked {
+                package: "is-number@7.0.0".into(),
+                verdict: "malicious".into(),
+                reason: "product_default policy maps malicious to block".into(),
+                decision_id: Some("decision-1".into()),
+                match_source: Some("package".into()),
+            }
+            .error_code(),
+            "npm_firewall_blocked"
+        );
+        assert_eq!(
+            LpmError::UpstreamProxyEntitlementRequired {
+                message: "A Pro account or active org membership is required.".into(),
+                reason: Some("personal_plan_not_eligible".into()),
+                entitlement_source: None,
+            }
+            .error_code(),
+            "upstream_proxy_entitlement_required"
+        );
         assert_eq!(LpmError::Network("x".into()).error_code(), "network");
         assert_eq!(
             LpmError::RateLimited {
