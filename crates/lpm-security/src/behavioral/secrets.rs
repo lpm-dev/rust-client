@@ -284,12 +284,13 @@ pub fn is_blocked_file(filename: &str) -> bool {
 
 /// Truncate a secret value for safe display: show first 8 and last 4 chars.
 fn truncate_secret(value: &str) -> String {
-    if value.len() > 20 {
-        let start = &value[..8];
-        let end = &value[value.len() - 4..];
+    let char_count = value.chars().count();
+    if char_count > 20 {
+        let start: String = value.chars().take(8).collect();
+        let end: String = value.chars().skip(char_count - 4).collect();
         format!("{start}...{end}")
-    } else if value.len() > 12 {
-        let start = &value[..6];
+    } else if char_count > 12 {
+        let start: String = value.chars().take(6).collect();
         format!("{start}...")
     } else {
         "••••••••".to_string()
@@ -558,6 +559,14 @@ mod tests {
     fn truncate_short_value() {
         let truncated = truncate_secret("short");
         assert_eq!(truncated, "••••••••");
+    }
+
+    #[test]
+    fn truncate_non_ascii_secret_without_panicking() {
+        let matches = scan_content("password: 'Contraseña',", "messages.js");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].matched_text, "password...ña',");
     }
 
     #[test]
