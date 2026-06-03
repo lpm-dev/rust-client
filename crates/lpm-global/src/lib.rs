@@ -39,7 +39,7 @@ pub use shim::{
 pub use sweep::{
     SweepFailure, SweepReport, count_pending_tombstones, sweep_tombstones,
     try_count_pending_tombstones, try_sweep_tombstones, validated_install_root_absolute,
-    validated_install_root_relative,
+    validated_install_root_relative, validated_local_link_root_relative,
 };
 pub use trusted_deps::{
     GlobalTrustedDependencies, TrustMatch as GlobalTrustMatch, TrustedDependencyBinding,

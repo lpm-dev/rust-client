@@ -206,7 +206,8 @@ jobs:
             echo "Publishing @lpm-registry/cli-${platform}@${VERSION}..."
             cd npm/cli-${platform}
             cp ../../binaries/lpm-${platform} ./lpm
-            chmod +x ./lpm
+            cp ./lpm ./lpx
+            chmod +x ./lpm ./lpx
             npm version "$VERSION" --no-git-tag-version --allow-same-version
             publish_pkg
             cd ../..
@@ -217,6 +218,7 @@ jobs:
           echo "Publishing @lpm-registry/cli-win32-x64@${VERSION}..."
           cd npm/cli-win32-x64
           cp ../../binaries/lpm-win32-x64.exe ./lpm.exe
+          cp ./lpm.exe ./lpx.exe
           cp ../../binaries/lpm-sandbox-helper-win32-x64.exe ./lpm-sandbox-helper.exe
           npm version "$VERSION" --no-git-tag-version --allow-same-version
           publish_pkg
@@ -271,6 +273,9 @@ jobs:
               if (pkg.optionalDependencies[p]) {
                 pkg.optionalDependencies[p] = '$VERSION';
               }
+            }
+            if (pkg.bin?.lpm) {
+              pkg.bin.lpx = pkg.bin.lpm;
             }
             pkg.repository = {
               type: 'git',

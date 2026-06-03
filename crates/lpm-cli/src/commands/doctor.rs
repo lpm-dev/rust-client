@@ -2263,8 +2263,12 @@ fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
     let mut issues: Vec<String> = Vec::new();
 
     for (pkg_name, entry) in &manifest.packages {
-        if let Err(reason) = lpm_global::validated_install_root_relative(&global_root, &entry.root)
-        {
+        let root_check = if entry.source == lpm_global::PackageSource::LocalLink {
+            lpm_global::validated_local_link_root_relative(&global_root, &entry.root)
+        } else {
+            lpm_global::validated_install_root_relative(&global_root, &entry.root)
+        };
+        if let Err(reason) = root_check {
             issues.push(format!(
                 "package '{}': root {:?} structurally invalid ({reason})",
                 lpm_common::sanitize_for_terminal(pkg_name),
@@ -2651,8 +2655,33 @@ fn check_install_root_consistency(
     use lpm_global::InstallRootStatus;
     let mut missing: Vec<String> = Vec::new();
     let mut not_ready: Vec<(String, String)> = Vec::new();
+    let mut registry_roots = 0usize;
+    let mut local_link_roots = 0usize;
     for (name, entry) in &manifest.packages {
         let install_root = root.global_root().join(&entry.root);
+        if entry.source == lpm_global::PackageSource::LocalLink {
+            local_link_roots += 1;
+            if !install_root.is_dir() {
+                missing.push(name.clone());
+                continue;
+            }
+            let install_bin = install_root.join("node_modules").join(".bin");
+            let missing_shims: Vec<String> = entry
+                .commands
+                .iter()
+                .filter(|command| !lpm_global::artifacts_complete(&install_bin, command))
+                .cloned()
+                .collect();
+            if !missing_shims.is_empty() {
+                not_ready.push((
+                    name.clone(),
+                    format!("LocalLinkMissingShims({})", missing_shims.join(", ")),
+                ));
+            }
+            continue;
+        }
+
+        registry_roots += 1;
         let status = match lpm_global::validate_install_root(&install_root, Some(&entry.commands)) {
             Ok(s) => s,
             Err(e) => {
@@ -2675,13 +2704,11 @@ fn check_install_root_consistency(
         return Check::pass(
             &doctor_catalog::GLOBAL_INSTALL_ROOTS_HEALTHY,
             &format!(
-                "{} root{} healthy (marker + bin targets + lockfile validated)",
-                manifest.packages.len(),
-                if manifest.packages.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                },
+                "{} registry install root{} and {} local-link root{} healthy",
+                registry_roots,
+                if registry_roots == 1 { "" } else { "s" },
+                local_link_roots,
+                if local_link_roots == 1 { "" } else { "s" },
             ),
         );
     }
