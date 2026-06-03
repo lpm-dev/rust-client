@@ -10,11 +10,11 @@ pub fn phase(msg: &str) {
 }
 
 pub fn detail(label: &str, value: &str) {
-    install_ui::phase(&format!("{label} {value}"));
+    install_ui::detail(&format_detail_line(label, value, None));
 }
 
 pub fn detail_with_hint(label: &str, value: &str, hint: &str) {
-    install_ui::phase(&format!("{label} {value} {}", install_ui::dim(hint)));
+    install_ui::detail(&format_detail_line(label, value, Some(hint)));
 }
 
 pub fn readiness(label: &str, value: &str) {
@@ -32,6 +32,11 @@ fn format_readiness_line(label: &str, value: &str, hint: Option<&str>) -> String
         install_ui::bullet(true),
         label
     )
+}
+
+fn format_detail_line(label: &str, value: &str, hint: Option<&str>) -> String {
+    let suffix = hint.map_or_else(String::new, |hint| format!(" {}", install_ui::dim(hint)));
+    format!("  {} {value}{suffix}", install_ui::dim(label))
 }
 
 pub fn done(msg: &str) {
@@ -80,6 +85,17 @@ mod tests {
         assert!(
             line.contains("Node") && line.contains("v22.12.0") && line.contains("(.nvmrc)"),
             "readiness line must include label, value, and hint: {line:?}"
+        );
+    }
+
+    #[test]
+    fn detail_line_uses_label_row_without_phase_glyph() {
+        let line = format_detail_line("Local", "http://localhost:3000", None);
+        let plain = console::strip_ansi_codes(&line);
+
+        assert!(
+            !plain.contains('›') && plain.starts_with("  Local "),
+            "detail line must be a slim detail row, got: {plain:?}"
         );
     }
 }

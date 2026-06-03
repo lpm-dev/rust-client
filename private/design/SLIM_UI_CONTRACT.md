@@ -89,11 +89,13 @@ Add (color helpers honor `lpm_common::color::enabled()` like the existing ones):
 
 ## Rule 5 — Stream contract (one real bug to fix)
 
-Every slim-UI line goes to **stderr**. Table/tree "answer" output (outdated,
-graph, query results) may stay on stdout for piping. **`audit` is the
-exception to fix**: its section bodies print to **stdout** via `println!`
-while the framing goes to stderr — there is no `| jq` reason for audit to
-split, and it contradicts the stream contract. Move audit's human bodies to
+Every slim-UI line goes to **stderr**. Table/tree/report "answer" output
+(outdated, graph, query results, `doctor` report/list) may stay on stdout for
+piping. `doctor --fix` progress, doctor errors, and any other status/progress
+framing still use stderr through `install_ui::*`. **`audit` is the exception to
+fix**: its section bodies print to **stdout** via `println!` while the framing
+goes to stderr — there is no `| jq` reason for audit to split, and it
+contradicts the stream contract. Move audit's human bodies to
 `eprintln!`/`install_ui::*`.
 
 ## Rule 5a — Error exits are slim UI, not framework diagnostics
@@ -323,6 +325,8 @@ slim/cliclack. File:line are approximate — confirm before editing.
       width once.)
 - [x] [color] check names → plain, detail → `dim` (already), terminus counts:
       failures→red, warnings→gold.
+- [x] [stream/design] Human report/list output is a stdout answer surface;
+      fix/progress/error lines remain slim stderr.
 
 ### health — `commands/health.rs`  (B2 DONE)
 - [x] [B2/struct] Build the `Registry {url} / Status ● healthy / Response

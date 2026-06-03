@@ -436,6 +436,38 @@ fn lockfile_has_auto_isolated_peer_conflicts(lockfile_path: &Path) -> bool {
     content.windows(NEEDLE.len()).any(|window| window == NEEDLE)
 }
 
+fn binary_lockfile_needs_writeback(
+    lockfile_path: &Path,
+    lockfile: &lpm_lockfile::Lockfile,
+) -> bool {
+    if !lpm_lockfile::binary::binary_format_supports(lockfile) {
+        return false;
+    }
+
+    let binary_path = lockfile_path.with_extension("lockb");
+    if binary_lockfile_is_older_than_toml(lockfile_path, &binary_path) {
+        return true;
+    }
+
+    match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
+        Ok(Some(_)) => false,
+        Ok(None) | Err(_) => true,
+    }
+}
+
+fn binary_lockfile_is_older_than_toml(lockfile_path: &Path, binary_path: &Path) -> bool {
+    if !binary_path.exists() {
+        return false;
+    }
+    match (
+        lockfile_path.metadata().and_then(|m| m.modified()),
+        binary_path.metadata().and_then(|m| m.modified()),
+    ) {
+        (Ok(toml_time), Ok(binary_time)) => binary_time < toml_time,
+        _ => true,
+    }
+}
+
 /// Default concurrent-tarball-download pool size. Overridable per-invocation
 /// via `LPM_CONCURRENT_DOWNLOADS=N` for future network-condition A/B.
 ///
@@ -9826,20 +9858,7 @@ fn try_lockfile_fast_path(
 
     let lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
 
-    // Probe binary state only when this lockfile can be represented by
-    // the binary format. TOML-only metadata intentionally skips `lpm.lockb`;
-    // treating a missing binary as an upgrade need would rewrite forever.
-    let binary_path = lockfile_path.with_extension("lockb");
-    let needs_binary_upgrade = if lpm_lockfile::binary::binary_format_supports(&lockfile) {
-        match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
-            Ok(Some(_)) => false,
-            Ok(None) => true,
-            Err(lpm_lockfile::LockfileError::UnsupportedVersion { .. }) => true,
-            Err(_) => false,
-        }
-    } else {
-        false
-    };
+    let needs_binary_upgrade = binary_lockfile_needs_writeback(lockfile_path, &lockfile);
 
     // L19: scan the lockfile for entries with `http://` sources and
     // emit a single aggregate warn so re-installs against a lockfile
@@ -17250,6 +17269,74 @@ mod tests {
         assert!(
             result.needs_binary_upgrade,
             "missing lpm.lockb must set needs_binary_upgrade=true"
+        );
+    }
+
+    #[test]
+    fn try_lockfile_fast_path_flags_stale_binary_for_writeback() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        });
+        lf.write_all(&lockfile_path).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        lf.write_to_file(&lockfile_path).unwrap();
+
+        let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed via TOML");
+
+        assert!(
+            result.needs_binary_upgrade,
+            "stale lpm.lockb must trigger writeback"
+        );
+    }
+
+    #[test]
+    fn try_lockfile_fast_path_flags_corrupt_binary_for_writeback() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+        let binary_path = dir.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "lodash".to_string(),
+            version: "4.17.21".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        });
+        lf.write_to_file(&lockfile_path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&binary_path, b"not-a-binary-lockfile").unwrap();
+
+        let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed via TOML");
+
+        assert!(
+            result.needs_binary_upgrade,
+            "corrupt lpm.lockb must trigger writeback"
         );
     }
 

@@ -504,6 +504,13 @@ pub fn check_install_state_with_linker(
         };
     }
 
+    if binary_lockfile_sidecar_needs_refresh(project_dir) {
+        return InstallState {
+            up_to_date: false,
+            hash: Some(current_hash),
+        };
+    }
+
     // D8c — layout-aware freshness gate. If the project is
     // on the legacy `node_modules/.lpm/` wrapper layout but the new
     // `<project>/.lpm/wrappers/` root is empty, the install is NOT
@@ -676,6 +683,10 @@ fn try_mtime_fast_path(
         return None;
     }
 
+    if binary_lockfile_sidecar_needs_refresh(project_dir) {
+        return None;
+    }
+
     // External-modification check: if anything under node_modules was
     // touched more recently than the hash file, the recorded state
     // cannot be trusted even with matching manifest mtimes.
@@ -700,6 +711,37 @@ fn mtime_ns(path: &Path) -> Option<u64> {
     let dur = modified.duration_since(UNIX_EPOCH).ok()?;
     // `as_nanos` returns u128; narrow to u64 — safe until year 2554.
     Some(dur.as_nanos() as u64)
+}
+
+fn binary_lockfile_sidecar_needs_refresh(project_dir: &Path) -> bool {
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    if !lockfile_path.exists() {
+        return false;
+    }
+
+    let binary_path = lockfile_path.with_extension("lockb");
+    match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
+        Ok(Some(_)) => binary_lockfile_is_older_than_toml(&lockfile_path, &binary_path),
+        Ok(None) => binary_lockfile_absence_requires_refresh(&lockfile_path),
+        Err(_) => true,
+    }
+}
+
+fn binary_lockfile_absence_requires_refresh(lockfile_path: &Path) -> bool {
+    let Ok(lockfile) = lpm_lockfile::Lockfile::read_from_file(lockfile_path) else {
+        return false;
+    };
+    lpm_lockfile::binary::binary_format_supports(&lockfile)
+}
+
+fn binary_lockfile_is_older_than_toml(lockfile_path: &Path, binary_path: &Path) -> bool {
+    match (
+        lockfile_path.metadata().and_then(|m| m.modified()),
+        binary_path.metadata().and_then(|m| m.modified()),
+    ) {
+        (Ok(toml_time), Ok(binary_time)) => binary_time < toml_time,
+        _ => true,
+    }
 }
 
 /// Write `.lpm/install-hash` in the v6 format (hash line + mtime line +
@@ -1149,6 +1191,31 @@ mod tests {
         let state = check_install_state(dir.path());
         assert!(state.up_to_date);
         assert!(state.hash.is_some());
+    }
+
+    #[test]
+    fn missing_binary_lockfile_keeps_install_from_fast_lane_success() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let _home = scoped_home_for(p);
+        let package_json =
+            r#"{"name":"lockb-fast-lane-repro","version":"1.0.0","dependencies":{}}"#;
+        fs::write(p.join("package.json"), package_json).unwrap();
+        lpm_lockfile::Lockfile::default()
+            .write_to_file(&p.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        let lock = fs::read_to_string(p.join(lpm_lockfile::LOCKFILE_NAME)).unwrap();
+        let hash =
+            compute_install_hash_v6(package_json, &lock, &[], lpm_linker::LinkerMode::Isolated);
+        write_install_hash(p, &hash, lpm_linker::LinkerMode::Isolated).unwrap();
+
+        let state = check_install_state(p);
+
+        assert!(
+            !state.up_to_date,
+            "bare install must not exit before regenerating a representable missing lpm.lockb"
+        );
     }
 
     #[test]

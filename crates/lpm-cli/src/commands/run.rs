@@ -1,8 +1,8 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_runner::bin_path::ManagedRuntimeHint;
 use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write as _};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -98,7 +98,7 @@ pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
                 install_ui::phase(&format!(
                     "Using {} {} ({})",
                     runtime_display_name(runtime.as_str()),
-                    install_ui::bold(&version),
+                    install_ui::status_ok(&version),
                     install_ui::dim(&format!("from {source}"))
                 ));
                 bin_dirs.push(bin_dir);
@@ -112,7 +112,7 @@ pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
                 install_ui::done(&format!(
                     "Auto-installed {} {} (from {})",
                     runtime_display_name(runtime.as_str()),
-                    install_ui::bold(&version),
+                    install_ui::status_ok(&version),
                     source,
                 ));
                 bin_dirs.push(bin_dir);
@@ -126,13 +126,14 @@ pub async fn ensure_runtime(project_dir: &Path) -> ManagedRuntimeHint {
                     "{} requires {} {}, but it's not installed. Using system {}.",
                     source,
                     runtime_display_name(runtime.as_str()),
-                    install_ui::bold(&spec),
+                    install_ui::yellow(&spec),
                     runtime_display_name(runtime.as_str()),
                 ));
-                eprintln!(
-                    "    Run: {}",
-                    format!("lpm use {}@{spec}", runtime.as_str()).cyan(),
-                );
+                install_ui::detail(&format!(
+                    "    {} {}",
+                    install_ui::dim("Run:"),
+                    install_ui::yellow(&format!("lpm use {}@{spec}", runtime.as_str())),
+                ));
             }
         }
     }
@@ -421,6 +422,36 @@ fn format_run_failure_detail(subject: &str, reason: impl std::fmt::Display) -> S
     )
 }
 
+fn format_failed_task_output_header(name: &str) -> String {
+    format!(
+        "  {} {} output {}",
+        install_ui::dim("──"),
+        install_ui::yellow(name),
+        install_ui::dim(&"─".repeat(40))
+    )
+}
+
+fn format_failed_task_output_footer() -> String {
+    format!("  {}", install_ui::dim(&"─".repeat(50)))
+}
+
+fn format_cache_summary(cached: usize, missed: usize) -> String {
+    format!(
+        "  {} {} hit, {} miss",
+        install_ui::dim("Cache:"),
+        install_ui::status_ok(&cached.to_string()),
+        missed
+    )
+}
+
+fn format_workspace_member_scripts_header(member_name: &str, scripts: &[String]) -> String {
+    format!(
+        "  {} {}",
+        install_ui::cyan(&format!("[{member_name}]")),
+        install_ui::yellow(&scripts.join(", "))
+    )
+}
+
 fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Duration) {
     if results.len() <= 1 {
         return; // No summary for single task
@@ -440,7 +471,7 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
         .sum();
     let actual_ms = total_elapsed.as_millis();
 
-    eprintln!();
+    install_ui::detail("");
     if failed == 0 {
         let speedup = if sequential_ms > 0 && actual_ms < sequential_ms {
             let pct = ((sequential_ms - actual_ms) as f64 / sequential_ms as f64 * 100.0) as u32;
@@ -458,7 +489,7 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
             "{} completed in {}{}",
             ran_count,
             format_duration(total_elapsed),
-            speedup.dimmed(),
+            install_ui::dim(&speedup),
         ));
     } else {
         // denominator excludes skipped tasks
@@ -475,11 +506,10 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
         install_ui::detail(&format!("  {} skipped (dependency failed)", skipped));
     }
     if cached > 0 {
-        eprintln!(
-            "  Cache: {} hit, {} miss",
+        install_ui::detail(&format_cache_summary(
             cached,
             results.len() - cached - skipped,
-        );
+        ));
     }
 
     // Per-task breakdown when there's something interesting to show
@@ -697,11 +727,12 @@ async fn run_tasks_parallel(
     // Show execution plan when there's parallelism
     let total_tasks: usize = levels.iter().map(|l| l.len()).sum();
     if levels.len() > 1 || levels.first().map_or(0, |l| l.len()) > 1 {
-        eprintln!(
-            "  Running {} tasks ({} parallel groups)...\n",
-            total_tasks,
-            levels.len(),
-        );
+        install_ui::phase(&format!(
+            "Running {} tasks {}",
+            install_ui::yellow(&total_tasks.to_string()),
+            install_ui::dim(&format!("({} parallel groups)", levels.len()))
+        ));
+        install_ui::detail("");
     }
 
     // Tier 1 (L2 + L1 follow-up): wrap shared per-call state in `Arc`
@@ -1094,14 +1125,10 @@ async fn run_tasks_parallel(
 
                 // Dump failed task output after the level completes
                 for (name, stderr) in &failed_outputs {
-                    eprintln!();
-                    eprintln!(
-                        "  \u{2500}\u{2500} {} output {}",
-                        name.bold(),
-                        "\u{2500}".repeat(40)
-                    );
+                    install_ui::detail("");
+                    install_ui::detail(&format_failed_task_output_header(name));
                     eprint!("{stderr}");
-                    eprintln!("  {}", "\u{2500}".repeat(50));
+                    install_ui::detail(&format_failed_task_output_footer());
                 }
             }
         }
@@ -1235,11 +1262,11 @@ pub async fn run_workspace(
 
         install_ui::warn("No packages matched");
         if let Some(h) = hint {
-            eprintln!();
+            install_ui::detail("");
             for line in h.lines() {
-                eprintln!("  {}", line.dimmed());
+                install_ui::detail(&format!("  {}", install_ui::dim(line)));
             }
-            eprintln!();
+            install_ui::detail("");
         }
         return Ok(());
     }
@@ -1424,11 +1451,11 @@ fn run_workspace_package(
         return None;
     }
 
-    eprintln!(
-        "\n  {} {}",
-        format!("[{member_name}]").cyan(),
-        scripts.join(", ").bold(),
-    );
+    install_ui::detail("");
+    install_ui::detail(&format_workspace_member_scripts_header(
+        member_name,
+        scripts,
+    ));
 
     // Build per-package task graph
     let task_levels = match lpm_runner::task_graph::task_levels(&pkg.scripts, &tasks, scripts) {
@@ -1562,9 +1589,12 @@ pub fn run_watch(
     lpm_task::watch::watch_and_run(
         project_dir,
         Box::new(move || {
-            // Clear screen between runs
-            print!("\x1B[2J\x1B[1;1H");
-            println!("{} running {} ...", "[watch]".dimmed(), script);
+            let mut stderr = std::io::stderr();
+            if stderr.is_terminal() {
+                let _ = write!(stderr, "\x1B[2J\x1B[1;1H");
+                let _ = stderr.flush();
+            }
+            install_ui::phase(&format!("watch running {}", install_ui::yellow(&script)));
 
             let result =
                 lpm_runner::script::run_script(&dir, &script, &args, mode.as_deref(), &hint);
@@ -2052,6 +2082,37 @@ mod tests {
         assert_eq!(
             console::strip_ansi_codes(&format_run_failure_detail("web", "exit 1")).into_owned(),
             "  ✗ web: exit 1"
+        );
+    }
+
+    #[test]
+    fn failed_task_output_header_formats_as_slim_detail_row() {
+        let plain =
+            console::strip_ansi_codes(&format_failed_task_output_header("build")).into_owned();
+
+        assert!(
+            plain.starts_with("  ── build output "),
+            "failed output header must keep the task name in a slim detail row: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn cache_summary_formats_as_slim_detail_row() {
+        assert_eq!(
+            console::strip_ansi_codes(&format_cache_summary(2, 3)).into_owned(),
+            "  Cache: 2 hit, 3 miss"
+        );
+    }
+
+    #[test]
+    fn workspace_member_header_formats_as_slim_detail_row() {
+        let scripts = vec!["build".to_string(), "test".to_string()];
+        assert_eq!(
+            console::strip_ansi_codes(&format_workspace_member_scripts_header(
+                "@app/web", &scripts
+            ))
+            .into_owned(),
+            "  [@app/web] build, test"
         );
     }
 
