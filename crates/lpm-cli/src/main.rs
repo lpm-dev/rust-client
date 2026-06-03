@@ -1074,8 +1074,8 @@ enum Commands {
     /// Manage globally-installed CLI packages under ~/.lpm/global/.
     ///
     /// Subcommands: `list` (with `--outdated`/`--verbose`), `bin`,
-    /// `path <pkg>`, `remove <pkg>` (= `lpm uninstall -g <pkg>`),
-    /// `update [<pkg>[@<spec>]]` (with `--dry-run`).
+    /// `path <pkg>`, `link [path]`, `unlink <pkg>`, `remove <pkg>`
+    /// (= `lpm uninstall -g <pkg>`), `update [<pkg>[@<spec>]]` (with `--dry-run`).
     Global {
         #[command(subcommand)]
         action: commands::global::GlobalCmd,
@@ -1111,6 +1111,9 @@ enum Commands {
 
     /// Audit installed packages for security/quality issues.
     Audit {
+        #[command(subcommand)]
+        action: Option<commands::audit::AuditCmd>,
+
         /// Minimum severity level to report (info, moderate, high).
         #[arg(long)]
         level: Option<String>,
@@ -1130,6 +1133,14 @@ enum Commands {
         /// Scan installed packages for hardcoded secrets (API keys, tokens, private keys).
         #[arg(long)]
         secrets: bool,
+
+        /// Alias for `lpm audit fix`.
+        #[arg(long, conflicts_with = "secrets")]
+        fix: bool,
+
+        /// With `--fix`, show the fixes that would be applied without changing files.
+        #[arg(long, requires = "fix")]
+        dry_run: bool,
     },
 
     /// Query installed packages using CSS-like selectors.
@@ -2649,6 +2660,23 @@ where
     flag.as_ref() == std::ffi::OsStr::new("--version")
 }
 
+fn args_for_cli_parse<I>(args: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut args: Vec<std::ffi::OsString> = args.into_iter().collect();
+    let Some(program) = args.first() else {
+        return args;
+    };
+    let Some(stem) = std::path::Path::new(program).file_stem() else {
+        return args;
+    };
+    if stem == std::ffi::OsStr::new("lpx") {
+        args.insert(1, std::ffi::OsString::from("dlx"));
+    }
+    args
+}
+
 fn command_needs_global_state(cmd: &Commands) -> bool {
     match cmd {
         // `install -g` (the actual install pipeline is wired; the
@@ -3090,7 +3118,7 @@ async fn async_main() -> Result<()> {
     }))
     .ok();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(args_for_cli_parse(std::env::args_os()));
 
     // Color policy is already initialized at the top of `fn main()` via
     // the argv pre-scan. Re-run init here so any difference between the
@@ -4253,12 +4281,29 @@ async fn async_main() -> Result<()> {
             commands::remove::run(&cwd, &package, cli.json).await
         }
         Commands::Audit {
+            action,
             level,
             fail_on,
             secrets,
+            fix,
+            dry_run,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if secrets {
+            if let Some(commands::audit::AuditCmd::Fix { dry_run }) = action {
+                if fix {
+                    return Err(lpm_common::LpmError::Script(
+                        "use either `lpm audit fix` or `lpm audit --fix`, not both".into(),
+                    ));
+                }
+                if secrets {
+                    return Err(lpm_common::LpmError::Script(
+                        "`lpm audit fix` cannot be combined with `--secrets`".into(),
+                    ));
+                }
+                commands::audit::run_fix(&client, &cwd, cli.json, dry_run).await
+            } else if fix {
+                commands::audit::run_fix(&client, &cwd, cli.json, dry_run).await
+            } else if secrets {
                 commands::audit::run_secrets(&cwd, cli.json, fail_on.as_deref()).await
             } else {
                 commands::audit::run(
@@ -5562,6 +5607,39 @@ mod tests {
             "--version",
             "1.0.0"
         ]));
+    }
+
+    #[test]
+    fn args_for_cli_parse_maps_lpx_executable_to_dlx_command() {
+        let args = args_for_cli_parse(
+            ["lpx", "cowsay", "--version"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Commands::Dlx { package, args, .. }) = cli.command else {
+            panic!("lpx executable alias must parse as the dlx command");
+        };
+
+        assert_eq!(package, "cowsay");
+        assert_eq!(args, vec!["--version"]);
+    }
+
+    #[test]
+    fn args_for_cli_parse_leaves_lpm_invocations_unchanged() {
+        let args = args_for_cli_parse(
+            ["lpm", "dlx", "cowsay"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsString::from("lpm"),
+                std::ffi::OsString::from("dlx"),
+                std::ffi::OsString::from("cowsay"),
+            ],
+        );
     }
 
     #[test]

@@ -2005,6 +2005,94 @@ impl RegistryClient {
         finish!(Ok(metadata))
     }
 
+    /// Fetch npm package metadata from the configured LPM Worker proxy
+    /// without falling back to public npm.
+    ///
+    /// Diagnostic commands use this when the lockfile already records
+    /// the configured LPM registry as the package source. Re-querying
+    /// that same origin is not a new disclosure, but falling back to
+    /// `registry.npmjs.org` on a proxy miss would be.
+    pub async fn get_npm_package_metadata_proxy_only(
+        &self,
+        name: &str,
+    ) -> Result<PackageMetadata, LpmError> {
+        let cache_key = format!("npm:{name}");
+        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
+            tracing::debug!("metadata cache hit (proxy-only): npm:{name}");
+            return Ok(cached);
+        }
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
+        let cache_content = self.read_cache_content(&cache_key);
+        let mut req = self.build_get(&proxy_url).await?;
+        if let Some(etag) = cache_content
+            .as_ref()
+            .and_then(|content| content.etag.as_deref())
+        {
+            req = req.header("If-None-Match", etag);
+        }
+
+        let mut response = match self.send_with_retry(req).await {
+            Ok(response) => response,
+            Err(err) => return finish!(Err(err)),
+        };
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if let Some(path) = self.cache_path(&cache_key) {
+                let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
+            }
+            if let Some(content) = cache_content
+                && let Some(meta) = Self::deserialize_cached_metadata(&content.data)
+            {
+                tracing::debug!("metadata cache revalidated (proxy-only 304): npm:{name}");
+                return finish!(Ok(meta));
+            }
+            response = match self
+                .send_with_retry(self.build_get(&proxy_url).await?)
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => return finish!(Err(err)),
+            };
+        }
+
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_package_metadata_proxy_only {name}"),
+        )
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(err) => return finish!(Err(err)),
+        };
+        if metadata.name == name
+            || metadata
+                .versions
+                .values()
+                .any(|version| version.name == name)
+        {
+            self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+            return finish!(Ok(metadata));
+        }
+        finish!(Err(LpmError::Registry(format!(
+            "proxy returned metadata for unexpected package '{}' when requesting '{name}'",
+            metadata.name
+        ))))
+    }
+
     /// Fetch npm metadata honoring an explicit upstream route.
     ///
     /// [`UpstreamRoute::LpmWorker`] → full three-tier chain via

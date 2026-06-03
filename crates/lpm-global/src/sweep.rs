@@ -242,6 +242,71 @@ pub fn validated_install_root_relative(
     validated_tombstone_path(global_root, relative_path)
 }
 
+/// Validate a local-link root stored in the global manifest.
+///
+/// Local links use real directories under `links/<safe-package-name>`.
+/// They are not tombstones and must never be swept by the install-root
+/// janitor, but they need the same path-poisoning bar before any caller
+/// joins a manifest string and deletes or walks it.
+pub fn validated_local_link_root_relative(
+    global_root: &Path,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
+    if relative_path.is_empty() {
+        return Err("empty local-link root path (manifest corrupt?)".to_string());
+    }
+    let candidate = Path::new(relative_path);
+    let mut segments: Vec<&std::ffi::OsStr> = Vec::with_capacity(2);
+    for component in candidate.components() {
+        match component {
+            Component::Normal(s) => segments.push(s),
+            Component::ParentDir => {
+                return Err(format!(
+                    "refusing local-link root {relative_path:?}: contains parent-directory \
+                     traversal — manifest may be poisoned"
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "refusing local-link root {relative_path:?}: not a relative path under \
+                     the global root — manifest may be poisoned"
+                ));
+            }
+            Component::CurDir => {
+                return Err(format!(
+                    "refusing local-link root {relative_path:?}: contains current-directory \
+                     reference — real local-link roots never include `./`"
+                ));
+            }
+        }
+    }
+    if segments.len() != 2 {
+        return Err(format!(
+            "refusing local-link root {relative_path:?}: expected exactly \
+             `links/<name>` (got {} segment(s))",
+            segments.len()
+        ));
+    }
+    if segments[0] != std::ffi::OsStr::new("links") {
+        return Err(format!(
+            "refusing local-link root {relative_path:?}: first segment must be `links/`"
+        ));
+    }
+    if segments[1].is_empty() {
+        return Err(format!(
+            "refusing local-link root {relative_path:?}: leaf must not be empty"
+        ));
+    }
+
+    let joined = global_root.join(candidate);
+    if !joined.starts_with(global_root) {
+        return Err(format!(
+            "refusing local-link root {relative_path:?}: joined path escapes the global root"
+        ));
+    }
+    Ok(joined)
+}
+
 /// Same shape check, but takes an absolute path. Used by recovery
 /// when the path source is a WAL Intent's `new_root_path` field —
 /// recovery doesn't know the relative form a priori. Refuses absolute

@@ -24,9 +24,8 @@ fn write_minimal_lockfile(project: &TempProject, name: &str, version: &str) {
     write_minimal_lockfile_with_source(project, name, version, "registry+https://lpm.dev");
 }
 
-/// Write a minimal lpm.lock with an explicit source URL — needed for
-/// the M15 gate which only sends a package name to the public npm if
-/// the lockfile records an npmjs.org/npmjs.com source for it.
+/// Write a minimal lpm.lock with an explicit source URL so source-gated
+/// metadata lookups can be exercised directly.
 fn write_minimal_lockfile_with_source(
     project: &TempProject,
     name: &str,
@@ -98,12 +97,9 @@ async fn outdated_empty_deps_emits_empty_json_envelope() {
 /// default report instead of returning a false-clean zero-count
 /// envelope.
 ///
-/// M15: the lockfile must record `registry+https://registry.npmjs.org`
-/// for the M15 privacy gate to forward the name to the public npm
-/// registry. A non-public-npm source (lpm.dev, Verdaccio, GitHub
-/// Packages) is now treated as private and skipped, see the
-/// `outdated_skips_private_named_packages_without_npm_public_source`
-/// regression test below.
+/// The lockfile must record `registry+https://registry.npmjs.org`
+/// before the privacy gate forwards the name to public npm. Sources
+/// without public npm or LPM-proxy attribution are skipped instead.
 #[tokio::test]
 async fn outdated_reports_non_lpm_packages_by_default() {
     let project = TempProject::empty(
@@ -166,6 +162,75 @@ async fn outdated_reports_non_lpm_packages_by_default() {
     assert_eq!(entry["latest"], serde_json::json!("9.9.9"));
     assert_eq!(entry["section"], serde_json::json!("dependencies"));
     assert_eq!(entry["outdated"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn outdated_reports_npm_packages_installed_through_configured_lpm_registry() {
+    let project = TempProject::empty(
+        r#"{"name":"proxy-installed","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "ms",
+        "2.1.4",
+        &[
+            (
+                "2.1.3",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.1.3")),
+            ),
+            (
+                "2.1.4",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.1.4")),
+            ),
+        ],
+    )
+    .await;
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn lpm outdated --json");
+    assert!(
+        out.status.success(),
+        "outdated should include npm packages previously resolved through the configured LPM registry\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+    assert_eq!(
+        envelope["count"],
+        serde_json::json!(1),
+        "configured-registry npm package should be checked; lockfile:\n{}\n\nenvelope:\n{envelope:#}",
+        project.read_file("lpm.lock"),
+    );
+    assert_eq!(envelope["outdated_count"], serde_json::json!(1));
+    assert_eq!(envelope["packages"][0]["name"], serde_json::json!("ms"));
+    assert_eq!(
+        envelope["packages"][0]["current"],
+        serde_json::json!("2.1.3")
+    );
+    assert_eq!(
+        envelope["packages"][0]["latest"],
+        serde_json::json!("2.1.4")
+    );
+    assert!(
+        envelope.get("skipped_private").is_none(),
+        "configured-registry npm packages must not be reported as private skips: {envelope:#}",
+    );
 }
 
 #[tokio::test]
@@ -261,12 +326,9 @@ async fn outdated_registry_only_lpm_skips_non_lpm_packages() {
     assert_eq!(envelope["outdated_count"], serde_json::json!(0));
 }
 
-/// M15: a project whose lockfile records a non-public-npm source
-/// (here `registry+https://lpm.dev`, but the same holds for any
-/// private mirror — Verdaccio, GitHub Packages, self-hosted Nexus)
-/// must NOT have its package names forwarded to the public npm
-/// registry. The dep is reported under `skipped_private` and is
-/// absent from `packages`.
+/// A project whose lockfile lacks public npm or LPM-proxy attribution
+/// must not have its package names forwarded to public npm. The dep is
+/// reported under `skipped_private` and is absent from `packages`.
 #[tokio::test]
 async fn outdated_skips_private_named_packages_without_npm_public_source() {
     let project = TempProject::empty(

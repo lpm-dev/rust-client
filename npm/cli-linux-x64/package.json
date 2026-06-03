@@ -14,7 +14,8 @@
     "x64"
   ],
   "files": [
-    "lpm"
+    "lpm",
+    "lpx"
   ],
   "preferUnplugged": true
 }

@@ -1,5 +1,5 @@
 use crate::install_ui;
-use crate::npm_public_source::lockfile_source_is_npm_public;
+use crate::npm_public_source::{NpmMetadataSource, lockfile_npm_metadata_source};
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
@@ -95,24 +95,23 @@ pub async fn run(
             };
             client.get_package_metadata(&pkg_name).await
         } else if include_npm {
-            // M15: only query the public npm registry for packages
-            // whose lockfile source ALREADY routes through an npm
-            // registry. Querying the public npm registry for a
-            // package whose source is a workspace member, a `file:`
-            // dir, a `link:` dep, a private git URL, or a custom
-            // registry would leak the private package name to a
-            // public service — a free dependency-confusion oracle
-            // for typosquatters.
-            //
-            // No lockfile entry → no source attribution → refuse to
-            // leak the name. The operator should run `lpm install`
-            // first so the source is recorded, then re-run
-            // `lpm outdated --include-npm`.
-            if !lockfile_source_is_npm_public(lockfile.as_ref(), &dep.name) {
-                skipped_private.insert(dep.name.clone());
-                continue;
+            // Only query metadata endpoints that the lockfile already
+            // proves saw this package name: public npm directly, or the
+            // configured LPM registry worker. Unknown/custom sources are
+            // skipped so private package names are not disclosed to a new
+            // service.
+            match lockfile_npm_metadata_source(lockfile.as_ref(), &dep.name, client) {
+                Some(NpmMetadataSource::PublicNpm) => {
+                    client.get_npm_package_metadata(&dep.name).await
+                }
+                Some(NpmMetadataSource::ConfiguredRegistry) => {
+                    client.get_npm_package_metadata_proxy_only(&dep.name).await
+                }
+                None => {
+                    skipped_private.insert(dep.name.clone());
+                    continue;
+                }
             }
-            client.get_npm_package_metadata(&dep.name).await
         } else {
             continue;
         };
@@ -176,7 +175,7 @@ pub async fn run(
             json.as_object_mut().unwrap().insert(
                 "skipped_private_reason".into(),
                 serde_json::json!(
-                    "Packages without a recorded npm-public source were skipped to avoid leaking private names to registry.npmjs.org. Run `lpm install` to resolve sources, then re-run."
+                    "Packages without a recorded public npm or LPM-registry source were skipped to avoid leaking private names to registry.npmjs.org. Run `lpm install` to resolve sources, then re-run."
                 ),
             );
         }
@@ -245,7 +244,7 @@ pub async fn run(
         if !skipped_private.is_empty() {
             let skipped_private_list = skipped_private.iter().cloned().collect::<Vec<_>>();
             install_ui::warn(&format!(
-                "skipped {} package(s) without a recorded npm-public source to avoid leaking private names to registry.npmjs.org: {}",
+                "skipped {} package(s) without a recorded public npm or LPM-registry source to avoid leaking private names to registry.npmjs.org: {}",
                 skipped_private.len(),
                 skipped_private_list.join(", "),
             ));

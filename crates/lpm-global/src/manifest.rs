@@ -102,8 +102,10 @@ pub struct PackageEntry {
     /// SRI integrity hash of the package tarball.
     pub integrity: String,
     /// `"lpm-dev"` for first-party packages, `"upstream-npm"` for the
-    /// proxied npm ecosystem. Determines which registry path
-    /// `lpm global update` queries on re-resolution.
+    /// proxied npm ecosystem, or `"local-link"` for a developer
+    /// checkout linked onto PATH. Determines which registry path
+    /// `lpm global update` queries on re-resolution; local links are
+    /// intentionally skipped by registry update flows.
     pub source: PackageSource,
     /// When the install committed.
     pub installed_at: DateTime<Utc>,
@@ -155,6 +157,8 @@ pub enum PackageSource {
     LpmDev,
     /// Proxied npm-ecosystem package.
     UpstreamNpm,
+    /// Local package checkout linked into the global PATH surface.
+    LocalLink,
 }
 
 // ─── Read / write ─────────────────────────────────────────────────────

@@ -227,8 +227,9 @@ fn collect_all_targets(root: &LpmRoot) -> Result<Vec<Target>, LpmError> {
     let manifest = read_for(root)?;
     Ok(manifest
         .packages
-        .keys()
-        .map(|name| Target {
+        .iter()
+        .filter(|(_, entry)| entry.source != PackageSource::LocalLink)
+        .map(|(name, _)| Target {
             name: name.clone(),
             new_intent: None,
         })
@@ -306,6 +307,13 @@ async fn plan_upgrade(
             target.name, target.name
         ))
     })?;
+    if active.source == PackageSource::LocalLink {
+        return Err(LpmError::Script(format!(
+            "'{}' is a local global link. Edit the linked checkout directly, or run \
+             `lpm global unlink {}` and `lpm global link <path>` if the package metadata changed.",
+            target.name, target.name
+        )));
+    }
 
     // `decide_saved_dependency_spec` needs a UserSaveIntent. For bulk
     // update / `lpm global update <pkg>`, we re-resolve against the
