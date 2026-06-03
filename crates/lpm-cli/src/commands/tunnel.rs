@@ -1,6 +1,5 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use std::fmt::Display;
 use std::io::IsTerminal;
@@ -135,8 +134,16 @@ async fn run_start(
         && !d.contains('.')
     {
         install_ui::warn("Missing base domain.");
-        eprintln!("  Available: lpm.fyi, lpm.llc");
-        eprintln!("  Example: lpm tunnel start --domain {d}.lpm.llc");
+        install_ui::detail(&format!(
+            "  {} {}",
+            install_ui::dim("Available:"),
+            install_ui::yellow("lpm.fyi, lpm.llc")
+        ));
+        install_ui::detail(&format!(
+            "  {} {}",
+            install_ui::dim("Example:"),
+            install_ui::yellow(&format!("lpm tunnel start --domain {d}.lpm.llc"))
+        ));
         return Err(LpmError::Tunnel("missing base domain".into()));
     }
 
@@ -286,12 +293,12 @@ async fn run_start(
                     );
                 }
                 tunnel_detail("domain", &session.domain);
-                eprintln!();
+                install_ui::detail("");
                 install_ui::done("Listening for requests");
                 if inspector_url.is_some() {
-                    eprintln!("{}", format_tunnel_footer(true));
+                    install_ui::detail(&format_tunnel_footer(true));
                 } else {
-                    eprintln!("{}", format_tunnel_footer(false));
+                    install_ui::detail(&format_tunnel_footer(false));
                 }
             }
         },
@@ -409,7 +416,7 @@ async fn run_list(
     );
     install_ui::phase(&heading);
 
-    eprintln!("    {:<11} {used} of {limit}", "used");
+    tunnel_detail("used", format!("{used} of {limit}"));
 
     match domains {
         Some(doms) if !doms.is_empty() => {
@@ -417,15 +424,20 @@ async fn run_list(
                 let _domain = d["domain"].as_str().unwrap_or("?");
                 let url = d["url"].as_str().unwrap_or("?");
                 let base = d["baseDomain"].as_str().unwrap_or("?");
-                eprintln!("    {} {}", url.bold(), format!("({base})").dimmed());
+                install_ui::detail(&format!(
+                    "    {} {}",
+                    install_ui::url(url),
+                    install_ui::dim(&format!("({base})"))
+                ));
             }
         }
         _ => {
-            eprintln!("    {}", "No domains claimed".dimmed());
-            eprintln!(
-                "    {}",
-                "Claim one with: lpm tunnel claim <name>.lpm.llc".dimmed()
-            );
+            install_ui::detail(&format!("    {}", install_ui::dim("No domains claimed")));
+            install_ui::detail(&format!(
+                "    {} {}",
+                install_ui::dim("Claim one with:"),
+                install_ui::yellow("lpm tunnel claim <name>.lpm.llc")
+            ));
         }
     }
 
@@ -448,11 +460,15 @@ async fn run_domains(client: &RegistryClient, json_output: bool) -> Result<(), L
             let domain = d["domain"].as_str().unwrap_or("?");
             let plan = d["planRequired"].as_str().unwrap_or("?");
             let plan_badge = if plan == "free" {
-                "free".green().to_string()
+                install_ui::status_ok("free")
             } else {
-                "pro".cyan().to_string()
+                install_ui::cyan("pro")
             };
-            eprintln!("    {:<15} {}", domain, plan_badge);
+            install_ui::detail(&format!(
+                "    {:<15} {}",
+                install_ui::yellow(domain),
+                plan_badge
+            ));
         }
     }
 
@@ -473,7 +489,7 @@ async fn run_inspect_ui(_project_dir: &Path, inspect_port: Option<u16>) -> Resul
     let handle = lpm_inspect::start(state, inspect_port.unwrap_or(0)).await?;
 
     install_ui::done(&format!("Inspector: {}", handle.url));
-    eprintln!("  {}", "Press Ctrl+C to stop".dimmed());
+    install_ui::detail(&format!("  {}", install_ui::dim("Press Ctrl+C to stop")));
 
     // Block until Ctrl+C
     tokio::signal::ctrl_c()
@@ -541,33 +557,19 @@ async fn run_inspect(
         return Ok(());
     }
 
-    eprintln!("  Last {} webhooks:\n", entries.len());
+    install_ui::phase(&format!("Last {} webhooks", entries.len()));
     for (i, entry) in entries.iter().enumerate() {
-        let status = style_http_status(entry.status);
-        // Extract HH:MM:SS from ISO 8601 timestamp (safe: ts is always >=19 chars)
-        let time = if entry.ts.len() >= 19 {
-            &entry.ts[11..19]
-        } else {
-            &entry.ts
-        };
-
-        eprintln!(
-            "  #{:<3} {} {:<35} {}  {}ms  {}",
-            i + 1,
-            entry.method,
-            entry.path,
-            status,
-            entry.ms,
-            time,
-        );
+        install_ui::detail(&format_tunnel_log_entry(Some(i + 1), entry, false));
         if !entry.summary.is_empty() {
-            eprintln!("        {}", entry.summary.dimmed());
+            install_ui::detail(&format!("        {}", install_ui::dim(&entry.summary)));
         }
     }
-    eprintln!(
-        "\n  {} webhooks. Use --detail N for full request/response.",
-        entries.len()
-    );
+    install_ui::detail("");
+    install_ui::detail(&format!(
+        "  {} {}",
+        install_ui::status_ok(&entries.len().to_string()),
+        install_ui::dim("webhooks. Use --detail N for full request/response.")
+    ));
 
     Ok(())
 }
@@ -608,8 +610,15 @@ async fn run_replay(
         entries.get(n.saturating_sub(1))
     } else {
         install_ui::warn("Specify a webhook number or use --last");
-        eprintln!("  Usage: lpm tunnel replay 3");
-        eprintln!("         lpm tunnel replay --last");
+        install_ui::detail(&format!(
+            "  {} {}",
+            install_ui::dim("Usage:"),
+            install_ui::yellow("lpm tunnel replay 3")
+        ));
+        install_ui::detail(&format!(
+            "         {}",
+            install_ui::yellow("lpm tunnel replay --last")
+        ));
         return Ok(());
     };
 
@@ -619,8 +628,16 @@ async fn run_replay(
         .ok_or_else(|| LpmError::Tunnel("Webhook body data not found".into()))?;
 
     let idx = number.unwrap_or(1);
-    eprintln!("  Replaying #{}...", idx);
-    eprintln!("  {} {} — {}", webhook.method, webhook.path, entry.summary);
+    install_ui::phase(&format!(
+        "Replaying #{}",
+        install_ui::yellow(&idx.to_string())
+    ));
+    install_ui::detail(&format!(
+        "  {} {} — {}",
+        style_http_method(&webhook.method),
+        install_ui::cyan(&webhook.path),
+        lpm_common::sanitize_for_terminal(&entry.summary)
+    ));
 
     let replay_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -631,12 +648,13 @@ async fn run_replay(
 
     let status = style_http_status(result.status);
     let ok_suffix = if result.status < 300 { " OK" } else { "" };
-    eprintln!(
-        "  -> {}{} ({})",
+    install_ui::detail(&format!(
+        "  {} {}{} {}",
+        install_ui::dim("->"),
         status,
         ok_suffix,
-        format!("{}ms", result.duration_ms).dimmed()
-    );
+        install_ui::dim(&format!("({}ms)", result.duration_ms))
+    ));
 
     // Compare with original response to give actionable feedback
     if result.status < 400 && webhook.response_status >= 400 {
@@ -645,7 +663,7 @@ async fn run_replay(
             webhook.response_status, result.status
         ));
     } else if result.status >= 400 && webhook.response_status >= 400 {
-        eprintln!("  {} Still failing.", "x".red());
+        install_ui::failed("Still failing.");
     }
 
     Ok(())
@@ -691,19 +709,9 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
         return Ok(());
     }
 
-    eprintln!("  {} webhooks:\n", entries.len());
+    install_ui::phase(&format!("{} webhooks", entries.len()));
     for entry in &entries {
-        let status = style_http_status(entry.status);
-        let time = if entry.ts.len() >= 19 {
-            &entry.ts[11..19]
-        } else {
-            &entry.ts
-        };
-
-        eprintln!(
-            "  {}  {} {:<35} {}  {}ms  {}",
-            time, entry.method, entry.path, status, entry.ms, entry.summary,
-        );
+        install_ui::detail(&format_tunnel_log_entry(None, entry, true));
     }
 
     Ok(())
@@ -712,12 +720,12 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
 // ── Helper functions ────────────────────────────────────────────────
 
 fn tunnel_detail(label: &str, value: impl Display) {
-    eprintln!("{}", format_tunnel_detail(label, value));
+    install_ui::detail(&format_tunnel_detail(label, value));
 }
 
 fn format_tunnel_detail(label: &str, value: impl Display) -> String {
     let value = style_tunnel_detail_value(label, &value.to_string());
-    format!("    {} {value}", format!("{label:<11}").dimmed())
+    format!("    {} {value}", install_ui::dim(&format!("{label:<11}")))
 }
 
 fn style_tunnel_detail_value(label: &str, value: &str) -> String {
@@ -832,24 +840,53 @@ fn tunnel_control_from_key(event: crossterm::event::KeyEvent) -> TunnelControl {
 }
 
 fn print_tunnel_request(webhook: &lpm_tunnel::webhook::CapturedWebhook) {
-    eprintln!("{}", format_tunnel_request(webhook));
+    install_ui::detail(&format_tunnel_request(webhook));
 }
 
 fn format_tunnel_request(webhook: &lpm_tunnel::webhook::CapturedWebhook) -> String {
     format!(
         "  {} {} {} {} {}",
-        "→".dimmed(),
+        install_ui::dim("→"),
         style_http_method(&webhook.method),
-        webhook.path,
+        install_ui::cyan(&webhook.path),
         style_http_status(webhook.response_status),
-        format!("{}ms", webhook.duration_ms).dimmed(),
+        install_ui::dim(&format!("{}ms", webhook.duration_ms)),
     )
+}
+
+fn format_tunnel_log_entry(
+    index: Option<usize>,
+    entry: &lpm_tunnel::webhook_log::WebhookLogEntry,
+    include_summary: bool,
+) -> String {
+    let time = tunnel_entry_time(&entry.ts);
+    let prefix = index.map_or_else(
+        || format!("  {} ", install_ui::dim(time)),
+        |idx| format!("  #{idx:<3}"),
+    );
+    let summary = if include_summary {
+        format!("  {}", lpm_common::sanitize_for_terminal(&entry.summary))
+    } else {
+        String::new()
+    };
+    format!(
+        "{prefix} {} {:<35} {}  {}{}",
+        style_http_method(&entry.method),
+        install_ui::cyan(&entry.path),
+        style_http_status(entry.status),
+        install_ui::dim(&format!("{}ms", entry.ms)),
+        summary
+    )
+}
+
+fn tunnel_entry_time(ts: &str) -> &str {
+    if ts.len() >= 19 { &ts[11..19] } else { ts }
 }
 
 fn style_http_method(method: &str) -> String {
     match method {
-        "GET" => method.blue(),
-        "POST" => method.yellow(),
+        "GET" => install_ui::url(method),
+        "POST" => install_ui::yellow(method),
         _ => method.to_string(),
     }
 }
@@ -945,24 +982,42 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
         .provider
         .map_or_else(|| "unknown".to_string(), |p| p.to_string());
 
-    eprintln!();
-    eprintln!("  {} Webhook #{index}", "━".repeat(40).dimmed());
-    eprintln!();
-    eprintln!(
+    install_ui::detail("");
+    install_ui::phase(&format!(
+        "Webhook #{}",
+        install_ui::yellow(&index.to_string())
+    ));
+    install_ui::detail(&format!(
         "  {} {} {}",
-        "Request:".bold(),
-        webhook.method,
-        webhook.path,
-    );
-    eprintln!("  {} {}", "Provider:".dimmed(), provider_display);
-    eprintln!("  {} {}", "Response:".bold(), status,);
-    eprintln!("  {} {}ms", "Duration:".dimmed(), webhook.duration_ms);
-    eprintln!("  {} {}", "Time:".dimmed(), webhook.timestamp);
+        install_ui::section("Request:"),
+        style_http_method(&webhook.method),
+        install_ui::cyan(&webhook.path),
+    ));
+    install_ui::detail(&format!(
+        "  {} {}",
+        install_ui::dim("Provider:"),
+        install_ui::yellow(&provider_display)
+    ));
+    install_ui::detail(&format!(
+        "  {} {}",
+        install_ui::section("Response:"),
+        status,
+    ));
+    install_ui::detail(&format!(
+        "  {} {}",
+        install_ui::dim("Duration:"),
+        install_ui::dim(&format!("{}ms", webhook.duration_ms))
+    ));
+    install_ui::detail(&format!(
+        "  {} {}",
+        install_ui::dim("Time:"),
+        install_ui::dim(&webhook.timestamp.to_string())
+    ));
 
     // Request headers
     if !webhook.request_headers.is_empty() {
-        eprintln!();
-        eprintln!("  {}", "Request Headers:".bold());
+        install_ui::detail("");
+        install_ui::detail(&format!("  {}", install_ui::section("Request Headers:")));
         for (key, value) in &webhook.request_headers {
             // Mask sensitive values (auth tokens, signatures)
             let lower_key = key.to_lowercase();
@@ -972,14 +1027,18 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
                 } else {
                     value.clone()
                 };
-            eprintln!("    {}: {}", key.dimmed(), display_value);
+            install_ui::detail(&format!(
+                "    {}: {}",
+                install_ui::dim(key),
+                lpm_common::sanitize_for_terminal(&display_value)
+            ));
         }
     }
 
     // Request body (truncated for large payloads)
     if !webhook.request_body.is_empty() {
-        eprintln!();
-        eprintln!("  {}", "Request Body:".bold());
+        install_ui::detail("");
+        install_ui::detail(&format!("  {}", install_ui::section("Request Body:")));
         // Try interpreting as UTF-8 for display
         let body_str = String::from_utf8_lossy(&webhook.request_body);
         // Try pretty-printing JSON
@@ -993,30 +1052,32 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
                 &lines
             };
             for line in display_lines {
-                eprintln!("    {line}");
+                install_ui::detail(&format!("    {line}"));
             }
             if lines.len() > 40 {
-                eprintln!("    {} ({} more lines)", "...".dimmed(), lines.len() - 40);
+                install_ui::detail(&format!(
+                    "    {}",
+                    install_ui::dim(&format!("... ({} more lines)", lines.len() - 40))
+                ));
             }
         } else if body_str.len() > 2000 {
-            eprintln!("    {}", &body_str[..2000]);
-            eprintln!(
-                "    {} ({} bytes total)",
-                "...".dimmed(),
-                webhook.request_body.len()
-            );
+            install_ui::detail(&format!("    {}", &body_str[..2000]));
+            install_ui::detail(&format!(
+                "    {}",
+                install_ui::dim(&format!("... ({} bytes total)", webhook.request_body.len()))
+            ));
         } else {
-            eprintln!("    {body_str}");
+            install_ui::detail(&format!("    {body_str}"));
         }
     }
 
     // Signature diagnostic
     if let Some(ref diag) = webhook.signature_diagnostic {
-        eprintln!();
-        eprintln!("  {} {}", "Signature Issue:".yellow().bold(), diag);
+        install_ui::detail("");
+        install_ui::warn(&format!("Signature issue: {diag}"));
     }
 
-    eprintln!();
+    install_ui::detail("");
 }
 
 /// Validate a tunnel domain for claiming.
@@ -1107,6 +1168,28 @@ mod tests {
         assert_eq!(
             console::strip_ansi_codes(&style_http_status(500)).into_owned(),
             "500"
+        );
+    }
+
+    #[test]
+    fn tunnel_log_entry_formats_as_slim_detail_row() {
+        lpm_common::color::set_enabled(false);
+        let entry = lpm_tunnel::webhook_log::WebhookLogEntry {
+            id: "wh_1".to_string(),
+            ts: "2026-05-31T12:34:56Z".to_string(),
+            method: "POST".to_string(),
+            path: "/hooks".to_string(),
+            status: 500,
+            ms: 37,
+            provider: Some("Stripe".to_string()),
+            summary: "Stripe: payment".to_string(),
+            req_size: 10,
+            res_size: 20,
+        };
+
+        assert_eq!(
+            console::strip_ansi_codes(&format_tunnel_log_entry(Some(2), &entry, true)).into_owned(),
+            "  #2   POST /hooks                              500  37ms  Stripe: payment"
         );
     }
 

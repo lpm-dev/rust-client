@@ -225,6 +225,29 @@ fn doctor_all_codes_are_superset_of_default_codes() {
     );
 }
 
+#[test]
+fn doctor_all_human_output_shows_slim_progress_on_stderr() {
+    let project = TempProject::empty(r#"{"name": "doctor-progress", "version": "1.0.0"}"#);
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("NO_COLOR", "1")
+        .args(["doctor", "--all"])
+        .output()
+        .expect("failed to run lpm doctor --all");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("› Running doctor --all checks"),
+        "human `doctor --all` must show a slim progress line on stderr while \
+         expensive checks run.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("doctor found") || stdout.contains("All "),
+        "human `doctor --all` report must remain on stdout. stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 // ─── Fast-mode human output: suppress passes except linker_mode ────
 
 /// Pins the renderer contract documented in `defaults-fixes-todo.md`:

@@ -300,7 +300,7 @@ pub async fn run(
             dev_ui::blank_line();
             dev_ui::detail_with_hint(
                 "Network",
-                &install_ui::bold(&url),
+                &install_ui::url(&url),
                 &format!("({})", primary.interface_type),
             );
 
@@ -312,7 +312,11 @@ pub async fn run(
                     } else {
                         format!("{scheme}://{}:{port}", addr.ip)
                     };
-                    dev_ui::hint_line(&format!("{} ({})", url, addr.interface_type));
+                    dev_ui::hint_line(&format!(
+                        "{} {}",
+                        install_ui::url(&url),
+                        install_ui::dim(&format!("({})", addr.interface_type))
+                    ));
                 }
             }
         } else {
@@ -345,7 +349,7 @@ pub async fn run(
                         "Mobile",
                         &format!(
                             "First time on mobile? Visit {} to install the CA certificate",
-                            install_ui::bold(&format!("http://{}:{ca_port}", primary.ip))
+                            install_ui::url(&format!("http://{}:{ca_port}", primary.ip))
                         ),
                     );
                 }
@@ -355,8 +359,8 @@ pub async fn run(
                     "Mobile",
                     &format!(
                         "enable with {} or copy {} to the device manually",
-                        install_ui::bold("--allow-ca-bootstrap"),
-                        install_ui::bold("rootCA.pem")
+                        install_ui::cyan("--allow-ca-bootstrap"),
+                        install_ui::cyan("rootCA.pem")
                     ),
                 );
             }
@@ -544,23 +548,13 @@ pub async fn run(
                     continue;
                 }
 
-                let status_indicator = if webhook.response_status >= 400 {
-                    " !"
-                } else {
-                    ""
-                };
-                let status = format_dev_webhook_status(webhook.response_status);
-
-                eprintln!(
-                    "  {} {} {} -> {} ({}ms) — {}{}",
-                    "[tunnel]".dimmed(),
-                    webhook.method,
-                    webhook.path,
-                    status,
+                install_ui::detail(&format_dev_webhook_line(
+                    &webhook.method,
+                    &webhook.path,
+                    webhook.response_status,
                     webhook.duration_ms,
-                    webhook.summary,
-                    status_indicator,
-                );
+                    &webhook.summary,
+                ));
 
                 // Show signature diagnostic if present
                 if let Some(ref diag) = webhook.signature_diagnostic {
@@ -604,7 +598,7 @@ pub async fn run(
                         "Tunnel",
                         &format!(
                             "{} → localhost:{}",
-                            install_ui::bold(&session.tunnel_url),
+                            install_ui::url(&session.tunnel_url),
                             session.local_port,
                         ),
                     );
@@ -849,7 +843,7 @@ pub async fn run(
 
     let scheme = if https { "https" } else { "http" };
     let url = format!("{scheme}://localhost:{port}");
-    dev_ui::detail("Local", &install_ui::bold(&url));
+    dev_ui::detail("Local", &install_ui::url(&url));
     dev_ui::blank_line();
 
     // Start readiness check + browser open in background thread (non-blocking)
@@ -1222,7 +1216,7 @@ fn map_proxy_register_error(err: lpm_proxy::ProxyError) -> LpmError {
 }
 
 fn local_proxy_https_start_command() -> String {
-    install_ui::bold("lpm proxy start --tls-port 9443")
+    install_ui::yellow("lpm proxy start --tls-port 9443")
 }
 
 async fn release_proxy_lease_after(
@@ -1287,9 +1281,9 @@ fn print_registered_proxy_routes(routes: &[lpm_proxy::Route]) {
     for route in routes {
         let target = format!("{} -> localhost:{}", route.host, route.upstream_port);
         if let Some(ref service) = route.service {
-            dev_ui::detail_with_hint("Proxy", &install_ui::bold(&target), service);
+            dev_ui::detail_with_hint("Proxy", &install_ui::yellow(&target), service);
         } else {
-            dev_ui::detail("Proxy", &install_ui::bold(&target));
+            dev_ui::detail("Proxy", &install_ui::yellow(&target));
         }
     }
     dev_ui::blank_line();
@@ -1620,7 +1614,7 @@ fn auto_copy_env_example(project_dir: &std::path::Path) -> Option<String> {
             dev_ui::hint_line("Review .env and fill in missing values");
             dev_ui::hint_line(&format!(
                 "Or use {} to store secrets in the vault",
-                install_ui::bold("lpm env vars set")
+                install_ui::yellow("lpm env vars set")
             ));
             Some("created from .env.example".to_string())
         }
@@ -1655,6 +1649,31 @@ fn format_dev_webhook_status(status: u16) -> String {
     } else {
         install_ui::status_ok(&status_label)
     }
+}
+
+fn format_dev_webhook_line(
+    method: &str,
+    path: &str,
+    response_status: u16,
+    duration_ms: u64,
+    summary: &str,
+) -> String {
+    let method = method.to_uppercase();
+    let warning = if response_status >= 400 {
+        format!(" {}", install_ui::yellow("!"))
+    } else {
+        String::new()
+    };
+    format!(
+        "  {} {} {} -> {} {} — {}{}",
+        install_ui::dim("tunnel"),
+        install_ui::yellow(&method),
+        install_ui::cyan(path),
+        format_dev_webhook_status(response_status),
+        install_ui::dim(&format!("({duration_ms}ms)")),
+        lpm_common::sanitize_for_terminal(summary),
+        warning
+    )
 }
 
 /// Check if a port number is in the privileged range (< 1024).
@@ -1832,6 +1851,21 @@ mod tests {
         assert_eq!(
             console::strip_ansi_codes(&format_dev_webhook_status(500)).into_owned(),
             "500"
+        );
+    }
+
+    #[test]
+    fn webhook_line_uses_slim_detail_shape_without_legacy_tag() {
+        let line = format_dev_webhook_line("post", "/stripe", 502, 37, "Stripe: payment");
+        let plain = console::strip_ansi_codes(&line);
+
+        assert_eq!(
+            plain,
+            "  tunnel POST /stripe -> 502 (37ms) — Stripe: payment !"
+        );
+        assert!(
+            !plain.contains("[tunnel]") && !plain.contains('›'),
+            "webhook row must not use the old tag or a phase glyph: {plain:?}"
         );
     }
 
