@@ -47,6 +47,7 @@
 //! lives on a real user's machine.
 
 use crate::LpmError;
+use crate::color::Painted;
 use std::path::{Path, PathBuf};
 
 /// Filename of the durable completeness marker written into every
@@ -393,7 +394,14 @@ fn derived_lock_path(data_path: &Path, suffix: &str) -> PathBuf {
 /// "you're not stuck, another LPM process is in the way" without
 /// claiming a PID we can't actually look up via `fd-lock`.
 fn default_wait_hint() {
-    eprintln!("  Waiting for another lpm store operation to finish...");
+    eprintln!("{}", format_default_wait_hint());
+}
+
+fn format_default_wait_hint() -> String {
+    format!(
+        "{} Waiting for another lpm operation to finish...",
+        "›".blue()
+    )
 }
 
 /// RAII handle for a held shared (multi-reader) lock. Drop releases.
@@ -1110,6 +1118,20 @@ mod tests {
         let p = root.install_root_for("name\0evil", "1.0.0");
         let tail = p.file_name().unwrap().to_string_lossy();
         assert!(!tail.contains('\0'), "null byte must be stripped: {tail}");
+    }
+
+    #[test]
+    fn default_wait_hint_uses_slim_phase_shape() {
+        let hint = format_default_wait_hint();
+
+        assert!(
+            hint.contains('›'),
+            "wait hint should use phase glyph: {hint:?}"
+        );
+        assert!(
+            hint.contains("Waiting for another lpm operation to finish..."),
+            "wait hint should explain contention: {hint:?}"
+        );
     }
 
     #[test]

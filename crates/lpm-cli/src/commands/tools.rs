@@ -746,7 +746,7 @@ pub async fn tool_workspace(
             if json_output {
                 emit_envelope(&failed_members, total, succeeded, failed, elapsed);
             } else {
-                eprintln!("  {} {tool}: {prewarm_err}", "\u{2716}".to_string().red(),);
+                emit_prewarm_failure(tool, &prewarm_err.to_string());
                 emit_human_summary(tool, total, succeeded, failed, target_set.len(), elapsed);
             }
             return Err(LpmError::ExitCode(1));
@@ -951,7 +951,11 @@ async fn run_one_member(
     let start = std::time::Instant::now();
 
     if matches!(stdio, StdioMode::Inherit) {
-        eprintln!("  {} {tool}", format!("[{member_name}]").bold());
+        install_ui::detail(&format!(
+            "  {} {}",
+            install_ui::cyan(&format!("[{member_name}]")),
+            install_ui::yellow(tool)
+        ));
     }
 
     let outcome_result = match tool {
@@ -985,12 +989,9 @@ async fn run_one_member(
 
     if matches!(stdio, StdioMode::Inherit) && !success {
         if let Some(code) = exit_code {
-            eprintln!(
-                "  {} {member_name}: exit {code}",
-                "\u{2716}".to_string().red()
-            );
+            install_ui::detail(&format_member_failure(member_name, &format!("exit {code}")));
         } else if let Some(ref msg) = error {
-            eprintln!("  {} {member_name}: {msg}", "\u{2716}".to_string().red());
+            install_ui::detail(&format_member_failure(member_name, msg));
         }
     }
 
@@ -1318,15 +1319,50 @@ fn emit_human_summary(
         tools_ui::done_workspace(tool, total, elapsed);
         if targeted > total {
             // Some level filtering reduced the actual run set; surface that.
-            eprintln!(
+            install_ui::detail(&format!(
                 "  {} {} targeted",
-                "·".dimmed(),
-                format!("{targeted} packages").dimmed()
-            );
+                install_ui::dim("·"),
+                install_ui::dim(&format!("{targeted} packages"))
+            ));
         }
     } else {
         tools_ui::failed_workspace(tool, succeeded, failed, total, elapsed);
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ToolFailureLine {
+    Failed(String),
+    Detail(String),
+}
+
+fn emit_prewarm_failure(tool: &str, reason: &str) {
+    for line in format_prewarm_failure(tool, reason) {
+        match line {
+            ToolFailureLine::Failed(message) => install_ui::failed(&message),
+            ToolFailureLine::Detail(message) => install_ui::detail(&message),
+        }
+    }
+}
+
+fn format_prewarm_failure(tool: &str, reason: &str) -> Vec<ToolFailureLine> {
+    vec![
+        ToolFailureLine::Failed(format!("{} prewarm failed", install_ui::yellow(tool))),
+        ToolFailureLine::Detail(format!(
+            "  {} {}",
+            install_ui::dim("reason"),
+            lpm_common::sanitize_for_terminal(reason)
+        )),
+    ]
+}
+
+fn format_member_failure(member_name: &str, reason: &str) -> String {
+    format!(
+        "  {} {}: {}",
+        install_ui::red("✗"),
+        install_ui::yellow(member_name),
+        lpm_common::sanitize_for_terminal(reason)
+    )
 }
 
 #[cfg(test)]
@@ -1371,6 +1407,38 @@ mod tests {
             &["--reporter".to_string(), "; echo pwned".to_string()],
         );
         assert_eq!(cmd, "vitest run '--reporter' '; echo pwned'");
+    }
+
+    #[test]
+    fn prewarm_failure_formats_as_slim_failure_with_reason_detail() {
+        let lines = format_prewarm_failure("lint", "download failed");
+        let plain: Vec<ToolFailureLine> = lines
+            .into_iter()
+            .map(|line| match line {
+                ToolFailureLine::Failed(message) => {
+                    ToolFailureLine::Failed(console::strip_ansi_codes(&message).into_owned())
+                }
+                ToolFailureLine::Detail(message) => {
+                    ToolFailureLine::Detail(console::strip_ansi_codes(&message).into_owned())
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            plain,
+            vec![
+                ToolFailureLine::Failed("lint prewarm failed".to_string()),
+                ToolFailureLine::Detail("  reason download failed".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn member_failure_formats_as_slim_detail_row() {
+        assert_eq!(
+            console::strip_ansi_codes(&format_member_failure("web", "exit 1")).into_owned(),
+            "  ✗ web: exit 1"
+        );
     }
 
     #[test]

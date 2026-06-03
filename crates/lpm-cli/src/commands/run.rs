@@ -384,31 +384,41 @@ struct TaskResult {
 
 fn print_task_result(result: &TaskResult) {
     if result.skipped {
-        eprintln!(
+        install_ui::detail(&format!(
             "  {} {}   {}",
-            "\u{2298}".dimmed(),
-            result.name.dimmed(),
-            "skipped".dimmed(),
-        );
+            install_ui::dim("⊘"),
+            install_ui::dim(&result.name),
+            install_ui::dim("skipped"),
+        ));
     } else if result.success {
         let timing = format_duration(result.duration);
         let cache_label = if result.cached { ", cached" } else { "" };
-        eprintln!(
+        install_ui::detail(&format!(
             "  {} {}   passed ({}{})",
-            "\u{2714}".green(),
-            result.name.bold(),
+            install_ui::status_ok("✓"),
+            install_ui::yellow(&result.name),
             timing,
             cache_label,
-        );
+        ));
     } else {
         let timing = format_duration(result.duration);
-        eprintln!(
+        install_ui::detail(&format!(
             "  {} {}   failed (exit 1, {})",
-            "\u{2716}".red(),
-            result.name.bold(),
+            install_ui::red("✗"),
+            install_ui::yellow(&result.name),
             timing,
-        );
+        ));
     }
+}
+
+fn format_run_failure_detail(subject: &str, reason: impl std::fmt::Display) -> String {
+    let reason = reason.to_string();
+    format!(
+        "  {} {}: {}",
+        install_ui::red("✗"),
+        install_ui::yellow(subject),
+        lpm_common::sanitize_for_terminal(&reason)
+    )
 }
 
 fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Duration) {
@@ -444,13 +454,12 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
         };
         // use ran count (excludes skipped) in summary
         let ran_count = results.iter().filter(|r| !r.skipped).count();
-        eprintln!(
-            "  {} {} completed in {}{}",
-            "\u{2714}".green(),
+        install_ui::done(&format!(
+            "{} completed in {}{}",
             ran_count,
             format_duration(total_elapsed),
             speedup.dimmed(),
-        );
+        ));
     } else {
         // denominator excludes skipped tasks
         let ran = results.len() - skipped;
@@ -459,17 +468,11 @@ fn print_results_summary(results: &[TaskResult], total_elapsed: std::time::Durat
         } else {
             String::new()
         };
-        eprintln!(
-            "  {} {} of {} tasks failed.{}",
-            "\u{2716}".red(),
-            failed,
-            ran,
-            skip_note,
-        );
+        install_ui::failed(&format!("{failed} of {ran} tasks failed.{skip_note}"));
     }
 
     if skipped > 0 {
-        eprintln!("  {} skipped (dependency failed)", skipped);
+        install_ui::detail(&format!("  {} skipped (dependency failed)", skipped));
     }
     if cached > 0 {
         eprintln!(
@@ -1073,7 +1076,10 @@ async fn run_tasks_parallel(
                         }
                         Err(_) => {
                             let name = chunk_names[i].clone();
-                            eprintln!("  {} {} thread panicked", "\u{2716}".red(), name);
+                            install_ui::detail(&format_run_failure_detail(
+                                &name,
+                                "thread panicked",
+                            ));
                             failed_tasks.insert(name.clone());
                             all_results.push(TaskResult {
                                 name,
@@ -1324,7 +1330,10 @@ pub async fn run_workspace(
                         }
                         Ok(None) => {} // skipped
                         Err(_) => {
-                            eprintln!("  {} workspace task panicked", "\u{2716}".red());
+                            install_ui::detail(&format_run_failure_detail(
+                                "workspace task",
+                                "panicked",
+                            ));
                             failed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
@@ -1391,7 +1400,7 @@ fn run_workspace_package(
     let pkg = match lpm_workspace::read_package_json(&pkg_json_path) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("  {} {member_name}: {e}", "\u{2716}".red());
+            install_ui::detail(&format_run_failure_detail(member_name, e));
             return Some(false);
         }
     };
@@ -1425,7 +1434,7 @@ fn run_workspace_package(
     let task_levels = match lpm_runner::task_graph::task_levels(&pkg.scripts, &tasks, scripts) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("  {} {member_name}: {e}", "\u{2716}".red());
+            install_ui::detail(&format_run_failure_detail(member_name, e));
             return Some(false);
         }
     };
@@ -1457,7 +1466,7 @@ fn run_workspace_package(
         ) {
             Ok(()) => Some(true),
             Err(e) => {
-                eprintln!("  {} {member_name}: {e}", "\u{2716}".red());
+                install_ui::detail(&format_run_failure_detail(member_name, e));
                 Some(false)
             }
         };
@@ -1562,15 +1571,18 @@ pub fn run_watch(
 
             match result {
                 Ok(()) => {
-                    println!(
-                        "\n{} {} completed. Waiting for changes...",
-                        "✓".green(),
-                        script,
-                    );
+                    install_ui::done(&format!(
+                        "{} completed. Waiting for changes...",
+                        install_ui::yellow(&script)
+                    ));
                 }
                 Err(e) => {
-                    eprintln!("\n{} {}: {}", "✗".red(), script, e,);
-                    eprintln!("Waiting for changes...");
+                    install_ui::failed(&format!(
+                        "{}: {}",
+                        install_ui::yellow(&script),
+                        lpm_common::sanitize_for_terminal(&e.to_string())
+                    ));
+                    install_ui::detail("  Waiting for changes...");
                 }
             }
         }),
@@ -2034,6 +2046,14 @@ mod tests {
     use super::*;
     use lpm_runner::bin_path::ManagedRuntimeHint::Unknown;
     use std::collections::HashMap;
+
+    #[test]
+    fn run_failure_detail_formats_as_slim_detail_row() {
+        assert_eq!(
+            console::strip_ansi_codes(&format_run_failure_detail("web", "exit 1")).into_owned(),
+            "  ✗ web: exit 1"
+        );
+    }
 
     // --- transitive skip propagation ---
 

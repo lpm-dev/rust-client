@@ -69,12 +69,10 @@ fn ci_env(args: &[&str], project_dir: &Path, _json_output: bool) -> Result<(), L
             lpm_env::format_env(&env_vars, lpm_env::PrintFormat::Dotenv, &secret_keys);
         std::fs::write(file, &dotenv_output)
             .map_err(|e| LpmError::Script(format!("failed to write {file}: {e}")))?;
-        // M38: lock to owner-only — same posture as M10's env oidc
-        // pull --output. Default umask leaves plaintext-secret
-        // dotenv files at 0o644 on most Linux distros, which means
-        // any concurrent CI build step running as a different uid
-        // can read them. Best-effort: tracing::warn on chmod
-        // failure (filesystems without POSIX modes silently no-op).
+        // Lock to owner-only. Default umask leaves plaintext-secret dotenv
+        // files at 0o644 on most Linux distros, which means any concurrent
+        // CI build step running as a different uid can read them.
+        // Best-effort: tracing::warn on chmod failure.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -86,7 +84,11 @@ fn ci_env(args: &[&str], project_dir: &Path, _json_output: bool) -> Result<(), L
                 );
             }
         }
-        eprintln!("  {} wrote {} vars to {file}", "✓".green(), env_vars.len());
+        install_ui::done(&format!(
+            "Wrote {} vars to {}",
+            install_ui::status_ok(&env_vars.len().to_string()),
+            install_ui::cyan(file)
+        ));
     } else {
         // Print to stdout in CI-native format
         println!("{output}");

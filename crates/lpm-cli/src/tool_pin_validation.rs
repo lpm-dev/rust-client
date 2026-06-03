@@ -11,6 +11,7 @@
 //! added, both [`lpm_plugin::registry::PLUGINS`] and this list need
 //! updating; the unit test pins the inventory.
 
+use crate::install_ui;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -52,15 +53,24 @@ fn collect_unsupported(tools: &std::collections::HashMap<String, String>) -> Vec
 }
 
 fn emit_warning(unsupported: &[String]) {
+    install_ui::warn(&format_warning(unsupported));
+}
+
+fn format_warning(unsupported: &[String]) -> String {
     let names = unsupported
         .iter()
-        .map(|n| format!("tools.{n}"))
+        .map(|n| install_ui::cyan(&format!("tools.{n}")))
         .collect::<Vec<_>>()
         .join(", ");
-    let supported = PLUGIN_BACKED_TOOLS.join(" and ");
-    eprintln!(
-        "  \x1b[33m!\x1b[0m lpm.json: {names} ignored — only {supported} are plugin-backed today",
-    );
+    let supported = PLUGIN_BACKED_TOOLS
+        .iter()
+        .map(|tool| install_ui::yellow(tool))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!(
+        "{}: {names} ignored — only {supported} are plugin-backed today",
+        install_ui::cyan("lpm.json")
+    )
 }
 
 #[cfg(test)]
@@ -103,5 +113,19 @@ mod tests {
 
         let unsupported = collect_unsupported(&tools);
         assert_eq!(unsupported, vec!["aaa", "mmm", "zzz"]);
+    }
+
+    #[test]
+    fn unsupported_tool_pin_warning_uses_slim_body_roles() {
+        let warning = console::strip_ansi_codes(&format_warning(&[
+            "typescript".to_string(),
+            "eslint".to_string(),
+        ]))
+        .into_owned();
+
+        assert_eq!(
+            warning,
+            "lpm.json: tools.typescript, tools.eslint ignored — only oxlint and biome are plugin-backed today"
+        );
     }
 }

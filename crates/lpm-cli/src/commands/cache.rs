@@ -88,14 +88,9 @@ fn run_clean(root: &LpmRoot, subcategory: Option<&str>, json_output: bool) -> Re
         }
 
         // One-time notice: warn users who ran `lpm cache clean` expecting
-        // the pre-phase-37 store-wipe behavior. Only fires when (a) the
-        // command was invoked without a subcategory (the blanket form is
-        // what matches the old workflow), (b) stdout is not JSON (the
-        // notice goes to stderr either way, but we keep machine output
-        // clean), and (c) the store contains recently-touched packages —
-        // i.e. the user actually had store state the old command would
-        // have cleared. The marker file suppresses the notice on
-        // subsequent runs even if the conditions stay true.
+        // the older store-wipe behavior. Only fires when the blanket form
+        // was invoked, stdout is not JSON, and the store contains recently
+        // touched packages. The marker file suppresses later repeats.
         if subcategory.is_none() && !json_output {
             maybe_show_semantic_change_notice(root);
         }
@@ -249,12 +244,34 @@ fn maybe_show_semantic_change_notice(root: &LpmRoot) {
     if !store_has_recent_children(&root.store_v1(), RECENT_STORE_ACTIVITY_WINDOW) {
         return;
     }
-    eprintln!();
-    eprintln!("Note: `lpm cache clean` now cleans metadata, task, and dlx caches only.");
-    eprintln!("The package store was left untouched. Use `lpm cache prune --apply` for");
-    eprintln!("reference-aware cleanup, or `lpm store clean` to wipe the store.");
-    eprintln!();
+    emit_semantic_change_notice();
     let _ = std::fs::write(&marker, b"");
+}
+
+fn emit_semantic_change_notice() {
+    install_ui::warn("cache clean left the package store untouched");
+    for line in semantic_change_notice_details() {
+        install_ui::detail(&line);
+    }
+}
+
+fn semantic_change_notice_details() -> Vec<String> {
+    vec![
+        format!(
+            "  {} `lpm cache clean` now cleans metadata, task, and dlx caches only.",
+            install_ui::dim("note")
+        ),
+        format!(
+            "  {} Use {} for reference-aware cleanup.",
+            install_ui::dim("command"),
+            install_ui::yellow("lpm cache prune --apply")
+        ),
+        format!(
+            "  {} Use {} to wipe the store.",
+            install_ui::dim("command"),
+            install_ui::yellow("lpm store clean")
+        ),
+    ]
 }
 
 /// True when `dir` has at least one direct child modified within `max_age`.
@@ -323,6 +340,24 @@ mod tests {
         let err = resolve_targets(&root, Some("bogus")).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("unknown cache subcategory"), "got: {msg}");
+    }
+
+    #[test]
+    fn semantic_change_notice_details_use_slim_body_roles() {
+        let details = semantic_change_notice_details();
+        let joined = details.join("\n");
+        let joined = console::strip_ansi_codes(&joined).into_owned();
+
+        assert!(
+            joined
+                .contains("note `lpm cache clean` now cleans metadata, task, and dlx caches only."),
+            "notice should explain the new cache-clean scope: {joined}"
+        );
+        assert!(
+            joined.contains("command Use lpm cache prune --apply")
+                && joined.contains("command Use lpm store clean"),
+            "notice should include command detail rows: {joined}"
+        );
     }
 
     #[tokio::test]

@@ -543,8 +543,7 @@ async fn run_inspect(
 
     eprintln!("  Last {} webhooks:\n", entries.len());
     for (i, entry) in entries.iter().enumerate() {
-        let status_color = status_ansi_color(entry.status);
-        let reset = "\x1b[0m";
+        let status = style_http_status(entry.status);
         // Extract HH:MM:SS from ISO 8601 timestamp (safe: ts is always >=19 chars)
         let time = if entry.ts.len() >= 19 {
             &entry.ts[11..19]
@@ -553,11 +552,11 @@ async fn run_inspect(
         };
 
         eprintln!(
-            "  #{:<3} {} {:<35} {status_color}{}{reset}  {}ms  {}",
+            "  #{:<3} {} {:<35} {}  {}ms  {}",
             i + 1,
             entry.method,
             entry.path,
-            entry.status,
+            status,
             entry.ms,
             time,
         );
@@ -630,11 +629,13 @@ async fn run_replay(
         .map_err(|e| LpmError::Tunnel(format!("failed to create HTTP client: {e}")))?;
     let result = lpm_tunnel::webhook_replay::replay_webhook(&replay_client, &webhook, port).await?;
 
-    let status_color = status_ansi_color(result.status);
+    let status = style_http_status(result.status);
     let ok_suffix = if result.status < 300 { " OK" } else { "" };
     eprintln!(
-        "  -> {status_color}{}{ok_suffix}\x1b[0m ({}ms)",
-        result.status, result.duration_ms
+        "  -> {}{} ({})",
+        status,
+        ok_suffix,
+        format!("{}ms", result.duration_ms).dimmed()
     );
 
     // Compare with original response to give actionable feedback
@@ -692,8 +693,7 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
 
     eprintln!("  {} webhooks:\n", entries.len());
     for entry in &entries {
-        let status_color = status_ansi_color(entry.status);
-        let reset = "\x1b[0m";
+        let status = style_http_status(entry.status);
         let time = if entry.ts.len() >= 19 {
             &entry.ts[11..19]
         } else {
@@ -701,8 +701,8 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
         };
 
         eprintln!(
-            "  {}  {} {:<35} {status_color}{}{reset}  {}ms  {}",
-            time, entry.method, entry.path, entry.status, entry.ms, entry.summary,
+            "  {}  {} {:<35} {}  {}ms  {}",
+            time, entry.method, entry.path, status, entry.ms, entry.summary,
         );
     }
 
@@ -857,9 +857,9 @@ fn style_http_method(method: &str) -> String {
 fn style_http_status(status: u16) -> String {
     let status = status.to_string();
     match status.as_bytes().first() {
-        Some(b'2') | Some(b'3') => status.green(),
-        Some(b'4') | Some(b'5') => status.red(),
-        _ => status.yellow(),
+        Some(b'2') | Some(b'3') => install_ui::status_ok(&status),
+        Some(b'4') | Some(b'5') => install_ui::red(&status),
+        _ => install_ui::yellow(&status),
     }
 }
 
@@ -939,8 +939,7 @@ fn build_filter(
 
 /// Print full detail for a single captured webhook (headers, body, response).
 fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: usize) {
-    let status_color = status_ansi_color(webhook.response_status);
-    let reset = "\x1b[0m";
+    let status = style_http_status(webhook.response_status);
 
     let provider_display = webhook
         .provider
@@ -956,11 +955,7 @@ fn print_webhook_detail(webhook: &lpm_tunnel::webhook::CapturedWebhook, index: u
         webhook.path,
     );
     eprintln!("  {} {}", "Provider:".dimmed(), provider_display);
-    eprintln!(
-        "  {} {status_color}{}{reset}",
-        "Response:".bold(),
-        webhook.response_status,
-    );
+    eprintln!("  {} {}", "Response:".bold(), status,);
     eprintln!("  {} {}ms", "Duration:".dimmed(), webhook.duration_ms);
     eprintln!("  {} {}", "Time:".dimmed(), webhook.timestamp);
 
@@ -1045,15 +1040,6 @@ fn is_valid_tunnel_domain(domain: &str) -> bool {
 		&& base.contains('.')
 }
 
-/// Return ANSI color escape code for HTTP status codes.
-fn status_ansi_color(status: u16) -> &'static str {
-    if status >= 400 {
-        "\x1b[31m" // red
-    } else {
-        "\x1b[32m" // green
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,6 +1091,22 @@ mod tests {
         assert_eq!(
             format_tunnel_request(&webhook),
             "  → POST /hooks/stripe 201 42ms"
+        );
+    }
+
+    #[test]
+    fn tunnel_status_formatter_plain_content_is_stable() {
+        assert_eq!(
+            console::strip_ansi_codes(&style_http_status(200)).into_owned(),
+            "200"
+        );
+        assert_eq!(
+            console::strip_ansi_codes(&style_http_status(404)).into_owned(),
+            "404"
+        );
+        assert_eq!(
+            console::strip_ansi_codes(&style_http_status(500)).into_owned(),
+            "500"
         );
     }
 
