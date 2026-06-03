@@ -884,6 +884,22 @@ fn install_warns_when_pnpm_overrides_dropped() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("! ") && line.contains("`pnpm.overrides`")),
+        "manifest compatibility warning must use a slim warning line, got:\n{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("fix:") && line.contains("lpm migrate")),
+        "manifest compatibility warning must include a slim fix detail row, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("warning:"),
+        "manifest compatibility warning must not use the legacy warning label, got:\n{stderr}"
+    );
+    assert!(
         stderr.contains("`pnpm.overrides`") && stderr.contains("LPM doesn't honor"),
         "expected stderr warning, got:\n{stderr}"
     );

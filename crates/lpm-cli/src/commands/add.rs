@@ -2534,7 +2534,7 @@ async fn handle_dependencies(
 
         let updated = serde_json::to_string_pretty(&doc)
             .map_err(|e| LpmError::Registry(format!("failed to serialize package.json: {e}")))?;
-        std::fs::write(&pkg_json_path, format!("{updated}\n"))
+        lpm_common::write_file_atomic(&pkg_json_path, format!("{updated}\n"))
             .map_err(|e| LpmError::Registry(format!("failed to write package.json: {e}")))?;
     }
 

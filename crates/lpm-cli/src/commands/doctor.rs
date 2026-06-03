@@ -718,7 +718,7 @@ pub async fn run(
                             fixes_applied.push("lpm install".into());
                             install_ran = true;
                         }
-                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m lpm install failed: {e}"),
+                        Err(e) => render_autofix_failed("lpm install", &e),
                     }
                 }
                 "node_pinned_unmet" | "node_missing_pinned" | "node_missing_unpinned" => {
@@ -744,7 +744,7 @@ pub async fn run(
                             .await
                             {
                                 Ok(ver) => fixes_applied.push(format!("installed node {ver}")),
-                                Err(e) => eprintln!("  \x1b[31m✗\x1b[0m node install failed: {e}"),
+                                Err(e) => render_autofix_failed("node install", &e),
                             }
                         }
                     }
@@ -756,7 +756,7 @@ pub async fn run(
                     let result = crate::commands::tools::fmt(project_dir, &[], false, false).await;
                     match result {
                         Ok(()) => fixes_applied.push("lpm fmt".into()),
-                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m lpm fmt failed: {e}"),
+                        Err(e) => render_autofix_failed("lpm fmt", &e),
                     }
                 }
                 "lockfile_missing" if !install_ran => {
@@ -768,7 +768,7 @@ pub async fn run(
                             fixes_applied.push("lpm install (lockfile)".into());
                             install_ran = true;
                         }
-                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m lpm install failed: {e}"),
+                        Err(e) => render_autofix_failed("lpm install", &e),
                     }
                 }
                 "deps_sync_drift" if !install_ran => {
@@ -780,7 +780,7 @@ pub async fn run(
                             fixes_applied.push("lpm install (deps sync)".into());
                             install_ran = true;
                         }
-                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m lpm install failed: {e}"),
+                        Err(e) => render_autofix_failed("lpm install", &e),
                     }
                 }
                 "lockfile_binary_stale" | "lockfile_binary_corrupt" | "lockfile_binary_missing" => {
@@ -789,7 +789,7 @@ pub async fn run(
                     }
                     match fix_binary_lockfile(project_dir) {
                         Ok(()) => fixes_applied.push("regenerated lpm.lockb".into()),
-                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m {e}"),
+                        Err(e) => render_autofix_failed("regenerate lpm.lockb", &e),
                     }
                 }
                 "gitattributes_missing" | "gitattributes_lockb_unmarked" => {
@@ -800,7 +800,7 @@ pub async fn run(
                     }
                     match fix_gitattributes(project_dir) {
                         Ok(()) => fixes_applied.push("updated .gitattributes".into()),
-                        Err(e) => eprintln!("  \x1b[31m✗\x1b[0m {e}"),
+                        Err(e) => render_autofix_failed("update .gitattributes", &e),
                     }
                 }
                 "tunnel_not_claimed" => {
@@ -814,9 +814,7 @@ pub async fn run(
                             Ok(_) => {
                                 fixes_applied.push(format!("claimed tunnel domain {domain}"));
                             }
-                            Err(e) => {
-                                eprintln!("  \x1b[31m✗\x1b[0m tunnel claim failed: {e}");
-                            }
+                            Err(e) => render_autofix_failed("tunnel claim", &e),
                         }
                     }
                 }
@@ -982,6 +980,10 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn render_autofix_failed(action: &str, error: &impl std::fmt::Display) {
+    install_ui::failed(&format!("{action} failed: {error}"));
 }
 
 #[cfg(test)]

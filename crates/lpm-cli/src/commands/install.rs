@@ -12274,7 +12274,7 @@ pub(crate) fn stage_packages_to_manifest(
     if doc_mutated {
         let updated =
             serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
-        std::fs::write(pkg_json_path, format!("{updated}\n"))?;
+        lpm_common::write_file_atomic(pkg_json_path, format!("{updated}\n"))?;
     }
 
     Ok(StagedManifest {
@@ -12531,7 +12531,7 @@ fn finalize_packages_in_manifest_with_catalog_policy(
     if doc_mutated {
         let updated =
             serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
-        std::fs::write(&staged.pkg_json_path, format!("{updated}\n"))?;
+        lpm_common::write_file_atomic(&staged.pkg_json_path, format!("{updated}\n"))?;
     }
     Ok(())
 }
@@ -12790,7 +12790,7 @@ async fn pin_staged_dist_tags_for_resolution(
 
     let updated =
         serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
-    std::fs::write(&staged.pkg_json_path, format!("{updated}\n"))?;
+    lpm_common::write_file_atomic(&staged.pkg_json_path, format!("{updated}\n"))?;
     Ok(())
 }
 

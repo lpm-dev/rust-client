@@ -1106,10 +1106,9 @@ async fn run_under_store_lock(
                         install_ui::red("✗"),
                     ));
                 }
-                // Always to stderr so JSON consumers (parsing stdout)
-                // still see the failure; the summary `failed` count
-                // alone wouldn't tell them WHICH package broke.
-                eprintln!("lpm rebuild: {}@{}: {e}", pkg.name, pkg.version);
+                if json_output {
+                    install_ui::failed(&rebuild_package_failure_message(pkg, &e));
+                }
                 failures += 1;
                 continue;
             }
@@ -2177,6 +2176,13 @@ struct ScriptablePackage {
 
 fn rebuild_package_label(pkg: &ScriptablePackage) -> String {
     format!("{}@{}", pkg.name, pkg.version)
+}
+
+fn rebuild_package_failure_message(
+    pkg: &ScriptablePackage,
+    error: &impl std::fmt::Display,
+) -> String {
+    format!("{} failed: {error}", rebuild_package_label(pkg))
 }
 
 fn scripts_word(count: usize) -> &'static str {
@@ -4416,6 +4422,17 @@ mod tests {
                 TrustReason::Untrusted
             },
         }
+    }
+
+    #[test]
+    fn rebuild_package_failure_message_names_package_and_error() {
+        let pkg = synthetic_scriptable("green-native", false, true);
+        let message = rebuild_package_failure_message(&pkg, &"live package directory missing");
+
+        assert_eq!(
+            message,
+            "green-native@1.0.0 failed: live package directory missing"
+        );
     }
 
     #[test]

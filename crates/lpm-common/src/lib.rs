@@ -2,10 +2,10 @@
 //!
 //! Hosts the canonical [`PackageName`] parser, [`Integrity`] (SRI) helpers,
 //! [`LpmError`] (the unified error type returned by the CLI surface), and the
-//! [`LpmRoot`] / locking primitives every install pass touches. Nothing in
-//! this crate performs I/O beyond the lock-file helpers — it is the dependency
-//! floor of the workspace and must stay leaf-like.
+//! [`LpmRoot`] / locking primitives every install pass touches. I/O helpers in
+//! this crate stay small and dependency-light so it remains the workspace floor.
 
+pub mod atomic_write;
 pub mod color;
 pub mod error;
 pub mod integrity;
@@ -16,6 +16,7 @@ pub mod platform;
 pub mod provenance;
 pub mod symlink;
 
+pub use atomic_write::write_file_atomic;
 pub use error::LpmError;
 pub use integrity::Integrity;
 pub use package_name::PackageName;

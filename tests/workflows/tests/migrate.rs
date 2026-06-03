@@ -239,6 +239,15 @@ fn migrate_pnpm_overrides_conflict_aborts_before_any_write() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr_clean = strip_ansi(&stderr);
+    assert!(
+        stderr_clean.contains("✗ Cannot translate `pnpm.overrides` to `lpm.overrides`"),
+        "stderr should render the conflict headline as a slim failure line, got:\n{stderr_clean}"
+    );
+    assert!(
+        !stderr_clean.contains("  error ") && !stderr_clean.contains("error:"),
+        "stderr must not use the legacy raw error label, got:\n{stderr_clean}"
+    );
     assert!(
         stderr.contains("conflicts with existing `lpm.overrides`"),
         "stderr should describe the conflict, got:\n{stderr}"
@@ -394,6 +403,16 @@ fn migrate_pnpm_patches_conflict_aborts_before_any_write() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr_clean = strip_ansi(&stderr);
+    assert!(
+        stderr_clean
+            .contains("✗ Cannot translate `pnpm.patchedDependencies` to `lpm.patchedDependencies`"),
+        "stderr should render the conflict headline as a slim failure line, got:\n{stderr_clean}"
+    );
+    assert!(
+        !stderr_clean.contains("  error ") && !stderr_clean.contains("error:"),
+        "stderr must not use the legacy raw error label, got:\n{stderr_clean}"
+    );
     assert!(
         stderr.contains("conflicts with existing `lpm.patchedDependencies`"),
         "stderr should describe the conflict, got:\n{stderr}"
