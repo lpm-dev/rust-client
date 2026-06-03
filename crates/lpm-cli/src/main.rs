@@ -2677,6 +2677,50 @@ where
     args
 }
 
+fn argv_requests_json(args: &[std::ffi::OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .take_while(|arg| arg.as_os_str() != std::ffi::OsStr::new("--"))
+        .any(|arg| arg.as_os_str() == std::ffi::OsStr::new("--json"))
+}
+
+fn clap_help_hint_from_argv(args: &[std::ffi::OsString]) -> Option<String> {
+    let mut skip_next = false;
+    for arg in args
+        .iter()
+        .skip(1)
+        .take_while(|arg| arg.as_os_str() != std::ffi::OsStr::new("--"))
+    {
+        let Some(value) = arg.to_str() else {
+            continue;
+        };
+
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        match value {
+            "--json" | "--verbose" | "--insecure" | "-V" | "-v" => continue,
+            "--registry" | "--token" | "--color" => {
+                skip_next = true;
+                continue;
+            }
+            _ if value.starts_with("--registry=")
+                || value.starts_with("--token=")
+                || value.starts_with("--color=") =>
+            {
+                continue;
+            }
+            _ if value.starts_with('-') => continue,
+            command => {
+                return Some(format!("Run `lpm {command} --help` for command usage."));
+            }
+        }
+    }
+    None
+}
+
 fn command_needs_global_state(cmd: &Commands) -> bool {
     match cmd {
         // `install -g` (the actual install pipeline is wired; the
@@ -3107,7 +3151,7 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    let cli = Cli::parse_from(args_for_cli_parse(std::env::args_os()));
+    let cli = parse_cli_or_exit();
 
     // Color policy is already initialized at the top of `fn main()` via
     // the argv pre-scan. Re-run init here so any difference between the
@@ -5286,10 +5330,37 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
+fn parse_cli_or_exit() -> Cli {
+    let args = args_for_cli_parse(std::env::args_os());
+    let json_output = argv_requests_json(&args);
+    let help_hint = clap_help_hint_from_argv(&args);
+    match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) => exit_with_clap_error(error, json_output, help_hint),
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum SlimErrorLine {
     Failed(String),
     Detail(String),
+}
+
+fn exit_with_clap_error(error: clap::Error, json_output: bool, help_hint: Option<String>) -> ! {
+    match error.kind() {
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+            error.exit();
+        }
+        _ => {
+            let exit_code = error.exit_code();
+            if json_output {
+                print_json_clap_error(&error, help_hint.as_deref());
+            } else {
+                render_slim_clap_error(&error, help_hint.as_deref());
+            }
+            std::process::exit(exit_code);
+        }
+    }
 }
 
 fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: bool, registry_url: &str) -> ! {
@@ -5307,6 +5378,48 @@ fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: bool, registry
         lpm_common::LpmError::ExitCode(code) => std::process::exit(*code),
         _ => std::process::exit(1),
     }
+}
+
+fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>) {
+    let mut object = serde_json::Map::with_capacity(8);
+    object.insert("success".to_owned(), serde_json::json!(false));
+    object.insert("error_code".to_owned(), serde_json::json!("usage"));
+    object.insert(
+        "kind".to_owned(),
+        serde_json::json!(clap_error_kind_code(error.kind())),
+    );
+    object.insert(
+        "error".to_owned(),
+        serde_json::json!(clap_error_reason(error)),
+    );
+
+    if let Some(argument) = clap_context_first(error, clap::error::ContextKind::InvalidArg) {
+        object.insert("argument".to_owned(), serde_json::json!(argument));
+    }
+    if let Some(command) = clap_context_first(error, clap::error::ContextKind::InvalidSubcommand) {
+        object.insert("command".to_owned(), serde_json::json!(command));
+    }
+    if let Some(value) = clap_context_first(error, clap::error::ContextKind::InvalidValue) {
+        object.insert("value".to_owned(), serde_json::json!(value));
+    }
+
+    let valid_values = clap_context_values(error, clap::error::ContextKind::ValidValue);
+    if !valid_values.is_empty() {
+        object.insert("valid_values".to_owned(), serde_json::json!(valid_values));
+    }
+
+    if let Some(usage) = clap_usage(error) {
+        object.insert("usage".to_owned(), serde_json::json!(usage));
+    }
+    object.insert(
+        "hint".to_owned(),
+        serde_json::json!(clap_help_hint(error, help_hint)),
+    );
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::Value::Object(object)).unwrap()
+    );
 }
 
 fn print_json_error(error: &lpm_common::LpmError) {
@@ -5336,6 +5449,15 @@ fn print_json_error(error: &lpm_common::LpmError) {
     println!("{}", serde_json::to_string_pretty(&json).unwrap());
 }
 
+fn render_slim_clap_error(error: &clap::Error, help_hint: Option<&str>) {
+    for line in slim_clap_error_lines(error, help_hint) {
+        match line {
+            SlimErrorLine::Failed(message) => install_ui::failed(&message),
+            SlimErrorLine::Detail(message) => install_ui::detail(&message),
+        }
+    }
+}
+
 fn render_slim_error(error: &lpm_common::LpmError) {
     for line in slim_error_lines(error) {
         match line {
@@ -5343,6 +5465,85 @@ fn render_slim_error(error: &lpm_common::LpmError) {
             SlimErrorLine::Detail(message) => install_ui::detail(&message),
         }
     }
+}
+
+fn slim_clap_error_lines(error: &clap::Error, help_hint: Option<&str>) -> Vec<SlimErrorLine> {
+    let mut lines = vec![SlimErrorLine::Failed("Invalid command line".to_owned())];
+    push_multiline_detail(&mut lines, "reason", &clap_error_reason(error));
+    push_clap_context_detail(
+        &mut lines,
+        "argument",
+        error,
+        clap::error::ContextKind::InvalidArg,
+        ClapDetailStyle::Command,
+    );
+    push_clap_context_detail(
+        &mut lines,
+        "command",
+        error,
+        clap::error::ContextKind::InvalidSubcommand,
+        ClapDetailStyle::Command,
+    );
+    push_clap_context_detail(
+        &mut lines,
+        "value",
+        error,
+        clap::error::ContextKind::InvalidValue,
+        ClapDetailStyle::Value,
+    );
+    push_clap_context_detail(
+        &mut lines,
+        "values",
+        error,
+        clap::error::ContextKind::ValidValue,
+        ClapDetailStyle::Value,
+    );
+    push_clap_context_detail(
+        &mut lines,
+        "conflicts",
+        error,
+        clap::error::ContextKind::PriorArg,
+        ClapDetailStyle::Command,
+    );
+    push_clap_context_detail(
+        &mut lines,
+        "suggestion",
+        error,
+        clap::error::ContextKind::SuggestedCommand,
+        ClapDetailStyle::Command,
+    );
+    push_clap_context_detail(
+        &mut lines,
+        "suggestion",
+        error,
+        clap::error::ContextKind::SuggestedSubcommand,
+        ClapDetailStyle::Command,
+    );
+    push_clap_context_detail(
+        &mut lines,
+        "suggestion",
+        error,
+        clap::error::ContextKind::SuggestedArg,
+        ClapDetailStyle::Command,
+    );
+    push_clap_context_detail(
+        &mut lines,
+        "suggestion",
+        error,
+        clap::error::ContextKind::SuggestedValue,
+        ClapDetailStyle::Value,
+    );
+
+    if let Some(usage) = clap_usage(error) {
+        push_detail(&mut lines, "usage", &install_ui::yellow(&usage));
+    }
+
+    push_detail(
+        &mut lines,
+        "hint",
+        &install_ui::dim(&clap_help_hint(error, help_hint)),
+    );
+    lines
 }
 
 fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
@@ -5656,6 +5857,173 @@ fn push_dimmed_multiline_detail(lines: &mut Vec<SlimErrorLine>, label: &str, val
             "    {}",
             install_ui::dim(line)
         )));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClapDetailStyle {
+    Command,
+    Value,
+}
+
+fn push_clap_context_detail(
+    lines: &mut Vec<SlimErrorLine>,
+    label: &str,
+    error: &clap::Error,
+    kind: clap::error::ContextKind,
+    style: ClapDetailStyle,
+) {
+    let values = clap_context_values(error, kind);
+    if values.is_empty() {
+        return;
+    }
+
+    let joined = values.join(", ");
+    let styled = match style {
+        ClapDetailStyle::Command => install_ui::yellow(&joined),
+        ClapDetailStyle::Value => install_ui::cyan(&joined),
+    };
+    push_detail(lines, label, &styled);
+}
+
+fn clap_context_first(error: &clap::Error, kind: clap::error::ContextKind) -> Option<String> {
+    clap_context_values(error, kind).into_iter().next()
+}
+
+fn clap_context_values(error: &clap::Error, kind: clap::error::ContextKind) -> Vec<String> {
+    let Some(value) = error.get(kind) else {
+        return Vec::new();
+    };
+
+    match value {
+        clap::error::ContextValue::None => Vec::new(),
+        clap::error::ContextValue::Bool(value) => vec![value.to_string()],
+        clap::error::ContextValue::String(value) => one_non_empty(value),
+        clap::error::ContextValue::Strings(values) => values
+            .iter()
+            .filter_map(|value| non_empty_plain(value))
+            .collect(),
+        clap::error::ContextValue::StyledStr(value) => one_non_empty(&value.to_string()),
+        clap::error::ContextValue::StyledStrs(values) => values
+            .iter()
+            .filter_map(|value| non_empty_plain(&value.to_string()))
+            .collect(),
+        clap::error::ContextValue::Number(value) => vec![value.to_string()],
+        _ => one_non_empty(&value.to_string()),
+    }
+}
+
+fn one_non_empty(value: &str) -> Vec<String> {
+    non_empty_plain(value).into_iter().collect()
+}
+
+fn non_empty_plain(value: &str) -> Option<String> {
+    let plain = console::strip_ansi_codes(value).trim().to_owned();
+    (!plain.is_empty()).then_some(plain)
+}
+
+fn clap_usage(error: &clap::Error) -> Option<String> {
+    clap_context_first(error, clap::error::ContextKind::Usage).map(|usage| {
+        let usage = usage
+            .strip_prefix("Usage:")
+            .unwrap_or(&usage)
+            .trim()
+            .to_owned();
+        normalize_clap_program_name(&usage)
+    })
+}
+
+fn normalize_clap_program_name(usage: &str) -> String {
+    if let Some(rest) = usage.strip_prefix("lpm-rs ") {
+        format!("lpm {rest}")
+    } else if usage == "lpm-rs" {
+        "lpm".to_owned()
+    } else {
+        usage.to_owned()
+    }
+}
+
+fn clap_error_reason(error: &clap::Error) -> String {
+    let rendered = console::strip_ansi_codes(&error.render().to_string()).into_owned();
+    for line in rendered.lines() {
+        let trimmed = line.trim();
+        if let Some(reason) = trimmed.strip_prefix("error: ") {
+            return reason.to_owned();
+        }
+    }
+
+    for line in rendered.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("Usage:")
+            || trimmed.starts_with("For more information, try")
+        {
+            continue;
+        }
+        return trimmed.to_owned();
+    }
+
+    clap_error_kind_fallback(error.kind()).to_owned()
+}
+
+fn clap_error_kind_fallback(kind: clap::error::ErrorKind) -> &'static str {
+    match kind {
+        clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            "required command line input was missing"
+        }
+        clap::error::ErrorKind::Io => "command line parser I/O failed",
+        clap::error::ErrorKind::Format => "command line parser formatting failed",
+        _ => kind.as_str().unwrap_or("invalid command line"),
+    }
+}
+
+fn clap_error_kind_code(kind: clap::error::ErrorKind) -> &'static str {
+    match kind {
+        clap::error::ErrorKind::InvalidValue => "invalid_value",
+        clap::error::ErrorKind::UnknownArgument => "unknown_argument",
+        clap::error::ErrorKind::InvalidSubcommand => "invalid_subcommand",
+        clap::error::ErrorKind::NoEquals => "missing_equals",
+        clap::error::ErrorKind::ValueValidation => "value_validation",
+        clap::error::ErrorKind::TooManyValues => "too_many_values",
+        clap::error::ErrorKind::TooFewValues => "too_few_values",
+        clap::error::ErrorKind::WrongNumberOfValues => "wrong_number_of_values",
+        clap::error::ErrorKind::ArgumentConflict => "argument_conflict",
+        clap::error::ErrorKind::MissingRequiredArgument => "missing_required_argument",
+        clap::error::ErrorKind::MissingSubcommand => "missing_subcommand",
+        clap::error::ErrorKind::InvalidUtf8 => "invalid_utf8",
+        clap::error::ErrorKind::DisplayHelp => "display_help",
+        clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            "display_help_on_missing_argument_or_subcommand"
+        }
+        clap::error::ErrorKind::DisplayVersion => "display_version",
+        clap::error::ErrorKind::Io => "io",
+        clap::error::ErrorKind::Format => "format",
+        _ => "unknown",
+    }
+}
+
+fn clap_help_hint(error: &clap::Error, fallback: Option<&str>) -> String {
+    let Some(usage) = clap_usage(error) else {
+        return fallback.unwrap_or("Run `lpm --help` for usage.").to_owned();
+    };
+
+    let mut parts = usage.split_whitespace();
+    let _program = parts.next();
+    let mut command_path = Vec::new();
+    for part in parts {
+        if part.starts_with('-') || part.starts_with('[') || part.starts_with('<') {
+            break;
+        }
+        command_path.push(part);
+    }
+
+    if command_path.is_empty() {
+        fallback.unwrap_or("Run `lpm --help` for usage.").to_owned()
+    } else {
+        format!(
+            "Run `lpm {} --help` for command usage.",
+            command_path.join(" ")
+        )
     }
 }
 
