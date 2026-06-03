@@ -61,8 +61,12 @@ fn sigstore_wizard_set_off_without_tty_requires_security_approval_and_does_not_p
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
     assert!(
-        combined.contains("security approval required"),
+        combined.contains("✗ Security approval required"),
         "--set off must fail through the security approval guard; got:\n{combined}",
+    );
+    assert!(
+        !combined.contains("Error:") && !combined.contains("×") && !combined.contains("│"),
+        "--set off must use the slim error renderer, not the diagnostic frame; got:\n{combined}",
     );
     assert!(
         !home.path().join(".lpm").join("config.toml").exists(),

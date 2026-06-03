@@ -714,9 +714,8 @@ fn snapshot_dir_entries(path: &std::path::Path) -> std::collections::BTreeSet<St
 }
 
 /// Assert the install output carries the non-interactive `--path`
-/// requirement guard. miette wraps long error lines, so substring
-/// fragments must be checked individually rather than against the
-/// joined string.
+/// requirement guard. The central slim error renderer owns wrapping,
+/// so keep this focused on the semantic guard text.
 fn assert_add_path_guard_error(out: &std::process::Output, scenario: &str) {
     assert!(
         !out.status.success(),
