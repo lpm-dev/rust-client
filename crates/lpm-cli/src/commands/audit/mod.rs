@@ -586,7 +586,7 @@ pub async fn run_fix(
         false, // keep audit-fix JSON stdout single-document
         false,
         false,
-        false,
+        true, // no_security_summary: audit fix emits its own final report.
         false,
         None,
         None,
@@ -701,7 +701,7 @@ fn choose_audit_fix_target(
         .collect();
     fixed_versions.sort();
     fixed_versions.dedup();
-    let Some(min_fixed) = fixed_versions.last().cloned() else {
+    let Some(required_fixed_floor) = fixed_versions.last().cloned() else {
         return Err("OSV advisory does not publish a fixed version".into());
     };
     let installed = Version::parse(installed_version).ok();
@@ -710,14 +710,14 @@ fn choose_audit_fix_target(
         .keys()
         .filter_map(|version| Version::parse(version).ok())
         .filter(|version| !version.is_prerelease())
-        .filter(|version| version >= &min_fixed)
+        .filter(|version| version >= &required_fixed_floor)
         .filter(|version| installed.as_ref().is_none_or(|current| version > current))
         .collect();
     candidates.sort();
     candidates.first().map(ToString::to_string).ok_or_else(|| {
         format!(
             "registry has no non-prerelease version of '{package}' newer than {installed_version} \
-                 at or above OSV fixed version {min_fixed}"
+                 at or above highest OSV fixed version {required_fixed_floor}"
         )
     })
 }
