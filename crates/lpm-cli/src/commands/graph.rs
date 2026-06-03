@@ -156,15 +156,14 @@ pub async fn run(
     // Handle --why
     if let Some(target) = why {
         if json_output {
-            println!(
-                "{}",
-                graph_render::render_why_json(
-                    &graph,
-                    target,
-                    overrides_state.as_ref(),
-                    patch_state.as_ref()
-                )
-            );
+            let output = graph_render::render_why_json(
+                &graph,
+                target,
+                overrides_state.as_ref(),
+                patch_state.as_ref(),
+            )
+            .map_err(|e| LpmError::Script(format!("failed to serialize graph why JSON: {e}")))?;
+            println!("{output}");
         } else {
             print!(
                 "{}",
@@ -203,13 +202,16 @@ pub async fn run(
             print!("{}", graph_render::render_mermaid(&graph));
         }
         "json" => {
-            println!("{}", graph_render::render_json(&graph));
+            let output = graph_render::render_json(&graph)
+                .map_err(|e| LpmError::Script(format!("failed to serialize graph JSON: {e}")))?;
+            println!("{output}");
         }
         "stats" => {
             print!("{}", graph_render::render_stats(&graph));
         }
         "html" => {
-            let html = graph_render::render_html(&graph);
+            let html = graph_render::render_html(&graph)
+                .map_err(|e| LpmError::Script(format!("failed to render graph HTML: {e}")))?;
             let out_dir = project_dir.join(".lpm");
             std::fs::create_dir_all(&out_dir)
                 .map_err(|e| LpmError::Script(format!("failed to create .lpm dir: {e}")))?;
@@ -565,7 +567,7 @@ mod tests {
     #[test]
     fn fixture_json_output() {
         let graph = load_fixture_graph();
-        let json = graph_render::render_json(&graph);
+        let json = graph_render::render_json(&graph).expect("render graph JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["packages"].as_u64().unwrap(), 8);
         assert_eq!(parsed["root"].as_str().unwrap(), "graph-test-project@1.0.0");
@@ -612,7 +614,7 @@ mod tests {
     #[test]
     fn fixture_html_output() {
         let graph = load_fixture_graph();
-        let html = graph_render::render_html(&graph);
+        let html = graph_render::render_html(&graph).expect("render graph HTML");
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("LPM Dependency Graph"));
         // Stats should be HTML-escaped in the header
@@ -666,7 +668,7 @@ mod tests {
         let mut graph = load_fixture_graph();
         graph_render::prune_to_depth(&mut graph, 2);
         graph_render::recompute_stats(&mut graph);
-        let json = graph_render::render_json(&graph);
+        let json = graph_render::render_json(&graph).expect("render graph JSON");
         assert!(json.contains("express"), "direct dep should be in JSON");
         // ms is depth 3+; before the fix this would still appear in JSON.
         assert!(
@@ -708,7 +710,7 @@ mod tests {
     fn fixture_filter_json() {
         let mut graph = load_fixture_graph();
         apply_filter(&mut graph, "debug");
-        let json = graph_render::render_json(&graph);
+        let json = graph_render::render_json(&graph).expect("render graph JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let nodes = parsed["nodes"].as_array().unwrap();
         let node_names: Vec<&str> = nodes.iter().map(|n| n["name"].as_str().unwrap()).collect();
@@ -790,7 +792,7 @@ mod tests {
     fn fixture_filter_html() {
         let mut graph = load_fixture_graph();
         apply_filter(&mut graph, "debug");
-        let html = graph_render::render_html(&graph);
+        let html = graph_render::render_html(&graph).expect("render graph HTML");
         assert!(html.contains("debug"), "HTML should contain matched node");
         assert!(
             !html.contains("vitest"),

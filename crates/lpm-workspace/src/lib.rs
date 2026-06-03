@@ -2428,7 +2428,7 @@ pub fn prune_unused_package_json_catalogs(
             path.display()
         ))
     })?;
-    std::fs::write(path, format!("{updated}\n"))
+    lpm_common::write_file_atomic(path, format!("{updated}\n"))
         .map_err(|e| WorkspaceError::Io(format!("failed to write {}: {e}", path.display())))?;
     Ok(true)
 }
@@ -2506,7 +2506,7 @@ pub fn prune_unused_pnpm_workspace_catalogs(
             path.display()
         ))
     })?;
-    std::fs::write(path, updated)
+    lpm_common::write_file_atomic(path, updated)
         .map_err(|e| WorkspaceError::Io(format!("failed to write {}: {e}", path.display())))?;
     Ok(true)
 }

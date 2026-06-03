@@ -745,7 +745,7 @@ pub fn render_mermaid(graph: &DepGraph) -> String {
 
 // ── JSON Renderer ──────────────────────────────────────────────────
 
-pub fn render_json(graph: &DepGraph) -> String {
+pub fn render_json(graph: &DepGraph) -> Result<String, serde_json::Error> {
     let nodes: Vec<serde_json::Value> = graph
         .nodes
         .iter()
@@ -804,10 +804,6 @@ pub fn render_json(graph: &DepGraph) -> String {
         "nodes": nodes,
         "edges": edges,
     }))
-    .unwrap_or_else(|e| {
-        eprintln!("  \x1b[31m✖\x1b[0m failed to serialize graph JSON: {e}");
-        "{}".to_string()
-    })
 }
 
 // ── Stats Renderer ─────────────────────────────────────────────────
@@ -1003,7 +999,7 @@ pub fn render_why_json(
     target_name: &str,
     overrides_state: Option<&crate::overrides_state::OverridesState>,
     patch_state: Option<&crate::patch_state::PatchState>,
-) -> String {
+) -> Result<String, serde_json::Error> {
     let paths = graph.find_paths(target_name);
 
     let json_paths: Vec<Vec<String>> = paths
@@ -1083,16 +1079,12 @@ pub fn render_why_json(
         "applied_overrides": override_hits,
         "applied_patches": patch_hits,
     }))
-    .unwrap_or_else(|e| {
-        eprintln!("  \x1b[31m✖\x1b[0m failed to serialize why JSON: {e}");
-        "{}".to_string()
-    })
 }
 
 // ── HTML Renderer ──────────────────────────────────────────────────
 
-pub fn render_html(graph: &DepGraph) -> String {
-    let json_data = render_json(graph);
+pub fn render_html(graph: &DepGraph) -> Result<String, serde_json::Error> {
+    let json_data = render_json(graph)?;
     let stats = render_stats(graph).replace('\n', " | ");
     let stats = stats.trim_end_matches(" | ");
 
@@ -1103,9 +1095,9 @@ pub fn render_html(graph: &DepGraph) -> String {
     // HTML-escape the stats string to prevent XSS via package names
     let safe_stats = html_escape(stats);
 
-    include_str!("templates/graph.html")
+    Ok(include_str!("templates/graph.html")
         .replace("__GRAPH_DATA__", &safe_json)
-        .replace("__STATS__", &safe_stats)
+        .replace("__STATS__", &safe_stats))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -1250,7 +1242,7 @@ mod tests {
     #[test]
     fn json_output_parseable() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_json(&graph);
+        let json = render_json(&graph).expect("render graph JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["packages"].as_u64().unwrap(), 7); // excludes synthetic root
         assert!(!parsed["nodes"].as_array().unwrap().is_empty());
@@ -1297,7 +1289,7 @@ mod tests {
             "stats text should display 1-based level matching --depth: {stats}"
         );
 
-        let json = render_json(&graph);
+        let json = render_json(&graph).expect("render graph JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["max_depth"].as_u64(),
@@ -1305,7 +1297,7 @@ mod tests {
             "json max_depth must mirror the 1-based stats value: {json}"
         );
 
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         assert!(
             html.contains("Max depth: 2"),
             "html stats summary must use the 1-based level"
@@ -1359,7 +1351,7 @@ mod tests {
     #[test]
     fn html_has_max_force_nodes_check() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         assert!(
             html.contains("MAX_FORCE_NODES"),
             "HTML template should contain MAX_FORCE_NODES guard for large graphs"
@@ -1373,7 +1365,7 @@ mod tests {
     #[test]
     fn html_mousemove_has_passive_true() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         // The mousemove addEventListener should close with }, {passive: true});
         assert!(
             html.contains("'mousemove'"),
@@ -1394,7 +1386,7 @@ mod tests {
     #[test]
     fn html_resize_has_passive_true() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         let resize_idx = html.find("'resize'").expect("should have resize listener");
         let after_resize = &html[resize_idx..];
         // Resize handler is simple, find closing within 500 chars
@@ -1408,7 +1400,7 @@ mod tests {
     #[test]
     fn html_wheel_not_passive() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         let wheel_idx = html.find("'wheel'").expect("should have wheel listener");
         let after_wheel = &html[wheel_idx..];
         let section = &after_wheel[..after_wheel.len().min(500)];
@@ -1421,7 +1413,7 @@ mod tests {
     #[test]
     fn html_contains_data() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("express"));
         assert!(html.contains("LPM Dependency Graph"));
@@ -1500,7 +1492,7 @@ mod tests {
         );
 
         // json
-        let json = render_json(&graph);
+        let json = render_json(&graph).expect("render graph JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let names: Vec<&str> = parsed["nodes"]
             .as_array()
@@ -1519,7 +1511,7 @@ mod tests {
 
         // html — stats summary embedded in the page header reflects the
         // pruned graph, not the original duplicate set.
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         assert!(html.contains("express"), "html should keep direct dep");
         assert!(
             !html.contains("ms@2.0.0"),
@@ -1571,7 +1563,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         // The stats div should not contain raw HTML tags
         let stats_div_start = html.find("class=\"stats\">").unwrap();
         let stats_div_end = html[stats_div_start..].find("</div>").unwrap() + stats_div_start;
@@ -1591,7 +1583,7 @@ mod tests {
     #[test]
     fn html_tooltip_uses_textcontent_not_innerhtml() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         assert!(
             !html.contains(".meta').innerHTML") && !html.contains(".meta\").innerHTML"),
             "tooltip must not use innerHTML (XSS risk)"
@@ -1761,7 +1753,7 @@ mod tests {
         }];
         let direct: HashSet<String> = ["pkg</SCRIPT>test"].iter().map(|s| s.to_string()).collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         // Check within the <script> tag specifically
         let script_start = html.find("<script>").unwrap();
         let script_end = html.rfind("</script>").unwrap();
@@ -1977,7 +1969,7 @@ mod tests {
     #[test]
     fn json_output_has_root_field() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_json(&graph);
+        let json = render_json(&graph).expect("render graph JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             parsed["root"].as_str().unwrap(),
@@ -2057,7 +2049,7 @@ mod tests {
     #[test]
     fn html_uses_snake_case_properties() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
 
         // Should NOT contain camelCase property access on data objects
         assert!(
@@ -2082,7 +2074,7 @@ mod tests {
     #[test]
     fn html_search_has_debounce() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let html = render_html(&graph);
+        let html = render_html(&graph).expect("render graph HTML");
         assert!(
             html.contains("setTimeout"),
             "search should use setTimeout for debounce"
@@ -2124,9 +2116,9 @@ mod tests {
         let _tree = render_tree(&graph, false);
         let _dot = render_dot(&graph);
         let _mermaid = render_mermaid(&graph);
-        let _json = render_json(&graph);
+        let _json = render_json(&graph).expect("render graph JSON");
         let _stats = render_stats(&graph);
-        let _html = render_html(&graph);
+        let _html = render_html(&graph).expect("render graph HTML");
     }
 
     // ── re-audit: why with multiple versions ─────────────────
@@ -2188,7 +2180,7 @@ mod tests {
     #[test]
     fn why_json_output() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_why_json(&graph, "ms", None, None);
+        let json = render_why_json(&graph, "ms", None, None).expect("render graph why JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["target"].as_str().unwrap(), "ms");
         assert!(parsed["found"].as_bool().unwrap());
@@ -2199,7 +2191,7 @@ mod tests {
     #[test]
     fn why_json_not_found() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_why_json(&graph, "lodash", None, None);
+        let json = render_why_json(&graph, "lodash", None, None).expect("render graph why JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!parsed["found"].as_bool().unwrap());
         assert_eq!(parsed["path_count"].as_u64().unwrap(), 0);
@@ -2275,7 +2267,8 @@ mod tests {
     fn render_why_json_includes_applied_overrides_field() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         let state = fake_overrides_state("ms", "2.0.0", "2.1.3", Some("debug"));
-        let json = render_why_json(&graph, "ms", Some(&state), None);
+        let json =
+            render_why_json(&graph, "ms", Some(&state), None).expect("render graph why JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = parsed["applied_overrides"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -2288,7 +2281,7 @@ mod tests {
     #[test]
     fn render_why_json_empty_applied_overrides_when_no_state() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_why_json(&graph, "ms", None, None);
+        let json = render_why_json(&graph, "ms", None, None).expect("render graph why JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = parsed["applied_overrides"].as_array().unwrap();
         assert!(arr.is_empty());
@@ -2436,7 +2429,8 @@ mod tests {
     fn render_why_json_includes_applied_patches_field() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         let state = fake_patch_state("ms");
-        let json = render_why_json(&graph, "ms", None, Some(&state));
+        let json =
+            render_why_json(&graph, "ms", None, Some(&state)).expect("render graph why JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = parsed["applied_patches"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -2460,7 +2454,7 @@ mod tests {
     #[test]
     fn render_why_json_empty_applied_patches_when_no_state() {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
-        let json = render_why_json(&graph, "ms", None, None);
+        let json = render_why_json(&graph, "ms", None, None).expect("render graph why JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let arr = parsed["applied_patches"].as_array().unwrap();
         assert!(arr.is_empty());
@@ -2629,7 +2623,7 @@ mod tests {
         let mut graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         filter_graph(&mut graph, "ms");
 
-        let json = render_json(&graph);
+        let json = render_json(&graph).expect("render graph JSON");
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let nodes = parsed["nodes"].as_array().unwrap();
         let names: Vec<&str> = nodes.iter().map(|n| n["name"].as_str().unwrap()).collect();

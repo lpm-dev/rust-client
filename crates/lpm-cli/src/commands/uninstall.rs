@@ -433,7 +433,7 @@ fn uninstall_from_manifest(
 
     let updated =
         serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
-    std::fs::write(pkg_json_path, format!("{updated}\n"))?;
+    lpm_common::write_file_atomic(pkg_json_path, format!("{updated}\n"))?;
     Ok(result)
 }
 

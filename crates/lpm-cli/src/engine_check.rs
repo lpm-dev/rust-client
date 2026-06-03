@@ -35,7 +35,6 @@
 use crate::engine_strict_config;
 use crate::output;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_runtime::effective::resolve_effective_node_version_with_engines;
 use lpm_workspace::{PackageJson, discover_workspace, read_package_json};
 use std::collections::HashMap;
@@ -252,16 +251,14 @@ fn version_satisfies(required: &str, actual: &str) -> Result<bool, String> {
 /// pipelines should consume the same signals from `lpm doctor --json`,
 /// where each issue lands as a `Check::warn` with its stable code.
 ///
-/// Both lines per issue: bold "warning: <detail>" then "  <remediation>".
-/// Matches the multi-line shape that pre-existed for the `pnpm.overrides`
-/// drift warning before the consolidation.
+/// Renders each issue as a slim warning plus a dimmed `fix:` detail row.
 fn emit_manifest_compat_warnings(pkg: &PackageJson, json_output: bool) {
     if json_output {
         return;
     }
     for issue in pkg.manifest_compat_issues() {
-        eprintln!("{}: {}", "warning".yellow().bold(), issue.detail);
-        eprintln!("  {}", issue.remediation);
+        output::warn(&issue.detail);
+        output::field("fix", &issue.remediation);
     }
 }
 

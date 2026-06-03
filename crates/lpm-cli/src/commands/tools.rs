@@ -1,5 +1,5 @@
 use super::tools_ui;
-use crate::CheckEngine;
+use crate::{CheckEngine, install_ui};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::num::NonZeroUsize;
@@ -340,7 +340,7 @@ fn read_tool_version(project_dir: &Path, tool_name: &str) -> Option<String> {
         Ok(Some(config)) => config.tools.get(tool_name).cloned(),
         Ok(None) => None,
         Err(e) => {
-            eprintln!("  \x1b[33m!\x1b[0m failed to read lpm.json tools config: {e}");
+            install_ui::warn(&format!("failed to read lpm.json tools config: {e}"));
             None
         }
     }

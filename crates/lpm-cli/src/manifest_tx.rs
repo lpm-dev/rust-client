@@ -148,7 +148,7 @@ impl Drop for ManifestTransaction {
         for entry in &self.snapshots {
             match &entry.original_bytes {
                 Some(bytes) => {
-                    if let Err(e) = std::fs::write(&entry.path, bytes) {
+                    if let Err(e) = lpm_common::write_file_atomic(&entry.path, bytes) {
                         tracing::error!(
                             "manifest transaction rollback: failed to restore {}: {e}",
                             entry.path.display()

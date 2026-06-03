@@ -244,21 +244,8 @@ pub async fn run(
 
     migration_backup.write_manifest(cwd)?;
 
-    // Write the lockfile — on failure, rollback
     if let Err(e) = result.lockfile.write_all(&lockfile_path) {
-        eprintln!("  {} Migration failed: {e}", "error".red().bold());
-        if let Err(rollback_err) = migration_backup.rollback() {
-            eprintln!(
-                "  {} Rollback also failed: {rollback_err}",
-                "error".red().bold()
-            );
-            eprintln!(
-                "  {} Manual cleanup may be needed. Check .backup files.",
-                "warn".yellow().bold()
-            );
-        } else {
-            eprintln!("  {} Rolled back to original state.", "info".blue().bold());
-        }
+        render_migration_failure_with_rollback(&e, &migration_backup);
         return Err(LpmError::Script(format!("failed to write lockfile: {e}")));
     }
 
@@ -266,10 +253,7 @@ pub async fn run(
     if let Err(e) = lpm_lockfile::ensure_gitattributes(cwd) {
         // Non-fatal: warn but continue
         if !json {
-            eprintln!(
-                "  {} failed to update .gitattributes: {e}",
-                "warn".yellow().bold()
-            );
+            install_ui::warn(&format!("failed to update .gitattributes: {e}"));
         }
     }
 
@@ -289,28 +273,15 @@ pub async fn run(
     // restores it cleanly along with the lockfile.
     if overrides_plan.has_entries() {
         if let Err(e) = apply_overrides_to_package_json(&pkg_json_path, &overrides_plan.to_apply) {
-            eprintln!("  {} Migration failed: {e}", "error".red().bold());
-            if let Err(rollback_err) = migration_backup.rollback() {
-                eprintln!(
-                    "  {} Rollback also failed: {rollback_err}",
-                    "error".red().bold()
-                );
-                eprintln!(
-                    "  {} Manual cleanup may be needed. Check .backup files.",
-                    "warn".yellow().bold()
-                );
-            } else {
-                eprintln!("  {} Rolled back to original state.", "info".blue().bold());
-            }
+            render_migration_failure_with_rollback(&e, &migration_backup);
             return Err(e);
         }
         if !json {
             let n = overrides_plan.to_apply.len();
-            eprintln!(
-                "  {} Translated {n} `pnpm.overrides` entr{} → `lpm.overrides`",
-                "ok".green().bold(),
+            install_ui::done(&format!(
+                "Translated {n} `pnpm.overrides` entr{} -> `lpm.overrides`",
                 if n == 1 { "y" } else { "ies" },
-            );
+            ));
         }
     }
 
@@ -332,19 +303,7 @@ pub async fn run(
             &patches_plan.to_apply,
             &mut migration_backup,
         ) {
-            eprintln!("  {} Migration failed: {e}", "error".red().bold());
-            if let Err(rollback_err) = migration_backup.rollback() {
-                eprintln!(
-                    "  {} Rollback also failed: {rollback_err}",
-                    "error".red().bold()
-                );
-                eprintln!(
-                    "  {} Manual cleanup may be needed. Check .backup files.",
-                    "warn".yellow().bold()
-                );
-            } else {
-                eprintln!("  {} Rolled back to original state.", "info".blue().bold());
-            }
+            render_migration_failure_with_rollback(&e, &migration_backup);
             return Err(e);
         }
         if !json {
@@ -354,13 +313,12 @@ pub async fn run(
                 .iter()
                 .filter(|t| !t.is_self_copy)
                 .count();
-            eprintln!(
-                "  {} Translated {n} `pnpm.patchedDependencies` entr{} → `lpm.patchedDependencies` \
+            install_ui::done(&format!(
+                "Translated {n} `pnpm.patchedDependencies` entr{} -> `lpm.patchedDependencies` \
                  ({copied} patch file{} copied)",
-                "ok".green().bold(),
                 if n == 1 { "y" } else { "ies" },
                 if copied == 1 { "" } else { "s" },
-            );
+            ));
         }
     }
 
@@ -371,31 +329,17 @@ pub async fn run(
     // package.json from the backup taken alongside the lockfile.
     if peer_rules_plan.has_entries() {
         if let Err(e) = apply_peer_rules_to_package_json(&pkg_json_path, &peer_rules_plan) {
-            eprintln!("  {} Migration failed: {e}", "error".red().bold());
-            if let Err(rollback_err) = migration_backup.rollback() {
-                eprintln!(
-                    "  {} Rollback also failed: {rollback_err}",
-                    "error".red().bold()
-                );
-                eprintln!(
-                    "  {} Manual cleanup may be needed. Check .backup files.",
-                    "warn".yellow().bold()
-                );
-            } else {
-                eprintln!("  {} Rolled back to original state.", "info".blue().bold());
-            }
+            render_migration_failure_with_rollback(&e, &migration_backup);
             return Err(e);
         }
         if !json {
             let n = peer_rules_plan.ignore_missing_to_apply.len()
                 + peer_rules_plan.allow_any_to_apply.len()
                 + peer_rules_plan.allowed_versions_to_apply.len();
-            eprintln!(
-                "  {} Translated {n} `pnpm.peerDependencyRules` entr{} → \
-                 `lpm.peerDependencyRules`",
-                "ok".green().bold(),
+            install_ui::done(&format!(
+                "Translated {n} `pnpm.peerDependencyRules` entr{} -> `lpm.peerDependencyRules`",
                 if n == 1 { "y" } else { "ies" },
-            );
+            ));
         }
     }
 
@@ -447,15 +391,13 @@ pub async fn run(
             Err(e) => {
                 if !json {
                     eprintln!();
-                    eprintln!("  {} Install failed: {e}", "warn".yellow().bold());
-                    eprintln!(
+                    install_ui::warn(&format!("Install failed: {e}"));
+                    install_ui::detail(&format!(
                         "  {} The lockfile was written successfully. Run {} manually to retry.",
-                        "info".blue().bold(),
+                        install_ui::dim("hint:"),
                         install_ui::yellow("lpm install")
-                    );
+                    ));
                 }
-                // Install failure is non-fatal for migration — the lockfile is still valid.
-                // The user can retry install separately.
             }
         }
     }
@@ -580,9 +522,9 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
         new_content.push_str("@lpm.dev:registry=https://lpm.dev/api/registry/\n");
 
         if let Err(e) = std::fs::write(&npmrc_path, &new_content) {
-            eprintln!("  {} Failed to update .npmrc: {e}", "error".red().bold());
+            install_ui::failed(&format!("Failed to update .npmrc: {e}"));
             if let Err(re) = backup.rollback() {
-                eprintln!("  {} Rollback also failed: {re}", "error".red().bold());
+                install_ui::failed(&format!("Rollback also failed: {re}"));
             }
             return Err(LpmError::Script(format!("failed to write .npmrc: {e}")));
         }
@@ -599,9 +541,9 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
 
         let npmrc_content = "@lpm.dev:registry=https://lpm.dev/api/registry/\n";
         if let Err(e) = std::fs::write(&npmrc_path, npmrc_content) {
-            eprintln!("  {} Failed to write .npmrc: {e}", "error".red().bold());
+            install_ui::failed(&format!("Failed to write .npmrc: {e}"));
             if let Err(re) = backup.rollback() {
-                eprintln!("  {} Rollback also failed: {re}", "error".red().bold());
+                install_ui::failed(&format!("Rollback also failed: {re}"));
             }
             return Err(LpmError::Script(format!("failed to write .npmrc: {e}")));
         }
@@ -612,6 +554,20 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
     }
 
     Ok(())
+}
+
+fn render_migration_failure_with_rollback(
+    error: &impl std::fmt::Display,
+    backup: &MigrationBackup,
+) {
+    install_ui::failed(&format!("Migration failed: {error}"));
+    match backup.rollback() {
+        Ok(()) => install_ui::done("Rolled back to original state."),
+        Err(rollback_err) => {
+            install_ui::failed(&format!("Rollback also failed: {rollback_err}"));
+            install_ui::warn("Manual cleanup may be needed. Check .backup files.");
+        }
+    }
 }
 
 /// Run build and test verification scripts from package.json.
@@ -847,57 +803,56 @@ fn render_overrides_plan_errors(plan: &super::migrate_overrides::PnpmOverridesPl
     }
 
     eprintln!();
-    eprintln!(
-        "  {} cannot translate `pnpm.overrides` to `lpm.overrides`:",
-        "error".red().bold()
-    );
+    install_ui::failed("Cannot translate `pnpm.overrides` to `lpm.overrides`");
 
     if !plan.parse_errors.is_empty() {
         eprintln!();
-        eprintln!("  parse errors (entries rejected by LPM's selector grammar):");
+        install_ui::detail("  parse errors (entries rejected by LPM's selector grammar):");
         for e in &plan.parse_errors {
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {}: {}",
                 "-".dimmed(),
                 format!("`{}`", e.key).bold(),
                 e.error,
-            );
+            ));
         }
     }
 
     if !plan.unsupported_shapes.is_empty() {
         eprintln!();
-        eprintln!("  unsupported value shapes (LPM only accepts string targets):");
+        install_ui::detail("  unsupported value shapes (LPM only accepts string targets):");
         for s in &plan.unsupported_shapes {
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {}: {}",
                 "-".dimmed(),
                 format!("`{}`", s.key).bold(),
                 s.got,
-            );
+            ));
         }
     }
 
     if !plan.conflicts.is_empty() {
         eprintln!();
-        eprintln!("  conflicts with existing `lpm.overrides` (same key, different target):");
+        install_ui::detail(
+            "  conflicts with existing `lpm.overrides` (same key, different target):",
+        );
         for c in &plan.conflicts {
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {} — pnpm has {}, lpm.overrides has {}",
                 "-".dimmed(),
                 format!("`{}`", c.key).bold(),
                 format!("\"{}\"", c.pnpm_target).cyan(),
                 format!("\"{}\"", c.lpm_target).cyan(),
-            );
+            ));
         }
     }
 
     eprintln!();
-    eprintln!(
+    install_ui::detail(&format!(
         "  {} No files were modified. Resolve the issues above in `package.json` and re-run {}.",
-        "info".blue().bold(),
+        install_ui::dim("hint:"),
         "lpm migrate".bold()
-    );
+    ));
 }
 
 /// Merge the validated `pnpm.overrides` plan into
@@ -1000,55 +955,52 @@ fn render_patches_plan_errors(plan: &super::migrate_patches::PnpmPatchesPlan, js
     }
 
     eprintln!();
-    eprintln!(
-        "  {} cannot translate `pnpm.patchedDependencies` to `lpm.patchedDependencies`:",
-        "error".red().bold()
-    );
+    install_ui::failed("Cannot translate `pnpm.patchedDependencies` to `lpm.patchedDependencies`");
 
     if !plan.parse_errors.is_empty() {
         eprintln!();
-        eprintln!("  parse errors (key isn't `name@version`-shaped):");
+        install_ui::detail("  parse errors (key isn't `name@version`-shaped):");
         for e in &plan.parse_errors {
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {}: {}",
                 "-".dimmed(),
                 format!("`{}`", e.key).bold(),
                 e.reason,
-            );
+            ));
         }
     }
 
     if !plan.unsupported_shapes.is_empty() {
         eprintln!();
-        eprintln!("  unsupported value shapes (LPM only accepts string paths):");
+        install_ui::detail("  unsupported value shapes (LPM only accepts string paths):");
         for s in &plan.unsupported_shapes {
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {}: {}",
                 "-".dimmed(),
                 format!("`{}`", s.key).bold(),
                 s.got,
-            );
+            ));
         }
     }
 
     if !plan.path_violations.is_empty() {
         eprintln!();
-        eprintln!("  path validation failures:");
+        install_ui::detail("  path validation failures:");
         for v in &plan.path_violations {
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {} → {}",
                 "-".dimmed(),
                 format!("`{}`", v.key).bold(),
                 v.detail,
-            );
+            ));
         }
     }
 
     if !plan.integrity_misses.is_empty() {
         eprintln!();
-        eprintln!(
+        install_ui::detail(
             "  cannot bind to a tarball integrity hash (LPM patches require \
-             `originalIntegrity`):"
+             `originalIntegrity`):",
         );
         for m in &plan.integrity_misses {
             let why = match m.reason {
@@ -1059,38 +1011,38 @@ fn render_patches_plan_errors(plan: &super::migrate_patches::PnpmPatchesPlan, js
                     "lockfile entry has no `integrity` field (workspace link or git dep?)"
                 }
             };
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {} ({}@{}) — {why}",
                 "-".dimmed(),
                 format!("`{}`", m.key).bold(),
                 m.name,
                 m.version,
-            );
+            ));
         }
     }
 
     if !plan.conflicts.is_empty() {
         eprintln!();
-        eprintln!(
-            "  conflicts with existing `lpm.patchedDependencies` (same key, different path):"
+        install_ui::detail(
+            "  conflicts with existing `lpm.patchedDependencies` (same key, different path):",
         );
         for c in &plan.conflicts {
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {} — pnpm would write {}, lpm.patchedDependencies has {}",
                 "-".dimmed(),
                 format!("`{}`", c.key).bold(),
                 format!("\"{}\"", c.pnpm_dest).cyan(),
                 format!("\"{}\"", c.lpm_path).cyan(),
-            );
+            ));
         }
     }
 
     eprintln!();
-    eprintln!(
+    install_ui::detail(&format!(
         "  {} No files were modified. Resolve the issues above in `package.json` and re-run {}.",
-        "info".blue().bold(),
+        install_ui::dim("hint:"),
         "lpm migrate".bold()
-    );
+    ));
 }
 
 /// Render a structured `pnpm.peerDependencyRules` translation-plan
@@ -1139,61 +1091,58 @@ fn render_peer_rules_plan_errors(plan: &super::migrate_peer_rules::PnpmPeerRules
     }
 
     eprintln!();
-    eprintln!(
-        "  {} cannot translate `pnpm.peerDependencyRules` to `lpm.peerDependencyRules`:",
-        "error".red().bold()
-    );
+    install_ui::failed("Cannot translate `pnpm.peerDependencyRules` to `lpm.peerDependencyRules`");
 
     if !plan.allowed_versions_parse_errors.is_empty() {
         eprintln!();
-        eprintln!("  parse errors in `allowedVersions`:");
+        install_ui::detail("  parse errors in `allowedVersions`:");
         for e in &plan.allowed_versions_parse_errors {
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {}: {} ({})",
                 "-".dimmed(),
                 format!("`{}`", e.name).bold(),
                 format!("\"{}\"", e.range).cyan(),
                 e.error,
-            );
+            ));
         }
     }
 
     if !plan.unsupported_shapes.is_empty() {
         eprintln!();
-        eprintln!("  unsupported value shapes:");
+        install_ui::detail("  unsupported value shapes:");
         for s in &plan.unsupported_shapes {
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {}: got {}",
                 "-".dimmed(),
                 format!("`{}`", s.field).bold(),
                 s.got,
-            );
+            ));
         }
     }
 
     if !plan.allowed_versions_conflicts.is_empty() {
         eprintln!();
-        eprintln!(
+        install_ui::detail(
             "  conflicts with existing `lpm.peerDependencyRules.allowedVersions` \
-             (same name, different range):"
+             (same name, different range):",
         );
         for c in &plan.allowed_versions_conflicts {
-            eprintln!(
+            install_ui::detail(&format!(
                 "    {} {} — pnpm wants {}, lpm.peerDependencyRules has {}",
                 "-".dimmed(),
                 format!("`{}`", c.name).bold(),
                 format!("\"{}\"", c.pnpm_range).cyan(),
                 format!("\"{}\"", c.lpm_range).cyan(),
-            );
+            ));
         }
     }
 
     eprintln!();
-    eprintln!(
+    install_ui::detail(&format!(
         "  {} No files were modified. Resolve the issues above in `package.json` and re-run {}.",
-        "info".blue().bold(),
+        install_ui::dim("hint:"),
         "lpm migrate".bold()
-    );
+    ));
 }
 
 /// Apply a validated peer-rules plan to

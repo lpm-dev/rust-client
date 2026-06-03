@@ -124,6 +124,32 @@ fn doctor_fix_regenerates_binary_lockfile_when_toml_present() {
     );
 }
 
+#[test]
+fn doctor_fix_lockfile_binary_write_failure_uses_slim_error() {
+    let project = TempProject::empty(r#"{"name":"doctor-lockb-dir","version":"1.0.0"}"#);
+    seed_healthy_hoisted_install(&project);
+    seed_minimal_lockfile(&project);
+    std::fs::create_dir(project.path().join("lpm.lockb"))
+        .expect("failed to create lpm.lockb directory fixture");
+
+    let output = lpm_doctor_offline(&project)
+        .arg("doctor")
+        .arg("--fix")
+        .arg("--yes")
+        .output()
+        .expect("failed to run lpm doctor --fix");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("✗ regenerate lpm.lockb failed:"),
+        "doctor auto-fix failure must use a slim failure line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("  error ") && !stderr.contains("warning:"),
+        "doctor auto-fix failure must not use the legacy raw error label, got:\n{stderr}"
+    );
+}
+
 // ─── doctor (no --fix) is read-only ──────────────────────────────────
 
 #[test]

@@ -787,6 +787,42 @@ fn lint_single_package_reports_slim_completion_with_elapsed_time() {
 
 #[cfg(unix)]
 #[test]
+fn lint_malformed_lpm_json_tools_config_warns_with_slim_line() {
+    let project = TempProject::empty(r#"{"name":"slim-lint-config","version":"1.0.0"}"#);
+    project.write_file("lpm.json", "{");
+    seed_fake_plugin(&project, "oxlint", "1.58.0", ".lint-ok");
+
+    let output = lpm(&project)
+        .args(["lint"])
+        .output()
+        .expect("failed to run lpm lint");
+
+    assert!(
+        output.status.success(),
+        "lint stand-in must succeed despite malformed lpm.json\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        project.file_exists(".lint-ok"),
+        "lint stand-in must execute inside the project"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("! failed to read lpm.json tools config:")),
+        "malformed lpm.json warning must use a slim warning line, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("\u{1b}[33m!") && !stderr.contains("warning: failed to read lpm.json"),
+        "malformed lpm.json warning must not use the legacy raw warning label, got:\n{stderr:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn fmt_write_single_package_reports_slim_completion_with_elapsed_time() {
     let project = TempProject::empty(r#"{"name":"slim-fmt","version":"1.0.0"}"#);
     project.write_file("lpm.json", r#"{"tools":{"biome":"1.0.0"}}"#);
