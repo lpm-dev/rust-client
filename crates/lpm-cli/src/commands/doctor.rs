@@ -242,6 +242,11 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let mut checks: Vec<Check> = Vec::new();
     let mut fixes_applied: Vec<String> = Vec::new();
+    let mut sweep_progress = if all && !json_output {
+        Some(install_ui::spin("Running doctor --all checks"))
+    } else {
+        None
+    };
 
     // Shared between the registry/auth probe (Extended) and the
     // tunnel block (Extended). Stays `false` on the fast path since
@@ -686,6 +691,10 @@ pub async fn run(
         for check in check_script_policy_surface() {
             checks.push(check);
         }
+    }
+
+    if let Some(progress) = sweep_progress.take() {
+        progress.settle();
     }
 
     // === Auto-fix (runs before output so JSON includes fixes_applied) ===

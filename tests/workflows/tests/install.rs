@@ -852,6 +852,63 @@ fn empty_deps_second_install_is_up_to_date() {
     );
 }
 
+#[test]
+fn bare_install_regenerates_missing_binary_lockfile_before_reporting_fresh() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "empty-deps-lockb-refresh",
+        "version": "1.0.0",
+        "dependencies": {}
+    }"#,
+    );
+
+    let first = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run first lpm install");
+    assert!(
+        first.status.success(),
+        "first empty-deps install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+    assert!(
+        project.file_exists("lpm.lockb"),
+        "first install must materialize lpm.lockb"
+    );
+
+    std::fs::remove_file(project.path().join("lpm.lockb")).expect("remove lpm.lockb");
+
+    let second = lpm(&project)
+        .args(["install"])
+        .output()
+        .expect("failed to run second lpm install");
+    assert!(
+        second.status.success(),
+        "second install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert!(
+        project.file_exists("lpm.lockb"),
+        "bare install must regenerate missing lpm.lockb before reporting fresh"
+    );
+
+    let doctor = lpm(&project)
+        .args(["doctor"])
+        .output()
+        .expect("failed to run lpm doctor");
+    let doctor_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        !doctor_output.contains("lpm.lockb missing"),
+        "doctor must not keep warning after bare install regenerated lpm.lockb:\n{doctor_output}"
+    );
+}
+
 // ─── install-time warning for `pnpm.overrides` ─────
 
 /// A project with `pnpm.overrides` but no LPM-readable equivalent

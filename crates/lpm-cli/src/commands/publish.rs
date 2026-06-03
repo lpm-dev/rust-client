@@ -1,9 +1,8 @@
 use crate::commands::publish_common::{self, TarballFile};
 use crate::commands::publish_npm;
-use crate::{auth, install_ui, oidc, output, provenance, quality, sigstore};
+use crate::{auth, install_ui, oidc, provenance, quality, sigstore};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_runner::lpm_json;
 use lpm_security::behavioral::secrets::SecretScanResult;
@@ -442,14 +441,14 @@ pub async fn run(
 
     if has_skills && targets_lpm {
         if !json_output {
-            output::info("Validating skills...");
+            install_ui::phase("Validating skills");
         }
 
         let (valid, skill_errors, security_issues) = validate_skills_for_publish(&skills_dir);
 
         if !security_issues.is_empty() {
             for issue in &security_issues {
-                output::warn(&format!(
+                install_ui::warn(&format!(
                     "Skill security: {} — {} at line {} ({})",
                     issue.matched_text, issue.category, issue.line_number, issue.pattern
                 ));
@@ -461,7 +460,7 @@ pub async fn run(
 
         if !skill_errors.is_empty() {
             for err in &skill_errors {
-                output::warn(err);
+                install_ui::warn(err);
             }
             return Err(LpmError::Registry(
                 "skills validation failed — fix errors above".into(),
@@ -469,7 +468,7 @@ pub async fn run(
         }
 
         if !json_output {
-            output::success(&format!("{valid} skill(s) validated"));
+            install_ui::done(&format!("{valid} skill(s) validated"));
         }
 
         ensure_lpm_in_files(&pkg_json_path, &pkg_json)?;
@@ -509,7 +508,7 @@ pub async fn run(
                 Ok(oidc_token) => {
                     oidc_swapped_client = client.clone_with_config().with_token(oidc_token.token);
                     if !json_output {
-                        output::info("Using OIDC-exchanged session token for LPM publish.");
+                        install_ui::phase("Using OIDC-exchanged session token for LPM publish");
                     }
                     &oidc_swapped_client
                 }
@@ -536,7 +535,7 @@ pub async fn run(
                 let local_digest = compute_skills_digest(&skills_dir);
                 let published_digest = compute_published_skills_digest(&prev.skills);
                 if local_digest == published_digest && !json_output {
-                    output::warn(
+                    install_ui::warn(
                         "Skills are identical to the previously published version — consider updating them",
                     );
                 }
@@ -591,36 +590,18 @@ pub async fn run(
                 eco = "swift".to_string();
             }
 
-            eprintln!();
-            eprintln!("  {} Dry run — no changes will be made.\n", "ℹ".blue());
-            eprintln!(
-                "  {} {}",
-                "Package:".dimmed(),
-                format!("{name}@{version}").bold()
-            );
-            for (registry_key, target_name) in &target_names {
-                eprintln!(
-                    "  {} {}",
-                    format!("{registry_key} name:").dimmed(),
-                    target_name.bold()
-                );
-            }
-            eprintln!(
-                "  {} {} files ({})",
-                "Files:".dimmed(),
-                tarball_files.len(),
-                lpm_common::format_bytes(tarball_size as u64)
-            );
-            if let Some(ref qr) = quality_result {
-                eprintln!("  {} {}/{}", "Quality:".dimmed(), qr.score, qr.max_score);
-            }
-            if has_skills {
-                eprintln!("  {} included", "Skills:".dimmed());
-            }
-            eprintln!("  {} {}", "Ecosystem:".dimmed(), eco);
-            let target_names: Vec<String> = targets.iter().map(|t| t.key()).collect();
-            eprintln!("  {} {}", "Targets:".dimmed(), target_names.join(", "));
-            eprintln!();
+            let summary = DryRunSummary {
+                name,
+                version,
+                target_names: &target_names,
+                file_count: tarball_files.len(),
+                tarball_size,
+                quality_result: quality_result.as_ref(),
+                has_skills,
+                ecosystem: &eco,
+                targets: &targets,
+            };
+            print_dry_run_summary(&summary);
         }
         return Ok(());
     }
@@ -648,7 +629,7 @@ pub async fn run(
                 .map_err(|e| LpmError::Registry(e.to_string()))?;
 
             if !confirm {
-                output::info("Publish cancelled.");
+                install_ui::skipped("Publish cancelled");
                 return Ok(());
             }
         }
@@ -727,7 +708,7 @@ pub async fn run(
                             )))?;
 
                         if !json_output {
-                            output::success("Sigstore provenance generated and recorded in Rekor");
+                            install_ui::done("Sigstore provenance generated and recorded in Rekor");
                         }
                         let bundle_json = serde_json::to_value(&bundle).unwrap_or_default();
                         lpm_version_data["_provenance"] = bundle_json.clone();
@@ -778,7 +759,7 @@ pub async fn run(
                             {
                                 for w in warnings {
                                     if let Some(msg) = w.as_str() {
-                                        output::warn(msg);
+                                        install_ui::warn(msg);
                                     }
                                 }
                             }
@@ -792,7 +773,7 @@ pub async fn run(
                     }
                     Err(e) => {
                         if !json_output {
-                            output::warn(&format!("LPM publish failed: {e}"));
+                            install_ui::warn(&format!("LPM publish failed: {e}"));
                         }
                         results.push(PublishResult {
                             target: "lpm".into(),
@@ -963,7 +944,7 @@ pub async fn run(
                             )))?;
 
                         if !json_output {
-                            output::success(&format!(
+                            install_ui::done(&format!(
                                 "Sigstore provenance generated for {} → Rekor",
                                 display
                             ));
@@ -1020,7 +1001,7 @@ pub async fn run(
                         }
                     } else if !json_output {
                         let err_msg = npm_result.error.as_deref().unwrap_or("unknown error");
-                        output::warn(&format!("{display} publish failed: {err_msg}"));
+                        install_ui::warn(&format!("{display} publish failed: {err_msg}"));
                     }
 
                     Ok(PublishResult {
@@ -1039,7 +1020,10 @@ pub async fn run(
                     Err(e) => {
                         let duration = start.elapsed();
                         if !json_output {
-                            output::warn(&format!("{} publish failed: {e}", target.display_name()));
+                            install_ui::warn(&format!(
+                                "{} publish failed: {e}",
+                                target.display_name()
+                            ));
                         }
                         results.push(PublishResult {
                             target: target.key(),
@@ -1076,11 +1060,7 @@ pub async fn run(
             ));
             for (target, result) in targets.iter().zip(results.iter()) {
                 if !result.success {
-                    eprintln!(
-                        "  Retry: {} publish {}",
-                        "lpm".dimmed(),
-                        target.retry_flag()
-                    );
+                    install_ui::detail(&format_publish_retry_detail(target));
                 }
             }
         } else {
@@ -1151,12 +1131,11 @@ async fn publish_to_lpm(
         && !registry_url.starts_with("http://127.0.0.1")
         && !json_output
     {
-        eprintln!();
-        eprintln!(
-            "  {} Publishing to non-default registry: {}",
-            "!".yellow().bold(),
-            registry_url.bold()
-        );
+        install_ui::detail("");
+        install_ui::warn(&format!(
+            "Publishing to non-default registry: {}",
+            install_ui::url(registry_url)
+        ));
     }
 
     // Verify token has publish scope
@@ -1239,7 +1218,7 @@ async fn publish_to_lpm(
     let tarball_mb = tarball_data.len() / (1024 * 1024);
     if tarball_mb > 50 && !json_output {
         let peak_mb = tarball_data.len() * 4 / 3 / (1024 * 1024) + tarball_mb;
-        output::warn(&format!(
+        install_ui::warn(&format!(
             "Large tarball ({tarball_mb}MB). This will require ~{peak_mb}MB of memory."
         ));
     }
@@ -1488,7 +1467,7 @@ fn ensure_lpm_in_files(pkg_json_path: &Path, pkg_json: &serde_json::Value) -> Re
                 std::fs::write(&tmp, &new_content)?;
                 std::fs::rename(&tmp, pkg_json_path)?;
 
-                output::warn(
+                install_ui::warn(
                     "Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise",
                 );
             }
@@ -1570,9 +1549,80 @@ fn print_upload_phase(
     publish_detail("dist-tag", &install_ui::yellow(dist_tag));
 }
 
+struct DryRunSummary<'a> {
+    name: &'a str,
+    version: &'a str,
+    target_names: &'a std::collections::HashMap<String, String>,
+    file_count: usize,
+    tarball_size: usize,
+    quality_result: Option<&'a quality::QualityResult>,
+    has_skills: bool,
+    ecosystem: &'a str,
+    targets: &'a [PublishTarget],
+}
+
+fn print_dry_run_summary(summary: &DryRunSummary<'_>) {
+    install_ui::detail("");
+    install_ui::phase("Dry run — no changes will be made");
+    publish_detail(
+        "package",
+        &install_ui::yellow(&format!("{}@{}", summary.name, summary.version)),
+    );
+    for (registry_key, target_name) in summary.target_names {
+        publish_detail(
+            &format!("{registry_key} name"),
+            &install_ui::yellow(target_name),
+        );
+    }
+    publish_detail(
+        "files",
+        &format_dry_run_files_value(summary.file_count, summary.tarball_size),
+    );
+    if let Some(qr) = summary.quality_result {
+        publish_detail(
+            "quality",
+            &format!(
+                "{}/{}",
+                install_ui::status_ok(&qr.score.to_string()),
+                qr.max_score
+            ),
+        );
+    }
+    if summary.has_skills {
+        publish_detail("skills", &install_ui::status_ok("included"));
+    }
+    publish_detail("ecosystem", &install_ui::yellow(summary.ecosystem));
+    let target_keys = summary
+        .targets
+        .iter()
+        .map(PublishTarget::key)
+        .collect::<Vec<_>>();
+    publish_detail("targets", &install_ui::yellow(&target_keys.join(", ")));
+    install_ui::detail("");
+}
+
 fn publish_detail(label: &str, value: &str) {
     let label = format!("{label:<10}");
     install_ui::detail(&format!("    {} {}", install_ui::dim(&label), value));
+}
+
+fn format_dry_run_files_value(file_count: usize, tarball_size: usize) -> String {
+    format!(
+        "{} files {}",
+        install_ui::status_ok(&file_count.to_string()),
+        install_ui::dim(&format!(
+            "({})",
+            lpm_common::format_bytes(tarball_size as u64)
+        ))
+    )
+}
+
+fn format_publish_retry_detail(target: &PublishTarget) -> String {
+    format!(
+        "  {} {}",
+        install_ui::dim("Retry:"),
+        install_ui::yellow(&format!("lpm publish {}", target.retry_flag()))
+    )
 }
 
 fn lpm_visibility(_pkg_json: &serde_json::Value) -> &'static str {
@@ -2071,6 +2121,23 @@ mod tests {
         );
         assert_eq!(PublishTarget::Npm.retry_flag(), "--npm");
         assert_eq!(PublishTarget::GitHub.retry_flag(), "--github");
+    }
+
+    #[test]
+    fn dry_run_files_value_uses_slim_value_roles() {
+        assert_eq!(
+            console::strip_ansi_codes(&format_dry_run_files_value(3, 2048)).into_owned(),
+            "3 files (2.0 KB)"
+        );
+    }
+
+    #[test]
+    fn publish_retry_detail_uses_slim_detail_shape() {
+        assert_eq!(
+            console::strip_ansi_codes(&format_publish_retry_detail(&PublishTarget::Npm))
+                .into_owned(),
+            "  Retry: lpm publish --npm"
+        );
     }
 
     #[test]
