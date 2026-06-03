@@ -831,7 +831,11 @@ pub async fn run(
                     fixes_applied.len(),
                     fixes_applied.join(", ")
                 ));
-                println!("\n  Run {} to verify fixes.", "lpm doctor".bold());
+                install_ui::detail(&format!(
+                    "  {} Run {} to verify fixes.",
+                    install_ui::dim("hint"),
+                    install_ui::yellow("lpm doctor")
+                ));
             }
         }
     }

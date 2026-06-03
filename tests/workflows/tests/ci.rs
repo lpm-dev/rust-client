@@ -120,7 +120,7 @@ fn ci_env_output_writes_dotenv_file_for_selected_env_mode() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("wrote 3 vars to ci.env"),
+        stderr.contains("✓ Wrote 3 vars to ci.env"),
         "ci env --output must report the file write, got:\n{stderr}"
     );
 }

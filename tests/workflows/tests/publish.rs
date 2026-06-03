@@ -70,6 +70,82 @@ fn publish_without_package_json_fails() {
     );
 }
 
+#[test]
+fn publish_secret_scan_human_failure_uses_stderr_only() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.secret-pkg",
+        "version": "1.0.0",
+        "description": "Contains a secret fixture",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file(
+        "index.js",
+        r#"const password = "not-a-real-secret-fixture";"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("failed to run lpm publish");
+
+    assert!(!output.status.success(), "secret scan must block publish");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.trim().is_empty(),
+        "human secret-scan failure must not write to stdout, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("! Secret scan found")
+            && stderr.contains("✗ Publish blocked. Remove secrets before publishing.")
+            && stderr.contains("hint If these are false positives, use --allow-secrets."),
+        "expected slim stderr secret-scan failure, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Registry error") && !stderr.contains("Error:"),
+        "command-owned failure should not be followed by framework diagnostics:\n{stderr}"
+    );
+}
+
+#[test]
+fn publish_secret_scan_json_failure_emits_single_envelope() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.secret-json-pkg",
+        "version": "1.0.0",
+        "description": "Contains a secret fixture",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file(
+        "index.js",
+        r#"const password = "not-a-real-json-secret-fixture";"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("failed to run lpm publish --json");
+
+    assert!(!output.status.success(), "secret scan must block publish");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be one JSON object");
+
+    assert_eq!(json["error"], "secret_scan_failed");
+    assert_eq!(json["matches"][0]["pattern"], "generic_password");
+    assert!(
+        stderr.trim().is_empty(),
+        "JSON secret-scan failure must not add human diagnostics, got:\n{stderr}"
+    );
+}
+
 // ─── Missing Required Fields ─────────────────────────────────────
 
 #[test]

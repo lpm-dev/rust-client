@@ -6,6 +6,7 @@ use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_runner::lpm_json;
+use lpm_security::behavioral::secrets::SecretScanResult;
 use lpm_security::skill_security;
 use std::path::Path;
 
@@ -61,6 +62,13 @@ pub struct PublishResult {
     pub success: bool,
     pub error: Option<String>,
     pub duration: std::time::Duration,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SecretScanLine {
+    Warn(String),
+    Failed(String),
+    Detail(String),
 }
 
 /// Resolve the target registries from CLI flags and lpm.json config.
@@ -386,60 +394,11 @@ pub async fn run(
         let secret_scan = lpm_security::behavioral::secrets::scan_directory(project_dir);
         if secret_scan.has_secrets() {
             if json_output {
-                let matches_json: Vec<serde_json::Value> = secret_scan
-                    .matches
-                    .iter()
-                    .map(|m| {
-                        serde_json::json!({
-                            "pattern": m.pattern_name,
-                            "description": m.description,
-                            "line": m.line,
-                            "severity": m.severity,
-                        })
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "error": "secret_scan_failed",
-                        "matches": matches_json,
-                        "hint": "Use --allow-secrets to bypass (not recommended)",
-                    })
-                );
+                println!("{}", secret_scan_json(&secret_scan));
             } else {
-                println!();
-                output::warn(&format!(
-                    "Secret scan found {} potential leak(s):",
-                    secret_scan.matches.len()
-                ));
-                println!();
-                for m in &secret_scan.matches {
-                    let severity_color = match m.severity.as_str() {
-                        "critical" => "\x1b[31m", // red
-                        "high" => "\x1b[33m",     // yellow
-                        _ => "\x1b[90m",          // dimmed
-                    };
-                    let location = if m.line > 0 {
-                        format!(":{}", m.line)
-                    } else {
-                        String::new()
-                    };
-                    println!(
-                        "  {severity_color}{}{}\x1b[0m  {}  {}",
-                        m.matched_text, location, m.pattern_name, m.description
-                    );
-                }
-                println!();
-                println!("  Publish blocked. Remove secrets before publishing.");
-                println!(
-                    "  If these are false positives, use {} (not recommended).",
-                    "--allow-secrets".bold()
-                );
-                println!();
+                emit_secret_scan_human(&secret_scan);
             }
-            return Err(LpmError::Registry(
-                "publish blocked: secrets detected in package".into(),
-            ));
+            return Err(LpmError::ExitCode(1));
         }
         if !json_output {
             install_ui::done("Secret scan passed");
@@ -1320,6 +1279,92 @@ async fn publish_to_lpm(
 }
 
 // ---------------------------------------------------------------------------
+fn secret_scan_json(scan: &SecretScanResult) -> serde_json::Value {
+    let matches_json: Vec<serde_json::Value> = scan
+        .matches
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "pattern": m.pattern_name,
+                "description": m.description,
+                "line": m.line,
+                "severity": m.severity,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "error": "secret_scan_failed",
+        "matches": matches_json,
+        "hint": "Use --allow-secrets to bypass (not recommended)",
+    })
+}
+
+fn emit_secret_scan_human(scan: &SecretScanResult) {
+    for line in format_secret_scan_human(scan) {
+        match line {
+            SecretScanLine::Warn(message) => install_ui::warn(&message),
+            SecretScanLine::Failed(message) => install_ui::failed(&message),
+            SecretScanLine::Detail(message) => install_ui::detail(&message),
+        }
+    }
+}
+
+fn format_secret_scan_human(scan: &SecretScanResult) -> Vec<SecretScanLine> {
+    let mut lines = Vec::with_capacity(scan.matches.len() + 3);
+    lines.push(SecretScanLine::Warn(format!(
+        "Secret scan found {} potential {}",
+        install_ui::status_ok(&scan.matches.len().to_string()),
+        if scan.matches.len() == 1 {
+            "leak"
+        } else {
+            "leaks"
+        }
+    )));
+
+    for secret_match in &scan.matches {
+        lines.push(SecretScanLine::Detail(format_secret_match(secret_match)));
+    }
+
+    lines.push(SecretScanLine::Failed(
+        "Publish blocked. Remove secrets before publishing.".to_string(),
+    ));
+    lines.push(SecretScanLine::Detail(format!(
+        "  {} If these are false positives, use {}.",
+        install_ui::dim("hint"),
+        install_ui::yellow("--allow-secrets")
+    )));
+    lines
+}
+
+fn format_secret_match(secret_match: &lpm_security::behavioral::secrets::SecretMatch) -> String {
+    let matched_text = lpm_common::sanitize_for_terminal(&secret_match.matched_text);
+    let pattern_name = lpm_common::sanitize_for_terminal(&secret_match.pattern_name);
+    let description = lpm_common::sanitize_for_terminal(&secret_match.description);
+    let location = if secret_match.line > 0 {
+        install_ui::dim(&format!(":{}", secret_match.line))
+    } else {
+        String::new()
+    };
+
+    format!(
+        "  {} {}{}  {}  {}",
+        format_secret_severity(&secret_match.severity),
+        install_ui::red(&matched_text),
+        location,
+        install_ui::cyan(&pattern_name),
+        description
+    )
+}
+
+fn format_secret_severity(severity: &str) -> String {
+    match severity {
+        "critical" => install_ui::red("critical"),
+        "high" => install_ui::yellow("high"),
+        _ => install_ui::dim(severity),
+    }
+}
+
 // Skills validation helpers
 // ---------------------------------------------------------------------------
 
@@ -1763,6 +1808,73 @@ fn extract_swift_metadata(manifest: &serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lpm_security::behavioral::secrets::SecretMatch;
+
+    #[test]
+    fn secret_scan_human_renderer_uses_slim_lines_with_expected_content() {
+        let scan = SecretScanResult {
+            matches: vec![SecretMatch {
+                pattern_name: "stripe_live_secret".to_string(),
+                description: "Stripe live secret key".to_string(),
+                matched_text: "sk_live_********1234".to_string(),
+                line: 7,
+                severity: "critical".to_string(),
+            }],
+            files_scanned: 1,
+        };
+
+        let lines = format_secret_scan_human(&scan);
+        let joined = lines
+            .iter()
+            .map(|line| match line {
+                SecretScanLine::Warn(message)
+                | SecretScanLine::Failed(message)
+                | SecretScanLine::Detail(message) => message.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let joined = console::strip_ansi_codes(&joined).into_owned();
+
+        assert!(
+            matches!(lines.first(), Some(SecretScanLine::Warn(_))),
+            "secret scan headline should render as an install_ui warning"
+        );
+        assert!(
+            matches!(lines.get(2), Some(SecretScanLine::Failed(_))),
+            "blocking result should render as an install_ui failure"
+        );
+        assert!(
+            joined.contains("Secret scan found 1 potential leak")
+                && joined.contains("critical sk_live_********1234:7  stripe_live_secret")
+                && joined.contains("Publish blocked. Remove secrets before publishing.")
+                && joined.contains("use --allow-secrets"),
+            "secret scan slim output missing expected detail:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn secret_scan_json_envelope_preserves_machine_fields() {
+        let scan = SecretScanResult {
+            matches: vec![SecretMatch {
+                pattern_name: "github_pat".to_string(),
+                description: "GitHub personal access token".to_string(),
+                matched_text: "ghp_********1234".to_string(),
+                line: 3,
+                severity: "critical".to_string(),
+            }],
+            files_scanned: 1,
+        };
+
+        let json = secret_scan_json(&scan);
+
+        assert_eq!(json["error"], "secret_scan_failed");
+        assert_eq!(json["matches"][0]["pattern"], "github_pat");
+        assert_eq!(json["matches"][0]["line"], 3);
+        assert_eq!(
+            json["hint"],
+            "Use --allow-secrets to bypass (not recommended)"
+        );
+    }
 
     #[test]
     fn ensure_lpm_in_files_preserves_tabs() {

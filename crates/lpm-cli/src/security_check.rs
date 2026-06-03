@@ -12,8 +12,7 @@
 //!
 //! Uses batch metadata endpoint for @lpm.dev packages (1 request for all).
 
-use crate::{install_ui, output};
-use lpm_common::color::Painted;
+use crate::install_ui;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::{self, PackageAnalysis};
 use lpm_store::PackageStore;
@@ -33,6 +32,12 @@ struct TagIssue {
     tag_label: &'static str,
     severity: Severity,
     packages: Vec<String>, // "name@version"
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SecuritySummaryLine {
+    Warn(String),
+    Detail(String),
 }
 
 /// Run the full post-install security summary.
@@ -143,15 +148,47 @@ pub async fn post_install_security_summary(
         return;
     }
 
-    // ── Human-readable output ─────────────────────────────────
-
-    println!();
     let total: usize = tag_counts.values().map(|v| v.len()).sum();
-    output::info(&format!(
-        "Security summary ({} packages, {} findings):",
-        packages.len(),
-        total,
-    ));
+    emit_human_security_summary(packages.len(), total, &issues, quiet);
+}
+
+fn emit_human_security_summary(
+    package_count: usize,
+    finding_count: usize,
+    issues: &[TagIssue],
+    quiet: bool,
+) {
+    for line in format_human_security_summary(package_count, finding_count, issues, quiet) {
+        match line {
+            SecuritySummaryLine::Warn(message) => install_ui::warn(&message),
+            SecuritySummaryLine::Detail(message) => install_ui::detail(&message),
+        }
+    }
+}
+
+fn format_human_security_summary(
+    package_count: usize,
+    finding_count: usize,
+    issues: &[TagIssue],
+    quiet: bool,
+) -> Vec<SecuritySummaryLine> {
+    let mut lines = Vec::new();
+    lines.push(SecuritySummaryLine::Warn(format!(
+        "Security summary · {} · {}",
+        install_ui::status_ok(&format!(
+            "{} {}",
+            package_count,
+            install_ui::packages_word(package_count)
+        )),
+        install_ui::status_ok(&format!(
+            "{finding_count} {}",
+            if finding_count == 1 {
+                "finding"
+            } else {
+                "findings"
+            }
+        ))
+    )));
 
     for severity in [
         Severity::Critical,
@@ -175,38 +212,60 @@ pub async fn post_install_security_summary(
             continue;
         }
 
-        let (label, color) = match severity {
-            Severity::Critical => ("Critical", "\x1b[31m"), // red
-            Severity::High => ("High", "\x1b[33m"),         // yellow
-            Severity::Medium => ("Medium", "\x1b[36m"),     // cyan
-            Severity::Info => ("Info", "\x1b[2m"),          // dim
-        };
-        let reset = "\x1b[0m";
-
-        println!("\n  {color}! {label}{reset}");
+        lines.push(SecuritySummaryLine::Detail(format!(
+            "  {}",
+            format_security_severity(severity)
+        )));
 
         for issue in tier_issues {
             let count = issue.packages.len();
-            let preview: Vec<&str> = issue.packages.iter().take(3).map(|s| s.as_str()).collect();
-            let preview_str = preview.join(", ");
+            let preview_str = preview_packages(&issue.packages, 3);
             let suffix = if count > 3 {
-                format!(", ... (+{})", count - 3)
+                install_ui::dim(&format!(", ... (+{})", count - 3))
             } else {
                 String::new()
             };
 
-            println!(
-                "    {count} {:<20} {color}→{reset} {preview_str}{suffix}",
-                issue.tag_label,
-            );
+            lines.push(SecuritySummaryLine::Detail(format!(
+                "    {} {:<20} {} {}{}",
+                install_ui::status_ok(&count.to_string()),
+                install_ui::cyan(issue.tag_label),
+                install_ui::dim("→"),
+                install_ui::dim(&preview_str),
+                suffix,
+            )));
         }
     }
 
-    println!("\n  Run {} for full details.", "lpm audit".bold());
-    println!(
-        "  Run {} to inspect specific tags.\n",
-        "lpm query \":critical\"".bold()
-    );
+    lines.push(SecuritySummaryLine::Detail(format!(
+        "  {} Run {} for full details.",
+        install_ui::dim("hint"),
+        install_ui::yellow("lpm audit")
+    )));
+    lines.push(SecuritySummaryLine::Detail(format!(
+        "  {} Run {} to inspect specific tags.",
+        install_ui::dim("hint"),
+        install_ui::yellow("lpm query \":critical\"")
+    )));
+    lines
+}
+
+fn format_security_severity(severity: Severity) -> String {
+    match severity {
+        Severity::Critical => install_ui::red("Critical"),
+        Severity::High => install_ui::yellow("High"),
+        Severity::Medium => install_ui::cyan("Medium"),
+        Severity::Info => install_ui::dim("Info"),
+    }
+}
+
+fn preview_packages(packages: &[String], limit: usize) -> String {
+    packages
+        .iter()
+        .take(limit)
+        .map(|pkg| lpm_common::sanitize_for_terminal(pkg))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Collect tags from a client-side PackageAnalysis into the tag_counts map.
@@ -683,6 +742,88 @@ mod tests {
                 .get("copyleft_license")
                 .unwrap()
                 .contains("pkg@2.0.0")
+        );
+    }
+
+    #[test]
+    fn human_security_summary_uses_slim_lines_with_expected_content() {
+        let issues = vec![
+            TagIssue {
+                tag_label: "lifecycle script",
+                severity: Severity::Critical,
+                packages: vec!["evil@1.0.0".to_string(), "risky@2.0.0".to_string()],
+            },
+            TagIssue {
+                tag_label: "network access",
+                severity: Severity::Medium,
+                packages: vec!["net@3.0.0".to_string()],
+            },
+        ];
+
+        let lines = format_human_security_summary(3, 3, &issues, false);
+        let joined = lines
+            .iter()
+            .map(|line| match line {
+                SecuritySummaryLine::Warn(message) | SecuritySummaryLine::Detail(message) => {
+                    message.as_str()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let joined = console::strip_ansi_codes(&joined).into_owned();
+
+        assert!(
+            matches!(lines.first(), Some(SecuritySummaryLine::Warn(_))),
+            "security summary headline should render through install_ui::warn"
+        );
+        assert!(
+            joined.contains("Security summary · 3 packages · 3 findings"),
+            "summary headline missing: {joined}"
+        );
+        assert!(
+            joined.contains("2 lifecycle script") && joined.contains("→ evil@1.0.0, risky@2.0.0"),
+            "critical issue detail missing: {joined}"
+        );
+        assert!(
+            joined.contains("Run lpm audit for full details."),
+            "hint detail missing: {joined}"
+        );
+    }
+
+    #[test]
+    fn human_security_summary_quiet_mode_keeps_high_signal_tiers_only() {
+        let issues = vec![
+            TagIssue {
+                tag_label: "network access",
+                severity: Severity::Medium,
+                packages: vec!["net@3.0.0".to_string()],
+            },
+            TagIssue {
+                tag_label: "lifecycle script",
+                severity: Severity::High,
+                packages: vec!["risky@2.0.0".to_string()],
+            },
+        ];
+
+        let lines = format_human_security_summary(2, 2, &issues, true);
+        let joined = lines
+            .iter()
+            .map(|line| match line {
+                SecuritySummaryLine::Warn(message) | SecuritySummaryLine::Detail(message) => {
+                    message.as_str()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let joined = console::strip_ansi_codes(&joined).into_owned();
+
+        assert!(
+            joined.contains("lifecycle script"),
+            "high-severity issue should stay visible: {joined}"
+        );
+        assert!(
+            !joined.contains("network access"),
+            "medium-severity issue should be suppressed in quiet mode: {joined}"
         );
     }
 

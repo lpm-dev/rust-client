@@ -549,21 +549,14 @@ pub async fn run(
                 } else {
                     ""
                 };
-                let status_color = if webhook.response_status >= 500 {
-                    "\x1b[31m"
-                } else if webhook.response_status >= 400 {
-                    "\x1b[33m"
-                } else {
-                    "\x1b[32m"
-                };
-                let reset = "\x1b[0m";
+                let status = format_dev_webhook_status(webhook.response_status);
 
                 eprintln!(
-                    "  {} {} {} -> {status_color}{}{reset} ({}ms) — {}{}",
+                    "  {} {} {} -> {} ({}ms) — {}{}",
                     "[tunnel]".dimmed(),
                     webhook.method,
                     webhook.path,
-                    webhook.response_status,
+                    status,
                     webhook.duration_ms,
                     webhook.summary,
                     status_indicator,
@@ -571,7 +564,11 @@ pub async fn run(
 
                 // Show signature diagnostic if present
                 if let Some(ref diag) = webhook.signature_diagnostic {
-                    eprintln!("           {}", format!("! {diag}").yellow());
+                    install_ui::detail(&format!(
+                        "           {} {}",
+                        install_ui::yellow("!"),
+                        lpm_common::sanitize_for_terminal(diag)
+                    ));
                 }
             }
         });
@@ -1649,6 +1646,17 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
+fn format_dev_webhook_status(status: u16) -> String {
+    let status_label = status.to_string();
+    if status >= 500 {
+        install_ui::red(&status_label)
+    } else if status >= 400 {
+        install_ui::yellow(&status_label)
+    } else {
+        install_ui::status_ok(&status_label)
+    }
+}
+
 /// Check if a port number is in the privileged range (< 1024).
 ///
 /// On Linux, binding to ports below 1024 requires root or `CAP_NET_BIND_SERVICE`.
@@ -1809,6 +1817,22 @@ mod tests {
     fn format_duration_secs() {
         let d = std::time::Duration::from_millis(3200);
         assert_eq!(format_duration(d), "3.2s");
+    }
+
+    #[test]
+    fn webhook_status_formatter_plain_content_is_stable() {
+        assert_eq!(
+            console::strip_ansi_codes(&format_dev_webhook_status(200)).into_owned(),
+            "200"
+        );
+        assert_eq!(
+            console::strip_ansi_codes(&format_dev_webhook_status(404)).into_owned(),
+            "404"
+        );
+        assert_eq!(
+            console::strip_ansi_codes(&format_dev_webhook_status(500)).into_owned(),
+            "500"
+        );
     }
 
     #[test]
