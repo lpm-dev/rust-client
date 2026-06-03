@@ -976,7 +976,7 @@ fn upgrade_interactive_with_json_is_hard_error() {
     );
 }
 
-/// `-i -y` is mutually exclusive — clap-level rejection. Error names
+/// `-i -y` is mutually exclusive — parse-layer rejection. Error names
 /// both flags.
 #[test]
 fn upgrade_interactive_and_yes_is_hard_error() {

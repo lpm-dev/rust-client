@@ -693,12 +693,12 @@ fn install_audit_after_install_flags_are_mutually_exclusive() {
         .expect("failed to run lpm install");
     assert!(
         !output.status.success(),
-        "clap must reject passing both flags simultaneously"
+        "parse layer must reject passing both flags simultaneously"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("cannot be used with"),
-        "expected clap conflict message; got stderr:\n{stderr}"
+        "expected parse conflict message; got stderr:\n{stderr}"
     );
 }
 
@@ -4918,10 +4918,9 @@ fn install_rejects_unknown_lpm_linker_value_loudly() {
     );
 }
 
-/// CLI flag `--linker symlink` is rejected by clap at parse time. The
-/// install pipeline never sees an unknown value through this surface, so
-/// the error format is clap's standard "invalid value" message rather than
-/// the install-time message.
+/// CLI flag `--linker symlink` is rejected at parse time. The install pipeline
+/// never sees an unknown value through this surface, so the error format is the
+/// slim command-line error rather than the install-time message.
 #[test]
 fn install_cli_linker_flag_rejects_unknown_value_at_parse_time() {
     let project = TempProject::empty(
@@ -4938,14 +4937,14 @@ fn install_cli_linker_flag_rejects_unknown_value_at_parse_time() {
 
     assert!(
         !out.status.success(),
-        "`--linker symlink` should fail at clap parse time"
+        "`--linker symlink` should fail at parse time"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("invalid value")
             || stderr.contains("possible values")
             || stderr.contains("isolated"),
-        "stderr must surface the clap rejection; got:\n{stderr}"
+        "stderr must surface the parse rejection; got:\n{stderr}"
     );
 }
 

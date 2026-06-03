@@ -60,7 +60,7 @@ fn empty_project_with_dep(dep: &str) -> TempProject {
     ))
 }
 
-// ─── clap mutual-exclusion contract ──────────────────────────────────
+// ─── parse mutual-exclusion contract ─────────────────────────────────
 
 #[tokio::test]
 async fn install_policy_and_yolo_together_is_rejected_by_clap() {
@@ -75,7 +75,7 @@ async fn install_policy_and_yolo_together_is_rejected_by_clap() {
 
     assert!(
         !output.status.success(),
-        "--policy and --yolo are mutually exclusive; clap must reject"
+        "--policy and --yolo are mutually exclusive; parser must reject"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -98,7 +98,7 @@ async fn install_policy_and_triage_together_is_rejected_by_clap() {
 
     assert!(
         !output.status.success(),
-        "--policy and --triage are mutually exclusive; clap must reject"
+        "--policy and --triage are mutually exclusive; parser must reject"
     );
 }
 
@@ -115,7 +115,7 @@ async fn install_yolo_and_triage_together_is_rejected_by_clap() {
 
     assert!(
         !output.status.success(),
-        "--yolo and --triage are mutually exclusive; clap must reject"
+        "--yolo and --triage are mutually exclusive; parser must reject"
     );
 }
 
