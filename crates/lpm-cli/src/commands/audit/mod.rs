@@ -584,28 +584,28 @@ pub async fn run_fix(
         client,
         project_dir,
         false, // keep audit-fix JSON stdout single-document
-        false,
-        false,
-        true, // no_security_summary: audit fix emits its own final report.
-        false,
-        None,
-        None,
-        false,
-        false,
-        false,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        false, // offline
+        false, // force
+        false, // allow_new
+        false, // strict_integrity
+        None,  // strict_peer_dependencies_override
+        None,  // linker_override
+        false, // no_skills
+        false, // no_editor_setup
+        true,  // no_security_summary: audit fix emits its own final report.
+        false, // auto_build
+        None,  // target_set
+        None,  // direct_versions_out
+        None,  // requested_add_count
+        None,  // script_policy_override
+        None,  // advisor_override
+        None,  // min_release_age_override
         crate::provenance_fetch::DriftIgnorePolicy::default(),
         crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
-        false,
-        false,
-        false,
-        false,
+        false, // strict_sandbox
+        false, // no_sandbox
+        false, // verbose
+        false, // audit_after_install
     )
     .await;
 
