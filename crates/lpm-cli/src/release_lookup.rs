@@ -224,7 +224,7 @@ impl std::fmt::Display for LookupError {
         //   (`RateLimited`). Source-agnostic variants stay neutral.
         // - The `GITHUB_TOKEN` / `GH_TOKEN` remediation hint that used
         //   to live here moved into the wrapping
-        //   `LpmError::SelfUpdateRateLimited` miette help text. Repeating
+        //   `LpmError::SelfUpdateRateLimited` diagnostic help text. Repeating
         //   it here would print the same instruction twice on screen.
         match self {
             Self::Transport(msg) => write!(f, "network error: {msg}"),
@@ -1060,7 +1060,7 @@ mod tests {
         assert!(s.contains("Try again in"), "msg: {s}");
         // GITHUB_TOKEN guidance must NOT live in the LookupError body
         // any more — it's owned by the wrapping
-        // `LpmError::SelfUpdateRateLimited` miette help text.
+        // `LpmError::SelfUpdateRateLimited` diagnostic help text.
         // Duplicating it here would double-print on screen.
         assert!(
             !s.contains("GITHUB_TOKEN"),

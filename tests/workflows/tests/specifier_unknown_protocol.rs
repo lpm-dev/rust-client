@@ -129,20 +129,13 @@ fn cli_install_argv_rejects_unknown_protocol_token() {
     );
 }
 
-/// Collapse miette's hard-wrapped multi-line error rendering into a
-/// single-spaced string so assertions on contiguous-by-source phrases
-/// don't false-fail when the renderer breaks a line between, e.g.,
-/// "Did you" and "mean 'file:'?". Also strips miette's vertical-bar
-/// gutter (`│` U+2502, prefixed on every wrapped continuation line)
-/// which would otherwise survive the whitespace collapse and intrude
-/// between the user's prose. The terminal-width wrap is cosmetic; the
-/// substring must match regardless of where it lands on the user's
-/// screen.
+/// Collapse multi-line error rendering into a single-spaced string so
+/// assertions on contiguous-by-source phrases don't false-fail when a
+/// renderer breaks a line between, e.g., "Did you" and "mean 'file:'?".
+/// The terminal-width wrap is cosmetic; the substring must match
+/// regardless of where it lands on the user's screen.
 fn normalize_whitespace(s: &str) -> String {
-    s.split_whitespace()
-        .filter(|tok| *tok != "│")
-        .collect::<Vec<_>>()
-        .join(" ")
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[test]

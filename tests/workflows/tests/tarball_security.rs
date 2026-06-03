@@ -935,8 +935,8 @@ async fn tarball_with_single_path_component_exceeding_name_max_fails_cleanly() {
     );
 
     // Stderr should name SOMETHING actionable. The extractor wraps
-    // the OS error as `LpmError::Io` → miette renders it with the
-    // original system message ("File name too long" / "filename
+    // the OS error as `LpmError::Io`, and the slim renderer preserves
+    // the original system message ("File name too long" / "filename
     // exceeds maximum length"). The word list is broad to tolerate
     // platform variance.
     let stderr_l = stderr.to_lowercase();

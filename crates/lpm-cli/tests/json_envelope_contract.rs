@@ -6,7 +6,7 @@
 //! 1. **Envelope universality (finding #76):** every `lpm --json <cmd>`
 //!    that errors BEFORE reaching the command's own JSON-output branch
 //!    must still emit a structured `{"success": false, "error": ...,
-//!    "error_code": ...}` envelope on stdout — not a miette-formatted
+//!    "error_code": ...}` envelope on stdout — not a human-formatted
 //!    error on stderr. Pre-fix, a `?` early-exit inside a match arm
 //!    body short-circuited `async_main` directly, bypassing the
 //!    top-level envelope handler.
@@ -86,7 +86,7 @@ struct DispatchCase {
 const CASES: &[DispatchCase] = &[
     // ApproveScripts arm: explicit `return Err(LpmError::Script(...))`
     // path inside the arm body. Pre-finding-#76 this was lost to
-    // miette stderr.
+    // human stderr.
     DispatchCase {
         arm: "ApproveScripts",
         args: &["--json", "approve-scripts", "--group"],

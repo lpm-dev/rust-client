@@ -342,8 +342,8 @@ async fn catalog_entry_recursive_definition_fails_with_clear_error() {
     assert!(
         text.contains("recursive")
             && text.contains("is-positive")
-            && text.contains("catalog")
-            && text.contains("'default'"),
+            && text.contains("catalog default")
+            && text.contains("specifier catalog:loop"),
         "recursive catalog error must name the package and catalog\n{text}"
     );
 }

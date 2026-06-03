@@ -96,6 +96,26 @@ while the framing goes to stderr — there is no `| jq` reason for audit to
 split, and it contradicts the stream contract. Move audit's human bodies to
 `eprintln!`/`install_ui::*`.
 
+## Rule 5a — Error exits are slim UI, not miette
+
+Every human `LpmError` exit renders through `install_ui::failed` plus optional
+`install_ui::detail` rows. The visible transcript must never show miette's
+normal diagnostic frame (`Error:`, `×`, `│`, `help:`) for an `LpmError`.
+Preserve `--json` envelopes exactly: JSON failures still emit a single stdout
+object and no human diagnostic.
+
+Error rows use the Rule-1 roles: the failed headline is plain text after the red
+`✗`, labels are dim, subjects/commands are yellow, paths/keys/scopes are cyan,
+status/durations/counts are green, and hints are dim. Security approval,
+firewall, entitlement, provenance, self-update, engine, peer-dependency, and
+auth failures should keep their structured context as detail rows rather than
+collapsing into a long wrapped sentence.
+
+Clap parse/help output is the current explicit exception: it is the argument
+parser's own surface, not an `LpmError`. If the parse layer is redesigned later,
+wrap `Cli::try_parse_from` separately and add workflow coverage before changing
+that contract.
+
 ## Rule 6 — Spinners (animate → settle) + no per-step chatter
 
 - **In-progress phases animate** as a braille spinner (blue) while the work
@@ -169,6 +189,9 @@ slim/cliclack. File:line are approximate — confirm before editing.
 ## Foundation (do first)
 
 - [x] Rule 4 — add all `install_ui` helpers + recolor `+`/`-` + `●` + doc update.
+- [x] Rule 5a — central `LpmError` human exits on slim UI; no miette diagnostic
+      frame for command/runtime `LpmError` failures, with `--json` envelopes
+      preserved.
 - [x] **Spinner primitive** in `install_ui` (Rule 6 / `SLIM_UI.md` "Spinner
       lifecycle") — animated braille (blue) at the glyph position that settles
       to `›`/`✓`/`✗`/`!`. Requirements: TTY-gated (animate only on interactive
