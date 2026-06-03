@@ -187,9 +187,77 @@ async fn upgrade_upgrades_npm_packages_with_public_npm_lock_source() {
     );
 }
 
-/// A non-`@lpm.dev/*` dependency whose lockfile source is not the
-/// public npm registry must still be skipped to avoid leaking private
-/// package names to registry.npmjs.org.
+#[tokio::test]
+async fn upgrade_upgrades_npm_packages_installed_through_configured_lpm_registry() {
+    let project = TempProject::empty(
+        r#"{"name":"proxy-installed-up","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "ms",
+        "2.1.4",
+        &[
+            (
+                "2.1.3",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.1.3")),
+            ),
+            (
+                "2.1.4",
+                serde_json::json!({}),
+                Some(make_tarball("ms", "2.1.4")),
+            ),
+        ],
+    )
+    .await;
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    project.write_file(
+        "package.json",
+        r#"{"name":"proxy-installed-up","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y"])
+        .output()
+        .expect("spawn lpm upgrade");
+    assert!(
+        out.status.success(),
+        "upgrade should include npm packages previously resolved through the configured LPM registry\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(pkg_json["dependencies"]["ms"], serde_json::json!("^2.1.4"));
+
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read lpm.lock after proxy npm upgrade");
+    let entry = lockfile
+        .packages
+        .iter()
+        .find(|p| p.name == "ms")
+        .expect("lockfile must still contain ms after upgrade");
+    assert_eq!(entry.version, "2.1.4");
+    assert!(
+        entry.tarball.is_some(),
+        "proxy-installed npm package should keep a tarball hint after upgrade",
+    );
+}
+
+/// A non-`@lpm.dev/*` dependency whose lockfile source is neither
+/// public npm nor the configured LPM registry must still be skipped to
+/// avoid leaking private package names.
 #[tokio::test]
 async fn upgrade_skips_non_public_npm_sources_and_reports_them() {
     let project = TempProject::empty(
@@ -1000,7 +1068,7 @@ async fn upgrade_major_yes_jumps_to_latest_major_version() {
 }
 
 /// `--json` envelope's `has_install_scripts: true` when the candidate
-/// version declares lifecycle scripts. Pre-Phase-7 the field was absent.
+/// version declares lifecycle scripts.
 #[tokio::test]
 async fn upgrade_yes_marks_install_scripts_in_json() {
     let project = TempProject::empty("");

@@ -13,6 +13,7 @@ set -e
 REPO="lpm-dev/rust-client"
 INSTALL_DIR="$HOME/.lpm/bin"
 BINARY_NAME="lpm"
+ALIAS_NAME="lpx"
 
 # Minimum version this installer is willing to deliver. Bumped manually
 # alongside each release that fixes a security-relevant gap. The floor
@@ -240,8 +241,10 @@ fi
 
 mv "$BIN_TMP" "$INSTALL_DIR/$BINARY_NAME"
 chmod +x "$INSTALL_DIR/$BINARY_NAME"
+ln -sf "$BINARY_NAME" "$INSTALL_DIR/$ALIAS_NAME"
 
 echo "Installed to $INSTALL_DIR/$BINARY_NAME"
+echo "Alias installed to $INSTALL_DIR/$ALIAS_NAME"
 
 # Check PATH
 case ":$PATH:" in

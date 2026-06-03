@@ -1,5 +1,5 @@
 use crate::install_ui;
-use crate::npm_public_source::lockfile_source_is_npm_public;
+use crate::npm_public_source::{NpmMetadataSource, lockfile_npm_metadata_source};
 use crate::prompt::prompt_err;
 #[cfg(test)]
 use crate::upgrade_engine::PeerViolation;
@@ -82,7 +82,7 @@ enum TargetKind {
 #[derive(Debug, Clone)]
 enum MetadataLookup {
     Lpm(PackageName),
-    Npm,
+    Npm(NpmMetadataSource),
 }
 
 #[derive(Debug, Clone)]
@@ -174,12 +174,12 @@ pub async fn run(
                 });
             }
 
-            if lockfile_source_is_npm_public(lockfile.as_ref(), &name) {
+            if let Some(source) = lockfile_npm_metadata_source(lockfile.as_ref(), &name, client) {
                 return Some(UpgradeDependency {
                     name,
                     range,
                     is_dev,
-                    lookup: MetadataLookup::Npm,
+                    lookup: MetadataLookup::Npm(source),
                 });
             }
 
@@ -617,7 +617,12 @@ async fn fetch_metadata(
 ) -> Result<PackageMetadata, LpmError> {
     match lookup {
         MetadataLookup::Lpm(pkg_name) => client.get_package_metadata(pkg_name).await,
-        MetadataLookup::Npm => client.get_npm_package_metadata(name).await,
+        MetadataLookup::Npm(NpmMetadataSource::PublicNpm) => {
+            client.get_npm_package_metadata(name).await
+        }
+        MetadataLookup::Npm(NpmMetadataSource::ConfiguredRegistry) => {
+            client.get_npm_package_metadata_proxy_only(name).await
+        }
     }
 }
 
@@ -632,7 +637,7 @@ fn attach_skipped_private(json: &mut serde_json::Value, skipped_private: &[Strin
     json.as_object_mut().unwrap().insert(
         "skipped_private_reason".into(),
         serde_json::json!(
-            "Packages without a recorded npm-public source were skipped to avoid leaking private names to registry.npmjs.org. Run `lpm install` to resolve sources, then re-run."
+            "Packages without a recorded public npm or LPM-registry source were skipped to avoid leaking private names to registry.npmjs.org. Run `lpm install` to resolve sources, then re-run."
         ),
     );
 }
@@ -643,7 +648,7 @@ fn warn_skipped_private(skipped_private: &[String]) {
     }
 
     install_ui::warn(&format!(
-        "skipped {} package(s) without a recorded npm-public source to avoid leaking private names to registry.npmjs.org: {}",
+        "skipped {} package(s) without a recorded public npm or LPM-registry source to avoid leaking private names to registry.npmjs.org: {}",
         skipped_private.len(),
         skipped_private.join(", "),
     ));

@@ -1,15 +1,21 @@
-//! `lpm global` — read-only commands against the global manifest.
+//! `lpm global` — commands against the global manifest.
 //!
 //! Subcommands: `list` (with `--outdated`/`--verbose`), `bin`,
-//! `path <pkg>`, `remove <pkg>` (= `lpm uninstall -g <pkg>`),
-//! `update [<pkg>[@<spec>]]` (with `--dry-run`).
+//! `path <pkg>`, `link [path]`, `unlink <pkg>`, `remove <pkg>`
+//! (= `lpm uninstall -g <pkg>`), `update [<pkg>[@<spec>]]` (with `--dry-run`).
 //! Read-only commands (`list`, `bin`, `path`) do not acquire a lock.
 
 use crate::install_ui;
+use chrono::Utc;
 use lpm_common::color::Painted;
-use lpm_common::{LpmError, LpmRoot, format_bytes, sanitize_for_terminal};
-use lpm_global::{GlobalManifest, PackageEntry};
-use std::path::Path;
+use lpm_common::{LpmError, LpmRoot, format_bytes, sanitize_for_terminal, with_exclusive_lock};
+use lpm_global::{
+    GlobalManifest, PackageEntry, PackageSource, Shim, artifacts_complete, emit_shim,
+    find_command_collisions, remove_shim,
+};
+use std::path::{Path, PathBuf};
+
+const LOCAL_LINK_SPEC_PREFIX: &str = "link:";
 
 /// Subcommands of `lpm global`. Defined here (not in `main.rs`) so the
 /// dispatcher and the implementation share the same type without needing
@@ -39,6 +45,19 @@ pub enum GlobalCmd {
     /// Print the install root for one specific globally-installed package.
     Path {
         /// Package name (e.g. `eslint`, `@lpm.dev/owner.tool`).
+        package: String,
+    },
+
+    /// Link a local package's bin entries into the global PATH surface.
+    Link {
+        /// Local package directory. Defaults to the current directory.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+
+    /// Remove a local package link created with `lpm global link`.
+    Unlink {
+        /// Package name (e.g. `my-cli`, `@scope/tool`).
         package: String,
     },
 
@@ -100,6 +119,8 @@ pub async fn run(
             Ok(())
         }
         GlobalCmd::Path { package } => run_path(&root, &manifest, &package, json_output),
+        GlobalCmd::Link { path } => run_link(&root, path.as_deref(), json_output),
+        GlobalCmd::Unlink { package } => run_unlink(&root, &package, json_output),
         // `lpm global remove` and `lpm uninstall -g` are two surfaces
         // for the same operation. Both route through the
         // `uninstall_global` pipeline.
@@ -177,6 +198,45 @@ async fn run_list_outdated(
         return Ok(());
     }
 
+    let local_links: Vec<String> = manifest
+        .packages
+        .iter()
+        .filter_map(|(name, entry)| {
+            (entry.source == PackageSource::LocalLink).then_some(name.clone())
+        })
+        .collect();
+    let names: Vec<String> = manifest
+        .packages
+        .iter()
+        .filter_map(|(name, entry)| {
+            (entry.source != PackageSource::LocalLink).then_some(name.clone())
+        })
+        .collect();
+
+    if names.is_empty() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": true,
+                    "outdated": [],
+                    "up_to_date": [],
+                    "unresolved": [],
+                    "skipped_local_links": local_links,
+                    "count_outdated": 0,
+                }))
+                .unwrap()
+            );
+        } else {
+            install_ui::done(&format!(
+                "No registry-backed global packages to check ({} local link{} skipped).",
+                local_links.len(),
+                if local_links.len() == 1 { "" } else { "s" },
+            ));
+        }
+        return Ok(());
+    }
+
     // Single batch call covers every globally-installed package.
     //
     // Accepted-posture trade-off (L41): the batch endpoint is called
@@ -193,12 +253,11 @@ async fn run_list_outdated(
     //      it transparently proxies npm metadata via the same `dist`
     //      shape, which is exactly what `pick_latest_matching` expects.
     //
-    //   2. The privacy concern that drove M15 (`outdated --include-npm`
-    //      leaking private package names to public npm) is enforced at
-    //      a different layer — install/audit's `lockfile_source_is_npm_public`
-    //      gate. That gate refuses to disclose names to a *public* npm
-    //      endpoint; routing through the configured LPM endpoint is
-    //      explicitly the authorized destination.
+    //   2. Private-name disclosure checks are enforced at project-lockfile
+    //      command surfaces that may otherwise contact npm metadata
+    //      endpoints. Global installs already route through the
+    //      configured LPM endpoint, which is the authorized destination
+    //      for this batch call.
     //
     //   3. Splitting by source here would replace one batch call with
     //      N per-package round-trips through `get_npm_package_metadata`,
@@ -214,7 +273,6 @@ async fn run_list_outdated(
     // `get_npm_package_metadata`, and merge the results. Today's
     // posture is "the LPM batch endpoint is the canonical metadata
     // service for this diagnostic."
-    let names: Vec<String> = manifest.packages.keys().cloned().collect();
     let metadata = match client.batch_metadata(&names).await {
         Ok(m) => m,
         Err(e) => {
@@ -229,6 +287,9 @@ async fn run_list_outdated(
     let mut unresolved: Vec<UnresolvedRow> = Vec::new();
 
     for (name, entry) in &manifest.packages {
+        if entry.source == PackageSource::LocalLink {
+            continue;
+        }
         let Some(meta) = metadata.get(name) else {
             unresolved.push(UnresolvedRow {
                 package: name.clone(),
@@ -265,9 +326,9 @@ async fn run_list_outdated(
     unresolved.sort_by(|a, b| a.package.cmp(&b.package));
 
     if json_output {
-        emit_outdated_json(&outdated, &up_to_date, &unresolved);
+        emit_outdated_json(&outdated, &up_to_date, &unresolved, &local_links);
     } else {
-        emit_outdated_human(&outdated, &up_to_date, &unresolved, verbose);
+        emit_outdated_human(&outdated, &up_to_date, &unresolved, &local_links, verbose);
     }
     Ok(())
 }
@@ -363,6 +424,7 @@ fn emit_outdated_json(
     outdated: &[OutdatedRow],
     up_to_date: &[String],
     unresolved: &[UnresolvedRow],
+    local_links: &[String],
 ) {
     let out_entries: Vec<_> = outdated
         .iter()
@@ -387,6 +449,7 @@ fn emit_outdated_json(
             "outdated": out_entries,
             "up_to_date": up_to_date,
             "unresolved": unresolved_entries,
+            "skipped_local_links": local_links,
         }))
         .unwrap()
     );
@@ -396,14 +459,27 @@ fn emit_outdated_human(
     outdated: &[OutdatedRow],
     up_to_date: &[String],
     unresolved: &[UnresolvedRow],
+    local_links: &[String],
     verbose: bool,
 ) {
     if outdated.is_empty() && unresolved.is_empty() {
         install_ui::done(&format!(
-            "All {} globally-installed package{} are up-to-date.",
+            "All {} registry-backed global package{} are up-to-date.",
             up_to_date.len(),
             if up_to_date.len() == 1 { "" } else { "s" },
         ));
+        if !local_links.is_empty() && verbose {
+            let names_safe: Vec<String> = local_links
+                .iter()
+                .map(|n| sanitize_for_terminal(n))
+                .collect();
+            install_ui::phase(&format!(
+                "{} local link{} skipped: {}",
+                local_links.len(),
+                if local_links.len() == 1 { "" } else { "s" },
+                names_safe.join(", ").dimmed(),
+            ));
+        }
         return;
     }
 
@@ -567,6 +643,9 @@ fn package_to_json(
         obj["bytes_on_disk"] = serde_json::json!(bytes);
         obj["size_on_disk"] = serde_json::Value::String(format_bytes(bytes));
         obj["root"] = serde_json::Value::String(install_root.display().to_string());
+        if let Some(path) = linked_source_path(entry) {
+            obj["linked_path"] = serde_json::Value::String(path.to_string());
+        }
     }
     obj
 }
@@ -624,6 +703,10 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
             );
             let root_safe = sanitize_for_terminal(&install_root.display().to_string());
             println!("        root: {}", root_safe.dimmed());
+            if let Some(path) = linked_source_path(entry) {
+                let path_safe = sanitize_for_terminal(path);
+                println!("        linked: {}", path_safe.dimmed());
+            }
         }
     }
     if !manifest.aliases.is_empty() {
@@ -706,7 +789,7 @@ fn run_path(
             "package '{package}' is not globally installed. Run `lpm global list` to see installed packages."
         ))
     })?;
-    let install_root = root.global_root().join(&entry.root);
+    let display_path = display_path_for_entry(root, entry);
     if json_output {
         println!(
             "{}",
@@ -714,17 +797,480 @@ fn run_path(
                 "success": true,
                 "package": package,
                 "version": entry.resolved,
-                "path": install_root.display().to_string(),
+                "source": entry.source,
+                "path": display_path,
             }))
             .unwrap()
         );
     } else {
-        println!(
-            "{}",
-            sanitize_for_terminal(&install_root.display().to_string())
-        );
+        println!("{}", sanitize_for_terminal(&display_path));
     }
     Ok(())
+}
+
+// ─── link / unlink ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct LocalLinkBin {
+    command_name: String,
+    target: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct LocalLinkPackage {
+    name: String,
+    version: String,
+    source_dir: PathBuf,
+    root_relative: String,
+    bins: Vec<LocalLinkBin>,
+}
+
+fn run_link(root: &LpmRoot, path: Option<&Path>, json_output: bool) -> Result<(), LpmError> {
+    let link = load_local_link_package(path)?;
+    let command_names: Vec<String> = link
+        .bins
+        .iter()
+        .map(|bin| bin.command_name.clone())
+        .collect();
+
+    with_exclusive_lock(root.global_tx_lock(), || {
+        let mut manifest = lpm_global::read_for(root)?;
+        if let Some(existing) = manifest.packages.get(&link.name) {
+            let name_safe = sanitize_for_terminal(&link.name);
+            return match existing.source {
+                PackageSource::LocalLink => Err(LpmError::Script(format!(
+                    "'{name_safe}' is already linked globally. Run `lpm global unlink {name_safe}` \
+                     before linking it again."
+                ))),
+                _ => Err(LpmError::Script(format!(
+                    "'{name_safe}' is already globally installed from the registry. Run \
+                     `lpm global remove {name_safe}` before linking a local checkout."
+                ))),
+            };
+        }
+
+        if let Some((other_name, _)) = manifest.packages.iter().find(|(other_name, entry)| {
+            *other_name != &link.name && entry.root == link.root_relative
+        }) {
+            return Err(LpmError::Script(format!(
+                "local-link root '{}' is already used by '{}'. Rename one package or unlink the \
+                 existing package first.",
+                sanitize_for_terminal(&link.root_relative),
+                sanitize_for_terminal(other_name),
+            )));
+        }
+
+        let collisions = find_command_collisions(&manifest, &link.name, &command_names);
+        if !collisions.is_empty() {
+            return Err(local_link_collision_error(&link.name, &collisions));
+        }
+
+        let result = materialize_local_link(root, &link).and_then(|()| {
+            let entry = PackageEntry {
+                saved_spec: format!("{LOCAL_LINK_SPEC_PREFIX}{}", link.source_dir.display()),
+                resolved: link.version.clone(),
+                integrity: "local-link".into(),
+                source: PackageSource::LocalLink,
+                installed_at: Utc::now(),
+                root: link.root_relative.clone(),
+                commands: command_names.clone(),
+            };
+            manifest.packages.insert(link.name.clone(), entry);
+            lpm_global::write_for(root, &manifest)
+        });
+
+        if let Err(err) = result {
+            cleanup_local_link_outputs(root, &link);
+            return Err(err);
+        }
+        Ok(())
+    })?;
+
+    emit_link_success(&link, json_output);
+    Ok(())
+}
+
+fn run_unlink(root: &LpmRoot, package: &str, json_output: bool) -> Result<(), LpmError> {
+    let summary = with_exclusive_lock(root.global_tx_lock(), || {
+        let mut manifest = lpm_global::read_for(root)?;
+        let entry = manifest.packages.get(package).cloned().ok_or_else(|| {
+            LpmError::Script(format!(
+                "package '{}' is not globally linked. Run `lpm global list` to see installed packages.",
+                sanitize_for_terminal(package),
+            ))
+        })?;
+        if entry.source != PackageSource::LocalLink {
+            return Err(LpmError::Script(format!(
+                "'{}' is a registry-backed global install. Use `lpm global remove {}` to remove it.",
+                sanitize_for_terminal(package),
+                sanitize_for_terminal(package),
+            )));
+        }
+
+        let aliases: Vec<String> = manifest
+            .aliases
+            .iter()
+            .filter_map(|(alias, owner)| (owner.package == package).then_some(alias.clone()))
+            .collect();
+        for command in &entry.commands {
+            remove_shim(&root.bin_dir(), command)?;
+        }
+        for alias in &aliases {
+            remove_shim(&root.bin_dir(), alias)?;
+        }
+        remove_local_link_root(root, &entry.root)?;
+
+        manifest.packages.remove(package);
+        for alias in aliases {
+            manifest.aliases.remove(&alias);
+        }
+        lpm_global::write_for(root, &manifest)?;
+
+        let linked_path = linked_source_path(&entry).map(str::to_string);
+        Ok(UnlinkSummary {
+            package: package.to_string(),
+            version: entry.resolved,
+            linked_path,
+            commands: entry.commands,
+        })
+    })?;
+
+    emit_unlink_success(&summary, json_output);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct UnlinkSummary {
+    package: String,
+    version: String,
+    linked_path: Option<String>,
+    commands: Vec<String>,
+}
+
+fn load_local_link_package(path: Option<&Path>) -> Result<LocalLinkPackage, LpmError> {
+    let raw_dir = match path {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().map_err(LpmError::Io)?,
+    };
+    let source_dir = raw_dir.canonicalize().map_err(|e| {
+        LpmError::Script(format!(
+            "could not resolve local package path '{}': {e}",
+            sanitize_for_terminal(&raw_dir.display().to_string()),
+        ))
+    })?;
+    if !source_dir.is_dir() {
+        return Err(LpmError::Script(format!(
+            "'{}' is not a directory",
+            sanitize_for_terminal(&source_dir.display().to_string()),
+        )));
+    }
+
+    let pkg_json = source_dir.join("package.json");
+    let package = lpm_workspace::read_package_json(&pkg_json).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to read local package manifest '{}': {e}",
+            sanitize_for_terminal(&pkg_json.display().to_string()),
+        ))
+    })?;
+    let name = package
+        .name
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| {
+            LpmError::Script("local package.json must declare a non-empty `name`".into())
+        })?;
+    let version = package
+        .version
+        .filter(|version| !version.trim().is_empty())
+        .ok_or_else(|| {
+            LpmError::Script(format!(
+                "local package '{}' must declare a non-empty `version`",
+                sanitize_for_terminal(&name),
+            ))
+        })?;
+    let Some(bin_config) = package.bin else {
+        return Err(LpmError::Script(format!(
+            "local package '{}' exposes no `bin` entries to link",
+            sanitize_for_terminal(&name),
+        )));
+    };
+
+    let mut entries = bin_config.entries(&name);
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.dedup_by(|a, b| a.0 == b.0);
+    if entries.is_empty() {
+        return Err(LpmError::Script(format!(
+            "local package '{}' exposes no non-empty `bin` entries to link",
+            sanitize_for_terminal(&name),
+        )));
+    }
+
+    let mut bins = Vec::with_capacity(entries.len());
+    for (command_name, script_path) in entries {
+        if let Err(err) = lpm_global::shim::validate_command_name(&command_name) {
+            return Err(LpmError::Script(format!(
+                "local package '{}' declares invalid bin command '{}': {err}",
+                sanitize_for_terminal(&name),
+                sanitize_for_terminal(&command_name),
+            )));
+        }
+        let target = resolve_local_bin_target(&source_dir, &script_path)?;
+        bins.push(LocalLinkBin {
+            command_name,
+            target,
+        });
+    }
+
+    Ok(LocalLinkPackage {
+        root_relative: local_link_root_relative(&name),
+        name,
+        version,
+        source_dir,
+        bins,
+    })
+}
+
+fn resolve_local_bin_target(package_dir: &Path, script_path: &str) -> Result<PathBuf, LpmError> {
+    let relative = normalize_relative_bin_path(script_path)?;
+    let candidate = package_dir.join(&relative);
+    let metadata = std::fs::metadata(&candidate).map_err(|e| {
+        LpmError::Script(format!(
+            "bin target '{}' does not exist or cannot be read: {e}",
+            sanitize_for_terminal(&candidate.display().to_string()),
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(LpmError::Script(format!(
+            "bin target '{}' is not a file",
+            sanitize_for_terminal(&candidate.display().to_string()),
+        )));
+    }
+    let canonical = candidate.canonicalize().map_err(LpmError::Io)?;
+    if !canonical.starts_with(package_dir) {
+        return Err(LpmError::Script(format!(
+            "bin target '{}' resolves outside the package directory",
+            sanitize_for_terminal(&candidate.display().to_string()),
+        )));
+    }
+    Ok(canonical)
+}
+
+fn normalize_relative_bin_path(script_path: &str) -> Result<PathBuf, LpmError> {
+    if script_path.trim().is_empty() {
+        return Err(LpmError::Script("bin target path must not be empty".into()));
+    }
+    let raw = Path::new(script_path);
+    if raw.is_absolute() {
+        return Err(LpmError::Script(format!(
+            "bin target '{}' must be relative to the package root",
+            sanitize_for_terminal(script_path),
+        )));
+    }
+    let mut normalized = PathBuf::new();
+    for component in raw.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(LpmError::Script(format!(
+                    "bin target '{}' must not contain parent-directory traversal",
+                    sanitize_for_terminal(script_path),
+                )));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(LpmError::Script(format!(
+                    "bin target '{}' must be relative to the package root",
+                    sanitize_for_terminal(script_path),
+                )));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(LpmError::Script("bin target path must not be empty".into()));
+    }
+    Ok(normalized)
+}
+
+fn local_link_root_relative(package_name: &str) -> String {
+    let mut safe = String::with_capacity(package_name.len());
+    for ch in package_name.chars() {
+        match ch {
+            '/' | '\\' => safe.push('+'),
+            '@' | '.' | '_' | '-' | '+' => safe.push(ch),
+            c if c.is_ascii_alphanumeric() => safe.push(c),
+            _ => safe.push('_'),
+        }
+    }
+    while safe.contains("..") {
+        safe = safe.replace("..", "_");
+    }
+    if safe.is_empty() {
+        safe.push_str("package");
+    }
+    format!("links/{safe}")
+}
+
+fn materialize_local_link(root: &LpmRoot, link: &LocalLinkPackage) -> Result<(), LpmError> {
+    let link_root = validated_local_link_root(root, &link.root_relative)?;
+    if std::fs::symlink_metadata(&link_root).is_ok() {
+        remove_local_link_root(root, &link.root_relative)?;
+    }
+    let install_bin = link_root.join("node_modules").join(".bin");
+    for bin in &link.bins {
+        emit_shim(
+            &install_bin,
+            &Shim {
+                command_name: bin.command_name.clone(),
+                target: bin.target.clone(),
+            },
+        )?;
+        if !artifacts_complete(&install_bin, &bin.command_name) {
+            return Err(LpmError::Script(format!(
+                "failed to create complete local-link shim for '{}'",
+                sanitize_for_terminal(&bin.command_name),
+            )));
+        }
+    }
+
+    let global_bin = root.bin_dir();
+    for bin in &link.bins {
+        emit_shim(
+            &global_bin,
+            &Shim {
+                command_name: bin.command_name.clone(),
+                target: install_bin.join(&bin.command_name),
+            },
+        )?;
+        if !artifacts_complete(&global_bin, &bin.command_name) {
+            return Err(LpmError::Script(format!(
+                "failed to create complete global shim for '{}'",
+                sanitize_for_terminal(&bin.command_name),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_local_link_outputs(root: &LpmRoot, link: &LocalLinkPackage) {
+    for bin in &link.bins {
+        let _ = remove_shim(&root.bin_dir(), &bin.command_name);
+    }
+    let _ = remove_local_link_root(root, &link.root_relative);
+}
+
+fn remove_local_link_root(root: &LpmRoot, relative: &str) -> Result<(), LpmError> {
+    let path = validated_local_link_root(root, relative)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_dir() => std::fs::remove_dir_all(&path)?,
+        Ok(_) => std::fs::remove_file(&path)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(LpmError::Io(e)),
+    }
+    Ok(())
+}
+
+fn validated_local_link_root(root: &LpmRoot, relative: &str) -> Result<PathBuf, LpmError> {
+    lpm_global::validated_local_link_root_relative(&root.global_root(), relative).map_err(
+        |reason| {
+            LpmError::Script(format!(
+                "invalid local-link root '{}': {reason}",
+                sanitize_for_terminal(relative),
+            ))
+        },
+    )
+}
+
+fn local_link_collision_error(
+    package: &str,
+    collisions: &[lpm_global::CommandCollision],
+) -> LpmError {
+    let mut lines = Vec::with_capacity(collisions.len());
+    for collision in collisions {
+        let via = if collision.via_alias {
+            "alias owned by"
+        } else {
+            "owned by"
+        };
+        lines.push(format!(
+            "{} ({via} {})",
+            sanitize_for_terminal(&collision.command),
+            sanitize_for_terminal(&collision.current_owner),
+        ));
+    }
+    LpmError::Script(format!(
+        "local package '{}' cannot be linked because its command name{} already exist{}: {}. \
+         Remove or unlink the owning package first.",
+        sanitize_for_terminal(package),
+        if collisions.len() == 1 { "" } else { "s" },
+        if collisions.len() == 1 { "s" } else { "" },
+        lines.join(", "),
+    ))
+}
+
+fn emit_link_success(link: &LocalLinkPackage, json_output: bool) {
+    let commands: Vec<String> = link
+        .bins
+        .iter()
+        .map(|bin| bin.command_name.clone())
+        .collect();
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "package": link.name,
+                "version": link.version,
+                "path": link.source_dir.display().to_string(),
+                "commands": commands,
+            }))
+            .unwrap()
+        );
+        return;
+    }
+    install_ui::done(&format!(
+        "Linked {}@{}",
+        sanitize_for_terminal(&link.name),
+        sanitize_for_terminal(&link.version),
+    ));
+    install_ui::phase(&format!(
+        "Path: {}",
+        sanitize_for_terminal(&link.source_dir.display().to_string()).dimmed(),
+    ));
+    install_ui::phase(&format!("Commands: {}", format_bins(&commands).dimmed(),));
+}
+
+fn emit_unlink_success(summary: &UnlinkSummary, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "package": summary.package,
+                "version": summary.version,
+                "path": summary.linked_path,
+                "commands": summary.commands,
+            }))
+            .unwrap()
+        );
+        return;
+    }
+    install_ui::done(&format!(
+        "Unlinked {}@{}",
+        sanitize_for_terminal(&summary.package),
+        sanitize_for_terminal(&summary.version),
+    ));
+}
+
+fn linked_source_path(entry: &PackageEntry) -> Option<&str> {
+    (entry.source == PackageSource::LocalLink)
+        .then(|| entry.saved_spec.strip_prefix(LOCAL_LINK_SPEC_PREFIX))
+        .flatten()
+}
+
+fn display_path_for_entry(root: &LpmRoot, entry: &PackageEntry) -> String {
+    linked_source_path(entry).map_or_else(
+        || root.global_root().join(&entry.root).display().to_string(),
+        str::to_string,
+    )
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────

@@ -92,6 +92,22 @@ fn run_audit(
     cmd.output().expect("failed to spawn lpm audit")
 }
 
+fn run_audit_json(
+    project: &TempProject,
+    mock: &MockRegistry,
+    extra_args: &[&str],
+) -> std::process::Output {
+    let osv_url = format!("{}/v1/querybatch", mock.url());
+    let mut cmd = lpm_with_registry(project, &mock.url());
+    cmd.env("LPM_OSV_URL", &osv_url);
+    cmd.arg("--json");
+    cmd.arg("audit");
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd.output().expect("failed to spawn lpm audit --json")
+}
+
 /// Mount `pkg@1.0.0` on the mock registry and install it into `project`.
 /// Returns the original tarball bytes (callers don't need them yet but
 /// the future-OSV-helper-per-package shape may).
@@ -160,6 +176,83 @@ async fn install_one_with_pkg_json(
         ])
         .assert()
         .success();
+}
+
+async fn install_vulnerable_direct_dep_with_fixed_version(
+    project: &TempProject,
+    mock: &MockRegistry,
+) {
+    let vulnerable = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "vuln-pkg",
+            "version": "1.0.0",
+            "license": "MIT",
+            "main": "index.js"
+        }),
+        &[],
+    );
+    let fixed = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "vuln-pkg",
+            "version": "1.0.1",
+            "license": "MIT",
+            "main": "index.js"
+        }),
+        &[],
+    );
+    mock.with_full_package_metadata(
+        "vuln-pkg",
+        "1.0.1",
+        &[
+            ("1.0.0", serde_json::json!({}), Some(vulnerable)),
+            ("1.0.1", serde_json::json!({}), Some(fixed)),
+        ],
+    )
+    .await;
+
+    lpm_with_registry(project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    mark_lockfile_package_as_public_npm(project, "vuln-pkg");
+}
+
+fn mark_lockfile_package_as_public_npm(project: &TempProject, package: &str) {
+    let lockfile_path = project.path().join("lpm.lock");
+    let mut lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("read lpm.lock fixture");
+    for locked in &mut lockfile.packages {
+        if locked.name == package {
+            locked.source = Some("registry+https://registry.npmjs.org".to_string());
+        }
+    }
+    lockfile
+        .write_all(&lockfile_path)
+        .expect("write lpm.lock fixture");
+}
+
+fn osv_fixed_vuln(id: &str, package: &str, fixed: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "summary": "test vulnerability",
+        "severity": [{ "type": "CVSS_V3", "score": "9.8" }],
+        "affected": [{
+            "package": { "ecosystem": "npm", "name": package },
+            "ranges": [{
+                "type": "SEMVER",
+                "events": [
+                    { "introduced": "0" },
+                    { "fixed": fixed }
+                ]
+            }]
+        }]
+    })
 }
 
 // ─── Discovery + happy paths ────────────────────────────────────────────
@@ -245,6 +338,91 @@ async fn audit_clean_dep_with_empty_osv_response_exits_zero() {
             && !stderr.contains("Run lpm audit --json"),
         "clean audit must not render the old verbose body, got:\n{stderr}",
     );
+}
+
+// ─── Fix ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn audit_fix_dry_run_reports_direct_dependency_fix_without_mutating_files() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-dry-run","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-test-dry",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+
+    let out = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
+    assert!(
+        out.status.success(),
+        "audit fix --dry-run must exit 0\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("audit fix --json must emit JSON: {e}"));
+    assert_eq!(envelope["dry_run"], serde_json::json!(true));
+    assert_eq!(envelope["planned"], serde_json::json!(1));
+    assert_eq!(envelope["fixed"], serde_json::json!(0));
+    assert_eq!(
+        envelope["packages"][0]["name"],
+        serde_json::json!("vuln-pkg")
+    );
+    assert_eq!(envelope["packages"][0]["to"], serde_json::json!("1.0.1"));
+
+    let package_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).expect("parse package.json");
+    assert_eq!(
+        package_json["dependencies"]["vuln-pkg"],
+        serde_json::json!("1.0.0"),
+        "dry-run must not mutate package.json",
+    );
+}
+
+#[tokio::test]
+async fn audit_fix_updates_vulnerable_direct_dependency_and_reinstalls_lockfile() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-apply","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(
+        "GHSA-test-apply",
+        "vuln-pkg",
+        "1.0.1",
+    )]])
+    .await;
+
+    let out = run_audit_json(&project, &mock, &["fix"]);
+    assert!(
+        out.status.success(),
+        "audit fix must exit 0\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("audit fix --json must emit JSON: {e}"));
+    assert_eq!(envelope["fixed"], serde_json::json!(1));
+    assert_eq!(envelope["packages"][0]["to"], serde_json::json!("1.0.1"));
+
+    let package_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).expect("parse package.json");
+    assert_eq!(
+        package_json["dependencies"]["vuln-pkg"],
+        serde_json::json!("1.0.1"),
+        "audit fix must write the patched range to package.json",
+    );
+
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("read updated lpm.lock");
+    let pkg = lockfile
+        .find_package("vuln-pkg")
+        .expect("vuln-pkg must remain installed");
+    assert_eq!(pkg.version, "1.0.1");
 }
 
 // ─── Fail-on policies ───────────────────────────────────────────────────

@@ -142,6 +142,9 @@ pub fn aggregate_with_manifest_and_trust(
     let mut unreadable_origins: Vec<String> = Vec::new();
 
     for (pkg_name, entry) in &manifest.packages {
+        if entry.source == lpm_global::PackageSource::LocalLink {
+            continue;
+        }
         let install_root = root.global_root().join(&entry.root);
         let Some(per_install_state) = read_build_state_for_install(&install_root) else {
             unreadable_origins.push(pkg_name.clone());
