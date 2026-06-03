@@ -1,6 +1,6 @@
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
-use miette::{IntoDiagnostic, Result};
+use miette::{Diagnostic as _, Result};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
@@ -3107,17 +3107,6 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    // Install miette's fancy error handler for pretty error display
-    miette::set_hook(Box::new(|_| {
-        Box::new(
-            miette::MietteHandlerOpts::new()
-                .terminal_links(true)
-                .context_lines(2)
-                .build(),
-        )
-    }))
-    .ok();
-
     let cli = Cli::parse_from(args_for_cli_parse(std::env::args_os()));
 
     // Color policy is already initialized at the top of `fn main()` via
@@ -3200,12 +3189,14 @@ async fn async_main() -> Result<()> {
     // thinking it means `warn` would get the fail-closed posture
     // they did NOT ask for, with no signal that their intent
     // didn't take effect.
-    provenance_fetch::EnforceMode::validate_from_env()?;
-
     let registry_url = cli
         .registry
         .as_deref()
         .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
+
+    if let Err(error) = provenance_fetch::EnforceMode::validate_from_env() {
+        exit_with_lpm_error(&error, cli.json, registry_url);
+    }
 
     // lazy auth. Build the SessionManager from purely local
     // state — no network calls. Refresh is deferred to the first
@@ -3337,21 +3328,12 @@ async fn async_main() -> Result<()> {
                 // L44: in `--json` mode, route through the same
                 // `{"success": false, "error", "error_code"}` envelope
                 // that wraps dispatch errors below — otherwise the
-                // recovery path emits a miette/human diagnostic on
-                // stderr and the JSON consumer sees an empty stdout
+                // recovery path emits a human diagnostic on stderr and
+                // the JSON consumer sees an empty stdout
                 // alongside a non-zero exit, breaking the
                 // `--json contract` exactly when the user most needs to
                 // parse the failure (corrupt / newer WAL, etc.).
-                if cli.json {
-                    let json = serde_json::json!({
-                        "success": false,
-                        "error": format!("{e}"),
-                        "error_code": e.error_code(),
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json).unwrap());
-                    std::process::exit(1);
-                }
-                return Err(e).into_diagnostic();
+                exit_with_lpm_error(&e, cli.json, registry_url);
             }
         }
     }
@@ -3375,10 +3357,10 @@ async fn async_main() -> Result<()> {
     //
     // Do NOT remove this wrap without auditing every arm body for `?`
     // operators and explicit `return Err(...)` paths — both rely on
-    // returning to *this* block, not to `async_main`'s outer
-    // `Result<(), miette::Report>`. The redundant per-arm wraps from
-    // the v2 sweep (Install, Login, Dlx, Use, Tunnel) were flattened
-    // alongside finding A — there is no remaining defense-in-depth.
+    // returning to *this* block, not to `async_main`'s outer result.
+    // The redundant per-arm wraps from the v2 sweep (Install, Login,
+    // Dlx, Use, Tunnel) were flattened alongside finding A — there is
+    // no remaining defense-in-depth.
     let result: Result<(), lpm_common::LpmError> = async {
     match command {
         Commands::Info {
@@ -5297,67 +5279,11 @@ async fn async_main() -> Result<()> {
         spawn_background_update_check();
     }
 
-    // Handle ExitCode at the top level — the only place process::exit() should be called.
-    // Library code returns Err(LpmError::ExitCode(code)) instead of calling process::exit()
-    // directly, so Drop handlers run and the code remains testable.
     if let Err(e) = &result {
-        // --json mode: output structured error JSON so LLMs/MCP servers can parse failures.
-        // Without this, miette prints colored human-readable errors that can't be parsed.
-        //
-        // Skip for ExitCode errors — commands that return ExitCode (like `lpm run`)
-        // have already emitted their own structured JSON output. Printing a second
-        // generic error JSON would break the "single JSON result" contract.
-        if cli.json && !matches!(e, lpm_common::LpmError::ExitCode(_)) {
-            let json = match e {
-                lpm_common::LpmError::SecurityApprovalRequired {
-                    message,
-                    requested_scopes,
-                    project_root,
-                    suggested_command,
-                } => serde_json::json!({
-                    "success": false,
-                    "error_code": "security_approval_required",
-                    "error": {
-                        "code": "SECURITY_APPROVAL_REQUIRED",
-                        "message": message,
-                        "requested_scopes": requested_scopes,
-                        "project_root": project_root,
-                        "suggested_command": suggested_command,
-                    }
-                }),
-                _ => serde_json::json!({
-                    "success": false,
-                    "error": format!("{e}"),
-                    "error_code": e.error_code(),
-                }),
-            };
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
-        }
-
-        if !cli.json && render_slim_error(e) {
-            std::process::exit(1);
-        }
-
-        // Preserve existing side effects before exiting
-        match e {
-            lpm_common::LpmError::ExitCode(code) => {
-                std::process::exit(*code);
-            }
-            lpm_common::LpmError::AuthRequired => {
-                let _ = auth::clear_token(registry_url);
-                if cli.json {
-                    std::process::exit(1);
-                }
-            }
-            _ => {
-                if cli.json {
-                    std::process::exit(1);
-                }
-            }
-        }
+        exit_with_lpm_error(e, cli.json, registry_url);
     }
 
-    result.into_diagnostic()
+    Ok(())
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -5366,23 +5292,108 @@ enum SlimErrorLine {
     Detail(String),
 }
 
-fn render_slim_error(error: &lpm_common::LpmError) -> bool {
-    let Some(lines) = slim_error_lines(error) else {
-        return false;
-    };
+fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: bool, registry_url: &str) -> ! {
+    if json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
+        print_json_error(error);
+    } else if !json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
+        render_slim_error(error);
+    }
 
-    for line in lines {
+    if matches!(error, lpm_common::LpmError::AuthRequired) {
+        let _ = auth::clear_token(registry_url);
+    }
+
+    match error {
+        lpm_common::LpmError::ExitCode(code) => std::process::exit(*code),
+        _ => std::process::exit(1),
+    }
+}
+
+fn print_json_error(error: &lpm_common::LpmError) {
+    let json = match error {
+        lpm_common::LpmError::SecurityApprovalRequired {
+            message,
+            requested_scopes,
+            project_root,
+            suggested_command,
+        } => serde_json::json!({
+            "success": false,
+            "error_code": "security_approval_required",
+            "error": {
+                "code": "SECURITY_APPROVAL_REQUIRED",
+                "message": message,
+                "requested_scopes": requested_scopes,
+                "project_root": project_root,
+                "suggested_command": suggested_command,
+            }
+        }),
+        _ => serde_json::json!({
+            "success": false,
+            "error": format!("{error}"),
+            "error_code": error.error_code(),
+        }),
+    };
+    println!("{}", serde_json::to_string_pretty(&json).unwrap());
+}
+
+fn render_slim_error(error: &lpm_common::LpmError) {
+    for line in slim_error_lines(error) {
         match line {
             SlimErrorLine::Failed(message) => install_ui::failed(&message),
             SlimErrorLine::Detail(message) => install_ui::detail(&message),
         }
     }
-
-    true
 }
 
-fn slim_error_lines(error: &lpm_common::LpmError) -> Option<Vec<SlimErrorLine>> {
+fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
     match error {
+        lpm_common::LpmError::InvalidPackageName(reason) => {
+            diagnostic_lines("Invalid package name", Some(reason), error)
+        }
+        lpm_common::LpmError::InvalidIntegrity(reason) => {
+            diagnostic_lines("Invalid integrity hash", Some(reason), error)
+        }
+        lpm_common::LpmError::IntegrityMismatch { expected, actual } => {
+            let mut lines = vec![SlimErrorLine::Failed("Integrity mismatch".to_owned())];
+            push_detail(&mut lines, "expected", &install_ui::cyan(expected));
+            push_detail(&mut lines, "actual", &install_ui::cyan(actual));
+            push_diagnostic_help(&mut lines, error);
+            lines
+        }
+        lpm_common::LpmError::InvalidVersion(reason) => {
+            diagnostic_lines("Invalid version", Some(reason), error)
+        }
+        lpm_common::LpmError::InvalidVersionRange(reason) => {
+            diagnostic_lines("Invalid version range", Some(reason), error)
+        }
+        lpm_common::LpmError::Registry(reason) => {
+            diagnostic_lines("Registry error", Some(reason), error)
+        }
+        lpm_common::LpmError::PeerDependency(reason) => {
+            diagnostic_lines("Peer dependency check failed", Some(reason), error)
+        }
+        lpm_common::LpmError::Network(reason) => {
+            diagnostic_lines("Network error", Some(reason), error)
+        }
+        lpm_common::LpmError::Http { status, message } => {
+            let status = if *status >= 400 {
+                install_ui::red(&status.to_string())
+            } else {
+                install_ui::yellow(&status.to_string())
+            };
+            let mut lines = vec![SlimErrorLine::Failed(format!("HTTP {status}"))];
+            push_detail(&mut lines, "message", message);
+            lines
+        }
+        lpm_common::LpmError::AuthRequired => {
+            diagnostic_lines("Authentication required", None, error)
+        }
+        lpm_common::LpmError::SessionExpired => {
+            diagnostic_lines("Session expired or revoked", None, error)
+        }
+        lpm_common::LpmError::Forbidden(reason) => {
+            diagnostic_lines("Forbidden", Some(reason), error)
+        }
         lpm_common::LpmError::NpmFirewallBlocked {
             package,
             verdict,
@@ -5418,7 +5429,7 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Option<Vec<SlimErrorLine>> 
                 install_ui::dim("hint"),
                 install_ui::dim("The package was not downloaded.")
             )));
-            Some(lines)
+            lines
         }
         lpm_common::LpmError::UpstreamProxyEntitlementRequired {
             message,
@@ -5450,9 +5461,201 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Option<Vec<SlimErrorLine>> 
                     "Use a Pro/org token, or route standalone npm packages directly to npm."
                 )
             )));
-            Some(lines)
+            lines
         }
-        _ => None,
+        lpm_common::LpmError::NotFound(reason) => {
+            diagnostic_lines("Not found", Some(reason), error)
+        }
+        lpm_common::LpmError::RateLimited { retry_after_secs } => {
+            let mut lines = vec![SlimErrorLine::Failed("Rate limited".to_owned())];
+            push_detail(
+                &mut lines,
+                "retry after",
+                &install_ui::status_ok(&format!("{retry_after_secs}s")),
+            );
+            push_diagnostic_help(&mut lines, error);
+            lines
+        }
+        lpm_common::LpmError::Script(reason) => {
+            diagnostic_lines("Script error", Some(reason), error)
+        }
+        lpm_common::LpmError::Cert(reason) => {
+            diagnostic_lines("Certificate error", Some(reason), error)
+        }
+        lpm_common::LpmError::Tunnel(reason) => {
+            diagnostic_lines("Tunnel error", Some(reason), error)
+        }
+        lpm_common::LpmError::Store(reason) => diagnostic_lines("Store error", Some(reason), error),
+        lpm_common::LpmError::ScriptWithOutput {
+            code,
+            stdout,
+            stderr,
+        } => {
+            let mut lines = vec![SlimErrorLine::Failed(format!(
+                "Script exited with code {}",
+                install_ui::red(&code.to_string())
+            ))];
+            push_captured_output(&mut lines, "stdout", stdout);
+            push_captured_output(&mut lines, "stderr", stderr);
+            lines
+        }
+        lpm_common::LpmError::ExitCode(code) => {
+            vec![SlimErrorLine::Failed(format!(
+                "Process exited with code {}",
+                install_ui::red(&code.to_string())
+            ))]
+        }
+        lpm_common::LpmError::Io(reason) => {
+            diagnostic_lines("I/O error", Some(&reason.to_string()), error)
+        }
+        lpm_common::LpmError::Json(reason) => {
+            diagnostic_lines("JSON error", Some(&reason.to_string()), error)
+        }
+        lpm_common::LpmError::Task(reason) => diagnostic_lines("Task error", Some(reason), error),
+        lpm_common::LpmError::Plugin(reason) => {
+            diagnostic_lines("Plugin error", Some(reason), error)
+        }
+        lpm_common::LpmError::Engine(reason) => {
+            diagnostic_lines("Engine error", Some(reason), error)
+        }
+        lpm_common::LpmError::Workspace(reason) => {
+            diagnostic_lines("Workspace error", Some(reason), error)
+        }
+        lpm_common::LpmError::CatalogEntryInvalidRecursiveDefinition {
+            dependency,
+            catalog,
+            specifier,
+        } => {
+            let mut lines = vec![SlimErrorLine::Failed(
+                "Invalid recursive catalog entry".to_owned(),
+            )];
+            push_detail(&mut lines, "dependency", &install_ui::yellow(dependency));
+            push_detail(&mut lines, "catalog", &install_ui::cyan(catalog));
+            push_detail(&mut lines, "specifier", &install_ui::cyan(specifier));
+            push_diagnostic_help(&mut lines, error);
+            lines
+        }
+        lpm_common::LpmError::EnvValidation(reason) => {
+            diagnostic_lines("Environment validation failed", Some(reason), error)
+        }
+        lpm_common::LpmError::EngineMismatch {
+            engine,
+            required,
+            actual,
+            from,
+        } => {
+            let mut lines = vec![SlimErrorLine::Failed("Engine version mismatch".to_owned())];
+            push_detail(&mut lines, "engine", &install_ui::yellow(engine));
+            push_detail(&mut lines, "required", &install_ui::cyan(required));
+            push_detail(&mut lines, "actual", &install_ui::cyan(actual));
+            push_detail(&mut lines, "from", &install_ui::dim(from));
+            push_diagnostic_help(&mut lines, error);
+            lines
+        }
+        lpm_common::LpmError::SelfUpdatePaused(reason) => {
+            diagnostic_lines("Update check paused", Some(reason), error)
+        }
+        lpm_common::LpmError::SelfUpdateRateLimited(reason) => {
+            diagnostic_lines("Update check rate-limited", Some(reason), error)
+        }
+        lpm_common::LpmError::ProvenanceVerification(reason) => {
+            diagnostic_lines("Provenance verification failed", Some(reason), error)
+        }
+        lpm_common::LpmError::SelfUpdate(reason) => {
+            diagnostic_lines("Self-update refused", Some(reason), error)
+        }
+        lpm_common::LpmError::SecurityFloor(reason) => {
+            diagnostic_lines("Security floor refused", Some(reason), error)
+        }
+        lpm_common::LpmError::SecurityApprovalStore(reason) => {
+            diagnostic_lines("Security approval store refused", Some(reason), error)
+        }
+        lpm_common::LpmError::SecurityApprovalRequired {
+            message,
+            requested_scopes,
+            project_root,
+            suggested_command,
+        } => {
+            let mut lines = vec![SlimErrorLine::Failed(
+                "Security approval required".to_owned(),
+            )];
+            push_multiline_detail(&mut lines, "reason", message);
+            if !requested_scopes.is_empty() {
+                push_detail(
+                    &mut lines,
+                    "scopes",
+                    &install_ui::cyan(&requested_scopes.join(", ")),
+                );
+            }
+            if let Some(project_root) = project_root {
+                push_detail(&mut lines, "project", &install_ui::cyan(project_root));
+            }
+            if let Some(suggested_command) = suggested_command {
+                push_detail(
+                    &mut lines,
+                    "command",
+                    &install_ui::yellow(suggested_command),
+                );
+            }
+            push_diagnostic_help(&mut lines, error);
+            lines
+        }
+    }
+}
+
+fn diagnostic_lines(
+    headline: &str,
+    reason: Option<&str>,
+    error: &lpm_common::LpmError,
+) -> Vec<SlimErrorLine> {
+    let mut lines = vec![SlimErrorLine::Failed(headline.to_owned())];
+    if let Some(reason) = reason {
+        push_multiline_detail(&mut lines, "reason", reason);
+    }
+    push_diagnostic_help(&mut lines, error);
+    lines
+}
+
+fn push_detail(lines: &mut Vec<SlimErrorLine>, label: &str, value: &str) {
+    lines.push(SlimErrorLine::Detail(format!(
+        "  {} {value}",
+        install_ui::dim(label)
+    )));
+}
+
+fn push_multiline_detail(lines: &mut Vec<SlimErrorLine>, label: &str, value: &str) {
+    let mut non_empty = value.lines().filter(|line| !line.trim().is_empty());
+    if let Some(first) = non_empty.next() {
+        push_detail(lines, label, first);
+    }
+    for line in non_empty {
+        lines.push(SlimErrorLine::Detail(format!("    {line}")));
+    }
+}
+
+fn push_diagnostic_help(lines: &mut Vec<SlimErrorLine>, error: &lpm_common::LpmError) {
+    if let Some(help) = error.help() {
+        push_dimmed_multiline_detail(lines, "hint", &help.to_string());
+    }
+}
+
+fn push_captured_output(lines: &mut Vec<SlimErrorLine>, label: &str, output: &str) {
+    if output.trim().is_empty() {
+        return;
+    }
+    push_dimmed_multiline_detail(lines, label, output.trim_end());
+}
+
+fn push_dimmed_multiline_detail(lines: &mut Vec<SlimErrorLine>, label: &str, value: &str) {
+    let mut non_empty = value.lines().filter(|line| !line.trim().is_empty());
+    if let Some(first) = non_empty.next() {
+        push_detail(lines, label, &install_ui::dim(first));
+    }
+    for line in non_empty {
+        lines.push(SlimErrorLine::Detail(format!(
+            "    {}",
+            install_ui::dim(line)
+        )));
     }
 }
 
@@ -5482,7 +5685,7 @@ mod tests {
             match_source: Some("package".into()),
         };
 
-        let lines = slim_error_lines(&error).expect("firewall error should render in slim UI");
+        let lines = slim_error_lines(&error);
         let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
 
         assert_eq!(plain[0], "Firewall blocked is-number@7.0.0");
@@ -5504,7 +5707,7 @@ mod tests {
             entitlement_source: None,
         };
 
-        let lines = slim_error_lines(&error).expect("entitlement error should render in slim UI");
+        let lines = slim_error_lines(&error);
         let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
 
         assert_eq!(plain[0], "Upstream npm proxy access denied");
@@ -5517,6 +5720,45 @@ mod tests {
             plain[3],
             "  hint Use a Pro/org token, or route standalone npm packages directly to npm."
         );
+    }
+
+    #[test]
+    fn slim_error_lines_render_script_errors_without_miette_frame() {
+        let error = lpm_common::LpmError::Script(
+            "--workspace-concurrency requires --all, --filter, --filter-prod, or --affected".into(),
+        );
+
+        let lines = slim_error_lines(&error);
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(plain[0], "Script error");
+        assert_eq!(
+            plain[1],
+            "  reason --workspace-concurrency requires --all, --filter, --filter-prod, or --affected"
+        );
+        assert!(
+            plain.iter().all(|line| !line.contains("Error:")),
+            "slim error rows must not include miette framing: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn slim_error_lines_render_security_approval_context_rows() {
+        let error = lpm_common::LpmError::SecurityApprovalRequired {
+            message: "strict sandbox weakening needs approval".into(),
+            requested_scopes: vec!["sandbox.strict".into(), "network.host".into()],
+            project_root: Some("/repo/app".into()),
+            suggested_command: Some("lpm security unlock sandbox.strict".into()),
+        };
+
+        let lines = slim_error_lines(&error);
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(plain[0], "Security approval required");
+        assert_eq!(plain[1], "  reason strict sandbox weakening needs approval");
+        assert_eq!(plain[2], "  scopes sandbox.strict, network.host");
+        assert_eq!(plain[3], "  project /repo/app");
+        assert_eq!(plain[4], "  command lpm security unlock sandbox.strict");
     }
 
     // ─── audit follow-up: -v / -V / --version + verbose ───

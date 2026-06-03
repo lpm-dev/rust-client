@@ -267,7 +267,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
 }
 
 /// Map a `LookupError` into `LpmError` so the existing CLI error
-/// surface (miette / `--json`) renders it without losing the typed
+/// surfaces (slim UI / `--json`) render it without losing the typed
 /// rate-limit info.
 ///
 /// Mapping is purpose-specific so error categories match user intent:
@@ -279,7 +279,7 @@ pub async fn run(json_output: bool, refresh: bool) -> Result<(), LpmError> {
 ///
 /// `LookupError`'s own `Display` is the canonical body — it owns the
 /// reset-hint formatting and intentionally omits the `GITHUB_TOKEN`
-/// guidance (which lives in the wrapping variant's miette help). The
+/// guidance (which lives in the wrapping variant's diagnostic help). The
 /// wrapper here just adds the user-facing context prefix.
 fn lookup_error_to_lpm(e: LookupError) -> LpmError {
     match &e {
@@ -1999,7 +1999,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     }
 
     /// Rendered body must not duplicate the GITHUB_TOKEN hint — that
-    /// guidance now lives in the variant's miette help text. Doubling
+    /// guidance now lives in the variant's diagnostic help text. Doubling
     /// it would print the same instruction twice.
     #[test]
     fn lookup_error_rate_limit_body_is_not_doubled_with_help_text() {

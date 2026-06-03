@@ -305,8 +305,8 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
 
     // human-mode path. Per-skill warnings have already
     // been emitted above; return a concise summary error so the
-    // top-level miette handler renders an "Error: …" footer AND the
-    // process exits non-zero. Without this, CI gates that run
+    // top-level error handler renders a slim failure AND the process
+    // exits non-zero. Without this, CI gates that run
     // `lpm skills validate` silently passed on broken skill files.
     // Mirrors the contract of every other audit/lint-style command.
     if !errors.is_empty() {

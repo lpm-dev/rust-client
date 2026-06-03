@@ -1689,10 +1689,10 @@ async fn install_to_readonly_project_dir_fails_with_clear_error() {
         "install to readonly dir reported success: stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // No panic should escape — `miette`-formatted error is fine,
-    // bare "panicked at" / "RUST_BACKTRACE" lines are not. The
-    // failure should also reference the operation that couldn't
-    // proceed (write / permission / lpm.lock-ish).
+    // No panic should escape — a normal slim error is fine, bare
+    // "panicked at" / "RUST_BACKTRACE" lines are not. The failure
+    // should also reference the operation that couldn't proceed
+    // (write / permission / lpm.lock-ish).
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
