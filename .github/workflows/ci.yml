@@ -241,6 +241,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
+      - name: Install sccache
+        if: matrix.os == 'windows-latest'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
       - name: Cache cargo
         continue-on-error: ${{ matrix.os == 'windows-latest' }}
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -268,7 +272,15 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Build lpm-rs (release)
+        if: matrix.os != 'windows-latest'
         run: cargo build --release -p lpm-cli
+
+      - name: Build lpm-rs (release with sccache)
+        if: matrix.os == 'windows-latest'
+        run: cargo build --release -p lpm-cli
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
 
       - name: Install audit security policy
         if: runner.os == 'Linux'
@@ -284,6 +296,11 @@ jobs:
         env:
           LPM_NO_SKILLS: "1"
           LPM_STORE_VERSION: ${{ matrix.store_version == 'v1' && 'v1' || '' }}
+
+      - name: sccache stats
+        if: ${{ always() && matrix.os == 'windows-latest' }}
+        shell: bash
+        run: ${SCCACHE_PATH:-sccache} --show-stats
 
       # Always upload result JSONs — useful for triaging mode-asymmetric
       # outcomes in CI without re-running locally.
