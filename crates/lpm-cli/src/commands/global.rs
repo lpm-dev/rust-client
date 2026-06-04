@@ -189,6 +189,7 @@ async fn run_list_outdated(
                     "up_to_date": [],
                     "unresolved": [],
                     "count_outdated": 0,
+                    "count_unresolved": 0,
                 }))
                 .unwrap()
             );
@@ -224,6 +225,7 @@ async fn run_list_outdated(
                     "unresolved": [],
                     "skipped_local_links": local_links,
                     "count_outdated": 0,
+                    "count_unresolved": 0,
                 }))
                 .unwrap()
             );
@@ -329,6 +331,9 @@ async fn run_list_outdated(
         emit_outdated_json(&outdated, &up_to_date, &unresolved, &local_links);
     } else {
         emit_outdated_human(&outdated, &up_to_date, &unresolved, &local_links, verbose);
+    }
+    if !unresolved.is_empty() {
+        return Err(LpmError::ExitCode(1));
     }
     Ok(())
 }
@@ -444,8 +449,9 @@ fn emit_outdated_json(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "success": true,
+            "success": unresolved.is_empty(),
             "count_outdated": outdated.len(),
+            "count_unresolved": unresolved.len(),
             "outdated": out_entries,
             "up_to_date": up_to_date,
             "unresolved": unresolved_entries,
