@@ -4,7 +4,7 @@ use lpm_common::{
     LpmError, LpmRoot, format_bytes, sanitize_for_terminal, with_exclusive_lock, with_shared_lock,
 };
 use lpm_store::PackageStore;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Manage the global content-addressable package store.
 ///
@@ -207,6 +207,7 @@ fn run_verify(
     fix: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let deep = deep || fix;
     let mut packages: Vec<StoreVerifyEntry> = list_v1_verify_entries(store)?;
     let (v2_entries, mut sidecar_issues) = list_v2_verify_entries(lpm_root)?;
     let v2_link_count = v2_entries.len() + sidecar_issues.len();
@@ -222,63 +223,28 @@ fn run_verify(
         print_verify_counts(verify_counts);
     }
 
-    if packages.is_empty() && sidecar_issues.is_empty() && verify_counts.objects == 0 {
+    let (lockfile_integrity, lockfile_issue) = load_lockfile_integrity_for_verify(deep);
+    let mut corrupted: Vec<String> =
+        Vec::with_capacity(sidecar_issues.len() + usize::from(lockfile_issue.is_some()));
+    if let Some(issue) = lockfile_issue {
+        corrupted.push(issue);
+    }
+    corrupted.append(&mut sidecar_issues);
+
+    if packages.is_empty() && corrupted.is_empty() && verify_counts.objects == 0 {
         if json_output {
-            // F4: empty-store envelope mirrors the populated-store
-            // shape so downstream consumers don't need to special-case
-            // the zero path. `verified` retained as an alias of
-            // `entries_verified` for the legacy field name.
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "success": true,
-                    "entries_verified": 0,
-                    "verified": 0,
-                    "unique_coords": 0,
-                    "duplicated_entries": 0,
-                    "corrupted": 0,
-                    "issues": [],
-                }))
-                .unwrap()
-            );
+            let result = build_verify_envelope(true, deep, 0, 0, 0, &[], 0, 0);
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
         } else {
             install_ui::done("Store is empty — nothing to verify");
         }
         return Ok(());
     }
 
-    // In deep mode, load lockfile integrity hashes for cross-checking
-    let lockfile_integrity: std::collections::HashMap<String, String> = if deep {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let lockfile_path = cwd.join("lpm.lock");
-        if lockfile_path.exists() {
-            lpm_lockfile::Lockfile::read_fast(&lockfile_path)
-                .map(|lf| {
-                    lf.packages
-                        .iter()
-                        .filter_map(|p| {
-                            p.integrity
-                                .as_ref()
-                                .map(|i| (format!("{}@{}", p.name, p.version), i.clone()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            std::collections::HashMap::new()
-        }
-    } else {
-        std::collections::HashMap::new()
-    };
-
     let mut verified = 0u32;
-    let mut corrupted: Vec<String> = Vec::new();
-    // L57: v2 link directories whose sidecar was missing/malformed/
-    // schema-mismatched/unsafe-name reach us as pre-seeded corruption
-    // entries. They never become "verified."
-    corrupted.append(&mut sidecar_issues);
     let mut security_mismatches = 0u32;
     let mut security_reanalyzed = 0u32;
+    let mut security_fix_failures = 0u32;
     let mut referenced_objects_ok = true;
     let v2_paths = lpm_store::v2::StoreV2Paths::from_lpm_root(lpm_root);
 
@@ -455,18 +421,27 @@ fn run_verify(
                     if !security_analysis_matches(cached_analysis, &fresh) {
                         security_mismatches += 1;
                         if fix {
-                            if let Err(e) =
-                                lpm_security::behavioral::write_cached_analysis(dir, &fresh)
-                            {
-                                tracing::warn!(
-                                    "failed to re-write .lpm-security.json for {name}@{version}: {e}"
-                                );
-                            } else {
-                                security_reanalyzed += 1;
-                            }
+                            let fixed = match write_security_cache_for_verify(
+                                dir,
+                                &fresh,
+                                &safe_name,
+                                &safe_version,
+                            ) {
+                                Ok(()) => {
+                                    security_reanalyzed += 1;
+                                    true
+                                }
+                                Err(issue) => {
+                                    security_fix_failures += 1;
+                                    tracing::warn!("{issue}");
+                                    corrupted.push(issue);
+                                    false
+                                }
+                            };
                             if !json_output {
+                                let status = if fixed { "fixed" } else { "fix failed" };
                                 install_ui::warn(&format!(
-                                    "{name}@{version} — security analysis mismatch (fixed)"
+                                    "{safe_name}@{safe_version} — security analysis mismatch ({status})"
                                 ));
                             }
                         } else if !json_output {
@@ -479,17 +454,27 @@ fn run_verify(
                 None => {
                     security_mismatches += 1;
                     if fix {
-                        if let Err(e) = lpm_security::behavioral::write_cached_analysis(dir, &fresh)
-                        {
-                            tracing::warn!(
-                                "failed to write .lpm-security.json for {name}@{version}: {e}"
-                            );
-                        } else {
-                            security_reanalyzed += 1;
-                        }
+                        let fixed = match write_security_cache_for_verify(
+                            dir,
+                            &fresh,
+                            &safe_name,
+                            &safe_version,
+                        ) {
+                            Ok(()) => {
+                                security_reanalyzed += 1;
+                                true
+                            }
+                            Err(issue) => {
+                                security_fix_failures += 1;
+                                tracing::warn!("{issue}");
+                                corrupted.push(issue);
+                                false
+                            }
+                        };
                         if !json_output {
+                            let status = if fixed { "fixed" } else { "fix failed" };
                             install_ui::warn(&format!(
-                                "{name}@{version} — missing security cache (fixed)"
+                                "{safe_name}@{safe_version} — missing security cache ({status})"
                             ));
                         }
                     } else if !json_output {
@@ -596,7 +581,13 @@ fn run_verify(
             install_ui::warn(issue);
         }
         if deep && security_mismatches > 0 {
-            let suffix = if fix { "fixed" } else { "use --fix to refresh" };
+            let suffix = if fix && security_fix_failures > 0 {
+                "fix failed"
+            } else if fix {
+                "fixed"
+            } else {
+                "use --fix to refresh"
+            };
             install_ui::warn(&format!(
                 "{security_mismatches} security analysis mismatch{} ({suffix})",
                 if security_mismatches == 1 { "" } else { "es" }
@@ -661,6 +652,54 @@ fn compute_verify_dedup_counts(entries: &[StoreVerifyEntry]) -> (usize, usize) {
     let unique = seen.len();
     let duplicated = entries.len().saturating_sub(unique);
     (unique, duplicated)
+}
+
+fn load_lockfile_integrity_for_verify(deep: bool) -> (HashMap<String, String>, Option<String>) {
+    if !deep {
+        return (HashMap::new(), None);
+    }
+
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            return (
+                HashMap::new(),
+                Some(format!(
+                    "lpm.lock — unreadable: {}",
+                    sanitize_for_terminal(&e.to_string())
+                )),
+            );
+        }
+    };
+    let lockfile_path = cwd.join("lpm.lock");
+    if !lockfile_path.exists() {
+        return (HashMap::new(), None);
+    }
+
+    match lpm_lockfile::Lockfile::read_fast(&lockfile_path) {
+        Ok(lockfile) => {
+            let integrity = lockfile
+                .packages
+                .iter()
+                .filter_map(|package| {
+                    package.integrity.as_ref().map(|integrity| {
+                        (
+                            format!("{}@{}", package.name, package.version),
+                            integrity.clone(),
+                        )
+                    })
+                })
+                .collect();
+            (integrity, None)
+        }
+        Err(e) => (
+            HashMap::new(),
+            Some(format!(
+                "lpm.lock — unreadable: {}",
+                sanitize_for_terminal(&e.to_string())
+            )),
+        ),
+    }
 }
 
 /// Build the JSON envelope `lpm store verify --json` emits to stdout.
@@ -833,6 +872,20 @@ fn security_analysis_matches(
     cached.source == fresh.source
         && cached.supply_chain == fresh.supply_chain
         && cached.manifest == fresh.manifest
+}
+
+fn write_security_cache_for_verify(
+    dir: &std::path::Path,
+    fresh: &lpm_security::behavioral::PackageAnalysis,
+    safe_name: &str,
+    safe_version: &str,
+) -> Result<(), String> {
+    lpm_security::behavioral::write_cached_analysis(dir, fresh).map_err(|e| {
+        format!(
+            "{safe_name}@{safe_version} — failed to write .lpm-security.json: {}",
+            sanitize_for_terminal(&e.to_string())
+        )
+    })
 }
 
 #[cfg(test)]
