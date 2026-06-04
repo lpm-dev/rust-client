@@ -322,7 +322,7 @@ pub async fn run_multi(
     let total_tasks: usize = levels.iter().map(|l| l.len()).sum();
 
     // Fast path: single task with no dependencies — delegate to simple runner
-    if total_tasks == 1 && scripts.len() == 1 {
+    if total_tasks == 1 && scripts.len() == 1 && !json_output {
         return run(
             project_dir,
             &scripts[0],
@@ -1258,6 +1258,17 @@ pub async fn run_workspace(
                 Some(h) => format!("{base_msg}\n\n{h}"),
                 None => base_msg.to_string(),
             }));
+        }
+
+        if json_output {
+            let json = serde_json::json!({
+                "success": true,
+                "packages": 0,
+                "succeeded": 0,
+                "duration_ms": 0,
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            return Ok(());
         }
 
         install_ui::warn("No packages matched");

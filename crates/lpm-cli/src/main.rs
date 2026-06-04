@@ -3098,7 +3098,8 @@ fn main() -> Result<()> {
         let pkg_content_opt = std::fs::read_to_string(cwd.join("package.json")).ok();
         let is_workspace = pkg_content_opt
             .as_deref()
-            .is_some_and(install_state::is_workspace_root_content);
+            .is_some_and(install_state::is_workspace_root_content)
+            || install_state::has_pnpm_workspace_yaml(&cwd);
 
         if !is_workspace && let Some(pkg_content) = pkg_content_opt.as_deref() {
             let state = install_state::check_install_state_with_content(&cwd, pkg_content);

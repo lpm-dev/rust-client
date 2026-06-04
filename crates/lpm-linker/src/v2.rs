@@ -1205,6 +1205,13 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
+    fn write_local_source_object(store: &V2Store, sri: &str, source_dir: &Path) -> PathBuf {
+        store
+            .populate_object_from_local_source(source_dir, sri)
+            .unwrap()
+    }
+
     fn target(name: &str, version: &str, sri: &str, is_direct: bool) -> V2Target {
         V2Target {
             target: LinkTarget {
@@ -1334,6 +1341,86 @@ mod tests {
         // And the symlink target resolves to the lib link entry's
         // package.json.
         assert!(lib_sibling.join("package.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_packages_v2_supports_local_source_dep_edges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        let source_dir = tmp.path().join("sources").join("cycle-b");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        std::fs::write(
+            source_dir.join("package.json"),
+            b"{\"name\":\"@smoke/cycle-b\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        std::fs::write(source_dir.join("index.js"), b"module.exports = 'before';\n").unwrap();
+
+        let local_sri = synthetic_sri(b"link_packages_v2/local_source_cycle_b");
+        write_local_source_object(&store, &local_sri, &source_dir);
+
+        let consumer_sri = synthetic_sri(b"link_packages_v2/external_reentry");
+        write_object(
+            &store,
+            &consumer_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"external-reentry\",\"version\":\"1.0.0\",\"dependencies\":{\"@smoke/cycle-b\":\"1.0.0\"}}",
+            )],
+        );
+
+        let mut consumer = target("external-reentry", "1.0.0", &consumer_sri, true);
+        consumer.target.dependencies = vec![("@smoke/cycle-b".into(), "1.0.0".into())];
+
+        let mut local = target("@smoke/cycle-b", "1.0.0", &local_sri, false);
+        local.target.materialization = crate::Materialization::DirectorySource;
+
+        let result = link_packages_v2(
+            &project,
+            vec![consumer, local],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        let consumer_link_pkg = result
+            .materialized
+            .iter()
+            .find(|m| m.name == "external-reentry")
+            .map(|m| m.destination.clone())
+            .unwrap();
+        let consumer_link_dir = consumer_link_pkg.parent().unwrap().parent().unwrap();
+        let local_sibling = consumer_link_dir
+            .join("node_modules")
+            .join("@smoke/cycle-b");
+        assert!(
+            local_sibling.join("package.json").is_file(),
+            "local-source dep sibling must resolve inside the consumer link entry"
+        );
+
+        let local_link_pkg = result
+            .materialized
+            .iter()
+            .find(|m| m.name == "@smoke/cycle-b")
+            .map(|m| m.destination.clone())
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(local_link_pkg.join("index.js")).unwrap(),
+            "module.exports = 'before';\n"
+        );
+
+        std::fs::write(source_dir.join("index.js"), b"module.exports = 'after';\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(local_link_pkg.join("index.js")).unwrap(),
+            "module.exports = 'after';\n",
+            "v2 local-source link entries must stay live to source edits"
+        );
     }
 
     #[test]

@@ -24,6 +24,12 @@ struct OutdatedResult {
     outdated: bool,
 }
 
+struct LookupFailure {
+    name: String,
+    section: &'static str,
+    reason: String,
+}
+
 /// Check for newer versions of installed dependencies.
 pub async fn run(
     client: &RegistryClient,
@@ -85,6 +91,7 @@ pub async fn run(
     });
 
     let mut results = Vec::new();
+    let mut lookup_failures = Vec::new();
     let mut skipped_private: BTreeSet<String> = BTreeSet::new();
 
     for dep in dep_entries {
@@ -141,7 +148,13 @@ pub async fn run(
                     outdated: is_outdated,
                 });
             }
-            Err(_) => continue,
+            Err(e) => {
+                lookup_failures.push(LookupFailure {
+                    name: dep.name,
+                    section: dep.section,
+                    reason: e.to_string(),
+                });
+            }
         }
     }
 
@@ -163,11 +176,30 @@ pub async fn run(
             .collect();
         let mut json = serde_json::json!({
             "schema_version": OUTDATED_JSON_SCHEMA_VERSION,
-            "success": true,
+            "success": lookup_failures.is_empty(),
             "packages": package_json,
             "count": results.len(),
             "outdated_count": outdated_count,
         });
+        if !lookup_failures.is_empty() {
+            let unresolved_json: Vec<_> = lookup_failures
+                .iter()
+                .map(|failure| {
+                    serde_json::json!({
+                        "name": failure.name,
+                        "section": failure.section,
+                        "reason": failure.reason,
+                    })
+                })
+                .collect();
+            json.as_object_mut()
+                .unwrap()
+                .insert("unresolved".into(), serde_json::json!(unresolved_json));
+            json.as_object_mut().unwrap().insert(
+                "unresolved_count".into(),
+                serde_json::json!(lookup_failures.len()),
+            );
+        }
         if !skipped_private.is_empty() {
             json.as_object_mut()
                 .unwrap()
@@ -180,6 +212,9 @@ pub async fn run(
             );
         }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        if !lookup_failures.is_empty() {
+            return Err(LpmError::ExitCode(1));
+        }
     } else {
         let outdated: Vec<_> = results.iter().filter(|result| result.outdated).collect();
         if outdated.is_empty() {
@@ -249,6 +284,21 @@ pub async fn run(
                 skipped_private_list.join(", "),
             ));
             install_ui::phase("run `lpm install` first to record sources in lpm.lock, then re-run");
+        }
+        if !lookup_failures.is_empty() {
+            install_ui::warn(&format!(
+                "could not check {} package(s) due to registry lookup failures",
+                lookup_failures.len(),
+            ));
+            for failure in &lookup_failures {
+                install_ui::detail(&format!(
+                    "  {} {}: {}",
+                    failure.section.dimmed(),
+                    failure.name,
+                    lpm_common::sanitize_for_terminal(&failure.reason),
+                ));
+            }
+            return Err(LpmError::ExitCode(1));
         }
     }
 

@@ -420,6 +420,31 @@ pub async fn resolve_greedy_fused(
     spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
     auto_install_peers: bool,
 ) -> Result<ResolveResult, ResolveError> {
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    resolve_greedy_fused_with_cache(
+        client,
+        dependencies,
+        overrides,
+        route_table,
+        npm_fanout,
+        spec_tx,
+        shared_cache,
+        auto_install_peers,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors resolve_greedy_fused plus an install-owned cache
+pub async fn resolve_greedy_fused_with_cache(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    route_table: RouteTable,
+    npm_fanout: usize,
+    spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    shared_cache: SharedCache,
+    auto_install_peers: bool,
+) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!(
         "resolve_greedy_fused",
         n_deps = dependencies.len(),
@@ -441,7 +466,6 @@ pub async fn resolve_greedy_fused(
     // around `inflight` / `parked` because they never cross task
     // boundaries — only the spawn closures own clones of the
     // canonicals they're fetching.
-    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     let metadata_sem = Arc::new(tokio::sync::Semaphore::new(npm_fanout));
 
     // Counters. Declared here so the lpm.dev pre-batch below can

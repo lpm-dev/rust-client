@@ -328,6 +328,57 @@ async fn cli_install_global_json_emits_single_result_document() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cli_install_global_rejects_invalid_declared_bin_without_pending_state() {
+    let server = MockServer::start().await;
+    common::mount_mock_registry(
+        &server,
+        &[MockPackage {
+            name: "bad-bin",
+            versions: vec![MockPackageVersion {
+                version: "1.0.0",
+                dependencies: Vec::new(),
+                bins: vec![("../escape", "bin/escape.js")],
+            }],
+        }],
+    )
+    .await;
+
+    let sandbox = TempDir::new().unwrap();
+    let cwd = sandbox.path().join("workspace");
+    let lpm_home = sandbox.path().join("lpm-home");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&lpm_home).unwrap();
+    let root = LpmRoot::from_dir(&lpm_home);
+
+    let (status, stdout, stderr) = common::run_lpm(
+        &cwd,
+        &lpm_home,
+        Some(&server.uri()),
+        &["install", "-g", "bad-bin@1.0.0"],
+    );
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "install -g should reject a package with no materialized safe bin entries. stdout={stdout} stderr={stderr}"
+    );
+
+    let manifest = read_for(&root).unwrap();
+    assert!(
+        !manifest.packages.contains_key("bad-bin"),
+        "failed install must not create an active global package row"
+    );
+    assert!(
+        !manifest.pending.contains_key("bad-bin"),
+        "failed install must roll back the pending global transaction immediately"
+    );
+    assert!(
+        !root.install_root_for("bad-bin", "1.0.0").exists(),
+        "failed install must remove the unusable install root"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cli_replace_bin_then_uninstall_removes_transferred_shim_cleanly() {
     let server = MockServer::start().await;
     common::mount_mock_registry(

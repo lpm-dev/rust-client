@@ -112,7 +112,7 @@ fn reject_invalid_keys<'a>(pairs: impl IntoIterator<Item = &'a str>) -> Result<(
         Ok(())
     } else {
         Err(format!(
-            "vault keys must match [A-Za-z_][A-Za-z0-9_]* (rejected: {})",
+            "env keys must match [A-Za-z_][A-Za-z0-9_]* (rejected: {})",
             bad.join(", ")
         ))
     }
@@ -1009,11 +1009,10 @@ KEY3=no-quotes"#;
         });
     }
 
-    /// M44: vault setters refuse keys that would let a downstream
-    /// shell-eval / dotenv / env-file consumer interpret the key as
-    /// command syntax. The check is independent of OS keychain
-    /// availability — it runs before the keychain hop, so we don't
-    /// need `with_forced_file_vault_backend`.
+    /// Vault setters refuse keys that would let a downstream shell-eval,
+    /// dotenv, or env-file consumer interpret the key as command syntax.
+    /// The check is independent of OS keychain availability because it runs
+    /// before the keychain hop.
     #[test]
     fn set_rejects_keys_that_break_shell_or_dotenv_syntax() {
         let dir = tempfile::tempdir().unwrap();
@@ -1030,7 +1029,7 @@ KEY3=no-quotes"#;
             let err =
                 set(dir.path(), &[(bad, "v")]).expect_err(&format!("must reject key {bad:?}"));
             assert!(
-                err.contains("vault keys must match"),
+                err.contains("env keys must match"),
                 "expected validation error for {bad:?}, got: {err}"
             );
         }
@@ -1041,7 +1040,7 @@ KEY3=no-quotes"#;
         let dir = tempfile::tempdir().unwrap();
         let err = set_env(dir.path(), "live", &[("A; rm -rf /; #", "v")])
             .expect_err("must reject injection-shaped key");
-        assert!(err.contains("vault keys must match"));
+        assert!(err.contains("env keys must match"));
     }
 
     #[test]
@@ -1056,7 +1055,7 @@ KEY3=no-quotes"#;
         envs.insert("live".to_string(), live_env);
         let err = replace_all_environments(dir.path(), &envs)
             .expect_err("must reject if any env has an invalid key");
-        assert!(err.contains("vault keys must match"));
+        assert!(err.contains("env keys must match"));
     }
 
     #[test]

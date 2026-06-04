@@ -138,6 +138,7 @@ fn publish_secret_scan_json_failure_emits_single_envelope() {
     let json: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout should be one JSON object");
 
+    assert_eq!(json["success"], serde_json::json!(false));
     assert_eq!(json["error"], "secret_scan_failed");
     assert_eq!(json["matches"][0]["pattern"], "generic_password");
     assert!(
@@ -237,6 +238,44 @@ fn publish_check_mode_shows_quality() {
         combined.contains("quality") || combined.contains("score") || combined.contains("Quality"),
         "expected quality report in --check output, got:\n{combined}"
     );
+}
+
+#[test]
+fn publish_check_npm_json_emits_success_object_without_lpm_quality() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "npm-check-json-pkg",
+        "version": "1.0.0",
+        "description": "npm-only check JSON should stay object-shaped",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--npm"])
+        .output()
+        .expect("failed to run lpm publish --check --npm --json");
+
+    assert!(
+        output.status.success(),
+        "npm-only publish check must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("publish --check --npm --json must be valid JSON: {e}\n---\n{stdout}")
+    });
+    let envelope = envelope
+        .as_object()
+        .unwrap_or_else(|| panic!("publish check JSON must be an object, got: {envelope:#}"));
+
+    assert_eq!(envelope.get("success"), Some(&serde_json::json!(true)));
+    assert_eq!(envelope.get("check"), Some(&serde_json::json!(true)));
+    assert_eq!(envelope.get("quality"), Some(&serde_json::Value::Null));
 }
 
 // ─── Mock Registry Publish ───────────────────────────────────────

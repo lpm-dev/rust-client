@@ -547,13 +547,7 @@ pub async fn run(
     // Step 5: Check-only or dry-run modes
     if check_only {
         if json_output {
-            let mut json = quality_result
-                .as_ref()
-                .and_then(|qr| serde_json::to_value(qr).ok())
-                .unwrap_or_default();
-            if let Some(obj) = json.as_object_mut() {
-                obj.insert("success".to_string(), serde_json::Value::Bool(true));
-            }
+            let json = publish_check_json(quality_result.as_ref(), &targets, &target_names);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         }
         return Ok(());
@@ -1273,10 +1267,45 @@ fn secret_scan_json(scan: &SecretScanResult) -> serde_json::Value {
         .collect();
 
     serde_json::json!({
+        "success": false,
         "error": "secret_scan_failed",
         "matches": matches_json,
         "hint": "Use --allow-secrets to bypass (not recommended)",
     })
+}
+
+fn publish_check_json(
+    quality_result: Option<&quality::QualityResult>,
+    targets: &[PublishTarget],
+    target_names: &std::collections::HashMap<String, String>,
+) -> serde_json::Value {
+    let mut json = quality_result
+        .and_then(|qr| serde_json::to_value(qr).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({ "quality": null }));
+
+    let obj = json
+        .as_object_mut()
+        .expect("publish check JSON seed must be an object");
+    obj.insert("success".to_string(), serde_json::Value::Bool(true));
+    obj.insert("check".to_string(), serde_json::Value::Bool(true));
+    obj.insert(
+        "targets".to_string(),
+        serde_json::Value::Array(
+            targets
+                .iter()
+                .map(|target| {
+                    let key = target.key();
+                    serde_json::json!({
+                        "registry": key,
+                        "name": target_names.get(&key),
+                    })
+                })
+                .collect(),
+        ),
+    );
+
+    json
 }
 
 fn emit_secret_scan_human(scan: &SecretScanResult) {

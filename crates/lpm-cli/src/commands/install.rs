@@ -15,7 +15,7 @@ use lpm_resolver::{
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,7 +24,6 @@ use tokio::sync::Semaphore;
 
 /// Test-only deterministic-panic injection hook.
 ///
-/// Reads `LPM_TEST_PANIC_AT`. If the env value matches the `stage`
 /// argument AND the build is `cfg!(debug_assertions)` OR
 /// `LPM_TEST_MODE=1`, panics with a recognizable message that
 /// includes the stage name. Production builds without
@@ -998,6 +997,198 @@ fn extract_workspace_protocol_deps(
     Ok(extracted)
 }
 
+fn reject_workspace_self_dependency(pkg: &lpm_workspace::PackageJson) -> Result<(), LpmError> {
+    let Some(package_name) = pkg.name.as_deref() else {
+        return Ok(());
+    };
+
+    for (section, deps) in [
+        ("dependencies", &pkg.dependencies),
+        ("devDependencies", &pkg.dev_dependencies),
+        ("peerDependencies", &pkg.peer_dependencies),
+        ("optionalDependencies", &pkg.optional_dependencies),
+    ] {
+        let Some(spec) = deps.get(package_name) else {
+            continue;
+        };
+        if spec.starts_with("workspace:") {
+            return Err(LpmError::Workspace(format!(
+                "workspace member `{package_name}` depends on itself via {section}.{package_name} = `{spec}`"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn workspace_member_cache_info(
+    member: &WorkspaceMemberLink,
+) -> Option<lpm_resolver::CachedPackageInfo> {
+    let version = lpm_resolver::NpmVersion::parse(&member.version).ok()?;
+    let pkg = lpm_workspace::read_package_json(&member.source_dir.join("package.json")).ok()?;
+    let version_str = version.to_string();
+
+    let mut deps = HashMap::with_capacity(pkg.dependencies.len() + pkg.optional_dependencies.len());
+    let mut aliases = HashMap::new();
+    let mut optional_names = HashSet::with_capacity(pkg.optional_dependencies.len());
+    {
+        let mut insert_dep =
+            |local_name: String, raw_spec: String| match lpm_resolver::ranges::parse_npm_alias(
+                &raw_spec,
+            ) {
+                Some(alias) => {
+                    aliases.insert(local_name.clone(), alias.target);
+                    deps.insert(local_name, alias.range);
+                }
+                None => {
+                    deps.insert(local_name, raw_spec);
+                }
+            };
+        for (name, spec) in pkg.dependencies {
+            insert_dep(name, spec);
+        }
+        for (name, spec) in pkg.optional_dependencies {
+            optional_names.insert(name.clone());
+            insert_dep(name, spec);
+        }
+    }
+
+    let mut deps_by_version = HashMap::with_capacity(1);
+    deps_by_version.insert(version_str.clone(), deps);
+
+    let mut peer_deps = HashMap::new();
+    if !pkg.peer_dependencies.is_empty() {
+        peer_deps.insert(version_str.clone(), pkg.peer_dependencies);
+    }
+
+    let mut optional_dep_names = HashMap::new();
+    if !optional_names.is_empty() {
+        optional_dep_names.insert(version_str.clone(), optional_names);
+    }
+
+    let mut optional_peer_names = HashMap::new();
+    let optional_peers: HashSet<String> = pkg
+        .peer_dependencies_meta
+        .into_iter()
+        .filter_map(|(name, meta)| meta.optional.then_some(name))
+        .collect();
+    if !optional_peers.is_empty() {
+        optional_peer_names.insert(version_str.clone(), optional_peers);
+    }
+
+    let mut aliases_by_version = HashMap::new();
+    if !aliases.is_empty() {
+        aliases_by_version.insert(version_str, aliases);
+    }
+
+    Some(lpm_resolver::CachedPackageInfo {
+        versions: vec![version],
+        deps: deps_by_version,
+        peer_deps,
+        optional_dep_names,
+        optional_peer_names,
+        bundled_dep_names: HashMap::new(),
+        platform: HashMap::new(),
+        dist: HashMap::new(),
+        aliases: aliases_by_version,
+    })
+}
+
+fn seed_workspace_resolver_cache(
+    shared_cache: &lpm_resolver::SharedCache,
+    members: &[WorkspaceMemberLink],
+) {
+    for member in members {
+        let Some(info) = workspace_member_cache_info(member) else {
+            continue;
+        };
+        let key = lpm_resolver::CanonicalKey::from_dep_name(&member.name);
+        shared_cache.insert(key, Arc::new(info));
+    }
+}
+
+fn workspace_member_source(project_dir: &Path, source_dir: &Path) -> String {
+    let source_path =
+        pathdiff::diff_paths(source_dir, project_dir).unwrap_or_else(|| source_dir.to_path_buf());
+    let source = source_path.to_string_lossy().replace('\\', "/");
+    format!("directory+{source}")
+}
+
+fn rewrite_workspace_resolved_sources(
+    packages: &mut [InstallPackage],
+    workspace_members: &[WorkspaceMemberLink],
+    project_dir: &Path,
+) {
+    if workspace_members.is_empty() {
+        return;
+    }
+    let members_by_name: HashMap<&str, &WorkspaceMemberLink> = workspace_members
+        .iter()
+        .map(|member| (member.name.as_str(), member))
+        .collect();
+
+    for package in packages {
+        let Some(member) = members_by_name.get(package.name.as_str()) else {
+            continue;
+        };
+        if package.version != member.version {
+            continue;
+        }
+        package.source = workspace_member_source(project_dir, &member.source_dir);
+        package.is_lpm = false;
+        package.integrity = None;
+        package.tarball_url = None;
+        package.metadata_checked_for_tarball = false;
+    }
+}
+
+fn append_workspace_links_from_local_packages(
+    project_dir: &Path,
+    packages: &[InstallPackage],
+    workspace_member_deps: &mut Vec<WorkspaceMemberLink>,
+    all_workspace_members: &[WorkspaceMemberLink],
+    skip_workspace_members: &[WorkspaceMemberLink],
+) {
+    if all_workspace_members.is_empty() {
+        return;
+    }
+    let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let skipped: HashSet<(String, PathBuf)> = skip_workspace_members
+        .iter()
+        .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+        .collect();
+    let mut seen: HashSet<(String, PathBuf)> = workspace_member_deps
+        .iter()
+        .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+        .collect();
+
+    for package in packages {
+        let Ok(source) = package.source_kind() else {
+            continue;
+        };
+        let local_path = match source {
+            lpm_lockfile::Source::Directory { path } | lpm_lockfile::Source::Link { path } => {
+                project_dir.join(path)
+            }
+            _ => continue,
+        };
+        let canonical_source = canonicalize_path(&local_path);
+        let Some(member) = all_workspace_members.iter().find(|member| {
+            member.name == package.name
+                && member.version == package.version
+                && canonicalize_path(&member.source_dir) == canonical_source
+        }) else {
+            continue;
+        };
+        if skipped.contains(&(member.name.clone(), canonical_source.clone())) {
+            continue;
+        }
+        if seen.insert((member.name.clone(), canonical_source)) {
+            workspace_member_deps.push(member.clone());
+        }
+    }
+}
+
 ///
 ///
 /// Walk root deps for `file:` / `link:` specs whose target realpaths
@@ -1597,26 +1788,9 @@ struct InstallPackage {
     source: String,
     /// Dependencies: (dep_name_in_parent, dep_version). The name is the
     /// LOCAL label THIS package uses for the dep in its own `package.json`
-    /// (what the linker will create as the `node_modules/<name>/` symlink);
-    /// for npm-alias edges it diverges from the child's
-    /// canonical registry name, and the alias target is recorded in
-    /// `aliases` below.
     dependencies: Vec<(String, String)>,
-    /// — per-package npm-alias edges:
-    /// `local_name → target_canonical_name`. Empty unless this package
-    /// declares aliased deps. Only surface aliases whose edge survived
-    /// resolution (not platform-skipped) so the linker's dep-walk and
-    /// the lockfile writer see identical sets.
+    /// npm alias edges declared by this package: local dep name -> canonical target name.
     aliases: HashMap<String, String>,
-    /// — explicit root-symlink filenames for this
-    /// package. `None` preserves the pre-P2 "use pkg.name if
-    /// is_direct" behavior. `Some(vec)` drives of the linker
-    /// directly. Populated by `resolved_to_install_packages` from the
-    /// resolver's `root_aliases` map so the linker can build
-    /// `node_modules/<local>/` for aliased root deps (and the rare
-    /// dual-reference case where the same resolved `(name, version)`
-    /// is root-referenced both canonically AND by one or more
-    /// aliases).
     root_link_names: Option<Vec<String>>,
     /// Whether this is a direct dependency of the root project
     is_direct: bool,
@@ -2024,6 +2198,133 @@ struct NonRegistryPreResolveResult {
     /// `node_modules/<canonical>` — matches consumer expectation
     /// when the local name aliases the workspace member.
     additional_workspace_links: Vec<WorkspaceMemberLink>,
+}
+
+#[derive(Debug, Default)]
+struct V2WorkspaceRootPreResolveResult {
+    install_pkgs: Vec<InstallPackage>,
+    source_deps: HashMap<String, Vec<SourceDep>>,
+    additional_workspace_links: Vec<WorkspaceMemberLink>,
+}
+
+#[derive(Debug, Default)]
+struct LocalSourceExpansionResult {
+    source_deps: HashMap<String, Vec<SourceDep>>,
+    additional_workspace_links: Vec<WorkspaceMemberLink>,
+}
+
+fn expand_local_source_install_packages(
+    project_dir: &Path,
+    deps: &mut HashMap<String, String>,
+    install_pkgs: &mut Vec<InstallPackage>,
+    workspace_members: &[WorkspaceMemberLink],
+    json_output: bool,
+) -> Result<LocalSourceExpansionResult, LpmError> {
+    let mut source_deps_out: HashMap<String, Vec<SourceDep>> = HashMap::new();
+    let mut visited_realpaths: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+    for p in &*install_pkgs {
+        if let Ok(s) = p.source_kind() {
+            let path_opt = match s {
+                lpm_lockfile::Source::Directory { path } => Some(path),
+                lpm_lockfile::Source::Link { path } => Some(path),
+                _ => None,
+            };
+            if let Some(path) = path_opt
+                && let Ok(rp) = project_dir.join(&path).canonicalize()
+            {
+                visited_realpaths.insert(rp);
+            }
+        }
+    }
+
+    let immediate_dir_link: Vec<(String, PathBuf)> = install_pkgs
+        .iter()
+        .filter_map(|p| match p.source_kind() {
+            Ok(lpm_lockfile::Source::Directory { path }) => {
+                Some((p.source.clone(), project_dir.join(path)))
+            }
+            Ok(lpm_lockfile::Source::Link { path }) => {
+                Some((p.source.clone(), project_dir.join(path)))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut node_modules_warned: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+    let mut additional_workspace_links: Vec<WorkspaceMemberLink> = Vec::new();
+    for (parent_source_string, parent_abs) in immediate_dir_link {
+        let Ok(realpath) = parent_abs.canonicalize() else {
+            continue;
+        };
+        recurse_local_source_deps(
+            &realpath,
+            &parent_source_string,
+            deps,
+            install_pkgs,
+            &mut source_deps_out,
+            &mut visited_realpaths,
+            1,
+            3,
+            workspace_members,
+            json_output,
+            &mut node_modules_warned,
+            &mut additional_workspace_links,
+        )?;
+    }
+
+    Ok(LocalSourceExpansionResult {
+        source_deps: source_deps_out,
+        additional_workspace_links,
+    })
+}
+
+fn pre_resolve_v2_direct_workspace_member_deps(
+    project_dir: &Path,
+    deps: &mut HashMap<String, String>,
+    direct_workspace_member_deps: &[WorkspaceMemberLink],
+    all_workspace_members: &[WorkspaceMemberLink],
+    json_output: bool,
+) -> Result<V2WorkspaceRootPreResolveResult, LpmError> {
+    if direct_workspace_member_deps.is_empty() {
+        return Ok(V2WorkspaceRootPreResolveResult::default());
+    }
+
+    let mut install_pkgs = Vec::with_capacity(direct_workspace_member_deps.len());
+    for member in direct_workspace_member_deps {
+        install_pkgs.push(InstallPackage {
+            name: member.name.clone(),
+            version: member.version.clone(),
+            source: workspace_member_source(project_dir, &member.source_dir),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec![member.name.clone()]),
+            is_direct: true,
+            is_lpm: false,
+            peers: Vec::new(),
+            integrity: None,
+            tarball_url: None,
+            metadata_checked_for_tarball: false,
+        });
+    }
+
+    let LocalSourceExpansionResult {
+        source_deps,
+        additional_workspace_links,
+    } = expand_local_source_install_packages(
+        project_dir,
+        deps,
+        &mut install_pkgs,
+        all_workspace_members,
+        json_output,
+    )?;
+
+    Ok(V2WorkspaceRootPreResolveResult {
+        install_pkgs,
+        source_deps,
+        additional_workspace_links,
+    })
 }
 
 /// derive the canonical registry URL
@@ -2786,66 +3087,16 @@ async fn pre_resolve_non_registry_deps(
     //   - Stash per-source-string dep specs in `source_deps_out` for
     //     the post-resolve fix-up at install.rs:2663+.
     //
-    // The recursion shares the `visited` set across ALL immediate
-    // deps so a transitive dep referenced by two different immediates
-    // dedupes to a single InstallPackage. Each immediate dep's
-    // realpath is also pre-marked visited so recursive paths back to
-    // an immediate (e.g., A → util → A) don't fork.
-    let mut source_deps_out: HashMap<String, Vec<SourceDep>> = HashMap::new();
-    let mut visited_realpaths: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::new();
-    // Pre-mark every immediate directory/link InstallPackage's
-    // realpath as visited. This handles the diamond + cycle patterns
-    // uniformly.
-    for p in &install_pkgs {
-        if let Ok(s) = p.source_kind() {
-            let path_opt = match s {
-                lpm_lockfile::Source::Directory { path } => Some(path),
-                lpm_lockfile::Source::Link { path } => Some(path),
-                _ => None,
-            };
-            if let Some(path) = path_opt
-                && let Ok(rp) = project_dir.join(&path).canonicalize()
-            {
-                visited_realpaths.insert(rp);
-            }
-        }
-    }
-    // Walk every immediate directory/link InstallPackage's source.
-    // Indexing-by-clone because we'll be appending to install_pkgs
-    // during the walk; the immediate slice we want to walk is
-    // captured at function entry.
-    let immediate_dir_link: Vec<(String, PathBuf)> = install_pkgs
-        .iter()
-        .filter_map(|p| match p.source_kind() {
-            Ok(lpm_lockfile::Source::Directory { path }) => {
-                Some((p.source.clone(), project_dir.join(path)))
-            }
-            Ok(lpm_lockfile::Source::Link { path }) => {
-                Some((p.source.clone(), project_dir.join(path)))
-            }
-            _ => None,
-        })
-        .collect();
-    for (parent_source_string, parent_abs) in immediate_dir_link {
-        let Ok(realpath) = parent_abs.canonicalize() else {
-            continue;
-        };
-        recurse_local_source_deps(
-            &realpath,
-            &parent_source_string,
-            deps,
-            &mut install_pkgs,
-            &mut source_deps_out,
-            &mut visited_realpaths,
-            1, // start at depth 1 — immediates are depth 0; we walk THEIR deps
-            3, // bound: depth 3 from consumer (matches F7a + umbrella prepare-runner)
-            workspace_members,
-            json_output,
-            &mut node_modules_warned,
-            &mut additional_workspace_links,
-        )?;
-    }
+    let LocalSourceExpansionResult {
+        source_deps: source_deps_out,
+        additional_workspace_links,
+    } = expand_local_source_install_packages(
+        project_dir,
+        deps,
+        &mut install_pkgs,
+        workspace_members,
+        json_output,
+    )?;
 
     Ok(NonRegistryPreResolveResult {
         install_pkgs,
@@ -4135,6 +4386,7 @@ async fn run_with_options_under_store_lock(
     for (name, range) in &pkg.dev_dependencies {
         deps.entry(name.clone()).or_insert_with(|| range.clone());
     }
+    reject_workspace_self_dependency(&pkg)?;
 
     let declared_deps = deps.clone();
 
@@ -4224,6 +4476,12 @@ async fn run_with_options_under_store_lock(
             }
         }
         (Vec::new(), catalog_resolutions)
+    };
+    let requested_v2_mode = lpm_store::StoreVersion::from_env().is_v2();
+    let direct_workspace_member_deps = if requested_v2_mode {
+        workspace_member_deps.clone()
+    } else {
+        Vec::new()
     };
 
     //
@@ -4639,6 +4897,21 @@ async fn run_with_options_under_store_lock(
 
     let arc_client = Arc::new(client.clone_with_config());
 
+    let v2_workspace_root_pre_resolve = if requested_v2_mode {
+        pre_resolve_v2_direct_workspace_member_deps(
+            project_dir,
+            &mut deps,
+            &direct_workspace_member_deps,
+            &all_workspace_members,
+            json_output,
+        )?
+    } else {
+        V2WorkspaceRootPreResolveResult::default()
+    };
+    if requested_v2_mode {
+        workspace_member_deps.clear();
+    }
+
     // Offline mode: require lockfile, no network
     if offline {
         // Offline
@@ -4815,6 +5088,23 @@ async fn run_with_options_under_store_lock(
         // already populated `workspace_member_deps` with file:/link:
         // deps that match members, so the BFS seed set already
         // includes those.)
+        let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        if !v2_workspace_root_pre_resolve
+            .additional_workspace_links
+            .is_empty()
+        {
+            let existing: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
+                .iter()
+                .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+                .collect();
+            let mut seen = existing;
+            for entry in &v2_workspace_root_pre_resolve.additional_workspace_links {
+                let key = (entry.name.clone(), canonicalize_path(&entry.source_dir));
+                if seen.insert(key) {
+                    workspace_member_deps.push(entry.clone());
+                }
+            }
+        }
         expand_workspace_member_deps_with_transitives(
             &mut workspace_member_deps,
             &all_workspace_members,
@@ -4832,6 +5122,8 @@ async fn run_with_options_under_store_lock(
             &deps,
             &pkg,
             locked,
+            &v2_workspace_root_pre_resolve.install_pkgs,
+            &v2_workspace_root_pre_resolve.source_deps,
             0,
             0,
             true,
@@ -5037,13 +5329,22 @@ async fn run_with_options_under_store_lock(
     // mutable from its declaration site; round-6 hoisted the F9
     // pre-pass before the offline/online dispatch.)
     let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    if !additional_workspace_links.is_empty() {
+    let all_additional_workspace_links: Vec<WorkspaceMemberLink> = additional_workspace_links
+        .into_iter()
+        .chain(
+            v2_workspace_root_pre_resolve
+                .additional_workspace_links
+                .iter()
+                .cloned(),
+        )
+        .collect();
+    if !all_additional_workspace_links.is_empty() {
         let existing: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
             .iter()
             .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
             .collect();
         let mut seen = existing;
-        for entry in additional_workspace_links {
+        for entry in all_additional_workspace_links {
             let key = (entry.name.clone(), canonicalize_path(&entry.source_dir));
             if seen.insert(key) {
                 workspace_member_deps.push(entry);
@@ -5249,13 +5550,16 @@ async fn run_with_options_under_store_lock(
                         .filter(|&n| n > 0)
                         .unwrap_or(256);
 
-                    let res = lpm_resolver::resolve_greedy_fused(
+                    let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
+                    seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
+                    let res = lpm_resolver::resolve_greedy_fused_with_cache(
                         arc_client.clone(),
                         deps.clone(),
                         override_set.clone(),
                         route_table.clone(),
                         npm_fanout,
                         Some(spec_tx),
+                        shared_cache,
                         auto_install_peers,
                     )
                     .await
@@ -5299,6 +5603,7 @@ async fn run_with_options_under_store_lock(
                     // aborted" invariant.
                     use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
                     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+                    seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
                     let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
                     // wait-loop shutdown handshake: the walker stores
                     // `true` (Release) and broadcasts `notify_waiters()` across
@@ -5528,12 +5833,14 @@ async fn run_with_options_under_store_lock(
                 // reproduce the same top-level node_modules layout.
                 ambient_peer_installs_for_lockfile = resolve_result.ambient_peer_installs.clone();
 
-                let mut packages = resolved_to_install_packages(
+                let mut packages = resolved_to_install_packages_with_workspace_members(
                     &resolve_result.packages,
                     &deps,
                     &resolve_result.root_aliases,
                     &resolve_result.ambient_peer_installs,
                     &route_table,
+                    &all_workspace_members,
+                    project_dir,
                 );
 
                 // Snapshot the resolver's metadata cache as
@@ -5600,6 +5907,22 @@ async fn run_with_options_under_store_lock(
                 (packages, ms, false, platform_skipped, latest_stable)
             }
         };
+
+    if requested_v2_mode && !v2_workspace_root_pre_resolve.install_pkgs.is_empty() {
+        packages.extend(v2_workspace_root_pre_resolve.install_pkgs.iter().cloned());
+        apply_post_resolve_directory_link_fixup(
+            &mut packages,
+            &v2_workspace_root_pre_resolve.source_deps,
+        );
+    }
+
+    append_workspace_links_from_local_packages(
+        project_dir,
+        &packages,
+        &mut workspace_member_deps,
+        &all_workspace_members,
+        &direct_workspace_member_deps,
+    );
 
     // Step 3: Download & store (parallel).: `store` is
     // already bound above — speculative dispatcher writes into it
@@ -5670,12 +5993,38 @@ async fn run_with_options_under_store_lock(
     // the serial path — it has a different layout model and isn't the
     // hot path for the default `lpm install`.
     let serial_link = std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
+    let v2_mode = store_v2_handle.is_some();
+    let local_source_sri_for_target = |target: &LinkTarget| {
+        let wrapper_id = target.wrapper_id.as_deref().unwrap_or("");
+        let seed = format!(
+            "lpm-v2-local-source\0{}\0{}\0{}\0{}",
+            target.name,
+            target.version,
+            wrapper_id,
+            target.store_path.display()
+        );
+        lpm_store::compute_sri_hash(seed.as_bytes())
+    };
+    if v2_mode {
+        let store_v2 = store_v2_handle
+            .as_deref()
+            .expect("v2_mode implies v2 store handle is available");
+        for target in &link_targets {
+            if !matches!(
+                target.materialization,
+                lpm_linker::Materialization::DirectorySource
+            ) {
+                continue;
+            }
+            let sri = local_source_sri_for_target(target);
+            store_v2.populate_object_from_local_source(&target.store_path, &sri)?;
+        }
+    }
     // — under v2 mode, link_packages_v2 needs the
     // full LinkTarget set in one batch so the GraphKey pre-pass can
     // resolve cross-references. Per-package event-driven linking
     // (which v1's isolated path uses) doesn't fit the v2 dispatcher's
     // shape, so v2 always takes the serial path.
-    let v2_mode = store_v2_handle.is_some();
     let event_driven_link =
         !serial_link && !v2_mode && matches!(linker_mode, lpm_linker::LinkerMode::Isolated);
 
@@ -5702,10 +6051,10 @@ async fn run_with_options_under_store_lock(
     // diverging from the serial path. On predicate failure we fall
     // through to today's serial v2 link at the link stage.
     //
-    // Local-source targets (`Materialization::DirectorySource`) stay
-    // outside the v2 store and continue through the existing tail
-    // loop after `link_v2_finalize`; they are filtered out before the
-    // gate is checked.
+    // Local-source targets now get synthetic v2 objects keyed by a
+    // stable sha512 of their resolved source identity, so they stay in
+    // the same target set as CAS-backed packages during GraphKey
+    // derivation and link-entry population.
     //
     // Mode independence: `link_v2_prepare` / `link_v2_one` /
     // `link_v2_finalize` are linker-mode-agnostic for per-package
@@ -5715,21 +6064,26 @@ async fn run_with_options_under_store_lock(
     // wiring identically across modes. So the gate does NOT require
     // Isolated — the post-Hoisted default is fully
     // supported.
-    let v2_cas_targets_pre: Vec<lpm_linker::v2::V2Target> = if v2_mode && !serial_link {
+    let v2_targets_pre: Vec<lpm_linker::v2::V2Target> = if v2_mode && !serial_link {
         let mut acc: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
         let mut all_have_sri = true;
         for (lt, p) in link_targets.iter().zip(packages.iter()) {
-            if !matches!(lt.materialization, lpm_linker::Materialization::CasBacked) {
-                continue;
-            }
-            match p.integrity.as_deref() {
-                Some(sri) => acc.push(lpm_linker::v2::V2Target {
-                    target: lt.clone(),
-                    source_sri: sri.to_string(),
-                }),
-                None => {
-                    all_have_sri = false;
-                    break;
+            match lt.materialization {
+                lpm_linker::Materialization::CasBacked => match p.integrity.as_deref() {
+                    Some(sri) => acc.push(lpm_linker::v2::V2Target {
+                        target: lt.clone(),
+                        source_sri: sri.to_string(),
+                    }),
+                    None => {
+                        all_have_sri = false;
+                        break;
+                    }
+                },
+                lpm_linker::Materialization::DirectorySource => {
+                    acc.push(lpm_linker::v2::V2Target {
+                        target: lt.clone(),
+                        source_sri: local_source_sri_for_target(lt),
+                    });
                 }
             }
         }
@@ -5754,8 +6108,7 @@ async fn run_with_options_under_store_lock(
     //   same empty set from `package.json`. On the lockfile fast-path
     //   (`used_lockfile`), peers are NOT persisted today (per the
     //   `LinkTarget.peers` doc), so we must fall back to serial v2.
-    let v2_event_driven =
-        v2_mode && !serial_link && !v2_cas_targets_pre.is_empty() && !used_lockfile;
+    let v2_event_driven = v2_mode && !serial_link && !v2_targets_pre.is_empty() && !used_lockfile;
 
     // Plan + per-key V2Target index — both shared across the cache-hit
     // dispatch loop and every per-pkg fetch task. `Arc<LinkPlanV2>`
@@ -5765,7 +6118,7 @@ async fn run_with_options_under_store_lock(
     let v2_plan: Option<std::sync::Arc<lpm_linker::v2::LinkPlanV2>> = if v2_event_driven {
         let plan = lpm_linker::v2::link_v2_prepare(
             project_dir,
-            v2_cas_targets_pre,
+            v2_targets_pre,
             store_v2_handle
                 .as_deref()
                 .expect("v2_event_driven implies v2 store"),
@@ -5781,10 +6134,14 @@ async fn run_with_options_under_store_lock(
                 .iter()
                 .zip(link_targets.iter())
                 .filter_map(|(p, lt)| {
-                    if !matches!(lt.materialization, lpm_linker::Materialization::CasBacked) {
-                        return None;
-                    }
-                    let sri = p.integrity.as_deref()?.to_string();
+                    let sri = match lt.materialization {
+                        lpm_linker::Materialization::CasBacked => {
+                            p.integrity.as_deref()?.to_string()
+                        }
+                        lpm_linker::Materialization::DirectorySource => {
+                            local_source_sri_for_target(lt)
+                        }
+                    };
                     Some((
                         install_pkg_key(p),
                         lpm_linker::v2::V2Target {
@@ -5840,18 +6197,32 @@ async fn run_with_options_under_store_lock(
         // already-extracted bytes.)
         //
         // Per-source carve-out: local sources (`Source::Directory`
-        // / `Source::Link`) are NOT content-addressable and bypass
-        // both v1 and v2 stores. They live at the source realpath
-        // and their `store_has_source_aware` returns true iff that
-        // path resolves to a directory with a package.json. Sending
-        // them through the fetch loop under v2 mode is wrong:
-        // there's nothing to download, and the loop assigns them an
-        // empty integrity which then trips the binary lockfile's
-        // empty-string-vs-None guard.
+        // / `Source::Link`) still skip the fetch loop, but under v2
+        // they now flow through pre-populated synthetic objects
+        // instead of a project-root-only post-link step.
         let is_local_source = matches!(
             p.source_kind(),
             Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
         );
+
+        if v2_mode && is_local_source {
+            cached += 1;
+            if v2_event_driven
+                && let Some(plan) = v2_plan.as_ref()
+                && let Some(target) = v2_target_by_key.get(&install_pkg_key(p)).cloned()
+            {
+                let plan_arc = std::sync::Arc::clone(plan);
+                let store_arc = std::sync::Arc::clone(
+                    store_v2_handle
+                        .as_ref()
+                        .expect("v2_event_driven implies v2 store"),
+                );
+                v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
+                    lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
+                }));
+            }
+            continue;
+        }
 
         // — v2 native cache-hit short-circuit.
         //
@@ -5961,8 +6332,7 @@ async fn run_with_options_under_store_lock(
             }
         }
 
-        if !force && (is_local_source || !v2_mode) && p.store_has_source_aware(&store, project_dir)
-        {
+        if !force && !v2_mode && p.store_has_source_aware(&store, project_dir) {
             cached += 1;
             //b: spawn per-pkg link task immediately — this
             // package is already materialized in the store, so             // can run in parallel with the fetch loop below.
@@ -6208,6 +6578,9 @@ async fn run_with_options_under_store_lock(
         if !used_lockfile && cooldown_policy.minimum_release_age_secs > 0 {
             let mut map = std::collections::HashMap::with_capacity(packages.len());
             for p in &packages {
+                if install_package_is_local_source(p) {
+                    continue;
+                }
                 let publish_time = if p.is_lpm {
                     lpm_common::PackageName::parse(&p.name)
                         .ok()
@@ -7155,20 +7528,17 @@ async fn run_with_options_under_store_lock(
             self_referenced: finalize.self_referenced,
             materialized: materialized_all,
         }
-    } else if let Some(store_v2) = store_v2_handle.as_deref() {
-        // — v2 path with per-source routing.
+    } else if v2_mode {
+        let store_v2 = store_v2_handle
+            .as_deref()
+            .expect("v2_mode implies v2 store handle is available");
+        // — v2 path with unified source routing.
         //
-        // Per the v2 preplan, CAS-backed sources (Registry,
-        // Tarball remote+local, Git) flow through the v2 store +
-        // link-entry materialization. Local-source kinds
-        // (`Source::Directory` = `file:`, `Source::Link` = `link:`)
-        // are NOT content-addressable (the source can be edited at
-        // any time) and intentionally stay outside the global v2
-        // store. They land as project-side symlinks pointing at the
-        // source realpath — same observable contract as v1's
-        // wrapper-based path for the audit-fixture scope (the local
-        // source has no transitive deps, so Node's module resolution
-        // doesn't need a wrapper boundary).
+        // CAS-backed sources (Registry, Tarball remote+local, Git)
+        // use extracted `objects/<sri>/`. Local directory/link
+        // sources use synthetic `objects/<synthetic-sri>/` symlink
+        // trees so they participate in GraphKey resolution while
+        // staying live to source edits.
         // Key: "name\x00version" — single String avoids 2-clone tuple on
         // both construction and per-package lookup.
         let sri_by_pkg: HashMap<String, String> = packages
@@ -7185,32 +7555,30 @@ async fn run_with_options_under_store_lock(
             .collect();
 
         let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
-        let mut local_targets: Vec<&LinkTarget> = Vec::new();
         for t in &link_targets {
-            match t.materialization {
-                lpm_linker::Materialization::CasBacked => {
-                    let lookup_key = {
-                        let mut k = String::with_capacity(t.name.len() + 1 + t.version.len());
-                        k.push_str(&t.name);
-                        k.push('\x00');
-                        k.push_str(&t.version);
-                        k
-                    };
-                    let sri = sri_by_pkg.get(&lookup_key).cloned().ok_or_else(|| {
-                        LpmError::Registry(format!(
-                            "v2 install: missing source SRI for {}@{}",
-                            t.name, t.version
-                        ))
-                    })?;
-                    v2_targets.push(lpm_linker::v2::V2Target {
-                        target: t.clone(),
-                        source_sri: sri,
-                    });
-                }
+            let lookup_key = {
+                let mut k = String::with_capacity(t.name.len() + 1 + t.version.len());
+                k.push_str(&t.name);
+                k.push('\x00');
+                k.push_str(&t.version);
+                k
+            };
+            let sri = match t.materialization {
+                lpm_linker::Materialization::CasBacked => sri_by_pkg.get(&lookup_key).cloned(),
                 lpm_linker::Materialization::DirectorySource => {
-                    local_targets.push(t);
+                    Some(local_source_sri_for_target(t))
                 }
             }
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "v2 install: missing source SRI for {}@{}",
+                    t.name, t.version
+                ))
+            })?;
+            v2_targets.push(lpm_linker::v2::V2Target {
+                target: t.clone(),
+                source_sri: sri,
+            });
         }
 
         // followup #6b — event-driven v2 path.
@@ -7223,7 +7591,7 @@ async fn run_with_options_under_store_lock(
         // would have produced. The serial fall-back below keeps the
         // shape of the pre-#6b path for installs that didn't pass the
         // gate (e.g. `Source::Tarball` TOFU before the SRI is known).
-        let mut result = if v2_event_driven {
+        if v2_event_driven {
             let plan = v2_plan
                 .as_ref()
                 .expect("v2_event_driven implies v2_plan is Some");
@@ -7241,12 +7609,12 @@ async fn run_with_options_under_store_lock(
             }
             let finalize =
                 lpm_linker::v2::link_v2_finalize(project_dir, plan, store_v2, pkg.name.as_deref())?;
-            let cas_total = plan.augmented_targets.len();
+            let target_total = plan.augmented_targets.len();
             LinkResult {
                 linked: linked_count,
                 symlinked: finalize.symlinked,
                 bin_linked: finalize.bin_count,
-                skipped: cas_total.saturating_sub(linked_count),
+                skipped: target_total.saturating_sub(linked_count),
                 self_referenced: finalize.self_referenced,
                 materialized: materialized_all,
             }
@@ -7258,69 +7626,7 @@ async fn run_with_options_under_store_lock(
                 linker_mode,
                 pkg.name.as_deref(),
             )?
-        };
-
-        // Materialize directory-source targets via project-side
-        // symlink to the source realpath. Both the event-driven
-        // `link_v2_finalize` path and the serial `link_packages_v2`
-        // path wipe + recreate `<project>/node_modules/`, so we
-        // append here either way.
-        if !local_targets.is_empty() {
-            let nm = project_dir.join("node_modules");
-            std::fs::create_dir_all(&nm).map_err(|e| {
-                LpmError::Registry(format!(
-                    "v2 install (local-source): failed to ensure node_modules at {}: {e}",
-                    nm.display()
-                ))
-            })?;
-            for t in local_targets {
-                let names: Vec<String> = if let Some(rl) = &t.root_link_names {
-                    rl.clone()
-                } else if t.is_direct {
-                    vec![t.name.clone()]
-                } else {
-                    Vec::new()
-                };
-                for root_name in &names {
-                    let link_path = nm.join(root_name);
-                    if let Some(parent) = link_path.parent()
-                        && parent != nm
-                        && !parent.exists()
-                    {
-                        std::fs::create_dir_all(parent).map_err(|e| {
-                            LpmError::Registry(format!(
-                                "v2 install (local-source): failed to create scope dir at {}: {e}",
-                                parent.display()
-                            ))
-                        })?;
-                    }
-                    if link_path.symlink_metadata().is_ok() {
-                        // CAS root symlink already at slot — local-source
-                        // dep with the same root_link_name would only
-                        // occur via aliasing, which the resolver
-                        // disambiguates upstream. Defensive skip.
-                        continue;
-                    }
-                    lpm_common::symlink::create_dir_symlink_or_junction(&t.store_path, &link_path)
-                        .map_err(|e| {
-                            LpmError::Registry(format!(
-                                "v2 install (local-source): failed to symlink {} → {}: {e}",
-                                link_path.display(),
-                                t.store_path.display()
-                            ))
-                        })?;
-                    result.symlinked += 1;
-                }
-                result.materialized.push(MaterializedPackage {
-                    name: t.name.clone(),
-                    version: t.version.clone(),
-                    destination: t.store_path.clone(),
-                });
-                result.linked += 1;
-            }
         }
-
-        result
     } else {
         match linker_mode {
             lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
@@ -7834,7 +8140,17 @@ async fn run_with_options_under_store_lock(
     if !used_lockfile {
         let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver(resolved_with);
         lockfile.metadata.auto_isolated_peer_conflicts = auto_isolated_peer_conflicts;
-        for p in &packages {
+        let ephemeral_workspace_pkg_keys: HashSet<String> = v2_workspace_root_pre_resolve
+            .install_pkgs
+            .iter()
+            .map(install_pkg_key)
+            .collect();
+        let persisted_packages: Vec<InstallPackage> = packages
+            .iter()
+            .filter(|p| !ephemeral_workspace_pkg_keys.contains(&install_pkg_key(p)))
+            .cloned()
+            .collect();
+        for p in &persisted_packages {
             let dep_strings: Vec<String> = p
                 .dependencies
                 .iter()
@@ -7892,7 +8208,7 @@ async fn run_with_options_under_store_lock(
         // without re-resolving. The HashMap → BTreeMap conversion
         // gives deterministic serialized order, matching the
         // sort-by-name policy on `packages`.
-        lockfile.root_aliases = root_aliases_for_lockfile(&packages, &deps);
+        lockfile.root_aliases = root_aliases_for_lockfile(&persisted_packages, &deps);
 
         // persist the resolver's `ambient_peer_installs`
         // set so the warm-install fast path knows which canonicals
@@ -7906,8 +8222,10 @@ async fn run_with_options_under_store_lock(
             &override_catalog_resolutions,
             &applied_overrides,
         );
-        lockfile.catalogs =
-            catalog_snapshot_from_install_packages(&lockfile_catalog_resolutions, &packages)?;
+        lockfile.catalogs = catalog_snapshot_from_install_packages(
+            &lockfile_catalog_resolutions,
+            &persisted_packages,
+        )?;
 
         lockfile
             .write_all(&lockfile_path)
@@ -8066,9 +8384,11 @@ async fn run_with_options_under_store_lock(
             advisor_session.as_ref().map(|s| s.approvals()),
         )
         .await
-        && !json_output
     {
-        output::warn(&format!("Auto-build failed: {e}"));
+        if !json_output {
+            output::warn(&format!("Auto-build failed: {e}"));
+        }
+        return Err(e);
     }
 
     // post-auto-build canonical pointer.
@@ -8085,11 +8405,9 @@ async fn run_with_options_under_store_lock(
     //
     // JSON mode: per-entry `static_tier` enrichment below in the
     // JSON output block gives agents the machine-readable shape; no
-    // extra line here. Non-JSON: one concise warn line. Neither
-    // changes exit semantics — install stays Ok, matching the
-    // table's "0 (warning)" expectation across all three
-    // environments (see rationale re:
-    // `install.rs:2361-2377`'s `warn`-wrapped auto-build contract).
+    // extra line here. Non-JSON: one concise warn line after a
+    // successful auto-build that still leaves amber/red packages for
+    // explicit review.
     maybe_emit_post_auto_build_triage_pointer(
         auto_build_attempted,
         step10_effective_policy,
@@ -9328,6 +9646,9 @@ async fn build_blocked_set_metadata(
     let meta_ns = std::sync::atomic::AtomicU64::new(0);
     let meta_ns_ref = &meta_ns;
     let entry_futures = packages.iter().map(|p| async move {
+        if install_package_is_local_source(p) {
+            return None;
+        }
         // Grab the full PackageMetadata for `time[version]` (→
         // `published_at`) and `versions[version]._behavioralTags` (→
         // `behavioral_tags_hash` + `behavioral_tags`). Errors are
@@ -10363,6 +10684,26 @@ fn resolved_to_install_packages(
         .collect()
 }
 
+fn resolved_to_install_packages_with_workspace_members(
+    resolved: &[ResolvedPackage],
+    deps: &HashMap<String, String>,
+    root_aliases: &HashMap<String, String>,
+    ambient_peer_installs: &[String],
+    route_table: &RouteTable,
+    all_workspace_members: &[WorkspaceMemberLink],
+    project_dir: &Path,
+) -> Vec<InstallPackage> {
+    let mut packages = resolved_to_install_packages(
+        resolved,
+        deps,
+        root_aliases,
+        ambient_peer_installs,
+        route_table,
+    );
+    rewrite_workspace_resolved_sources(&mut packages, all_workspace_members, project_dir);
+    packages
+}
+
 /// Offline/shared path: link packages from store, write lockfile, print output.
 #[allow(clippy::too_many_arguments)]
 async fn run_link_and_finish(
@@ -10371,6 +10712,8 @@ async fn run_link_and_finish(
     _deps: &HashMap<String, String>,
     pkg: &lpm_workspace::PackageJson,
     packages: Vec<InstallPackage>,
+    ephemeral_packages: &[InstallPackage],
+    ephemeral_source_deps: &HashMap<String, Vec<SourceDep>>,
     downloaded: usize,
     cached: usize,
     used_lockfile: bool,
@@ -10390,6 +10733,11 @@ async fn run_link_and_finish(
     let force_security_floor = crate::security_floor::force_security_floor_enabled(
         &crate::commands::config::GlobalConfig::load(),
     );
+    let mut packages = packages;
+    if !ephemeral_packages.is_empty() {
+        packages.extend(ephemeral_packages.iter().cloned());
+        apply_post_resolve_directory_link_fixup(&mut packages, ephemeral_source_deps);
+    }
     let store = PackageStore::default_location()?;
     // confidence-followup S5b — same hoist as `run_with_options`;
     // post-install helpers route through `find_installed_package_baseline`.
@@ -12384,6 +12732,13 @@ fn install_package_is_registry_source(package: &InstallPackage) -> bool {
     matches!(
         package.source_kind(),
         Ok(lpm_lockfile::Source::Registry { .. })
+    )
+}
+
+fn install_package_is_local_source(package: &InstallPackage) -> bool {
+    matches!(
+        package.source_kind(),
+        Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
     )
 }
 

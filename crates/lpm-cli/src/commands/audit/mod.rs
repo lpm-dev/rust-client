@@ -223,7 +223,9 @@ pub async fn run(
     let discovery = discovery::discover_packages(project_dir)?;
 
     if discovery.packages.is_empty() {
-        if !json_output {
+        if json_output {
+            print_json_report(&[], &[], None, &discovery, 0);
+        } else {
             install_ui::warn("No packages found to audit");
         }
         return Ok(());
@@ -2396,11 +2398,13 @@ pub async fn run_secrets(
 
         println!(
             "{}",
-            serde_json::json!({
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
                 "packagesScanned": total_packages,
                 "packagesWithSecrets": packages_with_secrets.len(),
                 "findings": findings,
-            })
+            }))
+            .unwrap()
         );
         if should_fail_secrets(fail_policy, !packages_with_secrets.is_empty()) {
             return Err(LpmError::ExitCode(1));

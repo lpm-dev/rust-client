@@ -1138,6 +1138,34 @@ async fn run_remote_cache_disabled_does_not_contact_remote_server() {
 // ─── Multi-Task JSON ─────────────────────────────────────────────
 
 #[test]
+fn run_single_task_json_output() {
+    let project = TempProject::from_fixture("with-scripts");
+
+    let output = lpm(&project)
+        .args(["run", "build", "--json"])
+        .output()
+        .expect("failed to run lpm run build --json");
+
+    assert!(
+        output.status.success(),
+        "run build --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let json = support::assertions::parse_json_output(&output.stdout);
+
+    assert_eq!(json["success"], true);
+    assert_eq!(json["total"], 1);
+    assert_eq!(json["passed"], 1);
+    assert_eq!(json["failed"], 0);
+    let tasks = json["tasks"].as_array().expect("tasks should be an array");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["name"], "build");
+    assert_eq!(tasks[0]["success"], true);
+}
+
+#[test]
 fn run_multi_task_json_output() {
     // This is tested in json_output.rs but we verify the shape here too
     let project = TempProject::from_fixture("with-scripts");
@@ -1452,6 +1480,29 @@ fn run_filter_typo_without_fail_flag_exits_zero() {
             "{member} must NOT execute on empty-match filter"
         );
     }
+}
+
+#[test]
+fn run_filter_typo_json_outputs_zero_package_summary() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_unique_scripts(&project);
+
+    let output = lpm(&project)
+        .args(["run", "echo", "--filter", "this-does-not-exist", "--json"])
+        .output()
+        .expect("failed to run lpm run --filter --json");
+
+    assert!(
+        output.status.success(),
+        "empty-match JSON run must exit 0\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let json = support::assertions::parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert_eq!(json["packages"], 0);
+    assert_eq!(json["succeeded"], 0);
 }
 
 #[test]

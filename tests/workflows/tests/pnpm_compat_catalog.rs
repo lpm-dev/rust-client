@@ -930,6 +930,61 @@ async fn warm_install_updates_catalog_snapshot_when_catalog_specifier_drifts() {
 }
 
 #[tokio::test]
+async fn warm_install_updates_pnpm_workspace_catalog_snapshot_when_catalog_specifier_drifts() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = pnpm_workspace_catalog_project(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            }
+        }"#,
+        r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^1.0.0
+"#,
+    );
+
+    let first = run_install(&project, &mock, &[]);
+    let first_text = output_text(&first);
+    assert!(
+        first.status.success(),
+        "initial pnpm-workspace catalog install must succeed\n{first_text}"
+    );
+    assert_eq!(
+        catalog_snapshot_entry(&project, "default", "is-positive").specifier,
+        "^1.0.0"
+    );
+
+    project.write_file(
+        "pnpm-workspace.yaml",
+        r#"packages:
+  - "packages/*"
+catalog:
+  is-positive: ^2.0.0
+"#,
+    );
+
+    let second = run_install(&project, &mock, &[]);
+    let second_text = output_text(&second);
+    assert!(
+        second.status.success(),
+        "warm install after pnpm-workspace catalog drift must succeed\n{second_text}"
+    );
+    let entry = catalog_snapshot_entry(&project, "default", "is-positive");
+    assert_eq!(
+        entry.specifier, "^2.0.0",
+        "warm install must refresh lockfile catalog provenance when pnpm-workspace.yaml changes"
+    );
+    assert_eq!(entry.version, "2.0.0");
+    assert_eq!(entry.reference, "catalog:");
+}
+
+#[tokio::test]
 async fn override_default_catalog_reference_resolves_to_catalog_range() {
     let mock = MockRegistry::start().await;
     mount_is_positive_versions(&mock).await;

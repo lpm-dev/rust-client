@@ -230,16 +230,27 @@ pub async fn run(
     // removes the pending row + cleans the install root. Single
     // cleanup code path, called from one place.
     do_install(&root, &registry, &prep, json_output, &overrides).await?;
-    let commands = discover_bin_commands(&prep.install_root, &prep.name)?;
+    let commands = match discover_materialized_bin_commands(&prep.install_root, &prep.name) {
+        Ok(commands) => commands,
+        Err(e) => {
+            rollback_after_install_failure(&root, &prep, &e.to_string())?;
+            return Err(e);
+        }
+    };
     if commands.is_empty() {
         let name_safe = sanitize_for_terminal(&prep.name);
-        return Err(LpmError::Script(format!(
+        let reason = format!(
             "package '{name_safe}' exposes no bin entries — `lpm install -g` is for executable tools. \
              Install it as a project dep with `lpm install {name_safe}` and `require()`/`import` it."
-        )));
+        );
+        rollback_after_install_failure(&root, &prep, &reason)?;
+        return Err(LpmError::Script(reason));
     }
     let marker = InstallReadyMarker::new(commands);
-    write_marker(&prep.install_root, &marker)?;
+    if let Err(e) = write_marker(&prep.install_root, &marker) {
+        rollback_after_install_failure(&root, &prep, &e.to_string())?;
+        return Err(e);
+    }
 
     // ─── Step 3a: TTY interactive prompt ───────────────────
     //
@@ -694,6 +705,52 @@ fn short_name(package_name: &str) -> &str {
         return &rest[slash + 1..];
     }
     package_name
+}
+
+fn discover_materialized_bin_commands(
+    install_root: &std::path::Path,
+    package_name: &str,
+) -> Result<Vec<String>, LpmError> {
+    let declared = discover_bin_commands(install_root, package_name)?;
+    let bin_dir = install_root.join("node_modules").join(".bin");
+    let mut commands = Vec::with_capacity(declared.len());
+    for command in declared {
+        if let Err(reason) = lpm_linker::validate_bin_name(&command, package_name) {
+            tracing::warn!("global install: skipping invalid bin \"{command}\": {reason}");
+            continue;
+        }
+        let bin_path = bin_dir.join(&command);
+        if !is_materialized_bin_command(&bin_path)? {
+            tracing::warn!(
+                "global install: skipping bin \"{command}\" because {} was not materialized",
+                bin_path.display()
+            );
+            continue;
+        }
+        commands.push(command);
+    }
+    Ok(commands)
+}
+
+fn is_materialized_bin_command(bin_path: &std::path::Path) -> Result<bool, LpmError> {
+    let meta = match std::fs::symlink_metadata(bin_path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(LpmError::Io(e)),
+    };
+    if meta.is_symlink() && !bin_path.exists() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let target_meta = std::fs::metadata(bin_path).map_err(LpmError::Io)?;
+        Ok(target_meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(true)
+    }
 }
 
 // ─── Step 3: commit under .tx.lock ───────────────────────────────────
@@ -1676,6 +1733,17 @@ pub(crate) fn apply_ownership_change_to_manifest(
     }
 }
 
+fn rollback_after_install_failure(
+    root: &LpmRoot,
+    prep: &PrepResult,
+    reason: &str,
+) -> Result<(), LpmError> {
+    with_exclusive_lock(root.global_tx_lock(), || {
+        let mut manifest = read_for(root)?;
+        rollback_aborted_commit(root, &mut manifest, prep, reason, &[])
+    })
+}
+
 /// Roll back a transaction that reached commit_locked but failed
 /// validation (collision, future failure modes). Mirrors recover.rs's
 /// roll_back semantics from the user-facing call site so the on-disk
@@ -2395,6 +2463,33 @@ mod tests {
         let mut cmds = discover_bin_commands(tmp.path(), "typescript").unwrap();
         cmds.sort();
         assert_eq!(cmds, vec!["tsc", "tsserver"]);
+    }
+
+    #[test]
+    fn discover_materialized_bin_commands_uses_actual_bin_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        tmp_pkg_json(
+            tmp.path(),
+            "tool",
+            serde_json::json!({
+                "good": "./bin/good.js",
+                "../escape": "./bin/escape.js",
+                "missing": "./bin/missing.js",
+            }),
+        );
+        let bin_dir = tmp.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let good = bin_dir.join("good");
+        std::fs::write(&good, b"#!/bin/sh\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let commands = discover_materialized_bin_commands(tmp.path(), "tool").unwrap();
+
+        assert_eq!(commands, vec!["good"]);
     }
 
     #[test]
