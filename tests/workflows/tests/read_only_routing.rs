@@ -240,3 +240,44 @@ async fn search_json_routes_query_through_project_npmrc_registry() {
         vec![Some(format!("Bearer {TOKEN}"))]
     );
 }
+
+#[tokio::test]
+async fn search_human_banner_names_project_npmrc_registry() {
+    let project = TempProject::empty(r#"{"name":"read-only-routing","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    write_project_npmrc(&project, &mock.url());
+    mount_auth_required_npm_search(&mock, PACKAGE_NAME, 20).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env_remove("LPM_NPM_ROUTE")
+        .env_remove("LPM_TOKEN")
+        .args(["search", PACKAGE_NAME])
+        .output()
+        .expect("failed to run lpm search");
+
+    assert!(
+        output.status.success(),
+        "lpm search must honor project .npmrc routing; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("› Searching 127.0.0.1 for \"lodash.merge\""),
+        "search banner must name the routed custom registry, got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Searching lpm.dev for \"lodash.merge\""),
+        "npm/custom search banner must not claim lpm.dev, got:\n{combined}"
+    );
+
+    assert_eq!(
+        received_auth_headers(&mock).await,
+        vec![Some(format!("Bearer {TOKEN}"))]
+    );
+}

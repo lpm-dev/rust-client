@@ -11,7 +11,7 @@ use lpm_runner::lpm_json::NpmPublishConfig;
 use std::time::Duration;
 
 /// Default npm registry URL.
-const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
+pub(crate) const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
 
 /// Result of a single registry publish attempt.
 #[derive(Debug)]

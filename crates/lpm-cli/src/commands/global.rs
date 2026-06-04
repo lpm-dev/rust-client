@@ -13,6 +13,7 @@ use lpm_global::{
     GlobalManifest, PackageEntry, PackageSource, Shim, artifacts_complete, emit_shim,
     find_command_collisions, remove_shim,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const LOCAL_LINK_SPEC_PREFIX: &str = "link:";
@@ -27,9 +28,7 @@ pub enum GlobalCmd {
     List {
         /// Compare each install's resolved version against the registry
         /// and flag packages with newer versions available under the
-        /// persisted `saved_spec`. Uses batch metadata so large global
-        /// manifests can be checked without one registry round-trip per
-        /// package.
+        /// persisted `saved_spec`.
         #[arg(long)]
         outdated: bool,
 
@@ -158,13 +157,6 @@ fn run_list(
 /// version against the highest version the registry exposes under the
 /// package's persisted `saved_spec`. Report packages whose registry
 /// has something newer.
-///
-/// Optimization: uses `RegistryClient::batch_metadata` so the whole
-/// manifest fits in 1-3 HTTP round-trips regardless of how many
-/// packages are globally installed. Individual `get_package_metadata`
-/// calls per package would be N round-trips; the batch endpoint is
-/// the right shape for the "list everything outdated" query.
-///
 /// Schema: each outdated row carries (current, latest) versions + the
 /// saved_spec used for comparison. The caller can pipe `--json` output
 /// into a script that auto-runs `lpm global update <pkg>` for each
@@ -199,22 +191,21 @@ async fn run_list_outdated(
         return Ok(());
     }
 
-    let local_links: Vec<String> = manifest
-        .packages
-        .iter()
-        .filter_map(|(name, entry)| {
-            (entry.source == PackageSource::LocalLink).then_some(name.clone())
-        })
-        .collect();
-    let names: Vec<String> = manifest
-        .packages
-        .iter()
-        .filter_map(|(name, entry)| {
-            (entry.source != PackageSource::LocalLink).then_some(name.clone())
-        })
-        .collect();
+    let package_count = manifest.packages.len();
+    let mut local_links = Vec::with_capacity(package_count);
+    let mut lpm_names = Vec::with_capacity(package_count);
+    let mut npm_names = Vec::with_capacity(package_count);
+    for (name, entry) in &manifest.packages {
+        match entry.source {
+            PackageSource::LocalLink => local_links.push(name.clone()),
+            _ if lpm_common::package_name::is_lpm_package(name) => {
+                lpm_names.push(name.clone());
+            }
+            _ => npm_names.push(name.clone()),
+        }
+    }
 
-    if names.is_empty() {
+    if lpm_names.is_empty() && npm_names.is_empty() {
         if json_output {
             println!(
                 "{}",
@@ -239,50 +230,37 @@ async fn run_list_outdated(
         return Ok(());
     }
 
-    // Single batch call covers every globally-installed package.
-    //
-    // Accepted-posture trade-off (L41): the batch endpoint is called
-    // with every package name regardless of `entry.source`. That means
-    // an `upstream-npm` row's name is included in the POST body to the
-    // configured LPM registry, not routed through the npm-specific
-    // `get_npm_package_metadata` proxy/public-fallback path the
-    // install/update flows use.
-    //
-    // Why this is intentional for this surface:
-    //
-    //   1. The LPM Worker batch endpoint is the canonical metadata
-    //      service for both `LpmDev` and `UpstreamNpm` source kinds —
-    //      it transparently proxies npm metadata via the same `dist`
-    //      shape, which is exactly what `pick_latest_matching` expects.
-    //
-    //   2. Private-name disclosure checks are enforced at project-lockfile
-    //      command surfaces that may otherwise contact npm metadata
-    //      endpoints. Global installs already route through the
-    //      configured LPM endpoint, which is the authorized destination
-    //      for this batch call.
-    //
-    //   3. Splitting by source here would replace one batch call with
-    //      N per-package round-trips through `get_npm_package_metadata`,
-    //      and the operator's manifest can easily contain 50+ globals.
-    //      For a diagnostic surface, the latency cost is not worth the
-    //      negligible privacy delta over the existing LPM-proxy
-    //      relationship.
-    //
-    // Future hardening: if a user opts into a strict-routing mode where
-    // npm metadata must never traverse the LPM proxy, this is the site
-    // to honor it — split `names` by `entry.source`, dispatch
-    // `LpmDev` to `batch_metadata`, `UpstreamNpm` to
-    // `get_npm_package_metadata`, and merge the results. Today's
-    // posture is "the LPM batch endpoint is the canonical metadata
-    // service for this diagnostic."
-    let metadata = match client.batch_metadata(&names).await {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(LpmError::Script(format!(
-                "batch metadata fetch failed — cannot compute outdated: {e}"
-            )));
+    let mut metadata: HashMap<String, lpm_registry::PackageMetadata> =
+        HashMap::with_capacity(lpm_names.len() + npm_names.len());
+    let mut metadata_errors: HashMap<String, String> = HashMap::new();
+
+    if !lpm_names.is_empty() {
+        match client.batch_metadata(&lpm_names).await {
+            Ok(batch) => metadata.extend(batch),
+            Err(e) => {
+                return Err(LpmError::Script(format!(
+                    "batch metadata fetch failed — cannot compute outdated: {e}"
+                )));
+            }
         }
-    };
+    }
+
+    let npm_fetches = npm_names.iter().map(|name| async move {
+        (
+            name.clone(),
+            client.get_npm_package_metadata(name.as_str()).await,
+        )
+    });
+    for (name, result) in futures::future::join_all(npm_fetches).await {
+        match result {
+            Ok(package_metadata) => {
+                metadata.insert(name, package_metadata);
+            }
+            Err(error) => {
+                metadata_errors.insert(name, error.to_string());
+            }
+        }
+    }
 
     let mut outdated: Vec<OutdatedRow> = Vec::new();
     let mut up_to_date: Vec<String> = Vec::new();
@@ -295,7 +273,9 @@ async fn run_list_outdated(
         let Some(meta) = metadata.get(name) else {
             unresolved.push(UnresolvedRow {
                 package: name.clone(),
-                reason: "no registry metadata returned for this package".into(),
+                reason: metadata_errors.get(name).cloned().unwrap_or_else(|| {
+                    "no registry metadata returned for this package".to_string()
+                }),
             });
             continue;
         };
@@ -371,9 +351,8 @@ fn pick_latest_matching(
     if let Some(v) = meta.dist_tags.get(saved_spec) {
         return Ok(v.clone());
     }
-    // Exact version: verify the registry still serves it (L42). A
-    // yanked / deleted / tampered pin should surface as `unresolved`,
-    // not silently reported up-to-date.
+    // Exact pins that disappeared upstream should surface as unresolved,
+    // not silently report up-to-date.
     if lpm_semver::Version::parse(saved_spec).is_ok() {
         if meta.versions.contains_key(saved_spec) {
             return Ok(saved_spec.to_string());
@@ -420,10 +399,6 @@ fn pick_absolute_latest(meta: &lpm_registry::PackageMetadata) -> Option<String> 
             .map(|v| v.to_string())
     })
 }
-
-// Step 6 fix: removed `build_registry` — all callers now
-// receive the injected `&RegistryClient` from `main.rs` so the
-// `--registry` flag and the shared `SessionManager` are honored.
 
 fn emit_outdated_json(
     outdated: &[OutdatedRow],
@@ -1612,22 +1587,18 @@ mod tests {
         assert_eq!(pick_latest_matching(&meta, "9.24.0").unwrap(), "9.24.0");
     }
 
-    /// L42: an exact pin the registry no longer serves (yanked / deleted /
-    /// tampered) must surface as `unresolved`. Pre-fix `pick_latest_matching`
-    /// returned `Ok(saved_spec)` verbatim and `lpm global list --outdated`
-    /// reported the package as up-to-date because `latest == entry.resolved`,
-    /// which masked a real supply-chain or registry-state signal.
+    /// An exact pin the registry no longer serves must surface as `unresolved`.
     #[test]
     fn pick_latest_matching_exact_version_missing_from_registry_surfaces_as_unresolved() {
         let meta = fake_metadata("eslint", &["9.23.0", "9.24.0"], &[]);
         let err = pick_latest_matching(&meta, "100.0.0").unwrap_err();
         assert!(
             err.contains("registry no longer serves"),
-            "L42: missing exact pin must surface a 'no longer served' message; got: {err}"
+            "missing exact pin must surface a 'no longer served' message; got: {err}"
         );
         assert!(
             err.contains("100.0.0"),
-            "L42: error must name the missing version; got: {err}"
+            "error must name the missing version; got: {err}"
         );
     }
 

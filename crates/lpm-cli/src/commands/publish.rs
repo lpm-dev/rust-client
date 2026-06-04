@@ -63,6 +63,53 @@ pub struct PublishResult {
     pub duration: std::time::Duration,
 }
 
+/// Local package artifact prepared for publish-like uploads.
+pub(crate) struct PublishProject {
+    pub(crate) package_json_path: std::path::PathBuf,
+    pub(crate) pkg_json: serde_json::Value,
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) publish_config: Option<lpm_json::PublishConfig>,
+    pub(crate) readme: Option<String>,
+    pub(crate) tarball_data: Vec<u8>,
+    pub(crate) tarball_files: Vec<TarballFile>,
+    pub(crate) tarball_size: usize,
+    pub(crate) detected_ecosystem: String,
+    pub(crate) swift_manifest: Option<serde_json::Value>,
+}
+
+pub(crate) struct ProvenanceContext {
+    ci: oidc::CiEnvironment,
+    jwt: String,
+}
+
+pub(crate) struct NpmTargetArtifact {
+    pub(crate) tarball_data: Vec<u8>,
+    pub(crate) version_data: serde_json::Value,
+}
+
+pub(crate) struct PublishQualityGateInput<'a> {
+    pub(crate) pkg_json: &'a serde_json::Value,
+    pub(crate) readme: Option<&'a str>,
+    pub(crate) project_dir: &'a Path,
+    pub(crate) tarball_files: &'a [TarballFile],
+    pub(crate) detected_ecosystem: &'a str,
+    pub(crate) swift_manifest: Option<&'a serde_json::Value>,
+    pub(crate) min_score: Option<u32>,
+    pub(crate) json_output: bool,
+}
+
+pub(crate) struct NpmTargetArtifactInput<'a> {
+    pub(crate) package_json_name: &'a str,
+    pub(crate) npm_name: &'a str,
+    pub(crate) version: &'a str,
+    pub(crate) base_version_data: &'a serde_json::Value,
+    pub(crate) base_tarball_data: &'a [u8],
+    pub(crate) provenance_context: Option<&'a ProvenanceContext>,
+    pub(crate) target_label: &'a str,
+    pub(crate) json_output: bool,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum SecretScanLine {
     Warn(String),
@@ -204,6 +251,234 @@ fn deduplicate_targets(targets: Vec<PublishTarget>) -> Vec<PublishTarget> {
         .collect()
 }
 
+pub(crate) fn prepare_publish_project(project_dir: &Path) -> Result<PublishProject, LpmError> {
+    let package_json_path = project_dir.join("package.json");
+    if !package_json_path.exists() {
+        return Err(LpmError::NotFound(
+            "no package.json found in current directory".to_string(),
+        ));
+    }
+
+    let content = std::fs::read_to_string(&package_json_path)?;
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
+
+    let name = pkg_json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LpmError::Registry("package.json missing \"name\"".into()))?
+        .to_string();
+
+    let version = pkg_json
+        .get("version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LpmError::Registry("package.json missing \"version\"".into()))?
+        .to_string();
+
+    let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Registry)?;
+    let publish_config = lpm_config.and_then(|c| c.publish);
+    let readme = publish_common::read_readme(project_dir);
+    let (mut tarball_data, tarball_files) = publish_common::create_tarball(project_dir, &pkg_json)?;
+
+    let workspace = lpm_workspace::discover_workspace(project_dir)
+        .ok()
+        .flatten();
+    if let Some(ref ws) = workspace {
+        tarball_data = publish_common::rewrite_workspace_deps_in_tarball(&tarball_data, ws)?;
+    }
+
+    let tarball_size = tarball_data.len();
+    if tarball_size > 500 * 1024 * 1024 {
+        return Err(LpmError::Registry(format!(
+            "tarball too large: {} (max 500MB)",
+            lpm_common::format_bytes(tarball_size as u64)
+        )));
+    }
+
+    let (detected_ecosystem, swift_manifest) = detect_publish_ecosystem(project_dir);
+
+    Ok(PublishProject {
+        package_json_path,
+        pkg_json,
+        name,
+        version,
+        publish_config,
+        readme,
+        tarball_data,
+        tarball_files,
+        tarball_size,
+        detected_ecosystem,
+        swift_manifest,
+    })
+}
+
+fn detect_publish_ecosystem(project_dir: &Path) -> (String, Option<serde_json::Value>) {
+    let mut detected_ecosystem = "js".to_string();
+    let lpm_config_path = project_dir.join("lpm.config.json");
+    if lpm_config_path.exists()
+        && let Ok(config_str) = std::fs::read_to_string(&lpm_config_path)
+        && let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str)
+        && let Some(eco) = config.get("ecosystem").and_then(|v| v.as_str())
+    {
+        detected_ecosystem = eco.to_string();
+    }
+    if project_dir.join("Package.swift").exists() && detected_ecosystem == "js" {
+        detected_ecosystem = "swift".to_string();
+    }
+
+    let swift_manifest = if detected_ecosystem == "swift" {
+        std::process::Command::new("swift")
+            .args(["package", "dump-package"])
+            .current_dir(project_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+    } else {
+        None
+    };
+
+    (detected_ecosystem, swift_manifest)
+}
+
+pub(crate) fn run_publish_secret_scan(
+    project_dir: &Path,
+    json_output: bool,
+    allow_secrets: bool,
+) -> Result<(), LpmError> {
+    if allow_secrets {
+        return Ok(());
+    }
+
+    let secret_scan = lpm_security::behavioral::secrets::scan_directory(project_dir);
+    if secret_scan.has_secrets() {
+        if json_output {
+            println!("{}", secret_scan_json(&secret_scan));
+        } else {
+            emit_secret_scan_human(&secret_scan);
+        }
+        return Err(LpmError::ExitCode(1));
+    }
+    if !json_output {
+        install_ui::done("Secret scan passed");
+    }
+    Ok(())
+}
+
+pub(crate) fn run_publish_quality_gate(
+    input: PublishQualityGateInput<'_>,
+) -> Result<quality::QualityResult, LpmError> {
+    let file_names: Vec<String> = input.tarball_files.iter().map(|f| f.path.clone()).collect();
+    let result = quality::run_quality_checks(
+        input.pkg_json,
+        input.readme,
+        input.project_dir,
+        &file_names,
+        input.detected_ecosystem,
+        input.swift_manifest,
+    );
+
+    if !input.json_output {
+        print_publish_quality_result(&result);
+    }
+
+    if let Some(min) = input.min_score
+        && result.score < min
+    {
+        return Err(LpmError::Registry(format!(
+            "quality score {} is below minimum {} (use --min-score to adjust)",
+            result.score, min
+        )));
+    }
+
+    Ok(result)
+}
+
+pub(crate) fn build_publish_version_data(
+    pkg_json: &serde_json::Value,
+    name: &str,
+    version: &str,
+    readme: Option<&str>,
+    tarball_data: &[u8],
+) -> serde_json::Value {
+    let hashes = publish_common::compute_hashes(tarball_data);
+    let mut version_data = pkg_json.clone();
+    version_data["_id"] = serde_json::json!(format!("{name}@{version}"));
+    if let Some(readme_text) = readme {
+        version_data["readme"] = serde_json::json!(readme_text);
+    }
+    version_data["dist"] = serde_json::json!({
+        "shasum": hashes.shasum,
+        "integrity": hashes.integrity,
+    });
+    version_data
+}
+
+pub(crate) async fn resolve_provenance_context(
+    provenance_flag: bool,
+) -> Result<Option<ProvenanceContext>, LpmError> {
+    if !provenance_flag {
+        return Ok(None);
+    }
+
+    let (ci, jwt) = oidc::resolve_provenance_jwt().await?;
+    Ok(Some(ProvenanceContext { ci, jwt }))
+}
+
+pub(crate) async fn prepare_npm_target_artifact(
+    input: NpmTargetArtifactInput<'_>,
+) -> Result<NpmTargetArtifact, LpmError> {
+    let tarball_data = if input.npm_name != input.package_json_name {
+        publish_common::rewrite_tarball_name(
+            input.base_tarball_data,
+            input.package_json_name,
+            input.npm_name,
+        )?
+    } else {
+        input.base_tarball_data.to_vec()
+    };
+
+    let mut version_data = input.base_version_data.clone();
+    if let Some(context) = input.provenance_context {
+        let final_hashes = publish_common::compute_hashes(&tarball_data);
+        let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
+        let slsa = provenance::build_slsa_statement(
+            &context.ci,
+            input.npm_name,
+            input.version,
+            &sha512_hex,
+        );
+        let slsa_json = serde_json::to_vec(&slsa)
+            .map_err(|e| LpmError::Registry(format!("failed to serialize SLSA statement: {e}")))?;
+
+        let bundle = sigstore::sign_and_record(&context.jwt, &slsa_json)
+            .await
+            .map_err(|e| {
+                LpmError::Registry(format!(
+                    "Sigstore provenance failed: {e}. \
+                     Publish aborted because --provenance requires successful provenance generation."
+                ))
+            })?;
+
+        if !input.json_output {
+            install_ui::done(&format!(
+                "Sigstore provenance generated for {} → Rekor",
+                input.target_label
+            ));
+        }
+        let bundle_json = serde_json::to_value(&bundle).unwrap_or_default();
+        version_data["_provenance"] = bundle_json.clone();
+        version_data["_npmProvenanceAttestations"] = bundle_json;
+    }
+
+    Ok(NpmTargetArtifact {
+        tarball_data,
+        version_data,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &RegistryClient,
@@ -223,31 +498,20 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let publish_started = std::time::Instant::now();
 
-    // Step 1: Read package.json
-    let pkg_json_path = project_dir.join("package.json");
-    if !pkg_json_path.exists() {
-        return Err(LpmError::NotFound(
-            "no package.json found in current directory".to_string(),
-        ));
-    }
-
-    let content = std::fs::read_to_string(&pkg_json_path)?;
-    let pkg_json: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
-
-    let name = pkg_json
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| LpmError::Registry("package.json missing \"name\"".into()))?;
-
-    let version = pkg_json
-        .get("version")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| LpmError::Registry("package.json missing \"version\"".into()))?;
-
-    // Step 1b: Read lpm.json for publish config
-    let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Registry)?;
-    let publish_config = lpm_config.as_ref().and_then(|c| c.publish.as_ref());
+    let PublishProject {
+        package_json_path: pkg_json_path,
+        pkg_json,
+        name,
+        version,
+        publish_config,
+        readme,
+        tarball_data,
+        tarball_files,
+        tarball_size,
+        detected_ecosystem,
+        swift_manifest,
+    } = prepare_publish_project(project_dir)?;
+    let publish_config = publish_config.as_ref();
 
     // Resolve target registries
     let targets = resolve_targets(
@@ -310,14 +574,14 @@ pub async fn run(
                 // npm: config override → package.json name. Reject @lpm.dev/.
                 npm_config
                     .and_then(|c| c.name.clone())
-                    .map_or_else(|| publish_npm::resolve_npm_name(name, None), Ok)?
+                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?
             }
             PublishTarget::GitHub => {
                 // GitHub: config override → npm config → package.json. Must be scoped.
                 let gh_name = github_config
                     .and_then(|c| c.name.clone())
                     .or_else(|| npm_config.and_then(|c| c.name.clone()))
-                    .map_or_else(|| publish_npm::resolve_npm_name(name, None), Ok)?;
+                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?;
                 if !gh_name.starts_with('@') {
                     return Err(LpmError::Registry(
                         "GitHub Packages requires scoped package names (@owner/package). \
@@ -332,113 +596,32 @@ pub async fn run(
                 gitlab_config
                     .and_then(|c| c.name.clone())
                     .or_else(|| npm_config.and_then(|c| c.name.clone()))
-                    .map_or_else(|| publish_npm::resolve_npm_name(name, None), Ok)?
+                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?
             }
             PublishTarget::Custom(_) => {
                 // Custom: npm config → package.json.
                 npm_config
                     .and_then(|c| c.name.clone())
-                    .map_or_else(|| publish_npm::resolve_npm_name(name, None), Ok)?
+                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?
             }
         };
         target_names.insert(target.key(), resolved);
     }
 
-    // Step 2: Read README
-    let readme = publish_common::read_readme(project_dir);
-
-    // Step 3: Create tarball (silent — messages print after quality checks)
-    let (mut tarball_data, tarball_files) = publish_common::create_tarball(project_dir, &pkg_json)?;
-
-    // Step 3a: Rewrite workspace:/catalog: protocols in tarball before hashing.
-    // Monorepo packages contain "workspace:*" in deps which registries can't resolve.
-    let workspace = lpm_workspace::discover_workspace(project_dir)
-        .ok()
-        .flatten();
-    if let Some(ref ws) = workspace {
-        tarball_data = publish_common::rewrite_workspace_deps_in_tarball(&tarball_data, ws)?;
-    }
-
-    let tarball_size = tarball_data.len();
-    if tarball_size > 500 * 1024 * 1024 {
-        return Err(LpmError::Registry(format!(
-            "tarball too large: {} (max 500MB)",
-            lpm_common::format_bytes(tarball_size as u64)
-        )));
-    }
-
-    // Step 3b: Detect ecosystem (needed before quality checks)
-    let mut detected_ecosystem = "js".to_string();
-    let lpm_config_path = project_dir.join("lpm.config.json");
-    if lpm_config_path.exists()
-        && let Ok(config_str) = std::fs::read_to_string(&lpm_config_path)
-        && let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str)
-        && let Some(eco) = config.get("ecosystem").and_then(|v| v.as_str())
-    {
-        detected_ecosystem = eco.to_string();
-    }
-    if project_dir.join("Package.swift").exists() && detected_ecosystem == "js" {
-        detected_ecosystem = "swift".to_string();
-    }
-
-    // Step 3c: Extract Swift manifest for quality scoring (if Swift)
-    let swift_manifest = if detected_ecosystem == "swift" {
-        std::process::Command::new("swift")
-            .args(["package", "dump-package"])
-            .current_dir(project_dir)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
-    } else {
-        None
-    };
-
-    // Step 3d: Pre-publish secret scan
-    if !allow_secrets {
-        let secret_scan = lpm_security::behavioral::secrets::scan_directory(project_dir);
-        if secret_scan.has_secrets() {
-            if json_output {
-                println!("{}", secret_scan_json(&secret_scan));
-            } else {
-                emit_secret_scan_human(&secret_scan);
-            }
-            return Err(LpmError::ExitCode(1));
-        }
-        if !json_output {
-            install_ui::done("Secret scan passed");
-        }
-    }
+    run_publish_secret_scan(project_dir, json_output, allow_secrets)?;
 
     // Step 4: Quality checks (LPM target only — A7)
     let quality_result = if targets_lpm {
-        let file_names: Vec<String> = tarball_files.iter().map(|f| f.path.clone()).collect();
-        let qr = quality::run_quality_checks(
-            &pkg_json,
-            readme.as_deref(),
+        Some(run_publish_quality_gate(PublishQualityGateInput {
+            pkg_json: &pkg_json,
+            readme: readme.as_deref(),
             project_dir,
-            &file_names,
-            &detected_ecosystem,
-            swift_manifest.as_ref(),
-        );
-
-        if !json_output {
-            print_publish_quality_result(&qr);
-        }
-
-        // Enforce --min-score if provided
-        if let Some(min) = min_score
-            && qr.score < min
-        {
-            return Err(LpmError::Registry(format!(
-                "quality score {} is below minimum {} (use --min-score to adjust)",
-                qr.score, min
-            )));
-        }
-
-        Some(qr)
+            tarball_files: &tarball_files,
+            detected_ecosystem: &detected_ecosystem,
+            swift_manifest: swift_manifest.as_ref(),
+            min_score,
+            json_output,
+        })?)
     } else {
         None
     };
@@ -512,7 +695,7 @@ pub async fn run(
     let oidc_swapped_client;
     let client: &RegistryClient =
         if targets_lpm && !check_only && oidc::registry_exchange_jwt_available() {
-            match oidc::exchange_oidc_token(client.base_url(), Some(name), "publish").await {
+            match oidc::exchange_oidc_token(client.base_url(), Some(&name), "publish").await {
                 Ok(oidc_token) => {
                     oidc_swapped_client = client.clone_with_config().with_token(oidc_token.token);
                     if !json_output {
@@ -537,7 +720,7 @@ pub async fn run(
     // identical to the previously published version") is part of the
     // LPM-side preflight a dry-run is meant to surface.
     if has_skills && targets_lpm && !check_only {
-        let name_short = name.strip_prefix("@lpm.dev/").unwrap_or(name);
+        let name_short = name.strip_prefix("@lpm.dev/").unwrap_or(&name);
         match client.get_skills(name_short, None).await {
             Ok(prev) if !prev.skills.is_empty() => {
                 let local_digest = compute_skills_digest(&skills_dir);
@@ -593,8 +776,8 @@ pub async fn run(
             }
 
             let summary = DryRunSummary {
-                name,
-                version,
+                name: &name,
+                version: &version,
                 target_names: &target_names,
                 file_count: tarball_files.len(),
                 tarball_size,
@@ -637,30 +820,9 @@ pub async fn run(
         }
     }
 
-    // Step 7: Compute hashes from original tarball (used as base for version_data)
-    let hashes = publish_common::compute_hashes(&tarball_data);
-
-    // Step 8: Build version data (shared base for LPM payload)
-    let mut version_data = pkg_json.clone();
-    version_data["_id"] = serde_json::json!(format!("{name}@{version}"));
-    if let Some(readme_text) = &readme {
-        version_data["readme"] = serde_json::json!(readme_text);
-    }
-    version_data["dist"] = serde_json::json!({
-        "shasum": hashes.shasum,
-        "integrity": hashes.integrity,
-    });
-
-    // Step 8b: Prepare OIDC JWT for Sigstore provenance (if --provenance).
-    // Resolved once and reused per target — provenance is generated per-target
-    // after tarball rewriting so the SHA-512 in the SLSA statement matches the
-    // bytes actually uploaded.
-    let provenance_context = if provenance_flag {
-        let (ci, jwt) = oidc::resolve_provenance_jwt().await?;
-        Some((ci, jwt))
-    } else {
-        None
-    };
+    let version_data =
+        build_publish_version_data(&pkg_json, &name, &version, readme.as_deref(), &tarball_data);
+    let provenance_context = resolve_provenance_context(provenance_flag).await?;
 
     // Sequential publish to each target registry (B1)
     // All per-target errors are caught and collected — the loop NEVER aborts early.
@@ -673,12 +835,11 @@ pub async fn run(
             PublishTarget::Lpm => {
                 // Wrap the entire LPM publish path so any error becomes a PublishResult
                 let lpm_result: Result<serde_json::Value, LpmError> = async {
-                    let lpm_name =
-                        target_names.get("lpm").map_or(name, |s| s.as_str());
+                    let lpm_name = target_names.get("lpm").map_or(name.as_str(), |s| s.as_str());
 
                     // Rewrite tarball if LPM name differs from package.json name
-                    let lpm_tarball = if lpm_name != name {
-                        publish_common::rewrite_tarball_name(&tarball_data, name, lpm_name)?
+                    let lpm_tarball = if lpm_name != name.as_str() {
+                        publish_common::rewrite_tarball_name(&tarball_data, &name, lpm_name)?
                     } else {
                         tarball_data.clone()
                     };
@@ -686,7 +847,7 @@ pub async fn run(
                     // Recompute dist hashes from the final rewritten tarball so metadata
                     // matches the actual uploaded artifact (not the pre-rewrite original).
                     let mut lpm_version_data = version_data.clone();
-                    if lpm_name != name {
+                    if lpm_name != name.as_str() {
                         let lpm_hashes = publish_common::compute_hashes(&lpm_tarball);
                         lpm_version_data["dist"] = serde_json::json!({
                             "shasum": lpm_hashes.shasum,
@@ -695,15 +856,20 @@ pub async fn run(
                     }
 
                     // Generate per-target provenance from the final rewritten tarball
-                    if let Some((ref ci, ref jwt)) = provenance_context {
+                    if let Some(ref context) = provenance_context {
                         let final_hashes = publish_common::compute_hashes(&lpm_tarball);
                         let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
-                        let slsa = provenance::build_slsa_statement(ci, lpm_name, version, &sha512_hex);
+                        let slsa = provenance::build_slsa_statement(
+                            &context.ci,
+                            lpm_name,
+                            &version,
+                            &sha512_hex,
+                        );
                         let slsa_json = serde_json::to_vec(&slsa)
                             .map_err(|e| LpmError::Registry(format!("failed to serialize SLSA statement: {e}")))?;
 
                         // --provenance is strict: fail if Sigstore fails
-                        let bundle = sigstore::sign_and_record(jwt, &slsa_json).await
+                        let bundle = sigstore::sign_and_record(&context.jwt, &slsa_json).await
                             .map_err(|e| LpmError::Registry(format!(
                                 "Sigstore provenance failed: {e}. \
                                  Publish aborted because --provenance requires successful provenance generation."
@@ -721,7 +887,7 @@ pub async fn run(
                         print_upload_phase(
                             "lpm.dev",
                             lpm_name,
-                            version,
+                            &version,
                             lpm_visibility(&pkg_json),
                             "latest",
                         );
@@ -731,7 +897,7 @@ pub async fn run(
                         client,
                         project_dir,
                         lpm_name,
-                        version,
+                        &version,
                         &readme,
                         &lpm_tarball,
                         &tarball_files,
@@ -746,7 +912,9 @@ pub async fn run(
                 .await;
 
                 let duration = start.elapsed();
-                let lpm_name = target_names.get("lpm").map_or(name, |s| s.as_str());
+                let lpm_name = target_names
+                    .get("lpm")
+                    .map_or(name.as_str(), |s| s.as_str());
                 match lpm_result {
                     Ok(resp) => {
                         if !json_output {
@@ -896,7 +1064,7 @@ pub async fn run(
                         print_upload_phase(
                             display,
                             npm_name_str,
-                            version,
+                            &version,
                             visibility_from_access(&npm_access),
                             &npm_tag,
                         );
@@ -914,54 +1082,24 @@ pub async fn run(
                         .unwrap_or(false)
                         || auth::is_otp_required(registry_key_for_otp);
 
-                    // Rewrite tarball name if needed
-                    let target_tarball = if npm_name_str != name {
-                        publish_common::rewrite_tarball_name(&tarball_data, name, npm_name_str)?
-                    } else {
-                        tarball_data.clone()
-                    };
-
-                    // Generate per-target provenance from the final rewritten tarball
-                    let mut target_version_data = version_data.clone();
-                    if let Some((ref ci, ref jwt)) = provenance_context {
-                        let final_hashes = publish_common::compute_hashes(&target_tarball);
-                        let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
-                        let slsa = provenance::build_slsa_statement(
-                            ci,
-                            npm_name_str,
-                            version,
-                            &sha512_hex,
-                        );
-                        let slsa_json = serde_json::to_vec(&slsa).map_err(|e| {
-                            LpmError::Registry(format!(
-                                "failed to serialize SLSA statement: {e}"
-                            ))
-                        })?;
-
-                        // --provenance is strict: fail if Sigstore fails
-                        let bundle = sigstore::sign_and_record(jwt, &slsa_json).await
-                            .map_err(|e| LpmError::Registry(format!(
-                                "Sigstore provenance failed: {e}. \
-                                 Publish aborted because --provenance requires successful provenance generation."
-                            )))?;
-
-                        if !json_output {
-                            install_ui::done(&format!(
-                                "Sigstore provenance generated for {} → Rekor",
-                                display
-                            ));
-                        }
-                        let bundle_json = serde_json::to_value(&bundle).unwrap_or_default();
-                        target_version_data["_provenance"] = bundle_json.clone();
-                        target_version_data["_npmProvenanceAttestations"] = bundle_json;
-                    }
+                    let target_artifact = prepare_npm_target_artifact(NpmTargetArtifactInput {
+                        package_json_name: &name,
+                        npm_name: npm_name_str,
+                        version: &version,
+                        base_version_data: &version_data,
+                        base_tarball_data: &tarball_data,
+                        provenance_context: provenance_context.as_ref(),
+                        target_label: display,
+                        json_output,
+                    })
+                    .await?;
 
                     let npm_result = publish_npm::publish_to_npm(
                         &token,
                         npm_name_str,
-                        version,
-                        &target_version_data,
-                        &target_tarball,
+                        &version,
+                        &target_artifact.version_data,
+                        &target_artifact.tarball_data,
                         &npm_access,
                         &npm_tag,
                         &registry_url,
@@ -1076,7 +1214,7 @@ pub async fn run(
     } else if !any_failed {
         let target = &targets[0];
         let key = target.key();
-        let published_name = target_names.get(&key).map_or(name, |s| s.as_str());
+        let published_name = target_names.get(&key).map_or(name.as_str(), |s| s.as_str());
         let elapsed = install_ui::green(&install_ui::format_duration(publish_started.elapsed()));
         install_ui::done(&format!(
             "Done · published {} in {elapsed}",

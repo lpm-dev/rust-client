@@ -1,0 +1,274 @@
+---
+source: tests/workflows/tests/stage.rs
+expression: envelope
+---
+{
+  "success": true,
+  "dry_run": true,
+  "target": "npm",
+  "registry": "http://mock.registry",
+  "name": "@scope/staged-pkg",
+  "version": "1.0.0",
+  "tag": "latest",
+  "access": "public",
+  "files": 3,
+  "tarball_size": 289,
+  "quality": {
+    "score": 15,
+    "max_score": 100,
+    "checks": [
+      {
+        "id": "has-readme",
+        "category": "documentation",
+        "label": "Has README",
+        "passed": false,
+        "points": 0,
+        "max_points": 8,
+        "detail": "No README found"
+      },
+      {
+        "id": "readme-install",
+        "category": "documentation",
+        "label": "README has install section",
+        "passed": false,
+        "points": 0,
+        "max_points": 3,
+        "detail": "Add install/setup instructions to README"
+      },
+      {
+        "id": "readme-usage",
+        "category": "documentation",
+        "label": "README has usage examples",
+        "passed": false,
+        "points": 0,
+        "max_points": 3,
+        "detail": "Add usage examples or 2+ code blocks"
+      },
+      {
+        "id": "readme-api",
+        "category": "documentation",
+        "label": "README has API reference",
+        "passed": false,
+        "points": 0,
+        "max_points": 2
+      },
+      {
+        "id": "has-changelog",
+        "category": "documentation",
+        "label": "Has CHANGELOG",
+        "passed": false,
+        "points": 0,
+        "max_points": 3
+      },
+      {
+        "id": "has-license",
+        "category": "documentation",
+        "label": "Has license",
+        "passed": true,
+        "points": 3,
+        "max_points": 3
+      },
+      {
+        "id": "has-types",
+        "category": "code-quality",
+        "label": "Has TypeScript types",
+        "passed": false,
+        "points": 0,
+        "max_points": 8
+      },
+      {
+        "id": "esm-exports",
+        "category": "code-quality",
+        "label": "ESM exports",
+        "passed": false,
+        "points": 0,
+        "max_points": 3
+      },
+      {
+        "id": "tree-shakable",
+        "category": "code-quality",
+        "label": "Tree-shakeable",
+        "passed": false,
+        "points": 0,
+        "max_points": 3
+      },
+      {
+        "id": "has-exports-map",
+        "category": "code-quality",
+        "label": "Has exports map",
+        "passed": false,
+        "points": 0,
+        "max_points": 3
+      },
+      {
+        "id": "has-engines",
+        "category": "code-quality",
+        "label": "Has engines field",
+        "passed": false,
+        "points": 0,
+        "max_points": 1
+      },
+      {
+        "id": "small-deps",
+        "category": "code-quality",
+        "label": "Small dependency footprint",
+        "passed": true,
+        "points": 3,
+        "max_points": 3,
+        "detail": "0 dependencies"
+      },
+      {
+        "id": "source-maps",
+        "category": "code-quality",
+        "label": "Has source maps",
+        "passed": false,
+        "points": 0,
+        "max_points": 1
+      },
+      {
+        "id": "intellisense-coverage",
+        "category": "code-quality",
+        "label": "IntelliSense coverage",
+        "passed": false,
+        "points": 0,
+        "max_points": 4,
+        "detail": "Server verifies after upload",
+        "server_only": true
+      },
+      {
+        "id": "no-eval",
+        "category": "code-quality",
+        "label": "No eval() usage",
+        "passed": false,
+        "points": 0,
+        "max_points": 3,
+        "detail": "Server verifies after upload",
+        "server_only": true
+      },
+      {
+        "id": "has-test-files",
+        "category": "testing",
+        "label": "Has test files",
+        "passed": false,
+        "points": 0,
+        "max_points": 7
+      },
+      {
+        "id": "has-test-script",
+        "category": "testing",
+        "label": "Has test script",
+        "passed": false,
+        "points": 0,
+        "max_points": 4
+      },
+      {
+        "id": "has-description",
+        "category": "health",
+        "label": "Has description",
+        "passed": true,
+        "points": 3,
+        "max_points": 3
+      },
+      {
+        "id": "has-keywords",
+        "category": "health",
+        "label": "Has keywords",
+        "passed": false,
+        "points": 0,
+        "max_points": 1
+      },
+      {
+        "id": "has-repository",
+        "category": "health",
+        "label": "Has repository",
+        "passed": false,
+        "points": 0,
+        "max_points": 2
+      },
+      {
+        "id": "has-homepage",
+        "category": "health",
+        "label": "Has homepage",
+        "passed": false,
+        "points": 0,
+        "max_points": 1
+      },
+      {
+        "id": "no-lifecycle-scripts",
+        "category": "health",
+        "label": "No lifecycle scripts",
+        "passed": true,
+        "points": 2,
+        "max_points": 2
+      },
+      {
+        "id": "semver-consistency",
+        "category": "health",
+        "label": "SemVer consistency",
+        "passed": true,
+        "points": 4,
+        "max_points": 4
+      },
+      {
+        "id": "no-vulnerabilities",
+        "category": "health",
+        "label": "No known vulnerabilities",
+        "passed": false,
+        "points": 0,
+        "max_points": 5,
+        "detail": "Server verifies after upload",
+        "server_only": true
+      },
+      {
+        "id": "maintenance-health",
+        "category": "health",
+        "label": "Active maintenance",
+        "passed": false,
+        "points": 0,
+        "max_points": 4,
+        "detail": "Server verifies after upload",
+        "server_only": true
+      },
+      {
+        "id": "author-verified",
+        "category": "health",
+        "label": "Verified author",
+        "passed": false,
+        "points": 0,
+        "max_points": 3,
+        "detail": "Server verifies after upload",
+        "server_only": true
+      },
+      {
+        "id": "has-skills",
+        "category": "health",
+        "label": "Has Agent Skills",
+        "passed": false,
+        "points": 0,
+        "max_points": 7,
+        "detail": "Server verifies after upload",
+        "server_only": true
+      },
+      {
+        "id": "skills-comprehensive",
+        "category": "health",
+        "label": "Comprehensive Agent Skills",
+        "passed": false,
+        "points": 0,
+        "max_points": 3,
+        "detail": "Server verifies after upload",
+        "server_only": true
+      },
+      {
+        "id": "reasonable-size",
+        "category": "health",
+        "label": "Reasonable package size",
+        "passed": false,
+        "points": 0,
+        "max_points": 3,
+        "detail": "Server verifies after upload",
+        "server_only": true
+      }
+    ]
+  }
+}

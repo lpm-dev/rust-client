@@ -1,0 +1,591 @@
+mod support;
+
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use flate2::read::GzDecoder;
+use std::io::Read;
+use support::mock_registry::{MockRegistry, make_tarball};
+use support::{TempProject, lpm};
+use wiremock::matchers::{header, method, path, query_param};
+use wiremock::{Mock, ResponseTemplate};
+
+const STAGE_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+const NPM_TOKEN: &str = "stage-token";
+
+#[tokio::test]
+async fn stage_publish_posts_rewritten_payload_to_npm_stage_endpoint() {
+    let mock = MockRegistry::start().await;
+    mount_package_metadata(&mock, "@scope/staged-pkg", serde_json::json!({"0.9.0": {}})).await;
+    mount_stage_publish(&mock, "@scope/staged-pkg").await;
+    let project = stage_project();
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "--json",
+            "stage",
+            "publish",
+            "--yes",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage publish --json");
+
+    assert!(
+        output.status.success(),
+        "stage publish must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = parse_json(&output.stdout);
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["stageId"], serde_json::json!(STAGE_ID));
+
+    insta::with_settings!({ filters => stage_json_filters() }, {
+        insta::assert_json_snapshot!("stage_publish_json_envelope", envelope);
+    });
+
+    let payload = recorded_stage_publish_payload(&mock).await;
+    assert_eq!(payload["_id"], serde_json::json!("@scope/staged-pkg"));
+    assert_eq!(
+        payload["versions"]["1.0.0"]["name"],
+        serde_json::json!("@scope/staged-pkg")
+    );
+
+    let attachment = payload["_attachments"]
+        .as_object()
+        .and_then(|attachments| attachments.values().next())
+        .expect("stage payload must contain tarball attachment");
+    let tarball = BASE64
+        .decode(
+            attachment["data"]
+                .as_str()
+                .expect("tarball data must be base64"),
+        )
+        .expect("tarball data must decode");
+    let manifest = extract_package_json(&tarball);
+    assert_eq!(manifest["name"], serde_json::json!("@scope/staged-pkg"));
+}
+
+#[tokio::test]
+async fn stage_publish_preserves_provenance_fields_in_payload() {
+    let mock = MockRegistry::start().await;
+    mount_package_metadata(
+        &mock,
+        "@scope/provenance-pkg",
+        serde_json::json!({"0.9.0": {}}),
+    )
+    .await;
+    mount_stage_publish(&mock, "@scope/provenance-pkg").await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.provenance-pkg",
+        "version": "1.0.0",
+        "description": "A staged publish provenance package",
+        "main": "index.js",
+        "license": "MIT",
+        "_provenance": {"bundle": "kept"},
+        "_npmProvenanceAttestations": {"attestations": [{"bundle": {"kept": true}}]}
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"npm":{"name":"@scope/provenance-pkg"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "--json",
+            "stage",
+            "publish",
+            "--yes",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run provenance-preserving lpm stage publish");
+
+    assert!(
+        output.status.success(),
+        "stage publish must preserve provenance payload\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let payload = recorded_stage_publish_payload(&mock).await;
+    let version = &payload["versions"]["1.0.0"];
+    assert_eq!(
+        version["_provenance"],
+        serde_json::json!({"bundle": "kept"})
+    );
+    assert_eq!(
+        version["_npmProvenanceAttestations"],
+        serde_json::json!({"attestations": [{"bundle": {"kept": true}}]})
+    );
+}
+
+#[tokio::test]
+async fn stage_publish_dry_run_does_not_contact_npm_registry() {
+    let mock = MockRegistry::start().await;
+    let project = stage_project();
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "stage",
+            "publish",
+            "--dry-run",
+            "--yes",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage publish --dry-run --json");
+
+    assert!(
+        output.status.success(),
+        "stage publish dry-run must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = parse_json(&output.stdout);
+    assert_eq!(envelope["dry_run"], serde_json::json!(true));
+    insta::with_settings!({ filters => stage_json_filters() }, {
+        insta::assert_json_snapshot!("stage_publish_dry_run_json_envelope", envelope);
+    });
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "dry-run must not contact npm registry, got {} request(s)",
+        requests.len()
+    );
+}
+
+#[tokio::test]
+async fn stage_publish_blocks_implicit_latest_when_higher_version_exists() {
+    let mock = MockRegistry::start().await;
+    mount_package_metadata(&mock, "@scope/staged-pkg", serde_json::json!({"2.0.0": {}})).await;
+    let project = stage_project();
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args(["stage", "publish", "--yes", "--npm-registry", &mock.url()])
+        .output()
+        .expect("failed to run lpm stage publish");
+
+    assert!(
+        !output.status.success(),
+        "implicit latest guard must fail when a higher version exists"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Cannot implicitly apply the \"latest\" tag"),
+        "expected latest-tag guard, got:\n{stderr}"
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method.as_str() != "POST"),
+        "version guard must run before upload"
+    );
+}
+
+#[tokio::test]
+async fn stage_list_returns_json_envelope() {
+    let mock = MockRegistry::start().await;
+    mount_stage_list_page(&mock, 0, "pkg", vec![stage_item("a")], 1).await;
+    let project = TempProject::empty(r#"{"name":"stage-list","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "--json",
+            "stage",
+            "list",
+            "pkg",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage list --json");
+
+    assert!(
+        output.status.success(),
+        "stage list must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = parse_json(&output.stdout);
+    assert_eq!(envelope["total"], serde_json::json!(1));
+    insta::with_settings!({ filters => stage_json_filters() }, {
+        insta::assert_json_snapshot!("stage_list_json_envelope", envelope);
+    });
+}
+
+#[tokio::test]
+async fn stage_list_fetches_second_page_when_first_page_is_full() {
+    let mock = MockRegistry::start().await;
+    let first_page: Vec<_> = (0..100)
+        .map(|index| stage_item(&format!("page-a-{index}")))
+        .collect();
+    mount_stage_list_page(&mock, 0, "pkg", first_page, 101).await;
+    mount_stage_list_page(&mock, 1, "pkg", vec![stage_item("page-b")], 101).await;
+    let project = TempProject::empty(r#"{"name":"stage-list-pages","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "--json",
+            "stage",
+            "list",
+            "pkg",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run paginated lpm stage list --json");
+
+    assert!(
+        output.status.success(),
+        "paginated stage list must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = parse_json(&output.stdout);
+    assert_eq!(
+        envelope["data"]
+            .as_array()
+            .expect("data must be array")
+            .len(),
+        101
+    );
+}
+
+#[tokio::test]
+async fn stage_view_returns_json_envelope() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/-/stage/{STAGE_ID}")))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(stage_item(STAGE_ID)))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"stage-view","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "--json",
+            "stage",
+            "view",
+            STAGE_ID,
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage view --json");
+
+    assert!(output.status.success(), "stage view must succeed");
+    let envelope = parse_json(&output.stdout);
+    insta::with_settings!({ filters => stage_json_filters() }, {
+        insta::assert_json_snapshot!("stage_view_json_envelope", envelope);
+    });
+}
+
+#[tokio::test]
+async fn stage_approve_sends_otp_to_approve_endpoint() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/-/stage/{STAGE_ID}/approve")))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .and(header("npm-otp", "123456"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true
+        })))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"stage-approve","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "--json",
+            "stage",
+            "approve",
+            STAGE_ID,
+            "--otp",
+            "123456",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage approve --json");
+
+    assert!(output.status.success(), "stage approve must succeed");
+    let envelope = parse_json(&output.stdout);
+    insta::with_settings!({ filters => stage_json_filters() }, {
+        insta::assert_json_snapshot!("stage_approve_json_envelope", envelope);
+    });
+}
+
+#[tokio::test]
+async fn stage_reject_deletes_stage_endpoint_with_otp() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/-/stage/{STAGE_ID}")))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .and(header("npm-otp", "123456"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"stage-reject","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "--json",
+            "stage",
+            "reject",
+            STAGE_ID,
+            "--otp",
+            "123456",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage reject --json");
+
+    assert!(output.status.success(), "stage reject must succeed");
+    let envelope = parse_json(&output.stdout);
+    insta::with_settings!({ filters => stage_json_filters() }, {
+        insta::assert_json_snapshot!("stage_reject_json_envelope", envelope);
+    });
+}
+
+#[tokio::test]
+async fn stage_download_writes_tarball_named_from_manifest() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("@scope/staged-pkg", "1.0.0");
+    Mock::given(method("GET"))
+        .and(path(format!("/-/stage/{STAGE_ID}/tarball")))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"stage-download","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "--json",
+            "stage",
+            "download",
+            STAGE_ID,
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage download --json");
+
+    assert!(output.status.success(), "stage download must succeed");
+    let expected = project
+        .path()
+        .join(format!("scope-staged-pkg-1.0.0-{STAGE_ID}.tgz"));
+    assert!(
+        expected.exists(),
+        "downloaded tarball must exist at {expected:?}"
+    );
+    let envelope = parse_json(&output.stdout);
+    insta::with_settings!({ filters => vec![
+        (r#"http://127\.0\.0\.1:\d+"#, "http://mock.registry"),
+        (
+            r#""path":\s*"[^"]+scope-staged-pkg-1\.0\.0-123e4567-e89b-12d3-a456-426614174000\.tgz""#,
+            r#""path": "[PROJECT]/scope-staged-pkg-1.0.0-123e4567-e89b-12d3-a456-426614174000.tgz""#,
+        ),
+    ]}, {
+        insta::assert_json_snapshot!("stage_download_json_envelope", envelope);
+    });
+}
+
+#[test]
+fn stage_rejects_global_registry_flag() {
+    let project = TempProject::empty(r#"{"name":"stage-registry-flag","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["--registry", "https://lpm.example.test", "stage", "list"])
+        .output()
+        .expect("failed to run lpm stage list with --registry");
+
+    assert!(
+        !output.status.success(),
+        "stage must reject global --registry"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--npm-registry"),
+        "error must point users to --npm-registry, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn stage_publish_missing_npm_token_fails_before_upload() {
+    let project = stage_project();
+    let output = lpm(&project)
+        .args([
+            "stage",
+            "publish",
+            "--yes",
+            "--npm-registry",
+            "http://127.0.0.1:9",
+        ])
+        .output()
+        .expect("failed to run lpm stage publish without NPM_TOKEN");
+
+    assert!(
+        !output.status.success(),
+        "stage publish without npm token must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no npm token found"),
+        "expected missing npm token guidance, got:\n{stderr}"
+    );
+}
+
+fn stage_project() -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.staged-pkg",
+        "version": "1.0.0",
+        "description": "A staged publish test package",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"npm":{"name":"@scope/staged-pkg"}}}"#,
+    );
+    project
+}
+
+async fn mount_package_metadata(mock: &MockRegistry, package: &str, versions: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", encoded_package(package))))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "versions": versions
+        })))
+        .mount(mock.server())
+        .await;
+}
+
+async fn mount_stage_publish(mock: &MockRegistry, package: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/-/stage/package/{}",
+            encoded_package(package)
+        )))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .and(header("npm-command", "stage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "stageId": STAGE_ID
+        })))
+        .mount(mock.server())
+        .await;
+}
+
+async fn mount_stage_list_page(
+    mock: &MockRegistry,
+    page: u32,
+    package: &str,
+    items: Vec<serde_json::Value>,
+    total: u32,
+) {
+    Mock::given(method("GET"))
+        .and(path("/-/stage"))
+        .and(query_param("page", page.to_string()))
+        .and(query_param("perPage", "100"))
+        .and(query_param("package", package))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": items,
+            "total": total
+        })))
+        .mount(mock.server())
+        .await;
+}
+
+fn stage_item(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "packageName": "@scope/staged-pkg",
+        "version": "1.0.0",
+        "tag": "latest",
+        "createdAt": "2026-06-04T00:00:00.000Z",
+        "actor": "testuser",
+        "actorType": "user",
+        "shasum": "abc123"
+    })
+}
+
+fn parse_json(stdout: &[u8]) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(stdout).into_owned();
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stage JSON output must be valid JSON: {e}\n---\n{stdout}"))
+}
+
+fn extract_package_json(tarball: &[u8]) -> serde_json::Value {
+    let decoder = GzDecoder::new(tarball);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().expect("tarball entries must read") {
+        let mut entry = entry.expect("tarball entry must read");
+        if entry.path().expect("entry path must read")
+            == std::path::Path::new("package/package.json")
+        {
+            let mut content = String::new();
+            entry
+                .read_to_string(&mut content)
+                .expect("package.json entry must read");
+            return serde_json::from_str(&content).expect("package.json must parse");
+        }
+    }
+    panic!("tarball missing package/package.json");
+}
+
+async fn recorded_stage_publish_payload(mock: &MockRegistry) -> serde_json::Value {
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let publish_request = requests
+        .iter()
+        .find(|request| request.method.as_str() == "POST")
+        .expect("stage publish POST must be recorded");
+    serde_json::from_slice(&publish_request.body).expect("stage payload must be JSON")
+}
+
+fn stage_json_filters() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (r#"http://127\.0\.0\.1:\d+"#, "http://mock.registry"),
+        (r#""duration_ms":\s*\d+"#, r#""duration_ms": 0"#),
+    ]
+}
+
+fn encoded_package(package: &str) -> String {
+    package.replace('@', "%40").replace('/', "%2F")
+}
