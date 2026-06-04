@@ -252,6 +252,78 @@ async fn global_list_outdated_human_output_uses_current_wanted_latest_bins_table
     );
 }
 
+#[tokio::test]
+async fn global_list_outdated_json_with_unresolved_metadata_exits_nonzero() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    seed_global_package(&project, "missing-cli", vec!["missing".to_string()]);
+
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![]).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "global", "list", "--outdated"])
+        .output()
+        .expect("failed to run lpm global list --outdated --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("envelope must be valid JSON: {e}\n---\n{stdout}"));
+
+    assert!(
+        !output.status.success(),
+        "unresolved registry metadata must make global list --outdated fail\nstdout: {}\nstderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["count_outdated"], serde_json::json!(0));
+    assert_eq!(envelope["count_unresolved"], serde_json::json!(1));
+    let unresolved = envelope["unresolved"]
+        .as_array()
+        .expect("envelope must carry unresolved rows");
+    assert_eq!(
+        unresolved.len(),
+        1,
+        "expected one unresolved row: {envelope}"
+    );
+    assert_eq!(unresolved[0]["package"], serde_json::json!("missing-cli"));
+    assert!(
+        unresolved[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no registry metadata")),
+        "unresolved reason must explain missing metadata: {envelope}",
+    );
+}
+
+#[tokio::test]
+async fn global_list_outdated_human_with_unresolved_metadata_exits_nonzero() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    seed_global_package(&project, "missing-cli", vec!["missing".to_string()]);
+
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![]).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["global", "list", "--outdated"])
+        .output()
+        .expect("failed to run lpm global list --outdated");
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+
+    assert!(
+        !output.status.success(),
+        "unresolved registry metadata must make global list --outdated fail\n{combined}",
+    );
+    assert!(
+        combined.contains("could not be compared") && combined.contains("missing-cli"),
+        "human output must surface unresolved package details, got:\n{combined}",
+    );
+}
+
 // ─── bin ──────────────────────────────────────────────────────────────
 
 #[test]
