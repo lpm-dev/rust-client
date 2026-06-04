@@ -1,5 +1,5 @@
 use crate::commands::publish_common::{self, TarballFile};
-use crate::commands::publish_npm;
+use crate::commands::{npm_auth, publish_npm};
 use crate::{auth, install_ui, oidc, provenance, quality, sigstore};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lpm_common::LpmError;
@@ -60,6 +60,7 @@ pub struct PublishResult {
     pub target: String,
     pub success: bool,
     pub error: Option<String>,
+    pub auth: Option<&'static str>,
     pub duration: std::time::Duration,
 }
 
@@ -938,6 +939,7 @@ pub async fn run(
                             target: "lpm".into(),
                             success: true,
                             error: None,
+                            auth: None,
                             duration,
                         });
                     }
@@ -949,6 +951,7 @@ pub async fn run(
                             target: "lpm".into(),
                             success: false,
                             error: Some(e.to_string()),
+                            auth: None,
                             duration,
                         });
                     }
@@ -969,24 +972,28 @@ pub async fn run(
                     })?;
 
                     // Resolve registry URL, token, display name per target
-                    let (registry_url, token_result, display) = match target {
-                        PublishTarget::Npm => (
-                            publish_npm::resolve_npm_registry(npm_config),
-                            auth::get_npm_token().ok_or_else(|| {
-                                LpmError::Registry(
-                                    "no npm token found. Run `lpm login --npm` for browser login, pass `lpm login --npm --token <token>`, or set NPM_TOKEN.".into(),
-                                )
-                            }),
-                            "npm",
-                        ),
+                    let (registry_url, token, display, auth_source) = match target {
+                        PublishTarget::Npm => {
+                            let registry_url = publish_npm::resolve_npm_registry(npm_config);
+                            let npm_auth =
+                                npm_auth::resolve_publish_auth(npm_name_str, &registry_url)
+                                    .await?;
+                            (
+                                registry_url,
+                                npm_auth.token().to_string(),
+                                "npm",
+                                Some(npm_auth.source().as_str()),
+                            )
+                        }
                         PublishTarget::GitHub => (
                             "https://npm.pkg.github.com".to_string(),
                             auth::get_github_token().ok_or_else(|| {
                                 LpmError::Registry(
                                     "no GitHub Packages token found. Run `gh auth login --hostname github.com`, run `lpm login --github --token <pat>`, or set GITHUB_TOKEN.".into(),
                                 )
-                            }),
+                            })?,
                             "GitHub Packages",
+                            None,
                         ),
                         PublishTarget::GitLab => {
                             let gl_cfg = publish_config.and_then(|p| p.gitlab.as_ref());
@@ -1027,8 +1034,9 @@ pub async fn run(
                                     LpmError::Registry(
                                         "no GitLab Packages token found. For gitlab.com, run `glab auth login`; otherwise run `lpm login --gitlab --token <token>` or set GITLAB_TOKEN/CI_JOB_TOKEN.".into(),
                                     )
-                                }),
+                                })?,
                                 "GitLab Packages",
+                                None,
                             )
                         }
                         PublishTarget::Custom(url) => (
@@ -1037,13 +1045,16 @@ pub async fn run(
                                 LpmError::Registry(format!(
                                     "no token found for {url}. Run `lpm login --login-registry {url} --token <token>`."
                                 ))
-                            }),
+                            })?,
                             "custom",
+                            None,
                         ),
                         _ => unreachable!(),
                     };
 
-                    let token = token_result?;
+                    if auth_source == Some("oidc") && !json_output {
+                        install_ui::phase("Using npm Trusted Publishing (OIDC)");
+                    }
 
                     // Per-target access
                     let npm_access = match target {
@@ -1148,6 +1159,7 @@ pub async fn run(
                         target: target.key(),
                         success: npm_result.success,
                         error: npm_result.error,
+                        auth: auth_source,
                         duration: npm_result.duration,
                     })
                 }
@@ -1169,6 +1181,7 @@ pub async fn run(
                             target: target.key(),
                             success: false,
                             error: Some(e.to_string()),
+                            auth: None,
                             duration,
                         });
                     }
@@ -1184,12 +1197,7 @@ pub async fn run(
     if json_output {
         let json = serde_json::json!({
             "success": !any_failed,
-            "results": results.iter().map(|r| serde_json::json!({
-                "registry": r.target,
-                "success": r.success,
-                "error": r.error,
-                "duration_ms": r.duration.as_millis() as u64,
-            })).collect::<Vec<_>>(),
+            "results": results.iter().map(publish_result_json).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if targets.len() > 1 {
@@ -1649,6 +1657,38 @@ fn ensure_lpm_in_files(pkg_json_path: &Path, pkg_json: &serde_json::Value) -> Re
         }
     }
     Ok(())
+}
+
+fn publish_result_json(result: &PublishResult) -> serde_json::Value {
+    let mut object = serde_json::Map::with_capacity(5);
+    object.insert(
+        "registry".to_string(),
+        serde_json::Value::String(result.target.clone()),
+    );
+    object.insert(
+        "success".to_string(),
+        serde_json::Value::Bool(result.success),
+    );
+    object.insert(
+        "error".to_string(),
+        result
+            .error
+            .as_ref()
+            .map_or(serde_json::Value::Null, |error| {
+                serde_json::Value::String(error.clone())
+            }),
+    );
+    if let Some(auth) = result.auth {
+        object.insert(
+            "auth".to_string(),
+            serde_json::Value::String(auth.to_string()),
+        );
+    }
+    object.insert(
+        "duration_ms".to_string(),
+        serde_json::json!(result.duration.as_millis() as u64),
+    );
+    serde_json::Value::Object(object)
 }
 
 /// Compute a deterministic digest of local skill files for staleness comparison.

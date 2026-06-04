@@ -32,6 +32,7 @@ pub mod migrate;
 pub mod migrate_overrides;
 pub mod migrate_patches;
 pub mod migrate_peer_rules;
+pub mod npm_auth;
 pub mod npm_stage;
 pub mod npmrc;
 pub mod outdated;

@@ -10,6 +10,8 @@ use wiremock::{Mock, ResponseTemplate};
 
 const STAGE_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
 const NPM_TOKEN: &str = "stage-token";
+const NPM_ID_TOKEN: &str = "stage-oidc-id-token";
+const OIDC_NPM_TOKEN: &str = "stage-oidc-exchanged-token";
 
 #[tokio::test]
 async fn stage_publish_posts_rewritten_payload_to_npm_stage_endpoint() {
@@ -65,6 +67,76 @@ async fn stage_publish_posts_rewritten_payload_to_npm_stage_endpoint() {
         .expect("tarball data must decode");
     let manifest = extract_package_json(&tarball);
     assert_eq!(manifest["name"], serde_json::json!("@scope/staged-pkg"));
+}
+
+#[tokio::test]
+async fn stage_publish_uses_npm_trusted_publishing_token_exchange() {
+    let mock = MockRegistry::start().await;
+    mount_npm_oidc_exchange(&mock, "@scope/staged-pkg").await;
+    mount_package_metadata_with_token(
+        &mock,
+        "@scope/staged-pkg",
+        serde_json::json!({"0.9.0": {}}),
+        OIDC_NPM_TOKEN,
+    )
+    .await;
+    mount_stage_publish_with_token(&mock, "@scope/staged-pkg", OIDC_NPM_TOKEN).await;
+    let project = stage_project();
+
+    let output = lpm(&project)
+        .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .args([
+            "--json",
+            "stage",
+            "publish",
+            "--yes",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage publish with npm OIDC");
+
+    assert!(
+        output.status.success(),
+        "stage publish must succeed with npm Trusted Publishing\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = parse_json(&output.stdout);
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["auth"], serde_json::json!("oidc"));
+    assert_eq!(envelope["stageId"], serde_json::json!(STAGE_ID));
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let exchange = requests
+        .iter()
+        .find(|request| request.url.path().contains("/oidc/token/exchange/package/"))
+        .expect("OIDC exchange request must be recorded");
+    assert_eq!(
+        exchange
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("Bearer {NPM_ID_TOKEN}").as_str()),
+    );
+
+    let upload = requests
+        .iter()
+        .find(|request| {
+            request.method.as_str() == "POST" && request.url.path().contains("/-/stage/package/")
+        })
+        .expect("stage publish upload must be recorded");
+    assert_eq!(
+        upload
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("Bearer {OIDC_NPM_TOKEN}").as_str()),
+    );
 }
 
 #[tokio::test]
@@ -463,6 +535,37 @@ fn stage_publish_missing_npm_token_fails_before_upload() {
     );
 }
 
+#[tokio::test]
+async fn stage_list_requires_npm_token_when_npm_id_token_is_present() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(r#"{"name":"stage-list-auth","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .args(["stage", "list", "--npm-registry", &mock.url()])
+        .output()
+        .expect("failed to run lpm stage list with only NPM_ID_TOKEN");
+
+    assert!(
+        !output.status.success(),
+        "stage list must not use npm Trusted Publishing OIDC"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no npm token found"),
+        "expected normal npm token guidance, got:\n{stderr}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "stage list without npm token must fail before contacting registry"
+    );
+}
+
 fn stage_project() -> TempProject {
     let project = TempProject::empty(
         r#"{
@@ -482,9 +585,18 @@ fn stage_project() -> TempProject {
 }
 
 async fn mount_package_metadata(mock: &MockRegistry, package: &str, versions: serde_json::Value) {
+    mount_package_metadata_with_token(mock, package, versions, NPM_TOKEN).await;
+}
+
+async fn mount_package_metadata_with_token(
+    mock: &MockRegistry,
+    package: &str,
+    versions: serde_json::Value,
+    token: &str,
+) {
     Mock::given(method("GET"))
         .and(path(format!("/{}", encoded_package(package))))
-        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .and(header("authorization", format!("Bearer {token}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "name": package,
             "versions": versions
@@ -494,15 +606,34 @@ async fn mount_package_metadata(mock: &MockRegistry, package: &str, versions: se
 }
 
 async fn mount_stage_publish(mock: &MockRegistry, package: &str) {
+    mount_stage_publish_with_token(mock, package, NPM_TOKEN).await;
+}
+
+async fn mount_stage_publish_with_token(mock: &MockRegistry, package: &str, token: &str) {
     Mock::given(method("POST"))
         .and(path(format!(
             "/-/stage/package/{}",
             encoded_package(package)
         )))
-        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .and(header("authorization", format!("Bearer {token}")))
         .and(header("npm-command", "stage"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "stageId": STAGE_ID
+        })))
+        .mount(mock.server())
+        .await;
+}
+
+async fn mount_npm_oidc_exchange(mock: &MockRegistry, package: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/-/npm/v1/oidc/token/exchange/package/{}",
+            encoded_package(package)
+        )))
+        .and(header("authorization", format!("Bearer {NPM_ID_TOKEN}")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "token_type": "oidc",
+            "token": OIDC_NPM_TOKEN,
         })))
         .mount(mock.server())
         .await;

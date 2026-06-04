@@ -1,5 +1,5 @@
-use crate::commands::{npm_stage, publish, publish_npm};
-use crate::{auth, install_ui};
+use crate::commands::{npm_auth, npm_stage, publish, publish_npm};
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_runner::lpm_json::{self, NpmPublishConfig};
 use std::path::Path;
@@ -85,8 +85,11 @@ pub(crate) async fn publish_current_project(
         }
     }
 
-    let token = npm_token()?;
-    let metadata = npm_stage::fetch_package_metadata(&token, &npm_name, &registry).await?;
+    let auth = npm_auth::resolve_publish_auth(&npm_name, &registry).await?;
+    if auth.source() == npm_auth::NpmAuthSource::Oidc && !options.json_output {
+        install_ui::phase("Using npm Trusted Publishing (OIDC)");
+    }
+    let metadata = npm_stage::fetch_package_metadata(auth.token(), &npm_name, &registry).await?;
     enforce_stage_version_policy(&metadata, &npm_name, &prepared.version, tag_explicit)?;
     let version_data = publish::build_publish_version_data(
         &prepared.pkg_json,
@@ -116,7 +119,7 @@ pub(crate) async fn publish_current_project(
     }
 
     let result = npm_stage::stage_publish(
-        &token,
+        auth.token(),
         &npm_name,
         &prepared.version,
         &artifact.version_data,
@@ -132,6 +135,7 @@ pub(crate) async fn publish_current_project(
             "success": true,
             "target": "npm",
             "registry": registry,
+            "auth": auth.source().as_str(),
             "stageId": result.stage_id,
             "duration_ms": result.duration.as_millis() as u64,
             "data": result.data,
@@ -299,11 +303,7 @@ async fn mutate_stage(
 }
 
 fn npm_token() -> Result<String, LpmError> {
-    auth::get_npm_token().ok_or_else(|| {
-        LpmError::Registry(
-            "no npm token found. Run `lpm login --npm` for browser login, pass `lpm login --npm --token <token>`, or set NPM_TOKEN.".into(),
-        )
-    })
+    npm_auth::resolve_token_auth().map(|auth| auth.token().to_string())
 }
 
 fn read_npm_config(cwd: &Path) -> Option<NpmPublishConfig> {
