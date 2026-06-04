@@ -409,7 +409,10 @@ mod linker_mode_tests {
 // /J`) — duplicating it would have left v2 regressing on Windows
 // setups without Developer Mode. Re-imported under the legacy local
 // name to keep call sites untouched.
-use lpm_common::symlink::create_dir_symlink_or_junction as create_symlink_or_junction;
+use lpm_common::symlink::{
+    create_dir_symlink_or_junction as create_symlink_or_junction,
+    create_symlink as create_fs_symlink,
+};
 
 /// Drives the materialization branch in [`link_one_package`].
 ///
@@ -2676,7 +2679,7 @@ fn walk_directory_source(
                      exposing target as-is (matches Node resolution from the source itself)",
                 );
             }
-            create_symlink_or_junction(&abs_target, &entry_dst)?;
+            create_fs_symlink(&abs_target, &entry_dst)?;
             *count += 1;
         }
         // Other file types (devices, sockets, fifos) silently

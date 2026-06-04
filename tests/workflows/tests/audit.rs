@@ -298,6 +298,41 @@ async fn audit_empty_lockfile_reports_no_packages_and_exits_zero() {
     );
 }
 
+#[tokio::test]
+async fn audit_empty_lockfile_json_reports_zero_package_envelope() {
+    let project = TempProject::empty(r#"{"name":"empty-audit-json","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.lock",
+        "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n",
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![]).await;
+
+    let out = run_audit_json(&project, &mock, &[]);
+    assert!(
+        out.status.success(),
+        "audit --json on a zero-package lockfile must exit 0; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.trim().is_empty(),
+        "audit --json empty-lockfile path must not emit human warnings, got:\n{stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("audit --json must emit a JSON object: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["manager"], serde_json::json!("lpm"));
+    assert_eq!(envelope["scanned"], serde_json::json!(0));
+    assert_eq!(envelope["checked_lpm"], serde_json::json!(0));
+    assert_eq!(envelope["packages"], serde_json::json!([]));
+    assert_eq!(envelope["vulnerabilities"], serde_json::json!([]));
+}
+
 /// A project with one clean dep and an OSV response carrying zero vulns
 /// must exit 0 — nothing to fail on.
 #[tokio::test]
@@ -877,12 +912,17 @@ fn audit_secrets_json_envelope_carries_findings_array() {
         .args(["--json", "audit", "--secrets"])
         .output()
         .expect("failed to run lpm audit --secrets --json");
+    assert!(
+        !out.status.success(),
+        "default audit --secrets --json policy must exit non-zero when findings exist"
+    );
 
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("audit --secrets --json must be valid JSON: {e}\n---\n{stdout}")
     });
 
+    assert_eq!(envelope["success"], serde_json::json!(true));
     assert!(
         envelope["packagesScanned"].as_u64().is_some(),
         "envelope must carry packagesScanned: {envelope}"

@@ -54,6 +54,7 @@ scrypt = { workspace = true }
 sha2 = "0.10"
 p256 = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
 
 # Phase 46.1.1: workflows-local copy of the `socket-probe` test
 # bin so `cargo test -p lpm-workflows` (and CI's `--workspace`

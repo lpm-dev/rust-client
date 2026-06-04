@@ -560,6 +560,14 @@ pub async fn run(
                 restore_err
             );
         }
+        if let Err(invalidate_err) =
+            remove_optional_file(&project_dir.join(".lpm").join("install-hash"))
+        {
+            tracing::error!(
+                "failed to invalidate .lpm/install-hash after install failure: {}",
+                invalidate_err
+            );
+        }
         return Err(e);
     }
 

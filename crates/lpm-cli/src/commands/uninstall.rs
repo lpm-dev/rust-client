@@ -4,7 +4,7 @@ use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,17 +68,18 @@ fn cleanup_removed_packages(
         })
         .collect();
 
-    let install_hash_path = project_dir.join(".lpm").join("install-hash");
-    if install_hash_path.exists() {
-        std::fs::remove_file(&install_hash_path)?;
-    }
+    invalidate_install_hash_marker(project_dir)?;
 
     let node_modules = project_dir.join("node_modules");
     let mut freed_bytes = 0u64;
     for name in removed {
+        freed_bytes =
+            freed_bytes.saturating_add(cleanup_bin_shims_for_package(&node_modules, name)?);
         freed_bytes = freed_bytes.saturating_add(remove_node_modules_entry(&node_modules, name)?);
     }
     for package in &orphaned {
+        freed_bytes = freed_bytes
+            .saturating_add(cleanup_bin_shims_for_package(&node_modules, &package.name)?);
         freed_bytes =
             freed_bytes.saturating_add(remove_node_modules_entry(&node_modules, &package.name)?);
     }
@@ -90,6 +91,127 @@ fn cleanup_removed_packages(
         cleaned_empty_dirs,
         freed_bytes,
     })
+}
+
+fn invalidate_install_hash_marker(project_dir: &Path) -> Result<(), LpmError> {
+    let path = project_dir.join(".lpm").join("install-hash");
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(&path)?;
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir(&path))?;
+    #[cfg(windows)]
+    std::fs::remove_dir(&path).or_else(|_| std::fs::remove_file(&path))?;
+
+    Ok(())
+}
+
+fn cleanup_bin_shims_for_package(node_modules: &Path, name: &str) -> Result<u64, LpmError> {
+    let package_dir = node_modules.join(name);
+    let manifest_path = package_dir.join("package.json");
+    let Ok(pkg_json) = lpm_workspace::read_package_json(&manifest_path) else {
+        return Ok(0);
+    };
+    let Some(bin_config) = pkg_json.bin.as_ref() else {
+        return Ok(0);
+    };
+
+    let package_name = pkg_json.name.as_deref().unwrap_or(name);
+    let bin_dir = node_modules.join(".bin");
+    let mut freed_bytes = 0u64;
+    for (cmd_name, script_path) in bin_config.entries(package_name) {
+        let Some(shim_path) = safe_bin_shim_path(&bin_dir, &cmd_name) else {
+            continue;
+        };
+        let expected_target = package_dir.join(script_path);
+        freed_bytes =
+            freed_bytes.saturating_add(remove_owned_bin_shim(&shim_path, &expected_target)?);
+
+        #[cfg(windows)]
+        {
+            let cmd_path = shim_path.with_extension("cmd");
+            freed_bytes =
+                freed_bytes.saturating_add(remove_owned_cmd_shim(&cmd_path, &expected_target)?);
+        }
+    }
+
+    Ok(freed_bytes)
+}
+
+fn safe_bin_shim_path(bin_dir: &Path, cmd_name: &str) -> Option<PathBuf> {
+    if cmd_name.is_empty()
+        || cmd_name == "."
+        || cmd_name == ".."
+        || cmd_name.contains('/')
+        || cmd_name.contains('\\')
+    {
+        return None;
+    }
+    Some(bin_dir.join(cmd_name))
+}
+
+fn remove_owned_bin_shim(shim_path: &Path, expected_target: &Path) -> Result<u64, LpmError> {
+    let Ok(metadata) = shim_path.symlink_metadata() else {
+        return Ok(0);
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+
+    let Ok(actual_target) = std::fs::read_link(shim_path) else {
+        return Ok(0);
+    };
+    let actual_abs = if actual_target.is_absolute() {
+        actual_target
+    } else {
+        shim_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(actual_target)
+    };
+    let Ok(actual_canonical) = actual_abs.canonicalize() else {
+        return Ok(0);
+    };
+    let Ok(expected_canonical) = expected_target.canonicalize() else {
+        return Ok(0);
+    };
+    if actual_canonical != expected_canonical {
+        return Ok(0);
+    }
+
+    let freed_bytes = removable_path_size(shim_path, &metadata);
+    std::fs::remove_file(shim_path)?;
+    Ok(freed_bytes)
+}
+
+#[cfg(windows)]
+fn remove_owned_cmd_shim(shim_path: &Path, expected_target: &Path) -> Result<u64, LpmError> {
+    let Ok(metadata) = shim_path.symlink_metadata() else {
+        return Ok(0);
+    };
+    if !metadata.is_file() {
+        return Ok(0);
+    }
+    let Ok(expected_canonical) = expected_target.canonicalize() else {
+        return Ok(0);
+    };
+    let Ok(content) = std::fs::read_to_string(shim_path) else {
+        return Ok(0);
+    };
+    if !content.contains(&expected_canonical.to_string_lossy().replace('/', "\\")) {
+        return Ok(0);
+    }
+    let freed_bytes = removable_path_size(shim_path, &metadata);
+    std::fs::remove_file(shim_path)?;
+    Ok(freed_bytes)
 }
 
 fn remove_node_modules_entry(node_modules: &Path, name: &str) -> Result<u64, LpmError> {

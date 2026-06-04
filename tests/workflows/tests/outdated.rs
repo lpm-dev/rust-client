@@ -361,6 +361,35 @@ async fn outdated_skips_private_named_packages_without_npm_public_source() {
 }
 
 #[tokio::test]
+async fn outdated_metadata_lookup_failure_exits_nonzero_in_json_mode() {
+    let pkg = "@lpm.dev/owner.missing-outdated";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"lookup-failure","version":"1.0.0","dependencies":{{"{pkg}":"^1.0.0"}}}}"#
+    ));
+    write_minimal_lockfile(&project, pkg, "1.0.0");
+
+    let mock = MockRegistry::start().await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn lpm outdated --json");
+
+    assert!(
+        !out.status.success(),
+        "metadata lookup failures must not be reported as a clean outdated result\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON failure envelope");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["unresolved_count"], serde_json::json!(1));
+    assert_eq!(envelope["unresolved"][0]["name"], serde_json::json!(pkg));
+}
+
+#[tokio::test]
 async fn outdated_reports_newer_version_for_outdated_lpm_dep() {
     let pkg = "@lpm.dev/owner.outdated-pkg";
     let project = TempProject::empty(&format!(

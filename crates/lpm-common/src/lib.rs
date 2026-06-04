@@ -27,7 +27,7 @@ pub use paths::{
     with_shared_lock, with_shared_lock_async,
 };
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus};
-pub use symlink::create_dir_symlink_or_junction;
+pub use symlink::{create_dir_symlink_or_junction, create_symlink};
 
 /// The LPM scope prefix. All LPM packages live under this scope.
 pub const LPM_SCOPE: &str = "@lpm.dev";

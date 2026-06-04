@@ -39,8 +39,23 @@ pub fn create_dir_symlink_or_junction(target: &Path, link: &Path) -> std::io::Re
     create_dir_symlink_or_junction_inner(target, link)
 }
 
+/// Create a filesystem symlink from `link` to `target`.
+///
+/// - **Unix:** plain `symlink(2)` for files and directories.
+/// - **Windows:** `symlink_file` for files; directory targets reuse
+///   [`create_dir_symlink_or_junction`] so the junction fallback still
+///   applies.
+pub fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    create_symlink_inner(target, link)
+}
+
 #[cfg(unix)]
 fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(unix)]
+fn create_symlink_inner(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
 
@@ -97,6 +112,15 @@ fn create_dir_symlink_or_junction_inner(target: &Path, link: &Path) -> std::io::
         _ => Err(std::io::Error::other(
             "failed to create junction or symlink",
         )),
+    }
+}
+
+#[cfg(windows)]
+fn create_symlink_inner(target: &Path, link: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(target) {
+        Ok(meta) if meta.is_dir() => create_dir_symlink_or_junction_inner(target, link),
+        Ok(_) => std::os::windows::fs::symlink_file(target, link),
+        Err(e) => Err(e),
     }
 }
 
@@ -216,6 +240,17 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         let link = dir.path().join("link");
         create_dir_symlink_or_junction(&target, &link).unwrap();
+        let read = std::fs::read_link(&link).unwrap();
+        assert_eq!(read, target);
+    }
+
+    #[test]
+    fn create_symlink_round_trips_file_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.js");
+        std::fs::write(&target, b"console.log('ok')\n").unwrap();
+        let link = dir.path().join("link.js");
+        create_symlink(&target, &link).unwrap();
         let read = std::fs::read_link(&link).unwrap();
         assert_eq!(read, target);
     }
