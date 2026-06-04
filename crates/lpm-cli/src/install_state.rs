@@ -222,6 +222,13 @@ pub fn collect_file_link_manifest_bytes(
     let mut visited: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
     let mut buf: Vec<(std::path::PathBuf, Vec<u8>)> = Vec::new();
+    let mut freshness_files: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+
+    if let Some(path) = nearest_pnpm_workspace_yaml(project_dir) {
+        push_freshness_file(path, &mut freshness_files, &mut buf);
+    }
+
     walk_file_link_deps(project_dir, pkg_content, 0, 3, &mut visited, &mut buf);
 
     // **audit response (round 6) — workspace member
@@ -242,6 +249,12 @@ pub fn collect_file_link_manifest_bytes(
     // package.json / canonicalize failure) — same posture as the
     // outer walker.
     if let Ok(Some(ws)) = lpm_workspace::discover_workspace(project_dir) {
+        push_freshness_file(
+            ws.root.join("pnpm-workspace.yaml"),
+            &mut freshness_files,
+            &mut buf,
+        );
+
         for member in &ws.members {
             let Ok(realpath) = member.path.canonicalize() else {
                 continue;
@@ -274,6 +287,36 @@ pub fn collect_file_link_manifest_bytes(
         out.push(0);
     }
     out
+}
+
+fn nearest_pnpm_workspace_yaml(project_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = Some(project_dir);
+    while let Some(dir) = current {
+        let candidate = dir.join("pnpm-workspace.yaml");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+pub fn has_pnpm_workspace_yaml(project_dir: &std::path::Path) -> bool {
+    nearest_pnpm_workspace_yaml(project_dir).is_some()
+}
+
+fn push_freshness_file(
+    path: std::path::PathBuf,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    buf: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+) {
+    let Ok(content) = std::fs::read(&path) else {
+        return;
+    };
+    let key = path.canonicalize().unwrap_or(path);
+    if seen.insert(key.clone()) {
+        buf.push((key, content));
+    }
 }
 
 fn walk_file_link_deps(
@@ -463,7 +506,7 @@ pub fn check_install_state_with_linker(
     // mtime short-circuit also applies here. The caller may have
     // already read pkg.json for an earlier check, but the fast path still
     // skips the read of lpm.lock + the SHA-256 pass.
-    if let Some(state) = try_mtime_fast_path(project_dir, linker_mode) {
+    if let Some(state) = try_mtime_fast_path(project_dir, pkg_content, linker_mode) {
         return state;
     }
 
@@ -611,10 +654,15 @@ pub fn check_install_state_with_linker(
 /// cost is negligible compared to the fast path's ~4 stats.
 fn try_mtime_fast_path(
     project_dir: &Path,
+    pkg_content: &str,
     linker_mode: lpm_linker::LinkerMode,
 ) -> Option<InstallState> {
     let nm = project_dir.join("node_modules");
     if !nm.exists() {
+        return None;
+    }
+
+    if package_json_needs_slow_freshness(pkg_content) || has_pnpm_workspace_yaml(project_dir) {
         return None;
     }
 
@@ -700,6 +748,12 @@ fn try_mtime_fast_path(
         up_to_date: true,
         hash: Some(stored_hash.to_string()),
     })
+}
+
+fn package_json_needs_slow_freshness(pkg_content: &str) -> bool {
+    pkg_content.contains("\"file:")
+        || pkg_content.contains("\"link:")
+        || pkg_content.contains("\"workspaces\"")
 }
 
 /// Return the modified-time of `path` as nanoseconds since the Unix
@@ -801,10 +855,9 @@ pub fn write_install_hash(
     // negatives are impossible for the file: / link: case: every
     // such spec is `"<key>": "file:..."` / `"<key>": "link:..."`.
     let sentinel = hash_dir.join("has-local-sources");
-    let needs_slow_path =
-        std::fs::read_to_string(project_dir.join("package.json")).is_ok_and(|s| {
-            s.contains("\"file:") || s.contains("\"link:") || s.contains("\"workspaces\"")
-        });
+    let needs_slow_path = std::fs::read_to_string(project_dir.join("package.json"))
+        .is_ok_and(|s| package_json_needs_slow_freshness(&s))
+        || has_pnpm_workspace_yaml(project_dir);
     if needs_slow_path {
         write_state_file_owner_only(&sentinel, b"")?;
     } else if sentinel.exists() {
@@ -1050,6 +1103,50 @@ mod tests {
         assert!(
             state.hash.is_some(),
             "readable file should still produce a hash for dev.rs"
+        );
+    }
+
+    #[test]
+    fn pnpm_workspace_yaml_change_invalidates_matching_mtime_state() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let _home = scoped_home_for(p);
+        let pkg = r#"{"dependencies":{"is-positive":"catalog:"}}"#;
+        let lock = "lock-content";
+        fs::write(p.join("package.json"), pkg).unwrap();
+        fs::write(p.join("lpm.lock"), lock).unwrap();
+        fs::write(
+            p.join("pnpm-workspace.yaml"),
+            "packages:\n  - \"packages/*\"\ncatalog:\n  is-positive: ^1.0.0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+        fs::create_dir_all(p.join(".lpm")).unwrap();
+
+        let hash = compute_install_hash_v6(
+            pkg,
+            lock,
+            &collect_file_link_manifest_bytes(p, pkg),
+            lpm_linker::LinkerMode::default(),
+        );
+        let content = format!(
+            "{hash}\nm:{}:{}\nl:{}\n",
+            mtime_ns(&p.join("package.json")).unwrap(),
+            mtime_ns(&p.join("lpm.lock")).unwrap(),
+            lpm_linker::LinkerMode::default().as_str()
+        );
+        fs::write(p.join(".lpm").join("install-hash"), content).unwrap();
+
+        fs::write(
+            p.join("pnpm-workspace.yaml"),
+            "packages:\n  - \"packages/*\"\ncatalog:\n  is-positive: ^2.0.0\n",
+        )
+        .unwrap();
+
+        let state = check_install_state(p);
+        assert!(
+            !state.up_to_date,
+            "pnpm-workspace.yaml drift must force the install pipeline"
         );
     }
 
@@ -1399,13 +1496,14 @@ mod tests {
         // Write the install-hash for an isolated layout.
         write_install_hash(p, "deadbeef", lpm_linker::LinkerMode::Isolated).unwrap();
         // Mtime fast path with matching linker → up_to_date.
-        let same = try_mtime_fast_path(p, lpm_linker::LinkerMode::Isolated);
+        let pkg_content = fs::read_to_string(p.join("package.json")).unwrap();
+        let same = try_mtime_fast_path(p, &pkg_content, lpm_linker::LinkerMode::Isolated);
         assert!(
             same.is_some_and(|s| s.up_to_date),
             "matching linker should keep up_to_date=true on the fast path"
         );
         // Mtime fast path with FLIPPED linker → bails (returns None).
-        let flipped = try_mtime_fast_path(p, lpm_linker::LinkerMode::Hoisted);
+        let flipped = try_mtime_fast_path(p, &pkg_content, lpm_linker::LinkerMode::Hoisted);
         assert!(
             flipped.is_none(),
             "stored linker `isolated` must NOT short-circuit a check \

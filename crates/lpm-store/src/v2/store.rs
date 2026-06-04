@@ -38,6 +38,9 @@ pub type VerifyLinkEntry = (PathBuf, Result<LinkMeta, LpmError>);
 /// `node_modules/` sub-name inside each `links/<graph-key>/` entry.
 const LINK_NODE_MODULES: &str = "node_modules";
 
+/// Marker file written into synthetic local-source objects.
+const LOCAL_SOURCE_OBJECT_SENTINEL: &str = ".lpm-local-source";
+
 /// Pure path helper for the v2 store layout.
 ///
 /// Holds an immutable handle on the v2 root; every method is a pure
@@ -915,6 +918,47 @@ impl Store {
         }
     }
 
+    /// Populate `objects/<sri>/` from a live local source directory.
+    ///
+    /// The populated object is a per-file symlink tree pointing at the
+    /// source realpath, so link entries built from it stay live to
+    /// source edits without re-running install. The synthetic SRI is a
+    /// stable identity key rather than a content hash, so each populate
+    /// refreshes the symlink tree to pick up added and removed files.
+    pub fn populate_object_from_local_source(
+        &self,
+        source_dir: &Path,
+        sri: &str,
+    ) -> Result<PathBuf, LpmError> {
+        let canonical_source = source_dir.canonicalize().map_err(|e| {
+            LpmError::Store(format!(
+                "v2 local-source object: failed to canonicalize {}: {e}",
+                source_dir.display()
+            ))
+        })?;
+        let object_dir = self.paths.object_dir(sri)?;
+
+        if let Some(parent) = object_dir.parent() {
+            ensure_store_tier_dir_locked(parent)
+                .map_err(|e| LpmError::Store(format!("failed to create v2 objects dir: {e}")))?;
+        }
+
+        let tmp_dir = tmp_sibling(&object_dir);
+        if tmp_dir.exists() {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+        create_tmp_dir_locked(&tmp_dir)
+            .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
+
+        if let Err(e) = populate_local_source_object_into(&canonical_source, &tmp_dir, sri) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
+
+        replace_local_source_object(&tmp_dir, &object_dir)?;
+        Ok(object_dir)
+    }
+
     /// Iterate every object directory under `objects/` that has a
     /// readable `.integrity` marker (i.e., looks complete).
     ///
@@ -1149,6 +1193,84 @@ fn is_complete_object_dir(dir: &Path) -> bool {
     dir.is_dir() && dir.join("package.json").exists() && dir.join(".integrity").exists()
 }
 
+fn is_complete_local_source_object_dir(dir: &Path) -> bool {
+    is_complete_object_dir(dir) && dir.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file()
+}
+
+fn replace_local_source_object(tmp_dir: &Path, object_dir: &Path) -> Result<(), LpmError> {
+    if !object_dir.exists() {
+        return finish_local_source_object_rename(tmp_dir, object_dir);
+    }
+
+    let backup_dir = tmp_sibling(object_dir);
+    if backup_dir.exists() {
+        let _ = std::fs::remove_dir_all(&backup_dir);
+    }
+
+    match std::fs::rename(object_dir, &backup_dir) {
+        Ok(()) => {}
+        Err(_) if !object_dir.exists() => {
+            return finish_local_source_object_rename(tmp_dir, object_dir);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(tmp_dir);
+            return Err(LpmError::Store(format!(
+                "failed to move previous v2 local-source object at {} aside: {e}",
+                object_dir.display()
+            )));
+        }
+    }
+
+    match std::fs::rename(tmp_dir, object_dir) {
+        Ok(()) => {
+            if let Err(e) = std::fs::remove_dir_all(&backup_dir) {
+                tracing::warn!(
+                    target = %backup_dir.display(),
+                    "v2 local-source object: failed to remove replaced object backup: {e}"
+                );
+            }
+            Ok(())
+        }
+        Err(e) if is_complete_local_source_object_dir(object_dir) => {
+            let _ = std::fs::remove_dir_all(tmp_dir);
+            let _ = std::fs::remove_dir_all(&backup_dir);
+            tracing::debug!(
+                target = %object_dir.display(),
+                "v2 local-source object: concurrent refresh completed first: {e}"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(tmp_dir);
+            if !object_dir.exists() {
+                let _ = std::fs::rename(&backup_dir, object_dir);
+            } else {
+                let _ = std::fs::remove_dir_all(&backup_dir);
+            }
+            Err(LpmError::Store(format!(
+                "failed to atomically refresh v2 local-source object at {}: {e}",
+                object_dir.display()
+            )))
+        }
+    }
+}
+
+fn finish_local_source_object_rename(tmp_dir: &Path, object_dir: &Path) -> Result<(), LpmError> {
+    match std::fs::rename(tmp_dir, object_dir) {
+        Ok(()) => Ok(()),
+        Err(_) if is_complete_local_source_object_dir(object_dir) => {
+            let _ = std::fs::remove_dir_all(tmp_dir);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(tmp_dir);
+            Err(LpmError::Store(format!(
+                "failed to atomically install v2 local-source object: {e}"
+            )))
+        }
+    }
+}
+
 fn tmp_sibling(dir: &Path) -> PathBuf {
     // Random 64-bit suffix replaces the pid+tid pair so a same-UID
     // attacker can't predict the tmp path and plant a symlink there
@@ -1179,6 +1301,107 @@ fn create_tmp_dir_locked(path: &Path) -> std::io::Result<()> {
     {
         std::fs::create_dir_all(path)
     }
+}
+
+const MAX_LOCAL_SOURCE_OBJECT_DEPTH: usize = 256;
+
+fn populate_local_source_object_into(
+    source_root: &Path,
+    tmp_dir: &Path,
+    sri: &str,
+) -> Result<(), LpmError> {
+    walk_local_source_object(source_root, source_root, tmp_dir, 0)?;
+    std::fs::write(tmp_dir.join(".integrity"), sri).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to write v2 local-source .integrity at {}: {e}",
+            tmp_dir.display()
+        ))
+    })?;
+    std::fs::write(
+        tmp_dir.join(LOCAL_SOURCE_OBJECT_SENTINEL),
+        source_root.display().to_string(),
+    )
+    .map_err(|e| {
+        LpmError::Store(format!(
+            "failed to write v2 local-source sentinel at {}: {e}",
+            tmp_dir.display()
+        ))
+    })?;
+
+    let analysis = lpm_security::behavioral::analyze_package(tmp_dir);
+    if let Err(e) = lpm_security::behavioral::write_cached_analysis(tmp_dir, &analysis) {
+        tracing::warn!("v2 local-source object: failed to write .lpm-security.json: {e}");
+    }
+
+    Ok(())
+}
+
+fn walk_local_source_object(
+    source_root: &Path,
+    src: &Path,
+    dst: &Path,
+    depth: usize,
+) -> Result<(), LpmError> {
+    if depth > MAX_LOCAL_SOURCE_OBJECT_DEPTH {
+        return Err(LpmError::Store(format!(
+            "v2 local-source object exceeds maximum walk depth ({MAX_LOCAL_SOURCE_OBJECT_DEPTH}) at {}",
+            src.display()
+        )));
+    }
+    std::fs::create_dir_all(dst).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to create v2 local-source object dir at {}: {e}",
+            dst.display()
+        ))
+    })?;
+
+    for entry in std::fs::read_dir(src).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to read local source directory {}: {e}",
+            src.display()
+        ))
+    })? {
+        let entry = entry
+            .map_err(|e| LpmError::Store(format!("failed to enumerate local source entry: {e}")))?;
+        let name = entry.file_name();
+        if name == "node_modules" || name == ".git" {
+            continue;
+        }
+
+        let entry_src = entry.path();
+        let entry_dst = dst.join(&name);
+        let metadata = std::fs::symlink_metadata(&entry_src).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to stat local source entry {}: {e}",
+                entry_src.display()
+            ))
+        })?;
+        let ft = metadata.file_type();
+        if ft.is_dir() {
+            walk_local_source_object(source_root, &entry_src, &entry_dst, depth + 1)?;
+        } else if ft.is_file() || ft.is_symlink() {
+            let abs_target = entry_src
+                .canonicalize()
+                .unwrap_or_else(|_| entry_src.clone());
+            if ft.is_symlink() && !abs_target.starts_with(source_root) {
+                tracing::warn!(
+                    source = %source_root.display(),
+                    symlink = %entry_src.display(),
+                    target = %abs_target.display(),
+                    "v2 local-source object: symlink escapes source root; exposing target as-is"
+                );
+            }
+            create_fs_symlink(&abs_target, &entry_dst).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to stage v2 local-source symlink {} → {}: {e}",
+                    entry_dst.display(),
+                    abs_target.display()
+                ))
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Ensure a store-tier directory exists at 0o700. Idempotent — if the
@@ -1260,6 +1483,7 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 // `symlink_dir`-only path would regress Windows users without
 // Developer Mode.
 use lpm_common::symlink::create_dir_symlink_or_junction as create_dir_symlink;
+use lpm_common::symlink::create_symlink as create_fs_symlink;
 
 /// Materialize `src/` into `dst/` using the fastest available primitive.
 ///
@@ -1304,6 +1528,15 @@ use lpm_common::symlink::create_dir_symlink_or_junction as create_dir_symlink;
 /// `private/security-findings.md` H22 for the full trade-off
 /// discussion.
 fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
+    let allow_source_symlinks = src.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file();
+    materialize_into_inner(src, dst, allow_source_symlinks)
+}
+
+fn materialize_into_inner(
+    src: &Path,
+    dst: &Path,
+    allow_source_symlinks: bool,
+) -> Result<(), LpmError> {
     #[cfg(target_os = "macos")]
     {
         if try_clonefile(src, dst) {
@@ -1326,6 +1559,9 @@ fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
     })? {
         let entry = entry
             .map_err(|e| LpmError::Store(format!("failed to enumerate v2 source dir: {e}")))?;
+        if allow_source_symlinks && entry.file_name() == LOCAL_SOURCE_OBJECT_SENTINEL {
+            continue;
+        }
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
@@ -1337,18 +1573,33 @@ fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
         })?;
 
         if file_type.is_dir() {
-            materialize_into(&src_path, &dst_path)?;
+            materialize_into_inner(&src_path, &dst_path, allow_source_symlinks)?;
         } else if file_type.is_symlink() {
-            // Refuse symlink entries — the extractor's `is_file()`
-            // filter blocks them at extract time, so a symlink under
-            // `objects/` means a same-UID actor planted it. Symmetric
-            // with the v1→v2 `copy_dir_recursively` refusal.
-            let target = std::fs::read_link(&src_path).unwrap_or_default();
-            return Err(LpmError::Store(format!(
-                "refusing v2 symlink entry {} → {}; symlinks must not appear under objects/",
-                src_path.display(),
-                target.display(),
-            )));
+            if !allow_source_symlinks {
+                // Refuse symlink entries — the extractor's `is_file()`
+                // filter blocks them at extract time, so a symlink under
+                // `objects/` means a same-UID actor planted it. Symmetric
+                // with the v1→v2 `copy_dir_recursively` refusal.
+                let target = std::fs::read_link(&src_path).unwrap_or_default();
+                return Err(LpmError::Store(format!(
+                    "refusing v2 symlink entry {} → {}; symlinks must not appear under objects/",
+                    src_path.display(),
+                    target.display(),
+                )));
+            }
+            let target = std::fs::read_link(&src_path).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to read v2 local-source symlink {}: {e}",
+                    src_path.display()
+                ))
+            })?;
+            create_fs_symlink(&target, &dst_path).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to recreate v2 local-source symlink {} → {}: {e}",
+                    dst_path.display(),
+                    target.display()
+                ))
+            })?;
         } else if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
             tracing::trace!(
                 src = %src_path.display(),
@@ -1538,6 +1789,97 @@ mod tests {
         assert_eq!(read_back.source_sri, sri);
         assert!(read_back.object_path.starts_with("objects/sha512-"));
         assert_eq!(read_back.deps, vec![]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn populate_object_from_local_source_keeps_live_symlink_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(source.join("node_modules")).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            b"{\"name\":\"local-pkg\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        std::fs::write(source.join("index.js"), b"module.exports = 'before';\n").unwrap();
+        std::fs::write(source.join("node_modules/ignored.js"), b"ignored\n").unwrap();
+
+        let sri = synthetic_sri(b"populate_object_from_local_source");
+        let object_dir = store
+            .populate_object_from_local_source(&source, &sri)
+            .unwrap();
+
+        assert!(object_dir.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file());
+        assert!(
+            object_dir
+                .join("package.json")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !object_dir.join("node_modules").exists(),
+            "local-source objects must exclude node_modules/"
+        );
+        assert_eq!(
+            std::fs::read_to_string(object_dir.join("index.js")).unwrap(),
+            "module.exports = 'before';\n"
+        );
+
+        std::fs::write(source.join("index.js"), b"module.exports = 'after';\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(object_dir.join("index.js")).unwrap(),
+            "module.exports = 'after';\n",
+            "local-source object must stay live to source edits"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn populate_object_from_local_source_refreshes_file_set_on_reinstall() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            b"{\"name\":\"local-pkg\",\"version\":\"1.0.0\"}",
+        )
+        .unwrap();
+        std::fs::write(source.join("index.js"), b"module.exports = 'before';\n").unwrap();
+
+        let sri = synthetic_sri(b"populate_object_from_local_source_refresh");
+        let object_dir = store
+            .populate_object_from_local_source(&source, &sri)
+            .unwrap();
+
+        assert!(object_dir.join("index.js").symlink_metadata().is_ok());
+        assert!(object_dir.join("new.js").symlink_metadata().is_err());
+
+        std::fs::write(source.join("new.js"), b"module.exports = 'new';\n").unwrap();
+        let refreshed_dir = store
+            .populate_object_from_local_source(&source, &sri)
+            .unwrap();
+
+        assert_eq!(refreshed_dir, object_dir);
+        assert_eq!(
+            std::fs::read_to_string(object_dir.join("new.js")).unwrap(),
+            "module.exports = 'new';\n"
+        );
+
+        std::fs::remove_file(source.join("index.js")).unwrap();
+        store
+            .populate_object_from_local_source(&source, &sri)
+            .unwrap();
+
+        assert!(
+            object_dir.join("index.js").symlink_metadata().is_err(),
+            "reinstall must remove stale object entries for source files that no longer exist"
+        );
     }
 
     #[test]

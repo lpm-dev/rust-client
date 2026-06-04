@@ -392,8 +392,9 @@ async fn postinstall_udp_send_is_denied_listener_silent() {
         .expect("spawn lpm install");
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let combined = format!("{stderr}\n{stdout}");
 
-    if !out.status.success() {
+    if combined.contains("\"SECURITY_APPROVAL_REQUIRED\"") {
         assert_security_approval_scope(&out, "scripts-allow");
         let marker = lpm_built_marker(&project, UDP_DEP_NAME);
         assert!(
@@ -404,18 +405,16 @@ async fn postinstall_udp_send_is_denied_listener_silent() {
         return;
     }
 
-    // ── Assertion 0: install exit 0 (soft-fail contract). ──
-    // Mirror `sandbox_network_denial.rs` Assertion 0 — auto-build
-    // failures soft-fail by design.
+    // ── Assertion 0: trusted auto-build failures fail install. ──
     assert!(
-        out.status.success(),
-        "install exit code MUST be 0 under the current soft-fail contract. \
+        !out.status.success(),
+        "install exit code MUST be non-zero when a trusted lifecycle script fails during \
+         auto-build. \
          Got: {:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
         out.status,
     );
 
     // ── Assertion 1: sandbox denial signal in stderr. ──
-    let combined = format!("{stderr}\n{stdout}");
     assert!(
         signals_sandbox_denial(&combined),
         "seccomp denial signal absent from install output. \
@@ -565,7 +564,7 @@ async fn postinstall_raw_packet_netlink_sockets_are_denied() {
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
     let combined = format!("{stderr}\n{stdout}");
 
-    if !out.status.success() {
+    if combined.contains("\"SECURITY_APPROVAL_REQUIRED\"") {
         assert_security_approval_scope(&out, "scripts-allow");
         let marker = lpm_built_marker(&project, FAMILY_DEP_NAME);
         assert!(
@@ -575,15 +574,6 @@ async fn postinstall_raw_packet_netlink_sockets_are_denied() {
         );
         return;
     }
-
-    // Soft-fail contract: install exits 0 even on lifecycle-script
-    // failure. Mirror the UDP case + TCP sibling.
-    assert!(
-        out.status.success(),
-        "install exit code MUST be 0 under the current soft-fail contract. \
-         Got: {:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
-        out.status,
-    );
 
     // L13 fail-closed: some kernel builds (notably the GitHub
     // Actions Ubuntu runners as of 2026-05) advertise landlock V4
@@ -606,6 +596,14 @@ async fn postinstall_raw_packet_netlink_sockets_are_denied() {
         );
         return;
     }
+
+    assert!(
+        out.status.success(),
+        "install exit code MUST be 0 when the socket-family probe confirms every \
+         family was denied and exits successfully. \
+         Got: {:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        out.status,
+    );
 
     // The seccomp filter denied each family — socket-probe exited
     // 0 in every case and the Node script printed

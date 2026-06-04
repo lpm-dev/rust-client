@@ -16,8 +16,12 @@
 
 mod support;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
 use support::{TempProject, lpm_with_registry};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Mount a scripted package on the mock registry. The package
 /// declares a `postinstall` script in its `package.json` — this is
@@ -54,10 +58,73 @@ async fn mount_scripted_pkg(mock: &MockRegistry, name: &str) {
     .await;
 }
 
+async fn mount_failing_scripted_pkg(mock: &MockRegistry, name: &str) {
+    let pkg_json = serde_json::json!({
+        "name": name,
+        "version": "1.0.0",
+        "license": "MIT",
+        "main": "index.js",
+        "scripts": {
+            "postinstall": "node fail.js"
+        },
+    });
+    mock.with_manifest_package(
+        pkg_json,
+        &[(
+            "fail.js",
+            br#"require('fs').writeFileSync('fail-marker.txt', 'ran');
+process.exit(1);
+"#,
+        )],
+    )
+    .await;
+}
+
 fn empty_project_with_dep(dep: &str) -> TempProject {
     TempProject::empty(&format!(
         r#"{{"name":"install-policy","version":"1.0.0","dependencies":{{"{dep}":"^1.0.0"}}}}"#
     ))
+}
+
+fn write_signed_unlock(project: &TempProject, scopes: &[&str]) {
+    let now = chrono::Utc::now();
+    let project_root = std::fs::canonicalize(project.path())
+        .expect("canonicalize temp project")
+        .to_string_lossy()
+        .to_string();
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "id": format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
+        "target": "project",
+        "project_root": project_root,
+        "scopes": scopes,
+        "limits": {},
+        "issued_at": now.to_rfc3339(),
+        "expires_at": (now + chrono::Duration::minutes(10)).to_rfc3339(),
+        "issuer": "user-presence",
+    });
+
+    let secret = [42u8; 32];
+    let security_dir = project.home().join(".lpm/security");
+    std::fs::create_dir_all(security_dir.join("unlocks")).expect("create security unlocks dir");
+    std::fs::write(security_dir.join("signing-secret.hex"), hex::encode(secret))
+        .expect("write security signing secret");
+
+    let mut mac = HmacSha256::new_from_slice(&secret).expect("valid hmac secret");
+    mac.update(&serde_json::to_vec(&payload).expect("serialize unlock payload"));
+    let signature = hex::encode(mac.finalize().into_bytes());
+    let envelope = serde_json::json!({
+        "payload": payload,
+        "signature": signature,
+    });
+    let unlock_id = envelope["payload"]["id"].as_str().unwrap();
+    std::fs::write(
+        security_dir
+            .join("unlocks")
+            .join(format!("{unlock_id}.json")),
+        serde_json::to_string_pretty(&envelope).expect("serialize unlock envelope"),
+    )
+    .expect("write signed unlock");
 }
 
 // ─── parse mutual-exclusion contract ─────────────────────────────────
@@ -277,6 +344,39 @@ async fn install_policy_allow_is_accepted_at_parse_time() {
             "--policy=allow must be parsed without clap errors, got stderr:\n{stderr}",
         );
     }
+}
+
+#[tokio::test]
+async fn install_auto_build_failing_script_exits_nonzero() {
+    let project = empty_project_with_dep("scripted-fail");
+    let mock = MockRegistry::start().await;
+    mount_failing_scripted_pkg(&mock, "scripted-fail").await;
+
+    write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--policy=allow", "--auto-build", "--no-sandbox"])
+        .output()
+        .expect("failed to run lpm install --auto-build");
+
+    assert!(
+        !output.status.success(),
+        "trusted auto-build failure must fail install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("postinstall failed")
+            || combined.contains("Auto-build failed")
+            || combined.contains("failed to build"),
+        "install must surface the failing lifecycle script, got:\n{combined}",
+    );
 }
 
 #[tokio::test]

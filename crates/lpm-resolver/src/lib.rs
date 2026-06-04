@@ -18,7 +18,7 @@ pub mod specifier;
 mod walker;
 
 pub use greedy::PeerConflictReport;
-pub use greedy::resolve_greedy_fused;
+pub use greedy::{resolve_greedy_fused, resolve_greedy_fused_with_cache};
 pub use npm_version::NpmVersion;
 pub use overrides::{
     NpmRangeMatcher, OverrideEntry, OverrideError, OverrideHit, OverrideSelector, OverrideSet,

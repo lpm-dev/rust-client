@@ -1143,14 +1143,17 @@ async fn upgrade_yes_marks_patch_invalidation_in_json() {
 }
 
 /// When the install pipeline fails after manifest mutation, the
-/// manifest and lockfile are restored byte-equal. Pins the rollback /
-/// restore path after upgrade now drops stale lockfiles before the
-/// internal install.
+/// manifest and lockfile are restored byte-equal, and any pre-existing
+/// install-hash is invalidated so the next bare install cannot fast-exit
+/// against a tree touched by the failed internal install.
 #[tokio::test]
-async fn upgrade_yes_install_failure_restores_manifest() {
+async fn upgrade_yes_install_failure_restores_manifest_and_invalidates_install_hash() {
     let project = TempProject::empty("");
     let mock = setup_up7_failed_install_fixture(&project).await;
     up7_write_lockfile(&project, &[(UP7_PKG, UP7_CURRENT)]);
+    let install_hash_path = project.path().join(".lpm").join("install-hash");
+    std::fs::create_dir_all(install_hash_path.parent().unwrap()).unwrap();
+    std::fs::write(&install_hash_path, "old-cache").unwrap();
     let before = project.read_file("package.json");
     let lockfile_before = project.read_file("lpm.lock");
 
@@ -1169,6 +1172,10 @@ async fn upgrade_yes_install_failure_restores_manifest() {
         lockfile_before,
         project.read_file("lpm.lock"),
         "lpm.lock must be restored byte-equal on install failure"
+    );
+    assert!(
+        !install_hash_path.exists(),
+        "failed upgrade must invalidate .lpm/install-hash after rollback"
     );
 }
 

@@ -13,7 +13,7 @@
 
 mod support;
 
-use support::mock_registry::{MockRegistry, make_tarball};
+use support::mock_registry::{MockRegistry, make_tarball, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_with_registry};
 
 /// Seed `project` with an installed-looking layout for `pkg@version`:
@@ -182,6 +182,116 @@ fn uninstall_preserves_lpm_lockb_alongside_lpm_lock_after_removal() {
     assert!(
         project.path().join("lpm.lockb").exists(),
         "lpm.lockb must remain alongside lpm.lock after uninstall"
+    );
+}
+
+#[test]
+fn uninstall_removes_package_when_install_hash_marker_is_directory() {
+    let project = TempProject::empty("");
+    seed_installed_package(&project, "corrupt-cache-marker", "1.0.0");
+    let install_hash = project.path().join(".lpm").join("install-hash");
+    std::fs::create_dir_all(&install_hash).expect("seed corrupt install-hash directory");
+
+    let out = lpm(&project)
+        .args(["uninstall", "corrupt-cache-marker"])
+        .output()
+        .expect("spawn lpm uninstall with corrupt install-hash marker");
+
+    assert!(
+        out.status.success(),
+        "corrupt cache marker must not block uninstall\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !install_hash.exists(),
+        "uninstall must invalidate the corrupt install-hash marker"
+    );
+    assert!(
+        !project
+            .path()
+            .join("node_modules/corrupt-cache-marker")
+            .exists(),
+        "uninstall must still remove the package from node_modules"
+    );
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert!(
+        pkg_json["dependencies"]
+            .as_object()
+            .is_none_or(|deps| !deps.contains_key("corrupt-cache-marker")),
+        "uninstall must remove the dependency from package.json; got: {pkg_json:#}"
+    );
+}
+
+#[tokio::test]
+async fn uninstall_scoped_package_removes_owned_bin_shim() {
+    let project = TempProject::empty(r#"{"name":"uninstall-scoped-bin","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "@smoke/scoped-cli",
+            "version": "1.0.0",
+            "bin": {
+                "scoped-smoke": "bin/scoped-smoke.js"
+            }
+        }),
+        &[(
+            "bin/scoped-smoke.js",
+            b"#!/usr/bin/env node\nconsole.log('scoped-smoke-ok')\n",
+        )],
+    );
+    mock.with_package("@smoke/scoped-cli", "1.0.0", &tarball)
+        .await;
+
+    let registry_url = mock.url();
+    let install = lpm_with_registry(&project, &registry_url)
+        .args(["install", "@smoke/scoped-cli@1.0.0"])
+        .output()
+        .expect("failed to run install for scoped CLI");
+    assert!(
+        install.status.success(),
+        "install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let shim = project.path().join("node_modules/.bin/scoped-smoke");
+    assert!(
+        shim.symlink_metadata().is_ok(),
+        "install must create the scoped CLI shim",
+    );
+
+    let uninstall = lpm(&project)
+        .args(["uninstall", "@smoke/scoped-cli"])
+        .output()
+        .expect("failed to run uninstall for scoped CLI");
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&uninstall.stdout),
+        String::from_utf8_lossy(&uninstall.stderr),
+    );
+
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert!(
+        pkg_json["dependencies"]
+            .as_object()
+            .is_none_or(|deps| !deps.contains_key("@smoke/scoped-cli")),
+        "uninstall must remove @smoke/scoped-cli from package.json; got: {pkg_json:#}",
+    );
+    assert!(
+        !project
+            .path()
+            .join("node_modules/@smoke/scoped-cli")
+            .exists(),
+        "uninstall must remove the scoped package directory",
+    );
+    assert!(
+        shim.symlink_metadata().is_err(),
+        "uninstall must remove the .bin shim owned by the scoped package; leftover target: {:?}",
+        std::fs::read_link(&shim),
     );
 }
 

@@ -3356,6 +3356,93 @@ fn install_workspace_caret_dep_resolves_to_local_member() {
     );
 }
 
+#[tokio::test]
+async fn install_direct_workspace_dep_installs_member_registry_deps_under_v2_store() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-direct-root-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "foo": "workspace:*"
+  }
+}"#,
+    );
+
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "external-leaf": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/index.js",
+        r#"module.exports = require("external-leaf")
+"#,
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "external-leaf",
+            "version": "1.0.0"
+        }),
+        &[("index.js", b"module.exports = 'from-registry'\n")],
+    )
+    .await;
+
+    let mut cmd = lpm_with_registry(&project, &mock.url());
+    cmd.env("LPM_STORE_VERSION", "v2");
+    let output = cmd
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run direct workspace install under v2 store");
+
+    assert!(
+        output.status.success(),
+        "v2 install should succeed for a direct workspace dep with registry transitives\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let foo_link = project.path().join("node_modules").join("foo");
+    let foo_meta = std::fs::symlink_metadata(&foo_link)
+        .unwrap_or_else(|e| panic!("node_modules/foo missing after v2 install: {e}"));
+    assert!(
+        foo_meta.file_type().is_symlink(),
+        "node_modules/foo must still be materialized as a symlink under v2"
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('foo'))")
+        .output()
+        .expect("spawn node runtime check");
+
+    assert!(
+        runtime.status.success(),
+        "direct workspace member should resolve its registry child after install\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "from-registry",
+        "runtime should resolve foo through its installed registry dependency",
+    );
+}
+
 /// In hoisted mode (`--linker hoisted`), a transitive dep must land at
 /// `node_modules/<C>` directly — flat npm-v3 layout — not nested under
 /// the package that pulled it in. Default isolated mode is exercised by
@@ -4081,6 +4168,273 @@ fn install_workspace_transitive_protocol_plants_sibling_root_symlink() {
 
     assert_root_symlink_resolves_to(&project, "foo", &foo_dir);
     assert_root_symlink_resolves_to(&project, "bar", &bar_dir);
+}
+
+#[tokio::test]
+async fn install_registry_transitive_dep_reenters_workspace_member() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-external-reentry-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}"#,
+    );
+    project.write_file(
+        "apps/app/package.json",
+        r#"{
+  "name": "@smoke/app",
+  "version": "1.0.0",
+  "dependencies": {
+    "@smoke/cycle-a": "workspace:*",
+    "external-reentry": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/cycle-a/package.json",
+        r#"{
+  "name": "@smoke/cycle-a",
+  "version": "1.0.0",
+  "dependencies": { "@smoke/cycle-b": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/cycle-b/package.json",
+        r#"{
+  "name": "@smoke/cycle-b",
+  "version": "1.0.0",
+  "dependencies": { "@smoke/cycle-a": "workspace:*" }
+}"#,
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "external-reentry",
+            "version": "1.0.0",
+            "dependencies": {
+                "@smoke/cycle-b": "1.0.0"
+            }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('@smoke/cycle-b').name;\n",
+        )],
+    )
+    .await;
+
+    let mut cmd = lpm_with_registry(&project, &mock.url());
+    cmd.current_dir(project.path().join("apps/app"));
+    let output = cmd
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run workspace external re-entry install");
+
+    assert!(
+        output.status.success(),
+        "install should resolve registry package transitive @smoke/cycle-b to the local workspace member\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let app_dir = project.path().join("apps/app");
+    let cycle_b_link = app_dir.join("node_modules/@smoke/cycle-b");
+    let cycle_b_resolved = cycle_b_link
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("failed to resolve {}: {e}", cycle_b_link.display()));
+    let cycle_b_expected = project
+        .path()
+        .join("packages/cycle-b")
+        .canonicalize()
+        .expect("resolve workspace cycle-b package");
+    assert_eq!(
+        cycle_b_resolved, cycle_b_expected,
+        "registry transitive @smoke/cycle-b dependency must re-enter the local workspace member",
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let leaked_cycle_b_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path().contains("cycle-b"))
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert!(
+        leaked_cycle_b_requests.is_empty(),
+        "install must not ask the registry for workspace member @smoke/cycle-b; leaked requests: {leaked_cycle_b_requests:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn install_registry_transitive_dep_reenters_workspace_member_under_v2_store() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-external-reentry-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}"#,
+    );
+    project.write_file(
+        "apps/app/package.json",
+        r#"{
+  "name": "@smoke/app",
+  "version": "1.0.0",
+  "dependencies": {
+    "@smoke/cycle-a": "workspace:*",
+    "external-reentry": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/cycle-a/package.json",
+        r#"{
+  "name": "@smoke/cycle-a",
+  "version": "1.0.0",
+  "dependencies": { "@smoke/cycle-b": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/cycle-b/package.json",
+        r#"{
+  "name": "@smoke/cycle-b",
+  "version": "1.0.0",
+  "dependencies": { "@smoke/cycle-a": "workspace:*" }
+}"#,
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "external-reentry",
+            "version": "1.0.0",
+            "dependencies": {
+                "@smoke/cycle-b": "1.0.0"
+            }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('@smoke/cycle-b').name;\n",
+        )],
+    )
+    .await;
+
+    let mut cmd = lpm_with_registry(&project, &mock.url());
+    cmd.env("LPM_STORE_VERSION", "v2");
+    cmd.current_dir(project.path().join("apps/app"));
+    let output = cmd
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run workspace external re-entry install under v2 store");
+
+    assert!(
+        output.status.success(),
+        "v2 install should resolve registry package transitive @smoke/cycle-b to the local workspace member without leaking to the registry\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let app_dir = project.path().join("apps/app");
+    let cycle_b_link = app_dir.join("node_modules/@smoke/cycle-b");
+    let cycle_b_resolved = cycle_b_link
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("failed to resolve {}: {e}", cycle_b_link.display()));
+    let cycle_b_expected = project
+        .path()
+        .join("packages/cycle-b")
+        .canonicalize()
+        .expect("resolve workspace cycle-b package");
+    assert_eq!(
+        cycle_b_resolved, cycle_b_expected,
+        "v2 install must still root-link the workspace member for direct workspace consumers",
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let leaked_cycle_b_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path().contains("cycle-b"))
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert!(
+        leaked_cycle_b_requests.is_empty(),
+        "v2 install must not ask the registry for workspace member @smoke/cycle-b; leaked requests: {leaked_cycle_b_requests:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn install_workspace_self_dependency_fails_without_writing_artifacts() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-self-loop-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/self-loop/package.json",
+        r#"{
+  "name": "@smoke/self-loop",
+  "version": "1.0.0",
+  "dependencies": {
+    "@smoke/self-loop": "workspace:*"
+  }
+}"#,
+    );
+
+    let mut cmd = lpm(&project);
+    cmd.current_dir(project.path().join("packages/self-loop"));
+    let output = cmd
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run workspace self-dependency install");
+
+    assert!(
+        !output.status.success(),
+        "self dependency must fail instead of self-linking\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("depends on itself") || stderr.contains("self-dependency"),
+        "error should explain the malformed self-dependency, got:\n{stderr}",
+    );
+    let member_dir = project.path().join("packages/self-loop");
+    assert!(
+        !member_dir.join("node_modules/@smoke/self-loop").exists(),
+        "self-dependency failure must not create a self-referential node_modules link",
+    );
+    assert!(
+        !member_dir.join("lpm.lock").exists() && !member_dir.join("lpm.lockb").exists(),
+        "self-dependency failure must happen before lockfiles are written",
+    );
 }
 
 /// Three-deep chain combining both discovery paths: root → foo via

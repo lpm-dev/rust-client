@@ -250,9 +250,8 @@ fn node_available() -> bool {
 /// failure, AND the forbidden file MUST NOT appear on disk.
 ///
 /// Three assertions, no scope creep:
-///   1. Install surfaces the script failure truthfully in stderr
-///      (the existing `output::warn("Auto-build failed: ...")` path,
-///      OR the rebuild pipeline's per-package error surface).
+///   1. Install exits non-zero and surfaces the script failure
+///      truthfully in stderr/stdout.
 ///   2. `.lpm-built` marker is absent for the synthetic dep.
 ///   3. The forbidden file is absent at `<project>/forbidden.txt`.
 ///
@@ -319,8 +318,9 @@ async fn postinstall_write_outside_allow_list_is_denied_marker_absent_file_absen
         .expect("spawn lpm install");
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let combined = format!("{stderr}\n{stdout}");
 
-    if !out.status.success() {
+    if combined.contains("\"SECURITY_APPROVAL_REQUIRED\"") {
         assert_security_approval_scope(&out, "scripts-allow");
         assert!(
             !forbidden_path.exists(),
@@ -334,34 +334,20 @@ async fn postinstall_write_outside_allow_list_is_denied_marker_absent_file_absen
         return;
     }
 
-    // ── Assertion 0: the install exit code is 0 (soft-fail contract). ──
-    //
-    // The install pipeline wraps auto-build failures in a soft
-    // `output::warn("Auto-build failed: ...")` (`install.rs:6920`),
-    // so the install exit code stays 0 even when a lifecycle script
-    // fails — the user gets a warning + a per-package "postinstall
-    // failed" line on stdout, but the install itself doesn't hard-
-    // fail. This test locks that contract: a future change that
-    // turns auto-build failures into hard install exits would
-    // surface here. If you intentionally tighten the contract to
-    // "auto-build failure → install exits non-zero," update this
-    // assertion AND the comment block on Assertion 1 (which
-    // describes the same contract) in the same commit so the test
-    // and its narration stay aligned.
+    // ── Assertion 0: trusted auto-build failures fail install. ──
     assert!(
-        out.status.success(),
-        "install exit code MUST be 0 under the current soft-fail contract — auto-build \
-         failures surface as warnings + per-package lines, not as install hard-fails. \
+        !out.status.success(),
+        "install exit code MUST be non-zero when a trusted lifecycle script fails during \
+         auto-build. \
          Got: {:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
         out.status,
     );
 
     // ── Assertion 1: install surfaces the failure truthfully. ──
     //
-    // Per the soft-fail contract pinned in Assertion 0, the install
-    // exit code is 0 — what we DO require is that the failure is
-    // VISIBLE somewhere in the user-facing output, with at least
-    // one signal from each of the two layers that observe it:
+    // The command must fail and make the cause visible somewhere in
+    // the user-facing output, with at least one signal from each of
+    // the two layers that observe it:
     //
     //   (a) The OS-level sandbox denial: EPERM (macOS Seatbelt) or
     //       EACCES (Linux landlock) appears in the script's stderr.
@@ -383,7 +369,6 @@ async fn postinstall_write_outside_allow_list_is_denied_marker_absent_file_absen
     //     sandbox enforcement → could be a transient network
     //     error, OOM, etc. — test would be giving false confidence
     //     in sandbox containment.
-    let combined = format!("{stderr}\n{stdout}");
     let signals_sandbox_denial = combined.contains("EPERM")
         || combined.contains("EACCES")
         || combined.contains("operation not permitted")

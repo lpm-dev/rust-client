@@ -1326,7 +1326,7 @@ pub async fn run(
 
         unknown => {
             return Err(LpmError::Script(format!(
-                "unknown vars action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, copy"
+                "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, copy"
             )));
         }
     }

@@ -686,6 +686,28 @@ fn env_check_without_lpm_json_env_schema_fails_with_helpful_message() {
 }
 
 #[test]
+fn env_set_invalid_key_reports_public_env_wording() {
+    let project = TempProject::empty(r#"{"name":"env-invalid-key","version":"1.0.0"}"#);
+
+    let out = lpm(&project)
+        .args(["env", "set", "BAD-NAME=value"])
+        .output()
+        .expect("failed to run lpm env set with invalid key");
+
+    assert!(!out.status.success(), "invalid env key must fail");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("env keys must match"),
+        "stderr must describe the public env key contract, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("vault keys"),
+        "env command errors must not leak internal vault wording, got:\n{stderr}",
+    );
+}
+
+#[test]
 fn env_unknown_action_lists_available_subcommands() {
     let project = TempProject::empty(r#"{"name":"env","version":"1.0.0"}"#);
 
@@ -700,6 +722,14 @@ fn env_unknown_action_lists_available_subcommands() {
     );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown env action"),
+        "stderr must name the public env command surface, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("unknown vars action"),
+        "stderr must not leak legacy vars wording, got:\n{stderr}",
+    );
     assert!(
         stderr.contains("set")
             && stderr.contains("get")

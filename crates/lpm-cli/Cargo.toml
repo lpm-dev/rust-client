@@ -94,6 +94,7 @@ flate2 = { workspace = true }
 
 # File collection
 glob = { workspace = true }
+pathdiff = { workspace = true }
 
 # URL encoding
 urlencoding = "2"

@@ -288,10 +288,10 @@ fn node_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Shared assertions block. Pins three
-/// assertions per case, plus the soft-fail contract; collected
-/// here so the primary and loopback-target cases stay in lock-
-/// step. A regression that diverges them would be a contract bug.
+/// Shared assertions block. Pins the same hard-fail contract and
+/// denial evidence per case so the primary and loopback-target
+/// cases stay in lock-step. A regression that diverges them would
+/// be a contract bug.
 async fn assert_network_denied(
     mock: &MockRegistry,
     project: &TempProject,
@@ -319,8 +319,9 @@ async fn assert_network_denied(
         .expect("spawn lpm install");
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let combined = format!("{stderr}\n{stdout}");
 
-    if !out.status.success() {
+    if combined.contains("\"SECURITY_APPROVAL_REQUIRED\"") {
         assert_security_approval_scope(&out, "scripts-allow");
         assert!(
             !lpm_built_marker(project, dep_name).exists(),
@@ -329,21 +330,11 @@ async fn assert_network_denied(
         return;
     }
 
-    // ── Assertion 0: install exit code 0 (soft-fail contract). ──
-    //
-    // Auto-build failures wrap in a soft `output::warn("Auto-build
-    // failed: ...")` (`install.rs:6920`) so the install exit code
-    // stays 0 even when a lifecycle script fails. This test pins
-    // the same contract for the network-denial path — a future
-    // change that turns auto-build failures into hard install
-    // exits would surface here. If you intentionally tighten the
-    // contract, update both this test AND
-    // `sandbox_filesystem_denial.rs`'s Assertion 0 in the same
-    // commit so they stay aligned.
+    // ── Assertion 0: trusted auto-build failures fail install. ──
     assert!(
-        out.status.success(),
-        "[{case_label}] install exit code MUST be 0 under the current soft-fail contract — \
-         auto-build failures surface as warnings + per-package lines, not hard fails. \
+        !out.status.success(),
+        "[{case_label}] install exit code MUST be non-zero when a trusted lifecycle \
+         script fails during auto-build. \
          Got: {:?}\nstderr:\n{stderr}\nstdout:\n{stdout}",
         out.status,
     );
@@ -393,7 +384,6 @@ async fn assert_network_denied(
     //     sandbox enforcement → could be transient network,
     //     OOM, etc. — test would give false confidence in
     //     sandbox containment.
-    let combined = format!("{stderr}\n{stdout}");
     // Windows AppContainer / WFP
     // surfaces denial as either WSAEACCES (10013, "operation not
     // permitted" / "EACCES" in Node's terminology) or as a silent
