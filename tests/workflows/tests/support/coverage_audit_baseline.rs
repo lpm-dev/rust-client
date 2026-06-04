@@ -21,7 +21,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 145;
+pub const EXPECTED_SURFACE_COUNT: usize = 152;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -35,6 +35,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Uninstall",
     "Add",
     "Publish",
+    "Stage",
     "Login",
     "Logout",
     "Setup",
@@ -1763,6 +1764,95 @@ pub const SURFACES: &[SurfaceBaseline] = &[
             "crates/lpm-cli/src/commands/hosts.rs",
             "crates/lpm-runner/src/local_domains.rs",
             "tests/workflows/tests/hosts.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 146,
+        name: "`lpm stage publish`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/npm_stage.rs",
+            "crates/lpm-cli/src/commands/stage.rs",
+            "tests/workflows/tests/stage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 147,
+        name: "`lpm stage publish --dry-run`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &["tests/workflows/tests/stage.rs"],
+    },
+    SurfaceBaseline {
+        id: 148,
+        name: "`lpm stage list [package]`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/npm_stage.rs",
+            "tests/workflows/tests/stage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 149,
+        name: "`lpm stage view <stage-id>`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/npm_stage.rs",
+            "tests/workflows/tests/stage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 150,
+        name: "`lpm stage approve <stage-id>`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/npm_stage.rs",
+            "tests/workflows/tests/stage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 151,
+        name: "`lpm stage reject <stage-id>`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/npm_stage.rs",
+            "tests/workflows/tests/stage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 152,
+        name: "`lpm stage download <stage-id>`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: true,
+        references: &[
+            "crates/lpm-cli/src/commands/npm_stage.rs",
+            "tests/workflows/tests/stage.rs",
         ],
     },
 ];

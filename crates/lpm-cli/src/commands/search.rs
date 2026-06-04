@@ -15,8 +15,9 @@ pub async fn run(
         prepare_routed_read_context(client, project_dir, &[query.to_string()], json_output)?;
     let route = search_route_for_query(&context.route_table, query);
     if !json_output {
+        let registry_label = search_registry_label(&context.client, &route);
         install_ui::phase(&format!(
-            "Searching lpm.dev for \"{}\"",
+            "Searching {registry_label} for \"{}\"",
             install_ui::cyan(query)
         ));
     }
@@ -77,6 +78,18 @@ pub async fn run(
     Ok(())
 }
 
+fn search_registry_label(client: &RegistryClient, route: &lpm_registry::UpstreamRoute) -> String {
+    match route {
+        lpm_registry::UpstreamRoute::LpmWorker => "lpm.dev".to_string(),
+        lpm_registry::UpstreamRoute::NpmDirect => {
+            install_ui::short_registry_host(client.npm_registry_url())
+        }
+        lpm_registry::UpstreamRoute::Custom { target, .. } => {
+            install_ui::short_registry_host(target.base_url.as_ref())
+        }
+    }
+}
+
 fn truncate_description(description: &str, max_chars: usize) -> String {
     if description.chars().count() <= max_chars {
         return description.to_string();
@@ -120,7 +133,8 @@ fn format_search_metadata(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_search_metadata, truncate_description};
+    use super::{format_search_metadata, search_registry_label, truncate_description};
+    use lpm_registry::RegistryClient;
 
     #[test]
     fn search_metadata_includes_latest_quality_and_ecosystem() {
@@ -139,6 +153,16 @@ mod tests {
                 .chars()
                 .count(),
             80
+        );
+    }
+
+    #[test]
+    fn search_registry_label_names_default_npm_registry_for_direct_route() {
+        let client = RegistryClient::new();
+
+        assert_eq!(
+            search_registry_label(&client, &lpm_registry::UpstreamRoute::NpmDirect),
+            "npmjs.org"
         );
     }
 }

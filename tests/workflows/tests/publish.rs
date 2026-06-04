@@ -6,6 +6,11 @@ mod support;
 
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, ResponseTemplate};
+
+const NPM_ID_TOKEN: &str = "publish-oidc-id-token";
+const OIDC_NPM_TOKEN: &str = "publish-oidc-exchanged-token";
 
 // ─── Dry Run ─────────────────────────────────────────────────────
 
@@ -429,6 +434,64 @@ catalog:
         serde_json::to_string_pretty(&published_package_json)
             .expect("published manifest must serialize")
     );
+}
+
+#[tokio::test]
+async fn publish_npm_uses_trusted_publishing_token_exchange() {
+    let mock = MockRegistry::start().await;
+    let package = "oidc-publish-pkg";
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/-/npm/v1/oidc/token/exchange/package/{package}"
+        )))
+        .and(header("authorization", format!("Bearer {NPM_ID_TOKEN}")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "token_type": "oidc",
+            "token": OIDC_NPM_TOKEN,
+        })))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/{package}")))
+        .and(header("authorization", format!("Bearer {OIDC_NPM_TOKEN}")))
+        .and(header("npm-command", "publish"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "oidc-publish-pkg",
+        "version": "1.0.0",
+        "description": "npm Trusted Publishing workflow test",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+    );
+
+    let output = lpm(&project)
+        .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .args(["--json", "publish", "--npm", "--yes"])
+        .output()
+        .expect("failed to run lpm publish --npm with npm OIDC");
+
+    assert!(
+        output.status.success(),
+        "npm publish must succeed with Trusted Publishing\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("publish JSON output must be valid JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["results"][0]["registry"], serde_json::json!("npm"));
+    assert_eq!(envelope["results"][0]["auth"], serde_json::json!("oidc"));
 }
 
 // ─── Multi-target flags ──────────────────────────────────────────
