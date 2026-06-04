@@ -466,10 +466,9 @@ fn emit_outdated_human(
 
     if !outdated.is_empty() {
         println!();
-        println!("  {} outdated:", outdated.len().to_string().bold(),);
         let widths = OutdatedTableWidths::for_rows(outdated);
         println!(
-            "  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}",
             format!("{:<width$}", "Package", width = widths.package).dimmed(),
             format!("{:<width$}", "Current", width = widths.current).dimmed(),
             format!("{:<width$}", "Wanted", width = widths.wanted).dimmed(),
@@ -494,7 +493,7 @@ fn emit_outdated_human(
                 String::new()
             };
             println!(
-                "  {}  {}  {}  {}  {}{}",
+                "{}  {}  {}  {}  {}{}",
                 package_col,
                 current_col,
                 wanted_col,
@@ -503,11 +502,6 @@ fn emit_outdated_human(
                 spec_suffix,
             );
         }
-        println!();
-        install_ui::phase(
-            "Run `lpm global update <pkg>` to upgrade one, or \
-             `lpm global update` to upgrade every outdated install.",
-        );
         println!();
     }
     if !unresolved.is_empty() {
@@ -532,6 +526,14 @@ fn emit_outdated_human(
             "{} up-to-date: {}",
             up_to_date.len(),
             names_safe.join(", ").dimmed(),
+        ));
+    }
+    if unresolved.is_empty() {
+        let checked_count = outdated.len() + up_to_date.len();
+        install_ui::done(&format!(
+            "{} global package{} installed",
+            checked_count,
+            if checked_count == 1 { "" } else { "s" },
         ));
     }
 }

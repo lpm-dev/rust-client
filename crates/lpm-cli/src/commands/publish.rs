@@ -884,17 +884,12 @@ pub async fn run(
                         lpm_version_data["_npmProvenanceAttestations"] = bundle_json;
                     }
 
-                    if !json_output {
-                        print_upload_phase(
-                            "lpm.dev",
-                            lpm_name,
-                            &version,
-                            lpm_visibility(&pkg_json),
-                            "latest",
-                        );
-                    }
-
-                    publish_to_lpm(
+                    let upload_spinner = if json_output {
+                        None
+                    } else {
+                        Some(install_ui::spin(&format_upload_message("lpm.dev")))
+                    };
+                    let response = publish_to_lpm(
                         client,
                         project_dir,
                         lpm_name,
@@ -908,7 +903,12 @@ pub async fn run(
                         &detected_ecosystem,
                         &swift_manifest,
                     )
-                    .await
+                    .await?;
+                    drop(upload_spinner);
+                    if !json_output {
+                        print_upload_details(lpm_name, &version, lpm_visibility(&pkg_json), "latest");
+                    }
+                    Ok(response)
                 }
                 .await;
 
@@ -1071,15 +1071,6 @@ pub async fn run(
                         _ => publish_npm::resolve_npm_access(npm_name_str, npm_config),
                     };
                     let npm_tag = publish_npm::resolve_npm_tag(npm_config);
-                    if !json_output {
-                        print_upload_phase(
-                            display,
-                            npm_name_str,
-                            &version,
-                            visibility_from_access(&npm_access),
-                            &npm_tag,
-                        );
-                    }
 
                     // OTP preemption
                     let registry_key_for_otp = match target {
@@ -1105,6 +1096,11 @@ pub async fn run(
                     })
                     .await?;
 
+                    let upload_spinner = if json_output {
+                        None
+                    } else {
+                        Some(install_ui::spin(&format_upload_message(display)))
+                    };
                     let npm_result = publish_npm::publish_to_npm(
                         &token,
                         npm_name_str,
@@ -1119,6 +1115,15 @@ pub async fn run(
                         yes,
                     )
                     .await?;
+                    drop(upload_spinner);
+                    if !json_output {
+                        print_upload_details(
+                            npm_name_str,
+                            &version,
+                            visibility_from_access(&npm_access),
+                            &npm_tag,
+                        );
+                    }
 
                     if npm_result.success {
                         if !json_output {
@@ -1745,17 +1750,11 @@ fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn print_upload_phase(
-    registry: &str,
-    target_name: &str,
-    version: &str,
-    visibility: &str,
-    dist_tag: &str,
-) {
-    install_ui::phase(&format!(
-        "Uploading tarball to {}",
-        install_ui::yellow(registry)
-    ));
+fn format_upload_message(registry: &str) -> String {
+    format!("Uploading tarball to {}", install_ui::yellow(registry))
+}
+
+fn print_upload_details(target_name: &str, version: &str, visibility: &str, dist_tag: &str) {
     publish_detail(
         "target",
         &install_ui::yellow(&format!("{target_name}@{version}")),

@@ -266,6 +266,12 @@ async fn global_list_outdated_human_output_uses_current_wanted_latest_bins_table
             && combined.contains("demo"),
         "outdated table must include current, wanted, absolute latest, and bins, got:\n{combined}"
     );
+    assert!(
+        !combined.contains("outdated:")
+            && !combined.contains("Run `lpm global update")
+            && combined.contains("✓ 1 global package installed"),
+        "outdated output must match the slim table-only shape, got:\n{combined}"
+    );
 }
 
 #[tokio::test]

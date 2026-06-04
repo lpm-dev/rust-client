@@ -70,6 +70,40 @@ async fn stage_publish_posts_rewritten_payload_to_npm_stage_endpoint() {
 }
 
 #[tokio::test]
+async fn stage_publish_human_output_uses_slim_upload_transcript() {
+    let mock = MockRegistry::start().await;
+    mount_package_metadata(&mock, "@scope/staged-pkg", serde_json::json!({"0.9.0": {}})).await;
+    mount_stage_publish(&mock, "@scope/staged-pkg").await;
+    let project = stage_project();
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args(["stage", "publish", "--yes", "--npm-registry", &mock.url()])
+        .output()
+        .expect("failed to run lpm stage publish");
+
+    assert!(
+        output.status.success(),
+        "stage publish must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "stage publish human status must stay off stdout, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("✓ Secret scan passed")
+            && stderr.contains("✓ Quality score:")
+            && stderr.contains("› Staging @scope/staged-pkg@1.0.0 to npm")
+            && stderr.contains("✓ Done · staged @scope/staged-pkg@1.0.0 with id 123e4567-e89b-12d3-a456-426614174000 in"),
+        "stage publish human output should use the slim contract, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn stage_publish_uses_npm_trusted_publishing_token_exchange() {
     let mock = MockRegistry::start().await;
     mount_npm_oidc_exchange(&mock, "@scope/staged-pkg").await;
@@ -307,6 +341,31 @@ async fn stage_list_returns_json_envelope() {
 }
 
 #[tokio::test]
+async fn stage_list_human_output_prints_stage_items_on_stdout() {
+    let mock = MockRegistry::start().await;
+    mount_stage_list_page(&mock, 0, "pkg", vec![stage_item("a")], 1).await;
+    let project = TempProject::empty(r#"{"name":"stage-list","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args(["stage", "list", "pkg", "--npm-registry", &mock.url()])
+        .output()
+        .expect("failed to run lpm stage list");
+
+    assert!(
+        output.status.success(),
+        "stage list must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("a @scope/staged-pkg@1.0.0 latest"),
+        "stage list human answer must print the staged item, got:\n{stdout}"
+    );
+}
+
+#[tokio::test]
 async fn stage_list_fetches_second_page_when_first_page_is_full() {
     let mock = MockRegistry::start().await;
     let first_page: Vec<_> = (0..100)
@@ -377,6 +436,36 @@ async fn stage_view_returns_json_envelope() {
 }
 
 #[tokio::test]
+async fn stage_view_human_output_prints_stage_item_on_stdout() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/-/stage/{STAGE_ID}")))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(stage_item(STAGE_ID)))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"stage-view","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args(["stage", "view", STAGE_ID, "--npm-registry", &mock.url()])
+        .output()
+        .expect("failed to run lpm stage view");
+
+    assert!(
+        output.status.success(),
+        "stage view must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("123e4567-e89b-12d3-a456-426614174000 @scope/staged-pkg@1.0.0 latest"),
+        "stage view human answer must print the staged item, got:\n{stdout}"
+    );
+}
+
+#[tokio::test]
 async fn stage_approve_sends_otp_to_approve_endpoint() {
     let mock = MockRegistry::start().await;
     Mock::given(method("POST"))
@@ -413,6 +502,47 @@ async fn stage_approve_sends_otp_to_approve_endpoint() {
 }
 
 #[tokio::test]
+async fn stage_approve_human_output_reports_approved_stage() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/-/stage/{STAGE_ID}/approve")))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .and(header("npm-otp", "123456"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true
+        })))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"stage-approve","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "stage",
+            "approve",
+            STAGE_ID,
+            "--otp",
+            "123456",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage approve");
+
+    assert!(output.status.success(), "stage approve must succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "stage approve human status must stay off stdout, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("✓ Staged package 123e4567-e89b-12d3-a456-426614174000 approved"),
+        "stage approve human output must report approval, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn stage_reject_deletes_stage_endpoint_with_otp() {
     let mock = MockRegistry::start().await;
     Mock::given(method("DELETE"))
@@ -444,6 +574,45 @@ async fn stage_reject_deletes_stage_endpoint_with_otp() {
     insta::with_settings!({ filters => stage_json_filters() }, {
         insta::assert_json_snapshot!("stage_reject_json_envelope", envelope);
     });
+}
+
+#[tokio::test]
+async fn stage_reject_human_output_reports_rejected_stage() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/-/stage/{STAGE_ID}")))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .and(header("npm-otp", "123456"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"stage-reject","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "stage",
+            "reject",
+            STAGE_ID,
+            "--otp",
+            "123456",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage reject");
+
+    assert!(output.status.success(), "stage reject must succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "stage reject human status must stay off stdout, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("✓ Staged package 123e4567-e89b-12d3-a456-426614174000 rejected"),
+        "stage reject human output must report rejection, got:\n{stderr}"
+    );
 }
 
 #[tokio::test]
@@ -489,6 +658,38 @@ async fn stage_download_writes_tarball_named_from_manifest() {
     ]}, {
         insta::assert_json_snapshot!("stage_download_json_envelope", envelope);
     });
+}
+
+#[tokio::test]
+async fn stage_download_human_output_reports_downloaded_tarball_path() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("@scope/staged-pkg", "1.0.0");
+    Mock::given(method("GET"))
+        .and(path(format!("/-/stage/{STAGE_ID}/tarball")))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"stage-download","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args(["stage", "download", STAGE_ID, "--npm-registry", &mock.url()])
+        .output()
+        .expect("failed to run lpm stage download");
+
+    assert!(output.status.success(), "stage download must succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.trim().is_empty(),
+        "stage download human status must stay off stdout, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("✓ Downloaded staged package to")
+            && stderr.contains("scope-staged-pkg-1.0.0-123e4567-e89b-12d3-a456-426614174000.tgz"),
+        "stage download human output must report the written tarball, got:\n{stderr}"
+    );
 }
 
 #[test]

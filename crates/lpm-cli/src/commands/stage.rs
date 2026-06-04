@@ -111,12 +111,14 @@ pub(crate) async fn publish_current_project(
     })
     .await?;
 
-    if !options.json_output {
-        install_ui::phase(&format!(
+    let upload_spinner = if options.json_output {
+        None
+    } else {
+        Some(install_ui::spin(&format!(
             "Staging {} to npm",
             install_ui::yellow(&format!("{}@{}", npm_name, prepared.version))
-        ));
-    }
+        )))
+    };
 
     let result = npm_stage::stage_publish(
         auth.token(),
@@ -129,6 +131,9 @@ pub(crate) async fn publish_current_project(
         &registry,
     )
     .await?;
+    if let Some(spinner) = upload_spinner {
+        spinner.settle();
+    }
 
     if options.json_output {
         print_json(serde_json::json!({
@@ -145,7 +150,7 @@ pub(crate) async fn publish_current_project(
         install_ui::done(&format!(
             "Done · staged {} with id {} in {elapsed}",
             install_ui::yellow(&format!("{}@{}", npm_name, prepared.version)),
-            install_ui::yellow(&result.stage_id),
+            install_ui::cyan(&result.stage_id),
         ));
     }
 
@@ -256,7 +261,7 @@ pub(crate) async fn download(
     } else {
         install_ui::done(&format!(
             "Downloaded staged package to {}",
-            install_ui::yellow(&result.path.display().to_string())
+            install_ui::cyan(&result.path.display().to_string())
         ));
     }
 
@@ -295,7 +300,7 @@ async fn mutate_stage(
     } else {
         install_ui::done(&format!(
             "Staged package {} {action}",
-            install_ui::yellow(stage_id)
+            install_ui::cyan(stage_id)
         ));
     }
 
@@ -420,9 +425,9 @@ fn print_stage_item(item: &serde_json::Value) {
 
     println!(
         "{} {} {}",
-        install_ui::yellow(id),
+        install_ui::cyan(id),
         install_ui::yellow(&format!("{package}@{version}")),
-        tag
+        install_ui::yellow(tag)
     );
 }
 
