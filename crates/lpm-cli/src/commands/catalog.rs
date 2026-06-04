@@ -142,6 +142,14 @@ fn show_resolved_catalog_entries(cwd: &Path, json_output: bool) -> Result<(), Lp
         ))
     })?;
 
+    let missing = missing_catalog_snapshot_references(&context.references, &lockfile.catalogs);
+    if !missing.is_empty() {
+        return Err(LpmError::Registry(format!(
+            "lpm.lock is missing resolved catalog snapshots for {}. Run `lpm install` to refresh the lockfile.",
+            missing.join(", ")
+        )));
+    }
+
     let mut entries = Vec::new();
     for (catalog, packages) in &lockfile.catalogs {
         for (package, entry) in packages {
@@ -166,6 +174,24 @@ fn show_resolved_catalog_entries(cwd: &Path, json_output: bool) -> Result<(), Lp
         print_resolved_catalog_entries(&entries);
         Ok(())
     }
+}
+
+fn missing_catalog_snapshot_references(
+    references: &lpm_workspace::CatalogReferences,
+    snapshots: &lpm_lockfile::CatalogSnapshots,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for (catalog, packages) in references {
+        for package in packages {
+            if !snapshots
+                .get(catalog)
+                .is_some_and(|entries| entries.contains_key(package))
+            {
+                missing.push(format!("{catalog}/{package}"));
+            }
+        }
+    }
+    missing
 }
 
 fn load_catalog_context(cwd: &Path) -> Result<CatalogContext, LpmError> {

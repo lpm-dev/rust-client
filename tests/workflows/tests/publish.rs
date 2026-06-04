@@ -512,6 +512,52 @@ fn publish_custom_registry_dry_run_json_surfaces_registry_url_and_resolved_name(
     assert_eq!(targets[0]["name"], serde_json::json!("custom-publish-pkg"));
 }
 
+#[test]
+fn publish_custom_registry_dry_run_rejects_http_cli_url() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "custom-http-publish-pkg",
+        "version": "1.2.3",
+        "description": "Custom registry HTTP dry-run test",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+
+    project.write_file("index.js", "module.exports = {}");
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "publish",
+            "--publish-registry",
+            "http://packages.example.test/npm",
+            "--dry-run",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to run lpm publish --publish-registry http:// --dry-run --json");
+
+    assert!(
+        !output.status.success(),
+        "publish dry-run must reject insecure custom registry URLs:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("publish HTTP registry rejection must be valid JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"].as_str().is_some_and(|error| {
+            error.contains("http://packages.example.test/npm") && error.contains("HTTPS")
+        }),
+        "HTTP registry rejection must name the URL and HTTPS requirement: {envelope:#}",
+    );
+}
+
 // ─── --github / --gitlab provider flags ───────────────────────────────
 //
 // The github/gitlab targets eventually hit GitHub Packages and GitLab

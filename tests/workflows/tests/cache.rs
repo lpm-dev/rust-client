@@ -21,6 +21,36 @@ fn seed_subcat(project: &TempProject, subcat: &str, filename: &str, bytes: &[u8]
     std::fs::write(dir.join(filename), bytes).expect("failed to seed cache file");
 }
 
+#[test]
+fn cache_prune_apply_json_exits_nonzero_when_tombstone_sweep_fails() {
+    let project = TempProject::empty(r#"{"name":"cache-prune","version":"1.0.0"}"#);
+    let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
+    std::fs::create_dir_all(root.global_root()).expect("create global root");
+    std::fs::write(root.global_manifest(), b"@@@ not valid toml @@@")
+        .expect("write corrupt global manifest");
+
+    let output = lpm(&project)
+        .args(["--json", "cache", "prune", "--apply"])
+        .output()
+        .expect("failed to run lpm cache prune --apply --json");
+
+    assert!(
+        !output.status.success(),
+        "cache prune --apply must fail when tombstone sweep fails\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("cache prune --json must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["tombstone_sweep_error"].as_str().is_some(),
+        "failed sweep must surface a machine-readable reason: {envelope}",
+    );
+}
+
 #[tokio::test]
 async fn cache_status_json_reports_local_usage_and_remote_status() {
     let server = MockServer::start().await;

@@ -270,3 +270,77 @@ fn security_unlock_bundle_rejects_package_filters_before_interactive_guard() {
     assert!(error.contains("`--package`"), "unexpected error: {error}");
     assert!(error.contains("default"), "unexpected error: {error}");
 }
+
+#[test]
+fn security_unlock_rejects_empty_package_filter_before_interactive_guard() {
+    let project = TempProject::empty(r#"{"name":"security-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "security",
+            "unlock",
+            "provenance-unverified",
+            "--package",
+            "   ",
+        ])
+        .output()
+        .expect("failed to run lpm --json security unlock provenance-unverified --package blank");
+
+    assert!(
+        !output.status.success(),
+        "empty package filter must fail before approval"
+    );
+
+    let envelope = json_output(
+        &output,
+        "lpm --json security unlock provenance-unverified --package blank",
+    );
+    assert_eq!(envelope["success"], serde_json::json!(false));
+
+    let error = envelope["error"]
+        .as_str()
+        .expect("error envelope must include a message");
+    assert!(error.contains("`--package`"), "unexpected error: {error}");
+    assert!(
+        error.contains("must not be empty"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn security_lock_rejects_empty_package_filter() {
+    let project = TempProject::empty(r#"{"name":"security-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "security",
+            "lock",
+            "provenance-unverified",
+            "--package",
+            "",
+        ])
+        .output()
+        .expect("failed to run lpm --json security lock provenance-unverified --package blank");
+
+    assert!(
+        !output.status.success(),
+        "empty lock package filter must fail"
+    );
+
+    let envelope = json_output(
+        &output,
+        "lpm --json security lock provenance-unverified --package blank",
+    );
+    assert_eq!(envelope["success"], serde_json::json!(false));
+
+    let error = envelope["error"]
+        .as_str()
+        .expect("error envelope must include a message");
+    assert!(error.contains("`--package`"), "unexpected error: {error}");
+    assert!(
+        error.contains("must not be empty"),
+        "unexpected error: {error}"
+    );
+}

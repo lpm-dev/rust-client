@@ -584,14 +584,16 @@ async fn run_under_store_lock(
         let mut approved: Vec<&BlockedPackage> = Vec::new();
         let skipped: Vec<&BlockedPackage> = Vec::new();
 
-        let target = find_blocked_by_arg(&effective_state.blocked_packages, arg);
-        let target = match target {
-            Some(t) => t,
-            None => {
+        let target = match lookup_blocked_by_arg(&effective_state.blocked_packages, arg) {
+            BlockedLookup::Match(target) => target,
+            BlockedLookup::NotFound => {
                 // Was the arg in the persisted (unfiltered) state? If so,
                 // it must have been filtered out by current trust →
                 // already approved.
-                if find_blocked_by_arg(&state.blocked_packages, arg).is_some() {
+                if !matches!(
+                    lookup_blocked_by_arg(&state.blocked_packages, arg),
+                    BlockedLookup::NotFound
+                ) {
                     return Err(LpmError::Script(format!(
                         "package '{arg}' is already approved (current binding matches). \
                          Run `lpm install` to refresh the blocked set, or pass `--list` to see what's still blocked."
@@ -599,6 +601,20 @@ async fn run_under_store_lock(
                 }
                 return Err(LpmError::NotFound(format!(
                     "package '{arg}' is not in the blocked set. Run `lpm approve-scripts --list` to see what's blocked."
+                )));
+            }
+            BlockedLookup::Ambiguous { candidates } => {
+                let mut keys: Vec<String> = candidates
+                    .iter()
+                    .map(|blocked| format!("{}@{}", blocked.name, blocked.version))
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                return Err(LpmError::Script(format!(
+                    "package '{arg}' is ambiguous in the blocked set — {} rows match. \
+                     Re-run with `name@version` to disambiguate. Candidates: {}",
+                    candidates.len(),
+                    keys.join(", "),
                 )));
             }
         };
@@ -1139,24 +1155,48 @@ fn print_version_diff_card_for_blocked(blocked: &BlockedPackage, trusted: &Trust
 
 /// Find a blocked package matching either `name` or `name@version`.
 /// Used by the `<pkg>` argument path.
+#[cfg(test)]
 fn find_blocked_by_arg<'a>(blocked: &'a [BlockedPackage], arg: &str) -> Option<&'a BlockedPackage> {
-    // Case 1: name@version (exact match)
-    // Case 2: bare name (returns the FIRST entry with that name)
-    //
-    // For scoped packages like `@scope/pkg@1.0.0`, the LAST `@` is the
-    // separator (the leading `@` is part of the scope).
+    match lookup_blocked_by_arg(blocked, arg) {
+        BlockedLookup::Match(blocked) => Some(blocked),
+        BlockedLookup::NotFound | BlockedLookup::Ambiguous { .. } => None,
+    }
+}
+
+#[derive(Debug)]
+enum BlockedLookup<'a> {
+    Match(&'a BlockedPackage),
+    NotFound,
+    Ambiguous { candidates: Vec<&'a BlockedPackage> },
+}
+
+fn lookup_blocked_by_arg<'a>(blocked: &'a [BlockedPackage], arg: &str) -> BlockedLookup<'a> {
     if let Some(at) = arg.rfind('@') {
         // arg COULD be `name@version` OR a scoped name `@scope/pkg`.
         // Distinguish: if the `@` is at position 0, it's the scope marker.
         if at > 0 {
             let (name, version) = (&arg[..at], &arg[at + 1..]);
-            return blocked
+            let matches: Vec<&BlockedPackage> = blocked
                 .iter()
-                .find(|b| b.name == name && b.version == version);
+                .filter(|b| b.name == name && b.version == version)
+                .collect();
+            return match matches.as_slice() {
+                [] => BlockedLookup::NotFound,
+                [single] => BlockedLookup::Match(single),
+                _ => BlockedLookup::Ambiguous {
+                    candidates: matches,
+                },
+            };
         }
     }
-    // Bare name lookup
-    blocked.iter().find(|b| b.name == arg)
+    let matches: Vec<&BlockedPackage> = blocked.iter().filter(|b| b.name == arg).collect();
+    match matches.as_slice() {
+        [] => BlockedLookup::NotFound,
+        [single] => BlockedLookup::Match(single),
+        _ => BlockedLookup::Ambiguous {
+            candidates: matches,
+        },
+    }
 }
 
 /// Extract `lpm.trustedDependencies` from a parsed manifest into a typed
@@ -1798,8 +1838,25 @@ async fn run_global_under_store_lock(
         return Ok(());
     }
 
+    if yes && !aggregate.unreadable_origins.is_empty() {
+        return Err(global_blocked_set_incomplete_error(
+            &aggregate.unreadable_origins,
+        ));
+    }
+
     // ── Empty set short-circuit (same as project-scoped run) ────
     if aggregate.rows.is_empty() {
+        if let Some(arg) = package {
+            if !aggregate.unreadable_origins.is_empty() {
+                return Err(global_blocked_set_incomplete_error(
+                    &aggregate.unreadable_origins,
+                ));
+            }
+            return Err(LpmError::NotFound(format!(
+                "package '{arg}' is not in the global blocked set. Run \
+                 `lpm approve-scripts --global --list` to see what's blocked."
+            )));
+        }
         if json_output {
             // close-out `dry_run` echoed for
             // schema-level uniformity — see the matching comment
@@ -1895,6 +1952,14 @@ async fn run_global_under_store_lock(
         runtime_enforce,
     )
     .await
+}
+
+fn global_blocked_set_incomplete_error(unreadable_origins: &[String]) -> LpmError {
+    LpmError::Registry(format!(
+        "global blocked set is incomplete: missing or unreadable build-state for {}. \
+         Reinstall those globals before approving scripts.",
+        unreadable_origins.join(", ")
+    ))
 }
 
 /// `--list` implementation: print the aggregate read-only. `--group`
@@ -2283,6 +2348,11 @@ async fn run_global_named(
     let row = match lookup_aggregate_by_arg(&aggregate.rows, arg) {
         AggregateLookup::Match(row) => row,
         AggregateLookup::NotFound => {
+            if !aggregate.unreadable_origins.is_empty() {
+                return Err(global_blocked_set_incomplete_error(
+                    &aggregate.unreadable_origins,
+                ));
+            }
             return Err(LpmError::NotFound(format!(
                 "package '{arg}' is not in the global blocked set. Run \
                  `lpm approve-scripts --global --list` to see what's blocked."

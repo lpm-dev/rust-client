@@ -140,6 +140,45 @@ fn trust_diff_reports_added_binding_against_snapshot() {
 }
 
 #[test]
+fn trust_diff_global_json_reports_added_binding_against_snapshot() {
+    let project = TempProject::empty(r#"{}"#);
+
+    write_trust_snapshot(
+        &project,
+        json!({ "esbuild@0.25.1": { "integrity": "sha512-e", "scriptHash": null } }),
+    );
+    write_pkg_with_trust(
+        &project,
+        json!({
+            "esbuild@0.25.1": { "integrity": "sha512-e" },
+            "sharp@0.33.0": { "integrity": "sha512-s" }
+        }),
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "trust", "diff"])
+        .output()
+        .expect("failed to run lpm --json trust diff");
+
+    assert!(
+        output.status.success(),
+        "global --json trust diff failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("lpm --json trust diff must emit one valid JSON document: {e}\n---\n{stdout}")
+    });
+
+    assert_eq!(envelope["success"], json!(true));
+    assert_eq!(envelope["command"], json!("trust diff"));
+    assert_eq!(envelope["diff_count"], json!(1));
+    assert_eq!(envelope["added"][0]["key"], json!("sharp@0.33.0"));
+}
+
+#[test]
 fn trust_diff_reports_removed_binding_when_manifest_dropped_an_entry() {
     let project = TempProject::empty(r#"{}"#);
 
@@ -325,6 +364,46 @@ fn trust_diff_assert_none_exits_nonzero_when_diff_entries_exist() {
 }
 
 #[test]
+fn trust_diff_json_assert_none_failure_emits_single_diff_envelope() {
+    let project = TempProject::empty(r#"{}"#);
+
+    write_trust_snapshot(
+        &project,
+        json!({ "esbuild@0.25.1": { "integrity": "sha512-e" } }),
+    );
+    write_pkg_with_trust(
+        &project,
+        json!({
+            "esbuild@0.25.1": { "integrity": "sha512-e" },
+            "sharp@0.33.0": { "integrity": "sha512-s" }
+        }),
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "trust", "diff", "--assert-none"])
+        .output()
+        .expect("failed to run lpm --json trust diff --assert-none");
+
+    assert!(
+        !output.status.success(),
+        "global --json trust diff --assert-none must fail when entries exist"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "assert-none failure must emit one valid JSON document on stdout: {e}\n---\n{stdout}"
+        )
+    });
+
+    assert_eq!(envelope["success"], json!(false));
+    assert_eq!(envelope["command"], json!("trust diff"));
+    assert_eq!(envelope["assertion_failed"], json!(true));
+    assert_eq!(envelope["error_code"], json!("trust_diff_assert_none"));
+    assert_eq!(envelope["diff_count"], json!(1));
+    assert_eq!(envelope["added"][0]["key"], json!("sharp@0.33.0"));
+}
+
+#[test]
 fn trust_diff_without_package_json_fails_with_helpful_message() {
     let project = TempProject::empty(r#"{}"#);
     // Remove the seeded package.json so the not-found branch fires.
@@ -389,6 +468,53 @@ fn trust_prune_dry_run_reports_stale_but_does_not_mutate() {
         "exactly one stale entry expected: {envelope}"
     );
     assert_eq!(stale[0], json!("removed-pkg@1.0.0"));
+
+    let after = std::fs::read_to_string(project.path().join("package.json"))
+        .expect("read package.json after");
+    assert_eq!(
+        before, after,
+        "dry-run must leave package.json byte-equal\nbefore:\n{before}\nafter:\n{after}",
+    );
+}
+
+#[test]
+fn trust_prune_global_json_dry_run_reports_success_without_mutation() {
+    let project = TempProject::empty(r#"{}"#);
+
+    write_pkg_with_trust(
+        &project,
+        json!({
+            "esbuild@0.25.1": { "integrity": "sha512-e" },
+            "removed-pkg@1.0.0": { "integrity": "sha512-r" }
+        }),
+    );
+    write_lockfile(&project, &[("esbuild", "0.25.1")]);
+
+    let before = std::fs::read_to_string(project.path().join("package.json"))
+        .expect("read package.json before");
+
+    let output = lpm(&project)
+        .args(["--json", "trust", "prune", "--dry-run"])
+        .output()
+        .expect("failed to run lpm --json trust prune --dry-run");
+
+    assert!(
+        output.status.success(),
+        "global --json trust prune --dry-run failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("lpm --json trust prune must emit one valid JSON document: {e}\n---\n{stdout}")
+    });
+
+    assert_eq!(envelope["success"], json!(true));
+    assert_eq!(envelope["command"], json!("trust prune"));
+    assert_eq!(envelope["dry_run"], json!(true));
+    assert_eq!(envelope["mutated"], json!(false));
+    assert_eq!(envelope["stale_count"], json!(1));
 
     let after = std::fs::read_to_string(project.path().join("package.json"))
         .expect("read package.json after");

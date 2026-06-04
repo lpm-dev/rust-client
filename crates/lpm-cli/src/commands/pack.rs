@@ -212,22 +212,38 @@ pub async fn pack(
     options: &PackOptions,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    if !json_output {
-        install_ui::phase(&format!("Using local {}", install_ui::yellow("tsdown")));
+    let start = std::time::Instant::now();
+    if json_output {
+        let outcome =
+            run_pack_process(project_dir, options, StdioMode::Capture).unwrap_or_else(|e| {
+                ToolOutcome {
+                    error: Some(e.to_string()),
+                    ..Default::default()
+                }
+            });
+        let result =
+            member_result_from_outcome(package_name_for_project(project_dir), outcome, start);
+        let succeeded = usize::from(result.success);
+        let failed = usize::from(!result.success);
+        let results = [result];
+        emit_envelope(&results, 1, succeeded, failed, start.elapsed());
+        if failed > 0 {
+            return Err(LpmError::ExitCode(1));
+        }
+        return Ok(());
     }
 
-    let start = std::time::Instant::now();
+    install_ui::phase(&format!("Using local {}", install_ui::yellow("tsdown")));
+
     let outcome = run_pack_process(project_dir, options, StdioMode::Inherit)?;
-    if !json_output {
-        if outcome.success() {
-            let duration = install_ui::format_duration(start.elapsed());
-            install_ui::done(&format!(
-                "Done · package build complete in {}",
-                install_ui::green(&duration)
-            ));
-        } else if let Some(code) = outcome.exit_code {
-            install_ui::failed(&format!("pack failed · exit code {code}"));
-        }
+    if outcome.success() {
+        let duration = install_ui::format_duration(start.elapsed());
+        install_ui::done(&format!(
+            "Done · package build complete in {}",
+            install_ui::green(&duration)
+        ));
+    } else if let Some(code) = outcome.exit_code {
+        install_ui::failed(&format!("pack failed · exit code {code}"));
     }
     outcome.into_result()
 }
@@ -556,28 +572,47 @@ async fn run_one_member(
         error: Some(e.to_string()),
         ..Default::default()
     });
-    let success = outcome.success();
-    let exit_code = outcome.exit_code;
-    let captured = outcome.captured;
-    let error = outcome.error;
-    let duration_ms = start.elapsed().as_millis() as u64;
+    let result = member_result_from_outcome(member_name.to_string(), outcome, start);
 
-    if matches!(stdio, StdioMode::Inherit) && !success {
-        if let Some(code) = exit_code {
+    if matches!(stdio, StdioMode::Inherit) && !result.success {
+        if let Some(code) = result.exit_code {
             install_ui::failed(&format!("{member_name}: exit {code}"));
-        } else if let Some(ref msg) = error {
+        } else if let Some(ref msg) = result.error {
             install_ui::failed(&format!("{member_name}: {msg}"));
         }
     }
 
+    result
+}
+
+fn member_result_from_outcome(
+    name: String,
+    outcome: ToolOutcome,
+    started_at: std::time::Instant,
+) -> MemberResult {
     MemberResult {
-        name: member_name.to_string(),
-        success,
-        exit_code,
-        duration_ms,
-        captured,
-        error,
+        name,
+        success: outcome.success(),
+        exit_code: outcome.exit_code,
+        duration_ms: started_at.elapsed().as_millis() as u64,
+        captured: outcome.captured,
+        error: outcome.error,
     }
+}
+
+fn package_name_for_project(project_dir: &Path) -> String {
+    let package_json_path = project_dir.join("package.json");
+    if let Ok(package) = lpm_workspace::read_package_json(&package_json_path)
+        && let Some(name) = package.name
+    {
+        return name;
+    }
+
+    project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(".")
+        .to_string()
 }
 
 fn truncate_output(text: &str) -> String {

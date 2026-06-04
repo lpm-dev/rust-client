@@ -912,22 +912,36 @@ fn run_unlink(root: &LpmRoot, package: &str, json_output: bool) -> Result<(), Lp
                 sanitize_for_terminal(package),
             )));
         }
+        let _validated_root = validated_local_link_root(root, &entry.root)?;
 
-        let aliases: Vec<String> = manifest
+        let aliases: Vec<(String, String)> = manifest
             .aliases
             .iter()
-            .filter_map(|(alias, owner)| (owner.package == package).then_some(alias.clone()))
+            .filter_map(|(alias, owner)| {
+                (owner.package == package).then_some((alias.clone(), owner.bin.clone()))
+            })
             .collect();
         for command in &entry.commands {
             remove_shim(&root.bin_dir(), command)?;
         }
-        for alias in &aliases {
+        for (alias, _) in &aliases {
             remove_shim(&root.bin_dir(), alias)?;
         }
-        remove_local_link_root(root, &entry.root)?;
+        if let Err(err) = remove_local_link_root(root, &entry.root) {
+            if let Err(restore_failures) = restore_local_link_global_shims(root, &entry, &aliases) {
+                return Err(LpmError::Script(format!(
+                    "failed to remove local-link root for '{}': {err}. Additionally, failed to \
+                     restore {} shim(s): {}",
+                    sanitize_for_terminal(package),
+                    restore_failures.len(),
+                    restore_failures.join("; "),
+                )));
+            }
+            return Err(err);
+        }
 
         manifest.packages.remove(package);
-        for alias in aliases {
+        for (alias, _) in aliases {
             manifest.aliases.remove(&alias);
         }
         lpm_global::write_for(root, &manifest)?;
@@ -1161,6 +1175,59 @@ fn cleanup_local_link_outputs(root: &LpmRoot, link: &LocalLinkPackage) {
         let _ = remove_shim(&root.bin_dir(), &bin.command_name);
     }
     let _ = remove_local_link_root(root, &link.root_relative);
+}
+
+fn restore_local_link_global_shims(
+    root: &LpmRoot,
+    entry: &PackageEntry,
+    aliases: &[(String, String)],
+) -> Result<(), Vec<String>> {
+    let install_bin = root
+        .global_root()
+        .join(&entry.root)
+        .join("node_modules")
+        .join(".bin");
+    let mut failures = Vec::new();
+
+    for command in &entry.commands {
+        match emit_shim(
+            &root.bin_dir(),
+            &Shim {
+                command_name: command.clone(),
+                target: install_bin.join(command),
+            },
+        ) {
+            Ok(_) if artifacts_complete(&root.bin_dir(), command) => {}
+            Ok(_) => failures.push(format!(
+                "{}: restored shim artifact is incomplete",
+                sanitize_for_terminal(command)
+            )),
+            Err(err) => failures.push(format!("{}: {err}", sanitize_for_terminal(command))),
+        }
+    }
+
+    for (alias, bin) in aliases {
+        match emit_shim(
+            &root.bin_dir(),
+            &Shim {
+                command_name: alias.clone(),
+                target: install_bin.join(bin),
+            },
+        ) {
+            Ok(_) if artifacts_complete(&root.bin_dir(), alias) => {}
+            Ok(_) => failures.push(format!(
+                "{}: restored alias shim artifact is incomplete",
+                sanitize_for_terminal(alias)
+            )),
+            Err(err) => failures.push(format!("{}: {err}", sanitize_for_terminal(alias))),
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures)
+    }
 }
 
 fn remove_local_link_root(root: &LpmRoot, relative: &str) -> Result<(), LpmError> {

@@ -102,6 +102,7 @@ pub fn resolve_targets(
             targets.push(PublishTarget::GitLab);
         }
         if let Some(url) = cli_registry {
+            validate_custom_publish_registry_url(url, "--publish-registry")?;
             targets.push(PublishTarget::Custom(url.to_string()));
         }
         return Ok(deduplicate_targets(targets));
@@ -120,35 +121,11 @@ pub fn resolve_targets(
                 "github" => targets.push(PublishTarget::GitHub),
                 "gitlab" => targets.push(PublishTarget::GitLab),
                 url if url.starts_with("https://") => {
-                    // M30: project-level `lpm.json` can list ANY https://
-                    // URL as a publish target — a hostile commit on a
-                    // downstream fork or a compromised dev machine could
-                    // silently redirect every `lpm publish` to an
-                    // attacker host, capturing tokens + tarballs. We
-                    // can't enforce a hard allowlist (legitimate
-                    // self-hosted registries exist) but we DO emit a
-                    // loud warn so an unexpected target appears in
-                    // operator logs / human terminal before the publish
-                    // network call fires.
-                    let host = reqwest::Url::parse(url)
-                        .ok()
-                        .and_then(|u| u.host_str().map(|s| s.to_string()))
-                        .unwrap_or_else(|| url.to_string());
-                    if !is_known_publish_host(&host) {
-                        tracing::warn!(
-                            target_url = %url,
-                            host = %host,
-                            "publish.registries: routing publish to non-default host \
-                             — confirm this is intentional (the LPM bearer goes via \
-                             this host)",
-                        );
-                    }
+                    validate_custom_publish_registry_url(url, "publish.registries")?;
                     targets.push(PublishTarget::Custom(url.to_string()));
                 }
                 url if url.starts_with("http://") => {
-                    return Err(LpmError::Registry(format!(
-                        "publish.registries: refusing HTTP URL \"{url}\" — publish requires HTTPS"
-                    )));
+                    validate_custom_publish_registry_url(url, "publish.registries")?;
                 }
                 other => unknown.push(other.to_string()),
             }
@@ -173,6 +150,37 @@ pub fn resolve_targets(
 
     // Default: LPM only
     Ok(vec![PublishTarget::Lpm])
+}
+
+fn validate_custom_publish_registry_url(url: &str, source: &str) -> Result<(), LpmError> {
+    if url.starts_with("https://") {
+        warn_on_unfamiliar_publish_host(url);
+        return Ok(());
+    }
+
+    if url.starts_with("http://") {
+        return Err(LpmError::Registry(format!(
+            "{source}: refusing HTTP URL \"{url}\" — publish requires HTTPS"
+        )));
+    }
+
+    Err(LpmError::Registry(format!(
+        "{source}: custom publish registry must be an https:// URL, got \"{url}\""
+    )))
+}
+
+fn warn_on_unfamiliar_publish_host(url: &str) {
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| url.to_string());
+    if !is_known_publish_host(&host) {
+        tracing::warn!(
+            target_url = %url,
+            host = %host,
+            "custom publish registry routes to a non-default host; confirm this is intentional",
+        );
+    }
 }
 
 /// Hosts considered "default" / first-party publish destinations.
@@ -2121,6 +2129,21 @@ mod tests {
             gitlab: None,
         };
         let result = resolve_targets(false, false, false, false, None, Some(&config));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("HTTPS"));
+    }
+
+    #[test]
+    fn resolve_targets_rejects_http_cli_registry_url() {
+        let result = resolve_targets(
+            false,
+            false,
+            false,
+            false,
+            Some("http://insecure.com"),
+            None,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("HTTPS"));

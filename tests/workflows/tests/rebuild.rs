@@ -568,6 +568,70 @@ fn rebuild_human_output_collapses_lifecycle_scripts_to_slim_rows() {
     );
 }
 
+#[test]
+fn rebuild_named_missing_package_fails_in_json_mode() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-missing-named", None, &[]);
+    seed_scripted_package(&project, "present-pkg", "1.0.0", "echo lifecycle-ok");
+    write_lockfile_for_packages(&project, &[("present-pkg", "1.0.0")]);
+
+    let out = lpm(&project)
+        .args(["--json", "rebuild", "missing-pkg", "--dry-run"])
+        .output()
+        .expect("spawn lpm rebuild missing-pkg --json");
+
+    assert!(
+        !out.status.success(),
+        "rebuild of an explicit missing package must fail, not succeed as an empty no-op\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope = assertions::parse_json_output(&out.stdout);
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let error = envelope["error"].to_string();
+    assert!(
+        error.contains("missing-pkg") && error.contains("lifecycle scripts"),
+        "JSON error must name the requested package and why it was not rebuildable: {envelope}",
+    );
+}
+
+#[test]
+fn rebuild_json_reports_empty_work_without_blank_stdout() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-empty-json", None, &[]);
+    write_lockfile_for_packages(&project, &[]);
+
+    let dry_run = lpm(&project)
+        .args(["--json", "rebuild", "--dry-run"])
+        .output()
+        .expect("spawn lpm rebuild --dry-run --json");
+    assert!(
+        dry_run.status.success(),
+        "empty rebuild dry-run should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr),
+    );
+    let dry_run_json = assertions::parse_json_output(&dry_run.stdout);
+    assert_eq!(dry_run_json["dry_run"], serde_json::json!(true));
+    assert_eq!(dry_run_json["packages"], serde_json::json!([]));
+
+    let live = lpm(&project)
+        .args(["--json", "rebuild"])
+        .output()
+        .expect("spawn lpm rebuild --json");
+    assert!(
+        live.status.success(),
+        "empty rebuild should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&live.stdout),
+        String::from_utf8_lossy(&live.stderr),
+    );
+    let live_json = assertions::parse_json_output(&live.stdout);
+    assert_eq!(live_json["success"], serde_json::json!(true));
+    assert_eq!(live_json["built"], serde_json::json!(0));
+    assert_eq!(live_json["failed"], serde_json::json!(0));
+}
+
 /// `--json` triage errors are still valid JSON and carry the security
 /// approval code instead of human pointer text.
 #[test]

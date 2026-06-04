@@ -342,6 +342,7 @@ async fn plan_upgrade(
             target.name
         ))
     })?;
+    ensure_registry_serves_version(&metadata, &new_version_str)?;
 
     // Compute the new saved_spec via BEFORE the
     // already-current check. Pre-fix this was computed only for the
@@ -512,6 +513,19 @@ fn pick_version(
             )))
         }
     }
+}
+
+fn ensure_registry_serves_version(
+    metadata: &lpm_registry::PackageMetadata,
+    version: &str,
+) -> Result<(), LpmError> {
+    if metadata.versions.contains_key(version) {
+        return Ok(());
+    }
+    Err(LpmError::Script(format!(
+        "registry no longer serves version '{version}' for '{}' - the version may have been yanked or deleted upstream",
+        metadata.name
+    )))
 }
 
 // ─── Execution ───────────────────────────────────────────────────────

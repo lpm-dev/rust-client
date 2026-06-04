@@ -67,6 +67,56 @@ async fn download_json_accepts_version_flag_and_canonicalizes_output_dir() {
 }
 
 #[tokio::test]
+async fn download_version_flag_resolves_dist_tags_instead_of_exact_versions_only() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let v1_tarball = make_tarball("tagged-download", "1.0.0");
+    let v2_tarball = make_tarball("tagged-download", "2.0.0");
+    mock.with_full_package_metadata(
+        "tagged-download",
+        "2.0.0",
+        &[
+            ("1.0.0", serde_json::json!({}), Some(v1_tarball)),
+            ("2.0.0", serde_json::json!({}), Some(v2_tarball)),
+        ],
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "download",
+            "tagged-download",
+            "--version",
+            "latest",
+            "--json",
+            "--output",
+            "tagged-out",
+        ])
+        .output()
+        .expect("failed to run lpm download --version latest --json");
+
+    assert!(
+        output.status.success(),
+        "download --version latest must resolve the registry dist-tag:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert_eq!(json["package"], "tagged-download");
+    assert_eq!(json["version"], "2.0.0");
+    assert!(
+        project
+            .path()
+            .join("tagged-out")
+            .join("package.json")
+            .is_file(),
+        "download must extract the dist-tag resolved tarball"
+    );
+}
+
+#[tokio::test]
 async fn download_human_output_uses_slim_progress_and_completion() {
     let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
     let mock = MockRegistry::start().await;
