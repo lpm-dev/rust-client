@@ -1,4 +1,6 @@
-use crate::commands::registry_reads::{fetch_routed_package_metadata, prepare_routed_read_context};
+use crate::commands::registry_reads::{
+    fetch_routed_package_metadata, normalize_package_version_input, prepare_routed_read_context,
+};
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
@@ -12,6 +14,7 @@ pub async fn run(
     version: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let (package, version) = normalize_package_version_input("info", package, version)?;
     let context =
         prepare_routed_read_context(client, project_dir, &[package.to_string()], json_output)?;
     let (_package_ref, metadata) = fetch_routed_package_metadata(&context, package).await?;
