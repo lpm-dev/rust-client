@@ -1,0 +1,17 @@
+---
+source: tests/workflows/tests/stage.rs
+expression: envelope
+---
+{
+  "success": true,
+  "target": "npm",
+  "registry": "http://mock.registry",
+  "stageId": "123e4567-e89b-12d3-a456-426614174000",
+  "path": "[PROJECT]/scope-staged-pkg-1.0.0-123e4567-e89b-12d3-a456-426614174000.tgz",
+  "bytes": 202,
+  "data": {
+    "name": "@scope/staged-pkg",
+    "version": "1.0.0",
+    "main": "index.js"
+  }
+}

@@ -247,6 +247,8 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
     cmd.remove_env("GITLAB_CI");
     cmd.remove_env("LPM_GITLAB_OIDC_TOKEN");
+    cmd.remove_env("NPM_ID_TOKEN");
+    cmd.remove_env("SIGSTORE_ID_TOKEN");
     cmd.remove_env("CI_JOB_JWT");
     cmd.remove_env("CI_JOB_JWT_V2");
 

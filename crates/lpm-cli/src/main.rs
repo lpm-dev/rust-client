@@ -159,6 +159,102 @@ pub(crate) enum BundlePlatform {
     Neutral,
 }
 
+#[derive(Subcommand)]
+enum StageCommands {
+    /// Stage the current package on the npm registry.
+    Publish {
+        /// npm dist-tag for the staged version.
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// npm package access.
+        #[arg(long, value_parser = ["public", "restricted"])]
+        access: Option<String>,
+
+        /// Preview without uploading.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Generate and require Sigstore provenance.
+        #[arg(long)]
+        provenance: bool,
+
+        /// Minimum quality score required to stage (0-100).
+        #[arg(long)]
+        min_score: Option<u32>,
+
+        /// Skip pre-publish secret scanning.
+        #[arg(long)]
+        allow_secrets: bool,
+
+        /// Skip confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Override the npm registry URL.
+        #[arg(long = "npm-registry", value_name = "URL")]
+        npm_registry: Option<String>,
+    },
+
+    /// List staged npm package versions.
+    List {
+        /// Optional package-name filter.
+        package: Option<String>,
+
+        /// Override the npm registry URL.
+        #[arg(long = "npm-registry", value_name = "URL")]
+        npm_registry: Option<String>,
+    },
+
+    /// View one staged npm package version.
+    View {
+        /// Staged package UUID.
+        stage_id: String,
+
+        /// Override the npm registry URL.
+        #[arg(long = "npm-registry", value_name = "URL")]
+        npm_registry: Option<String>,
+    },
+
+    /// Approve a staged npm package version.
+    Approve {
+        /// Staged package UUID.
+        stage_id: String,
+
+        /// One-time password for npm 2FA.
+        #[arg(long)]
+        otp: Option<String>,
+
+        /// Override the npm registry URL.
+        #[arg(long = "npm-registry", value_name = "URL")]
+        npm_registry: Option<String>,
+    },
+
+    /// Reject a staged npm package version.
+    Reject {
+        /// Staged package UUID.
+        stage_id: String,
+
+        /// One-time password for npm 2FA.
+        #[arg(long)]
+        otp: Option<String>,
+
+        /// Override the npm registry URL.
+        #[arg(long = "npm-registry", value_name = "URL")]
+        npm_registry: Option<String>,
+    },
+
+    /// Download a staged npm package tarball for inspection.
+    Download {
+        /// Staged package UUID.
+        stage_id: String,
+
+        /// Override the npm registry URL.
+        #[arg(long = "npm-registry", value_name = "URL")]
+        npm_registry: Option<String>,
+    },
+}
+
 impl LinkerCli {
     fn into_linker_mode(self) -> lpm_linker::LinkerMode {
         match self {
@@ -882,6 +978,12 @@ enum Commands {
         /// Publish to a custom npm-compatible registry.
         #[arg(long = "publish-registry", value_name = "URL")]
         publish_registry: Option<String>,
+    },
+
+    /// Stage packages for npm publishing.
+    Stage {
+        #[command(subcommand)]
+        command: StageCommands,
     },
 
     /// Log in to a package registry.
@@ -4111,6 +4213,113 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
+        Commands::Stage { command } => {
+            if argv_has_global_registry_flag(std::env::args_os()) {
+                return Err(lpm_common::LpmError::Registry(
+                    "`lpm stage` uses npm registries; use --npm-registry instead of global --registry.".into(),
+                ));
+            }
+            if !cli.json {
+                for warning in auth::check_token_expiry_warnings() {
+                    output::warn(&warning);
+                }
+            }
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            match command {
+                StageCommands::Publish {
+                    tag,
+                    access,
+                    dry_run,
+                    provenance,
+                    min_score,
+                    allow_secrets,
+                    yes,
+                    npm_registry,
+                } => {
+                    commands::stage::publish_current_project(
+                        &cwd,
+                        commands::stage::StagePublishOptions {
+                            tag: tag.as_deref(),
+                            access: access.as_deref(),
+                            dry_run,
+                            provenance,
+                            min_score,
+                            allow_secrets,
+                            yes,
+                            npm_registry: npm_registry.as_deref(),
+                            json_output: cli.json,
+                        },
+                    )
+                    .await
+                }
+                StageCommands::List {
+                    package,
+                    npm_registry,
+                } => {
+                    commands::stage::list(
+                        &cwd,
+                        package.as_deref(),
+                        npm_registry.as_deref(),
+                        cli.json,
+                    )
+                    .await
+                }
+                StageCommands::View {
+                    stage_id,
+                    npm_registry,
+                } => {
+                    commands::stage::view(
+                        &cwd,
+                        &stage_id,
+                        npm_registry.as_deref(),
+                        cli.json,
+                    )
+                    .await
+                }
+                StageCommands::Approve {
+                    stage_id,
+                    otp,
+                    npm_registry,
+                } => {
+                    commands::stage::approve(
+                        &cwd,
+                        &stage_id,
+                        otp.as_deref(),
+                        npm_registry.as_deref(),
+                        cli.json,
+                        false,
+                    )
+                    .await
+                }
+                StageCommands::Reject {
+                    stage_id,
+                    otp,
+                    npm_registry,
+                } => {
+                    commands::stage::reject(
+                        &cwd,
+                        &stage_id,
+                        otp.as_deref(),
+                        npm_registry.as_deref(),
+                        cli.json,
+                        false,
+                    )
+                    .await
+                }
+                StageCommands::Download {
+                    stage_id,
+                    npm_registry,
+                } => {
+                    commands::stage::download(
+                        &cwd,
+                        &stage_id,
+                        npm_registry.as_deref(),
+                        cli.json,
+                    )
+                    .await
+                }
+            }
+        }
         Commands::Login {
             npm,
             github,
@@ -5339,6 +5548,20 @@ fn parse_cli_or_exit() -> Cli {
         Ok(cli) => cli,
         Err(error) => exit_with_clap_error(error, json_output, help_hint),
     }
+}
+
+fn argv_has_global_registry_flag<I>(args: I) -> bool
+where
+    I: IntoIterator,
+    I::Item: Into<std::ffi::OsString>,
+{
+    args.into_iter().skip(1).any(|arg| {
+        let arg = arg.into();
+        arg == "--registry"
+            || arg
+                .to_str()
+                .is_some_and(|value| value.starts_with("--registry="))
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]

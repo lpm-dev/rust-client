@@ -1,0 +1,22 @@
+---
+source: tests/workflows/tests/stage.rs
+expression: envelope
+---
+{
+  "success": true,
+  "target": "npm",
+  "registry": "http://mock.registry",
+  "total": 1,
+  "data": [
+    {
+      "id": "a",
+      "packageName": "@scope/staged-pkg",
+      "version": "1.0.0",
+      "tag": "latest",
+      "createdAt": "2026-06-04T00:00:00.000Z",
+      "actor": "testuser",
+      "actorType": "user",
+      "shasum": "abc123"
+    }
+  ]
+}

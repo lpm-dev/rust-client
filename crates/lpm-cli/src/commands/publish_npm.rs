@@ -11,7 +11,7 @@ use lpm_runner::lpm_json::NpmPublishConfig;
 use std::time::Duration;
 
 /// Default npm registry URL.
-const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
+pub(crate) const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
 
 /// Result of a single registry publish attempt.
 #[derive(Debug)]
@@ -230,10 +230,9 @@ async fn publish_to_npm_impl(
         "SECURITY: LPM token must never be sent to npm registry"
     );
 
-    // Reject HTTP for publish (S9)
-    if !registry_url.starts_with("https://") && !runtime.allow_http {
+    if !lpm_common::lpm_registry_url_is_accepted(registry_url) && !runtime.allow_http {
         return Err(LpmError::Registry(format!(
-            "refusing to publish over HTTP to {registry_url} — credentials require HTTPS"
+            "refusing to publish to {registry_url} — credentials require HTTPS or HTTP loopback"
         )));
     }
 

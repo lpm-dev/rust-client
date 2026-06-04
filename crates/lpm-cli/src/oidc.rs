@@ -11,6 +11,10 @@
 //!   `LPM_GITLAB_OIDC_TOKEN` (legacy alias) on GitLab. `LPM_OIDC_TOKEN` is
 //!   intentionally NOT honored here: it carries the wrong audience for
 //!   Sigstore Fulcio and the SLSA builder needs a provider-specific tag.
+//! - **npm Trusted Publishing** (audience `npm:registry.npmjs.org`) — used by
+//!   `lpm publish --npm` and `lpm stage publish`. Accepts `NPM_ID_TOKEN` or
+//!   fetches from the GitHub Actions runtime. Other npm commands keep using
+//!   normal npm access tokens.
 //!
 //! `CI_JOB_JWT_V2` is intentionally not part of the documented contract:
 //! its default audience is the GitLab instance URL, which the LPM origin
@@ -29,6 +33,20 @@ pub struct OidcToken {
 pub enum CiEnvironment {
     GitHubActions,
     GitLabCI,
+}
+
+/// Source for an npm Trusted Publishing OIDC token.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum NpmTrustedPublishJwtSource {
+    EnvNpmIdToken,
+    GitHubActions,
+}
+
+/// JWT resolved for npm's token exchange endpoint.
+#[derive(Debug, Clone)]
+pub struct NpmTrustedPublishJwt {
+    pub token: String,
+    pub source: NpmTrustedPublishJwtSource,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,6 +222,42 @@ fn github_partial_runtime_hint() -> Option<&'static str> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// npm Trusted Publishing (audience: npm:registry.npmjs.org)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const NPM_TRUSTED_PUBLISH_AUDIENCE: &str = "npm:registry.npmjs.org";
+
+pub fn npm_trusted_publish_jwt_available() -> bool {
+    std::env::var("NPM_ID_TOKEN").is_ok_and(|token| !token.trim().is_empty())
+        || github_runtime_signal_present()
+}
+
+pub async fn resolve_npm_trusted_publish_jwt() -> Result<NpmTrustedPublishJwt, LpmError> {
+    if let Ok(token) = std::env::var("NPM_ID_TOKEN")
+        && !token.trim().is_empty()
+    {
+        return Ok(NpmTrustedPublishJwt {
+            token,
+            source: NpmTrustedPublishJwtSource::EnvNpmIdToken,
+        });
+    }
+    if github_runtime_signal_present() {
+        return Ok(NpmTrustedPublishJwt {
+            token: fetch_github_runtime_jwt(NPM_TRUSTED_PUBLISH_AUDIENCE).await?,
+            source: NpmTrustedPublishJwtSource::GitHubActions,
+        });
+    }
+
+    let base = "no OIDC signal found for npm Trusted Publishing. Set NPM_ID_TOKEN \
+                with audience `npm:registry.npmjs.org`, or run inside GitHub Actions \
+                with `permissions: id-token: write`.";
+    Err(LpmError::Registry(match github_partial_runtime_hint() {
+        Some(hint) => format!("{base} {hint}"),
+        None => base.to_string(),
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Registry exchange (audience: https://lpm.dev)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -338,6 +392,7 @@ mod tests {
     const ALL_VARS: &[&str] = &[
         "LPM_OIDC_TOKEN",
         "LPM_GITLAB_OIDC_TOKEN",
+        "NPM_ID_TOKEN",
         "SIGSTORE_ID_TOKEN",
         "ACTIONS_ID_TOKEN_REQUEST_URL",
         "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
@@ -438,6 +493,51 @@ mod tests {
         assert!(
             msg.contains("aud: https://lpm.dev"),
             "error must document the GitLab audience: {msg}"
+        );
+    }
+
+    // ─── npm Trusted Publishing ─────────────────────────────────────────
+
+    #[test]
+    fn npm_trusted_publish_signal_uses_npm_id_token() {
+        let _e = scoped(&[("NPM_ID_TOKEN", "npm-jwt")]);
+        assert!(npm_trusted_publish_jwt_available());
+    }
+
+    #[test]
+    fn npm_trusted_publish_signal_ignores_lpm_oidc_tokens() {
+        let _e = scoped(&[
+            ("LPM_OIDC_TOKEN", "lpm-jwt"),
+            ("LPM_GITLAB_OIDC_TOKEN", "legacy-lpm-jwt"),
+            ("SIGSTORE_ID_TOKEN", "sigstore-jwt"),
+        ]);
+        assert!(!npm_trusted_publish_jwt_available());
+    }
+
+    #[tokio::test]
+    async fn resolve_npm_trusted_publish_env_token_wins_over_github_runtime() {
+        let _e = scoped(&[
+            ("NPM_ID_TOKEN", "npm-id-token"),
+            ("ACTIONS_ID_TOKEN_REQUEST_URL", "http://127.0.0.1:1/oidc"),
+            ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "github-runtime-token"),
+        ]);
+        let jwt = resolve_npm_trusted_publish_jwt().await.unwrap();
+        assert_eq!(jwt.token, "npm-id-token");
+        assert_eq!(jwt.source, NpmTrustedPublishJwtSource::EnvNpmIdToken);
+    }
+
+    #[tokio::test]
+    async fn resolve_npm_trusted_publish_no_signals_errors_with_audience() {
+        let _e = scoped(&[]);
+        let err = resolve_npm_trusted_publish_jwt().await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("NPM_ID_TOKEN"),
+            "error must name NPM_ID_TOKEN: {msg}"
+        );
+        assert!(
+            msg.contains("npm:registry.npmjs.org"),
+            "error must document npm audience: {msg}"
         );
     }
 

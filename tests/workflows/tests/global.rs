@@ -22,6 +22,8 @@ use chrono::Utc;
 use lpm_global::{GlobalManifest, PackageEntry, PackageSource};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
+use wiremock::matchers::{method, path as wm_path};
+use wiremock::{Mock, ResponseTemplate};
 
 #[cfg(unix)]
 fn chmod_executable(path: &std::path::Path) {
@@ -58,7 +60,12 @@ fn global_root(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("global")
 }
 
-fn seed_global_package(project: &TempProject, package: &str, commands: Vec<String>) {
+fn seed_global_package_with_source(
+    project: &TempProject,
+    package: &str,
+    source: PackageSource,
+    commands: Vec<String>,
+) {
     let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
     let mut manifest = GlobalManifest::default();
     manifest.packages.insert(
@@ -67,13 +74,17 @@ fn seed_global_package(project: &TempProject, package: &str, commands: Vec<Strin
             saved_spec: "^1".to_string(),
             resolved: "1.0.0".to_string(),
             integrity: "sha512-test".to_string(),
-            source: PackageSource::UpstreamNpm,
+            source,
             installed_at: Utc::now(),
             root: format!("installs/{package}@1.0.0"),
             commands,
         },
     );
     lpm_global::write_for(&root, &manifest).expect("write global manifest fixture");
+}
+
+fn seed_global_package(project: &TempProject, package: &str, commands: Vec<String>) {
+    seed_global_package_with_source(project, package, PackageSource::UpstreamNpm, commands);
 }
 
 fn isolated_lpm_root(project: &TempProject) -> lpm_common::LpmRoot {
@@ -203,16 +214,21 @@ fn global_list_outdated_on_empty_manifest_succeeds_with_empty_set() {
 #[tokio::test]
 async fn global_list_outdated_human_output_uses_current_wanted_latest_bins_table() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
-    seed_global_package(&project, "demo-cli", vec!["demo".to_string()]);
+    seed_global_package_with_source(
+        &project,
+        "@lpm.dev/acme.demo-cli",
+        PackageSource::LpmDev,
+        vec!["demo".to_string()],
+    );
 
     let mock = MockRegistry::start().await;
     mock.with_batch_metadata(vec![serde_json::json!({
-        "name": "demo-cli",
+        "name": "@lpm.dev/acme.demo-cli",
         "dist-tags": { "latest": "2.0.0" },
         "versions": {
-            "1.0.0": { "name": "demo-cli", "version": "1.0.0" },
-            "1.5.0": { "name": "demo-cli", "version": "1.5.0" },
-            "2.0.0": { "name": "demo-cli", "version": "2.0.0" }
+            "1.0.0": { "name": "@lpm.dev/acme.demo-cli", "version": "1.0.0" },
+            "1.5.0": { "name": "@lpm.dev/acme.demo-cli", "version": "1.5.0" },
+            "2.0.0": { "name": "@lpm.dev/acme.demo-cli", "version": "2.0.0" }
         }
     })])
     .await;
@@ -250,12 +266,88 @@ async fn global_list_outdated_human_output_uses_current_wanted_latest_bins_table
             && combined.contains("demo"),
         "outdated table must include current, wanted, absolute latest, and bins, got:\n{combined}"
     );
+    assert!(
+        !combined.contains("outdated:")
+            && !combined.contains("Run `lpm global update")
+            && combined.contains("✓ 1 global package installed"),
+        "outdated output must match the slim table-only shape, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn global_list_outdated_routes_upstream_npm_packages_through_package_metadata() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    seed_global_package(&project, "demo-cli", vec!["demo".to_string()]);
+
+    let mock = MockRegistry::start().await;
+    let metadata = serde_json::json!({
+        "name": "demo-cli",
+        "dist-tags": { "latest": "2.0.0" },
+        "versions": {
+            "1.0.0": { "name": "demo-cli", "version": "1.0.0" },
+            "1.5.0": { "name": "demo-cli", "version": "1.5.0" },
+            "2.0.0": { "name": "demo-cli", "version": "2.0.0" }
+        }
+    });
+    Mock::given(method("GET"))
+        .and(wm_path("/api/registry/demo-cli"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["global", "list", "--outdated"])
+        .output()
+        .expect("failed to run lpm global list --outdated");
+
+    assert!(
+        output.status.success(),
+        "global list --outdated must route npm globals through package metadata\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let received_paths: Vec<String> = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests")
+        .into_iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert!(
+        received_paths
+            .iter()
+            .any(|path| path == "/api/registry/demo-cli"),
+        "npm global must use the per-package metadata path, got {received_paths:?}"
+    );
+    assert!(
+        !received_paths
+            .iter()
+            .any(|path| path == "/api/registry/batch-metadata"),
+        "npm global must not be sent to LPM batch metadata, got {received_paths:?}"
+    );
+
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+    assert!(
+        combined.contains("demo-cli") && combined.contains("1.5.0") && combined.contains("2.0.0"),
+        "outdated table must include routed npm metadata, got:\n{combined}"
+    );
 }
 
 #[tokio::test]
 async fn global_list_outdated_json_with_unresolved_metadata_exits_nonzero() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
-    seed_global_package(&project, "missing-cli", vec!["missing".to_string()]);
+    seed_global_package_with_source(
+        &project,
+        "@lpm.dev/acme.missing-cli",
+        PackageSource::LpmDev,
+        vec!["missing".to_string()],
+    );
 
     let mock = MockRegistry::start().await;
     mock.with_batch_metadata(vec![]).await;
@@ -286,7 +378,10 @@ async fn global_list_outdated_json_with_unresolved_metadata_exits_nonzero() {
         1,
         "expected one unresolved row: {envelope}"
     );
-    assert_eq!(unresolved[0]["package"], serde_json::json!("missing-cli"));
+    assert_eq!(
+        unresolved[0]["package"],
+        serde_json::json!("@lpm.dev/acme.missing-cli")
+    );
     assert!(
         unresolved[0]["reason"]
             .as_str()
@@ -298,7 +393,12 @@ async fn global_list_outdated_json_with_unresolved_metadata_exits_nonzero() {
 #[tokio::test]
 async fn global_list_outdated_human_with_unresolved_metadata_exits_nonzero() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
-    seed_global_package(&project, "missing-cli", vec!["missing".to_string()]);
+    seed_global_package_with_source(
+        &project,
+        "@lpm.dev/acme.missing-cli",
+        PackageSource::LpmDev,
+        vec!["missing".to_string()],
+    );
 
     let mock = MockRegistry::start().await;
     mock.with_batch_metadata(vec![]).await;
@@ -319,7 +419,8 @@ async fn global_list_outdated_human_with_unresolved_metadata_exits_nonzero() {
         "unresolved registry metadata must make global list --outdated fail\n{combined}",
     );
     assert!(
-        combined.contains("could not be compared") && combined.contains("missing-cli"),
+        combined.contains("could not be compared")
+            && combined.contains("@lpm.dev/acme.missing-cli"),
         "human output must surface unresolved package details, got:\n{combined}",
     );
 }

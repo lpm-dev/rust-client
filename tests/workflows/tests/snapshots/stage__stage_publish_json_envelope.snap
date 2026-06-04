@@ -1,0 +1,15 @@
+---
+source: tests/workflows/tests/stage.rs
+expression: envelope
+---
+{
+  "success": true,
+  "target": "npm",
+  "registry": "http://mock.registry",
+  "auth": "token",
+  "stageId": "123e4567-e89b-12d3-a456-426614174000",
+  "duration_ms": 0,
+  "data": {
+    "stageId": "123e4567-e89b-12d3-a456-426614174000"
+  }
+}
