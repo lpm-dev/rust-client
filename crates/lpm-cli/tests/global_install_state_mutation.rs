@@ -599,6 +599,69 @@ async fn cli_bulk_global_update_reports_mixed_success_skip_and_failure_in_single
     assert!(final_manifest.packages.contains_key("missing-tool"));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_global_update_exact_saved_spec_missing_from_registry_fails_instead_of_skipping() {
+    let server = MockServer::start().await;
+    common::mount_mock_registry(
+        &server,
+        &[MockPackage {
+            name: "tool",
+            versions: vec![MockPackageVersion {
+                version: "1.1.0",
+                dependencies: Vec::new(),
+                bins: vec![("tool", "bin/tool.js")],
+            }],
+        }],
+    )
+    .await;
+
+    let sandbox = TempDir::new().unwrap();
+    let cwd = sandbox.path().join("workspace");
+    let lpm_home = sandbox.path().join("lpm-home");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&lpm_home).unwrap();
+    let root = LpmRoot::from_dir(&lpm_home);
+
+    seed_active_global_package(&root, "tool", "1.0.0", "1.0.0", &["tool"], true);
+
+    let (status, stdout, stderr) = common::run_lpm(
+        &cwd,
+        &lpm_home,
+        Some(&server.uri()),
+        &["--json", "global", "update"],
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "exact-pinned version missing from registry must fail instead of skipping. stdout={stdout} stderr={stderr}"
+    );
+
+    let json = common::parse_json_stdout(&stdout);
+    assert_eq!(json["success"].as_bool(), Some(false));
+    let results = json["results"]
+        .as_array()
+        .expect("results should be an array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["package"], "tool");
+    assert_eq!(results[0]["action"], "failed");
+    assert!(
+        results[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("registry no longer serves version '1.0.0'"),
+        "failure reason should explain the yanked exact version: {json:?}"
+    );
+
+    let final_manifest = read_for(&root).unwrap();
+    let tool = final_manifest
+        .packages
+        .get("tool")
+        .expect("failed update must preserve active row");
+    assert_eq!(tool.resolved, "1.0.0");
+    assert_eq!(tool.saved_spec, "1.0.0");
+    assert_shim_points_to(&root, "tool", "tool@1.0.0");
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_uninstall_failure_emits_json_error_and_preserves_manifest_state() {

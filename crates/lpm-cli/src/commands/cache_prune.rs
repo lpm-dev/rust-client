@@ -173,7 +173,22 @@ pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Re
         emit_human(&summary, flags.apply, start.elapsed());
     }
 
+    if prune_had_errors(&summary) {
+        if json_output {
+            return Err(LpmError::ExitCode(1));
+        }
+        return Err(LpmError::Store(
+            "cache prune could not complete every requested cleanup step".into(),
+        ));
+    }
+
     Ok(())
+}
+
+fn prune_had_errors(summary: &PruneSummary) -> bool {
+    summary.registry_corrupt
+        || summary.tombstone_count_error.is_some()
+        || summary.tombstone_sweep_error.is_some()
 }
 
 /// Inner body executed under the store lock. Pulled out so the lock
@@ -737,6 +752,7 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
 
 fn emit_json(summary: &PruneSummary) {
     let json = serde_json::json!({
+        "success": !prune_had_errors(summary),
         "applied": summary.applied,
         "projects_walked": summary.projects_walked,
         "registry_entries_dropped": summary.registry_entries_dropped,
