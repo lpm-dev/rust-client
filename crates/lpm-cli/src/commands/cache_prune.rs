@@ -186,9 +186,7 @@ pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Re
 }
 
 fn prune_had_errors(summary: &PruneSummary) -> bool {
-    summary.registry_corrupt
-        || summary.tombstone_count_error.is_some()
-        || summary.tombstone_sweep_error.is_some()
+    summary.tombstone_count_error.is_some() || summary.tombstone_sweep_error.is_some()
 }
 
 /// Inner body executed under the store lock. Pulled out so the lock

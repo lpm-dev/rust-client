@@ -1225,6 +1225,53 @@ async fn catalog_show_resolved_json_reports_lockfile_catalog_snapshot() {
     insta::assert_json_snapshot!("catalog_show_resolved_json_envelope", envelope);
 }
 
+#[test]
+fn catalog_show_resolved_rejects_lockfile_missing_referenced_catalog_snapshot() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-catalog",
+            "version": "1.0.0",
+            "dependencies": {
+                "is-positive": "catalog:"
+            },
+            "catalogs": {
+                "default": {
+                    "is-positive": "^2.0.0"
+                }
+            }
+        }"#,
+    );
+    lpm_lockfile::Lockfile::new()
+        .write_to_file(&project.path().join("lpm.lock"))
+        .expect("empty stale lockfile writes");
+
+    let output = lpm(&project)
+        .args(["--json", "catalog", "show", "--resolved"])
+        .output()
+        .expect("failed to run lpm catalog show --resolved --json");
+    let text = output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "catalog show --resolved must reject a lockfile without referenced catalog snapshots\n{text}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!("stale catalog snapshot error must be valid JSON: {error}\n{text}")
+        });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"].as_str().is_some_and(|error| {
+            error.contains("lpm.lock")
+                && error.contains("catalog snapshot")
+                && error.contains("default")
+                && error.contains("is-positive")
+                && error.contains("lpm install")
+        }),
+        "catalog stale-lockfile error must name the missing reference and remediation\n{text}"
+    );
+}
+
 async fn mount_is_positive_versions(mock: &MockRegistry) {
     mock.with_full_package_metadata(
         "is-positive",
