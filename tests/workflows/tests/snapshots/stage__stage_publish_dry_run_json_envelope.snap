@@ -12,7 +12,7 @@ expression: envelope
   "tag": "latest",
   "access": "public",
   "files": 3,
-  "tarball_size": 289,
+  "tarball_size": 0,
   "quality": {
     "score": 15,
     "max_score": 100,

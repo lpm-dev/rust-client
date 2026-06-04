@@ -915,6 +915,7 @@ fn stage_json_filters() -> Vec<(&'static str, &'static str)> {
     vec![
         (r#"http://127\.0\.0\.1:\d+"#, "http://mock.registry"),
         (r#""duration_ms":\s*\d+"#, r#""duration_ms": 0"#),
+        (r#""tarball_size":\s*\d+"#, r#""tarball_size": 0"#),
     ]
 }
 
