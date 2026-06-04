@@ -483,6 +483,103 @@ fn approve_scripts_global_list_json_carries_dry_run_flag_on_both_axes() {
     );
 }
 
+#[test]
+fn approve_scripts_global_yes_fails_when_blocked_set_is_incomplete() {
+    let project = TempProject::empty("");
+    write_global_manifest(&project, "missing-state-global", "1.0.0");
+
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--global", "--yes"])
+        .output()
+        .expect("spawn lpm approve-scripts --global --yes");
+
+    assert!(
+        !out.status.success(),
+        "global --yes must fail when missing build-state makes the aggregate incomplete\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed = assertions::parse_json_output(&out.stdout);
+    assert_eq!(parsed["success"], serde_json::json!(false));
+    let error = parsed["error"].to_string();
+    assert!(
+        error.contains("missing-state-global") && error.contains("build-state"),
+        "error must name the unreadable global origin and build-state problem: {parsed}",
+    );
+}
+
+#[test]
+fn approve_scripts_global_named_empty_set_fails_as_not_found() {
+    let project = TempProject::empty("");
+
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--global", "not-blocked-pkg"])
+        .output()
+        .expect("spawn lpm approve-scripts --global not-blocked-pkg");
+
+    assert!(
+        !out.status.success(),
+        "global named approval of an empty blocked set must fail, not return a generic empty-set success\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed = assertions::parse_json_output(&out.stdout);
+    assert_eq!(parsed["success"], serde_json::json!(false));
+    let error = parsed["error"].to_string();
+    assert!(
+        error.contains("not-blocked-pkg") && error.contains("global blocked set"),
+        "error must name the requested package and the global blocked set: {parsed}",
+    );
+}
+
+#[test]
+fn approve_scripts_named_bare_package_fails_when_multiple_versions_are_blocked() {
+    let project = TempProject::empty(r#"{"name":"approve-scripts-ambiguous","version":"0.0.0"}"#);
+    write_build_state_audit(
+        &project,
+        &[
+            (
+                "multi-version-pkg",
+                "1.0.0",
+                "sha512-multi-v1",
+                "sha256-multi-v1",
+            ),
+            (
+                "multi-version-pkg",
+                "2.0.0",
+                "sha512-multi-v2",
+                "sha256-multi-v2",
+            ),
+        ],
+    );
+
+    let out = lpm(&project)
+        .args([
+            "--json",
+            "approve-scripts",
+            "multi-version-pkg",
+            "--dry-run",
+        ])
+        .output()
+        .expect("spawn lpm approve-scripts multi-version-pkg --dry-run");
+
+    assert!(
+        !out.status.success(),
+        "bare-name approval must fail when multiple blocked versions match\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed = assertions::parse_json_output(&out.stdout);
+    assert_eq!(parsed["success"], serde_json::json!(false));
+    let error = parsed["error"].to_string();
+    assert!(
+        error.contains("ambiguous")
+            && error.contains("multi-version-pkg@1.0.0")
+            && error.contains("multi-version-pkg@2.0.0"),
+        "error must explain ambiguity and list disambiguating candidates: {parsed}",
+    );
+}
+
 // ─── version-diff rendering on `--list` ────────────
 //
 // Ship criteria for approve-scripts:

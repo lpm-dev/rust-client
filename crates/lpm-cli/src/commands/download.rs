@@ -27,11 +27,13 @@ pub async fn run(
     let (package_ref, metadata) = fetch_routed_package_metadata(&context, package).await?;
     let package_name = metadata.name.clone();
 
-    // Resolve version
-    let version_key = version
-        .map(|v| v.to_string())
-        .or_else(|| metadata.latest_version_tag().map(|s| s.to_string()))
-        .ok_or_else(|| LpmError::NotFound(format!("no versions found for {package_name}")))?;
+    let version_key = match version {
+        Some(spec) => metadata.resolve_version_spec(spec)?,
+        None => metadata
+            .latest_version_tag()
+            .map(str::to_string)
+            .ok_or_else(|| LpmError::NotFound(format!("no versions found for {package_name}")))?,
+    };
 
     let ver = metadata.version(&version_key).ok_or_else(|| {
         LpmError::NotFound(format!(

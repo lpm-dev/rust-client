@@ -155,6 +155,54 @@ fn pack_runs_project_tsdown_with_lpm_flags() {
 
 #[cfg(unix)]
 #[test]
+fn pack_single_package_json_emits_success_envelope() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "pack-json-project",
+  "version": "1.0.0"
+}"#,
+    );
+    project.write_file("src/index.ts", "export const answer = 42\n");
+
+    let marker_file = project.home().join("pack-single-json.log");
+    seed_fake_tsdown(&project, &marker_file);
+
+    let output = lpm(&project)
+        .args([
+            "pack",
+            "--json",
+            "--entry",
+            "src/index.ts",
+            "--out-dir",
+            "dist",
+        ])
+        .output()
+        .expect("failed to run lpm pack --json");
+
+    assert!(
+        output.status.success(),
+        "single-package pack --json must succeed, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["packages"], serde_json::json!(1));
+    assert_eq!(envelope["succeeded"], serde_json::json!(1));
+    assert_eq!(envelope["failed"], serde_json::json!(0));
+    assert_eq!(
+        envelope["members"][0]["name"],
+        serde_json::json!("pack-json-project")
+    );
+    assert_eq!(envelope["members"][0]["success"], serde_json::json!(true));
+
+    let invocations = read_marker_lines(&marker_file);
+    assert_eq!(invocations.len(), 1, "expected one tsdown invocation");
+}
+
+#[cfg(unix)]
+#[test]
 fn pack_workspace_human_reports_slim_summary() {
     let project = TempProject::from_fixture("workspace-monorepo");
     for member in ["packages/utils", "packages/core", "packages/app"] {

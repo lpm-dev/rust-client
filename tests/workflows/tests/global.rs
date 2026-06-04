@@ -581,6 +581,53 @@ fn global_unlink_removes_local_link_manifest_entry_and_shims() {
 }
 
 #[test]
+fn global_unlink_invalid_local_link_root_preserves_manifest_entry_and_shims() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    write_local_cli_package(&project);
+
+    let link_output = lpm(&project)
+        .args(["global", "link", "linked-tool"])
+        .output()
+        .expect("failed to run lpm global link");
+    assert!(
+        link_output.status.success(),
+        "setup link failed\nstderr: {}",
+        String::from_utf8_lossy(&link_output.stderr),
+    );
+
+    let root = isolated_lpm_root(&project);
+    let mut manifest = lpm_global::read_for(&root).expect("read manifest after link");
+    manifest
+        .packages
+        .get_mut("linked-tool")
+        .expect("linked package row")
+        .root = "../outside-global-root".to_string();
+    lpm_global::write_for(&root, &manifest).expect("write corrupt local-link root fixture");
+
+    let unlink_output = lpm(&project)
+        .args(["global", "unlink", "linked-tool"])
+        .output()
+        .expect("failed to run lpm global unlink");
+    assert!(
+        !unlink_output.status.success(),
+        "unlink with invalid local-link root must fail"
+    );
+
+    let manifest = lpm_global::read_for(&root).expect("read manifest after failed unlink");
+    assert!(
+        manifest.packages.contains_key("linked-tool"),
+        "failed unlink must preserve the manifest row",
+    );
+    for artifact in lpm_global::expected_artifacts(&root.bin_dir(), "linked-tool") {
+        assert!(
+            artifact.exists(),
+            "failed unlink must preserve global shim artifact: {}",
+            artifact.display(),
+        );
+    }
+}
+
+#[test]
 fn global_link_refuses_command_owned_by_existing_global_package() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
     write_local_cli_package(&project);

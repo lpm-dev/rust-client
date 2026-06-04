@@ -4296,7 +4296,7 @@ async fn async_main() -> Result<()> {
         Commands::Global { action } => commands::global::run(&client, action, cli.json).await,
         Commands::Trust { action } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::trust::run(&action, &cwd).await
+            commands::trust::run(&action, &cwd, cli.json).await
         }
         Commands::Pool => commands::pool::run(&client, cli.json).await,
         Commands::Skills { action, package } => {

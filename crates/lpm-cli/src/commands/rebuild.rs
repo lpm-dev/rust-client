@@ -464,11 +464,15 @@ async fn run_under_store_lock(
     }
 
     if scriptable_packages.is_empty() {
-        if !json_output {
+        if json_output {
+            let result = if dry_run {
+                rebuild_dry_run_envelope(&[], force_security_floor)
+            } else {
+                rebuild_summary_envelope(0, 0, force_security_floor)
+            };
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        } else {
             install_ui::done("No packages have lifecycle scripts · nothing to build");
-        }
-        // Warn about stale trustedDependencies entries
-        if !json_output {
             warn_stale_trusted_deps(&policy, &scriptable_packages);
         }
         return Ok(());
@@ -483,6 +487,7 @@ async fn run_under_store_lock(
     let to_build: Vec<&ScriptablePackage> = if !specific_packages.is_empty() {
         // Build specific packages by name
         let mut selected = Vec::new();
+        let mut missing = Vec::new();
         for name in specific_packages {
             let found = scriptable_packages
                 .iter()
@@ -490,11 +495,26 @@ async fn run_under_store_lock(
             match found {
                 Some(pkg) => selected.push(pkg),
                 None => {
-                    install_ui::warn(&format!(
-                        "{name} has no lifecycle scripts or is not installed"
-                    ));
+                    let safe_name = lpm_common::sanitize_for_terminal(name);
+                    if !json_output {
+                        install_ui::warn(&format!(
+                            "{safe_name} has no lifecycle scripts or is not installed"
+                        ));
+                    }
+                    missing.push(safe_name);
                 }
             }
+        }
+        if !missing.is_empty() {
+            let package_word = if missing.len() == 1 {
+                "package"
+            } else {
+                "packages"
+            };
+            return Err(LpmError::Registry(format!(
+                "requested {package_word} {} have no lifecycle scripts or are not installed",
+                missing.join(", ")
+            )));
         }
         selected
     } else {
@@ -512,7 +532,14 @@ async fn run_under_store_lock(
     let to_build = toposort_packages(to_build, &lockfile);
 
     if to_build.is_empty() {
-        if !json_output {
+        if json_output {
+            let result = if dry_run {
+                rebuild_dry_run_envelope(&to_build, force_security_floor)
+            } else {
+                rebuild_summary_envelope(0, 0, force_security_floor)
+            };
+            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        } else {
             let total = scriptable_packages.len();
             let built = scriptable_packages.iter().filter(|p| p.is_built).count();
             // fix: distinguish "all built" from
@@ -582,18 +609,7 @@ async fn run_under_store_lock(
     // Dry run — show what would be executed
     if dry_run {
         if json_output {
-            let mut json = serde_json::json!({
-                "dry_run": true,
-                "packages": to_build.iter().map(|p| {
-                    serde_json::json!({
-                        "name": p.name,
-                        "version": p.version,
-                        "scripts": p.scripts,
-                        "trusted": p.is_trusted,
-                    })
-                }).collect::<Vec<_>>(),
-            });
-            crate::security_floor::attach_security_posture(&mut json, force_security_floor);
+            let json = rebuild_dry_run_envelope(&to_build, force_security_floor);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
             install_ui::phase(&format!(
@@ -1176,12 +1192,7 @@ async fn run_under_store_lock(
 
     // Summary
     if json_output {
-        let mut json = serde_json::json!({
-            "success": failures == 0,
-            "built": successes,
-            "failed": failures,
-        });
-        crate::security_floor::attach_security_posture(&mut json, force_security_floor);
+        let json = rebuild_summary_envelope(successes, failures, force_security_floor);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if failures == 0 {
         eprintln!();
@@ -2172,6 +2183,39 @@ struct ScriptablePackage {
     /// most call sites only care about the boolean and splitting the
     /// read avoids threading [`TrustReason`] through downstream code.
     trust_reason: TrustReason,
+}
+
+fn rebuild_dry_run_envelope(
+    packages: &[&ScriptablePackage],
+    force_security_floor: bool,
+) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "dry_run": true,
+        "packages": packages.iter().map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "version": p.version,
+                "scripts": p.scripts,
+                "trusted": p.is_trusted,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    crate::security_floor::attach_security_posture(&mut json, force_security_floor);
+    json
+}
+
+fn rebuild_summary_envelope(
+    successes: usize,
+    failures: usize,
+    force_security_floor: bool,
+) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "success": failures == 0,
+        "built": successes,
+        "failed": failures,
+    });
+    crate::security_floor::attach_security_posture(&mut json, force_security_floor);
+    json
 }
 
 fn rebuild_package_label(pkg: &ScriptablePackage) -> String {

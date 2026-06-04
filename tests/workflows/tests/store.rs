@@ -18,6 +18,11 @@ fn store_v1(project: &TempProject) -> std::path::PathBuf {
     store_root(project).join("v1")
 }
 
+fn v1_entry_dir(project: &TempProject, name: &str, version: &str) -> std::path::PathBuf {
+    let safe_name = name.replace(['/', '\\'], "+");
+    store_v1(project).join(format!("{safe_name}@{version}"))
+}
+
 fn v2_sri_and_segment(seed: &[u8]) -> (String, String) {
     let digest: [u8; 64] = Sha512::digest(seed).into();
     let sri = format!("sha512-{}", general_purpose::STANDARD.encode(digest));
@@ -29,8 +34,7 @@ fn v2_sri_and_segment(seed: &[u8]) -> (String, String) {
 /// Directory layout matches `PackageStore::package_dir`: scoped names use
 /// `+` instead of `/`, version follows `@`.
 fn seed_v1_entry(project: &TempProject, name: &str, version: &str, valid: bool) {
-    let safe_name = name.replace(['/', '\\'], "+");
-    let dir = store_v1(project).join(format!("{safe_name}@{version}"));
+    let dir = v1_entry_dir(project, name, version);
     std::fs::create_dir_all(&dir).expect("failed to create store entry dir");
 
     if valid {
@@ -277,6 +281,135 @@ fn store_verify_flags_corrupted_v1_entry_without_package_json() {
             .is_some_and(|s| s.contains("broken-pkg@1.0.0") && s.contains("package.json"))),
         "issues must mention the corrupted entry and the missing field, got: {issues:?}",
     );
+}
+
+#[test]
+fn store_verify_deep_fails_when_lockfile_is_unreadable() {
+    let project = TempProject::empty(r#"{"name":"store-verify","version":"1.0.0"}"#);
+    seed_v1_entry(&project, "deep-pkg", "1.0.0", true);
+    project.write_file("lpm.lock", "this is not a valid lpm lockfile");
+
+    let output = lpm(&project)
+        .args(["--json", "store", "verify", "--deep"])
+        .output()
+        .expect("failed to run lpm store verify --deep --json");
+
+    assert!(
+        !output.status.success(),
+        "deep verify must fail when its lockfile cross-check cannot be loaded\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("store verify --deep --json must emit JSON on failure: {e}\n---\n{stdout}")
+    });
+
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(
+        envelope["check_kind"],
+        serde_json::json!("lockfile_marker_consistency")
+    );
+    let issues = envelope["issues"]
+        .as_array()
+        .expect("issues must be an array");
+    assert!(
+        issues
+            .iter()
+            .filter_map(|issue| issue.as_str())
+            .any(|issue| issue.contains("lpm.lock") && issue.contains("unreadable")),
+        "deep verify must explain that the lockfile could not be read: {envelope}",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn store_verify_deep_fix_fails_when_security_cache_cannot_be_written() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempProject::empty(r#"{"name":"store-verify","version":"1.0.0"}"#);
+    seed_v1_entry(&project, "readonly-pkg", "1.0.0", true);
+
+    let pkg_dir = v1_entry_dir(&project, "readonly-pkg", "1.0.0");
+    let mut readonly = std::fs::metadata(&pkg_dir)
+        .expect("read package dir metadata")
+        .permissions();
+    readonly.set_mode(0o555);
+    std::fs::set_permissions(&pkg_dir, readonly).expect("make package dir readonly");
+
+    let output = lpm(&project)
+        .args(["--json", "store", "verify", "--deep", "--fix"])
+        .output()
+        .expect("failed to run lpm store verify --deep --fix --json");
+
+    let mut writable = std::fs::metadata(&pkg_dir)
+        .expect("read package dir metadata after verify")
+        .permissions();
+    writable.set_mode(0o755);
+    std::fs::set_permissions(&pkg_dir, writable).expect("restore writable package dir");
+
+    assert!(
+        !output.status.success(),
+        "deep verify --fix must fail when it cannot write the refreshed security cache\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("store verify --deep --fix --json must emit JSON on failure: {e}\n---\n{stdout}")
+    });
+
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["securityMismatches"], serde_json::json!(1));
+    assert_eq!(envelope["securityReanalyzed"], serde_json::json!(0));
+    let issues = envelope["issues"]
+        .as_array()
+        .expect("issues must be an array");
+    assert!(
+        issues
+            .iter()
+            .filter_map(|issue| issue.as_str())
+            .any(|issue| issue.contains("readonly-pkg@1.0.0")
+                && issue.contains(".lpm-security.json")),
+        "failed --fix must name the package and cache file that could not be written: {envelope}",
+    );
+}
+
+#[test]
+fn store_verify_fix_refreshes_security_cache_without_requiring_deep_flag() {
+    let project = TempProject::empty(r#"{"name":"store-verify","version":"1.0.0"}"#);
+    seed_v1_entry(&project, "cacheless-pkg", "1.0.0", true);
+
+    let pkg_dir = v1_entry_dir(&project, "cacheless-pkg", "1.0.0");
+    assert!(
+        !pkg_dir.join(".lpm-security.json").exists(),
+        "pre-condition: fixture starts without a security cache"
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "store", "verify", "--fix"])
+        .output()
+        .expect("failed to run lpm store verify --fix --json");
+
+    assert!(
+        output.status.success(),
+        "store verify --fix should succeed when it can refresh the missing cache\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        pkg_dir.join(".lpm-security.json").exists(),
+        "--fix must create the missing security cache even when --deep is omitted"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("store verify --fix --json must emit JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["securityMismatches"], serde_json::json!(1));
+    assert_eq!(envelope["securityReanalyzed"], serde_json::json!(1));
 }
 
 // ─── clean subcommand ─────────────────────────────────────────────────
