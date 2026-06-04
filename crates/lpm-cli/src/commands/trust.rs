@@ -79,11 +79,13 @@ pub enum TrustCmd {
 }
 
 /// Entry point called from main.rs.
-pub async fn run(cmd: &TrustCmd, project_dir: &Path) -> Result<(), LpmError> {
+pub async fn run(cmd: &TrustCmd, project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     match cmd {
-        TrustCmd::Diff { json, assert_none } => run_diff(project_dir, *json, *assert_none).await,
+        TrustCmd::Diff { json, assert_none } => {
+            run_diff(project_dir, json_output || *json, *assert_none).await
+        }
         TrustCmd::Prune { yes, dry_run, json } => {
-            run_prune(project_dir, *yes, *dry_run, *json).await
+            run_prune(project_dir, *yes, *dry_run, json_output || *json).await
         }
     }
 }
@@ -181,37 +183,54 @@ async fn run_diff(project_dir: &Path, json: bool, assert_none: bool) -> Result<(
             }),
     );
     let entries = compute_full_diff(snapshot.as_ref(), &current);
+    let assertion_failed = assert_none && !entries.is_empty();
 
     if json {
-        print_diff_json(&entries, snapshot.as_ref(), &current);
+        print_diff_json(
+            &entries,
+            snapshot.as_ref(),
+            &current,
+            !assertion_failed,
+            assertion_failed.then(|| assert_none_failure_message(entries.len())),
+        );
     } else {
         install_ui::phase("Comparing trust ledger against last install snapshot");
         print_diff_human(&entries, snapshot.as_ref());
     }
 
-    if assert_none && !entries.is_empty() {
-        return Err(LpmError::Registry(format!(
-            "assertion failed: {} trust diff entr{} present",
+    if assertion_failed {
+        if json {
+            return Err(LpmError::ExitCode(1));
+        }
+        return Err(LpmError::Registry(assert_none_failure_message(
             entries.len(),
-            if entries.len() == 1 {
-                "y is"
-            } else {
-                "ies are"
-            }
         )));
     }
 
     Ok(())
 }
 
+fn assert_none_failure_message(entry_count: usize) -> String {
+    format!(
+        "assertion failed: {entry_count} trust diff entr{} present",
+        if entry_count == 1 { "y is" } else { "ies are" }
+    )
+}
+
 fn print_diff_json(
     entries: &[DiffEntry],
     snapshot: Option<&TrustSnapshot>,
     current: &TrustSnapshot,
+    success: bool,
+    error: Option<String>,
 ) {
-    let body = serde_json::json!({
+    let assertion_failed = error.is_some();
+    let mut body = serde_json::json!({
+        "success": success,
         "schema_version": SCHEMA_VERSION,
         "command": "trust diff",
+        "assertion_failed": assertion_failed,
+        "diff_count": entries.len(),
         "snapshot_captured_at": snapshot.map(|s| s.captured_at.clone()),
         "current_binding_count": current.bindings.len(),
         "added": entries.iter().filter(|e| e.kind == DiffKind::Added)
@@ -221,6 +240,10 @@ fn print_diff_json(
         "changed": entries.iter().filter(|e| e.kind == DiffKind::Changed)
             .map(diff_entry_json).collect::<Vec<_>>(),
     });
+    if let Some(error) = error {
+        body["error_code"] = serde_json::json!("trust_diff_assert_none");
+        body["error"] = serde_json::json!(error);
+    }
     println!("{}", serde_json::to_string_pretty(&body).unwrap());
 }
 
@@ -562,6 +585,7 @@ fn trust_entry_word(count: usize) -> &'static str {
 
 fn print_prune_json(stale: &[String], dry_run: bool, will_mutate: bool) {
     let body = serde_json::json!({
+        "success": true,
         "schema_version": SCHEMA_VERSION,
         "command": "trust prune",
         "dry_run": dry_run,

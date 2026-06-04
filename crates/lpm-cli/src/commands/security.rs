@@ -127,7 +127,12 @@ fn ensure_supported_package_filters(
     selector: SecurityScopeSelector,
     packages: &[String],
 ) -> Result<(), LpmError> {
-    if selector.is_bundle() && packages.iter().any(|pkg| !pkg.trim().is_empty()) {
+    if packages.iter().any(|pkg| pkg.trim().is_empty()) {
+        return Err(LpmError::Registry(
+            "`--package` values must not be empty".into(),
+        ));
+    }
+    if selector.is_bundle() && !packages.is_empty() {
         return Err(LpmError::Registry(
             "`--package` can only be used with concrete scopes; `all` and `default` must be unlocked or locked without package filters".into(),
         ));
