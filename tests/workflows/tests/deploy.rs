@@ -176,8 +176,11 @@ fn deploy_dry_run_human_output_applies_slim_color_roles_when_forced() {
         stderr.contains("\x1b[33m@test/utils")
             && stderr.contains("\x1b[2moutput:")
             && stderr.contains("\x1b[33m/")
-            && stderr.contains("\x1b[32myes"),
-        "deploy dry-run should color target/path/status and dim labels, got:\n{stderr:?}",
+            && stderr.contains("\x1b[36m")
+            && stderr.contains("\x1b[32myes")
+            && stderr.contains("\x1b[32mproduction")
+            && stderr.contains("\x1b[32mincluded"),
+        "deploy dry-run should color target/path/status/count roles and dim labels, got:\n{stderr:?}",
     );
 }
 

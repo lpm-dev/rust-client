@@ -75,7 +75,7 @@ lpm ports                      # Dev service port management
 
 # Workspaces & deployment
 lpm filter <expr>              # Preview the workspace set a `--filter` expression selects
-lpm deploy <member>            # Materialize a member's production closure for `COPY --from=pruned`
+lpm deploy <output> --filter <member>  # Materialize a member's deploy closure for `COPY --from=pruned`
 
 # Project health
 lpm doctor                     # Health check (--fix to auto-repair)

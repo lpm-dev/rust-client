@@ -18,7 +18,9 @@ pub mod specifier;
 mod walker;
 
 pub use greedy::PeerConflictReport;
-pub use greedy::{resolve_greedy_fused, resolve_greedy_fused_with_cache};
+pub use greedy::{
+    resolve_greedy_fused, resolve_greedy_fused_with_cache, resolve_greedy_fused_with_cache_options,
+};
 pub use npm_version::NpmVersion;
 pub use overrides::{
     NpmRangeMatcher, OverrideEntry, OverrideError, OverrideHit, OverrideSelector, OverrideSet,
@@ -32,7 +34,8 @@ pub use resolve::{
     CompiledPeerRules, PeerWarning, ResolveError, ResolveResult, ResolvedPackage, StageTiming,
     check_unmet_peers, resolve_dependencies, resolve_dependencies_routed,
     resolve_dependencies_with_overrides, resolve_with_shared_cache,
-    validate_allowed_versions_range, validate_allowed_versions_selector,
+    resolve_with_shared_cache_options, validate_allowed_versions_range,
+    validate_allowed_versions_selector,
 };
 pub use specifier::{Specifier, SpecifierParseError};
 pub use walker::{BfsWalker, DEFAULT_NPM_FANOUT, LevelTiming, WalkerError, WalkerSummary};
