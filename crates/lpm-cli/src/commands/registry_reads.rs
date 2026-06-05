@@ -22,6 +22,48 @@ impl RoutedPackageRef {
     }
 }
 
+pub fn normalize_package_version_input<'a>(
+    command: &str,
+    package: &'a str,
+    version: Option<&'a str>,
+) -> Result<(&'a str, Option<&'a str>), LpmError> {
+    let (name, inline_version) = split_package_and_inline_version(package);
+    if name.is_empty() {
+        return Err(LpmError::InvalidPackageName(format!(
+            "could not parse package name from '{package}'"
+        )));
+    }
+
+    if let (Some(inline_version), Some(flag_version)) = (inline_version, version) {
+        return Err(LpmError::Script(format!(
+            "version specified twice for {name}: positional spec uses '{inline_version}' and \
+             --version uses '{flag_version}'. Use one form, for example \
+             `lpm {command} {name}@{inline_version}` or `lpm {command} {name} --version {flag_version}`."
+        )));
+    }
+
+    Ok((name, version.or(inline_version)))
+}
+
+fn split_package_and_inline_version(spec: &str) -> (&str, Option<&str>) {
+    let (name, version) = if let Some(rest) = spec.strip_prefix('@') {
+        match rest.find('@') {
+            Some(at_pos) => {
+                let split = at_pos + 1;
+                (&spec[..split], Some(&spec[split + 1..]))
+            }
+            None => (spec, None),
+        }
+    } else {
+        match spec.find('@') {
+            Some(at_pos) => (&spec[..at_pos], Some(&spec[at_pos + 1..])),
+            None => (spec, None),
+        }
+    };
+
+    (name, version.filter(|value| !value.is_empty()))
+}
+
 pub fn prepare_routed_read_context(
     client: &RegistryClient,
     project_dir: &Path,
@@ -101,5 +143,45 @@ pub fn search_route_for_query(route_table: &RouteTable, query: &str) -> Upstream
     match route_table.route_for_package(query) {
         UpstreamRoute::Custom { target, auth } => UpstreamRoute::Custom { target, auth },
         _ => UpstreamRoute::NpmDirect,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_package_and_inline_version_handles_unscoped_npm_specs() {
+        assert_eq!(
+            normalize_package_version_input("info", "react@0.14.3", None).unwrap(),
+            ("react", Some("0.14.3"))
+        );
+    }
+
+    #[test]
+    fn split_package_and_inline_version_handles_scoped_npm_specs() {
+        assert_eq!(
+            normalize_package_version_input("info", "@types/node@20.11.0", None).unwrap(),
+            ("@types/node", Some("20.11.0"))
+        );
+    }
+
+    #[test]
+    fn split_package_and_inline_version_handles_scoped_lpm_specs() {
+        assert_eq!(
+            normalize_package_version_input("download", "@lpm.dev/owner.react@1.0.0", None)
+                .unwrap(),
+            ("@lpm.dev/owner.react", Some("1.0.0"))
+        );
+    }
+
+    #[test]
+    fn normalize_package_version_input_rejects_two_version_selectors() {
+        let err = normalize_package_version_input("download", "react@0.14.3", Some("latest"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("version specified twice"),
+            "duplicate selectors must fail clearly, got {err}"
+        );
     }
 }

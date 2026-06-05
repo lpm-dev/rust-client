@@ -117,6 +117,51 @@ async fn download_version_flag_resolves_dist_tags_instead_of_exact_versions_only
 }
 
 #[tokio::test]
+async fn download_positional_npm_version_spec_resolves_requested_version() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let requested_tarball = make_tarball("react", "0.14.3");
+    let latest_tarball = make_tarball("react", "0.14.4");
+    mock.with_full_package_metadata(
+        "react",
+        "0.14.4",
+        &[
+            ("0.14.3", serde_json::json!({}), Some(requested_tarball)),
+            ("0.14.4", serde_json::json!({}), Some(latest_tarball)),
+        ],
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "download",
+            "react@0.14.3",
+            "--json",
+            "--output",
+            "inline-version-out",
+        ])
+        .output()
+        .expect("failed to run lpm download react@0.14.3 --json");
+
+    assert!(
+        output.status.success(),
+        "download must accept an npm-style positional version spec:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert_eq!(json["package"], "react");
+    assert_eq!(json["version"], "0.14.3");
+
+    let package_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("inline-version-out/package.json"))
+            .expect("download must extract a valid package.json");
+    assert_eq!(package_json["version"], "0.14.3");
+}
+
+#[tokio::test]
 async fn download_human_output_uses_slim_progress_and_completion() {
     let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
     let mock = MockRegistry::start().await;

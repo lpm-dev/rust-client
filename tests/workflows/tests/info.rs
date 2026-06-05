@@ -53,3 +53,42 @@ async fn info_human_output_uses_slim_completion_and_stdout_report() {
         "info must not use cliclack gutter output, got:\n{stderr}",
     );
 }
+
+#[tokio::test]
+async fn info_positional_npm_version_spec_resolves_requested_version() {
+    let project = TempProject::empty(r#"{"name":"info-inline-version","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let requested_tarball = make_tarball("react", "0.14.3");
+    let latest_tarball = make_tarball("react", "0.14.4");
+    mock.with_full_package_metadata(
+        "react",
+        "0.14.4",
+        &[
+            ("0.14.3", serde_json::json!({}), Some(requested_tarball)),
+            ("0.14.4", serde_json::json!({}), Some(latest_tarball)),
+        ],
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["info", "react@0.14.3"])
+        .output()
+        .expect("failed to run lpm info react@0.14.3");
+
+    assert!(
+        output.status.success(),
+        "info must accept an npm-style positional version spec:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("react") && stdout.contains("version      0.14.3"),
+        "info must show the requested inline version, got:\n{stdout}",
+    );
+    assert!(
+        !stdout.contains("version      0.14.4"),
+        "info must not show latest as the selected version when inline version is requested:\n{stdout}",
+    );
+}
