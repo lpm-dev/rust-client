@@ -10,16 +10,16 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
 use tempfile::TempDir;
 
 const VERDACCIO_VERSION: &str = "6.5.2";
-const DEFAULT_USERNAME: &str = "lpm-workflows";
 const DEFAULT_PASSWORD: &str = "lpm-workflows-password";
-const DEFAULT_EMAIL: &str = "lpm-workflows@example.test";
 const WORKFLOW_PUBLISHED_AT: &str = "2024-01-01T00:00:00.000Z";
+static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
@@ -93,8 +93,13 @@ impl VerdaccioRegistry {
         };
 
         registry.wait_until_ready().await;
+        let username = unique_username(port);
         registry.token = registry
-            .bootstrap_user(DEFAULT_USERNAME, DEFAULT_PASSWORD, DEFAULT_EMAIL)
+            .bootstrap_user(
+                &username,
+                DEFAULT_PASSWORD,
+                &format!("{username}@example.test"),
+            )
             .await;
         registry
     }
@@ -316,6 +321,7 @@ impl VerdaccioRegistry {
             .build()
             .expect("failed to build reqwest client for verdaccio readiness");
         let deadline = Instant::now() + Duration::from_secs(20);
+        let config_path = self.config_dir.path().join("config.yaml");
 
         loop {
             if let Some(status) = self
@@ -329,8 +335,14 @@ impl VerdaccioRegistry {
                 );
             }
 
+            let logs = self.logs();
+            let current_process_is_listening =
+                verdaccio_log_confirms_current_instance(&logs, &config_path, self.url());
+
             match http.get(format!("{}/-/ping", self.url())).send().await {
-                Ok(resp) if resp.status() == StatusCode::OK => return,
+                Ok(resp) if resp.status() == StatusCode::OK && current_process_is_listening => {
+                    return;
+                }
                 _ if Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(150)).await;
                 }
@@ -464,6 +476,19 @@ fn write_config(dir: &Path) {
     );
 
     std::fs::write(dir.join("config.yaml"), config).expect("failed to write verdaccio config");
+}
+
+fn unique_username(port: u16) -> String {
+    let id = NEXT_REGISTRY_ID.fetch_add(1, Ordering::Relaxed);
+    format!("lpm-workflows-{}-{id}-{port}", std::process::id())
+}
+
+pub(crate) fn verdaccio_log_confirms_current_instance(
+    logs: &str,
+    config_path: &Path,
+    base_url: &str,
+) -> bool {
+    logs.contains(&yaml_path(config_path)) && logs.contains(&format!("{base_url}/"))
 }
 
 fn yaml_path(path: &Path) -> String {

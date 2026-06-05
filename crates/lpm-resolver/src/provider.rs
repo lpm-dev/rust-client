@@ -299,6 +299,7 @@ pub struct LpmDependencyProvider {
     /// (e.g. a future per-split platform override) can't accidentally
     /// read stale memoized Ranges from a prior pass.
     range_cache: RefCell<HashMap<(ResolverPackage, String), Ranges<NpmVersion>>>,
+    include_optional_dependencies: bool,
 }
 
 impl LpmDependencyProvider {
@@ -326,6 +327,7 @@ impl LpmDependencyProvider {
             platform_skipped: RefCell::new(0),
             root_aliases: RefCell::new(HashMap::new()),
             range_cache: RefCell::new(HashMap::new()),
+            include_optional_dependencies: true,
         }
     }
 
@@ -355,7 +357,13 @@ impl LpmDependencyProvider {
             platform_skipped: RefCell::new(0),
             root_aliases: RefCell::new(HashMap::new()),
             range_cache: RefCell::new(HashMap::new()),
+            include_optional_dependencies: true,
         }
+    }
+
+    pub fn with_include_optional_dependencies(mut self, include: bool) -> Self {
+        self.include_optional_dependencies = include;
+        self
     }
 
     /// Attach an externally-owned shared cache + notify map (the one the
@@ -1407,7 +1415,7 @@ impl DependencyProvider for LpmDependencyProvider {
                 Some(deps) => deps.clone(),
                 None => return Ok(Dependencies::Available(pubgrub::Map::default())),
             };
-            let opt = info
+            let mut opt = info
                 .optional_dep_names
                 .get(&ver_str)
                 .cloned()
@@ -1439,6 +1447,10 @@ impl DependencyProvider for LpmDependencyProvider {
                          — provided by parent's tarball"
                     );
                 }
+            }
+            if !self.include_optional_dependencies && !opt.is_empty() {
+                deps.retain(|name, _| !opt.contains(name));
+                opt.clear();
             }
             (deps, opt, aliases, bundled)
         };
