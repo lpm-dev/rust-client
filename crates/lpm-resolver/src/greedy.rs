@@ -205,6 +205,7 @@ type ManifestState = Arc<CachedPackageInfo>;
 /// `~/.lpm/config.toml > auto-install-peers` to derive the value at
 /// the call site.
 #[allow(clippy::too_many_arguments)] // mirrors resolve_with_shared_cache for drop-in dispatch
+#[allow(dead_code)]
 pub async fn resolve_greedy(
     client: Arc<RegistryClient>,
     dependencies: HashMap<String, String>,
@@ -217,6 +218,36 @@ pub async fn resolve_greedy(
     metrics: StreamingBfsMetrics,
     auto_install_peers: bool,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_greedy_with_options(
+        client,
+        dependencies,
+        overrides,
+        shared_cache,
+        notify_map,
+        walker_done,
+        fetch_wait_timeout,
+        route_table,
+        metrics,
+        auto_install_peers,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_greedy_with_options(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    shared_cache: SharedCache,
+    notify_map: NotifyMap,
+    walker_done: WalkerDone,
+    fetch_wait_timeout: Duration,
+    route_table: RouteTable,
+    metrics: StreamingBfsMetrics,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!("resolve_greedy", n_deps = dependencies.len()).entered();
     let pass_start = Instant::now();
 
@@ -226,7 +257,8 @@ pub async fn resolve_greedy(
     crate::profile::reset_all();
     lpm_registry::timing::reset();
 
-    let mut state = ResolveState::new(dependencies, overrides);
+    let mut state =
+        ResolveState::new_with_options(dependencies, overrides, include_optional_dependencies);
     state.seed_root_edges()?;
 
     // ── Main task_queue + peer-drain fixed-point loop ──────────────
@@ -445,6 +477,32 @@ pub async fn resolve_greedy_fused_with_cache(
     shared_cache: SharedCache,
     auto_install_peers: bool,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_greedy_fused_with_cache_options(
+        client,
+        dependencies,
+        overrides,
+        route_table,
+        npm_fanout,
+        spec_tx,
+        shared_cache,
+        auto_install_peers,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_greedy_fused_with_cache_options(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    route_table: RouteTable,
+    npm_fanout: usize,
+    spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    shared_cache: SharedCache,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!(
         "resolve_greedy_fused",
         n_deps = dependencies.len(),
@@ -459,7 +517,8 @@ pub async fn resolve_greedy_fused_with_cache(
     crate::profile::reset_all();
     lpm_registry::timing::reset();
 
-    let mut state = ResolveState::new(dependencies, overrides);
+    let mut state =
+        ResolveState::new_with_options(dependencies, overrides, include_optional_dependencies);
     state.seed_root_edges()?;
 
     // Loop-local state, owned by this single task. No Arcs needed
@@ -931,6 +990,7 @@ struct ResolveState {
     /// stable hash of the sorted parent peer context so repeated peer-drain
     /// passes don't recompute the same manifest decision.
     peer_resolution_cache: dashmap::DashMap<PeerResolutionCacheKey, CachedPeerResolution>,
+    include_optional_dependencies: bool,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -944,7 +1004,16 @@ struct ResolvedNodeBuilder {
 }
 
 impl ResolveState {
+    #[cfg(test)]
     fn new(root_deps: HashMap<String, String>, overrides: OverrideSet) -> Self {
+        Self::new_with_options(root_deps, overrides, true)
+    }
+
+    fn new_with_options(
+        root_deps: HashMap<String, String>,
+        overrides: OverrideSet,
+        include_optional_dependencies: bool,
+    ) -> Self {
         ResolveState {
             root_deps,
             task_queue: VecDeque::with_capacity(256),
@@ -965,6 +1034,7 @@ impl ResolveState {
             // Allocated lazily on first conflict.
             peer_conflicts: Vec::new(),
             peer_resolution_cache: dashmap::DashMap::with_capacity(64),
+            include_optional_dependencies,
         }
     }
 
@@ -1608,6 +1678,15 @@ fn enqueue_child_deps(
         };
 
         let optional = optional_names.is_some_and(|set| set.contains(local_name));
+        if optional && !state.include_optional_dependencies {
+            tracing::debug!(
+                "skipping optional dep {} of {}@{} by install option",
+                local_name,
+                parent_canonical,
+                ver_str,
+            );
+            continue;
+        }
 
         state.task_queue.push_back(Edge {
             parent: parent_id,
@@ -3289,6 +3368,40 @@ mod tests {
             .collect();
         queued.sort();
         assert_eq!(queued, vec!["lodash", "react"]);
+    }
+
+    #[test]
+    fn enqueue_child_deps_omits_optional_dependencies_when_disabled() {
+        let mut info = mk_info(&["1.0.0"], &[]);
+        let mut deps_of_latest = HashMap::new();
+        deps_of_latest.insert("required-child".to_string(), "^1.0.0".to_string());
+        deps_of_latest.insert("optional-child".to_string(), "^2.0.0".to_string());
+        info.deps.insert("1.0.0".to_string(), deps_of_latest);
+        let mut optional = HashSet::new();
+        optional.insert("optional-child".to_string());
+        info.optional_dep_names
+            .insert("1.0.0".to_string(), optional);
+
+        let mut state = ResolveState::new_with_options(HashMap::new(), OverrideSet::empty(), false);
+        state.nodes.push(ResolvedNodeBuilder {
+            canonical: CanonicalKey::npm("parent"),
+            version: NpmVersion::parse("1.0.0").unwrap(),
+            children: Vec::new(),
+        });
+        enqueue_child_deps(
+            0,
+            &CanonicalKey::npm("parent"),
+            &NpmVersion::parse("1.0.0").unwrap(),
+            &info,
+            &mut state,
+        );
+
+        let queued: Vec<&str> = state
+            .task_queue
+            .iter()
+            .map(|edge| edge.local_name.as_str())
+            .collect();
+        assert_eq!(queued, vec!["required-child"]);
     }
 
     // ── workspace: defense-in-depth at resolver entry ────────────

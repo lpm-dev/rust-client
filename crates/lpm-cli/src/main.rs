@@ -1634,25 +1634,23 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Materialize a single workspace member's production closure into a
+    /// Materialize a single workspace member's deploy closure into a
     /// self-contained output directory ready for `COPY --from=pruned` in a
     /// Dockerfile.
     ///
     /// The deploy output contains:
     /// - The targeted member's source files (excluding `.env*`, `node_modules`,
     ///   `.git`, and other LPM-internal state)
-    /// - A `package.json` with `workspace:*` references rewritten to concrete
-    ///   versions
+    /// - Local workspace dependencies needed by the selected dependency mode
+    /// - A deploy-local store rooted under the output directory
     /// - A `node_modules/` populated by running the install pipeline at the
     ///   output directory
-    /// - A `lpm.lock` for the deploy output's dep tree
+    /// - A `lpm.lock` pruned for the deploy output's dep tree
     ///
     /// **Constraints:**
     /// - `--filter` is required and must match exactly one workspace member
     /// - The output directory must be outside the workspace tree
-    /// - Workspace members referenced via `workspace:*` must be PUBLISHED to
-    ///   the registry (the resolver has no local-package handling).a future release
-    ///   will add unpublished workspace dep injection.
+    /// - `--prod` is the default dependency mode; `--dev` deploys dev deps only
     ///
     /// **Example:**
     /// ```dockerfile
@@ -1690,6 +1688,18 @@ enum Commands {
         /// flag, deploy refuses to write into a non-empty directory.
         #[arg(long)]
         force: bool,
+
+        /// Deploy production dependencies. This is the default.
+        #[arg(long, conflicts_with = "dev")]
+        prod: bool,
+
+        /// Deploy devDependencies instead of production dependencies.
+        #[arg(long, conflicts_with = "prod")]
+        dev: bool,
+
+        /// Omit optionalDependencies from the deploy output and resolver graph.
+        #[arg(long = "no-optional")]
+        no_optional: bool,
 
         /// Show what would be deployed without making any filesystem changes.
         #[arg(long)]
@@ -4834,6 +4844,9 @@ async fn async_main() -> Result<()> {
             changed_files_ignore_pattern,
             test_pattern,
             force,
+            prod,
+            dev,
+            no_optional,
             dry_run,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -4847,6 +4860,9 @@ async fn async_main() -> Result<()> {
                 &changed_files_ignore_pattern,
                 &test_pattern,
                 force,
+                prod,
+                dev,
+                no_optional,
                 dry_run,
                 cli.json,
             )
@@ -7998,6 +8014,63 @@ mod tests {
                 .unwrap();
         match cli.command.expect("test parse missing subcommand") {
             Commands::Deploy { dry_run, .. } => assert!(dry_run),
+            _ => panic!("expected Deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_command_dependency_mode_flags_parse() {
+        let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api", "--prod"])
+            .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Deploy { prod, dev, .. } => {
+                assert!(prod);
+                assert!(!dev);
+            }
+            _ => panic!("expected Deploy command"),
+        }
+
+        let cli = Cli::try_parse_from(["lpm", "deploy", "/prod/api", "--filter", "api", "--dev"])
+            .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Deploy { prod, dev, .. } => {
+                assert!(!prod);
+                assert!(dev);
+            }
+            _ => panic!("expected Deploy command"),
+        }
+    }
+
+    #[test]
+    fn deploy_command_prod_and_dev_conflict() {
+        let result = Cli::try_parse_from([
+            "lpm",
+            "deploy",
+            "/prod/api",
+            "--filter",
+            "api",
+            "--prod",
+            "--dev",
+        ]);
+        assert!(
+            result.is_err(),
+            "deploy --prod and --dev must be mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn deploy_command_no_optional_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "deploy",
+            "/prod/api",
+            "--filter",
+            "api",
+            "--no-optional",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Deploy { no_optional, .. } => assert!(no_optional),
             _ => panic!("expected Deploy command"),
         }
     }

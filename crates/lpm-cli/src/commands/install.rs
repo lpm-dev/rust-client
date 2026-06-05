@@ -4042,6 +4042,69 @@ pub async fn run_with_options(
     // to the JSON envelope). Findings NEVER fail the install.
     audit_after_install: bool,
 ) -> Result<(), LpmError> {
+    let lpm_root = lpm_common::LpmRoot::from_env()?;
+    run_with_options_with_lpm_root(
+        client,
+        project_dir,
+        json_output,
+        offline,
+        force,
+        allow_new,
+        strict_integrity,
+        strict_peer_dependencies_override,
+        linker_override,
+        no_skills,
+        no_editor_setup,
+        no_security_summary,
+        auto_build,
+        target_set,
+        direct_versions_out,
+        requested_add_count,
+        script_policy_override,
+        advisor_override,
+        min_release_age_override,
+        drift_ignore_policy,
+        verify_policy,
+        strict_sandbox,
+        no_sandbox,
+        verbose,
+        audit_after_install,
+        lpm_root,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_options_with_lpm_root(
+    client: &RegistryClient,
+    project_dir: &Path,
+    json_output: bool,
+    offline: bool,
+    force: bool,
+    allow_new: bool,
+    strict_integrity: bool,
+    strict_peer_dependencies_override: Option<bool>,
+    linker_override: Option<lpm_linker::LinkerMode>,
+    no_skills: bool,
+    no_editor_setup: bool,
+    no_security_summary: bool,
+    auto_build: bool,
+    target_set: Option<&[String]>,
+    direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
+    requested_add_count: Option<usize>,
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    advisor_override: Option<String>,
+    min_release_age_override: Option<u64>,
+    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
+    strict_sandbox: bool,
+    no_sandbox: bool,
+    verbose: bool,
+    audit_after_install: bool,
+    lpm_root: lpm_common::LpmRoot,
+    omit_optional_dependencies: bool,
+) -> Result<(), LpmError> {
     // Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
     // freely; `lpm cache prune --apply` and `lpm store clean` (which take it
@@ -4052,7 +4115,7 @@ pub async fn run_with_options(
     // Acquired via the async helper so a contended lock doesn't block
     // the tokio reactor; the held handle lives for the lifetime of
     // the inner future and releases when the future returns.
-    let store_lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+    let store_lock_path = lpm_root.store_lock();
     lpm_common::with_shared_lock_async(
         store_lock_path,
         run_with_options_under_store_lock(
@@ -4081,6 +4144,8 @@ pub async fn run_with_options(
             no_sandbox,
             verbose,
             audit_after_install,
+            &lpm_root,
+            omit_optional_dependencies,
         ),
     )
     .await
@@ -4124,6 +4189,8 @@ async fn run_with_options_under_store_lock(
     verbose: bool,
     // Resolved audit-after-install boolean — see [`run_with_options`].
     audit_after_install: bool,
+    lpm_root: &lpm_common::LpmRoot,
+    omit_optional_dependencies: bool,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
     crate::security_floor::clear_recorded_suppressions();
@@ -5026,7 +5093,7 @@ async fn run_with_options_under_store_lock(
         }
 
         // Verify all packages are in the global store
-        let store = PackageStore::default_location()?;
+        let store = PackageStore::from_root(lpm_root);
         let mut missing = Vec::new();
         for p in &locked {
             // day-5.5 audit fix (HIGH-2 partial): source-
@@ -5133,6 +5200,7 @@ async fn run_with_options_under_store_lock(
             force,
             &workspace_member_deps,
             script_policy_override,
+            lpm_root,
         )
         .await;
     }
@@ -5224,7 +5292,7 @@ async fn run_with_options_under_store_lock(
     // dispatcher can write tarballs into the real store during the
     // resolve phase. Post-resolve, the fetch loop rebinds to the same
     // handle (cheap Arc-style clone underneath).
-    let store = PackageStore::default_location()?;
+    let store = PackageStore::from_root(lpm_root);
     // confidence-followup S5b — `lpm_root` lifted to function
     // scope so post-install helpers (`show_install_build_hint`,
     // `all_scripted_packages_trusted`) can reach the v2 store via
@@ -5232,8 +5300,6 @@ async fn run_with_options_under_store_lock(
     // `&PackageStore` (v1-only) and silently dropped every v2-installed
     // scripted package — auto-build never fired, build hints reported
     // 0 packages even when prisma / esbuild / sharp were waiting.
-    let lpm_root = lpm_common::LpmRoot::from_env()?;
-
     // — read the store-version flag once per
     // install. `LPM_STORE_VERSION=v2` opts in to the virtual-store
     // pipeline; everything else (unset, "v1", typos) takes the v1
@@ -5247,7 +5313,7 @@ async fn run_with_options_under_store_lock(
     let store_version = lpm_store::StoreVersion::from_env();
     let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> = if store_version.is_v2() {
         Some(std::sync::Arc::new(lpm_store::v2::Store::from_lpm_root(
-            &lpm_root,
+            lpm_root,
         )))
     } else {
         None
@@ -5552,7 +5618,7 @@ async fn run_with_options_under_store_lock(
 
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
                     seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
-                    let res = lpm_resolver::resolve_greedy_fused_with_cache(
+                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options(
                         arc_client.clone(),
                         deps.clone(),
                         override_set.clone(),
@@ -5561,6 +5627,7 @@ async fn run_with_options_under_store_lock(
                         Some(spec_tx),
                         shared_cache,
                         auto_install_peers,
+                        !omit_optional_dependencies,
                     )
                     .await
                     .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
@@ -5691,7 +5758,7 @@ async fn run_with_options_under_store_lock(
                         let _ = roots_ready_rx.await;
                         let roots_ready_at = batch_start.elapsed().as_millis();
                         let w2_resolve_start = Instant::now();
-                        let result = lpm_resolver::resolve_with_shared_cache(
+                        let result = lpm_resolver::resolve_with_shared_cache_options(
                             resolve_client,
                             resolve_deps,
                             resolve_overrides,
@@ -5702,6 +5769,7 @@ async fn run_with_options_under_store_lock(
                             route_table.clone(),
                             streaming_metrics_for_resolve,
                             auto_install_peers,
+                            !omit_optional_dependencies,
                         )
                         .await
                         .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
@@ -6737,7 +6805,6 @@ async fn run_with_options_under_store_lock(
         );
 
         if has_rich_approvals {
-            let lpm_root = lpm_common::paths::LpmRoot::from_env()?;
             let cache_root = lpm_root.cache_metadata_attestations();
             let http = reqwest::Client::new();
 
@@ -7848,7 +7915,7 @@ async fn run_with_options_under_store_lock(
         .get_bool("force-security-floor")
         .unwrap_or(false);
     let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
-        &lpm_root,
+        lpm_root,
         &all_pkgs_for_build,
         &policy,
         project_dir,
@@ -7959,7 +8026,7 @@ async fn run_with_options_under_store_lock(
                     .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
                     .collect();
                 crate::commands::rebuild::show_install_build_hint(
-                    &lpm_root,
+                    lpm_root,
                     &all_pkgs,
                     &policy,
                     project_dir,
@@ -9083,10 +9150,7 @@ async fn run_with_options_under_store_lock(
     // logged + dropped: the registry is non-load-bearing (prune
     // degrades gracefully without it) so a flaky write must never
     // block a successful install.
-    if let Ok(lpm_root) = lpm_common::LpmRoot::from_env()
-        && let Err(e) =
-            lpm_common::known_projects::register(&lpm_root.known_projects(), project_dir)
-    {
+    if let Err(e) = lpm_common::known_projects::register(&lpm_root.known_projects(), project_dir) {
         tracing::debug!("phase 4e: failed to register project in known-projects registry: {e}");
     }
 
@@ -10728,6 +10792,7 @@ async fn run_link_and_finish(
     // render the same triage summary line when the effective policy
     // is `triage`.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    lpm_root: &lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     crate::security_floor::clear_recorded_suppressions();
     let force_security_floor = crate::security_floor::force_security_floor_enabled(
@@ -10738,10 +10803,7 @@ async fn run_link_and_finish(
         packages.extend(ephemeral_packages.iter().cloned());
         apply_post_resolve_directory_link_fixup(&mut packages, ephemeral_source_deps);
     }
-    let store = PackageStore::default_location()?;
-    // confidence-followup S5b — same hoist as `run_with_options`;
-    // post-install helpers route through `find_installed_package_baseline`.
-    let lpm_root = lpm_common::LpmRoot::from_env()?;
+    let store = PackageStore::from_root(lpm_root);
 
     // Mirror of the online-arm
     // hoist: pre-resolve the per-target patch fingerprint map before
@@ -10932,7 +10994,7 @@ async fn run_link_and_finish(
                     .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
                     .collect();
                 crate::commands::rebuild::show_install_build_hint(
-                    &lpm_root,
+                    lpm_root,
                     &all_pkgs,
                     &policy,
                     project_dir,

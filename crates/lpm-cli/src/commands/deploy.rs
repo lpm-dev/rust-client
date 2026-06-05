@@ -1,9 +1,5 @@
-//! `lpm deploy` — materialize a workspace member's production closure into
+//! `lpm deploy` — materialize a workspace member's selected dependency closure into
 //! a self-contained directory ready for Docker / `COPY --from=pruned`.
-//!
-//! See [37-rust-client-RUNNER-VISION-phase32-phase3-status.md]
-//! for the milestone breakdown and the verified architectural facts that
-//! shape this design.
 //!
 //! ## High-level pipeline
 //!
@@ -11,11 +7,12 @@
 //!    the result is exactly one member (deploy is single-target).
 //! 2. Validate the output directory (must be outside the workspace, must be
 //!    empty unless `--force`).
-//! 3. Copy the member's source files into the output dir, applying the deny
-//!    list (no `.env`, no `node_modules`, no `.git`, etc.).
-//! 4. Rewrite `workspace:*` references in the copied `package.json` to
-//!    concrete versions (using the SOURCE workspace as the version source).
-//! 5. Run the install pipeline at the output dir to materialize the
+//! 3. Copy package-publishable source files into the output dir, applying
+//!    the deny list (no `.env`, no `node_modules`, no `.git`, etc.).
+//! 4. Copy any selected local workspace dependencies into a deploy-local
+//!    source area and rewrite `workspace:*` references to relative `file:`
+//!    specs.
+//! 5. Run the install pipeline with an LPM root inside the output dir to materialize the
 //!    dependency tree (downloads tarballs, links into `output/node_modules`).
 //! 6. Emit a structured success summary.
 //!
@@ -25,17 +22,15 @@
 //!   under the workspace root.
 //! - **`--dry-run` writes nothing.** Hard rule: zero filesystem writes when
 //!   `dry_run == true`.
-//! - **Deploy targets exactly one member.** Multi-member deploy isa future release.
-//! - **Workspace members must be PUBLISHED** for cross-member deps. The
-//!   resolver has no local-package handling; an unpublished workspace member
-//!   referenced via `workspace:*` will fail at the resolver step. This is
-//!   documented as a limitation.
+//! - **Deploy targets exactly one member.** Multi-member deploy is a future release.
+//! - **Deploy output is portable on Unix.** Internal absolute symlinks under
+//!   `node_modules` are rewritten to relative symlinks after install.
 
 use crate::commands::install_targets::{install_root_for, resolve_install_targets};
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -83,6 +78,7 @@ const DEPLOY_DENY_BASENAMES: &[&str] = &[
     // Version control
     ".git",
     ".gitignore",
+    ".npmignore",
     ".gitattributes",
     ".svn",
     ".hg",
@@ -91,6 +87,46 @@ const DEPLOY_DENY_BASENAMES: &[&str] = &[
     "Thumbs.db",
 ];
 
+const DEPLOY_WORKSPACE_DIR: &str = ".lpm/deploy-workspace";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyMode {
+    Production,
+    Development,
+}
+
+impl DependencyMode {
+    fn from_flags(_prod: bool, dev: bool) -> Self {
+        if dev {
+            Self::Development
+        } else {
+            Self::Production
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Development => "development",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ManifestSelectionStats {
+    dev_dependencies_stripped: usize,
+    production_dependencies_stripped: usize,
+    optional_dependencies_stripped: usize,
+}
+
+impl ManifestSelectionStats {
+    fn add(&mut self, other: &Self) {
+        self.dev_dependencies_stripped += other.dev_dependencies_stripped;
+        self.production_dependencies_stripped += other.production_dependencies_stripped;
+        self.optional_dependencies_stripped += other.optional_dependencies_stripped;
+    }
+}
+
 /// Stats from a [`copy_member_source`] call. Used by the deploy summary
 /// (human and JSON output paths).
 #[derive(Debug, Clone, Default)]
@@ -98,6 +134,181 @@ pub(crate) struct CopyStats {
     pub files_copied: usize,
     pub files_skipped: usize,
     pub bytes_copied: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PackageFileSelector {
+    files: Option<Vec<String>>,
+    ignore_rules: Vec<IgnoreRule>,
+}
+
+#[derive(Debug, Clone)]
+struct IgnoreRule {
+    pattern: String,
+    negated: bool,
+    anchored: bool,
+    directory_only: bool,
+}
+
+impl PackageFileSelector {
+    fn from_package_dir(package_dir: &Path) -> Result<Self, LpmError> {
+        let manifest_path = package_dir.join("package.json");
+        let manifest = std::fs::read_to_string(&manifest_path).map_err(|e| {
+            LpmError::Script(format!(
+                "deploy: failed to read package manifest {manifest_path:?}: {e}"
+            ))
+        })?;
+        let doc: serde_json::Value = serde_json::from_str(&manifest)
+            .map_err(|e| LpmError::Script(format!("deploy: invalid package.json: {e}")))?;
+        let files = doc
+            .get("files")
+            .and_then(|value| value.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str())
+                    .map(normalize_package_pattern)
+                    .filter(|entry| !entry.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|entries| !entries.is_empty());
+
+        let ignore_rules = if files.is_none() {
+            read_ignore_rules(package_dir)?
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            files,
+            ignore_rules,
+        })
+    }
+
+    fn should_copy(&self, rel_path: &Path, is_dir: bool) -> bool {
+        let rel = normalize_relative_path(rel_path);
+        if rel.is_empty() || package_publish_always_includes(&rel) {
+            return true;
+        }
+        if let Some(files) = &self.files {
+            return files
+                .iter()
+                .any(|pattern| files_entry_matches(pattern, &rel, is_dir));
+        }
+
+        let mut included = true;
+        for rule in &self.ignore_rules {
+            if rule.matches(&rel, is_dir) {
+                included = rule.negated;
+            }
+        }
+        included
+    }
+}
+
+impl IgnoreRule {
+    fn matches(&self, rel: &str, is_dir: bool) -> bool {
+        if self.directory_only && !is_dir {
+            return false;
+        }
+        let pattern = self.pattern.as_str();
+        if self.anchored || pattern.contains('/') {
+            glob_match(pattern, rel)
+        } else {
+            rel.split('/')
+                .any(|component| glob_match(pattern, component))
+        }
+    }
+}
+
+fn read_ignore_rules(package_dir: &Path) -> Result<Vec<IgnoreRule>, LpmError> {
+    let npmignore = package_dir.join(".npmignore");
+    let gitignore = package_dir.join(".gitignore");
+    let ignore_path = if npmignore.exists() {
+        Some(npmignore)
+    } else if gitignore.exists() {
+        Some(gitignore)
+    } else {
+        None
+    };
+    let Some(ignore_path) = ignore_path else {
+        return Ok(Vec::new());
+    };
+    let content = std::fs::read_to_string(&ignore_path).map_err(|e| {
+        LpmError::Script(format!(
+            "deploy: failed to read ignore file {ignore_path:?}: {e}"
+        ))
+    })?;
+    let mut rules = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let negated = line.starts_with('!');
+        let without_negation = if negated { &line[1..] } else { line };
+        let anchored = without_negation.starts_with('/');
+        let without_anchor = without_negation.trim_start_matches('/');
+        let directory_only = without_anchor.ends_with('/');
+        let pattern = normalize_package_pattern(without_anchor.trim_end_matches('/'));
+        if pattern.is_empty() {
+            continue;
+        }
+        rules.push(IgnoreRule {
+            pattern,
+            negated,
+            anchored,
+            directory_only,
+        });
+    }
+    Ok(rules)
+}
+
+fn normalize_relative_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            std::path::Component::ParentDir => Some("..".to_string()),
+            std::path::Component::CurDir => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn normalize_package_pattern(pattern: &str) -> String {
+    pattern
+        .trim()
+        .trim_start_matches("./")
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+fn package_publish_always_includes(rel: &str) -> bool {
+    if rel == "package.json" {
+        return true;
+    }
+    let lowercase = rel.to_ascii_lowercase();
+    lowercase == "readme"
+        || lowercase.starts_with("readme.")
+        || lowercase == "license"
+        || lowercase.starts_with("license.")
+}
+
+fn files_entry_matches(pattern: &str, rel: &str, is_dir: bool) -> bool {
+    let pattern = pattern.trim_end_matches('/');
+    if rel == pattern || rel.starts_with(&format!("{pattern}/")) {
+        return true;
+    }
+    if is_dir && pattern.starts_with(&format!("{rel}/")) {
+        return true;
+    }
+    glob_match(pattern, rel)
+}
+
+fn glob_match(pattern: &str, rel: &str) -> bool {
+    glob::Pattern::new(pattern)
+        .map(|pattern| pattern.matches_path(Path::new(rel)))
+        .unwrap_or(false)
 }
 
 /// Recursively copy `src_dir` into `dst_dir`, skipping any path that matches
@@ -127,15 +338,18 @@ pub(crate) fn copy_member_source(src_dir: &Path, dst_dir: &Path) -> Result<CopyS
     std::fs::create_dir_all(dst_dir)
         .map_err(|e| LpmError::Script(format!("failed to create deploy output dir: {e}")))?;
 
-    copy_member_source_recursive(src_dir, dst_dir, &mut stats)?;
+    let selector = PackageFileSelector::from_package_dir(src_dir)?;
+    copy_member_source_recursive(src_dir, src_dir, dst_dir, &selector, &mut stats)?;
     Ok(stats)
 }
 
 /// Inner recursive walker. Separated so the public entry point can do the
 /// one-time `create_dir_all` and stats initialization.
 fn copy_member_source_recursive(
+    root: &Path,
     src: &Path,
     dst: &Path,
+    selector: &PackageFileSelector,
     stats: &mut CopyStats,
 ) -> Result<(), LpmError> {
     let entries = std::fs::read_dir(src)
@@ -163,11 +377,16 @@ fn copy_member_source_recursive(
         let file_type = entry
             .file_type()
             .map_err(|e| LpmError::Script(format!("failed to stat {src_path:?}: {e}")))?;
+        let rel_path = src_path.strip_prefix(root).unwrap_or(src_path.as_path());
+        if !selector.should_copy(rel_path, file_type.is_dir()) {
+            stats.files_skipped += 1;
+            continue;
+        }
 
         if file_type.is_dir() {
             std::fs::create_dir_all(&dst_path)
                 .map_err(|e| LpmError::Script(format!("failed to create dir {dst_path:?}: {e}")))?;
-            copy_member_source_recursive(&src_path, &dst_path, stats)?;
+            copy_member_source_recursive(root, &src_path, &dst_path, selector, stats)?;
         } else if file_type.is_symlink() {
             // Preserve symlinks as-is. Don't follow them — that could escape
             // the source dir.
@@ -432,6 +651,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     result
 }
 
+#[cfg(test)]
 /// Rewrite `workspace:*` references in the deploy output's `package.json`
 /// to concrete versions, using the **source workspace** as the version
 /// source. The deploy output dir has no parent workspace, so without this
@@ -528,6 +748,7 @@ fn rewrite_workspace_protocol_in_deploy_manifest(
     Ok(total_rewritten)
 }
 
+#[cfg(test)]
 /// Strip `devDependencies` from the deploy output's `package.json`.
 ///
 /// Deploy produces a **production closure**. After `lpm install`
@@ -589,6 +810,546 @@ fn strip_dev_dependencies_from_deploy_manifest(output_dir: &Path) -> Result<usiz
     Ok(stripped_count)
 }
 
+fn read_manifest_value(manifest_path: &Path) -> Result<serde_json::Value, LpmError> {
+    let content = std::fs::read_to_string(manifest_path).map_err(|e| {
+        LpmError::Script(format!(
+            "deploy: failed to read manifest at {manifest_path:?}: {e}"
+        ))
+    })?;
+    serde_json::from_str(&content)
+        .map_err(|e| LpmError::Script(format!("deploy: invalid package.json: {e}")))
+}
+
+fn write_manifest_value(manifest_path: &Path, doc: &serde_json::Value) -> Result<(), LpmError> {
+    let updated = serde_json::to_string_pretty(doc)
+        .map_err(|e| LpmError::Script(format!("deploy: failed to serialize manifest: {e}")))?;
+    let _ = std::fs::remove_file(manifest_path);
+    std::fs::write(manifest_path, format!("{updated}\n"))
+        .map_err(|e| LpmError::Script(format!("deploy: failed to write manifest: {e}")))
+}
+
+fn section_len(doc: &serde_json::Value, section: &str) -> usize {
+    doc.get(section)
+        .and_then(|value| value.as_object())
+        .map_or(0, |object| object.len())
+}
+
+fn remove_manifest_section(doc: &mut serde_json::Value, section: &str) -> usize {
+    let count = section_len(doc, section);
+    if count > 0
+        && let Some(object) = doc.as_object_mut()
+    {
+        object.remove(section);
+    }
+    count
+}
+
+fn apply_dependency_selection_to_manifest_path(
+    manifest_path: &Path,
+    mode: DependencyMode,
+    no_optional: bool,
+) -> Result<ManifestSelectionStats, LpmError> {
+    let mut doc = read_manifest_value(manifest_path)?;
+    let mut stats = ManifestSelectionStats::default();
+
+    match mode {
+        DependencyMode::Production => {
+            stats.dev_dependencies_stripped = remove_manifest_section(&mut doc, "devDependencies");
+        }
+        DependencyMode::Development => {
+            stats.production_dependencies_stripped =
+                remove_manifest_section(&mut doc, "dependencies");
+            stats.optional_dependencies_stripped =
+                remove_manifest_section(&mut doc, "optionalDependencies");
+        }
+    }
+
+    if no_optional && matches!(mode, DependencyMode::Production) {
+        stats.optional_dependencies_stripped =
+            remove_manifest_section(&mut doc, "optionalDependencies");
+    }
+
+    if stats.dev_dependencies_stripped > 0
+        || stats.production_dependencies_stripped > 0
+        || stats.optional_dependencies_stripped > 0
+    {
+        write_manifest_value(manifest_path, &doc)?;
+    }
+
+    Ok(stats)
+}
+
+fn apply_dependency_selection_to_deploy_manifest(
+    output_dir: &Path,
+    mode: DependencyMode,
+    no_optional: bool,
+) -> Result<ManifestSelectionStats, LpmError> {
+    apply_dependency_selection_to_manifest_path(&output_dir.join("package.json"), mode, no_optional)
+}
+
+fn workspace_dep_names_for_package(
+    pkg: &lpm_workspace::PackageJson,
+    mode: DependencyMode,
+    no_optional: bool,
+) -> Vec<String> {
+    let mut names = Vec::with_capacity(
+        pkg.dependencies.len() + pkg.dev_dependencies.len() + pkg.optional_dependencies.len(),
+    );
+    match mode {
+        DependencyMode::Production => {
+            collect_workspace_dep_names(&pkg.dependencies, &mut names);
+            if !no_optional {
+                collect_workspace_dep_names(&pkg.optional_dependencies, &mut names);
+            }
+        }
+        DependencyMode::Development => {
+            collect_workspace_dep_names(&pkg.dev_dependencies, &mut names);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn collect_workspace_dep_names(deps: &HashMap<String, String>, names: &mut Vec<String>) {
+    for (name, spec) in deps {
+        if spec.starts_with("workspace:") {
+            names.push(name.clone());
+        }
+    }
+}
+
+fn copy_workspace_dependency_closure(
+    output_dir: &Path,
+    source_cwd: &Path,
+    root_member_name: &str,
+    mode: DependencyMode,
+    no_optional: bool,
+) -> Result<(usize, usize, CopyStats, ManifestSelectionStats), LpmError> {
+    let workspace = lpm_workspace::discover_workspace(source_cwd)
+        .map_err(|e| LpmError::Script(format!("workspace discovery failed: {e}")))?
+        .ok_or_else(|| {
+            LpmError::Script(
+                "deploy: source must be inside a workspace (no workspace found)".into(),
+            )
+        })?;
+
+    let members_by_name: HashMap<String, lpm_workspace::WorkspaceMember> = workspace
+        .members
+        .iter()
+        .filter_map(|member| Some((member.package.name.as_deref()?.to_string(), member.clone())))
+        .collect();
+    let root_member = members_by_name.get(root_member_name).ok_or_else(|| {
+        LpmError::Script(format!(
+            "deploy: selected member {root_member_name:?} was not found in the source workspace"
+        ))
+    })?;
+
+    let mut queue: VecDeque<String> =
+        workspace_dep_names_for_package(&root_member.package, mode, no_optional).into();
+    let mut selected = HashSet::new();
+    while let Some(name) = queue.pop_front() {
+        if name == root_member_name || !selected.insert(name.clone()) {
+            continue;
+        }
+        let Some(member) = members_by_name.get(&name) else {
+            continue;
+        };
+        for child in workspace_dep_names_for_package(
+            &member.package,
+            DependencyMode::Production,
+            no_optional,
+        ) {
+            if child != root_member_name && !selected.contains(&child) {
+                queue.push_back(child);
+            }
+        }
+    }
+
+    if selected.is_empty() {
+        return Ok((
+            0,
+            0,
+            CopyStats::default(),
+            ManifestSelectionStats::default(),
+        ));
+    }
+
+    let mut selected_names: Vec<String> = selected.into_iter().collect();
+    selected_names.sort();
+    let mut destination_by_name = HashMap::with_capacity(selected_names.len());
+    for name in &selected_names {
+        let member = members_by_name.get(name).ok_or_else(|| {
+            LpmError::Script(format!("deploy: workspace member {name:?} disappeared"))
+        })?;
+        let relative = pathdiff::diff_paths(&member.path, &workspace.root).ok_or_else(|| {
+            LpmError::Script(format!(
+                "deploy: failed to compute relative path for workspace member {name}"
+            ))
+        })?;
+        destination_by_name.insert(
+            name.clone(),
+            output_dir.join(DEPLOY_WORKSPACE_DIR).join(relative),
+        );
+    }
+
+    let mut copy_stats = CopyStats::default();
+    let mut selection_stats = ManifestSelectionStats::default();
+    let mut workspace_spec_rewrites = 0;
+    for name in &selected_names {
+        let member = members_by_name.get(name).ok_or_else(|| {
+            LpmError::Script(format!("deploy: workspace member {name:?} disappeared"))
+        })?;
+        let destination = destination_by_name
+            .get(name)
+            .expect("destination map is complete");
+        let stats = copy_member_source(&member.path, destination)?;
+        copy_stats.files_copied += stats.files_copied;
+        copy_stats.files_skipped += stats.files_skipped;
+        copy_stats.bytes_copied += stats.bytes_copied;
+
+        let manifest_path = destination.join("package.json");
+        let member_selection = apply_dependency_selection_to_manifest_path(
+            &manifest_path,
+            DependencyMode::Production,
+            no_optional,
+        )?;
+        selection_stats.add(&member_selection);
+        workspace_spec_rewrites +=
+            rewrite_workspace_specs_to_file_paths(&manifest_path, &destination_by_name)?;
+    }
+
+    workspace_spec_rewrites += rewrite_workspace_specs_to_file_paths(
+        &output_dir.join("package.json"),
+        &destination_by_name,
+    )?;
+
+    Ok((
+        selected_names.len(),
+        workspace_spec_rewrites,
+        copy_stats,
+        selection_stats,
+    ))
+}
+
+fn rewrite_workspace_specs_to_file_paths(
+    manifest_path: &Path,
+    destination_by_name: &HashMap<String, PathBuf>,
+) -> Result<usize, LpmError> {
+    let mut doc = read_manifest_value(manifest_path)?;
+    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        LpmError::Script(format!(
+            "deploy: manifest path {manifest_path:?} has no parent directory"
+        ))
+    })?;
+    let mut rewritten = 0;
+
+    for section in REWRITE_DEP_SECTIONS {
+        let Some(section_obj) = doc
+            .get_mut(*section)
+            .and_then(|value| value.as_object_mut())
+        else {
+            continue;
+        };
+        let keys: Vec<String> = section_obj.keys().cloned().collect();
+        for name in keys {
+            let Some(raw_spec) = section_obj.get(&name).and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if !raw_spec.starts_with("workspace:") {
+                continue;
+            }
+            let Some(destination) = destination_by_name.get(&name) else {
+                continue;
+            };
+            let relative = pathdiff::diff_paths(destination, manifest_dir).ok_or_else(|| {
+                LpmError::Script(format!(
+                    "deploy: failed to compute relative file path from {manifest_dir:?} to {destination:?}"
+                ))
+            })?;
+            let relative = normalize_relative_path(&relative);
+            section_obj.insert(name, serde_json::Value::String(format!("file:{relative}")));
+            rewritten += 1;
+        }
+    }
+
+    if rewritten > 0 {
+        write_manifest_value(manifest_path, &doc)?;
+    }
+
+    Ok(rewritten)
+}
+
+fn write_pruned_deploy_lockfile_if_possible(
+    source_cwd: &Path,
+    output_dir: &Path,
+) -> Result<Option<usize>, LpmError> {
+    let workspace = lpm_workspace::discover_workspace(source_cwd)
+        .map_err(|e| LpmError::Script(format!("workspace discovery failed: {e}")))?
+        .ok_or_else(|| {
+            LpmError::Script(
+                "deploy: source must be inside a workspace (no workspace found)".into(),
+            )
+        })?;
+    let source_lockfile_path = workspace.root.join(lpm_lockfile::LOCKFILE_NAME);
+    if !source_lockfile_path.exists() {
+        return Ok(None);
+    }
+
+    let root_specs = match collect_registry_specs_from_deploy_manifests(output_dir)? {
+        Some(specs) => specs,
+        None => return Ok(None),
+    };
+    let source_lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&source_lockfile_path).map_err(|e| {
+            LpmError::Script(format!(
+                "deploy: failed to read source lockfile {source_lockfile_path:?}: {e}"
+            ))
+        })?;
+
+    let mut queue = VecDeque::new();
+    for (name, spec) in &root_specs {
+        let Some(package) = select_locked_package_for_spec(&source_lockfile, name, spec) else {
+            return Ok(None);
+        };
+        queue.push_back(package.clone());
+    }
+
+    let mut selected = HashSet::new();
+    while let Some(package) = queue.pop_front() {
+        let key = locked_package_key(&package);
+        if !selected.insert(key) {
+            continue;
+        }
+        let alias_targets: HashMap<&str, &str> = package
+            .alias_dependencies
+            .iter()
+            .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+            .collect();
+        for edge in package.dependencies.iter().chain(package.peers.iter()) {
+            let Some((local_name, version)) = split_locked_edge(edge) else {
+                continue;
+            };
+            let target = alias_targets.get(local_name).copied().unwrap_or(local_name);
+            if let Some(child) = find_locked_package_exact(&source_lockfile, target, version) {
+                queue.push_back(child.clone());
+            }
+        }
+    }
+
+    let mut pruned = lpm_lockfile::Lockfile::new();
+    pruned.metadata = source_lockfile.metadata.clone();
+    pruned.catalogs = source_lockfile.catalogs.clone();
+    pruned.packages = source_lockfile
+        .packages
+        .into_iter()
+        .filter(|package| selected.contains(&locked_package_key(package)))
+        .collect();
+    pruned.root_aliases = source_lockfile
+        .root_aliases
+        .into_iter()
+        .filter(|(local, _)| root_specs.contains_key(local))
+        .collect();
+    pruned.ambient_peer_installs = source_lockfile
+        .ambient_peer_installs
+        .into_iter()
+        .filter(|name| pruned.packages.iter().any(|package| &package.name == name))
+        .collect();
+    let package_count = pruned.packages.len();
+    pruned
+        .write_all(&output_dir.join(lpm_lockfile::LOCKFILE_NAME))
+        .map_err(|e| LpmError::Script(format!("deploy: failed to write pruned lockfile: {e}")))?;
+
+    Ok(Some(package_count))
+}
+
+fn collect_registry_specs_from_deploy_manifests(
+    output_dir: &Path,
+) -> Result<Option<HashMap<String, String>>, LpmError> {
+    let mut specs = HashMap::new();
+    let mut manifests = vec![output_dir.join("package.json")];
+    let deploy_workspace = output_dir.join(DEPLOY_WORKSPACE_DIR);
+    if deploy_workspace.exists() {
+        collect_package_manifests_recursive(&deploy_workspace, &mut manifests)?;
+    }
+
+    for manifest in manifests {
+        let doc = read_manifest_value(&manifest)?;
+        for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+            let Some(deps) = doc.get(section).and_then(|value| value.as_object()) else {
+                continue;
+            };
+            for (name, value) in deps {
+                let Some(spec) = value.as_str() else {
+                    return Ok(None);
+                };
+                if spec.starts_with("workspace:")
+                    || spec.starts_with("file:")
+                    || spec.starts_with("link:")
+                    || spec.starts_with("portal:")
+                {
+                    continue;
+                }
+                if spec.starts_with("catalog:") {
+                    return Ok(None);
+                }
+                specs
+                    .entry(name.clone())
+                    .or_insert_with(|| spec.to_string());
+            }
+        }
+    }
+
+    Ok(Some(specs))
+}
+
+fn collect_package_manifests_recursive(
+    dir: &Path,
+    manifests: &mut Vec<PathBuf>,
+) -> Result<(), LpmError> {
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| LpmError::Script(format!("deploy: failed to read {dir:?}: {e}")))?
+    {
+        let entry = entry
+            .map_err(|e| LpmError::Script(format!("deploy: failed to read dir entry: {e}")))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| LpmError::Script(format!("deploy: failed to stat {path:?}: {e}")))?;
+        if file_type.is_dir() {
+            let manifest = path.join("package.json");
+            if manifest.exists() {
+                manifests.push(manifest);
+            }
+            collect_package_manifests_recursive(&path, manifests)?;
+        }
+    }
+    Ok(())
+}
+
+fn select_locked_package_for_spec<'a>(
+    lockfile: &'a lpm_lockfile::Lockfile,
+    local_name: &str,
+    spec: &str,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
+    let (target, range_spec) = match lpm_resolver::ranges::parse_npm_alias(spec) {
+        Some(alias) => (alias.target, alias.range),
+        None => (local_name.to_string(), spec.to_string()),
+    };
+    let range = lpm_resolver::NpmRange::parse(&range_spec).ok()?;
+    lockfile
+        .packages
+        .iter()
+        .filter_map(|package| {
+            if package.name != target {
+                return None;
+            }
+            let version = lpm_resolver::NpmVersion::parse(&package.version).ok()?;
+            range.satisfies(&version).then_some((version, package))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, package)| package)
+}
+
+fn find_locked_package_exact<'a>(
+    lockfile: &'a lpm_lockfile::Lockfile,
+    name: &str,
+    version: &str,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
+    lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == name && package.version == version)
+}
+
+fn split_locked_edge(edge: &str) -> Option<(&str, &str)> {
+    edge.rfind('@')
+        .map(|at| (&edge[..at], &edge[at + 1..]))
+        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+}
+
+fn locked_package_key(package: &lpm_lockfile::LockedPackage) -> (String, String, Option<String>) {
+    (
+        package.name.clone(),
+        package.version.clone(),
+        package.source.clone(),
+    )
+}
+
+#[cfg(unix)]
+fn retarget_internal_node_modules_symlinks(output_dir: &Path) -> Result<usize, LpmError> {
+    let node_modules = output_dir.join("node_modules");
+    if !node_modules.exists() {
+        return Ok(0);
+    }
+    let output_root = canonicalize_or_partial(output_dir);
+    retarget_internal_symlinks_recursive(&node_modules, output_dir, &output_root)
+}
+
+#[cfg(unix)]
+fn retarget_internal_symlinks_recursive(
+    dir: &Path,
+    output_dir: &Path,
+    output_root: &Path,
+) -> Result<usize, LpmError> {
+    let mut retargeted = 0;
+    for entry in std::fs::read_dir(dir)
+        .map_err(|e| LpmError::Script(format!("deploy: failed to read {dir:?}: {e}")))?
+    {
+        let entry = entry
+            .map_err(|e| LpmError::Script(format!("deploy: failed to read dir entry: {e}")))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| LpmError::Script(format!("deploy: failed to stat {path:?}: {e}")))?;
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&path).map_err(|e| {
+                LpmError::Script(format!("deploy: failed to read symlink {path:?}: {e}"))
+            })?;
+            if !target.is_absolute() {
+                continue;
+            }
+            let target_canonical = canonicalize_or_partial(&target);
+            if !target_canonical.starts_with(output_root) {
+                continue;
+            }
+            let target_for_relative = if target.starts_with(output_dir) {
+                target
+            } else {
+                let suffix = target_canonical.strip_prefix(output_root).map_err(|e| {
+                    LpmError::Script(format!(
+                        "deploy: failed to strip deploy root from {target_canonical:?}: {e}"
+                    ))
+                })?;
+                output_dir.join(suffix)
+            };
+            let parent = path.parent().ok_or_else(|| {
+                LpmError::Script(format!("deploy: symlink path {path:?} has no parent"))
+            })?;
+            let relative = pathdiff::diff_paths(&target_for_relative, parent).ok_or_else(|| {
+                LpmError::Script(format!(
+                    "deploy: failed to compute relative symlink target from {parent:?} to {target_for_relative:?}"
+                ))
+            })?;
+            std::fs::remove_file(&path).map_err(|e| {
+                LpmError::Script(format!("deploy: failed to replace {path:?}: {e}"))
+            })?;
+            std::os::unix::fs::symlink(&relative, &path).map_err(|e| {
+                LpmError::Script(format!("deploy: failed to write symlink {path:?}: {e}"))
+            })?;
+            retargeted += 1;
+        } else if file_type.is_dir() {
+            retargeted += retarget_internal_symlinks_recursive(&path, output_dir, output_root)?;
+        }
+    }
+    Ok(retargeted)
+}
+
+#[cfg(not(unix))]
+fn retarget_internal_node_modules_symlinks(_output_dir: &Path) -> Result<usize, LpmError> {
+    Ok(0)
+}
+
 /// Read the deploy target's package.json `name` field for the success
 /// summary. Falls back to the directory name if `name` is missing or
 /// non-string.
@@ -633,10 +1394,19 @@ pub async fn run(
     changed_files_ignore_pattern: &[String],
     test_pattern: &[String],
     force: bool,
+    prod: bool,
+    dev: bool,
+    no_optional: bool,
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
+    if prod && dev {
+        return Err(LpmError::Script(
+            "lpm deploy: --prod and --dev are mutually exclusive".into(),
+        ));
+    }
+    let dependency_mode = DependencyMode::from_flags(prod, dev);
     let plan = resolve_deploy_target(
         cwd,
         output_dir,
@@ -647,6 +1417,11 @@ pub async fn run(
         force,
     )?;
     let member_name = read_member_name(&plan.member_manifest);
+    let materialize_message = format!(
+        "Materializing {} closure for {}",
+        dependency_mode.label(),
+        install_ui::yellow(&member_name)
+    );
 
     if dry_run {
         // Dry-run: validation succeeded, but write nothing. Surface the
@@ -658,50 +1433,42 @@ pub async fn run(
                 "member": member_name,
                 "member_dir": plan.member_dir.display().to_string(),
                 "output_dir": plan.output_dir.display().to_string(),
+                "dependency_mode": dependency_mode.label(),
+                "optional_dependencies": !no_optional,
             });
             println!(
                 "{}",
                 serde_json::to_string_pretty(&payload).unwrap_or_default()
             );
         } else {
-            install_ui::phase(&format!(
-                "Materializing production closure for {}",
-                install_ui::yellow(&member_name)
-            ));
+            install_ui::phase(&materialize_message);
             deploy_detail_colored(
                 "output:",
                 install_ui::yellow(&plan.output_dir.display().to_string()),
             );
-            deploy_detail("member:", plan.member_dir.display());
+            deploy_detail_colored(
+                "member:",
+                install_ui::cyan(&plan.member_dir.display().to_string()),
+            );
             deploy_detail_colored("dry run:", install_ui::status_ok("yes"));
+            deploy_detail_colored(
+                "dependency mode:",
+                install_ui::status_ok(dependency_mode.label()),
+            );
+            deploy_detail_colored(
+                "optional deps:",
+                install_ui::status_ok(if no_optional { "omitted" } else { "included" }),
+            );
             install_ui::done("Done · dry run complete");
         }
         return Ok(());
     }
 
-    if !json_output {
-        install_ui::phase(&format!(
-            "Materializing production closure for {}",
-            install_ui::yellow(&member_name)
-        ));
-    }
+    let deploy_progress = (!json_output).then(|| install_ui::spin(&materialize_message));
 
-    // audit Medium fix : `--force` now ACTUALLY cleans
-    // the output directory. Pre-fix it only suppressed the non-empty-directory
-    // error in `validate_output_dir`, then ran `copy_member_source` over the
-    // existing tree in place — which left orphaned files (source files that
-    // had been deleted from the member, stale lockfiles, leftover
-    // node_modules from a previous deploy, etc.) in the deploy output and
-    // could mask "deleted file but still in container image" bugs.
-    //
-    // The fix: when `--force` is set and the output dir exists, unlink the
-    // whole tree and recreate the empty dir before any copy step runs. This
-    // restores the "fresh deploy starts from empty" invariant that callers
-    // already assume. We deliberately do this AFTER validate_output_dir has
-    // confirmed the path is outside the workspace, so an accidental
-    // `--force` against a path that resolves into the workspace cannot
-    // wipe out source files. validate_output_dir is the safety gate;
-    // remove_dir_all only runs once that gate has passed.
+    // validate_output_dir has already proven this path is outside the source
+    // workspace, so force-clearing here preserves a clean snapshot without
+    // risking source files.
     if force && plan.output_dir.exists() {
         std::fs::remove_dir_all(&plan.output_dir).map_err(|e| {
             LpmError::Script(format!(
@@ -717,37 +1484,34 @@ pub async fn run(
         })?;
     }
 
-    // Step 3: source file copy with deny list. The output dir is created
-    // by copy_member_source if it doesn't exist yet.
     let copy_stats = copy_member_source(&plan.member_dir, &plan.output_dir)?;
 
-    // Step 3b : strip `devDependencies` from the output
-    // manifest. `lpm install` now resolves devDeps (matching pnpm/npm),
-    // so without this step the install pipeline inside the output dir
-    // would pull dev-only tooling into the production closure. Deploy
-    // is explicitly production-only — see the module-level invariants.
-    let stripped_dev_deps = strip_dev_dependencies_from_deploy_manifest(&plan.output_dir)?;
+    let mut selection_stats = apply_dependency_selection_to_deploy_manifest(
+        &plan.output_dir,
+        dependency_mode,
+        no_optional,
+    )?;
 
-    // Step 4: rewrite workspace:* references in the deploy output's
-    // package.json to concrete versions, using the SOURCE workspace's
-    // member versions.
-    let rewritten_count = rewrite_workspace_protocol_in_deploy_manifest(&plan.output_dir, cwd)?;
+    let (
+        workspace_members_copied,
+        workspace_spec_rewrites,
+        workspace_copy_stats,
+        workspace_selection_stats,
+    ) = copy_workspace_dependency_closure(
+        &plan.output_dir,
+        cwd,
+        &member_name,
+        dependency_mode,
+        no_optional,
+    )?;
+    selection_stats.add(&workspace_selection_stats);
 
-    // Step 5: run the install pipeline AT THE DEPLOY OUTPUT DIR. This
-    // resolves the deps from the rewritten manifest, downloads tarballs,
-    // and links them into <output_dir>/node_modules/. The output is then
-    // self-contained.
-    //
-    // Step 6 fix: use the injected client (carries
-    // `--registry` and the shared SessionManager). Pre-fix this site
-    // built a fresh `RegistryClient::new()` with no token, so any
-    // `@lpm.dev` deps in the deploy output would have been
-    // unauthenticated. allow_new=true bypasses the minimumReleaseAge
-    // check because deploy is for fresh installs where the user has
-    // already chosen what versions to use.
+    let pruned_lockfile_packages =
+        write_pruned_deploy_lockfile_if_possible(cwd, &plan.output_dir)?.unwrap_or(0);
+
     let target_set: Vec<String> = vec![plan.output_dir.display().to_string()];
 
-    crate::commands::install::run_with_options(
+    crate::commands::install::run_with_options_with_lpm_root(
         client,
         &plan.output_dir,
         json_output,
@@ -769,8 +1533,8 @@ pub async fn run(
         None, // min_release_age_override: deploy already bypasses via allow_new=true above
         // drift-ignore: deploy captures an already-resolved tree;
         // `allow_new=true` above bypasses cooldown but drift is an
-        // orthogonal gate per D16. Deploy inherits the same default
-        // "enforce" — the output dir carries whatever
+        // orthogonal gate. Deploy inherits the same default "enforce";
+        // the output dir carries whatever
         // trustedDependencies the project defined, so legitimately-
         // identical identities pass normally.
         crate::provenance_fetch::DriftIgnorePolicy::default(),
@@ -787,8 +1551,13 @@ pub async fn run(
         false, // no_sandbox
         false, // verbose: internal pipeline, no user-facing Done footer
         false, // audit_after_install: internal pipeline never runs audit
+        lpm_common::LpmRoot::from_dir(plan.output_dir.join(".lpm")),
+        no_optional,
     )
     .await?;
+
+    let internal_symlinks_retargeted = retarget_internal_node_modules_symlinks(&plan.output_dir)?;
+    drop(deploy_progress);
 
     let elapsed = start.elapsed();
 
@@ -809,8 +1578,22 @@ pub async fn run(
                 "files_skipped": copy_stats.files_skipped,
                 "bytes_copied": copy_stats.bytes_copied,
             },
-            "workspace_protocol_rewrites": rewritten_count,
-            "dev_dependencies_stripped": stripped_dev_deps,
+            "workspace_copy_stats": {
+                "members_copied": workspace_members_copied,
+                "files_copied": workspace_copy_stats.files_copied,
+                "files_skipped": workspace_copy_stats.files_skipped,
+                "bytes_copied": workspace_copy_stats.bytes_copied,
+            },
+            "workspace_protocol_rewrites": workspace_spec_rewrites,
+            "dependency_mode": dependency_mode.label(),
+            "optional_dependencies": !no_optional,
+            "dependencies_stripped": {
+                "dev": selection_stats.dev_dependencies_stripped,
+                "production": selection_stats.production_dependencies_stripped,
+                "optional": selection_stats.optional_dependencies_stripped,
+            },
+            "pruned_lockfile_packages": pruned_lockfile_packages,
+            "internal_symlinks_retargeted": internal_symlinks_retargeted,
             "duration_ms": elapsed.as_millis() as u64,
         });
         println!(
@@ -822,9 +1605,31 @@ pub async fn run(
             "output:",
             install_ui::yellow(&plan.output_dir.display().to_string()),
         );
-        deploy_detail("workspace deps rewritten:", rewritten_count);
+        deploy_detail_colored(
+            "dependency mode:",
+            install_ui::status_ok(dependency_mode.label()),
+        );
+        deploy_detail_colored(
+            "workspace deps copied:",
+            install_ui::status_ok(&workspace_members_copied.to_string()),
+        );
+        deploy_detail_colored(
+            "workspace refs localized:",
+            install_ui::status_ok(&workspace_spec_rewrites.to_string()),
+        );
+        deploy_detail_colored(
+            "pruned lockfile packages:",
+            install_ui::status_ok(&pruned_lockfile_packages.to_string()),
+        );
+        deploy_detail_colored(
+            "relative symlinks:",
+            install_ui::status_ok(&internal_symlinks_retargeted.to_string()),
+        );
         deploy_detail_colored("node_modules installed:", install_ui::status_ok("yes"));
-        install_ui::done("Copied source, lockfile, and production dependencies");
+        install_ui::done(&format!(
+            "Copied source, lockfile, and {} dependencies",
+            install_ui::status_ok(dependency_mode.label())
+        ));
         install_ui::done(&format!(
             "Done · deploy tree ready at {}",
             install_ui::yellow(&plan.output_dir.display().to_string())
@@ -832,10 +1637,6 @@ pub async fn run(
     }
 
     Ok(())
-}
-
-fn deploy_detail(label: &str, value: impl std::fmt::Display) {
-    deploy_detail_colored(label, value.to_string());
 }
 
 fn deploy_detail_colored(label: &str, value: String) {
@@ -875,6 +1676,9 @@ mod tests {
             &[],
             &[],
             force,
+            false,
+            false,
+            false,
             dry_run,
             json_output,
         )
@@ -1340,16 +2144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_full_pipeline_workspace_protocol_dep_is_rewritten_in_output() {
-        // The fixture has api → workspace:* auth. After deploy:
-        // - output/package.json has @scope/auth: "1.5.0" (concrete version)
-        // - The source workspace's api/package.json STILL has workspace:*
-        // We can't run the actual install (auth isn't published) but we
-        // can verify the rewrite step landed correctly.
-        //
-        // Caveat: this test will FAIL at the install pipeline step
-        // because @scope/auth isn't in the registry. We use try_run and
-        // assert the rewrite happened EVEN if the install fails.
+    async fn run_full_pipeline_workspace_protocol_dep_is_localized_in_output() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_root = build_workspace_with_workspace_protocol_dep(tmp.path());
 
@@ -1367,10 +2162,7 @@ mod tests {
         )
         .await;
 
-        // The result will be Err because the install pipeline can't fetch
-        // @scope/auth from the registry. But the source copy + rewrite
-        // happen first, so we can verify them on disk regardless.
-        let _ = result; // expected to fail at install step
+        let _ = result;
 
         if output.join("package.json").exists() {
             let after: serde_json::Value = serde_json::from_str(
@@ -1378,8 +2170,15 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                after["dependencies"]["@scope/auth"], "1.5.0",
-                "workspace:* must be rewritten to concrete version in deploy output"
+                after["dependencies"]["@scope/auth"], "file:.lpm/deploy-workspace/packages/auth",
+                "workspace:* must be rewritten to a local file dependency in deploy output"
+            );
+            assert!(
+                output
+                    .join(DEPLOY_WORKSPACE_DIR)
+                    .join("packages/auth/package.json")
+                    .exists(),
+                "local workspace dependency source must be copied into the deploy output"
             );
 
             // CRITICAL: source workspace manifest is unchanged (still has workspace:*)
@@ -1606,18 +2405,18 @@ mod tests {
         assert_eq!(name, "@scope/api");
     }
 
-    // ── end-to-end integration: deny list + rewrite together ────────────
+    // ── end-to-end integration: deny list + local workspace deps ────────
 
     #[tokio::test]
-    async fn run_e2e_combines_deny_list_and_manifest_rewrite() {
+    async fn run_e2e_combines_deny_list_and_local_workspace_dep_rewrite() {
         // Comprehensive end-to-end test: workspace with workspace:* deps,
         // member containing .env files and a node_modules, deploy it, and
         // verify EVERY invariant in one place:
         //
         // 1. Source files are copied (positive assertion)
         // 2. .env files are NOT in the deploy output (security)
-        // 3. node_modules is NOT in the deploy output (security)
-        // 4. workspace:* deps are rewritten to concrete versions
+        // 3. source node_modules is NOT copied into the deploy output
+        // 4. workspace:* deps are rewritten to local file dependencies
         // 5. The source workspace's manifests are byte-identical
         let tmp = tempfile::tempdir().unwrap();
         let workspace_root = build_workspace_with_workspace_protocol_dep(tmp.path());
@@ -1653,11 +2452,9 @@ mod tests {
         let source_api_before =
             std::fs::read(workspace_root.join("packages/api/package.json")).unwrap();
 
-        // Run deploy. This will fail at the install pipeline step because
-        // @scope/auth isn't in the registry, but the copy + rewrite steps run first.
         let output_parent = tempfile::tempdir().unwrap();
         let output = output_parent.path().join("prod-api");
-        let _ = run(
+        let result = run(
             &RegistryClient::new(),
             &workspace_root,
             &output,
@@ -1667,6 +2464,7 @@ mod tests {
             true,
         )
         .await;
+        let _ = result;
 
         // ── Positive: deployed source files exist ──────────────────────────
         assert!(output.join("package.json").exists(), "package.json copied");
@@ -1686,19 +2484,30 @@ mod tests {
             "SECURITY: .env.production must not be in deploy output"
         );
 
-        // ── Security: node_modules not present ────────────────────────────
+        // ── Security: source node_modules content not copied ──────────────
         assert!(
-            !output.join("node_modules").exists(),
-            "node_modules must not be deployed"
+            !output
+                .join("node_modules")
+                .join("react")
+                .join("index.js")
+                .exists(),
+            "source node_modules content must not be copied into deploy output"
         );
 
-        // ── workspace:* deps rewritten to concrete versions ───────────────
+        // ── workspace:* deps rewritten to local file dependencies ─────────
         let deployed_pkg: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
                 .unwrap();
         assert_eq!(
-            deployed_pkg["dependencies"]["@scope/auth"], "1.5.0",
-            "workspace:* must be rewritten to a concrete version in the deploy output"
+            deployed_pkg["dependencies"]["@scope/auth"], "file:.lpm/deploy-workspace/packages/auth",
+            "workspace:* must be rewritten to a local file dependency in the deploy output"
+        );
+        assert!(
+            output
+                .join(DEPLOY_WORKSPACE_DIR)
+                .join("packages/auth/package.json")
+                .exists(),
+            "workspace dependency source must be copied into deploy output"
         );
 
         // ── Read-only on source: every source manifest is byte-identical ──
@@ -1773,6 +2582,128 @@ mod tests {
         .unwrap();
 
         root
+    }
+
+    #[test]
+    fn copy_workspace_dependency_closure_copies_unpublished_member_and_localizes_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = build_workspace_with_workspace_protocol_dep(tmp.path());
+        let output = tempfile::tempdir().unwrap();
+        copy_member_source(&workspace_root.join("packages/api"), output.path()).unwrap();
+        apply_dependency_selection_to_deploy_manifest(
+            output.path(),
+            DependencyMode::Production,
+            false,
+        )
+        .unwrap();
+
+        let (members_copied, rewrites, copy_stats, _selection_stats) =
+            copy_workspace_dependency_closure(
+                output.path(),
+                &workspace_root,
+                "@scope/api",
+                DependencyMode::Production,
+                false,
+            )
+            .unwrap();
+        let deployed_pkg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(output.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(members_copied, 1);
+        assert_eq!(rewrites, 2);
+        assert!(copy_stats.files_copied > 0);
+        assert_eq!(
+            deployed_pkg["dependencies"]["@scope/auth"],
+            "file:.lpm/deploy-workspace/packages/auth"
+        );
+        assert!(
+            output
+                .path()
+                .join(DEPLOY_WORKSPACE_DIR)
+                .join("packages/auth/package.json")
+                .exists(),
+            "workspace member source must be copied into deploy-local workspace area"
+        );
+    }
+
+    #[test]
+    fn write_pruned_deploy_lockfile_keeps_only_reachable_registry_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspace");
+        write_workspace_fixture(&workspace_root, &[("api", "packages/api")]);
+
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "runtime".to_string(),
+            version: "1.2.3".to_string(),
+            dependencies: vec!["transitive@2.0.0".to_string()],
+            ..Default::default()
+        });
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "transitive".to_string(),
+            version: "2.0.0".to_string(),
+            ..Default::default()
+        });
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "unrelated".to_string(),
+            version: "9.9.9".to_string(),
+            ..Default::default()
+        });
+        lockfile
+            .write_all(&workspace_root.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+
+        let output = tempfile::tempdir().unwrap();
+        std::fs::write(
+            output.path().join("package.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "api",
+                "dependencies": {"runtime": "^1.0.0"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let count =
+            write_pruned_deploy_lockfile_if_possible(&workspace_root, output.path()).unwrap();
+        let deployed_lockfile = lpm_lockfile::Lockfile::read_from_file(
+            &output.path().join(lpm_lockfile::LOCKFILE_NAME),
+        )
+        .unwrap();
+        let names: HashSet<String> = deployed_lockfile
+            .packages
+            .iter()
+            .map(|package| package.name.clone())
+            .collect();
+
+        assert_eq!(count, Some(2));
+        assert!(names.contains("runtime"));
+        assert!(names.contains("transitive"));
+        assert!(!names.contains("unrelated"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retarget_internal_node_modules_symlinks_makes_absolute_internal_links_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("deploy");
+        let target = output.join(".lpm/store/v2/links/runtime");
+        let link = output.join("node_modules/runtime");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let retargeted = retarget_internal_node_modules_symlinks(&output).unwrap();
+        let new_target = std::fs::read_link(&link).unwrap();
+
+        assert_eq!(retargeted, 1);
+        assert!(
+            !new_target.is_absolute(),
+            "deploy-internal symlink target must be relative after retargeting"
+        );
+        assert_eq!(new_target, PathBuf::from("../.lpm/store/v2/links/runtime"));
     }
 
     #[test]
@@ -2204,6 +3135,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn copy_member_source_honors_package_files_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("member");
+        std::fs::create_dir_all(src.join("dist")).unwrap();
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            r#"{"name":"pkg","version":"1.0.0","files":["dist"]}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("README.md"), "# pkg\n").unwrap();
+        std::fs::write(src.join("dist").join("index.js"), "module.exports = {}").unwrap();
+        std::fs::write(src.join("src").join("index.ts"), "export {};").unwrap();
+
+        let dst = tmp.path().join("output");
+        copy_member_source(&src, &dst).unwrap();
+
+        assert!(dst.join("package.json").exists());
+        assert!(dst.join("README.md").exists());
+        assert!(dst.join("dist").join("index.js").exists());
+        assert!(
+            !dst.join("src").exists(),
+            "files=[\"dist\"] must exclude source paths outside the publish set"
+        );
+    }
+
+    #[test]
+    fn copy_member_source_honors_npmignore_before_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("member");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            r#"{"name":"pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join(".npmignore"), "secret.txt\n").unwrap();
+        std::fs::write(src.join(".gitignore"), "!secret.txt\nignored-by-git.txt\n").unwrap();
+        std::fs::write(src.join("secret.txt"), "secret").unwrap();
+        std::fs::write(src.join("ignored-by-git.txt"), "git-only").unwrap();
+
+        let dst = tmp.path().join("output");
+        copy_member_source(&src, &dst).unwrap();
+
+        assert!(
+            !dst.join("secret.txt").exists(),
+            ".npmignore must exclude files from deploy copy"
+        );
+        assert!(
+            dst.join("ignored-by-git.txt").exists(),
+            ".npmignore must take precedence over .gitignore when both exist"
+        );
+        assert!(
+            !dst.join(".npmignore").exists(),
+            ".npmignore controls selection but is not deploy payload"
+        );
+    }
+
     // ── Security regressions: deny list ────────────────────────────────────
 
     #[test]
@@ -2410,6 +3400,98 @@ mod tests {
 
         assert!(dst.exists());
         assert!(dst.join("package.json").exists());
+    }
+
+    #[test]
+    fn dependency_selection_production_strips_dev_and_keeps_optional_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("package.json");
+        std::fs::write(
+            &manifest,
+            serde_json::to_string_pretty(&json!({
+                "name": "api",
+                "dependencies": {"runtime": "^1.0.0"},
+                "devDependencies": {"test-only": "^2.0.0"},
+                "optionalDependencies": {"optional-native": "^3.0.0"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stats = apply_dependency_selection_to_manifest_path(
+            &manifest,
+            DependencyMode::Production,
+            false,
+        )
+        .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+
+        assert_eq!(stats.dev_dependencies_stripped, 1);
+        assert!(doc.get("devDependencies").is_none());
+        assert_eq!(doc["dependencies"]["runtime"], "^1.0.0");
+        assert_eq!(doc["optionalDependencies"]["optional-native"], "^3.0.0");
+    }
+
+    #[test]
+    fn dependency_selection_dev_strips_production_and_optional_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("package.json");
+        std::fs::write(
+            &manifest,
+            serde_json::to_string_pretty(&json!({
+                "name": "api",
+                "dependencies": {"runtime": "^1.0.0"},
+                "devDependencies": {"test-only": "^2.0.0"},
+                "optionalDependencies": {"optional-native": "^3.0.0"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stats = apply_dependency_selection_to_manifest_path(
+            &manifest,
+            DependencyMode::Development,
+            false,
+        )
+        .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+
+        assert_eq!(stats.production_dependencies_stripped, 1);
+        assert_eq!(stats.optional_dependencies_stripped, 1);
+        assert!(doc.get("dependencies").is_none());
+        assert!(doc.get("optionalDependencies").is_none());
+        assert_eq!(doc["devDependencies"]["test-only"], "^2.0.0");
+    }
+
+    #[test]
+    fn dependency_selection_no_optional_strips_optional_in_production_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = tmp.path().join("package.json");
+        std::fs::write(
+            &manifest,
+            serde_json::to_string_pretty(&json!({
+                "name": "api",
+                "dependencies": {"runtime": "^1.0.0"},
+                "optionalDependencies": {"optional-native": "^3.0.0"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stats = apply_dependency_selection_to_manifest_path(
+            &manifest,
+            DependencyMode::Production,
+            true,
+        )
+        .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+
+        assert_eq!(stats.optional_dependencies_stripped, 1);
+        assert!(doc.get("optionalDependencies").is_none());
+        assert_eq!(doc["dependencies"]["runtime"], "^1.0.0");
     }
 
     #[test]

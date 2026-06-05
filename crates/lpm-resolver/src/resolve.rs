@@ -393,6 +393,36 @@ pub async fn resolve_with_shared_cache(
     metrics: StreamingBfsMetrics,
     auto_install_peers: bool,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_with_shared_cache_options(
+        client,
+        dependencies,
+        overrides,
+        shared_cache,
+        notify_map,
+        walker_done,
+        fetch_wait_timeout,
+        route_table,
+        metrics,
+        auto_install_peers,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_with_shared_cache_options(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    shared_cache: SharedCache,
+    notify_map: NotifyMap,
+    walker_done: crate::provider::WalkerDone,
+    fetch_wait_timeout: Duration,
+    route_table: RouteTable,
+    metrics: StreamingBfsMetrics,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+) -> Result<ResolveResult, ResolveError> {
     // Greedy is the default; users opt out to the legacy
     // PubGrub-with-split-retry resolver via `LPM_RESOLVER=pubgrub`.
     // The flag dispatches at the public entry-point so every caller —
@@ -404,7 +434,7 @@ pub async fn resolve_with_shared_cache(
     // See install.rs `fusion_enabled_local` for the resolver-dispatch
     // matrix.
     if std::env::var("LPM_RESOLVER").as_deref() != Ok("pubgrub") {
-        return crate::greedy::resolve_greedy(
+        return crate::greedy::resolve_greedy_with_options(
             client,
             dependencies,
             overrides,
@@ -415,6 +445,7 @@ pub async fn resolve_with_shared_cache(
             route_table,
             metrics,
             auto_install_peers,
+            include_optional_dependencies,
         )
         .await;
     }
@@ -466,6 +497,7 @@ pub async fn resolve_with_shared_cache(
         // Same metrics Arc across passes so split-retry counts
         // accumulate into the same counter set.
         let metrics_for_pass = metrics.clone();
+        let include_optional_dependencies_for_pass = include_optional_dependencies;
 
         let pass_start = std::time::Instant::now();
         let result: PubGrubResult = tokio::task::spawn_blocking(move || {
@@ -487,7 +519,8 @@ pub async fn resolve_with_shared_cache(
                 fetch_wait_timeout,
             )
             .with_route_table(route_table_for_pass)
-            .with_streaming_metrics(metrics_for_pass);
+            .with_streaming_metrics(metrics_for_pass)
+            .with_include_optional_dependencies(include_optional_dependencies_for_pass);
 
             match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
                 Ok(solution) => Ok((solution, provider)),
