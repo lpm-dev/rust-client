@@ -102,21 +102,21 @@ pub struct VersionMetadata {
     #[serde(default, rename = "optionalDependencies")]
     pub optional_dependencies: HashMap<String, String>,
 
-    /// Platform restrictions: ["darwin", "linux", "win32"]
-    #[serde(default)]
+    /// Platform restrictions: `"darwin"` or `["darwin", "linux", "win32"]`.
+    #[serde(default, deserialize_with = "deserialize_string_or_string_list")]
     pub os: Vec<String>,
 
-    /// CPU restrictions: ["x64", "arm64"]
-    #[serde(default)]
+    /// CPU restrictions: `"x64"` or `["x64", "arm64"]`.
+    #[serde(default, deserialize_with = "deserialize_string_or_string_list")]
     pub cpu: Vec<String>,
 
-    /// Linux libc flavor restrictions: ["glibc"], ["musl"], or
+    /// Linux libc flavor restrictions: `"glibc"`, `["glibc"]`, `["musl"]`, or
     /// exclusion form like ["!glibc"]. Documented at
     /// <https://docs.npmjs.com/cli/v9/configuring-npm/package-json#libc>.
     /// Native modules (sharp, esbuild, `@next/swc-*`) ship distinct
     /// binaries per libc; the resolver's platform filter consumes this
     /// field alongside `os`/`cpu`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_string_list")]
     pub libc: Vec<String>,
 
     #[serde(default)]
@@ -1166,7 +1166,7 @@ where
         where
             A: de::SeqAccess<'de>,
         {
-            let mut out = Vec::new();
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
             while let Some(s) = seq.next_element::<String>()? {
                 out.push(s);
             }
@@ -1175,6 +1175,53 @@ where
     }
 
     deserializer.deserialize_any(BundleVisitor)
+}
+
+fn deserialize_string_or_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct StringListVisitor;
+
+    impl<'de> Visitor<'de> for StringListVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string, a list of strings, or null")
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+            Ok(vec![value])
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(StringListVisitor)
 }
 
 // ─── Minimal types for install-time blocked-set capture ─────────────────────
@@ -1261,6 +1308,75 @@ mod tests {
         assert_eq!(
             meta.integrity_or_shasum().as_deref(),
             Some("sha1-2jmj7l5rSw0yVb/vlWAYkK/YBwk=")
+        );
+    }
+
+    #[test]
+    fn package_metadata_accepts_single_string_platform_fields_from_npm_packument() {
+        let json = r#"{
+            "name": "@utoo/utoo-darwin-x64",
+            "dist-tags": {
+                "latest": "1.0.32"
+            },
+            "versions": {
+                "1.0.32": {
+                    "name": "@utoo/utoo-darwin-x64",
+                    "version": "1.0.32",
+                    "os": "darwin",
+                    "cpu": "x64",
+                    "libc": null,
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/@utoo/utoo-darwin-x64/-/utoo-darwin-x64-1.0.32.tgz",
+                        "integrity": "sha512-3+sAQb+kpqsjLiRFS8dpQYjc8yvqjh0AcQ1qmog5l2/INIEE0FF0p+g0crqeEBmUNQ+rmg8j2reu9/h1uOdrjA=="
+                    }
+                }
+            }
+        }"#;
+
+        let metadata: PackageMetadata =
+            serde_json::from_str(json).expect("real npm packument shape should parse");
+        let version = metadata
+            .version("1.0.32")
+            .expect("metadata should include the requested version");
+
+        assert_eq!(
+            version.os.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["darwin"]
+        );
+        assert_eq!(
+            version.cpu.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["x64"]
+        );
+        assert!(version.libc.is_empty());
+    }
+
+    #[test]
+    fn package_metadata_accepts_single_string_libc_field_from_npm_packument() {
+        let json = r#"{
+            "name": "native-linux",
+            "dist-tags": {
+                "latest": "1.0.0"
+            },
+            "versions": {
+                "1.0.0": {
+                    "name": "native-linux",
+                    "version": "1.0.0",
+                    "os": ["linux"],
+                    "cpu": ["x64"],
+                    "libc": "glibc"
+                }
+            }
+        }"#;
+
+        let metadata: PackageMetadata =
+            serde_json::from_str(json).expect("single-string libc should parse");
+        let version = metadata
+            .version("1.0.0")
+            .expect("metadata should include the requested version");
+
+        assert_eq!(
+            version.libc.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["glibc"]
         );
     }
 
