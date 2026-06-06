@@ -613,7 +613,10 @@ fn set_dir_permissions_restricted(path: &Path) -> Result<(), LpmError> {
 
 /// No-op on non-Unix platforms.
 #[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "non-Unix stub keeps the same fallible helper signature"
+)]
 fn set_dir_permissions_restricted(_path: &Path) -> Result<(), LpmError> {
     Ok(())
 }

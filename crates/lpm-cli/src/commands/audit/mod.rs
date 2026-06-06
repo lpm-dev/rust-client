@@ -1118,11 +1118,17 @@ fn collect_registry_issues(ver_meta: &lpm_registry::VersionMetadata, issues: &mu
         if tags.crypto {
             notable.push("crypto");
         }
+        if tags.web_socket {
+            notable.push("websocket");
+        }
         if tags.telemetry {
             notable.push("telemetry");
         }
         if tags.minified {
             notable.push("minified");
+        }
+        if tags.url_strings {
+            notable.push("url strings");
         }
         if tags.trivial {
             notable.push("trivial");
@@ -2906,9 +2912,9 @@ mod tests {
         );
     }
 
-    // Notable bucket — filesystem, env_vars, crypto, telemetry, minified,
-    // trivial, copyleft_license. Emits severity=info, category=behavior,
-    // message starts with "accesses".
+    // Notable bucket - filesystem, env_vars, crypto, web_socket, telemetry,
+    // minified, url_strings, trivial, copyleft_license.
+    // Emits severity=info, category=behavior, message starts with "accesses".
 
     #[test]
     fn registry_issue_notable_bucket_fires_for_filesystem() {
@@ -2932,8 +2938,10 @@ mod tests {
                 "env vars",
             ),
             (Box::new(|t| t.crypto = true), "crypto"),
+            (Box::new(|t| t.web_socket = true), "websocket"),
             (Box::new(|t| t.telemetry = true), "telemetry"),
             (Box::new(|t| t.minified = true), "minified"),
+            (Box::new(|t| t.url_strings = true), "url strings"),
             (Box::new(|t| t.trivial = true), "trivial"),
             (Box::new(|t| t.copyleft_license = true), "copyleft"),
         ] {
@@ -2956,8 +2964,10 @@ mod tests {
             t.filesystem = true;
             t.environment_vars = true;
             t.crypto = true;
+            t.web_socket = true;
             t.telemetry = true;
             t.minified = true;
+            t.url_strings = true;
             t.trivial = true;
             t.copyleft_license = true;
         }));
@@ -2970,7 +2980,7 @@ mod tests {
         );
     }
 
-    // Edge cases — empty tags, unused-by-mapping tags, all-tags-set
+    // Edge cases - empty tags, combined notable tags, all-tags-set
 
     #[test]
     fn registry_issue_empty_tags_emits_no_issues() {
@@ -2982,26 +2992,31 @@ mod tests {
     }
 
     #[test]
-    fn registry_issue_url_strings_and_web_socket_not_currently_mapped() {
-        // FINDING: `url_strings` and `web_socket` exist on BehavioralTags
-        // but are not surfaced by collect_registry_issues. This test
-        // pins the current behavior. If a future change adds these to
-        // any bucket, update the test to assert the new mapping.
+    fn registry_issue_url_strings_and_web_socket_surface_as_notable_registry_issues() {
         let issues = collect(&meta_with_tags(|t| {
             t.url_strings = true;
             t.web_socket = true;
         }));
-        assert!(
-            issues.is_empty(),
-            "url_strings and web_socket are currently unmapped — \
-             if this changes, update the test to assert the new bucket. Got: {issues:?}"
+        assert_eq!(
+            issues.len(),
+            1,
+            "expected one notable issue; got: {issues:?}"
         );
+        let issue = issues
+            .iter()
+            .find(|i| i.message.starts_with("accesses"))
+            .expect("expected notable bucket issue");
+        assert_eq!(issue.severity, "info");
+        assert_eq!(issue.category, "behavior");
+        assert_eq!(issue.source, "registry");
+        assert!(issue.message.contains("url strings"));
+        assert!(issue.message.contains("websocket"));
     }
 
     #[test]
     fn registry_issue_all_tags_set_emits_one_issue_per_active_bucket() {
         let issues = collect(&meta_with_tags(|t| {
-            // Set every documented tag — all 22.
+            // Set every documented tag - all 22.
             t.eval = true;
             t.child_process = true;
             t.shell = true;
@@ -3025,7 +3040,7 @@ mod tests {
             t.copyleft_license = true;
             t.no_license = true;
         }));
-        // 4 buckets all fire → exactly 4 issues from behavioral tags.
+        // 4 buckets all fire: exactly 4 issues from behavioral tags.
         assert_eq!(
             issues.len(),
             4,
