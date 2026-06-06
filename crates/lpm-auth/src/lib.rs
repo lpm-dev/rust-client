@@ -59,6 +59,97 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 #[cfg(test)]
 const KEYCHAIN_SERVICE_TEST_ENV: &str = "LPM_AUTH_TEST_KEYCHAIN_SERVICE";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthStorageBackend {
+    Keychain,
+    EncryptedFileFallback,
+}
+
+impl AuthStorageBackend {
+    pub fn as_json_value(self) -> &'static str {
+        match self {
+            AuthStorageBackend::Keychain => "keychain",
+            AuthStorageBackend::EncryptedFileFallback => "encrypted_file_fallback",
+        }
+    }
+
+    pub fn human_label(self) -> &'static str {
+        match self {
+            AuthStorageBackend::Keychain => "keychain",
+            AuthStorageBackend::EncryptedFileFallback => "encrypted file fallback",
+        }
+    }
+
+    fn registry_status_label(self) -> &'static str {
+        match self {
+            AuthStorageBackend::Keychain => "configured (keychain)",
+            AuthStorageBackend::EncryptedFileFallback => "configured (encrypted file fallback)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthStorageStatus {
+    pub backend: Option<AuthStorageBackend>,
+    pub degraded: bool,
+}
+
+impl AuthStorageStatus {
+    pub fn none() -> Self {
+        Self {
+            backend: None,
+            degraded: false,
+        }
+    }
+
+    pub fn from_backend(backend: AuthStorageBackend) -> Self {
+        Self {
+            backend: Some(backend),
+            degraded: matches!(backend, AuthStorageBackend::EncryptedFileFallback),
+        }
+    }
+
+    pub fn from_backends(
+        access: Option<AuthStorageBackend>,
+        refresh: Option<AuthStorageBackend>,
+    ) -> Self {
+        if access == Some(AuthStorageBackend::EncryptedFileFallback)
+            || refresh == Some(AuthStorageBackend::EncryptedFileFallback)
+        {
+            return Self::from_backend(AuthStorageBackend::EncryptedFileFallback);
+        }
+
+        if access == Some(AuthStorageBackend::Keychain)
+            || refresh == Some(AuthStorageBackend::Keychain)
+        {
+            return Self::from_backend(AuthStorageBackend::Keychain);
+        }
+
+        Self::none()
+    }
+
+    pub fn backend_json_value(self) -> Option<&'static str> {
+        self.backend.map(AuthStorageBackend::as_json_value)
+    }
+
+    pub fn human_label(self) -> Option<&'static str> {
+        self.backend.map(AuthStorageBackend::human_label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryAuthStatus {
+    pub name: String,
+    pub status: String,
+    pub storage: AuthStorageStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredToken {
+    token: String,
+    backend: AuthStorageBackend,
+}
+
 fn force_file_auth() -> bool {
     // Release binaries always use the OS keychain — env contamination
     // (`.envrc`, CI vars, wrapper script) must not be able to coerce
@@ -97,12 +188,8 @@ pub fn get_token(registry_url: &str) -> Option<String> {
     }
 
     // 2. OS keychain (catch any panics from the keyring crate)
-    match std::panic::catch_unwind(|| get_token_from_keychain(registry_url)) {
-        Ok(Some(token)) => return Some(token),
-        Ok(None) => {}
-        Err(_) => {
-            tracing::debug!("keychain access panicked, falling through to file");
-        }
+    if let Some(token) = get_token_from_keychain_safe(registry_url) {
+        return Some(token);
     }
 
     // 3. Encrypted file fallback (Rust-native format, NOT compatible with JS CLI's format)
@@ -115,14 +202,30 @@ pub fn get_token(registry_url: &str) -> Option<String> {
 ///
 /// Tries keychain first, falls back to encrypted file.
 pub fn set_token(registry_url: &str, token: &str) -> Result<(), String> {
+    set_token_with_backend(registry_url, token).map(|_| ())
+}
+
+/// Store a token and report the backend that accepted it.
+pub fn set_token_with_backend(
+    registry_url: &str,
+    token: &str,
+) -> Result<AuthStorageBackend, String> {
     // Try keychain first
     if set_token_in_keychain(registry_url, token).is_ok() {
-        return Ok(());
+        return Ok(AuthStorageBackend::Keychain);
     }
 
     // Fall back to encrypted file
     tracing::warn!("system keychain unavailable — using encrypted file storage");
-    set_token_in_file(registry_url, token)
+    set_token_in_file(registry_url, token)?;
+    Ok(AuthStorageBackend::EncryptedFileFallback)
+}
+
+pub fn auth_storage_status(registry_url: &str) -> AuthStorageStatus {
+    AuthStorageStatus::from_backends(
+        stored_access_backend(registry_url),
+        stored_refresh_backend(registry_url),
+    )
 }
 
 /// Remove the stored token for a given registry URL.
@@ -149,6 +252,18 @@ pub fn clear_token(registry_url: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn clear_stored_token(registry_url: &str) -> Result<(), String> {
+    let keychain_result = clear_token_from_keychain(registry_url);
+    let file_result = clear_token_from_file(registry_url);
+
+    match (keychain_result, file_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(keychain), Ok(())) => Err(keychain),
+        (Ok(()), Err(file)) => Err(file),
+        (Err(keychain), Err(file)) => Err(format!("{keychain}; {file}")),
+    }
 }
 
 /// Clear all local login state for a registry.
@@ -212,21 +327,16 @@ pub fn get_npm_token() -> Option<String> {
 
 /// Store an npm token in the keychain.
 pub fn set_npm_token(token: &str) -> Result<(), String> {
-    if force_file_auth() {
-        return set_token_in_file(NPM_REGISTRY_URL, token);
-    }
+    set_npm_token_with_backend(token).map(|_| ())
+}
 
-    set_token_in_keychain(NPM_REGISTRY_URL, token)
+pub fn set_npm_token_with_backend(token: &str) -> Result<AuthStorageBackend, String> {
+    set_token_with_backend(NPM_REGISTRY_URL, token)
 }
 
 /// Clear stored npm token (`lpm logout --npm`).
 pub fn clear_npm_token() -> Result<(), String> {
-    if force_file_auth() {
-        return clear_token_from_file(NPM_REGISTRY_URL);
-    }
-
-    clear_token_from_keychain(NPM_REGISTRY_URL)
-        .map_err(|e| format!("failed to clear npm token: {e}"))
+    clear_stored_token(NPM_REGISTRY_URL).map_err(|e| format!("failed to clear npm token: {e}"))
 }
 
 // ─── GitHub Token ──────────────────────────────────────────────────
@@ -249,20 +359,16 @@ pub fn get_github_token() -> Option<String> {
 
 /// Store a GitHub Packages token in the keychain.
 pub fn set_github_token(token: &str) -> Result<(), String> {
-    if force_file_auth() {
-        return set_token_in_file(GITHUB_REGISTRY_URL, token);
-    }
+    set_github_token_with_backend(token).map(|_| ())
+}
 
-    set_token_in_keychain(GITHUB_REGISTRY_URL, token)
+pub fn set_github_token_with_backend(token: &str) -> Result<AuthStorageBackend, String> {
+    set_token_with_backend(GITHUB_REGISTRY_URL, token)
 }
 
 /// Clear stored GitHub token (`lpm logout --github`).
 pub fn clear_github_token() -> Result<(), String> {
-    if force_file_auth() {
-        return clear_token_from_file(GITHUB_REGISTRY_URL);
-    }
-
-    clear_token_from_keychain(GITHUB_REGISTRY_URL)
+    clear_stored_token(GITHUB_REGISTRY_URL)
         .map_err(|e| format!("failed to clear GitHub token: {e}"))
 }
 
@@ -308,40 +414,69 @@ pub fn get_gitlab_token_for_host(gitlab_host: &str) -> Option<String> {
 
 /// Store a GitLab Packages token in the keychain.
 pub fn set_gitlab_token(token: &str) -> Result<(), String> {
-    if force_file_auth() {
-        return set_token_in_file(GITLAB_REGISTRY_URL, token);
-    }
+    set_gitlab_token_with_backend(token).map(|_| ())
+}
 
-    set_token_in_keychain(GITLAB_REGISTRY_URL, token)
+pub fn set_gitlab_token_with_backend(token: &str) -> Result<AuthStorageBackend, String> {
+    set_token_with_backend(GITLAB_REGISTRY_URL, token)
 }
 
 /// Clear stored GitLab token (`lpm logout --gitlab`).
 pub fn clear_gitlab_token() -> Result<(), String> {
-    if force_file_auth() {
-        return clear_token_from_file(GITLAB_REGISTRY_URL);
-    }
-
-    clear_token_from_keychain(GITLAB_REGISTRY_URL)
+    clear_stored_token(GITLAB_REGISTRY_URL)
         .map_err(|e| format!("failed to clear GitLab token: {e}"))
 }
 
 fn get_stored_builtin_token(registry_url: &str) -> Option<String> {
+    get_stored_builtin_token_with_backend(registry_url).map(|stored| stored.token)
+}
+
+fn get_stored_builtin_token_with_backend(registry_url: &str) -> Option<StoredToken> {
+    get_stored_access_token_with_backend(registry_url)
+}
+
+fn get_stored_access_token_with_backend(registry_url: &str) -> Option<StoredToken> {
+    if let Some(token) =
+        get_token_from_keychain_safe(registry_url).filter(|token| !token.is_empty())
+    {
+        return Some(StoredToken {
+            token,
+            backend: AuthStorageBackend::Keychain,
+        });
+    }
+
+    get_token_from_file(registry_url)
+        .filter(|token| !token.is_empty())
+        .map(|token| StoredToken {
+            token,
+            backend: AuthStorageBackend::EncryptedFileFallback,
+        })
+}
+
+fn stored_access_backend(registry_url: &str) -> Option<AuthStorageBackend> {
+    get_stored_access_token_with_backend(registry_url).map(|stored| stored.backend)
+}
+
+fn stored_refresh_backend(registry_url: &str) -> Option<AuthStorageBackend> {
+    let account = scoped_refresh_account(registry_url);
+    if get_password_from_keychain_account(&account)
+        .filter(|token| !token.is_empty())
+        .is_some()
+    {
+        return Some(AuthStorageBackend::Keychain);
+    }
+
+    get_token_from_file(&format!("refresh:{registry_url}"))
+        .filter(|token| !token.is_empty())
+        .map(|_| AuthStorageBackend::EncryptedFileFallback)
+}
+
+fn get_token_from_keychain_safe(registry_url: &str) -> Option<String> {
     match std::panic::catch_unwind(|| get_token_from_keychain(registry_url)) {
-        Ok(Some(token)) => Some(token),
-        Ok(None) => {
-            if force_file_auth() {
-                get_token_from_file(registry_url)
-            } else {
-                None
-            }
-        }
+        Ok(token) => token,
         Err(_) => {
-            tracing::debug!("keychain access panicked for builtin registry token");
-            if force_file_auth() {
-                get_token_from_file(registry_url)
-            } else {
-                None
-            }
+            tracing::debug!("keychain access panicked, falling through to file");
+            None
         }
     }
 }
@@ -391,11 +526,11 @@ fn is_default_gitlab_host(raw: &str) -> bool {
 ///
 /// Priority: keychain(url) — custom registries use the existing scoped keychain.
 pub fn get_custom_registry_token(registry_url: &str) -> Option<String> {
-    match std::panic::catch_unwind(|| get_token_from_keychain(registry_url)) {
-        Ok(Some(token)) => Some(token),
-        _ if force_file_auth() => get_token_from_file(registry_url),
-        _ => None,
-    }
+    get_custom_registry_token_with_backend(registry_url).map(|stored| stored.token)
+}
+
+fn get_custom_registry_token_with_backend(registry_url: &str) -> Option<StoredToken> {
+    get_stored_access_token_with_backend(registry_url)
 }
 
 /// Return a token from the GitHub CLI without storing or copying it.
@@ -410,13 +545,16 @@ pub fn get_gitlab_cli_token() -> Option<String> {
 
 /// Store a token for a custom registry URL and track it for enumeration.
 pub fn set_custom_registry_token(registry_url: &str, token: &str) -> Result<(), String> {
-    if force_file_auth() {
-        set_token_in_file(registry_url, token)?;
-    } else {
-        set_token_in_keychain(registry_url, token)?;
-    }
+    set_custom_registry_token_with_backend(registry_url, token).map(|_| ())
+}
+
+pub fn set_custom_registry_token_with_backend(
+    registry_url: &str,
+    token: &str,
+) -> Result<AuthStorageBackend, String> {
+    let backend = set_token_with_backend(registry_url, token)?;
     track_custom_registry(registry_url);
-    Ok(())
+    Ok(backend)
 }
 
 /// Clear stored custom registry token and remove from tracking.
@@ -606,65 +744,114 @@ pub fn clear_all_custom_registries() -> Vec<(String, Result<(), String>)> {
 
 // ─── Registry Enumeration (B4) ─────────────────────────────────────
 
-/// Check which registries have stored tokens.
+/// Check which registries have available auth sources.
 ///
-/// Returns a list of `(display_name, status)` pairs for known registries.
-/// Status is "configured" (token exists) — does NOT verify the token is valid
-/// because that would require network calls. Use `verify_registry_token()` for that.
-pub fn list_stored_registries() -> Vec<(String, String)> {
+/// Does NOT verify tokens because that would require network calls. Use
+/// `verify_registry_token()` for that.
+pub fn list_registry_auth_statuses() -> Vec<RegistryAuthStatus> {
     let mut result = Vec::new();
 
     // npm: check env, keychain, .npmrc — show source so user knows where token came from
-    let npm_stored_token = get_stored_builtin_token(NPM_REGISTRY_URL);
+    let npm_stored_token = get_stored_builtin_token_with_backend(NPM_REGISTRY_URL);
 
     if let Ok(token) = std::env::var("NPM_TOKEN") {
         if !token.is_empty() {
-            result.push(("npmjs.org".into(), "configured (env: NPM_TOKEN)".into()));
+            result.push(RegistryAuthStatus {
+                name: "npmjs.org".into(),
+                status: "configured (env: NPM_TOKEN)".into(),
+                storage: AuthStorageStatus::none(),
+            });
         }
-    } else if npm_stored_token.is_some() {
-        result.push(("npmjs.org".into(), "configured (keychain)".into()));
+    } else if let Some(stored) = npm_stored_token {
+        result.push(RegistryAuthStatus {
+            name: "npmjs.org".into(),
+            status: stored.backend.registry_status_label().into(),
+            storage: AuthStorageStatus::from_backend(stored.backend),
+        });
     } else if parse_npmrc_token().is_some() {
-        result.push((
-            "npmjs.org".into(),
-            "found in .npmrc (may be expired — run `lpm login --npm` to verify)".into(),
-        ));
+        result.push(RegistryAuthStatus {
+            name: "npmjs.org".into(),
+            status: "found in .npmrc (may be expired — run `lpm login --npm` to verify)".into(),
+            storage: AuthStorageStatus::none(),
+        });
     }
 
     // GitHub: env, host CLI, or keychain
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         if !token.is_empty() {
-            result.push(("github.com".into(), "configured (env: GITHUB_TOKEN)".into()));
+            result.push(RegistryAuthStatus {
+                name: "github.com".into(),
+                status: "configured (env: GITHUB_TOKEN)".into(),
+                storage: AuthStorageStatus::none(),
+            });
         }
     } else if get_github_cli_token().is_some() {
-        result.push(("github.com".into(), "available (gh auth)".into()));
-    } else if get_stored_builtin_token(GITHUB_REGISTRY_URL).is_some() {
-        result.push(("github.com".into(), "configured (keychain)".into()));
+        result.push(RegistryAuthStatus {
+            name: "github.com".into(),
+            status: "available (gh auth)".into(),
+            storage: AuthStorageStatus::none(),
+        });
+    } else if let Some(stored) = get_stored_builtin_token_with_backend(GITHUB_REGISTRY_URL) {
+        result.push(RegistryAuthStatus {
+            name: "github.com".into(),
+            status: stored.backend.registry_status_label().into(),
+            storage: AuthStorageStatus::from_backend(stored.backend),
+        });
     }
 
     // GitLab: env, host CLI, or keychain
     if let Ok(token) = std::env::var("GITLAB_TOKEN") {
         if !token.is_empty() {
-            result.push(("gitlab.com".into(), "configured (env: GITLAB_TOKEN)".into()));
+            result.push(RegistryAuthStatus {
+                name: "gitlab.com".into(),
+                status: "configured (env: GITLAB_TOKEN)".into(),
+                storage: AuthStorageStatus::none(),
+            });
         }
     } else if let Ok(token) = std::env::var("CI_JOB_TOKEN") {
         if !token.is_empty() {
-            result.push(("gitlab.com".into(), "configured (env: CI_JOB_TOKEN)".into()));
+            result.push(RegistryAuthStatus {
+                name: "gitlab.com".into(),
+                status: "configured (env: CI_JOB_TOKEN)".into(),
+                storage: AuthStorageStatus::none(),
+            });
         }
     } else if get_gitlab_cli_token().is_some() {
-        result.push(("gitlab.com".into(), "available (glab auth)".into()));
-    } else if get_stored_builtin_token(GITLAB_REGISTRY_URL).is_some() {
-        result.push(("gitlab.com".into(), "configured (keychain)".into()));
+        result.push(RegistryAuthStatus {
+            name: "gitlab.com".into(),
+            status: "available (glab auth)".into(),
+            storage: AuthStorageStatus::none(),
+        });
+    } else if let Some(stored) = get_stored_builtin_token_with_backend(GITLAB_REGISTRY_URL) {
+        result.push(RegistryAuthStatus {
+            name: "gitlab.com".into(),
+            status: stored.backend.registry_status_label().into(),
+            storage: AuthStorageStatus::from_backend(stored.backend),
+        });
     }
 
     // Custom registries: read from tracking file
     for url in list_custom_registries() {
-        let has_token = get_custom_registry_token(&url).is_some();
-        if has_token {
-            result.push((url, "configured (keychain)".into()));
+        if let Some(stored) = get_custom_registry_token_with_backend(&url) {
+            result.push(RegistryAuthStatus {
+                name: url,
+                status: stored.backend.registry_status_label().into(),
+                storage: AuthStorageStatus::from_backend(stored.backend),
+            });
         }
     }
 
     result
+}
+
+/// Check which registries have stored tokens.
+///
+/// Returns a list of `(display_name, status)` pairs for known registries.
+pub fn list_stored_registries() -> Vec<(String, String)> {
+    list_registry_auth_statuses()
+        .into_iter()
+        .map(|registry| (registry.name, registry.status))
+        .collect()
 }
 
 /// Token expiry tracking file path.
@@ -875,17 +1062,24 @@ fn scoped_refresh_account(registry_url: &str) -> String {
 
 /// Store a refresh token for a registry (keychain first, encrypted file fallback).
 pub fn set_refresh_token(registry: &str, token: &str) {
+    if let Err(error) = set_refresh_token_with_backend(registry, token) {
+        tracing::warn!("failed to store refresh token securely: {error}");
+    }
+}
+
+pub fn set_refresh_token_with_backend(
+    registry: &str,
+    token: &str,
+) -> Result<AuthStorageBackend, String> {
     let account = scoped_refresh_account(registry);
 
     if set_password_in_keychain_account(&account, token).is_ok() {
-        return;
+        return Ok(AuthStorageBackend::Keychain);
     }
 
     // Fall back to encrypted file (same AES-256-GCM as main tokens)
-    if let Ok(()) = set_token_in_file(&format!("refresh:{registry}"), token) {
-        return;
-    }
-    tracing::warn!("failed to store refresh token securely");
+    set_token_in_file(&format!("refresh:{registry}"), token)?;
+    Ok(AuthStorageBackend::EncryptedFileFallback)
 }
 
 /// Get the stored refresh token for a registry.
@@ -1888,6 +2082,94 @@ mod tests {
     }
 
     #[test]
+    fn auth_storage_status_reports_none_for_env_token_without_stored_material() {
+        with_temp_home(|_| {
+            let registry = "http://localhost:3000";
+            let _env = LocalEnvGuard::update([
+                ("LPM_TOKEN", Some("env-token".into())),
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+            ]);
+
+            assert_eq!(get_token(registry), Some("env-token".to_string()));
+            assert_eq!(auth_storage_status(registry), AuthStorageStatus::none());
+        });
+    }
+
+    #[test]
+    fn auth_storage_status_reports_file_backed_access_token_as_degraded() {
+        with_temp_home(|_| {
+            let registry = "http://localhost:3000";
+            let _env = LocalEnvGuard::update([
+                ("LPM_TOKEN", None),
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+            ]);
+
+            set_token_in_file(registry, "access-token").unwrap();
+
+            assert_eq!(
+                auth_storage_status(registry),
+                AuthStorageStatus::from_backend(AuthStorageBackend::EncryptedFileFallback)
+            );
+        });
+    }
+
+    #[test]
+    fn auth_storage_status_reports_file_backed_refresh_token_as_degraded() {
+        with_temp_home(|_| {
+            let registry = "http://localhost:3000";
+            let _env = LocalEnvGuard::update([
+                ("LPM_TOKEN", None),
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+            ]);
+
+            set_token_in_file(&format!("refresh:{registry}"), "refresh-token").unwrap();
+
+            assert_eq!(
+                auth_storage_status(registry),
+                AuthStorageStatus::from_backend(AuthStorageBackend::EncryptedFileFallback)
+            );
+        });
+    }
+
+    #[test]
+    fn auth_storage_status_prefers_file_fallback_when_any_material_is_file_backed() {
+        assert_eq!(
+            AuthStorageStatus::from_backends(
+                Some(AuthStorageBackend::Keychain),
+                Some(AuthStorageBackend::EncryptedFileFallback),
+            ),
+            AuthStorageStatus::from_backend(AuthStorageBackend::EncryptedFileFallback)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn auth_storage_status_reports_keychain_backed_stored_token() {
+        require_keychain_opt_in();
+        with_temp_home(|_| {
+            let registry = "http://localhost:3000";
+            let _env = LocalEnvGuard::update([
+                ("LPM_TOKEN", None),
+                ("LPM_FORCE_FILE_AUTH", None),
+                (
+                    KEYCHAIN_SERVICE_TEST_ENV,
+                    Some("lpm-auth-storage-status-test".into()),
+                ),
+            ]);
+
+            set_token_in_keychain(registry, "access-token").unwrap();
+
+            assert_eq!(
+                auth_storage_status(registry),
+                AuthStorageStatus::from_backend(AuthStorageBackend::Keychain)
+            );
+
+            clear_token_from_keychain(registry).unwrap();
+        });
+    }
+
+    #[test]
     fn scoped_refresh_account_is_distinct_and_deterministic() {
         let refresh_a = scoped_refresh_account("https://lpm.dev");
         let refresh_b = scoped_refresh_account("https://lpm.dev");
@@ -2247,7 +2529,7 @@ mod tests {
                 name == "npmjs.org" && status.contains("found in .npmrc")
             }));
             assert!(registries.iter().any(|(name, status)| {
-                name == "gitlab.com" && status == "configured (keychain)"
+                name == "gitlab.com" && status == "configured (encrypted file fallback)"
             }));
             assert!(
                 registries.iter().all(|(name, _)| name != "github.com"),
@@ -2307,7 +2589,7 @@ mod tests {
                 name == "npmjs.org" && status.contains("found in .npmrc")
             }));
             assert!(registries.iter().any(|(name, status)| {
-                name == custom_registry && status == "configured (keychain)"
+                name == custom_registry && status == "configured (encrypted file fallback)"
             }));
             assert!(registries.iter().all(|(name, _)| name != "gitlab.com"));
             assert!(registries.iter().all(|(name, _)| name != "github.com"));
@@ -2367,10 +2649,10 @@ mod tests {
                 name == "npmjs.org" && status.contains("found in .npmrc")
             }));
             assert!(registries.iter().any(|(name, status)| {
-                name == "gitlab.com" && status == "configured (keychain)"
+                name == "gitlab.com" && status == "configured (encrypted file fallback)"
             }));
             assert!(registries.iter().any(|(name, status)| {
-                name == custom_registry && status == "configured (keychain)"
+                name == custom_registry && status == "configured (encrypted file fallback)"
             }));
             assert!(registries.iter().all(|(name, _)| name != "github.com"));
         });
@@ -2421,10 +2703,10 @@ mod tests {
 
             let registries = list_stored_registries();
             assert!(registries.iter().any(|(name, status)| {
-                name == "github.com" && status == "configured (keychain)"
+                name == "github.com" && status == "configured (encrypted file fallback)"
             }));
             assert!(registries.iter().any(|(name, status)| {
-                name == custom_registry && status == "configured (keychain)"
+                name == custom_registry && status == "configured (encrypted file fallback)"
             }));
             assert!(registries.iter().all(|(name, _)| name != "npmjs.org"));
             assert!(registries.iter().all(|(name, _)| name != "gitlab.com"));

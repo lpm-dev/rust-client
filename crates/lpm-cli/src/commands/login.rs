@@ -168,15 +168,26 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         .to_string();
 
     // Store the token
-    auth::set_token(registry_url, &token)
+    let access_backend = auth::set_token_with_backend(registry_url, &token)
         .map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
+    let mut storage_status = auth::AuthStorageStatus::from_backend(access_backend);
 
     // Store refresh token for session-based auth (Feature 44 Part B)
     if let Some(ref rt) = refresh_token {
         if let Some(ref ea) = expires_at {
             auth::set_session_access_token_expiry(registry_url, ea);
         }
-        auth::set_refresh_token(registry_url, rt);
+        match auth::set_refresh_token_with_backend(registry_url, rt) {
+            Ok(refresh_backend) => {
+                storage_status = auth::AuthStorageStatus::from_backends(
+                    Some(access_backend),
+                    Some(refresh_backend),
+                );
+            }
+            Err(error) => {
+                tracing::warn!("failed to store refresh token securely: {error}");
+            }
+        }
     } else if let Some(ref ea) = expires_at {
         // Legacy direct-token flow still uses date-based reminder metadata.
         let date_part = ea.split('T').next().unwrap_or(ea);
@@ -188,17 +199,24 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
             "success": true,
             "username": username,
             "registry": registry_url,
+            "storage_backend": storage_status.backend_json_value(),
+            "storage_degraded": storage_status.degraded,
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         let email_str = info.username.as_deref().unwrap_or("");
-        emit_browser_login_success(&username, email_str, registry_url);
+        emit_browser_login_success(&username, email_str, registry_url, storage_status);
     }
 
     Ok(())
 }
 
-fn emit_browser_login_success(username: &str, email: &str, registry_url: &str) {
+fn emit_browser_login_success(
+    username: &str,
+    email: &str,
+    registry_url: &str,
+    storage_status: auth::AuthStorageStatus,
+) {
     install_ui::done("Browser authentication complete");
     install_ui::detail(&login_detail_row(
         "user:",
@@ -208,7 +226,14 @@ fn emit_browser_login_success(username: &str, email: &str, registry_url: &str) {
         "registry:",
         &install_ui::yellow(&install_ui::short_registry_host(registry_url)),
     ));
-    install_ui::detail(&login_detail_row("storage:", "local secure store"));
+    if let Some(label) = storage_status.human_label() {
+        install_ui::detail(&login_detail_row("secure storage backend:", label));
+    }
+    if storage_status.degraded {
+        install_ui::warn(
+            "Encrypted file fallback is active; unlock or repair the OS keychain and run `lpm login` again to use keychain storage.",
+        );
+    }
 }
 
 fn login_user_value(username: &str, email: &str) -> String {

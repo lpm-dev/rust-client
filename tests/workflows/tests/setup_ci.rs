@@ -12,6 +12,7 @@
 
 mod support;
 
+use support::auth_state::{SessionSeed, seed_sessions};
 use support::{TempProject, lpm};
 
 // ─── default scoped config ────────────────────────────────────────────
@@ -175,6 +176,8 @@ fn setup_ci_json_envelope_carries_path_content_and_flag_state() {
     assert_eq!(envelope["proxy"], serde_json::json!(true));
     assert_eq!(envelope["oidc"], serde_json::json!(false));
     assert_eq!(envelope["uses_env_var"], serde_json::json!(true));
+    assert_eq!(envelope["storage_backend"], serde_json::Value::Null);
+    assert_eq!(envelope["storage_degraded"], serde_json::json!(false));
 
     let path = envelope["path"].as_str().expect("path must be a string");
     assert!(
@@ -189,4 +192,42 @@ fn setup_ci_json_envelope_carries_path_content_and_flag_state() {
         content.contains("registry=https://lpm.example.test/api/registry/"),
         "envelope content must include the unscoped registry line under --proxy, got:\n{content}",
     );
+}
+
+#[test]
+fn setup_ci_json_reports_file_backed_storage_backend_for_stored_token() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let registry_url = "https://lpm.example.test";
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url,
+            access_token: Some("stored-token"),
+            refresh_token: None,
+            session_access_expires_at: None,
+        }],
+    );
+
+    let output = lpm(&project)
+        .args(["--registry", registry_url, "--json", "setup", "ci"])
+        .output()
+        .expect("failed to run lpm setup ci --json");
+
+    assert!(
+        output.status.success(),
+        "lpm setup ci --json with stored token failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("setup ci --json must be valid JSON: {e}\n---\n{stdout}"));
+
+    assert_eq!(envelope["uses_env_var"], serde_json::json!(false));
+    assert_eq!(
+        envelope["storage_backend"],
+        serde_json::json!("encrypted_file_fallback")
+    );
+    assert_eq!(envelope["storage_degraded"], serde_json::json!(true));
 }
