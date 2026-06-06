@@ -1,5 +1,6 @@
 mod support;
 
+use support::assertions::parse_json_output;
 use support::auth_state::{SessionSeed, seed_sessions};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
@@ -139,6 +140,14 @@ async fn whoami_human_output_uses_slim_account_summary() {
         "authenticated whoami should show MFA status as an aligned detail row, got:\n{stderr}"
     );
     assert!(
+        stderr.contains("secure storage backend: encrypted file fallback"),
+        "authenticated whoami should show the active secure storage backend, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Encrypted file fallback is active"),
+        "authenticated whoami should warn when auth storage uses the encrypted file fallback, got:\n{stderr}"
+    );
+    assert!(
         stderr.contains("usage") && stderr.contains("storage        50.00MB / 500MB  █░░░░░░░░░"),
         "authenticated whoami should show storage usage with a quota bar, got:\n{stderr}"
     );
@@ -191,5 +200,58 @@ async fn whoami_human_output_uses_slim_account_summary() {
     assert!(
         colored_stderr.contains("\u{1b}[1;33;48;5;236m admin \u{1b}[0m"),
         "color-forced whoami should render admin with a badge background, got:\n{colored_stderr:?}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_json_reports_file_backed_auth_storage_backend() {
+    let project = TempProject::empty(r#"{"name":"whoami","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .and(header("authorization", "Bearer access-primary"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "test@example.com",
+            "profile_username": "testuser",
+            "email": "test@example.com"
+        })))
+        .mount(mock.server())
+        .await;
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("access-primary"),
+            refresh_token: None,
+            session_access_expires_at: None,
+        }],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["whoami", "--json"])
+        .output()
+        .expect("failed to run lpm whoami --json");
+
+    assert!(
+        output.status.success(),
+        "authenticated whoami --json must exit 0, stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(
+        json["storage_backend"],
+        serde_json::json!("encrypted_file_fallback")
+    );
+    assert_eq!(json["storage_degraded"], serde_json::json!(true));
+    assert_eq!(
+        json["registries"][0]["storage_backend"],
+        serde_json::json!("encrypted_file_fallback")
+    );
+    assert_eq!(
+        json["registries"][0]["storage_degraded"],
+        serde_json::json!(true)
     );
 }

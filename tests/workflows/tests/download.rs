@@ -117,6 +117,56 @@ async fn download_version_flag_resolves_dist_tags_instead_of_exact_versions_only
 }
 
 #[tokio::test]
+async fn download_accepts_single_string_platform_fields_from_npm_packument() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "@utoo/utoo-darwin-x64",
+            "version": "1.0.32",
+            "os": "darwin",
+            "cpu": "x64",
+            "libc": null,
+        }),
+        &[],
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "download",
+            "@utoo/utoo-darwin-x64",
+            "--version",
+            "1.0.32",
+            "--json",
+            "--output",
+            "utoo-out",
+        ])
+        .output()
+        .expect("failed to run lpm download for package with string platform fields");
+
+    assert!(
+        output.status.success(),
+        "download must parse npm packuments that use strings for platform fields:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert_eq!(json["package"], "@utoo/utoo-darwin-x64");
+    assert_eq!(json["version"], "1.0.32");
+    assert!(
+        project
+            .path()
+            .join("utoo-out")
+            .join("package.json")
+            .is_file(),
+        "download must extract the package after parsing the string platform fields"
+    );
+}
+
+#[tokio::test]
 async fn download_positional_npm_version_spec_resolves_requested_version() {
     let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
     let mock = MockRegistry::start().await;

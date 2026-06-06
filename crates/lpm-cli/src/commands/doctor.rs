@@ -297,6 +297,10 @@ pub async fn run(
         }
     }
 
+    if let Some(check) = auth_storage_check(auth::auth_storage_status(registry_url)) {
+        checks.push(check);
+    }
+
     checks.push(vault_storage_check(lpm_vault::storage_backend()));
 
     // 3. Global store accessible?
@@ -1036,6 +1040,20 @@ fn vault_storage_check(backend: lpm_vault::VaultStorageBackend) -> Check {
         lpm_vault::VaultStorageBackend::Unavailable { message } => {
             Check::fail(&doctor_catalog::VAULT_STORAGE_UNAVAILABLE, &message)
         }
+    }
+}
+
+fn auth_storage_check(status: auth::AuthStorageStatus) -> Option<Check> {
+    match status.backend {
+        Some(auth::AuthStorageBackend::Keychain) => Some(Check::pass(
+            &doctor_catalog::AUTH_STORAGE_KEYCHAIN,
+            "secure storage backend: keychain",
+        )),
+        Some(auth::AuthStorageBackend::EncryptedFileFallback) => Some(Check::warn(
+            &doctor_catalog::AUTH_STORAGE_FALLBACK,
+            "secure storage backend: encrypted file fallback",
+        )),
+        None => None,
     }
 }
 

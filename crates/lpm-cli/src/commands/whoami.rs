@@ -27,6 +27,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         .email
         .as_deref()
         .or(user.username.as_deref().filter(|u| u.contains('@')));
+    let storage_status = active_auth_storage_status(client);
 
     if json_output {
         let json = serde_json::json!({
@@ -49,7 +50,9 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 "name": o.name,
                 "role": o.role,
             })).collect::<Vec<_>>(),
-            "registries": build_registries_json(),
+            "registries": build_registries_json(storage_status),
+            "storage_backend": storage_status.backend_json_value(),
+            "storage_degraded": storage_status.degraded,
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
         return Ok(());
@@ -79,6 +82,15 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             install_ui::section("no")
         };
         whoami_ui::detail("mfa", &status);
+    }
+
+    if let Some(label) = storage_status.human_label() {
+        whoami_ui::detail("secure storage backend:", label);
+    }
+    if storage_status.degraded {
+        whoami_ui::warn(
+            "Encrypted file fallback is active; unlock or repair the OS keychain and run `lpm login` again to use keychain storage.",
+        );
     }
 
     // Usage & Limits
@@ -180,9 +192,9 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     whoami_ui::blank_line();
     whoami_ui::section("registries");
     whoami_ui::registry("lpm.dev", "authenticated", true);
-    let external_registries = auth::list_stored_registries();
-    for (name, status) in &external_registries {
-        whoami_ui::registry(name, status, true);
+    let external_registries = auth::list_registry_auth_statuses();
+    for registry in &external_registries {
+        whoami_ui::registry(&registry.name, &registry.status, true);
     }
 
     // Show token expiry warnings
@@ -195,16 +207,39 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
 }
 
 /// Build the registries array for JSON output.
-fn build_registries_json() -> Vec<serde_json::Value> {
-    let mut regs = vec![serde_json::json!({"name": "lpm.dev", "status": "authenticated"})];
-    for (name, status) in auth::list_stored_registries() {
-        regs.push(serde_json::json!({"name": name, "status": status}));
+fn build_registries_json(lpm_storage: auth::AuthStorageStatus) -> Vec<serde_json::Value> {
+    let mut regs = vec![serde_json::json!({
+        "name": "lpm.dev",
+        "status": "authenticated",
+        "storage_backend": lpm_storage.backend_json_value(),
+        "storage_degraded": lpm_storage.degraded,
+    })];
+    for registry in auth::list_registry_auth_statuses() {
+        regs.push(serde_json::json!({
+            "name": registry.name,
+            "status": registry.status,
+            "storage_backend": registry.storage.backend_json_value(),
+            "storage_degraded": registry.storage.degraded,
+        }));
     }
     regs
 }
 
 fn has_local_whoami_auth(registry_url: &str) -> bool {
     auth::get_token(registry_url).is_some() || auth::has_refresh_token(registry_url)
+}
+
+fn active_auth_storage_status(client: &RegistryClient) -> auth::AuthStorageStatus {
+    let Some(session) = client.session() else {
+        return auth::AuthStorageStatus::none();
+    };
+
+    match session.current_source() {
+        Some(auth::TokenSource::StoredSession | auth::TokenSource::StoredLegacy) => {
+            auth::auth_storage_status(session.registry_url())
+        }
+        _ => auth::AuthStorageStatus::none(),
+    }
 }
 
 fn login_command_for_registry(registry_url: &str) -> String {
