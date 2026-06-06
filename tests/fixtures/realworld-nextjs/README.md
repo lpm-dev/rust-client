@@ -21,6 +21,12 @@ The resolved tree exercises:
 - **Leaf typed packages** — `@types/*` packages have zero transitive deps each; their inclusion tests the resolver's handling of leaf-only nodes without inflating tarball-download work.
 - **Real npm tarball shapes** — every tarball comes through Verdaccio's proxy to `registry.npmjs.org`, exercising real-world `.tgz` payloads (not the mock-registry's hand-rolled `package/package.json`-only tarballs).
 
+The fixture pins `caniuse-lite` through `lpm.overrides` intentionally. This test
+is about the install pipeline at real package scale, not the release-age policy.
+Verdaccio serves live npm metadata, and `caniuse-lite` publishes often enough
+that a fresh transitive version can trip the default cooldown for reasons
+unrelated to resolver, fetch, extract, or link behavior.
+
 ## Empirical install timings (M-series macOS, 2026-05-14 dev box)
 
 - **Cold install** (Verdaccio storage empty, all tarballs proxied from npmjs upstream): **~14 s** end-to-end. Internal breakdown observed: resolve ~4.7 s, fetch ~7.9-8.2 s (parallel tarball downloads through the proxy), link ~0.1 s.
