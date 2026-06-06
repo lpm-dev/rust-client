@@ -83,8 +83,7 @@ pub async fn run(
 
     let token_placeholder = token
         .as_ref()
-        .map(|resolved| resolved.token.as_str())
-        .unwrap_or("${LPM_TOKEN}");
+        .map_or("${LPM_TOKEN}", |resolved| resolved.token.as_str());
     let uses_env = token.is_none();
     let storage_status = setup_storage_status(token.as_ref());
 
