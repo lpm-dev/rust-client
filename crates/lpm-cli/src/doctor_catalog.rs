@@ -303,6 +303,30 @@ pub static AUTH_MISSING: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static AUTH_STORAGE_KEYCHAIN: CheckEntry = CheckEntry {
+    code: "auth_storage_keychain",
+    name: "Auth storage backend",
+    category: Category::Auth,
+    tier: Tier::Fast,
+    description: "Stored auth material for the configured registry is protected by the OS keychain.",
+    when_fires: "A locally stored auth token or refresh token exists for the configured registry and is keychain-backed.",
+    remediation: "No action — keychain-backed storage is the recommended backend.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static AUTH_STORAGE_FALLBACK: CheckEntry = CheckEntry {
+    code: "auth_storage_fallback",
+    name: "Auth storage backend",
+    category: Category::Auth,
+    tier: Tier::Fast,
+    description: "Stored auth material for the configured registry is using encrypted file fallback instead of the OS keychain.",
+    when_fires: "A locally stored auth token or refresh token exists for the configured registry and at least one stored credential is file-backed.",
+    remediation: "Unlock or repair the OS keychain and run `lpm login` again so LPM can store auth material in keychain-backed storage.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 pub static VAULT_STORAGE_KEYCHAIN: CheckEntry = CheckEntry {
     code: "vault_storage_keychain",
     name: "Vault storage backend",
@@ -1816,6 +1840,8 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &AUTH_VALID,
     &AUTH_INVALID,
     &AUTH_MISSING,
+    &AUTH_STORAGE_KEYCHAIN,
+    &AUTH_STORAGE_FALLBACK,
     &VAULT_STORAGE_KEYCHAIN,
     &VAULT_STORAGE_NATIVE,
     &VAULT_STORAGE_FALLBACK,

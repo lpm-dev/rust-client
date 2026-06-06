@@ -9,12 +9,39 @@ fn hint_line(message: &str) {
 /// resolve a usable LPM bearer for CI/CD `.npmrc` generation.
 /// `setup ci` is best-effort — when no token is available it falls
 /// back to the `${LPM_TOKEN}` placeholder so CI can interpolate at runtime.
-async fn resolve_lpm_bearer_optional(registry_url: &str) -> Option<String> {
+async fn resolve_lpm_bearer_optional(registry_url: &str) -> Option<ResolvedSetupBearer> {
     let session = lpm_auth::SessionManager::new(registry_url, None);
-    session
+    let token = session
         .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
         .await
-        .ok()
+        .ok()?;
+    let storage = match session.current_source() {
+        Some(lpm_auth::TokenSource::StoredSession | lpm_auth::TokenSource::StoredLegacy) => {
+            lpm_auth::auth_storage_status(registry_url)
+        }
+        _ => lpm_auth::AuthStorageStatus::none(),
+    };
+    Some(ResolvedSetupBearer { token, storage })
+}
+
+struct ResolvedSetupBearer {
+    token: String,
+    storage: lpm_auth::AuthStorageStatus,
+}
+
+impl ResolvedSetupBearer {
+    fn oidc(token: String) -> Self {
+        Self {
+            token,
+            storage: lpm_auth::AuthStorageStatus::none(),
+        }
+    }
+}
+
+fn setup_storage_status(token: Option<&ResolvedSetupBearer>) -> lpm_auth::AuthStorageStatus {
+    token.map_or_else(lpm_auth::AuthStorageStatus::none, |resolved| {
+        resolved.storage
+    })
 }
 
 /// Generate .npmrc for CI/CD environments.
@@ -39,9 +66,9 @@ pub async fn run(
     // SessionManager handles `LPM_TOKEN` fallback internally,
     // so the explicit `or_else(LPM_TOKEN)` step is no longer needed
     // here — `bearer_string_for` returns it as `EnvVar` source.
-    let token: Option<String> = if use_oidc {
+    let token: Option<ResolvedSetupBearer> = if use_oidc {
         match oidc::exchange_oidc_token(registry_url, None, "install").await {
-            Ok(oidc_token) => Some(oidc_token.token),
+            Ok(oidc_token) => Some(ResolvedSetupBearer::oidc(oidc_token.token)),
             Err(e) => {
                 if !json_output {
                     install_ui::warn(&format!("OIDC token exchange failed: {e}"));
@@ -54,8 +81,12 @@ pub async fn run(
         resolve_lpm_bearer_optional(registry_url).await
     };
 
-    let token_placeholder = token.as_deref().unwrap_or("${LPM_TOKEN}");
+    let token_placeholder = token
+        .as_ref()
+        .map(|resolved| resolved.token.as_str())
+        .unwrap_or("${LPM_TOKEN}");
     let uses_env = token.is_none();
+    let storage_status = setup_storage_status(token.as_ref());
 
     // Build .npmrc content
     let registry_host = registry_url
@@ -94,6 +125,8 @@ pub async fn run(
             "uses_env_var": uses_env,
             "oidc": use_oidc,
             "proxy": proxy,
+            "storage_backend": storage_status.backend_json_value(),
+            "storage_degraded": storage_status.degraded,
             "note": if uses_env { "" } else { "JSON content uses ${LPM_TOKEN} placeholder; the on-disk .npmrc carries the actual token at 0o600." },
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());

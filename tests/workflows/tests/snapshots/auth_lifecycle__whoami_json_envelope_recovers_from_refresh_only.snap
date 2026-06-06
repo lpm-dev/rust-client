@@ -16,9 +16,13 @@ expression: json
   "registries": [
     {
       "name": "lpm.dev",
-      "status": "authenticated"
+      "status": "authenticated",
+      "storage_backend": "encrypted_file_fallback",
+      "storage_degraded": true
     }
   ],
+  "storage_backend": "encrypted_file_fallback",
+  "storage_degraded": true,
   "success": true,
   "usage": {
     "private_packages": 3,

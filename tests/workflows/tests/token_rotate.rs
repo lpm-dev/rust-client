@@ -112,9 +112,16 @@ async fn token_rotate_human_output_uses_slim_progress_and_completion() {
         "token-rotate must use a slim phase line, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("✓ Old token invalidated")
-            && stderr.contains("✓ New token stored in Keychain"),
+        stderr.contains("✓ Old token invalidated") && stderr.contains("✓ New token stored"),
         "token-rotate must show the middle token rotation steps, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("secure storage backend: encrypted file fallback"),
+        "token-rotate must show the secure storage backend, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Encrypted file fallback is active"),
+        "token-rotate must warn when auth storage uses the encrypted file fallback, got:\n{stderr}"
     );
     assert!(
         stderr.contains("✓ Done · session token rotated successfully"),

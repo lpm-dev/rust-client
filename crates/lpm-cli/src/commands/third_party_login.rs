@@ -18,7 +18,7 @@ pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), Lpm
             "explicit-token",
             json_output,
             true,
-            auth::set_npm_token,
+            auth::set_npm_token_with_backend,
         );
     }
     if let Some(token) = env_npm_token() {
@@ -28,7 +28,7 @@ pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), Lpm
             "env:NPM_TOKEN",
             json_output,
             true,
-            auth::set_npm_token,
+            auth::set_npm_token_with_backend,
         );
     }
 
@@ -51,17 +51,23 @@ pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), Lpm
     )
     .await?;
 
-    auth::set_npm_token(&token)
+    let storage_backend = auth::set_npm_token_with_backend(&token)
         .map_err(|e| LpmError::Registry(format!("failed to store npm token: {e}")))?;
     auth::clear_token_expiry(NPM_DISPLAY);
 
     if json_output {
-        print_success_json(NPM_DISPLAY, "npm-web", true);
+        print_success_json(
+            NPM_DISPLAY,
+            "npm-web",
+            true,
+            Some(auth::AuthStorageStatus::from_backend(storage_backend)),
+        );
     } else {
         install_ui::done(&format!(
             "Logged in to {} with npm web auth",
             NPM_DISPLAY.bold()
         ));
+        render_storage_backend(auth::AuthStorageStatus::from_backend(storage_backend));
     }
 
     Ok(())
@@ -75,7 +81,7 @@ pub fn run_github(token: Option<String>, json_output: bool) -> Result<(), LpmErr
             "explicit-token",
             json_output,
             true,
-            auth::set_github_token,
+            auth::set_github_token_with_backend,
         );
     }
 
@@ -86,7 +92,7 @@ pub fn run_github(token: Option<String>, json_output: bool) -> Result<(), LpmErr
     }
 
     if json_output {
-        print_success_json(GITHUB_DISPLAY, "gh", false);
+        print_success_json(GITHUB_DISPLAY, "gh", false, None);
     } else {
         install_ui::done(
             "GitHub Packages auth is available through GitHub CLI; no LPM token was stored",
@@ -104,7 +110,7 @@ pub fn run_gitlab(token: Option<String>, json_output: bool) -> Result<(), LpmErr
             "explicit-token",
             json_output,
             true,
-            auth::set_gitlab_token,
+            auth::set_gitlab_token_with_backend,
         );
     }
 
@@ -115,7 +121,7 @@ pub fn run_gitlab(token: Option<String>, json_output: bool) -> Result<(), LpmErr
     }
 
     if json_output {
-        print_success_json(GITLAB_DISPLAY, "glab", false);
+        print_success_json(GITLAB_DISPLAY, "glab", false, None);
     } else {
         install_ui::done(
             "GitLab Packages auth is available through GitLab CLI; no LPM token was stored",
@@ -157,7 +163,7 @@ pub fn run_custom(
         "explicit-token",
         json_output,
         false,
-        |token| auth::set_custom_registry_token(registry_url, token),
+        |token| auth::set_custom_registry_token_with_backend(registry_url, token),
     )
 }
 
@@ -167,7 +173,7 @@ fn store_builtin_token(
     source: &str,
     json_output: bool,
     supports_otp_metadata: bool,
-    store: impl FnOnce(&str) -> Result<(), String>,
+    store: impl FnOnce(&str) -> Result<auth::AuthStorageBackend, String>,
 ) -> Result<(), LpmError> {
     if token.is_empty() {
         return Err(LpmError::Registry("token cannot be empty".into()));
@@ -175,7 +181,9 @@ fn store_builtin_token(
 
     let metadata = token_metadata(registry_display, json_output, supports_otp_metadata);
     auth::clear_token_expiry(registry_display);
-    store(&token).map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
+    let storage_backend =
+        store(&token).map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
+    let storage_status = auth::AuthStorageStatus::from_backend(storage_backend);
 
     if metadata.otp_required {
         auth::set_otp_required(registry_display, true);
@@ -198,6 +206,7 @@ fn store_builtin_token(
                 registry_display.bold(),
                 expires_human.dimmed()
             ));
+            render_storage_backend(storage_status);
             return Ok(());
         }
     }
@@ -211,6 +220,8 @@ fn store_builtin_token(
                 "source": source,
                 "stored": true,
                 "otp_required": metadata.otp_required,
+                "storage_backend": storage_status.backend_json_value(),
+                "storage_degraded": storage_status.degraded,
             })
         );
     } else {
@@ -223,9 +234,21 @@ fn store_builtin_token(
             "Token stored for {}{otp_note}",
             registry_display.bold()
         ));
+        render_storage_backend(storage_status);
     }
 
     Ok(())
+}
+
+fn render_storage_backend(storage_status: auth::AuthStorageStatus) {
+    if let Some(label) = storage_status.human_label() {
+        install_ui::detail(&format!("secure storage backend: {label}"));
+    }
+    if storage_status.degraded {
+        install_ui::warn(
+            "Encrypted file fallback is active; unlock or repair the OS keychain and run login again to use keychain storage.",
+        );
+    }
 }
 
 #[derive(Default)]
@@ -270,7 +293,13 @@ fn env_npm_token() -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-fn print_success_json(registry: &str, source: &str, stored: bool) {
+fn print_success_json(
+    registry: &str,
+    source: &str,
+    stored: bool,
+    storage_status: Option<auth::AuthStorageStatus>,
+) {
+    let storage_status = storage_status.unwrap_or_else(auth::AuthStorageStatus::none);
     println!(
         "{}",
         serde_json::json!({
@@ -278,6 +307,8 @@ fn print_success_json(registry: &str, source: &str, stored: bool) {
             "registry": registry,
             "source": source,
             "stored": stored,
+            "storage_backend": storage_status.backend_json_value(),
+            "storage_degraded": storage_status.degraded,
         })
     );
 }
