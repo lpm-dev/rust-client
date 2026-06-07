@@ -9,7 +9,7 @@
 //! Protocols: `workspace:*`, `catalog:`, and `catalog:{name}`.
 //! `--filter` and workspace-aware `run` are supported.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -38,21 +38,16 @@ pub struct WorkspaceMember {
 }
 
 /// Minimal package.json fields needed for dependency resolution.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct PackageJson {
-    #[serde(default)]
     pub name: Option<String>,
 
-    #[serde(default)]
     pub version: Option<String>,
 
-    #[serde(default)]
     pub dependencies: HashMap<String, String>,
 
-    #[serde(default, rename = "devDependencies")]
     pub dev_dependencies: HashMap<String, String>,
 
-    #[serde(default, rename = "peerDependencies")]
     pub peer_dependencies: HashMap<String, String>,
 
     /// `peerDependenciesMeta` — per-peer typed metadata.
@@ -70,10 +65,8 @@ pub struct PackageJson {
     /// dropped. The Default flag for an entry is `false`, which
     /// matches the implicit npm contract (peer is required unless
     /// declared otherwise).
-    #[serde(default, rename = "peerDependenciesMeta")]
     pub peer_dependencies_meta: HashMap<String, PeerDependencyMeta>,
 
-    #[serde(default, rename = "optionalDependencies")]
     pub optional_dependencies: HashMap<String, String>,
 
     /// npm overrides / yarn resolutions — force specific versions for
@@ -92,39 +85,32 @@ pub struct PackageJson {
     /// `node_modules/.bin/`) plus any other read-`package.json`
     /// consumer (security analysis, lifecycle scripts, etc.).
     ///
-    /// The custom deserializer here keeps the simple `String`-valued
+    /// The manifest normalizer keeps the simple `String`-valued
     /// entries (which LPM CAN apply) and silently drops the
-    /// nested-object ones with a debug-level trace. When LPM's resolver
-    /// gains nested-override support, this can be promoted to a typed
-    /// `OverrideValue` enum and the readers updated. Until then,
-    /// "permissive parse + drop unsupported shapes" is the right
-    /// trade-off because it preserves the rest of the manifest's value.
-    #[serde(default, deserialize_with = "deserialize_lossy_string_map")]
+    /// nested-object ones. When LPM's resolver gains nested-override
+    /// support, this can be promoted to a typed `OverrideValue` enum
+    /// and the readers updated. Until then, "permissive parse + drop
+    /// unsupported shapes" is the right trade-off because it preserves
+    /// the rest of the manifest's value.
     pub overrides: HashMap<String, String>,
 
     /// Yarn-style resolutions (same purpose as overrides). Same
     /// lossy-string-map handling as `overrides`: yarn also supports
-    /// nested resolution objects, which we drop with a trace.
-    #[serde(default, deserialize_with = "deserialize_lossy_string_map")]
+    /// nested resolution objects, which we drop during normalization.
     pub resolutions: HashMap<String, String>,
 
-    #[serde(default)]
     pub workspaces: Option<WorkspacesConfig>,
 
     /// LPM-specific config section (decided: config goes in package.json "lpm" key).
-    #[serde(default)]
     pub lpm: Option<LpmConfig>,
 
     /// Engine version constraints (e.g., `{"node": ">=22.0.0"}`).
-    #[serde(default)]
     pub engines: HashMap<String, String>,
 
     /// Scripts defined in package.json (e.g., "build": "tsup", "dev": "vite dev").
-    #[serde(default)]
     pub scripts: HashMap<String, String>,
 
     /// Binary executables exposed by this package.
-    #[serde(default)]
     pub bin: Option<BinConfig>,
 
     /// Centralized version catalogs for monorepos.
@@ -139,7 +125,6 @@ pub struct PackageJson {
     ///   }
     /// }
     /// ```
-    #[serde(default)]
     pub catalogs: HashMap<String, HashMap<String, String>>,
 
     /// Captures the `pnpm` namespace from `package.json` as raw JSON.
@@ -151,8 +136,126 @@ pub struct PackageJson {
     /// — install-time warnings, `lpm doctor` checks, and structured
     /// migrate-time errors when the planner encounters a value LPM
     /// can't translate.
-    #[serde(default)]
     pub pnpm: Option<PnpmRaw>,
+}
+
+impl<'de> Deserialize<'de> for PackageJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        package_json_from_value(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn package_json_from_value(value: &serde_json::Value) -> Result<PackageJson, String> {
+    let Some(obj) = value.as_object() else {
+        return Err("expected package.json object".to_string());
+    };
+
+    Ok(PackageJson {
+        name: string_field(obj, "name"),
+        version: string_field(obj, "version"),
+        dependencies: lossy_string_map_from_value(obj.get("dependencies")),
+        dev_dependencies: lossy_string_map_from_value(obj.get("devDependencies")),
+        peer_dependencies: lossy_string_map_from_value(obj.get("peerDependencies")),
+        peer_dependencies_meta: peer_meta_map_from_value(obj.get("peerDependenciesMeta")),
+        optional_dependencies: lossy_string_map_from_value(obj.get("optionalDependencies")),
+        overrides: lossy_string_map_from_value(obj.get("overrides")),
+        resolutions: lossy_string_map_from_value(obj.get("resolutions")),
+        workspaces: optional_typed_field(obj, "workspaces")?,
+        lpm: optional_typed_field(obj, "lpm")?,
+        engines: lossy_string_map_from_value(obj.get("engines")),
+        scripts: lossy_string_map_from_value(obj.get("scripts")),
+        bin: obj.get("bin").and_then(bin_config_from_value),
+        catalogs: lossy_nested_string_map_from_value(obj.get("catalogs")),
+        pnpm: optional_typed_field(obj, "pnpm")?,
+    })
+}
+
+fn string_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    obj.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn optional_typed_field<T>(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<T>, String>
+where
+    T: DeserializeOwned,
+{
+    obj.get(key)
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|e| format!("failed to parse package.json field `{key}`: {e}"))
+        })
+        .transpose()
+}
+
+fn lossy_string_map_from_value(value: Option<&serde_json::Value>) -> HashMap<String, String> {
+    let Some(obj) = value.and_then(serde_json::Value::as_object) else {
+        return HashMap::new();
+    };
+
+    obj.iter()
+        .filter_map(|(key, value)| {
+            value
+                .as_str()
+                .map(|string| (key.clone(), string.to_string()))
+        })
+        .collect()
+}
+
+fn lossy_nested_string_map_from_value(
+    value: Option<&serde_json::Value>,
+) -> HashMap<String, HashMap<String, String>> {
+    let Some(obj) = value.and_then(serde_json::Value::as_object) else {
+        return HashMap::new();
+    };
+
+    obj.iter()
+        .filter_map(|(key, value)| {
+            let nested = value.as_object()?;
+            let map = nested
+                .iter()
+                .filter_map(|(entry_key, entry_value)| {
+                    entry_value
+                        .as_str()
+                        .map(|entry_value| (entry_key.clone(), entry_value.to_string()))
+                })
+                .collect();
+            Some((key.clone(), map))
+        })
+        .collect()
+}
+
+fn peer_meta_map_from_value(
+    value: Option<&serde_json::Value>,
+) -> HashMap<String, PeerDependencyMeta> {
+    let Some(obj) = value.and_then(serde_json::Value::as_object) else {
+        return HashMap::new();
+    };
+
+    obj.iter()
+        .filter_map(|(key, value)| {
+            serde_json::from_value(value.clone())
+                .ok()
+                .map(|meta| (key.clone(), meta))
+        })
+        .collect()
+}
+
+fn bin_config_from_value(value: &serde_json::Value) -> Option<BinConfig> {
+    if let Some(path) = value.as_str() {
+        return Some(BinConfig::Single(path.to_string()));
+    }
+
+    value
+        .as_object()
+        .map(|_| BinConfig::Map(lossy_string_map_from_value(Some(value))))
 }
 
 /// Per-peer metadata from `peerDependenciesMeta`.
@@ -706,57 +809,27 @@ fn preview(entries: &[String]) -> String {
     format!("{}, +{} more", head.join(", "), entries.len() - MAX)
 }
 
-/// Permissive `HashMap<String, String>` deserializer that accepts a
-/// JSON object with mixed string / non-string values, keeps only the
-/// `String`-valued entries, and silently drops the rest with a
-/// debug-level trace. Used for `package.json > overrides` and
-/// `package.json > resolutions` where the npm/yarn specs allow nested
-/// object values (e.g. `"path-scurry": {"lru-cache": "^11.3.5"}`) that
-/// LPM doesn't currently apply.
-///
-/// **Why drop instead of fail.** A transitive dep's `package.json` may
-/// contain override shapes LPM doesn't support; failing the whole parse
-/// blocks `lpm-linker::create_bin_links` (and every other consumer of
-/// `read_package_json`) for that dep. The lossy parse preserves the
-/// supported entries while letting the rest of the manifest be read.
-///
-/// Pinned by the rollup-plugins audit fixture: pre-fix, rollup's
-/// `"overrides": { "path-scurry": {"lru-cache": "^11.3.5"}, ... }` made
-/// `read_package_json` return `Err(parse error: invalid type: map,
-/// expected a string at line 246 column 19)`, which made the linker's
-/// bin-link step skip rollup, leaving `node_modules/.bin/rollup`
-/// unwritten and `rollup --version` failing.
-fn deserialize_lossy_string_map<'de, D>(
-    deserializer: D,
-) -> Result<HashMap<String, String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw: HashMap<String, serde_json::Value> = HashMap::deserialize(deserializer)?;
-    Ok(raw
-        .into_iter()
-        .filter_map(|(k, v)| match v {
-            serde_json::Value::String(s) => Some((k, s)),
-            // Non-string values (nested override objects) are silently
-            // dropped — LPM does not currently apply nested overrides,
-            // and erroring here would block the entire `read_package_json`
-            // call (used far more broadly than override application).
-            _ => None,
-        })
-        .collect())
-}
-
 /// The `"bin"` field in package.json can be a string or an object.
 ///
 /// - String form: `"bin": "./cli.js"` — name defaults to package name
 /// - Object form: `"bin": { "my-cmd": "./cli.js", "other": "./other.js" }`
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum BinConfig {
     /// Single binary: `"bin": "./cli.js"` — command name = package name.
     Single(String),
     /// Multiple binaries: `"bin": { "cmd": "./path.js" }`.
     Map(HashMap<String, String>),
+}
+
+impl<'de> Deserialize<'de> for BinConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        bin_config_from_value(&value)
+            .ok_or_else(|| serde::de::Error::custom("expected string or object for bin"))
+    }
 }
 
 impl BinConfig {
@@ -1828,10 +1901,9 @@ pub type PeerDepsResult = (HashMap<String, String>, HashMap<String, PeerDependen
 
 /// Read only `peerDependencies` and `peerDependenciesMeta` from a `package.json`.
 ///
-/// Uses a minimal deserialization struct — serde_json skips all other fields
-/// (dependencies, devDependencies, name, version, scripts, …) without allocating
-/// strings for their keys or values. Saves ~30-40 allocs per package on warm
-/// installs where `ensure_peer_context` reads every store object's manifest.
+/// Parses through `serde_json::Value` so duplicate keys and non-string
+/// peer-dependency values in third-party manifests don't reject the whole
+/// scan. Callers should byte-scan first when they are on hot paths.
 pub fn read_peer_dependencies(path: &Path) -> Result<PeerDepsResult, WorkspaceError> {
     let content = std::fs::read(path)
         .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
@@ -1846,36 +1918,29 @@ pub fn read_peer_dependencies(path: &Path) -> Result<PeerDepsResult, WorkspaceEr
 /// deps — the common case for the majority of packages in any install set.
 /// See `ensure_peer_context` in `lpm-linker` for the canonical call site.
 pub fn parse_peer_dependencies(content: &[u8]) -> Result<PeerDepsResult, WorkspaceError> {
-    #[derive(serde::Deserialize, Default)]
-    struct PeerDepsOnly {
-        #[serde(default, rename = "peerDependencies")]
-        peer_dependencies: HashMap<String, String>,
-        #[serde(default, rename = "peerDependenciesMeta")]
-        peer_dependencies_meta: HashMap<String, PeerDependencyMeta>,
-    }
-    let parsed: PeerDepsOnly = serde_json::from_slice(content)
+    let parsed: serde_json::Value = serde_json::from_slice(content)
         .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
-    Ok((parsed.peer_dependencies, parsed.peer_dependencies_meta))
+    let Some(obj) = parsed.as_object() else {
+        return Ok((HashMap::new(), HashMap::new()));
+    };
+    Ok((
+        lossy_string_map_from_value(obj.get("peerDependencies")),
+        peer_meta_map_from_value(obj.get("peerDependenciesMeta")),
+    ))
 }
 
 /// Parse only the `bin` field from already-read `package.json` bytes.
 ///
-/// Uses a one-field deserialization struct so serde_json skips every other
-/// field (`dependencies`, `scripts`, `peerDependencies`, …) without
-/// allocating strings for their keys or values. Callers that additionally
-/// byte-scan for `b"\"bin\""` before calling this can skip the parse
-/// entirely for packages that declare no binary — the common case.
+/// Parses through `serde_json::Value` so duplicate keys and non-string map
+/// entries in third-party manifests don't reject the whole scan. Callers that
+/// byte-scan for `b"\"bin\""` before calling this can skip the parse entirely
+/// for packages that declare no binary — the common case.
 ///
 /// See `create_bin_links_v2` in `lpm-linker` for the canonical call site.
 pub fn parse_bin_field(content: &[u8]) -> Result<Option<BinConfig>, WorkspaceError> {
-    #[derive(serde::Deserialize, Default)]
-    struct BinOnly {
-        #[serde(default)]
-        bin: Option<BinConfig>,
-    }
-    let parsed: BinOnly = serde_json::from_slice(content)
+    let parsed: serde_json::Value = serde_json::from_slice(content)
         .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
-    Ok(parsed.bin)
+    Ok(parsed.get("bin").and_then(bin_config_from_value))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2697,6 +2762,105 @@ mod tests {
         let entries = bin.entries(pkg.name.as_deref().unwrap());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "some-cli");
+    }
+
+    #[test]
+    fn read_package_json_tolerates_real_world_duplicate_maps_and_weird_values() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "weird-real-world-manifest",
+                "version": "1.0.0",
+                "dependencies": {
+                    "old-copy": "0.0.1"
+                },
+                "dependencies": {
+                    "react": "^19.0.0",
+                    "skip-boolean": false,
+                    "skip-object": {"nested": "1.0.0"}
+                },
+                "devDependencies": {
+                    "typescript": "5.9.2",
+                    "skip-number": 42
+                },
+                "peerDependencies": {
+                    "@types/node": ">=18",
+                    "skip-null": null
+                },
+                "optionalDependencies": {
+                    "fsevents": "^2.3.3",
+                    "skip-array": ["^1.0.0"]
+                },
+                "scripts": {
+                    "postinstall": "node setup.js",
+                    "skip-script": ["node", "setup.js"]
+                },
+                "engines": {
+                    "node": ">=18",
+                    "npm": 10
+                },
+                "types": ["./dist/index.d.ts"]
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json"))
+            .expect("weird but valid npm manifests must not fail the whole parse");
+
+        assert_eq!(pkg.dependencies.len(), 1);
+        assert_eq!(
+            pkg.dependencies.get("react").map(String::as_str),
+            Some("^19.0.0")
+        );
+        assert!(!pkg.dependencies.contains_key("old-copy"));
+        assert!(!pkg.dependencies.contains_key("skip-boolean"));
+        assert!(!pkg.dependencies.contains_key("skip-object"));
+        assert_eq!(
+            pkg.dev_dependencies.get("typescript").map(String::as_str),
+            Some("5.9.2")
+        );
+        assert!(!pkg.dev_dependencies.contains_key("skip-number"));
+        assert_eq!(
+            pkg.peer_dependencies.get("@types/node").map(String::as_str),
+            Some(">=18")
+        );
+        assert!(!pkg.peer_dependencies.contains_key("skip-null"));
+        assert_eq!(
+            pkg.optional_dependencies
+                .get("fsevents")
+                .map(String::as_str),
+            Some("^2.3.3")
+        );
+        assert!(!pkg.optional_dependencies.contains_key("skip-array"));
+        assert_eq!(
+            pkg.scripts.get("postinstall").map(String::as_str),
+            Some("node setup.js")
+        );
+        assert!(!pkg.scripts.contains_key("skip-script"));
+        assert_eq!(pkg.engines.get("node").map(String::as_str), Some(">=18"));
+        assert!(!pkg.engines.contains_key("npm"));
+    }
+
+    #[test]
+    fn read_package_json_preserves_empty_named_catalogs() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "empty-catalog-fixture",
+                "version": "1.0.0",
+                "catalogs": {
+                    "testing": {}
+                }
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let testing = pkg
+            .catalogs
+            .get("testing")
+            .expect("empty named catalog must still exist");
+        assert!(testing.is_empty());
     }
 
     /// Drift-guard: every code emitted by `manifest_compat_issues()`
@@ -5469,6 +5633,25 @@ mod peer_deps_parse_tests {
         let (deps, meta) = parse_peer_dependencies(json).unwrap();
         assert_eq!(deps.get("react").map(|s| s.as_str()), Some("^18.3.0"));
         assert!(!meta.get("react").unwrap().optional);
+    }
+
+    #[test]
+    fn parse_skips_non_string_peer_dependency_values() {
+        let json = br#"{
+            "name": "loose-peer-fixture",
+            "peerDependencies": {
+                "react": "^19.0.0",
+                "skip-bool": false,
+                "skip-object": {"range": "^1.0.0"}
+            },
+            "peerDependenciesMeta": {
+                "react": { "optional": true }
+            }
+        }"#;
+        let (deps, meta) = parse_peer_dependencies(json).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps.get("react").map(|s| s.as_str()), Some("^19.0.0"));
+        assert!(meta.get("react").unwrap().optional);
     }
 
     #[test]

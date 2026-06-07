@@ -91,6 +91,9 @@ jobs:
       - name: install.sh smoke tests
         run: sh tests/install-sh/run.sh
 
+      - name: Audit harness helper tests
+        run: bash bench/test-audit-install-args.sh
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -283,6 +286,7 @@ jobs:
         run: ./bench/audit-fixtures/run-all.sh
         env:
           LPM_NO_SKILLS: "1"
+          LPM_AUDIT_ALLOW_NEW: ${{ runner.os == 'Linux' && '1' || '' }}
           LPM_STORE_VERSION: ${{ matrix.store_version == 'v1' && 'v1' || '' }}
 
       # Always upload result JSONs — useful for triaging mode-asymmetric
@@ -346,6 +350,7 @@ jobs:
           # Mirror audit-fixtures' deterministic posture — `--no-skills`
           # avoids skills-auto-install variance.
           LPM_NO_SKILLS: "1"
+          LPM_AUDIT_ALLOW_NEW: "1"
 
       - name: Upload realworld result artifacts
         if: always()
@@ -406,6 +411,7 @@ jobs:
         run: ./bench/top-npm-audit/run-all.sh
         env:
           LPM_NO_SKILLS: "1"
+          LPM_AUDIT_ALLOW_NEW: "1"
           # Higher parallelism on CI — 8 slots gives us better utilization
           # than the default 4 without saturating the 2-core runner's
           # network or store contention.

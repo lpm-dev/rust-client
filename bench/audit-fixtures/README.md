@@ -22,6 +22,15 @@ real-world failure mode. Three risk buckets:
 ./run-all.sh
 ```
 
+The harness does not pass `--allow-new` by default. To run the CI-style
+cooldown-bypass posture locally, install the managed audit policy first
+and opt in explicitly:
+
+```bash
+sudo ./bench/install-audit-security-policy.sh
+LPM_AUDIT_ALLOW_NEW=1 ./bench/audit-fixtures/run-all.sh
+```
+
 Outputs land in `results/<fixture>-<mode>-<timestamp>.json`.
 
 Each result JSON also carries a typed `classification` for non-pass

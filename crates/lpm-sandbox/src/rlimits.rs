@@ -5,7 +5,11 @@
 //!
 //! Unix backends (landlock on Linux, seatbelt on macOS) install
 //! these via `setrlimit(2)` from inside the `pre_exec` closure —
-//! a single syscall per limit, async-signal-safe.
+//! a single syscall per limit, async-signal-safe. macOS deliberately
+//! skips `RLIMIT_NPROC`: XNU applies that limit to the user's already
+//! running process set, so lowering it inside the lifecycle child can
+//! make ordinary `sh -c "mkdir ..."` forks fail with `EAGAIN` on busy
+//! desktop sessions before the sandboxed script does anything risky.
 //!
 //! Windows applies the corresponding `JOB_OBJECT_LIMIT_*` flags
 //! on the job object; that path is wired in `windows.rs` rather
@@ -71,7 +75,8 @@ pub(crate) const MAX_OPEN_FILES: u64 = 4096;
 /// diagnostic than the wall-clock SIGKILL.
 pub(crate) const MAX_CPU_SECONDS: u64 = 600;
 
-/// User-wide process cap. See module-level note on Linux scope.
+/// Linux user-wide process cap. See module-level note on Linux scope.
+#[cfg(not(target_os = "macos"))]
 pub(crate) const MAX_PROCESSES: u64 = 4096;
 
 /// Per-process virtual-address-space cap. See the module-level
@@ -94,6 +99,7 @@ pub(crate) const MAX_ADDRESS_SPACE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// macOS) so the calls compile on both targets verbatim.
 #[inline]
 pub(crate) fn apply_resource_limits_as_safe() {
+    #[cfg(not(target_os = "macos"))]
     let cap_procs = libc::rlimit {
         rlim_cur: MAX_PROCESSES as libc::rlim_t,
         rlim_max: MAX_PROCESSES as libc::rlim_t,
@@ -113,6 +119,7 @@ pub(crate) fn apply_resource_limits_as_safe() {
     // SAFETY: passing a valid `rlimit` for a defined resource id.
     // Return values ignored — see fn doc.
     unsafe {
+        #[cfg(not(target_os = "macos"))]
         libc::setrlimit(libc::RLIMIT_NPROC, &cap_procs);
         libc::setrlimit(libc::RLIMIT_NOFILE, &cap_files);
         libc::setrlimit(libc::RLIMIT_CPU, &cap_cpu);
@@ -156,6 +163,7 @@ mod tests {
         // process count cap — a single fork-bombed process can
         // hold ~32 open fds, and we don't want fd exhaustion
         // to be the bottleneck before NPROC fires.
+        #[cfg(not(target_os = "macos"))]
         const _: () = assert!(MAX_OPEN_FILES >= MAX_PROCESSES);
     }
 
@@ -218,6 +226,50 @@ mod tests {
             code == Some(0) || code == Some(102),
             "child exited with unexpected status {code:?}; \
              pre_exec branch must complete without faulting"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apply_resource_limits_preserves_inherited_nproc_on_macos() {
+        use std::os::unix::process::CommandExt;
+
+        let mut inherited = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut inherited) };
+        assert_eq!(rc, 0, "parent must be able to read RLIMIT_NPROC");
+
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        unsafe {
+            cmd.pre_exec(move || {
+                apply_resource_limits_as_safe();
+                let mut observed = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NPROC, &mut observed) != 0 {
+                    libc::_exit(101);
+                }
+                if observed.rlim_cur == inherited.rlim_cur
+                    && observed.rlim_max == inherited.rlim_max
+                {
+                    libc::_exit(0);
+                }
+                libc::_exit(102);
+            });
+        }
+        let status = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn child");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "macOS sandbox setup must not lower user-wide RLIMIT_NPROC"
         );
     }
 }

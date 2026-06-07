@@ -29,6 +29,15 @@ cargo build --release -p lpm-cli
 LPM_TOP_NPM_PARALLEL=8 ./bench/top-npm-audit/run-all.sh
 ```
 
+Local runs do not pass `--allow-new` by default. To match CI's
+cooldown-bypass posture, install the managed audit policy first and opt
+in explicitly:
+
+```bash
+sudo ./bench/install-audit-security-policy.sh
+LPM_AUDIT_ALLOW_NEW=1 ./bench/top-npm-audit/run-all.sh
+```
+
 ## How it works
 
 1. **Generate** — `generate.sh` produces a `package.json` + `smoke.sh`
