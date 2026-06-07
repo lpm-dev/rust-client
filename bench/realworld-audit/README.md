@@ -23,6 +23,15 @@ cargo build --release -p lpm-cli
 ./bench/realworld-audit/run-all.sh next
 ```
 
+Local runs do not pass `--allow-new` by default. To match CI's
+cooldown-bypass posture, install the managed audit policy first and opt
+in explicitly:
+
+```bash
+sudo ./bench/install-audit-security-policy.sh
+LPM_AUDIT_ALLOW_NEW=1 ./bench/realworld-audit/run-all.sh
+```
+
 ## Layout
 
 ```
