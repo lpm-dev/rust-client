@@ -98,10 +98,74 @@ assert_run_install_includes_allow_new_when_opted_in() {
     grep -q '^install --allow-new --linker hoisted --json$' "$args"
 }
 
+assert_retryable_registry_failure_is_retried() {
+    local bin="$TMP_DIR/fake-lpm-retry"
+    local attempts="$TMP_DIR/retry-attempts.txt"
+    local out="$TMP_DIR/retry-install.json"
+    local err="$TMP_DIR/retry-install.log"
+
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'count=0' \
+        'if [[ -f "$LPM_TEST_ATTEMPTS_FILE" ]]; then count="$(cat "$LPM_TEST_ATTEMPTS_FILE")"; fi' \
+        'count=$((count + 1))' \
+        'printf "%s\n" "$count" > "$LPM_TEST_ATTEMPTS_FILE"' \
+        'if [[ "$count" -eq 1 ]]; then' \
+        '  printf "%s\n" "{\"success\":false,\"error\":\"registry error: HTTP 406: \"}"' \
+        '  exit 1' \
+        'fi' \
+        'printf "%s\n" "{\"success\":true}"' \
+        > "$bin"
+    chmod +x "$bin"
+
+    unset LPM_AUDIT_ALLOW_NEW
+    export LPM_AUDIT_INSTALL_RETRIES=2
+    export LPM_TEST_ATTEMPTS_FILE="$attempts"
+
+    lpm_audit_prepare_install_args > /dev/null
+    lpm_audit_run_install_with_retries "$bin" "$out" "$err" --linker hoisted --json 2>/dev/null
+
+    [[ "$(cat "$attempts")" == "2" ]]
+    grep -q '"success":true' "$out"
+}
+
+assert_non_retryable_failure_is_not_retried() {
+    local bin="$TMP_DIR/fake-lpm-no-retry"
+    local attempts="$TMP_DIR/no-retry-attempts.txt"
+    local out="$TMP_DIR/no-retry-install.json"
+    local err="$TMP_DIR/no-retry-install.log"
+
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'count=0' \
+        'if [[ -f "$LPM_TEST_ATTEMPTS_FILE" ]]; then count="$(cat "$LPM_TEST_ATTEMPTS_FILE")"; fi' \
+        'count=$((count + 1))' \
+        'printf "%s\n" "$count" > "$LPM_TEST_ATTEMPTS_FILE"' \
+        'printf "%s\n" "{\"success\":false,\"error\":\"manifest validation failed\"}"' \
+        'exit 1' \
+        > "$bin"
+    chmod +x "$bin"
+
+    unset LPM_AUDIT_ALLOW_NEW
+    export LPM_AUDIT_INSTALL_RETRIES=2
+    export LPM_TEST_ATTEMPTS_FILE="$attempts"
+
+    lpm_audit_prepare_install_args > /dev/null
+    if lpm_audit_run_install_with_retries "$bin" "$out" "$err" --linker isolated --json 2>/dev/null; then
+        echo "expected non-retryable install failure" >&2
+        exit 1
+    fi
+
+    [[ "$(cat "$attempts")" == "1" ]]
+    grep -q 'manifest validation failed' "$out"
+}
+
 assert_empty_default_args
 assert_allow_new_requires_policy
 assert_allow_new_adds_arg_with_policy
 assert_run_install_omits_allow_new_by_default
 assert_run_install_includes_allow_new_when_opted_in
+assert_retryable_registry_failure_is_retried
+assert_non_retryable_failure_is_not_retried
 
 echo "audit install arg helper tests passed"

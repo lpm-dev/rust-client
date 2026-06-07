@@ -230,7 +230,7 @@ run_mode() {
     local install_json="$work/.lpm-install.json"
     local s=$(now_ms)
     set +e
-    (cd "$work" && export LPM_HOME="$effective_lpm_home" && lpm_audit_run_install "$BIN" --linker "$mode" --json > "$install_json") 2> "$install_log"
+    (cd "$work" && export LPM_HOME="$effective_lpm_home" && lpm_audit_run_install_with_retries "$BIN" "$install_json" "$install_log" --linker "$mode" --json)
     local install_exit=$?
     set -e
     local e=$(now_ms)
