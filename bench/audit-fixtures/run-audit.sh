@@ -14,6 +14,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 FIXTURE_DIR="$HERE/$FIXTURE_REL"
 RESULTS_DIR="$HERE/results"
+source "$REPO_ROOT/bench/audit-install-args.sh"
 
 # confidence-followup — Windows portability.
 # On Git Bash (Windows-latest runner), the binary lands at
@@ -62,6 +63,7 @@ if ! command -v node &>/dev/null; then
     echo "ERROR: node not on PATH" >&2
     exit 2
 fi
+lpm_audit_prepare_install_args
 
 FIXTURE_NAME="$(echo "$FIXTURE_REL" | tr '/' '-')"
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -162,7 +164,7 @@ run_mode() {
     local install_json="$work/install.json"
     local s=$(now_ms)
     set +e
-    (cd "$work" && env LPM_HOME="$effective_lpm_home" "$BIN" install --allow-new --linker "$mode" --json > "$install_json") 2> "$install_log"
+    (cd "$work" && export LPM_HOME="$effective_lpm_home" && lpm_audit_run_install "$BIN" --linker "$mode" --json > "$install_json") 2> "$install_log"
     local install_exit=$?
     set -e
     local e=$(now_ms)

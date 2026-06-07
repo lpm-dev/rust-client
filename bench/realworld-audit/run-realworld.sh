@@ -20,6 +20,7 @@ CACHE_DIR="${LPM_REALWORLD_CACHE:-$HERE/.cache}"
 BIN="${LPM_BIN:-$REPO_ROOT/target/release/lpm-rs}"
 WORK_BASE="${LPM_REALWORLD_WORK_BASE:-/tmp/lpm-realworld-work}"
 MANIFEST="$HERE/projects.json"
+source "$REPO_ROOT/bench/audit-install-args.sh"
 # Per-smoke timeout (seconds). A real lpm bug surfaced as
 # vitepress@1.5 hanging forever on `--version` after install — pre-fix
 # that wedged a `run-all.sh` for 312 s before SIGKILL. Anything past
@@ -49,6 +50,7 @@ if ! command -v jq &>/dev/null; then
     echo "ERROR: jq not on PATH (manifest reader)" >&2
     exit 2
 fi
+lpm_audit_prepare_install_args
 
 # Pull the project's manifest entry.
 ENTRY=$(jq -e --arg n "$PROJECT_NAME" '.projects[] | select(.name == $n)' "$MANIFEST" 2>/dev/null || true)
@@ -228,7 +230,7 @@ run_mode() {
     local install_json="$work/.lpm-install.json"
     local s=$(now_ms)
     set +e
-    (cd "$work" && env LPM_HOME="$effective_lpm_home" "$BIN" install --allow-new --linker "$mode" --json > "$install_json") 2> "$install_log"
+    (cd "$work" && export LPM_HOME="$effective_lpm_home" && lpm_audit_run_install "$BIN" --linker "$mode" --json > "$install_json") 2> "$install_log"
     local install_exit=$?
     set -e
     local e=$(now_ms)

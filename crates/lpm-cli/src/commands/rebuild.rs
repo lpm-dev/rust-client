@@ -2047,20 +2047,11 @@ fn build_sanitized_env() -> HashMap<String, String> {
 
 /// Read lifecycle scripts from a package.json file.
 ///
-/// Trial 31: uses a minimal typed struct so serde_json skips all fields
-/// other than "scripts" without allocating strings for dependencies,
-/// devDependencies, etc. Adds a byte pre-scan so the parse is skipped
-/// entirely for packages that don't declare a "scripts" key — the common
-/// case for library packages.
+/// Uses a byte pre-scan so the parse is skipped entirely for packages
+/// that don't declare a "scripts" key — the common case for library
+/// packages. The JSON parse is intentionally tolerant of malformed
+/// non-script fields and non-string script values in published manifests.
 fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String>> {
-    // Minimal struct: serde_json skips every field except "scripts" via
-    // IgnoredAny, allocating no strings for deps, devDeps, engines, etc.
-    #[derive(serde::Deserialize, Default)]
-    struct ScriptsOnly {
-        #[serde(default)]
-        scripts: HashMap<String, String>,
-    }
-
     let content = std::fs::read(pkg_json_path).ok()?;
 
     // Fast byte pre-scan: if "scripts" never appears as a JSON key, the
@@ -2070,12 +2061,17 @@ fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String
         return None;
     }
 
-    let parsed: ScriptsOnly = serde_json::from_slice(&content).ok()?;
+    let parsed: serde_json::Value = serde_json::from_slice(&content).ok()?;
+    let scripts = parsed.get("scripts")?.as_object()?;
 
     let mut lifecycle = HashMap::new();
     for phase in EXECUTED_INSTALL_PHASES {
-        if let Some(cmd) = parsed.scripts.get(*phase).filter(|s| !s.is_empty()) {
-            lifecycle.insert((*phase).to_string(), cmd.clone());
+        if let Some(cmd) = scripts
+            .get(*phase)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            lifecycle.insert((*phase).to_string(), cmd.to_string());
         }
     }
 
@@ -3699,6 +3695,21 @@ mod tests {
         assert_eq!(scripts.get("postinstall").unwrap(), "node setup.js");
         // "test" is not a lifecycle script
         assert!(!scripts.contains_key("test"));
+    }
+
+    #[test]
+    fn reads_lifecycle_scripts_while_skipping_non_string_script_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_json = dir.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{"scripts":{"postinstall":"node setup.js","preinstall":["node","setup.js"],"install":false}}"#,
+        )
+        .unwrap();
+
+        let scripts = read_lifecycle_scripts(&pkg_json).unwrap();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts.get("postinstall").unwrap(), "node setup.js");
     }
 
     #[test]

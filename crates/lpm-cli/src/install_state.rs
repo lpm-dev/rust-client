@@ -525,10 +525,9 @@ pub fn check_install_state_with_linker(
         compute_install_hash_v6(pkg_content, &lock_content, &file_link_bytes, linker_mode);
 
     // Validate that package.json parses into the typed PackageJson struct —
-    // the same deserialization the full install path uses via read_package_json()
-    // at install.rs:447. A generic serde_json::Value check is NOT sufficient:
-    // it accepts semantically invalid shapes like {"dependencies":[]} that the
-    // typed parse correctly rejects (dependencies is HashMap<String, String>).
+    // the same deserialization the full install path uses via read_package_json().
+    // A generic serde_json::Value check is NOT sufficient: it accepts invalid
+    // LPM config values that the typed parse must still reject.
     //
     // The hash is still returned as Some so callers like dev.rs::needs_install()
     // know the file exists and can trigger a full install which surfaces the error.
@@ -1079,14 +1078,11 @@ mod tests {
     }
 
     #[test]
-    fn semantically_invalid_manifest_returns_not_up_to_date() {
-        // GPT audit round 2: {"dependencies":[]} is valid JSON but not a
-        // valid PackageJson (dependencies is HashMap<String,String>, not
-        // an array). The fast lane must reject this.
+    fn semantically_invalid_lpm_config_returns_not_up_to_date() {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         let _home = scoped_home_for(p);
-        let bad_shape = r#"{"dependencies":[]}"#;
+        let bad_shape = r#"{"lpm":{"catalogMode":"sometimes"}}"#;
         let lock = "lock-content";
         fs::write(p.join("package.json"), bad_shape).unwrap();
         fs::write(p.join("lpm.lock"), lock).unwrap();
@@ -1098,7 +1094,7 @@ mod tests {
         let state = check_install_state(p);
         assert!(
             !state.up_to_date,
-            "semantically invalid manifest must not be up to date"
+            "semantically invalid lpm config must not be up to date"
         );
         assert!(
             state.hash.is_some(),
