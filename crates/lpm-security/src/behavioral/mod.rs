@@ -200,29 +200,13 @@ fn analyze_single_file(file_path: &std::path::PathBuf) -> Option<FileAnalysisRes
 /// Pure function: no I/O, no allocations beyond the comment-stripped
 /// scratch buffer. Safe to call from any thread, no runtime needed.
 pub fn analyze_bytes(filename: &str, raw_content: &[u8]) -> FileAnalysisResult {
-    // Minified filename / content checks short-circuit the source scan —
-    // they're set-and-bail tags (no further per-file attribution).
-    if supply_chain::is_minified_filename(filename) || supply_chain::detect_minified(raw_content) {
-        return FileAnalysisResult {
-            source: SourceTags::default(),
-            supply_chain: SupplyChainTags {
-                minified: true,
-                ..Default::default()
-            },
-            url_domains: Vec::new(),
-            total_code_lines: 0,
-            total_export_count: 0,
-            files_scanned: 1,
-            bytes_scanned: raw_content.len() as u64,
-        };
-    }
-
     let mut comment_buf = Vec::with_capacity(raw_content.len());
     source::strip_comments(raw_content, &mut comment_buf);
     let stripped = String::from_utf8_lossy(&comment_buf);
 
     let file_source_tags = source::analyze_source(&stripped);
-    let file_supply_tags = supply_chain::analyze_supply_chain(&stripped, raw_content);
+    let mut file_supply_tags = supply_chain::analyze_supply_chain(&stripped, raw_content);
+    file_supply_tags.minified |= supply_chain::is_minified_filename(filename);
     let domains = supply_chain::extract_url_domains(&stripped);
     let trivial = supply_chain::analyze_trivial(&stripped);
 
@@ -891,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_minified_filenames() {
+    fn scans_minified_filenames() {
         let dir = tempfile::tempdir().unwrap();
         create_test_package(
             dir.path(),
@@ -904,8 +888,7 @@ mod tests {
 
         let analysis = analyze_package(dir.path());
         assert!(analysis.supply_chain.minified);
-        // eval in .min.js should NOT be detected (skip source analysis on minified)
-        assert!(!analysis.source.eval);
+        assert!(analysis.source.eval);
     }
 
     #[test]

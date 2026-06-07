@@ -1,4 +1,4 @@
-use crate::install_ui;
+use crate::{auth_storage_notice, install_ui};
 use lpm_common::LpmError;
 use std::path::Path;
 
@@ -7,8 +7,11 @@ use std::path::Path;
 /// SecretString round-trip would just leak immediately — this helper
 /// returns `Option<String>` to preserve the existing "skip auth on
 /// missing token" semantics without spreading `ExposeSecret` here.
-async fn resolve_lpm_bearer_optional(registry_url: &str) -> Option<String> {
-    let session = lpm_auth::SessionManager::new(registry_url, None);
+async fn resolve_lpm_bearer_optional(registry_url: &str, json_output: bool) -> Option<String> {
+    let session = auth_storage_notice::attach(
+        lpm_auth::SessionManager::new(registry_url, None),
+        json_output,
+    );
     session
         .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
         .await
@@ -118,7 +121,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
 
     // Step 2: Login with LPM token (HTTPS only — SPM refuses auth over HTTP)
     if is_https {
-        if let Some(token) = resolve_lpm_bearer_optional(registry_url).await {
+        if let Some(token) = resolve_lpm_bearer_optional(registry_url, json_output).await {
             if !json_output {
                 install_ui::phase("Configuring authentication");
             }
@@ -350,7 +353,7 @@ pub async fn ensure_configured(
     }
 
     // Step 2: Login (HTTPS only)
-    if is_https && let Some(token) = resolve_lpm_bearer_optional(registry_url).await {
+    if is_https && let Some(token) = resolve_lpm_bearer_optional(registry_url, json_output).await {
         let _ = tokio::process::Command::new("swift")
             .args([
                 "package-registry",

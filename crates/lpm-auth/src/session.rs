@@ -1,15 +1,14 @@
 //! `SessionManager` — lazy auth orchestrator.
 //!
 //! `SessionManager` is constructed once at CLI startup with **no
-//! network calls** (only local keychain / encrypted file reads). It
-//! classifies the effective token by source and refreshes lazily, only
-//! when an auth-required operation actually needs it, and only for
-//! refresh-backed stored sessions.
+//! network or keychain calls**. It classifies the effective token by
+//! source and refreshes lazily, only when an auth-required operation
+//! actually needs it, and only for refresh-backed stored sessions.
 
 use lpm_common::LpmError;
 use secrecy::{ExposeSecret, SecretString};
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -20,22 +19,23 @@ use crate::{
 /// Where the current effective token came from.
 ///
 /// Refresh eligibility, "session-required" semantics, and the user-facing
-/// re-login message all depend on this. Classification is determined
-/// once at `SessionManager::new` time and never changes for a given
-/// process — a refresh rotates the secret value but the source stays
-/// `StoredSession`.
+/// re-login message all depend on this. Eager classification is limited
+/// to env/flag sources at `SessionManager::new`; stored sources are
+/// classified on first use. A refresh rotates the secret value but the
+/// source stays `StoredSession`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenSource {
     /// Provided via `--token <value>` on the command line.
     ExplicitFlag,
     /// Read from the `LPM_TOKEN` environment variable.
     EnvVar,
-    /// Loaded from local storage with a refresh token alongside it.
-    /// This is the only source eligible for silent refresh.
+    /// Loaded from local storage and eligible to prove/use the refresh
+    /// token lazily. `SessionRequired` verifies refresh-token availability
+    /// before accepting this source.
     StoredSession,
-    /// Loaded from local storage without a refresh token (older login, or
-    /// a session whose refresh token was cleared). Cannot be silently
-    /// refreshed.
+    /// Loaded from local storage after refresh-token absence is confirmed
+    /// (older login, or a session whose refresh token was cleared). Cannot
+    /// be silently refreshed.
     StoredLegacy,
     /// Issued by a CI / OIDC token exchange. Never refreshed.
     CiToken,
@@ -97,6 +97,37 @@ pub enum AuthRequirement {
     SessionRequired,
 }
 
+/// Stored credential item that `SessionManager` is about to inspect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthStorageAccessKind {
+    /// Stored short-lived access token.
+    AccessToken,
+    /// Stored refresh token used for silent session rotation.
+    RefreshToken,
+}
+
+impl AuthStorageAccessKind {
+    /// Human notice text for macOS Keychain permission sheets.
+    pub fn macos_notice_message(self) -> &'static str {
+        match self {
+            AuthStorageAccessKind::AccessToken => {
+                "Checking stored LPM token; macOS may ask for permission. Choose Allow or Always Allow to continue."
+            }
+            AuthStorageAccessKind::RefreshToken => {
+                "Checking stored LPM refresh token; macOS may ask for permission. Choose Allow or Always Allow to continue."
+            }
+        }
+    }
+
+    #[inline]
+    fn notice_bit(self) -> u8 {
+        match self {
+            AuthStorageAccessKind::AccessToken => 0b0000_0001,
+            AuthStorageAccessKind::RefreshToken => 0b0000_0010,
+        }
+    }
+}
+
 /// Lazy session orchestrator — loaded once at startup, refreshed only
 /// when an auth-required operation actually needs it.
 pub struct SessionManager {
@@ -107,9 +138,10 @@ pub struct SessionManager {
     /// `true` once the keychain has been consulted (or
     /// skipped because env/flag already produced a token). Until this
     /// flips, reads that depend on the full classification must call
-    /// [`Self::ensure_classified`] first. The full classification
-    /// includes both the keychain and the refresh-only recovery
-    /// placeholder. Eager reads intended only for the startup bridge
+    /// [`Self::ensure_classified`] first. Stored access classification
+    /// deliberately defers refresh-token inspection; refresh-only recovery
+    /// still checks the refresh token when no access token exists. Eager
+    /// reads intended only for the startup bridge
     /// path (`current_bearer_for_bridge`) surface whatever's already
     /// cached without forcing classification, so the ~50 ms macOS
     /// Keychain IPC round-trip never runs on commands that don't
@@ -135,12 +167,35 @@ pub struct SessionManager {
     /// first refresh attempt (no startup cost when refresh never
     /// happens).
     http: tokio::sync::OnceCell<reqwest::Client>,
+    auth_storage_notice: Option<Arc<dyn Fn(AuthStorageAccessKind) + Send + Sync + 'static>>,
+    auth_storage_notice_bits: AtomicU8,
 }
 
 #[derive(Clone)]
 struct CachedToken {
     secret: SecretString,
     source: TokenSource,
+    refresh_state: RefreshState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshState {
+    NotRefreshable,
+    Unchecked,
+    Available,
+}
+
+impl RefreshState {
+    #[cfg(test)]
+    fn for_source(source: TokenSource) -> Self {
+        match source {
+            TokenSource::StoredSession => Self::Available,
+            TokenSource::ExplicitFlag
+            | TokenSource::EnvVar
+            | TokenSource::StoredLegacy
+            | TokenSource::CiToken => Self::NotRefreshable,
+        }
+    }
 }
 
 impl SessionManager {
@@ -171,6 +226,35 @@ impl SessionManager {
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
+            auth_storage_notice: None,
+            auth_storage_notice_bits: AtomicU8::new(0),
+        }
+    }
+
+    /// Register a callback that runs before stored auth material is read.
+    ///
+    /// The callback is de-duplicated per access/refresh credential kind for
+    /// this manager. It is intended for CLI surfaces that need to explain a
+    /// possible OS secure-storage prompt without making the auth crate depend
+    /// on terminal rendering.
+    pub fn with_auth_storage_access_notice(
+        mut self,
+        notice: impl Fn(AuthStorageAccessKind) + Send + Sync + 'static,
+    ) -> Self {
+        self.auth_storage_notice = Some(Arc::new(notice));
+        self
+    }
+
+    fn emit_auth_storage_notice(&self, kind: AuthStorageAccessKind) {
+        let bit = kind.notice_bit();
+        if self
+            .auth_storage_notice_bits
+            .fetch_or(bit, Ordering::AcqRel)
+            & bit
+            == 0
+            && let Some(notice) = &self.auth_storage_notice
+        {
+            notice(kind);
         }
     }
 
@@ -191,12 +275,50 @@ impl SessionManager {
         if self.classified.load(Ordering::Acquire) {
             return; // peer finished while we waited.
         }
-        if let Some(resolved) = classify_keychain_sources(&self.registry_url)
-            && let Ok(mut guard) = self.cached.write()
+        if let Some(resolved) = classify_keychain_sources(&self.registry_url, |kind| {
+            self.emit_auth_storage_notice(kind);
+        }) && let Ok(mut guard) = self.cached.write()
         {
             *guard = Some(resolved);
         }
         self.classified.store(true, Ordering::Release);
+    }
+
+    fn mark_refresh_available(&self) {
+        if let Ok(mut guard) = self.cached.write()
+            && let Some(cached) = guard.as_mut()
+            && cached.source == TokenSource::StoredSession
+        {
+            cached.refresh_state = RefreshState::Available;
+        }
+    }
+
+    fn mark_refresh_unavailable(&self) {
+        if let Ok(mut guard) = self.cached.write()
+            && let Some(cached) = guard.as_mut()
+            && cached.source == TokenSource::StoredSession
+        {
+            if cached.secret.expose_secret().is_empty() {
+                *guard = None;
+            } else {
+                cached.source = TokenSource::StoredLegacy;
+                cached.refresh_state = RefreshState::NotRefreshable;
+            }
+        }
+    }
+
+    fn load_refresh_token(&self) -> Result<String, LpmError> {
+        self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken);
+        match get_refresh_token(&self.registry_url) {
+            Some(refresh_token) => {
+                self.mark_refresh_available();
+                Ok(refresh_token)
+            }
+            None => {
+                self.mark_refresh_unavailable();
+                Err(LpmError::SessionExpired)
+            }
+        }
     }
 
     /// The registry URL this session is bound to.
@@ -378,10 +500,55 @@ impl SessionManager {
                 Some(secret) => Ok(Some(secret)),
                 None => Err(LpmError::AuthRequired),
             },
-            AuthRequirement::SessionRequired => match cached.and_then(session_only) {
-                Some(secret) => Ok(Some(secret)),
-                None => Err(LpmError::SessionExpired),
+            AuthRequirement::SessionRequired => match cached {
+                Some(cached)
+                    if cached.source.is_session_backed()
+                        && !cached.secret.expose_secret().is_empty() =>
+                {
+                    match cached.refresh_state {
+                        RefreshState::Available => Ok(Some(cached.secret)),
+                        RefreshState::Unchecked => {
+                            self.load_refresh_token()?;
+                            Ok(Some(cached.secret))
+                        }
+                        RefreshState::NotRefreshable => Err(LpmError::SessionExpired),
+                    }
+                }
+                Some(_) | None => Err(LpmError::SessionExpired),
             },
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_source_and_refresh_state(&self) -> Option<(TokenSource, RefreshState)> {
+        self.cached
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|c| (c.source, c.refresh_state)))
+    }
+
+    fn cached_non_empty_refreshable_secret(&self) -> Option<SecretString> {
+        self.cached.read().ok().and_then(|g| {
+            g.as_ref().and_then(|cached| {
+                if cached.source.refresh_policy() == RefreshPolicy::IfRefreshable
+                    && cached.refresh_state == RefreshState::Available
+                    && !cached.secret.expose_secret().is_empty()
+                {
+                    Some(cached.secret.clone())
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    fn cache_rotated_stored_session(&self, secret: SecretString) {
+        if let Ok(mut guard) = self.cached.write() {
+            *guard = Some(CachedToken {
+                secret,
+                source: TokenSource::StoredSession,
+                refresh_state: RefreshState::Available,
+            });
         }
     }
 
@@ -409,29 +576,22 @@ impl SessionManager {
         let _guard = self.refresh_lock.lock().await;
 
         if self.refresh_generation.load(Ordering::Acquire) != gen_before
-            && let Some(cached) = self.cached.read().ok().and_then(|g| g.clone())
-            && cached.source.refresh_policy() == RefreshPolicy::IfRefreshable
-            && !cached.secret.expose_secret().is_empty()
+            && let Some(secret) = self.cached_non_empty_refreshable_secret()
         {
-            return Ok(cached.secret);
+            return Ok(secret);
         }
 
         let new_token = self.do_silent_refresh().await?;
         let secret = SecretString::from(new_token.clone());
 
         // Persist + cache the rotated token. The source stays
-        // StoredSession — refresh rotates the secret, not the source.
+        // StoredSession because refresh rotates the secret, not the source.
         if let Err(e) = set_token(&self.registry_url, &new_token) {
             tracing::warn!(
                 "refreshed token obtained but failed to persist: {e}. Session may require re-login."
             );
         }
-        if let Ok(mut guard) = self.cached.write() {
-            *guard = Some(CachedToken {
-                secret: secret.clone(),
-                source: TokenSource::StoredSession,
-            });
-        }
+        self.cache_rotated_stored_session(secret.clone());
         self.refresh_generation.fetch_add(1, Ordering::AcqRel);
 
         Ok(secret)
@@ -451,8 +611,7 @@ impl SessionManager {
     /// Perform the HTTP silent-refresh round-trip. Called inside the
     /// single-flight lock; never called directly from outside.
     async fn do_silent_refresh(&self) -> Result<String, LpmError> {
-        let refresh_token =
-            get_refresh_token(&self.registry_url).ok_or(LpmError::SessionExpired)?;
+        let refresh_token = self.load_refresh_token()?;
 
         let device_fingerprint = compute_device_fingerprint();
         let refresh_url = format!("{}/api/cli/refresh", self.registry_url);
@@ -530,6 +689,7 @@ fn classify_eager_sources(explicit_flag_token: Option<String>) -> Option<CachedT
         return Some(CachedToken {
             secret: SecretString::from(tok),
             source: TokenSource::ExplicitFlag,
+            refresh_state: RefreshState::NotRefreshable,
         });
     }
 
@@ -544,6 +704,7 @@ fn classify_eager_sources(explicit_flag_token: Option<String>) -> Option<CachedT
         return Some(CachedToken {
             secret: SecretString::from(tok),
             source,
+            refresh_state: RefreshState::NotRefreshable,
         });
     }
 
@@ -556,21 +717,24 @@ fn classify_eager_sources(explicit_flag_token: Option<String>) -> Option<CachedT
 /// equivalent on Linux / Windows) which is the ~50 ms per-command
 /// tax we're amortizing away from startup.
 ///
-/// Preserves the refresh-only recovery placeholder from the original
-/// `classify_initial_token` — if only a refresh token is present
-/// (access token wiped, keychain reset, etc.), we seed an empty
-/// `StoredSession` placeholder so `refresh_now` can rotate it on the
-/// next auth-required request.
-fn classify_keychain_sources(registry_url: &str) -> Option<CachedToken> {
+/// Access-token classification deliberately does not inspect the refresh
+/// token. That keeps ordinary `AuthRequired` reads from touching two
+/// separate secure-storage items on macOS. Session-required and refresh
+/// paths prove refresh-token availability when they actually need it.
+///
+/// If only a refresh token is present (access token wiped, keychain
+/// reset, etc.), we still seed an empty `StoredSession` placeholder so
+/// `refresh_now` can rotate it on the next auth-required request.
+fn classify_keychain_sources(
+    registry_url: &str,
+    mut notice: impl FnMut(AuthStorageAccessKind),
+) -> Option<CachedToken> {
+    notice(AuthStorageAccessKind::AccessToken);
     if let Some(tok) = get_token(registry_url).filter(|t| !t.is_empty()) {
-        let source = if get_refresh_token(registry_url).is_some() {
-            TokenSource::StoredSession
-        } else {
-            TokenSource::StoredLegacy
-        };
         return Some(CachedToken {
             secret: SecretString::from(tok),
-            source,
+            source: TokenSource::StoredSession,
+            refresh_state: RefreshState::Unchecked,
         });
     }
 
@@ -586,10 +750,12 @@ fn classify_keychain_sources(registry_url: &str) -> Option<CachedToken> {
     // an `IfRefreshable` source and calls `refresh_now`, which reads
     // the refresh token from disk and exchanges it. The retry then
     // attaches the rotated access token.
+    notice(AuthStorageAccessKind::RefreshToken);
     if get_refresh_token(registry_url).is_some() {
         return Some(CachedToken {
             secret: SecretString::from(String::new()),
             source: TokenSource::StoredSession,
+            refresh_state: RefreshState::Available,
         });
     }
 
@@ -728,15 +894,6 @@ fn non_empty(c: CachedToken) -> Option<SecretString> {
     }
 }
 
-/// Filter `non_empty` plus `source.is_session_backed()`.
-fn session_only(c: CachedToken) -> Option<SecretString> {
-    if c.source.is_session_backed() && !c.secret.expose_secret().is_empty() {
-        Some(c.secret)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,12 +995,15 @@ mod tests {
             cached: RwLock::new(Some(CachedToken {
                 secret: SecretString::from(token.to_string()),
                 source,
+                refresh_state: RefreshState::for_source(source),
             })),
             classified: AtomicBool::new(true),
             classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
+            auth_storage_notice: None,
+            auth_storage_notice_bits: AtomicU8::new(0),
         }
     }
 
@@ -856,6 +1016,8 @@ mod tests {
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
+            auth_storage_notice: None,
+            auth_storage_notice_bits: AtomicU8::new(0),
         }
     }
 
@@ -1003,10 +1165,11 @@ mod tests {
     /// writes off the host.
     fn token_classify_isolate() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
         let tempdir = tempfile::tempdir().expect("create test home tempdir");
-        let scoped = crate::test_env::ScopedEnv::set([
-            ("HOME", tempdir.path().as_os_str().to_owned()),
-            ("LPM_FORCE_FILE_AUTH", "1".into()),
-            ("LPM_TEST_FAST_SCRYPT", "1".into()),
+        let scoped = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(tempdir.path().as_os_str().to_owned())),
+            ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+            ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
+            ("LPM_TOKEN", None),
         ]);
         (tempdir, scoped)
     }
@@ -1042,6 +1205,136 @@ mod tests {
         // Idempotent — a second call stays on the atomic-load fast path.
         let _ = mgr.current_bearer_lazy();
         assert!(mgr.classified.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn auth_storage_notice_emits_access_once_for_stored_access_bearer() {
+        let _env = token_classify_isolate();
+        let registry = "https://notice-access.invalid";
+        crate::set_token(registry, "stored-access").expect("access token should store");
+
+        let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&notices);
+        let mgr =
+            SessionManager::new(registry, None).with_auth_storage_access_notice(move |kind| {
+                captured.lock().unwrap().push(kind);
+            });
+
+        assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
+        assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
+        assert_eq!(
+            notices.lock().unwrap().as_slice(),
+            &[AuthStorageAccessKind::AccessToken],
+            "stored access reads should not warn for refresh unless refresh is needed"
+        );
+    }
+
+    #[test]
+    fn auth_storage_notice_emits_access_then_refresh_for_refresh_only_state() {
+        let _env = token_classify_isolate();
+        let registry = "https://notice-refresh-only.invalid";
+        crate::set_refresh_token(registry, "stored-refresh");
+
+        let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&notices);
+        let mgr =
+            SessionManager::new(registry, None).with_auth_storage_access_notice(move |kind| {
+                captured.lock().unwrap().push(kind);
+            });
+
+        assert_eq!(mgr.current_bearer_lazy(), None);
+        assert_eq!(
+            notices.lock().unwrap().as_slice(),
+            &[
+                AuthStorageAccessKind::AccessToken,
+                AuthStorageAccessKind::RefreshToken,
+            ],
+            "refresh-only recovery inspects access first, then refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_storage_notice_emits_refresh_once_for_session_required_check() {
+        let _env = token_classify_isolate();
+        let registry = "https://notice-session-required.invalid";
+        crate::set_token(registry, "stored-access").expect("access token should store");
+        crate::set_refresh_token(registry, "stored-refresh");
+
+        let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&notices);
+        let mgr =
+            SessionManager::new(registry, None).with_auth_storage_access_notice(move |kind| {
+                captured.lock().unwrap().push(kind);
+            });
+
+        assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
+        let first = mgr
+            .token_for(AuthRequirement::SessionRequired)
+            .await
+            .expect("stored refresh token should satisfy SessionRequired");
+        assert_eq!(first.unwrap().expose_secret(), "stored-access");
+        let second = mgr
+            .token_for(AuthRequirement::SessionRequired)
+            .await
+            .expect("confirmed refresh token should stay cached");
+        assert_eq!(second.unwrap().expose_secret(), "stored-access");
+
+        assert_eq!(
+            notices.lock().unwrap().as_slice(),
+            &[
+                AuthStorageAccessKind::AccessToken,
+                AuthStorageAccessKind::RefreshToken,
+            ],
+            "refresh-token notice should not repeat after the first read"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_access_bearer_defers_refresh_lookup_until_session_required() {
+        let _env = token_classify_isolate();
+        let registry = "https://defer-refresh.invalid";
+        crate::set_token(registry, "stored-access").expect("access token should store");
+
+        let mgr = SessionManager::new(registry, None);
+        assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
+        assert_eq!(
+            mgr.cached_source_and_refresh_state(),
+            Some((TokenSource::StoredSession, RefreshState::Unchecked)),
+            "ordinary bearer reads must not inspect the refresh token"
+        );
+
+        let result = mgr.token_for(AuthRequirement::SessionRequired).await;
+        assert!(matches!(result, Err(LpmError::SessionExpired)));
+        assert_eq!(
+            mgr.cached_source_and_refresh_state(),
+            Some((TokenSource::StoredLegacy, RefreshState::NotRefreshable)),
+            "session-required reads must downgrade stored access when no refresh token exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_required_confirms_refresh_for_stored_access_bearer() {
+        let _env = token_classify_isolate();
+        let registry = "https://confirm-refresh.invalid";
+        crate::set_token(registry, "stored-access").expect("access token should store");
+        crate::set_refresh_token(registry, "stored-refresh");
+
+        let mgr = SessionManager::new(registry, None);
+        assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
+        assert_eq!(
+            mgr.cached_source_and_refresh_state(),
+            Some((TokenSource::StoredSession, RefreshState::Unchecked))
+        );
+
+        let result = mgr
+            .token_for(AuthRequirement::SessionRequired)
+            .await
+            .expect("stored refresh token should satisfy SessionRequired");
+        assert_eq!(result.unwrap().expose_secret(), "stored-access");
+        assert_eq!(
+            mgr.cached_source_and_refresh_state(),
+            Some((TokenSource::StoredSession, RefreshState::Available))
+        );
     }
 
     #[test]
@@ -1176,12 +1469,15 @@ mod refresh_http_tests {
             cached: RwLock::new(Some(CachedToken {
                 secret: SecretString::from("at-stale".to_string()),
                 source: TokenSource::StoredSession,
+                refresh_state: RefreshState::Available,
             })),
             classified: AtomicBool::new(true),
             classify_lock: std::sync::Mutex::new(()),
             refresh_generation: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: tokio::sync::OnceCell::new(),
+            auth_storage_notice: None,
+            auth_storage_notice_bits: AtomicU8::new(0),
         }
     }
 

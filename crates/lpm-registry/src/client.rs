@@ -2838,13 +2838,13 @@ impl RegistryClient {
         Ok(response)
     }
 
-    /// File-spool tarball download with `.npmrc` Custom-route auth.
+    /// File-spool tarball download with route-appropriate auth.
     ///
-    /// Custom-route destinations (private/corp registries declared in
-    /// `.npmrc`) ride the auth-aware download so the npmrc credential
-    /// reaches the destination origin and the LPM session bearer is NOT
-    /// leaked. All other routes (LpmWorker, NpmDirect) use the no-auth
-    /// method.
+    /// Custom-route destinations attach their `.npmrc` credential when
+    /// one matches the tarball origin. `@lpm.dev/*` packages keep the
+    /// LPM session bearer. Public npm tarballs, including npm packages
+    /// whose metadata came through the Worker proxy, go anonymous so the
+    /// LPM session bearer is not sent cross-origin.
     ///
     /// File-spool variant — bounded memory via
     /// [`MAX_COMPRESSED_TARBALL_SIZE`] (500 MB). The streaming sibling
@@ -2856,34 +2856,41 @@ impl RegistryClient {
         name: &str,
         url: &str,
     ) -> Result<DownloadedTarball, LpmError> {
-        if matches!(
-            route_table.route_for_package(name),
-            crate::route::UpstreamRoute::Custom { .. }
-        ) {
-            let auth = route_table.auth_for_url(url);
-            self.download_tarball_to_file_with_auth(url, auth).await
-        } else {
-            self.download_tarball_to_file(url).await
+        match route_table.route_for_package(name) {
+            crate::route::UpstreamRoute::Custom { .. } => {
+                let auth = route_table.auth_for_url(url);
+                self.download_tarball_to_file_with_auth(url, auth).await
+            }
+            crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
+                self.download_tarball_to_file(url).await
+            }
+            crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
+                self.download_tarball_to_file_with_auth(url, None).await
+            }
         }
     }
 
-    /// Streaming variant of [`Self::download_tarball_routed`]. Same
-    /// Custom-vs-non-Custom split.
+    fn ensure_configured_tarball_origin(&self, url: &str) -> Result<(), LpmError> {
+        if self.is_configured_origin(url) {
+            Ok(())
+        } else {
+            Err(LpmError::Registry(format!(
+                "tarball URL refused — fresh dist.tarball origin is not in the configured \
+                 set (likely poisoned mirror or metadata tamper): {url}"
+            )))
+        }
+    }
+
+    /// Streaming variant of [`Self::download_tarball_routed`].
     ///
-    /// M66: for the non-Custom path (LpmWorker / NpmDirect), the
-    /// fresh `dist.tarball` URL's origin is verified against
-    /// `is_configured_origin` before the body is read. Pre-fix, no
-    /// origin gate applied to fresh URLs — a freshly-fetched metadata
-    /// response from a compromised mirror could point `dist.tarball`
-    /// at `https://evil.cdn/<pkg>.tgz` and pass the pipeline-level
-    /// scheme check unchallenged. The shape check (`/-/` + `.tgz`)
-    /// that `evaluate_cached_url` applies to LOCKFILE-cached URLs is
-    /// intentionally NOT applied here: a fresh packument from the
+    /// For the non-Custom path, the fresh `dist.tarball` URL's origin
+    /// is verified against `is_configured_origin` before the body is
+    /// read. The shape check (`/-/` + `.tgz`) that
+    /// `evaluate_cached_url` applies to lockfile-cached URLs is
+    /// intentionally not applied here: a fresh packument from the
     /// configured registry is allowed to use any path shape the
-    /// registry serves (some private registries and test mocks use
-    /// flat `/tarballs/<name>-<ver>.tgz` instead of npm's canonical
-    /// `/<pkg>/-/<pkg>-<ver>.tgz`). The origin check alone defends
-    /// against the M66 mirror-redirect shape.
+    /// registry serves. The origin check alone prevents a compromised
+    /// mirror from redirecting the tarball to an unrelated host.
     ///
     /// The Custom route path is exempt because its npmrc-declared
     /// target origin is intentionally outside the `(base_url,
@@ -2896,20 +2903,19 @@ impl RegistryClient {
         name: &str,
         url: &str,
     ) -> Result<reqwest::Response, LpmError> {
-        if matches!(
-            route_table.route_for_package(name),
-            crate::route::UpstreamRoute::Custom { .. }
-        ) {
-            let auth = route_table.auth_for_url(url);
-            self.download_tarball_streaming_with_auth(url, auth).await
-        } else {
-            if !self.is_configured_origin(url) {
-                return Err(LpmError::Registry(format!(
-                    "tarball URL refused — fresh dist.tarball origin is not in the configured \
-                     set (likely poisoned mirror or metadata tamper): {url}"
-                )));
+        match route_table.route_for_package(name) {
+            crate::route::UpstreamRoute::Custom { .. } => {
+                let auth = route_table.auth_for_url(url);
+                self.download_tarball_streaming_with_auth(url, auth).await
             }
-            self.download_tarball_streaming(url).await
+            crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
+                self.ensure_configured_tarball_origin(url)?;
+                self.download_tarball_streaming(url).await
+            }
+            crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
+                self.ensure_configured_tarball_origin(url)?;
+                self.download_tarball_streaming_with_auth(url, None).await
+            }
         }
     }
 
@@ -3981,10 +3987,9 @@ impl RegistryClient {
     /// 3. On refresh success, run `op()` again.
     /// 4. On refresh failure, return `LpmError::SessionExpired`.
     ///
-    /// Never loops. Never refreshes for explicit/env/CI/legacy/
-    /// non-session sources. The fuse on `provider.rs::batch_disabled`
-    /// only ever sees post-recovery 401s — transient 401s are absorbed
-    /// here.
+    /// Never loops. Never refreshes for explicit/env/CI/confirmed-legacy
+    /// sources. The fuse on `provider.rs::batch_disabled` only ever sees
+    /// post-recovery 401s — transient 401s are absorbed here.
     ///
     /// **Why both proactive AND reactive?** The reactive pass alone
     /// requires the server to return 401 to trigger refresh. Mock
@@ -4614,6 +4619,22 @@ fn parse_cached_metadata_blob(content: &[u8]) -> Option<(&[u8], &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct AuthorizationRecorder {
+        saw_authorization: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        body: Vec<u8>,
+    }
+
+    impl wiremock::Respond for AuthorizationRecorder {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            if request.headers.get("authorization").is_some() {
+                self.saw_authorization
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            wiremock::ResponseTemplate::new(200).set_body_bytes(self.body.clone())
+        }
+    }
 
     #[test]
     fn backoff_delay_exponential() {
@@ -9273,6 +9294,125 @@ mod tests {
             .download_tarball_to_file_with_auth(&url, None)
             .await
             .expect("anonymous download must succeed");
+    }
+
+    #[tokio::test]
+    async fn routed_npm_tarball_download_does_not_attach_lpm_bearer() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        let saw_authorization = Arc::new(AtomicBool::new(false));
+
+        Mock::given(method("GET"))
+            .and(path("/foo/-/foo-1.0.0.tgz"))
+            .respond_with(AuthorizationRecorder {
+                saw_authorization: Arc::clone(&saw_authorization),
+                body: b"fake-routed-tarball".to_vec(),
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut client = RegistryClient::new()
+            .with_base_url("https://lpm.dev")
+            .with_npm_registry_url(server.uri())
+            .with_token("LPM-SESSION-BEARER");
+        client.cache_dir = Some(tmp.path().to_path_buf());
+        let route_table = crate::route::RouteTable::from_mode_only(crate::route::RouteMode::Direct);
+        let url = format!("{}/foo/-/foo-1.0.0.tgz", server.uri());
+
+        let downloaded = client
+            .download_tarball_routed(&route_table, "foo", &url)
+            .await
+            .expect("routed npm tarball download should succeed anonymously");
+
+        assert_eq!(downloaded.compressed_size, 19);
+        assert!(
+            !saw_authorization.load(Ordering::SeqCst),
+            "routed npm tarballs must not receive the LPM session bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_npm_tarball_streaming_does_not_attach_lpm_bearer() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let server = MockServer::start().await;
+        let saw_authorization = Arc::new(AtomicBool::new(false));
+
+        Mock::given(method("GET"))
+            .and(path("/foo/-/foo-1.0.0.tgz"))
+            .respond_with(AuthorizationRecorder {
+                saw_authorization: Arc::clone(&saw_authorization),
+                body: b"fake-streamed-tarball".to_vec(),
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut client = RegistryClient::new()
+            .with_base_url("https://lpm.dev")
+            .with_npm_registry_url(server.uri())
+            .with_token("LPM-SESSION-BEARER");
+        client.cache_dir = Some(tmp.path().to_path_buf());
+        let route_table = crate::route::RouteTable::from_mode_only(crate::route::RouteMode::Direct);
+        let url = format!("{}/foo/-/foo-1.0.0.tgz", server.uri());
+
+        let response = client
+            .download_tarball_streaming_routed(&route_table, "foo", &url)
+            .await
+            .expect("routed npm streaming tarball download should succeed anonymously");
+        let body = response.bytes().await.expect("stream body should read");
+
+        assert_eq!(body.as_ref(), b"fake-streamed-tarball");
+        assert!(
+            !saw_authorization.load(Ordering::SeqCst),
+            "routed npm streaming tarballs must not receive the LPM session bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_lpm_tarball_download_keeps_lpm_bearer() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/lpm-tarball.tgz"))
+            .and(header("authorization", "Bearer LPM-SESSION-BEARER"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-lpm-tarball"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut client = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_npm_registry_url("https://registry.npmjs.org")
+            .with_token("LPM-SESSION-BEARER");
+        client.cache_dir = Some(tmp.path().to_path_buf());
+        let route_table = crate::route::RouteTable::from_mode_only(crate::route::RouteMode::Direct);
+        let url = format!("{}/lpm-tarball.tgz", server.uri());
+
+        let downloaded = client
+            .download_tarball_routed(&route_table, "@lpm.dev/acme.pkg", &url)
+            .await
+            .expect("routed LPM tarball download should carry the LPM bearer");
+
+        assert_eq!(downloaded.compressed_size, 16);
     }
 
     #[tokio::test]

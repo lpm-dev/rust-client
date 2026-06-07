@@ -1,4 +1,4 @@
-use crate::{install_ui, oidc};
+use crate::{auth_storage_notice, install_ui, oidc};
 use lpm_common::LpmError;
 use std::path::Path;
 
@@ -9,8 +9,14 @@ fn hint_line(message: &str) {
 /// resolve a usable LPM bearer for CI/CD `.npmrc` generation.
 /// `setup ci` is best-effort — when no token is available it falls
 /// back to the `${LPM_TOKEN}` placeholder so CI can interpolate at runtime.
-async fn resolve_lpm_bearer_optional(registry_url: &str) -> Option<ResolvedSetupBearer> {
-    let session = lpm_auth::SessionManager::new(registry_url, None);
+async fn resolve_lpm_bearer_optional(
+    registry_url: &str,
+    json_output: bool,
+) -> Option<ResolvedSetupBearer> {
+    let session = auth_storage_notice::attach(
+        lpm_auth::SessionManager::new(registry_url, None),
+        json_output,
+    );
     let token = session
         .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
         .await
@@ -74,11 +80,11 @@ pub async fn run(
                     install_ui::warn(&format!("OIDC token exchange failed: {e}"));
                     install_ui::warn("Falling back to stored token / ${LPM_TOKEN} placeholder.");
                 }
-                resolve_lpm_bearer_optional(registry_url).await
+                resolve_lpm_bearer_optional(registry_url, json_output).await
             }
         }
     } else {
-        resolve_lpm_bearer_optional(registry_url).await
+        resolve_lpm_bearer_optional(registry_url, json_output).await
     };
 
     let token_placeholder = token
