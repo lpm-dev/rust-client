@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod added_sources_state;
 mod auth;
+mod auth_storage_notice;
 pub mod build_state;
 pub mod capability;
 mod color_policy;
@@ -3369,10 +3370,10 @@ async fn async_main() -> Result<()> {
         .token
         .clone()
         .filter(|t| std::env::var("LPM_TOKEN").ok().as_deref() != Some(t.as_str()));
-    let session = std::sync::Arc::new(lpm_auth::SessionManager::new(
-        registry_url.to_string(),
-        explicit_flag_token,
-    ));
+    let session_manager =
+        lpm_auth::SessionManager::new(registry_url.to_string(), explicit_flag_token);
+    let session_manager = auth_storage_notice::attach(session_manager, cli.json);
+    let session = std::sync::Arc::new(session_manager);
 
     let mut client = lpm_registry::RegistryClient::new()
         .with_base_url(registry_url.to_string())

@@ -42,7 +42,8 @@ use security_framework::passwords::{
 
 mod session;
 pub use session::{
-    AuthRequirement, RefreshPolicy, SessionManager, TokenSource, compute_device_fingerprint,
+    AuthRequirement, AuthStorageAccessKind, RefreshPolicy, SessionManager, TokenSource,
+    compute_device_fingerprint,
 };
 
 /// Keychain service name (matches JS CLI).

@@ -85,7 +85,7 @@ fn obfuscation_patterns() -> &'static RegexSet {
 /// Obfuscation confidence score (0.0–1.0).
 ///
 /// Replaces the old boolean `detect_obfuscation` with a graduated score
-/// that accounts for signal density and minification context:
+/// that accounts for signal density:
 ///
 /// - **< 0.3** — not flagged (legitimate minified/compiled code)
 /// - **0.3–0.7** — flagged as info (possible obfuscation, likely compiled output)
@@ -94,7 +94,7 @@ fn obfuscation_patterns() -> &'static RegexSet {
 /// Factors:
 /// - Signal density (per 1000 lines) instead of raw counts
 /// - Dispatcher pattern presence (array + rotation + indexed access)
-/// - File is minified → signals suppressed (minified code naturally has short vars)
+/// - File is minified → density thresholds are higher, but obfuscation is not suppressed
 /// - Number of distinct signal types (2+ required)
 pub fn obfuscation_confidence(stripped: &str, is_minified: bool) -> f64 {
     let patterns = obfuscation_patterns();
@@ -159,12 +159,6 @@ pub fn obfuscation_confidence(stripped: &str, is_minified: bool) -> f64 {
     // Require 2+ independent signal types (same as before, but graduated)
     if signal_types < 2 && !has_dispatcher {
         return 0.0;
-    }
-
-    // Minified files get a penalty — obfuscation signals in minified code
-    // are much more likely to be false positives from UglifyJS/Terser
-    if is_minified {
-        score *= 0.4;
     }
 
     score.min(1.0)
@@ -818,25 +812,23 @@ mod tests {
     // ── Obfuscation confidence scoring ──────────────────────────
 
     #[test]
-    fn minified_file_suppresses_obfuscation() {
-        // This pattern would trigger obfuscation in a normal file,
-        // but should be suppressed when the file is minified.
+    fn minified_file_does_not_suppress_obfuscation() {
+        // Minification raises density thresholds for noisy signals, but strong
+        // obfuscation patterns must still be visible to the scanner.
         let code = r#"
             var _0x1a2b = "\x48\x65\x6c\x6c\x6f\x20\x57\x6f\x72\x6c\x64";
             var _0x3c4d = _0x1a2b;
         "#;
-        // Normal: should detect as obfuscated
         let normal_conf = obfuscation_confidence(code, false);
         assert!(
             normal_conf > 0.3,
             "non-minified should detect obfuscation, got {normal_conf}"
         );
 
-        // Minified: should have lower confidence (suppressed)
         let minified_conf = obfuscation_confidence(code, true);
         assert!(
-            minified_conf < normal_conf,
-            "minified confidence ({minified_conf}) should be lower than normal ({normal_conf})"
+            minified_conf > 0.3,
+            "minified confidence ({minified_conf}) should still detect obfuscation"
         );
     }
 
