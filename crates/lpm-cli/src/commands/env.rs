@@ -1,4 +1,4 @@
-use crate::{install_ui, output};
+use crate::{auth_storage_notice, install_ui, output};
 use futures::StreamExt;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
@@ -199,8 +199,11 @@ fn build_push_schema_value(
 /// see the persisted rotated token, so constructing per-call instead of
 /// threading a shared session is behaviorally equivalent for env's
 /// single-shot usage pattern.
-async fn resolve_lpm_bearer(registry_url: &str) -> Result<String, LpmError> {
-    let session = lpm_auth::SessionManager::new(registry_url, None);
+async fn resolve_lpm_bearer(registry_url: &str, json_output: bool) -> Result<String, LpmError> {
+    let session = auth_storage_notice::attach(
+        lpm_auth::SessionManager::new(registry_url, None),
+        json_output,
+    );
     session
         .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
         .await
@@ -217,8 +220,11 @@ async fn resolve_lpm_bearer(registry_url: &str) -> Result<String, LpmError> {
 ///   `resolve_lpm_bearer`.
 /// - **Has a non-session token** (`LPM_TOKEN` / `--token` / CI /
 ///   legacy stored): the upgrade-to-session message.
-async fn resolve_session_bearer(registry_url: &str) -> Result<String, LpmError> {
-    let session = lpm_auth::SessionManager::new(registry_url, None);
+async fn resolve_session_bearer(registry_url: &str, json_output: bool) -> Result<String, LpmError> {
+    let session = auth_storage_notice::attach(
+        lpm_auth::SessionManager::new(registry_url, None),
+        json_output,
+    );
     let has_any_source = session.current_source().is_some();
     session
         .bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
@@ -713,7 +719,7 @@ pub async fn run(
             }
 
             let registry_url = lpm_common::resolve_lpm_registry_url();
-            let auth_token = resolve_lpm_bearer(&registry_url).await?;
+            let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
             output::info("pushing vault to cloud...");
 
@@ -785,7 +791,7 @@ pub async fn run(
             // Org pull: different flow with X25519 decryption
             if let Some(org_slug) = org_flag {
                 let registry_url = lpm_common::resolve_lpm_registry_url();
-                let auth_token = resolve_lpm_bearer(&registry_url).await?;
+                let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
                 // Classify the sharing-key state before fetching the
                 // wrapped vault. RotationRequired refuses silent
@@ -890,7 +896,7 @@ pub async fn run(
             }
 
             let registry_url = lpm_common::resolve_lpm_registry_url();
-            let auth_token = resolve_lpm_bearer(&registry_url).await?;
+            let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
             output::info("pulling vault from cloud...");
 
@@ -933,7 +939,7 @@ pub async fn run(
                 .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
             let registry_url = lpm_common::resolve_lpm_registry_url();
-            let auth_token = resolve_lpm_bearer(&registry_url).await?;
+            let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
             let result =
                 lpm_vault::sync::get_audit_log(&registry_url, &auth_token, &vault_id, None)
@@ -995,7 +1001,7 @@ pub async fn run(
             }
 
             let registry_url = lpm_common::resolve_lpm_registry_url();
-            let auth_token = resolve_lpm_bearer(&registry_url).await?;
+            let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
             // Classify the sharing-key state before any wrap work. This
             // refuses the silent-overwrite path on RotationRequired and
@@ -1069,7 +1075,7 @@ pub async fn run(
                 .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
             let registry_url = lpm_common::resolve_lpm_registry_url();
-            let auth_token = resolve_lpm_bearer(&registry_url).await?;
+            let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
             let secrets = lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
             if secrets.is_empty() {
@@ -1186,7 +1192,7 @@ pub async fn run(
             // `SessionRequired` posture rejects `LPM_TOKEN`/`--token`/
             // CI/legacy tokens with the same message the old
             // `has_refresh_token` check produced.
-            let auth_token = resolve_session_bearer(&registry_url).await?;
+            let auth_token = resolve_session_bearer(&registry_url, json_output).await?;
 
             // Refuse a non-interactive pair without --yes BEFORE touching
             // the registry — a curl-piped-to-sh phishing payload should not
@@ -1274,7 +1280,7 @@ pub async fn run(
             let registry_url = lpm_common::resolve_lpm_registry_url();
             // Unpair revokes browser pairings — same session-backed
             // requirement as `pair`.
-            let auth_token = resolve_session_bearer(&registry_url).await?;
+            let auth_token = resolve_session_bearer(&registry_url, json_output).await?;
 
             output::info("revoking all browser pairings...");
 
@@ -2121,9 +2127,9 @@ fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Result<(), Lp
 // ─── Platform Sync (Tier 4B) ──────────────────────────────────────
 
 /// Get the LPM auth token and registry URL for API calls.
-async fn get_platform_auth() -> Result<(String, String), LpmError> {
+async fn get_platform_auth(json_output: bool) -> Result<(String, String), LpmError> {
     let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = resolve_lpm_bearer(&registry_url).await?;
+    let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
     Ok((registry_url, auth_token))
 }
 
@@ -2142,7 +2148,7 @@ async fn vars_connect(
     let platform = args[0];
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
-    let (registry_url, auth_token) = get_platform_auth().await?;
+    let (registry_url, auth_token) = get_platform_auth(json_output).await?;
 
     // Parse flags
     let mut project_id: Option<&str> = None;
@@ -2286,7 +2292,7 @@ async fn vars_platform_push(
 ) -> Result<(), LpmError> {
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured. Run `lpm env set` first".into()))?;
-    let (registry_url, auth_token) = get_platform_auth().await?;
+    let (registry_url, auth_token) = get_platform_auth(json_output).await?;
 
     // Parse flags
     let mut platform: Option<&str> = None;
@@ -2518,7 +2524,7 @@ async fn vars_platform_status(
 ) -> Result<(), LpmError> {
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured. Run `lpm env set` first".into()))?;
-    let (registry_url, auth_token) = get_platform_auth().await?;
+    let (registry_url, auth_token) = get_platform_auth(json_output).await?;
 
     // Load default env vars (backward compat)
     let default_vars = lpm_runner::dotenv::load_project_env(project_dir, None)?;
@@ -2733,7 +2739,7 @@ async fn vars_oidc_allow(
 ) -> Result<(), LpmError> {
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
-    let (registry_url, auth_token) = get_platform_auth().await?;
+    let (registry_url, auth_token) = get_platform_auth(json_output).await?;
 
     let mut provider = "github";
     let mut repo: Option<&str> = None;
@@ -2937,7 +2943,7 @@ async fn vars_oidc_allow(
 async fn vars_oidc_list(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
-    let (registry_url, auth_token) = get_platform_auth().await?;
+    let (registry_url, auth_token) = get_platform_auth(json_output).await?;
 
     let client = reqwest::Client::new();
     let response = client
@@ -3308,7 +3314,7 @@ async fn vars_platform_pull(
 ) -> Result<(), LpmError> {
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
-    let (registry_url, auth_token) = get_platform_auth().await?;
+    let (registry_url, auth_token) = get_platform_auth(json_output).await?;
 
     // Parse flags
     let mut platform: Option<&str> = None;
@@ -3521,7 +3527,7 @@ fn vars_list(
 /// List cloud vaults — personal or org.
 async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(), LpmError> {
     let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = resolve_lpm_bearer(&registry_url).await?;
+    let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
     if let Some(slug) = org_slug {
         // List org vaults
@@ -3665,7 +3671,7 @@ async fn vars_diff(
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
         let registry_url = lpm_common::resolve_lpm_registry_url();
-        let auth_token = resolve_lpm_bearer(&registry_url).await?;
+        let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
         let (remote, _version) =
             lpm_vault::sync::pull_env(&registry_url, &auth_token, &vault_id, &resolved.canonical)
@@ -3685,7 +3691,7 @@ async fn vars_diff(
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
         let registry_url = lpm_common::resolve_lpm_registry_url();
-        let auth_token = resolve_lpm_bearer(&registry_url).await?;
+        let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
         let (remote, _version) = lpm_vault::sync::pull(&registry_url, &auth_token, &vault_id)
             .await
@@ -3894,7 +3900,7 @@ async fn env_rotate_sharing_key(args: Vec<&str>, json_output: bool) -> Result<()
     }
 
     let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = resolve_lpm_bearer(&registry_url).await?;
+    let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
     // Crash recovery — if a pending key exists and matches the server,
     // the previous run committed the server side but didn't promote
