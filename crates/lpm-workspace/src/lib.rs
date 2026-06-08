@@ -17,6 +17,16 @@ use std::path::{Path, PathBuf};
 /// Catalog references grouped by catalog name, then package name.
 pub type CatalogReferences = BTreeMap<String, BTreeSet<String>>;
 
+const UTF8_BOM_BYTES: &[u8] = b"\xEF\xBB\xBF";
+
+fn strip_json_bom_str(content: &str) -> &str {
+    content.strip_prefix('\u{feff}').unwrap_or(content)
+}
+
+fn strip_json_bom_bytes(content: &[u8]) -> &[u8] {
+    content.strip_prefix(UTF8_BOM_BYTES).unwrap_or(content)
+}
+
 /// A discovered workspace root with its member packages.
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -1892,7 +1902,7 @@ pub fn read_package_json(path: &Path) -> Result<PackageJson, WorkspaceError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
 
-    serde_json::from_str(&content)
+    serde_json::from_str(strip_json_bom_str(&content))
         .map_err(|e| WorkspaceError::Parse(format!("failed to parse {}: {e}", path.display())))
 }
 
@@ -1918,7 +1928,7 @@ pub fn read_peer_dependencies(path: &Path) -> Result<PeerDepsResult, WorkspaceEr
 /// deps — the common case for the majority of packages in any install set.
 /// See `ensure_peer_context` in `lpm-linker` for the canonical call site.
 pub fn parse_peer_dependencies(content: &[u8]) -> Result<PeerDepsResult, WorkspaceError> {
-    let parsed: serde_json::Value = serde_json::from_slice(content)
+    let parsed: serde_json::Value = serde_json::from_slice(strip_json_bom_bytes(content))
         .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
     let Some(obj) = parsed.as_object() else {
         return Ok((HashMap::new(), HashMap::new()));
@@ -1938,7 +1948,7 @@ pub fn parse_peer_dependencies(content: &[u8]) -> Result<PeerDepsResult, Workspa
 ///
 /// See `create_bin_links_v2` in `lpm-linker` for the canonical call site.
 pub fn parse_bin_field(content: &[u8]) -> Result<Option<BinConfig>, WorkspaceError> {
-    let parsed: serde_json::Value = serde_json::from_slice(content)
+    let parsed: serde_json::Value = serde_json::from_slice(strip_json_bom_bytes(content))
         .map_err(|e| WorkspaceError::Parse(format!("parse error: {e}")))?;
     Ok(parsed.get("bin").and_then(bin_config_from_value))
 }
@@ -2476,12 +2486,13 @@ pub fn prune_unused_package_json_catalogs(
 ) -> Result<bool, WorkspaceError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| WorkspaceError::Io(format!("failed to read {}: {e}", path.display())))?;
-    let mut doc: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-        WorkspaceError::Parse(format!(
-            "failed to parse package manifest {}: {e}",
-            path.display()
-        ))
-    })?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(strip_json_bom_str(&content)).map_err(|e| {
+            WorkspaceError::Parse(format!(
+                "failed to parse package manifest {}: {e}",
+                path.display()
+            ))
+        })?;
 
     if !prune_json_catalogs(&mut doc, references) {
         return Ok(false);
@@ -2691,6 +2702,19 @@ mod tests {
 
     fn create_package_json(dir: &Path, content: &str) {
         fs::write(dir.join("package.json"), content).unwrap();
+    }
+
+    #[test]
+    fn read_package_json_accepts_utf8_bom_prefixed_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            "\u{feff}{\"name\":\"bom-prefixed\",\"version\":\"1.0.0\"}",
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+
+        assert_eq!(pkg.name.as_deref(), Some("bom-prefixed"));
     }
 
     /// Regression test for the rollup-plugins audit fixture. rollup's
@@ -5636,6 +5660,16 @@ mod peer_deps_parse_tests {
     }
 
     #[test]
+    fn parse_peer_dependencies_accepts_utf8_bom_prefixed_json() {
+        let json = b"\xEF\xBB\xBF{\"peerDependencies\":{\"react\":\"^19.0.0\"}}";
+
+        let (deps, meta) = parse_peer_dependencies(json).unwrap();
+
+        assert_eq!(deps.get("react").map(String::as_str), Some("^19.0.0"));
+        assert!(meta.is_empty());
+    }
+
+    #[test]
     fn parse_skips_non_string_peer_dependency_values() {
         let json = br#"{
             "name": "loose-peer-fixture",
@@ -5726,6 +5760,23 @@ mod peer_deps_parse_tests {
                     map.get("eslint").map(|s| s.as_str()),
                     Some("./bin/eslint.js")
                 )
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bin_field_accepts_utf8_bom_prefixed_json() {
+        let json = b"\xEF\xBB\xBF{\"name\":\"eslint\",\"bin\":{\"eslint\":\"./bin/eslint.js\"}}";
+
+        let result = parse_bin_field(json).unwrap().unwrap();
+
+        match result {
+            BinConfig::Map(map) => {
+                assert_eq!(
+                    map.get("eslint").map(String::as_str),
+                    Some("./bin/eslint.js")
+                );
             }
             other => panic!("expected Map, got {other:?}"),
         }
