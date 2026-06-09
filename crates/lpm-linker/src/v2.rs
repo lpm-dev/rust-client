@@ -39,12 +39,13 @@
 //!   incorrect for any package whose peer resolution depends on
 //!   the consuming project's other packages.
 //!
-//! When `LinkTarget.peers` is empty (lockfile fast-path doesn't
-//! persist peers today), the linker falls back to deriving them
-//! from the just-extracted `package.json` in `objects/<sri>/` and
-//! intersecting with the install-set's `(name, version)` map. This
-//! keeps cold-resolve and warm-fast-path producing the same
-//! GraphKeys for the same package.
+//! Current-schema lockfiles persist `LinkTarget.peers`, including
+//! meaningful empty sets for packages without resolved peers. Older
+//! callers that arrive with unknown peer context can still fall back
+//! to deriving it from the just-extracted `package.json` in
+//! `objects/<sri>/` and intersecting with the install-set's `(name,
+//! version)` map. That fallback requires the object directory to
+//! exist before plan preparation.
 //!
 //! # Multi-source disambiguation
 //!
@@ -123,12 +124,14 @@ impl LinkPlanV2 {
     /// Are all targets ready for the event-driven path? True iff every
     /// `LinkTarget.peers` is already populated (resolver-threaded
     /// greedy-fusion path) and `ensure_peer_context` made no
-    /// modifications. When false, callers should fall back to the
-    /// serial wrapper [`link_packages_v2`] — the lockfile fast-path
-    /// reads `package.json` from `objects/<sri>/` to derive peers,
-    /// which requires the object to be extracted; calling
-    /// `link_v2_prepare` before fetch would silently produce empty
-    /// peer-context graph keys.
+    /// modifications. This helper cannot distinguish current-schema
+    /// lockfiles whose empty peer sets are authoritative from legacy
+    /// callers whose empty peer sets are unknown; install.rs therefore
+    /// gates those lockfile fast paths with the lockfile schema
+    /// version. When peer context is unknown, callers should fall back
+    /// to the serial wrapper [`link_packages_v2`] — deriving peers from
+    /// `objects/<sri>/package.json` requires the object to be
+    /// extracted before [`link_v2_prepare`] runs.
     pub fn all_targets_have_resolver_threaded_peers(targets: &[V2Target]) -> bool {
         // Empty install set is event-driven-safe (zero work to dispatch).
         // Targets with declared peers but resolver-empty peers indicate
@@ -262,13 +265,11 @@ pub fn link_packages_v2(
 ///    `~/.lpm/store/v2/links/<key>/`, so wiping early frees us to spawn
 ///    them in parallel with fetch.
 /// 2. [`ensure_peer_context`] — best-effort fill-in for targets whose
-///    [`LinkTarget::peers`] arrived empty (lockfile fast-path). Reads
-///    `package.json` from extracted `objects/<sri>/`. **For
-///    pre-fetch event-driven dispatch, callers MUST pre-check
-///    [`LinkPlanV2::all_targets_have_resolver_threaded_peers`] and
-///    fall back to the serial wrapper if it returns false.** Otherwise
-///    peer-context for those targets is silently empty and graph keys
-///    diverge from the serial path.
+///    [`LinkTarget::peers`] arrived empty. Reads `package.json` from
+///    extracted `objects/<sri>/`. Pre-fetch callers that already have
+///    authoritative peer context should use
+///    [`link_v2_prepare_with_authoritative_peer_context`] instead of
+///    doing this disk fallback.
 /// 3. [`derive_graph_keys`] — computes the
 ///    `(name, version, wrapper_id) → GraphKey` map. Pure compute over
 ///    in-memory targets, no I/O. Multi-source-same-coords collisions
@@ -282,13 +283,60 @@ pub fn link_v2_prepare(
     store: &Store,
     linker_mode: LinkerMode,
 ) -> Result<LinkPlanV2, LpmError> {
+    link_v2_prepare_inner(
+        project_dir,
+        targets,
+        store,
+        linker_mode,
+        PeerContextMode::DeriveMissing,
+    )
+}
+
+/// Step 1 of the event-driven v2 link API when the caller has already
+/// supplied authoritative per-target peer context.
+///
+/// This is for current-schema lockfile warm installs: the lockfile
+/// records resolved peers for each package, and an empty list means
+/// "no resolved peers" rather than "unknown". Skipping
+/// [`ensure_peer_context`] avoids reading and pre-scanning
+/// `objects/<sri>/package.json` for every no-peer package on the warm
+/// path.
+pub fn link_v2_prepare_with_authoritative_peer_context(
+    project_dir: &Path,
+    targets: Vec<V2Target>,
+    store: &Store,
+    linker_mode: LinkerMode,
+) -> Result<LinkPlanV2, LpmError> {
+    link_v2_prepare_inner(
+        project_dir,
+        targets,
+        store,
+        linker_mode,
+        PeerContextMode::TrustTargets,
+    )
+}
+
+enum PeerContextMode {
+    DeriveMissing,
+    TrustTargets,
+}
+
+fn link_v2_prepare_inner(
+    project_dir: &Path,
+    targets: Vec<V2Target>,
+    store: &Store,
+    linker_mode: LinkerMode,
+    peer_context: PeerContextMode,
+) -> Result<LinkPlanV2, LpmError> {
     // Top-level linker-stage span. Visible in Tracy with
     // `--features tracy`; filtered at INFO level so it's essentially
     // free in regular builds.
     let _span = tracing::info_span!("linker.prepare", target_count = targets.len(),).entered();
     cleanup_v1_state(project_dir)?;
     let mut augmented_targets = targets;
-    ensure_peer_context(&mut augmented_targets, store)?;
+    if matches!(peer_context, PeerContextMode::DeriveMissing) {
+        ensure_peer_context(&mut augmented_targets, store)?;
+    }
     let platform = PlatformTuple::current();
     let linker_tag = match linker_mode {
         LinkerMode::Isolated => LinkerModeTag::Isolated,
