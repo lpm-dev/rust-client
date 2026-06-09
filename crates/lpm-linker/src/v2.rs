@@ -606,6 +606,15 @@ fn populate_one(
     let mut deps: Vec<DepLink> =
         Vec::with_capacity(v2t.target.dependencies.len() + v2t.target.peers.len());
     for dep in &v2t.target.dependencies {
+        if !is_safe_root_link_name(&dep.local) {
+            tracing::warn!(
+                "v2 linker: skipping unsafe dependency local name {:?} for {}@{}",
+                dep.local,
+                v2t.target.name,
+                v2t.target.version
+            );
+            continue;
+        }
         let dep_key = key_map
             .get_for_dependency(dep)
             .ok_or_else(|| {
@@ -639,6 +648,19 @@ fn populate_one(
             v2t.target
                 .peers
                 .iter()
+                .filter(|(peer_name, _)| {
+                    if is_safe_root_link_name(peer_name) {
+                        true
+                    } else {
+                        tracing::warn!(
+                            "v2 linker: skipping unsafe peer local name {:?} for {}@{}",
+                            peer_name,
+                            v2t.target.name,
+                            v2t.target.version
+                        );
+                        false
+                    }
+                })
                 .filter(|(peer_name, _)| !already_local.contains(peer_name.as_str()))
                 .filter_map(|(peer_name, peer_ver)| {
                     let peer_key = key_map.get_peer(peer_name, peer_ver)?.clone();
@@ -893,13 +915,7 @@ fn create_root_symlinks(
     store: &Store,
     key_map: &KeyMap,
 ) -> Result<usize, LpmError> {
-    let nm = project_dir.join("node_modules");
-    std::fs::create_dir_all(&nm).map_err(|e| {
-        LpmError::Store(format!(
-            "v2 linker: failed to create project node_modules at {}: {e}",
-            nm.display()
-        ))
-    })?;
+    let nm = ensure_node_modules_dir(project_dir)?;
 
     // Scratch `PathBuf` reused across iterations. The naïve
     // `nm.join(&root_name)` allocates a fresh `PathBuf` per
@@ -923,19 +939,7 @@ fn create_root_symlinks(
             link_path.clear();
             link_path.push(&nm);
             link_path.push(&root_name);
-            // Scoped root names (`@scope/dep`) need their `@scope/`
-            // parent directory created.
-            if let Some(parent) = link_path.parent()
-                && parent != nm
-                && !parent.exists()
-            {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    LpmError::Store(format!(
-                        "v2 linker: failed to create scope dir at {}: {e}",
-                        parent.display()
-                    ))
-                })?;
-            }
+            ensure_link_parent_dir(&nm, &link_path, "root symlink")?;
             // Best-effort cleanup: if a stale symlink/file is at the
             // slot, remove before re-creating. Should be a no-op after
             // `cleanup_v1_state` already wiped node_modules — defensive
@@ -1028,19 +1032,16 @@ fn is_safe_root_link_name(name: &str) -> bool {
     if name.is_empty() || name.contains('\0') {
         return false;
     }
-    // Scoped names are exactly `@<scope>/<pkg>`; only `/`-counts >1
-    // or backslashes (any) signal escape.
     if name.contains('\\') {
         return false;
     }
     let slash_count = name.matches('/').count();
-    if slash_count > 1 {
+    if slash_count == 0 && name.starts_with('@') {
         return false;
     }
-    if slash_count == 1 && !name.starts_with('@') {
+    if slash_count > 1 || (slash_count == 1 && !name.starts_with('@')) {
         return false;
     }
-    // Reject path components that are exactly `..` (anywhere in the name).
     for component in name.split('/') {
         if component == ".." || component == "." || component.is_empty() {
             return false;
@@ -1236,22 +1237,17 @@ fn is_direct(target: &LinkTarget) -> bool {
 /// Skipped if the slot is already occupied (a direct dep with the
 /// same name took the spot).
 fn create_self_ref(project_dir: &Path, self_name: &str) -> Result<bool, LpmError> {
-    let nm = project_dir.join("node_modules");
+    if !is_safe_root_link_name(self_name) {
+        tracing::warn!("v2 linker: skipping self-reference for unsafe package name: {self_name:?}");
+        return Ok(false);
+    }
+
+    let nm = ensure_node_modules_dir(project_dir)?;
     let link_path = nm.join(self_name);
     if link_path.symlink_metadata().is_ok() {
         return Ok(false);
     }
-    if let Some(parent) = link_path.parent()
-        && parent != nm
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            LpmError::Store(format!(
-                "v2 linker: failed to create self-ref scope dir at {}: {e}",
-                parent.display()
-            ))
-        })?;
-    }
+    ensure_link_parent_dir(&nm, &link_path, "self-reference")?;
     create_dir_symlink_or_junction(project_dir, &link_path).map_err(|e| {
         LpmError::Store(format!(
             "v2 linker: failed to create self-ref symlink {} → {}: {e}",
@@ -1260,6 +1256,68 @@ fn create_self_ref(project_dir: &Path, self_name: &str) -> Result<bool, LpmError
         ))
     })?;
     Ok(true)
+}
+
+fn ensure_node_modules_dir(project_dir: &Path) -> Result<PathBuf, LpmError> {
+    let nm = project_dir.join("node_modules");
+    std::fs::create_dir_all(&nm).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to create project node_modules at {}: {e}",
+            nm.display()
+        ))
+    })?;
+    ensure_real_dir(&nm, "project node_modules")?;
+    Ok(nm)
+}
+
+fn ensure_link_parent_dir(root: &Path, link_path: &Path, label: &str) -> Result<(), LpmError> {
+    let Some(parent) = link_path.parent() else {
+        return Err(LpmError::Store(format!(
+            "v2 linker: {label} path has no parent: {}",
+            link_path.display()
+        )));
+    };
+    if parent == root {
+        return Ok(());
+    }
+    match parent.symlink_metadata() {
+        Ok(_) => ensure_real_dir(parent, label),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                LpmError::Store(format!(
+                    "v2 linker: failed to create {label} parent at {}: {e}",
+                    parent.display()
+                ))
+            })?;
+            ensure_real_dir(parent, label)
+        }
+        Err(error) => Err(LpmError::Store(format!(
+            "v2 linker: failed to inspect {label} parent at {}: {error}",
+            parent.display()
+        ))),
+    }
+}
+
+fn ensure_real_dir(path: &Path, label: &str) -> Result<(), LpmError> {
+    let metadata = path.symlink_metadata().map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to inspect {label} directory at {}: {e}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(LpmError::Store(format!(
+            "v2 linker: refusing to write {label} through symlinked directory {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(LpmError::Store(format!(
+            "v2 linker: refusing to write {label} through non-directory {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1425,6 +1483,57 @@ mod tests {
         assert!(lib_sibling.join("package.json").is_file());
     }
 
+    #[test]
+    fn link_packages_v2_skips_dependency_local_name_with_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let consumer_sri = synthetic_sri(b"link_packages_v2/unsafe_dep_consumer");
+        write_object(
+            &store,
+            &consumer_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"consumer\",\"version\":\"1.0.0\"}",
+            )],
+        );
+        let dep_sri = synthetic_sri(b"link_packages_v2/unsafe_dep_target");
+        write_object(
+            &store,
+            &dep_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"debug\",\"version\":\"1.0.0\"}",
+            )],
+        );
+
+        let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
+        consumer.target.dependencies = vec![LinkDependency::new(
+            "../../../../escape",
+            "debug",
+            "1.0.0",
+            None,
+        )];
+        let debug = target("debug", "1.0.0", &dep_sri, false);
+
+        let result = link_packages_v2(
+            &project,
+            vec![consumer, debug],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.linked, 2);
+        assert!(
+            project.join("escape").symlink_metadata().is_err(),
+            "unsafe dependency local name must not create an entry outside the link entry",
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn link_packages_v2_supports_local_source_dep_edges() {
@@ -1588,6 +1697,39 @@ mod tests {
         let self_link = project.join("node_modules").join("self-pkg");
         let read = std::fs::read_link(&self_link).unwrap();
         assert_eq!(read, project);
+    }
+
+    #[test]
+    fn link_packages_v2_skips_self_reference_when_project_name_contains_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"link_packages_v2/self_ref_traversal");
+        write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"d\",\"version\":\"1.0.0\"}")],
+        );
+
+        let result = link_packages_v2(
+            &project,
+            vec![target("d", "1.0.0", &sri, false)],
+            &store,
+            LinkerMode::Isolated,
+            Some("../escape"),
+        )
+        .unwrap();
+
+        assert!(
+            !result.self_referenced,
+            "unsafe self-reference names must be skipped"
+        );
+        assert!(
+            !project.join("escape").exists(),
+            "self-reference must not create an entry outside node_modules",
+        );
     }
 
     #[test]
@@ -2350,6 +2492,51 @@ mod tests {
         assert!(
             !project.join("escape").exists(),
             "no `escape` entry should be created outside node_modules",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_v2_finalize_rejects_symlinked_scope_parent_before_root_symlink_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let sri = synthetic_sri(b"v2/scope_parent_symlink");
+        write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"@scope/pkg\",\"version\":\"1.0.0\"}",
+            )],
+        );
+
+        let plan = link_v2_prepare(
+            &project,
+            vec![target("@scope/pkg", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+        )
+        .unwrap();
+        link_v2_one(&plan, &plan.augmented_targets[0], &store).unwrap();
+
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        let scope_dir = project.join("node_modules").join("@scope");
+        std::os::unix::fs::symlink(&outside, &scope_dir).unwrap();
+
+        let result = link_v2_finalize(&project, &plan, &store, None);
+
+        assert!(
+            result.is_err(),
+            "finalize must reject a symlinked scope parent instead of writing through it",
+        );
+        assert!(
+            !outside.join("pkg").exists(),
+            "root symlink must not be created through a symlinked scope parent",
         );
     }
 }

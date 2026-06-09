@@ -196,17 +196,31 @@ impl AllocBudget {
         // exclusivity, which is the right behavior for an outsized
         // legitimate tarball.
         let request = bytes.min(PARALLEL_EXTRACT_BUDGET_BYTES);
-        let mut guard = self.available.lock().expect("EXTRACT_BUDGET poisoned");
+        let mut guard = self.lock_available();
         while *guard < request {
-            guard = self
-                .cv
-                .wait(guard)
-                .expect("EXTRACT_BUDGET condvar poisoned");
+            guard = self.wait_available(guard);
         }
         *guard -= request;
         AllocBudgetGuard {
             budget: self,
             bytes: request,
+        }
+    }
+
+    fn lock_available(&self) -> std::sync::MutexGuard<'_, u64> {
+        match self.available.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn wait_available<'a>(
+        &self,
+        guard: std::sync::MutexGuard<'a, u64>,
+    ) -> std::sync::MutexGuard<'a, u64> {
+        match self.cv.wait(guard) {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         }
     }
 }
@@ -218,13 +232,7 @@ struct AllocBudgetGuard<'a> {
 
 impl Drop for AllocBudgetGuard<'_> {
     fn drop(&mut self) {
-        let mut guard = match self.budget.available.lock() {
-            Ok(g) => g,
-            // Poisoned mutex on parent panic — still release the
-            // bytes so other waiters don't deadlock waiting on a
-            // budget that the panicked thread held.
-            Err(p) => p.into_inner(),
-        };
+        let mut guard = self.budget.lock_available();
         *guard = guard
             .saturating_add(self.bytes)
             .min(PARALLEL_EXTRACT_BUDGET_BYTES);
@@ -1753,5 +1761,26 @@ mod tests {
         // The acquire returned (didn't deadlock) and consumed the
         // whole budget rather than the impossible 4× request.
         assert_eq!(*budget.available.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn alloc_budget_acquire_recovers_from_poisoned_mutex() {
+        let budget = AllocBudget {
+            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
+            cv: std::sync::Condvar::new(),
+        };
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = budget.available.lock().unwrap();
+            panic!("poison throwaway allocation budget");
+        }));
+        assert!(poisoned.is_err());
+
+        let _guard = budget.acquire(1);
+        let available = match budget.available.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        assert_eq!(available, PARALLEL_EXTRACT_BUDGET_BYTES - 1);
     }
 }
