@@ -207,6 +207,14 @@ impl RouteTable {
         &self.npmrc.security_warnings
     }
 
+    /// Whether `.npmrc` declared any registry override. Accelerator
+    /// planning only supports the default npmjs/lpm.dev split for now;
+    /// custom registries must stay on the local installer path so their
+    /// origin-scoped auth and TLS rules remain entirely client-side.
+    pub fn has_custom_registries(&self) -> bool {
+        self.npmrc.default_registry.is_some() || !self.npmrc.scope_registries.is_empty()
+    }
+
     /// TLS overrides parsed from `.npmrc` (`cafile=` / `ca=` extra roots
     /// and `strict-ssl=false`). Callers thread this into
     /// [`RegistryClient::with_tls_overrides`](crate::client::RegistryClient::with_tls_overrides)

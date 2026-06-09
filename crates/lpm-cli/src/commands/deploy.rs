@@ -1553,6 +1553,7 @@ pub async fn run(
         false, // audit_after_install: internal pipeline never runs audit
         lpm_common::LpmRoot::from_dir(plan.output_dir.join(".lpm")),
         no_optional,
+        None,
     )
     .await?;
 

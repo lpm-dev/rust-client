@@ -939,6 +939,242 @@ pub struct TokenCheckResponse {
     pub error: Option<String>,
 }
 
+/// GET /api/registry/install-accelerator/capability
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallAcceleratorCapability {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default, rename = "protocolVersion")]
+    pub protocol_version: u32,
+
+    #[serde(default, rename = "entitlementSource")]
+    pub entitlement_source: Option<String>,
+
+    #[serde(default)]
+    pub features: InstallAcceleratorFeatures,
+
+    #[serde(default)]
+    pub limits: InstallAcceleratorLimits,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstallAcceleratorFeatures {
+    #[serde(default, rename = "graphPlan")]
+    pub graph_plan: bool,
+
+    #[serde(default, rename = "storeDiff")]
+    pub store_diff: bool,
+
+    #[serde(default, rename = "packageVersionBundles")]
+    pub package_version_bundles: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstallAcceleratorLimits {
+    #[serde(default, rename = "maxManifestBytes")]
+    pub max_manifest_bytes: Option<u64>,
+
+    #[serde(default, rename = "maxLockfileBytes")]
+    pub max_lockfile_bytes: Option<u64>,
+
+    #[serde(default, rename = "maxBundleBytes")]
+    pub max_bundle_bytes: Option<u64>,
+
+    #[serde(default, rename = "maxPackages")]
+    pub max_packages: Option<u32>,
+}
+
+/// POST /api/registry/install-accelerator/plan request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallAcceleratorPlanRequest {
+    #[serde(default)]
+    pub dependencies: HashMap<String, String>,
+
+    #[serde(default)]
+    pub options: InstallAcceleratorPlanOptions,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstallAcceleratorPlanOptions {
+    #[serde(default, rename = "includeOptional")]
+    pub include_optional: bool,
+
+    #[serde(default, rename = "includePeers")]
+    pub include_peers: bool,
+
+    #[serde(default, rename = "maxPackages")]
+    pub max_packages: Option<u32>,
+
+    #[serde(default, rename = "maxDepth")]
+    pub max_depth: Option<u32>,
+}
+
+/// POST /api/registry/install-accelerator/plan response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallAcceleratorPlan {
+    #[serde(default, rename = "protocolVersion")]
+    pub protocol_version: u32,
+
+    #[serde(default)]
+    pub mode: String,
+
+    #[serde(default)]
+    pub packages: HashMap<String, PackageMetadata>,
+
+    #[serde(default)]
+    pub graph: InstallAcceleratorGraphSummary,
+
+    #[serde(default)]
+    pub store: InstallAcceleratorStoreSummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstallAcceleratorGraphSummary {
+    #[serde(default, rename = "rootCount")]
+    pub root_count: u32,
+
+    #[serde(default, rename = "metadataCount")]
+    pub metadata_count: u32,
+
+    #[serde(default, rename = "storeCandidateCount")]
+    pub store_candidate_count: u32,
+
+    #[serde(default, rename = "unsupportedSpecCount")]
+    pub unsupported_spec_count: u32,
+
+    #[serde(default, rename = "maxDepthReached")]
+    pub max_depth_reached: u32,
+
+    #[serde(default)]
+    pub truncated: bool,
+
+    #[serde(default)]
+    pub unsupported: Vec<InstallAcceleratorUnsupportedSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstallAcceleratorUnsupportedSpec {
+    #[serde(default)]
+    pub name: Option<String>,
+
+    #[serde(default)]
+    pub range: Option<String>,
+
+    #[serde(default)]
+    pub reason: Option<String>,
+
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstallAcceleratorStoreSummary {
+    #[serde(default)]
+    pub candidates: Vec<InstallAcceleratorStoreCandidate>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstallAcceleratorStoreCandidate {
+    pub name: String,
+    pub version: String,
+
+    #[serde(default)]
+    pub integrity: Option<String>,
+
+    #[serde(default, rename = "tarballUrl")]
+    pub tarball_url: Option<String>,
+}
+
+/// POST /api/registry/install-accelerator/store-bundle request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallAcceleratorStoreBundleRequest {
+    #[serde(default, rename = "protocolVersion")]
+    pub protocol_version: u32,
+
+    #[serde(default)]
+    pub packages: Vec<InstallAcceleratorStoreBundlePackage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallAcceleratorStoreBundlePackage {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub integrity: String,
+
+    #[serde(rename = "tarballUrl")]
+    pub tarball_url: String,
+}
+
+/// `index.json` inside an install-accelerator store bundle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstallAcceleratorStoreBundleIndex {
+    #[serde(default, rename = "protocolVersion")]
+    pub protocol_version: u32,
+
+    #[serde(default)]
+    pub mode: String,
+
+    #[serde(default, rename = "requestedCount")]
+    pub requested_count: u32,
+
+    #[serde(default, rename = "bundledCount")]
+    pub bundled_count: u32,
+
+    #[serde(default, rename = "skippedCount")]
+    pub skipped_count: u32,
+
+    #[serde(default)]
+    pub truncated: bool,
+
+    #[serde(default)]
+    pub objects: Vec<InstallAcceleratorStoreBundleObject>,
+
+    #[serde(default)]
+    pub skipped: Vec<InstallAcceleratorStoreBundleSkipped>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstallAcceleratorStoreBundleObject {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub integrity: String,
+
+    #[serde(rename = "tarballUrl")]
+    pub tarball_url: String,
+
+    pub path: String,
+
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstallAcceleratorStoreBundleSkipped {
+    #[serde(default)]
+    pub name: Option<String>,
+
+    #[serde(default)]
+    pub version: Option<String>,
+
+    #[serde(default)]
+    pub source: Option<String>,
+
+    #[serde(default)]
+    pub integrity: Option<String>,
+
+    #[serde(default, rename = "tarballUrl")]
+    pub tarball_url: Option<String>,
+
+    #[serde(default)]
+    pub reason: Option<String>,
+
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 // ─── Intelligence ──────────────────────────────────────────────────
 
 /// GET /api/registry/quality

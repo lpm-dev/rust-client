@@ -4085,6 +4085,66 @@ pub async fn run_with_options(
     // to the JSON envelope). Findings NEVER fail the install.
     audit_after_install: bool,
 ) -> Result<(), LpmError> {
+    run_with_options_accelerated(
+        client,
+        project_dir,
+        json_output,
+        offline,
+        force,
+        allow_new,
+        strict_integrity,
+        strict_peer_dependencies_override,
+        linker_override,
+        no_skills,
+        no_editor_setup,
+        no_security_summary,
+        auto_build,
+        target_set,
+        direct_versions_out,
+        requested_add_count,
+        script_policy_override,
+        advisor_override,
+        min_release_age_override,
+        drift_ignore_policy,
+        verify_policy,
+        strict_sandbox,
+        no_sandbox,
+        verbose,
+        audit_after_install,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_options_accelerated(
+    client: &RegistryClient,
+    project_dir: &Path,
+    json_output: bool,
+    offline: bool,
+    force: bool,
+    allow_new: bool,
+    strict_integrity: bool,
+    strict_peer_dependencies_override: Option<bool>,
+    linker_override: Option<lpm_linker::LinkerMode>,
+    no_skills: bool,
+    no_editor_setup: bool,
+    no_security_summary: bool,
+    auto_build: bool,
+    target_set: Option<&[String]>,
+    direct_versions_out: Option<&mut HashMap<String, lpm_semver::Version>>,
+    requested_add_count: Option<usize>,
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    advisor_override: Option<String>,
+    min_release_age_override: Option<u64>,
+    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
+    verify_policy: crate::provenance_fetch::VerifyPolicy,
+    strict_sandbox: bool,
+    no_sandbox: bool,
+    verbose: bool,
+    audit_after_install: bool,
+    accelerated_install: Option<crate::install_accelerator::AcceleratedInstall>,
+) -> Result<(), LpmError> {
     let lpm_root = lpm_common::LpmRoot::from_env()?;
     run_with_options_with_lpm_root(
         client,
@@ -4114,6 +4174,7 @@ pub async fn run_with_options(
         audit_after_install,
         lpm_root,
         false,
+        accelerated_install,
     )
     .await
 }
@@ -4147,6 +4208,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     audit_after_install: bool,
     lpm_root: lpm_common::LpmRoot,
     omit_optional_dependencies: bool,
+    accelerated_install: Option<crate::install_accelerator::AcceleratedInstall>,
 ) -> Result<(), LpmError> {
     // Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
@@ -4189,6 +4251,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             audit_after_install,
             &lpm_root,
             omit_optional_dependencies,
+            accelerated_install,
         ),
     )
     .await
@@ -4234,6 +4297,7 @@ async fn run_with_options_under_store_lock(
     audit_after_install: bool,
     lpm_root: &lpm_common::LpmRoot,
     omit_optional_dependencies: bool,
+    accelerated_install: Option<crate::install_accelerator::AcceleratedInstall>,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
     crate::security_floor::clear_recorded_suppressions();
@@ -5530,6 +5594,9 @@ async fn run_with_options_under_store_lock(
     let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
     let mut lockfile_peer_context_authoritative = false;
     let mut needs_binary_upgrade = false;
+    let mut accelerator_stats = accelerated_install
+        .as_ref()
+        .map(crate::install_accelerator::AcceleratedInstall::requested_stats);
 
     // `route_table` is built upstream of this fork (day-4.5
     // hoisted it above the lockfile-vs-resolve match so custom-
@@ -5562,6 +5629,22 @@ async fn run_with_options_under_store_lock(
 
                 // route_table is constructed above the lockfile match
                 // (day-4.5) — we just borrow/clone it here.
+                let mut accelerated_metadata =
+                    if let Some(accelerated) = accelerated_install.as_ref() {
+                        let result = accelerated
+                            .fetch_plan(
+                                client,
+                                &deps,
+                                !omit_optional_dependencies,
+                                &store,
+                                store_v2_handle.as_deref(),
+                            )
+                            .await?;
+                        accelerator_stats = Some(result.stats);
+                        Some(result.packages)
+                    } else {
+                        None
+                    };
 
                 // **Default flip .** Greedy-fusion is now the
                 // global install default. The fused dispatcher
@@ -5664,6 +5747,12 @@ async fn run_with_options_under_store_lock(
 
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
                     seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
+                    seed_accelerated_metadata_for_resolver(
+                        &shared_cache,
+                        &mut accelerated_metadata,
+                        &mut accelerator_stats,
+                        Some(&spec_tx),
+                    );
                     let res = lpm_resolver::resolve_greedy_fused_with_cache_options(
                         arc_client.clone(),
                         deps.clone(),
@@ -5732,6 +5821,12 @@ async fn run_with_options_under_store_lock(
                     let (spec_tx, spec_rx) =
                         tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
                     let (roots_ready_tx, roots_ready_rx) = tokio::sync::oneshot::channel::<()>();
+                    seed_accelerated_metadata_for_resolver(
+                        &shared_cache,
+                        &mut accelerated_metadata,
+                        &mut accelerator_stats,
+                        Some(&spec_tx),
+                    );
 
                     let batch_start = Instant::now();
 
@@ -6043,6 +6138,29 @@ async fn run_with_options_under_store_lock(
     // during resolve, so by the time we reach here the store may hold
     // tarballs the `has_package` loop below picks up as cache hits.
     let fetch_start = Instant::now();
+
+    if used_lockfile
+        && !force
+        && let (Some(accelerated), Some(store_v2)) =
+            (accelerated_install.as_ref(), store_v2_handle.as_deref())
+    {
+        let candidates = lockfile_v2_store_bundle_candidates(&packages, store_v2);
+        let bundle_stats = accelerated
+            .hydrate_store_bundle(client, candidates, store_v2)
+            .await?;
+        if let Some(stats) = accelerator_stats.as_mut() {
+            let requested_count = bundle_stats.requested_count;
+            let hydrated_count = bundle_stats.hydrated_count;
+            stats.merge_store_bundle(bundle_stats);
+            if requested_count == 0 {
+                stats.skipped_reason = Some("lockfile_store_complete");
+            } else if hydrated_count == 0 {
+                stats.skipped_reason = Some("lockfile_store_bundle_empty");
+            }
+        }
+    } else if used_lockfile && let Some(stats) = accelerator_stats.as_mut() {
+        stats.skipped_reason = Some("lockfile_fast_path");
+    }
 
     // — aggregation buffer for the generalized writeback.
     // Populated inside the fetch block with every (name, version) →
@@ -8853,6 +8971,9 @@ async fn run_with_options_under_store_lock(
             "peer_conflicts": [],
             "peer_issues": peer_issues_json_value(&[], &[]),
         });
+        if let Some(stats) = accelerator_stats.as_ref() {
+            json["timing"]["resolve"]["accelerator"] = stats.to_json();
+        }
         // surface workspace target set for agents.
         // None for legacy/standalone callers; Some(...) for the filtered path.
         if let Some(targets) = target_set {
@@ -11341,6 +11462,80 @@ struct WalkerJoin {
     unresolved_parked: Arc<std::sync::atomic::AtomicU64>,
 }
 
+fn seed_accelerated_metadata_for_resolver(
+    shared_cache: &lpm_resolver::SharedCache,
+    accelerated_metadata: &mut Option<HashMap<String, lpm_registry::PackageMetadata>>,
+    accelerator_stats: &mut Option<crate::install_accelerator::AcceleratedPlanStats>,
+    spec_tx: Option<&tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+) {
+    if let Some(metadata) = accelerated_metadata.as_ref() {
+        let inserted =
+            lpm_resolver::seed_shared_cache_from_metadata(shared_cache, metadata.values());
+        if let Some(stats) = accelerator_stats.as_mut() {
+            stats.seeded_metadata_count = inserted;
+        }
+    }
+
+    if let (Some(tx), Some(metadata)) = (spec_tx, accelerated_metadata.take()) {
+        let sent = prime_speculation_dispatcher_with_metadata(tx, metadata);
+        if let Some(stats) = accelerator_stats.as_mut() {
+            stats.speculation_frames_sent = sent;
+        }
+    }
+}
+
+fn prime_speculation_dispatcher_with_metadata(
+    tx: &tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>,
+    metadata: HashMap<String, lpm_registry::PackageMetadata>,
+) -> usize {
+    let mut sent = 0usize;
+    for (name, package_metadata) in metadata {
+        if tx.try_send((name, package_metadata)).is_err() {
+            break;
+        }
+        sent += 1;
+    }
+    sent
+}
+
+fn lockfile_v2_store_bundle_candidates(
+    packages: &[InstallPackage],
+    store_v2: &lpm_store::v2::Store,
+) -> Vec<lpm_registry::InstallAcceleratorStoreBundlePackage> {
+    let mut seen_integrities = std::collections::HashSet::with_capacity(packages.len());
+    let mut candidates = Vec::with_capacity(packages.len());
+
+    for package in packages {
+        if !matches!(
+            package.source_kind(),
+            Ok(lpm_lockfile::Source::Registry { .. })
+        ) {
+            continue;
+        }
+        let Some(integrity) = package.integrity.as_deref() else {
+            continue;
+        };
+        if store_v2.has_object(integrity) {
+            continue;
+        }
+        let Some(tarball_url) = package.tarball_url.as_deref() else {
+            continue;
+        };
+        if !seen_integrities.insert(integrity.to_string()) {
+            continue;
+        }
+        candidates.push(lpm_registry::InstallAcceleratorStoreBundlePackage {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            source: package.source.clone(),
+            integrity: integrity.to_string(),
+            tarball_url: tarball_url.to_string(),
+        });
+    }
+
+    candidates
+}
+
 impl WalkerJoin {
     /// Await walker + dispatcher tails and fold dispatcher counters
     /// into `stats`. Consumes `self` so the handles can only be
@@ -11735,11 +11930,7 @@ async fn speculative_download_and_store(
     // misses an opportunity to skip).
     let already_present = if let Some(v2) = store_v2 {
         match integrity {
-            Some(sri) => v2
-                .paths()
-                .object_dir(sri)
-                .ok()
-                .is_some_and(|dir| dir.exists()),
+            Some(sri) => v2.has_object(sri),
             None => store.has_package(name, version),
         }
     } else {

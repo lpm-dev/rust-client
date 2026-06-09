@@ -19,6 +19,7 @@ pub mod engine_strict_config;
 mod global_blocked_set;
 mod graph_render;
 mod import_rewriter;
+mod install_accelerator;
 pub mod install_state;
 pub mod install_ui;
 pub mod intelligence;
@@ -377,6 +378,10 @@ enum Commands {
         /// Install without network (use lockfile + global store only).
         #[arg(long)]
         offline: bool,
+
+        /// Use the experimental LPM accelerated install control plane.
+        #[arg(long)]
+        accelerated: bool,
 
         /// Force full re-install: bypass the fast-exit hash check, skip the
         /// lockfile (force fresh resolution from registry), re-download all
@@ -2971,6 +2976,7 @@ fn validate_global_install_project_scoped_flags(
     fail_if_no_match: bool,
     yes: bool,
     catalog: bool,
+    accelerated: bool,
 ) -> Result<(), lpm_common::LpmError> {
     // `--allow-new`, `--min-release-age`, and
     // `--ignore-provenance-drift[-all]` are now forwarded into the
@@ -2987,11 +2993,13 @@ fn validate_global_install_project_scoped_flags(
         || fail_if_no_match
         || yes
         || catalog
+        || accelerated
     {
         return Err(lpm_common::LpmError::Script(
             "`-g` is mutually exclusive with `-D` / `--filter` / `--filter-prod` / \
              `--changed-files-ignore-pattern` / `--test-pattern` / `-w` / \
-             `--fail-if-no-match` / `-y` / `--catalog` (those are project-scoped)."
+             `--fail-if-no-match` / `-y` / `--catalog` / `--accelerated` \
+             (those are project-scoped)."
                 .into(),
         ));
     }
@@ -3562,6 +3570,7 @@ async fn async_main() -> Result<()> {
             packages,
             save_dev,
             offline,
+            accelerated,
             force,
             allow_new,
             strict_integrity,
@@ -3643,6 +3652,7 @@ async fn async_main() -> Result<()> {
                     fail_if_no_match,
                     yes,
                     catalog.is_some(),
+                    accelerated,
                 )?;
                 // parse collision-resolution flags. Syntactic
                 // validation only (no lookup against marker commands —
@@ -3724,6 +3734,25 @@ async fn async_main() -> Result<()> {
             // intentionally keeps the missing-manifest error — it has
             // nothing to install against.
             let cwd = resolve_install_project_dir(&cwd, !packages.is_empty(), cli.json)?;
+            if accelerated
+                && (!packages.is_empty()
+                    || !filter.is_empty()
+                    || !filter_prod.is_empty()
+                    || !changed_files_ignore_pattern.is_empty()
+                    || !test_pattern.is_empty()
+                    || workspace_root
+                    || fail_if_no_match
+                    || catalog.is_some())
+            {
+                return Err(lpm_common::LpmError::Script(
+                    "`--accelerated` currently supports bare project installs only. Run `lpm install --accelerated` with no package or workspace-add flags, or drop `--accelerated` for add/workspace flows."
+                        .into(),
+                ));
+            }
+            let accelerated_install =
+                install_accelerator::prepare_project_install(&client, &cwd, offline, accelerated)
+                    .await?;
+
             let cfg = commands::config::GlobalConfig::load();
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
 
@@ -3945,7 +3974,7 @@ async fn async_main() -> Result<()> {
                     // without each call site re-implementing it.
                     let cli_linker = linker.map(LinkerCli::into_linker_mode);
 
-                    commands::install::run_with_options(
+                    commands::install::run_with_options_accelerated(
                         &client,
                         &cwd,
                         cli.json,
@@ -3976,6 +4005,7 @@ async fn async_main() -> Result<()> {
                         no_sandbox,
                         cli.verbose,
                         eff_audit_after_install,
+                        accelerated_install,
                     )
                     .await
                 }
@@ -5905,6 +5935,36 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             )));
             lines
         }
+        lpm_common::LpmError::InstallAcceleratorEntitlementRequired {
+            message,
+            reason,
+            entitlement_source,
+        } => {
+            let mut lines = vec![
+                SlimErrorLine::Failed("Accelerated install access denied".to_owned()),
+                SlimErrorLine::Detail(format!("  {} {message}", install_ui::dim("reason"))),
+            ];
+            if let Some(reason) = reason {
+                lines.push(SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("policy"),
+                    install_ui::cyan(reason)
+                )));
+            }
+            if let Some(entitlement_source) = entitlement_source {
+                lines.push(SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("entitlement"),
+                    install_ui::cyan(entitlement_source)
+                )));
+            }
+            lines.push(SlimErrorLine::Detail(format!(
+                "  {} {}",
+                install_ui::dim("hint"),
+                install_ui::dim("Run without --accelerated to use the local installer.")
+            )));
+            lines
+        }
         lpm_common::LpmError::NotFound(reason) => {
             diagnostic_lines("Not found", Some(reason), error)
         }
@@ -7384,12 +7444,56 @@ mod tests {
                     fail_if_no_match,
                     yes,
                     false,
+                    false,
                 )
                 .unwrap_err();
 
                 match err {
                     lpm_common::LpmError::Script(message) => {
                         assert!(message.contains("`-y`"));
+                        assert!(message.contains("project-scoped"));
+                    }
+                    other => panic!("expected Script error, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_global_rejects_accelerated_flag() {
+        let cli = Cli::try_parse_from(["lpm", "install", "-g", "eslint", "--accelerated"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install {
+                save_dev,
+                filter,
+                workspace_root,
+                fail_if_no_match,
+                yes,
+                global,
+                accelerated,
+                ..
+            } => {
+                assert!(global);
+                assert!(accelerated);
+
+                let err = validate_global_install_project_scoped_flags(
+                    save_dev,
+                    &filter,
+                    &[],
+                    &[],
+                    &[],
+                    workspace_root,
+                    fail_if_no_match,
+                    yes,
+                    false,
+                    accelerated,
+                )
+                .unwrap_err();
+
+                match err {
+                    lpm_common::LpmError::Script(message) => {
+                        assert!(message.contains("`--accelerated`"));
                         assert!(message.contains("project-scoped"));
                     }
                     other => panic!("expected Script error, got {other:?}"),
@@ -7424,6 +7528,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .unwrap_err();
         match err {
@@ -7443,6 +7548,7 @@ mod tests {
             false,
             false,
             true,
+            false,
         )
         .unwrap_err();
         match err {
@@ -7460,6 +7566,7 @@ mod tests {
             &[],
             &[],
             &[],
+            false,
             false,
             false,
             false,

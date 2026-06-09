@@ -255,6 +255,12 @@ const MAX_METADATA_BYTES: usize = 100 * 1024 * 1024;
 /// path that never needed metadata-sized buffers.
 const MAX_API_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 
+/// Hard cap for install-accelerator store bundles. Bundles are larger
+/// than metadata because they carry compressed package tarballs, but
+/// still bounded because the first client prototype buffers the bundle
+/// before unpacking individual members through the v2 store verifier.
+const MAX_ACCELERATOR_BUNDLE_BYTES: usize = 512 * 1024 * 1024;
+
 /// Drain a response body with a two-stage size cap.
 ///
 /// Stage 1 (pre-stream): refuse when the server's declared
@@ -358,6 +364,16 @@ fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
             let message = json_string_field(&value, "message")
                 .unwrap_or("A Pro account or active org membership is required.");
             Some(LpmError::UpstreamProxyEntitlementRequired {
+                message: message.to_owned(),
+                reason: json_string_field(&value, "reason").map(str::to_owned),
+                entitlement_source: json_string_field(&value, "entitlementSource")
+                    .map(str::to_owned),
+            })
+        }
+        "install_accelerator_entitlement_required" => {
+            let message = json_string_field(&value, "message")
+                .unwrap_or("Accelerated installs require a personal Pro account.");
+            Some(LpmError::InstallAcceleratorEntitlementRequired {
                 message: message.to_owned(),
                 reason: json_string_field(&value, "reason").map(str::to_owned),
                 entitlement_source: json_string_field(&value, "entitlementSource")
@@ -1407,6 +1423,24 @@ impl RegistryClient {
     /// e.g., the `tunnel` command checks this before connecting).
     pub fn session(&self) -> Option<&Arc<SessionManager>> {
         self.session.as_ref()
+    }
+
+    /// Whether an authenticated request can attach a non-empty bearer.
+    ///
+    /// This may trigger lazy keychain classification when a session is
+    /// attached, matching the first real authenticated request. Callers
+    /// use it only on explicit auth-required surfaces where a local,
+    /// deterministic "please log in" error is better than sending an
+    /// anonymous request.
+    pub fn has_auth_bearer(&self) -> bool {
+        if let Some(session) = &self.session
+            && session.has_token()
+        {
+            return true;
+        }
+        self.token
+            .as_ref()
+            .is_some_and(|token| !token.expose_secret().is_empty())
     }
 
     /// Create a new client sharing the same HTTP connection pool.
@@ -3177,6 +3211,79 @@ impl RegistryClient {
         let url = format!("{}/api/registry/cli/check", self.base_url);
         self.execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
             .await
+    }
+
+    /// Read the server-side accelerated install capability for the
+    /// authenticated account.
+    ///
+    /// Posture: `AuthRequired`. A 401 can refresh once for stored
+    /// sessions; Pro entitlement failures surface through the shared
+    /// transport error mapping.
+    ///
+    /// Calls: GET /api/registry/install-accelerator/capability
+    pub async fn install_accelerator_capability(
+        &self,
+    ) -> Result<InstallAcceleratorCapability, LpmError> {
+        let url = format!(
+            "{}/api/registry/install-accelerator/capability",
+            self.base_url
+        );
+        self.execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+            .await
+    }
+
+    /// Fetch the server-side accelerated install metadata prefetch plan.
+    ///
+    /// Posture: `AuthRequired`. The response is metadata-sized because it
+    /// can carry many abbreviated npm packuments; the body still uses the
+    /// same bounded reader as ordinary metadata fetches.
+    ///
+    /// Calls: POST /api/registry/install-accelerator/plan
+    pub async fn install_accelerator_plan(
+        &self,
+        request: &InstallAcceleratorPlanRequest,
+    ) -> Result<InstallAcceleratorPlan, LpmError> {
+        let url = format!("{}/api/registry/install-accelerator/plan", self.base_url);
+        let body = serde_json::to_value(request)
+            .map_err(|e| LpmError::Registry(format!("failed to encode accelerator plan: {e}")))?;
+
+        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let response = self.post_json_raw(&url, &body).await?;
+            parse_capped_metadata(response, "install accelerator plan").await
+        })
+        .await
+    }
+
+    /// Fetch a lockfile-derived v2 store bundle from the install accelerator.
+    ///
+    /// Posture: `AuthRequired`. The payload is a bounded tar archive
+    /// containing original package tarball bytes plus an `index.json`
+    /// manifest. The caller must verify each member against its lockfile
+    /// SRI before publishing anything into the local store.
+    ///
+    /// Calls: POST /api/registry/install-accelerator/store-bundle
+    pub async fn install_accelerator_store_bundle(
+        &self,
+        request: &InstallAcceleratorStoreBundleRequest,
+    ) -> Result<Vec<u8>, LpmError> {
+        let url = format!(
+            "{}/api/registry/install-accelerator/store-bundle",
+            self.base_url
+        );
+        let body = serde_json::to_value(request).map_err(|e| {
+            LpmError::Registry(format!("failed to encode accelerator store bundle: {e}"))
+        })?;
+
+        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let response = self.post_json_raw(&url, &body).await?;
+            read_capped_body(
+                response,
+                MAX_ACCELERATOR_BUNDLE_BYTES,
+                "install accelerator store bundle",
+            )
+            .await
+        })
+        .await
     }
 
     /// Revoke the current token on the server.
@@ -6762,6 +6869,173 @@ mod tests {
             }
             other => panic!("expected typed entitlement error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn install_accelerator_capability_maps_entitlement_denial() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/install-accelerator/capability"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "install_accelerator_entitlement_required",
+                "message": "Accelerated installs require a personal Pro account during the experimental phase.",
+                "reason": "personal_plan_not_eligible",
+                "entitlementSource": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = client.install_accelerator_capability().await;
+
+        match result {
+            Err(LpmError::InstallAcceleratorEntitlementRequired {
+                message,
+                reason,
+                entitlement_source,
+            }) => {
+                assert_eq!(
+                    message,
+                    "Accelerated installs require a personal Pro account during the experimental phase."
+                );
+                assert_eq!(reason.as_deref(), Some("personal_plan_not_eligible"));
+                assert_eq!(entitlement_source, None);
+            }
+            other => panic!("expected typed accelerator entitlement error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn install_accelerator_plan_posts_dependencies_and_parses_metadata() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let client = client.with_token("accelerator-token");
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/install-accelerator/plan"))
+            .and(header("authorization", "Bearer accelerator-token"))
+            .and(body_json(serde_json::json!({
+                "dependencies": { "left-pad": "^1.3.0" },
+                "options": {
+                    "includeOptional": true,
+                    "includePeers": true,
+                    "maxPackages": 10,
+                    "maxDepth": 8
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "protocolVersion": 1,
+                "mode": "metadata-prefetch",
+                "packages": {
+                    "left-pad": {
+                        "name": "left-pad",
+                        "dist-tags": { "latest": "1.3.0" },
+                        "versions": {
+                            "1.3.0": {
+                                "name": "left-pad",
+                                "version": "1.3.0",
+                                "dist": {
+                                    "tarball": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                                    "integrity": "sha512-test"
+                                }
+                            }
+                        }
+                    }
+                },
+                "graph": {
+                    "rootCount": 1,
+                    "metadataCount": 1,
+                    "storeCandidateCount": 1,
+                    "unsupportedSpecCount": 0,
+                    "maxDepthReached": 1,
+                    "truncated": false,
+                    "unsupported": []
+                },
+                "store": {
+                    "candidates": [{
+                        "name": "left-pad",
+                        "version": "1.3.0",
+                        "integrity": "sha512-test",
+                        "tarballUrl": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let plan = client
+            .install_accelerator_plan(&InstallAcceleratorPlanRequest {
+                dependencies: [("left-pad".to_string(), "^1.3.0".to_string())]
+                    .into_iter()
+                    .collect(),
+                options: InstallAcceleratorPlanOptions {
+                    include_optional: true,
+                    include_peers: true,
+                    max_packages: Some(10),
+                    max_depth: Some(8),
+                },
+            })
+            .await
+            .expect("plan response parses");
+
+        assert_eq!(plan.mode, "metadata-prefetch");
+        assert_eq!(plan.packages["left-pad"].name, "left-pad");
+        assert_eq!(plan.store.candidates[0].version, "1.3.0");
+    }
+
+    #[tokio::test]
+    async fn install_accelerator_store_bundle_posts_lockfile_objects_and_returns_bytes() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (client, _tmp) = client_with_mock_server(&server.uri());
+        let client = client.with_token("accelerator-token");
+        let bundle = b"bundle-bytes".to_vec();
+
+        Mock::given(method("POST"))
+            .and(path("/api/registry/install-accelerator/store-bundle"))
+            .and(header("authorization", "Bearer accelerator-token"))
+            .and(body_json(serde_json::json!({
+                "protocolVersion": 1,
+                "packages": [{
+                    "name": "left-pad",
+                    "version": "1.3.0",
+                    "source": "registry+https://registry.npmjs.org",
+                    "integrity": "sha512-test",
+                    "tarballUrl": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+                }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bundle.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let received = client
+            .install_accelerator_store_bundle(&InstallAcceleratorStoreBundleRequest {
+                protocol_version: 1,
+                packages: vec![InstallAcceleratorStoreBundlePackage {
+                    name: "left-pad".to_string(),
+                    version: "1.3.0".to_string(),
+                    source: "registry+https://registry.npmjs.org".to_string(),
+                    integrity: "sha512-test".to_string(),
+                    tarball_url: "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+                        .to_string(),
+                }],
+            })
+            .await
+            .expect("bundle bytes read");
+
+        assert_eq!(received, bundle);
     }
 
     #[tokio::test]

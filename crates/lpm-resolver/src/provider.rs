@@ -989,6 +989,29 @@ pub(crate) fn parse_metadata_to_cache_info(
     }
 }
 
+/// Seed a shared resolver cache with registry metadata that was fetched before
+/// the resolver started. Returns the number of cache entries inserted.
+pub fn seed_shared_cache_from_metadata<'a>(
+    cache: &SharedCache,
+    packages: impl IntoIterator<Item = &'a lpm_registry::PackageMetadata>,
+) -> usize {
+    let mut inserted = 0usize;
+    for metadata in packages {
+        if !is_valid_dep_name(&metadata.name) {
+            tracing::warn!(
+                "skipping accelerated metadata for invalid package name: {:?}",
+                metadata.name
+            );
+            continue;
+        }
+        let key = CanonicalKey::from_dep_name(&metadata.name);
+        let info = Arc::new(parse_metadata_to_cache_info(metadata));
+        cache.insert(key, info);
+        inserted += 1;
+    }
+    inserted
+}
+
 /// Validate a dependency name from registry metadata.
 /// Rejects path traversal, null bytes, excessive length, and invalid formats.
 ///
@@ -2276,6 +2299,24 @@ mod tests {
             "versions": serde_json::Value::Object(versions_map),
         });
         serde_json::from_value(value).expect("valid PackageMetadata")
+    }
+
+    #[test]
+    fn seed_shared_cache_from_metadata_populates_canonical_entries() {
+        let cache: SharedCache = Arc::new(DashMap::new());
+        let metadata = metadata_with_versions("left-pad", &[("1.3.0", &[("repeat", "^1.0.0")])]);
+
+        let inserted = seed_shared_cache_from_metadata(&cache, [&metadata]);
+
+        assert_eq!(inserted, 1);
+        let cached = cache
+            .get(&CanonicalKey::npm("left-pad"))
+            .expect("accelerated metadata should populate canonical cache");
+        assert_eq!(cached.deps["1.3.0"]["repeat"], "^1.0.0");
+        assert_eq!(
+            cached.dist["1.3.0"].tarball_url.as_deref(),
+            Some("https://example.com/left-pad-1.3.0.tgz")
+        );
     }
 
     /// Regression test for the prerelease-stripping bug found in the

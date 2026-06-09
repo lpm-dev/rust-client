@@ -320,6 +320,14 @@ impl Store {
         Ok(self.extract_object_with_timings(sri, tarball_data)?.0)
     }
 
+    /// Whether the content-addressed object for `sri` is fully populated.
+    pub fn has_object(&self, sri: &str) -> bool {
+        self.paths
+            .object_dir(sri)
+            .ok()
+            .is_some_and(|dir| is_complete_object_dir(&dir))
+    }
+
     /// Same as [`Self::extract_object`] plus a [`StageTimings`]
     /// breakdown. Used by the install pipeline so `lpm install --json`
     /// keeps emitting an extract / security / finalize split under v2
@@ -1756,6 +1764,26 @@ mod tests {
         }
         std::fs::write(dir.join(".integrity"), sri).unwrap();
         dir
+    }
+
+    #[test]
+    fn has_object_requires_complete_object_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "lpm-v2-has-object-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = Store::at(&root);
+        let complete_sri = synthetic_sri(b"has_object_complete");
+        write_object(&store, &complete_sri, &[("package.json", b"{}")]);
+
+        let partial_sri = synthetic_sri(b"has_object_partial");
+        let partial_dir = store.paths().object_dir(&partial_sri).unwrap();
+        std::fs::create_dir_all(&partial_dir).unwrap();
+        std::fs::write(partial_dir.join(".integrity"), &partial_sri).unwrap();
+
+        assert!(store.has_object(&complete_sri));
+        assert!(!store.has_object(&partial_sri));
     }
 
     #[test]

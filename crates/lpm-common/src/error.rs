@@ -114,6 +114,19 @@ pub enum LpmError {
         entitlement_source: Option<String>,
     },
 
+    #[error("LPM accelerated installs access denied: {message}")]
+    #[diagnostic(
+        code(lpm::install_accelerator_entitlement_required),
+        help(
+            "Accelerated installs are experimental and require a personal Pro account. Run without --accelerated to use the local installer."
+        )
+    )]
+    InstallAcceleratorEntitlementRequired {
+        message: String,
+        reason: Option<String>,
+        entitlement_source: Option<String>,
+    },
+
     #[error("not found: {0}")]
     #[diagnostic(
         code(lpm::not_found),
@@ -359,6 +372,9 @@ impl LpmError {
             LpmError::UpstreamProxyEntitlementRequired { .. } => {
                 "upstream_proxy_entitlement_required"
             }
+            LpmError::InstallAcceleratorEntitlementRequired { .. } => {
+                "install_accelerator_entitlement_required"
+            }
             LpmError::NotFound(_) => "not_found",
             LpmError::RateLimited { .. } => "rate_limited",
             LpmError::Script(_) => "script",
@@ -517,6 +533,11 @@ mod tests {
                 reason: Some("personal_plan_not_eligible".into()),
                 entitlement_source: None,
             },
+            LpmError::InstallAcceleratorEntitlementRequired {
+                message: "Accelerated installs require a personal Pro account.".into(),
+                reason: Some("personal_plan_not_eligible".into()),
+                entitlement_source: None,
+            },
             LpmError::NotFound("x".into()),
             LpmError::RateLimited {
                 retry_after_secs: 5,
@@ -637,6 +658,15 @@ mod tests {
             }
             .error_code(),
             "upstream_proxy_entitlement_required"
+        );
+        assert_eq!(
+            LpmError::InstallAcceleratorEntitlementRequired {
+                message: "Accelerated installs require a personal Pro account.".into(),
+                reason: Some("personal_plan_not_eligible".into()),
+                entitlement_source: None,
+            }
+            .error_code(),
+            "install_accelerator_entitlement_required"
         );
         assert_eq!(LpmError::Network("x".into()).error_code(), "network");
         assert_eq!(
