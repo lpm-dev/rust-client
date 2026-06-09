@@ -254,6 +254,11 @@ const MAX_METADATA_BYTES: usize = 100 * 1024 * 1024;
 /// stops a hostile / compromised mirror from OOM-ing the CLI on a
 /// path that never needed metadata-sized buffers.
 const MAX_API_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const UTF8_BOM_BYTES: &[u8] = b"\xEF\xBB\xBF";
+
+fn strip_json_bom_bytes(content: &[u8]) -> &[u8] {
+    content.strip_prefix(UTF8_BOM_BYTES).unwrap_or(content)
+}
 
 /// Drain a response body with a two-stage size cap.
 ///
@@ -305,7 +310,7 @@ async fn parse_capped_metadata<T: serde::de::DeserializeOwned>(
     context: &str,
 ) -> Result<T, LpmError> {
     let buf = read_capped_body(response, MAX_METADATA_BYTES, context).await?;
-    serde_json::from_slice(&buf)
+    serde_json::from_slice(strip_json_bom_bytes(&buf))
         .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
 }
 
@@ -319,7 +324,7 @@ pub async fn parse_capped_api_json<T: serde::de::DeserializeOwned>(
     context: &str,
 ) -> Result<T, LpmError> {
     let buf = read_capped_body(response, MAX_API_RESPONSE_BYTES, context).await?;
-    serde_json::from_slice(&buf)
+    serde_json::from_slice(strip_json_bom_bytes(&buf))
         .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
 }
 
@@ -10558,6 +10563,29 @@ mod tests {
             .await
             .expect("under-cap response must parse");
         assert_eq!(parsed["name"], "@scope/p");
+    }
+
+    #[tokio::test]
+    async fn parse_capped_metadata_accepts_utf8_bom_prefixed_response() {
+        use wiremock::matchers::{method, path as match_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut body = Vec::from(UTF8_BOM_BYTES);
+        body.extend_from_slice(br#"{"name":"bom-prefixed","versions":{}}"#);
+        Mock::given(method("GET"))
+            .and(match_path("/p"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/p", server.uri()))
+            .await
+            .expect("connect");
+        let parsed: serde_json::Value = parse_capped_metadata(response, "bom-test")
+            .await
+            .expect("BOM-prefixed response must parse");
+        assert_eq!(parsed["name"], "bom-prefixed");
     }
 
     /// Non-metadata API responses share the streaming-cap helper with

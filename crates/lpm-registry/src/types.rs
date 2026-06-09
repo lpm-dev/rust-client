@@ -83,7 +83,11 @@ pub struct VersionMetadata {
     /// is read today. Empty when the manifest declares no metadata.
     /// Consumers gate the unmet-peer warning on
     /// `peer_dependencies_meta[name].optional`.
-    #[serde(default, rename = "peerDependenciesMeta")]
+    #[serde(
+        default,
+        rename = "peerDependenciesMeta",
+        deserialize_with = "deserialize_peer_dependencies_meta"
+    )]
     pub peer_dependencies_meta: HashMap<String, PeerDependencyMeta>,
 
     /// Names this version vendors inside its published tarball's
@@ -1177,6 +1181,38 @@ where
     deserializer.deserialize_any(BundleVisitor)
 }
 
+fn deserialize_peer_dependencies_meta<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, PeerDependencyMeta>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Object(entries)) = value else {
+        return Ok(HashMap::new());
+    };
+
+    let mut out = HashMap::with_capacity(entries.len());
+    for (name, value) in entries {
+        match value {
+            serde_json::Value::Object(mut fields) => {
+                let optional = fields
+                    .remove("optional")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                out.insert(name, PeerDependencyMeta { optional });
+            }
+            serde_json::Value::Bool(optional) => {
+                out.insert(name, PeerDependencyMeta { optional });
+            }
+            serde_json::Value::Null => {}
+            _ => {}
+        }
+    }
+
+    Ok(out)
+}
+
 fn deserialize_string_or_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1377,6 +1413,79 @@ mod tests {
         assert_eq!(
             version.libc.iter().map(String::as_str).collect::<Vec<_>>(),
             ["glibc"]
+        );
+    }
+
+    #[test]
+    fn package_metadata_accepts_boolean_peer_dependencies_meta_entries_from_npm_packument() {
+        let json = r#"{
+            "name": "errorreporter",
+            "dist-tags": {
+                "latest": "1.0.347"
+            },
+            "versions": {
+                "1.0.234": {
+                    "name": "errorreporter",
+                    "version": "1.0.234",
+                    "peerDependencies": {
+                        "ua-parser-js": "^1.0.2"
+                    },
+                    "peerDependenciesMeta": {
+                        "ua-parser-js": true,
+                        "ignored-null": null,
+                        "ignored-string": "yes"
+                    }
+                },
+                "1.0.347": {
+                    "name": "errorreporter",
+                    "version": "1.0.347",
+                    "peerDependencies": {
+                        "@babel/runtime": "^7.12.5",
+                        "ua-parser-js": "^1.0.2"
+                    },
+                    "peerDependenciesMeta": {
+                        "@babel/runtime": {
+                            "optional": true
+                        },
+                        "ua-parser-js": {
+                            "optional": true
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let metadata: PackageMetadata =
+            serde_json::from_str(json).expect("dirty npm packument should parse");
+        let dirty = metadata
+            .version("1.0.234")
+            .expect("metadata should include dirty historical version");
+        assert_eq!(
+            dirty
+                .peer_dependencies_meta
+                .get("ua-parser-js")
+                .map(|meta| meta.optional),
+            Some(true)
+        );
+        assert!(!dirty.peer_dependencies_meta.contains_key("ignored-null"));
+        assert!(!dirty.peer_dependencies_meta.contains_key("ignored-string"));
+
+        let requested = metadata
+            .version("1.0.347")
+            .expect("metadata should include requested version");
+        assert_eq!(
+            requested
+                .peer_dependencies_meta
+                .get("@babel/runtime")
+                .map(|meta| meta.optional),
+            Some(true)
+        );
+        assert_eq!(
+            requested
+                .peer_dependencies_meta
+                .get("ua-parser-js")
+                .map(|meta| meta.optional),
+            Some(true)
         );
     }
 
