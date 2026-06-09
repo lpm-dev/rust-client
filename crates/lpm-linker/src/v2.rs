@@ -55,7 +55,7 @@
 //! distinct GraphKeys via `with_root_link_names` + the dep-edge
 //! disambiguation that flows from each target's own `wrapper_id`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -68,7 +68,8 @@ use lpm_store::v2::{
 #[cfg(unix)]
 use crate::make_bin_target_executable;
 use crate::{
-    LinkResult, LinkTarget, LinkerMode, MaterializedPackage, validate_bin_name, validate_bin_target,
+    LinkDependency, LinkResult, LinkTarget, LinkerMode, MaterializedPackage, validate_bin_name,
+    validate_bin_target,
 };
 
 /// One LinkTarget plus the source SRI needed to resolve its v2 object
@@ -556,24 +557,22 @@ fn populate_one(
     // — `peerDependencies` keys ARE the canonical name by spec).
     let mut deps: Vec<DepLink> =
         Vec::with_capacity(v2t.target.dependencies.len() + v2t.target.peers.len());
-    for (local, ver) in &v2t.target.dependencies {
-        let canonical = v2t
-            .target
-            .aliases
-            .get(local)
-            .cloned()
-            .unwrap_or_else(|| local.clone());
+    for dep in &v2t.target.dependencies {
         let dep_key = key_map
-            .get_by_coords(&canonical, ver)
+            .get_for_dependency(dep)
             .ok_or_else(|| {
                 LpmError::Store(format!(
-                    "v2 linker: dep {local}@{ver} of {}@{} has no resolved graph key",
-                    v2t.target.name, v2t.target.version
+                    "v2 linker: dep {}=>{}@{} of {}@{} has no resolved graph key",
+                    dep.local,
+                    dep.target_name,
+                    dep.graph_key_value(),
+                    v2t.target.name,
+                    v2t.target.version
                 ))
             })?
             .clone();
         deps.push(DepLink {
-            local: local.clone(),
+            local: dep.local.clone(),
             target: dep_key,
         });
     }
@@ -594,7 +593,7 @@ fn populate_one(
                 .iter()
                 .filter(|(peer_name, _)| !already_local.contains(peer_name.as_str()))
                 .filter_map(|(peer_name, peer_ver)| {
-                    let peer_key = key_map.get_by_coords(peer_name, peer_ver)?.clone();
+                    let peer_key = key_map.get_peer(peer_name, peer_ver)?.clone();
                     Some(DepLink {
                         local: peer_name.clone(),
                         target: peer_key,
@@ -629,13 +628,14 @@ fn populate_one(
 /// Public so callers can hold a reference across spawn boundaries
 /// without reaching into linker private API.
 ///
-/// Two indexes:
+/// Two lookup indexes plus one duplicate guard:
 /// - `by_triple` — full `(name, version, wrapper_id)` identity. Used
-///   by `populate_one` to fetch THIS target's own key.
-/// - `by_coords` — `(name, version)` only. Used to resolve dep / peer
-///   edges, which carry only `(name, version)` today. Multi-source
-///   collisions are detected at construction time and surface a hard
-///   error before any link entry materializes.
+///   by `populate_one` to fetch this target's own key and to resolve
+///   source-aware dependency edges.
+/// - `by_coords` — `(name, version)` only. Used only when the install
+///   graph has a single unambiguous package at those coordinates.
+/// - `source_identities` — `(name, wrapper_id)` guard so one source
+///   identity cannot appear twice with diverging versions.
 ///
 /// Keys are stored as a single `String` using a `\x00`-separated
 /// compound key: `"name\x00version"` for `by_coords` and
@@ -645,10 +645,12 @@ fn populate_one(
 /// instead of cloning each field separately (2–3 allocs per lookup).
 pub struct KeyMap {
     by_triple: HashMap<String, Arc<GraphKey>>,
-    // Value is `(Arc<GraphKey>, first_wrapper_id_seen)`. The wrapper_id
-    // component exists solely to surface helpful collision-error messages —
-    // it is stripped at lookup time so callers always receive `&Arc<GraphKey>`.
-    by_coords: HashMap<String, (Arc<GraphKey>, Option<String>)>,
+    by_coords: HashMap<String, CoordEntry>,
+}
+
+enum CoordEntry {
+    Single(Arc<GraphKey>),
+    Ambiguous,
 }
 
 /// Form the `by_coords` key: `"name\x00version"`.
@@ -674,6 +676,15 @@ fn triple_key(name: &str, version: &str, wrapper_id: Option<&str>) -> String {
     key
 }
 
+#[inline]
+fn name_wrapper_key(name: &str, wrapper_id: &str) -> String {
+    let mut key = String::with_capacity(name.len() + 1 + wrapper_id.len());
+    key.push_str(name);
+    key.push('\x00');
+    key.push_str(wrapper_id);
+    key
+}
+
 impl KeyMap {
     fn get_for(&self, target: &LinkTarget) -> Option<&Arc<GraphKey>> {
         self.by_triple.get(&triple_key(
@@ -683,10 +694,33 @@ impl KeyMap {
         ))
     }
 
-    fn get_by_coords(&self, name: &str, version: &str) -> Option<&Arc<GraphKey>> {
-        self.by_coords
-            .get(&coords_key(name, version))
-            .map(|(gk, _)| gk)
+    fn get_for_dependency(&self, dep: &LinkDependency) -> Option<&Arc<GraphKey>> {
+        self.by_triple
+            .get(&triple_key(
+                &dep.target_name,
+                &dep.target_version,
+                dep.target_wrapper_id.as_deref(),
+            ))
+            .or_else(|| {
+                if dep.target_wrapper_id.is_none() {
+                    self.get_by_coords_unambiguous(&dep.target_name, &dep.target_version)
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn get_peer(&self, name: &str, version: &str) -> Option<&Arc<GraphKey>> {
+        self.by_triple
+            .get(&triple_key(name, version, None))
+            .or_else(|| self.get_by_coords_unambiguous(name, version))
+    }
+
+    fn get_by_coords_unambiguous(&self, name: &str, version: &str) -> Option<&Arc<GraphKey>> {
+        match self.by_coords.get(&coords_key(name, version)) {
+            Some(CoordEntry::Single(gk)) => Some(gk),
+            Some(CoordEntry::Ambiguous) | None => None,
+        }
     }
 }
 
@@ -696,8 +730,8 @@ fn derive_graph_keys(
     linker_tag: LinkerModeTag,
 ) -> Result<KeyMap, LpmError> {
     let mut by_triple: HashMap<String, Arc<GraphKey>> = HashMap::with_capacity(targets.len());
-    let mut by_coords: HashMap<String, (Arc<GraphKey>, Option<String>)> =
-        HashMap::with_capacity(targets.len());
+    let mut source_identities: HashSet<String> = HashSet::with_capacity(targets.len());
+    let mut by_coords: HashMap<String, CoordEntry> = HashMap::with_capacity(targets.len());
 
     for v2t in targets {
         let graph_key_peers: &[(String, String)] = if matches!(linker_tag, LinkerModeTag::Hoisted) {
@@ -705,12 +739,21 @@ fn derive_graph_keys(
         } else {
             &v2t.target.peers
         };
+        let mut graph_key_deps: Vec<(String, String)> =
+            Vec::with_capacity(v2t.target.dependencies.len());
+        graph_key_deps.extend(
+            v2t.target
+                .dependencies
+                .iter()
+                .map(|dep| (dep.local.clone(), dep.graph_key_value().to_string())),
+        );
+
         let key = Arc::new(GraphKey::derive_raw(
             &v2t.target.name,
             &v2t.target.version,
             platform,
             linker_tag,
-            &v2t.target.dependencies,
+            &graph_key_deps,
             &v2t.target.aliases,
             graph_key_peers,
             v2t.target.root_link_names.as_deref(),
@@ -729,32 +772,23 @@ fn derive_graph_keys(
                 v2t.target.name, v2t.target.version, v2t.target.wrapper_id
             )));
         }
+        if let Some(wrapper_id) = v2t.target.wrapper_id.as_deref() {
+            let wkey = name_wrapper_key(&v2t.target.name, wrapper_id);
+            if !source_identities.insert(wkey) {
+                return Err(LpmError::Store(format!(
+                    "v2 linker: duplicate source identity for {} wrapper_id={wrapper_id:?}",
+                    v2t.target.name
+                )));
+            }
+        }
 
-        // `ckey` ownership moves into the entry key — no clone needed.
-        // The stored `Option<String>` is only used to produce a helpful
-        // collision error message; `get_by_coords` strips it at lookup time.
         let ckey = coords_key(&v2t.target.name, &v2t.target.version);
         match by_coords.entry(ckey) {
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert((key, v2t.target.wrapper_id.clone()));
+                e.insert(CoordEntry::Single(key));
             }
-            std::collections::hash_map::Entry::Occupied(existing) => {
-                // Multi-source-same-coords. Dep edges carry only
-                // `(name, version)`, so we can't disambiguate which
-                // GraphKey a `dep on foo@1.0.0` should point at. Hard
-                // error rather than silently aliasing one onto the
-                // other; full disambiguation requires wrapper_id-aware
-                // dep edges, which is a follow-up.
-                return Err(LpmError::Store(format!(
-                    "v2 linker: multi-source LinkTarget collision for {}@{} \
-                     (existing wrapper_id={:?}, new wrapper_id={:?}). \
-                     Multi-source disambiguation requires wrapper_id-aware \
-                     dep edges.",
-                    v2t.target.name,
-                    v2t.target.version,
-                    existing.get().1,
-                    v2t.target.wrapper_id,
-                )));
+            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                existing.insert(CoordEntry::Ambiguous);
             }
         }
     }
@@ -1292,7 +1326,7 @@ mod tests {
         );
 
         let mut consumer = target("consumer", "0.1.0", &cons_sri, true);
-        consumer.target.dependencies = vec![("lib".into(), "1.2.3".into())];
+        consumer.target.dependencies = vec![LinkDependency::registry("lib", "1.2.3")];
         let lib = target("lib", "1.2.3", &lib_sri, false);
 
         let result = link_packages_v2(
@@ -1374,7 +1408,7 @@ mod tests {
         );
 
         let mut consumer = target("external-reentry", "1.0.0", &consumer_sri, true);
-        consumer.target.dependencies = vec![("@smoke/cycle-b".into(), "1.0.0".into())];
+        consumer.target.dependencies = vec![LinkDependency::registry("@smoke/cycle-b", "1.0.0")];
 
         let mut local = target("@smoke/cycle-b", "1.0.0", &local_sri, false);
         local.target.materialization = crate::Materialization::DirectorySource;
@@ -1413,13 +1447,14 @@ mod tests {
             std::fs::read_to_string(local_link_pkg.join("index.js")).unwrap(),
             "module.exports = 'before';\n"
         );
-
-        std::fs::write(source_dir.join("index.js"), b"module.exports = 'after';\n").unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(local_link_pkg.join("index.js")).unwrap(),
-            "module.exports = 'after';\n",
-            "v2 local-source link entries must stay live to source edits"
+        assert!(
+            !local_link_pkg
+                .join("index.js")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "local-source entrypoints must be real files so Node resolves deps from the v2 link entry"
         );
     }
 
@@ -1524,7 +1559,7 @@ mod tests {
         );
         let mut t = target("c", "1.0.0", &sri, true);
         // Dep 'phantom@9.9.9' has no matching LinkTarget in the set.
-        t.target.dependencies = vec![("phantom".into(), "9.9.9".into())];
+        t.target.dependencies = vec![LinkDependency::registry("phantom", "9.9.9")];
 
         let err =
             link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap_err();
@@ -1771,47 +1806,81 @@ mod tests {
         assert!(project.join("node_modules").join("consumer").exists());
     }
 
-    /// Multi-source-same-coords (two `LinkTarget`s with the same
-    /// `(name, version)` but different `wrapper_id`) currently can't
-    /// be disambiguated through the dep edges (which carry only
-    /// `(name, version)`). Until that's threaded through the resolver,
-    /// `derive_graph_keys` MUST surface a hard error rather than
-    /// silently aliasing — the audit-fixture suite never exercises
-    /// this shape, so the error is reachable only by a malformed
-    /// install set.
     #[test]
-    fn link_packages_v2_errors_on_multi_source_same_coords() {
+    fn link_packages_v2_resolves_multi_source_same_coords_with_source_edges() {
         let tmp = tempfile::tempdir().unwrap();
         let store = V2Store::at(tmp.path().join("store"));
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
 
-        // Two LinkTargets at the same (name, version) with distinct
-        // wrapper_ids.
-        let sri_a = synthetic_sri(b"multi_source/a");
-        let sri_b = synthetic_sri(b"multi_source/b");
+        let registry_sri = synthetic_sri(b"multi_source/registry");
+        let source_sri = synthetic_sri(b"multi_source/source");
+        let consumer_sri = synthetic_sri(b"multi_source/consumer");
         write_object(
             &store,
-            &sri_a,
-            &[("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}")],
+            &registry_sri,
+            &[
+                ("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}"),
+                ("index.js", b"module.exports = 'registry';\n"),
+            ],
         );
         write_object(
             &store,
-            &sri_b,
-            &[("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}")],
+            &source_sri,
+            &[
+                ("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}"),
+                ("index.js", b"module.exports = 'source';\n"),
+            ],
+        );
+        write_object(
+            &store,
+            &consumer_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"consumer\",\"version\":\"1.0.0\",\"dependencies\":{\"x\":\"1.0.0\"}}",
+            )],
         );
 
-        let mut a = target("x", "1.0.0", &sri_a, true);
-        a.target.wrapper_id = Some("t-aaaaaaaaaaaaaaaa".into());
-        let mut b = target("x", "1.0.0", &sri_b, true);
-        b.target.wrapper_id = Some("t-bbbbbbbbbbbbbbbb".into());
+        let registry_x = target("x", "1.0.0", &registry_sri, true);
+        let mut source_x = target("x", "1.0.0", &source_sri, false);
+        source_x.target.wrapper_id = Some("t-bbbbbbbbbbbbbbbb".into());
+        let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
+        consumer.target.dependencies = vec![LinkDependency::new(
+            "x",
+            "x",
+            "1.0.0",
+            Some("t-bbbbbbbbbbbbbbbb".into()),
+        )];
 
-        let err =
-            link_packages_v2(&project, vec![a, b], &store, LinkerMode::Isolated, None).unwrap_err();
-        let msg = format!("{err}");
+        let result = link_packages_v2(
+            &project,
+            vec![registry_x, source_x, consumer],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.linked, 3);
         assert!(
-            msg.contains("multi-source") && msg.contains("x@1.0.0"),
-            "multi-source collision error must name the package: {msg}"
+            project
+                .join("node_modules")
+                .join("x")
+                .join("index.js")
+                .is_file()
+        );
+
+        let consumer_link_pkg = result
+            .materialized
+            .iter()
+            .find(|m| m.name == "consumer")
+            .map(|m| m.destination.clone())
+            .unwrap();
+        let consumer_link_dir = consumer_link_pkg.parent().unwrap().parent().unwrap();
+        let source_sibling = consumer_link_dir.join("node_modules").join("x");
+        assert_eq!(
+            std::fs::read_to_string(source_sibling.join("index.js")).unwrap(),
+            "module.exports = 'source';\n",
         );
     }
 

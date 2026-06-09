@@ -36,8 +36,10 @@ mod support;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::io::Write;
-use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm_with_registry};
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
+use support::{TempProject, lpm, lpm_with_registry};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -90,7 +92,268 @@ fn install_args(spec: &str) -> Vec<&str> {
     ]
 }
 
+fn bare_install_args() -> [&'static str; 4] {
+    [
+        "install",
+        "--no-security-summary",
+        "--no-skills",
+        "--no-editor-setup",
+    ]
+}
+
+fn left_pad_package_json() -> serde_json::Value {
+    serde_json::json!({
+        "name": "left-pad",
+        "version": "1.0.0",
+        "main": "index.js",
+    })
+}
+
+fn evict_install_outputs(project: &TempProject) {
+    let node_modules = project.path().join("node_modules");
+    if node_modules.exists() {
+        std::fs::remove_dir_all(&node_modules)
+            .unwrap_or_else(|e| panic!("remove {}: {e}", node_modules.display()));
+    }
+    let store_dir = project.store_dir();
+    if store_dir.exists() {
+        std::fs::remove_dir_all(&store_dir)
+            .unwrap_or_else(|e| panic!("remove {}: {e}", store_dir.display()));
+    }
+    let install_hash = project.path().join(".lpm").join("install-hash");
+    if install_hash.exists() {
+        std::fs::remove_file(&install_hash)
+            .unwrap_or_else(|e| panic!("remove {}: {e}", install_hash.display()));
+    }
+}
+
+fn remove_binary_lockfile(project: &TempProject) {
+    let lockb = project.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    if lockb.exists() {
+        std::fs::remove_file(&lockb).unwrap_or_else(|e| panic!("remove {}: {e}", lockb.display()));
+    }
+}
+
+fn tamper_registry_lockfile_tarball(
+    project: &TempProject,
+    package_name: &str,
+    attacker_url: String,
+    attacker_integrity: String,
+) {
+    let lockfile_path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("read lpm.lock");
+    let pkg = lockfile
+        .packages
+        .iter_mut()
+        .find(|pkg| pkg.name == package_name && pkg.version == "1.0.0")
+        .unwrap_or_else(|| panic!("lpm.lock must contain {package_name}@1.0.0"));
+    assert!(
+        pkg.source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("registry+")),
+        "test setup must tamper a registry-sourced package, got {:?}",
+        pkg.source,
+    );
+    pkg.tarball = Some(attacker_url);
+    pkg.integrity = Some(attacker_integrity);
+    lockfile
+        .write_to_file(&lockfile_path)
+        .expect("write tampered lpm.lock");
+    remove_binary_lockfile(project);
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn registry_lockfile_tarball_hint_mismatch_is_rejected_before_fetch() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_manifest_package(
+            left_pad_package_json(),
+            &[("index.js", b"module.exports = 'registry-left-pad';")],
+        )
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "registry-tarball-binding",
+  "version": "1.0.0",
+  "dependencies": {
+    "left-pad": "1.0.0"
+  }
+}"#,
+    );
+
+    lpm_with_registry(&project, &registry.url())
+        .args(bare_install_args())
+        .assert()
+        .success();
+
+    let attacker_tarball = make_tarball_from_pkg_json(
+        left_pad_package_json(),
+        &[("index.js", b"module.exports = 'attacker-left-pad';")],
+    );
+    let attacker_path = "/tarballs/left-pad/-/left-pad-1.0.0-attacker.tgz";
+    Mock::given(method("GET"))
+        .and(path(attacker_path))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(attacker_tarball.clone())
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(registry.server())
+        .await;
+
+    tamper_registry_lockfile_tarball(
+        &project,
+        "left-pad",
+        format!("{}{}", registry.url(), attacker_path),
+        compute_integrity(&attacker_tarball),
+    );
+    evict_install_outputs(&project);
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(bare_install_args())
+        .output()
+        .expect("run install against tampered lockfile");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "tampered registry tarball hint must fail closed; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("registry lockfile tarball")
+            && stderr.contains("does not match registry metadata"),
+        "error must clearly name the registry tarball metadata mismatch; stderr:\n{stderr}"
+    );
+
+    let attacker_requests = registry
+        .server()
+        .received_requests()
+        .await
+        .expect("registry request log must be available")
+        .into_iter()
+        .filter(|request| request.url.path() == attacker_path)
+        .collect::<Vec<_>>();
+    assert!(
+        attacker_requests.is_empty(),
+        "install must reject the lockfile hint before fetching attacker bytes; got {} request(s)",
+        attacker_requests.len()
+    );
+}
+
+#[tokio::test]
+async fn matching_registry_lockfile_tarball_hint_reinstalls_after_store_eviction() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_manifest_package(
+            left_pad_package_json(),
+            &[("index.js", b"module.exports = 'registry-left-pad';")],
+        )
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "registry-tarball-binding-positive",
+  "version": "1.0.0",
+  "dependencies": {
+    "left-pad": "1.0.0"
+  }
+}"#,
+    );
+
+    lpm_with_registry(&project, &registry.url())
+        .args(bare_install_args())
+        .assert()
+        .success();
+
+    evict_install_outputs(&project);
+    remove_binary_lockfile(&project);
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(bare_install_args())
+        .output()
+        .expect("run reinstall from matching lockfile");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "matching registry tarball hint must remain installable; stderr:\n{stderr}"
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules/left-pad/index.js")
+            .exists(),
+        "reinstall must link the registry package after validating the lockfile hint"
+    );
+}
+
+#[tokio::test]
+async fn explicit_tarball_dependency_is_not_bound_to_registry_metadata() {
+    let server = MockServer::start().await;
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "direct-tarball-pkg",
+            "version": "1.0.0",
+            "main": "index.js",
+        }),
+        &[("index.js", b"module.exports = 'direct-tarball';")],
+    );
+    let integrity = compute_integrity(&tarball);
+
+    Mock::given(method("GET"))
+        .and(path("/direct-tarball-pkg-1.0.0.tgz"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(tarball)
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "explicit-tarball-source",
+  "version": "1.0.0",
+  "dependencies": {{
+    "direct-tarball-pkg": "{}/direct-tarball-pkg-1.0.0.tgz#{}"
+  }}
+}}"#,
+        server.uri(),
+        integrity,
+    ));
+
+    let output = lpm(&project)
+        .args(bare_install_args())
+        .output()
+        .expect("run explicit tarball install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "explicit tarball source must install without registry metadata binding; stderr:\n{stderr}"
+    );
+    let lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .expect("read lpm.lock");
+    let pkg = lockfile
+        .packages
+        .iter()
+        .find(|pkg| pkg.name == "direct-tarball-pkg" && pkg.version == "1.0.0")
+        .expect("lockfile must contain explicit tarball package");
+    assert!(
+        pkg.tarball.is_none()
+            && pkg
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("tarball+http://")),
+        "explicit tarball package must keep URL identity in source and no registry hint: {:?}",
+        pkg,
+    );
+}
 
 /// **Plan #1 — `..` path entry must be rejected.**
 ///

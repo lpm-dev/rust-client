@@ -3594,65 +3594,28 @@ pub fn unlock_global_scopes_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
 
     fn with_test_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        struct EnvRestore {
-            original_dir: Option<std::ffi::OsString>,
-            original_policy: Option<std::ffi::OsString>,
-            original_secret: Option<std::ffi::OsString>,
-            original_auth: Option<std::ffi::OsString>,
-            original_file_vault: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvRestore {
-            fn drop(&mut self) {
-                match self.original_dir.take() {
-                    Some(value) => unsafe { std::env::set_var(SECURITY_DIR_ENV, value) },
-                    None => unsafe { std::env::remove_var(SECURITY_DIR_ENV) },
-                }
-                match self.original_policy.take() {
-                    Some(value) => unsafe { std::env::set_var(SECURITY_POLICY_PATH_ENV, value) },
-                    None => unsafe { std::env::remove_var(SECURITY_POLICY_PATH_ENV) },
-                }
-                match self.original_secret.take() {
-                    Some(value) => unsafe { std::env::set_var(TEST_SECRET_ENV, value) },
-                    None => unsafe { std::env::remove_var(TEST_SECRET_ENV) },
-                }
-                match self.original_auth.take() {
-                    Some(value) => unsafe { std::env::set_var(TEST_AUTH_RESULT_ENV, value) },
-                    None => unsafe { std::env::remove_var(TEST_AUTH_RESULT_ENV) },
-                }
-                match self.original_file_vault.take() {
-                    Some(value) => unsafe { std::env::set_var("LPM_FORCE_FILE_VAULT", value) },
-                    None => unsafe { std::env::remove_var("LPM_FORCE_FILE_VAULT") },
-                }
-            }
-        }
-        let _restore = EnvRestore {
-            original_dir: std::env::var_os(SECURITY_DIR_ENV),
-            original_policy: std::env::var_os(SECURITY_POLICY_PATH_ENV),
-            original_secret: std::env::var_os(TEST_SECRET_ENV),
-            original_auth: std::env::var_os(TEST_AUTH_RESULT_ENV),
-            original_file_vault: std::env::var_os("LPM_FORCE_FILE_VAULT"),
-        };
         let policy_path = dir.join("managed-security-policy.toml");
-        // Test-only env mutation is isolated to this helper and
-        // restored before returning.
-        unsafe {
-            std::env::set_var(SECURITY_DIR_ENV, dir);
-            std::env::set_var(SECURITY_POLICY_PATH_ENV, &policy_path);
-            std::env::set_var(
+        let _env = crate::test_env::ScopedEnv::update([
+            (SECURITY_DIR_ENV, Some(dir.as_os_str().to_owned())),
+            (
+                SECURITY_POLICY_PATH_ENV,
+                Some(policy_path.as_os_str().to_owned()),
+            ),
+            (
                 TEST_SECRET_ENV,
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            );
-            std::env::set_var(TEST_AUTH_RESULT_ENV, "approve");
-        }
+                Some(std::ffi::OsString::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )),
+            ),
+            (
+                TEST_AUTH_RESULT_ENV,
+                Some(std::ffi::OsString::from("approve")),
+            ),
+            ("LPM_FORCE_FILE_VAULT", None),
+        ]);
         f()
     }
 
