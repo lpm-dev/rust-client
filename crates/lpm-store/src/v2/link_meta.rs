@@ -346,7 +346,7 @@ impl LinkMeta {
 /// `name` into a path and must trust that single source. Registry-
 /// supplied names ARE strict — this rejects only what a tampered
 /// sidecar could plausibly inject.
-fn validate_name_for_path_join(name: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_name_for_path_join(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("empty name");
     }
