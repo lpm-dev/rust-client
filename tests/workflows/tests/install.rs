@@ -3301,6 +3301,127 @@ async fn install_v2_links_same_name_version_edges_to_their_declared_sources() {
     );
 }
 
+#[tokio::test]
+async fn warm_v2_lockfile_peer_install_resolves_peer_after_relink() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "react",
+            "version": "18.3.1"
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "main": "index.js",
+            "peerDependencies": {
+                "react": "^18.0.0"
+            }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('react/package.json').version;\n",
+        )],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "warm-v2-peer-relink",
+  "version": "1.0.0",
+  "dependencies": {
+    "peer-consumer": "1.0.0",
+    "react": "18.3.1"
+  }
+}"#,
+    );
+
+    let cold = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run cold v2 install");
+    assert!(
+        cold.status.success(),
+        "cold v2 install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cold.stdout),
+        String::from_utf8_lossy(&cold.stderr),
+    );
+
+    let lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .expect("lockfile should parse after cold install");
+    assert_eq!(
+        lockfile.metadata.lockfile_version,
+        lpm_lockfile::LOCKFILE_VERSION,
+        "cold install should write current lockfile schema",
+    );
+    let consumer = lockfile
+        .packages
+        .iter()
+        .find(|pkg| pkg.name == "peer-consumer")
+        .expect("lockfile should contain peer-consumer");
+    assert_eq!(
+        consumer.peers,
+        vec!["react@18.3.1".to_string()],
+        "lockfile must persist resolved peer context for warm v2 linking",
+    );
+
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before warm relink");
+
+    let warm = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "--json",
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run warm v2 install");
+    assert!(
+        warm.status.success(),
+        "warm v2 install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&warm.stderr),
+    );
+    let warm_json: serde_json::Value =
+        serde_json::from_slice(&warm.stdout).expect("warm install should emit JSON");
+    assert_eq!(
+        warm_json["used_lockfile"].as_bool(),
+        Some(true),
+        "second install should use the lockfile fast path",
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('peer-consumer'))")
+        .output()
+        .expect("run peer consumer require after warm relink");
+    assert!(
+        runtime.status.success(),
+        "peer consumer should resolve react after warm v2 relink\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "18.3.1",
+        "warm v2 relink must preserve peer resolution",
+    );
+}
+
 /// Two independent fresh installs of the same package.json must produce
 /// byte-identical lpm.lock files. Non-determinism in the resolver or
 /// lockfile serializer would cause this test to fail via the snapshot.

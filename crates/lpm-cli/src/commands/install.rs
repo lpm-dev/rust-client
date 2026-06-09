@@ -234,6 +234,19 @@ fn resolve_strict_peer_dependencies(
         .unwrap_or(false)
 }
 
+fn v2_linking_can_prepare_before_fetch(
+    v2_mode: bool,
+    serial_link: bool,
+    has_targets_with_sri: bool,
+    used_lockfile: bool,
+    lockfile_peer_context_authoritative: bool,
+) -> bool {
+    v2_mode
+        && !serial_link
+        && has_targets_with_sri
+        && (!used_lockfile || lockfile_peer_context_authoritative)
+}
+
 #[derive(Debug, Clone)]
 struct CatalogSavePolicy {
     mode: lpm_workspace::CatalogMode,
@@ -5515,6 +5528,7 @@ async fn run_with_options_under_store_lock(
     // resolver builds its own lockfile via `resolved_to_install_packages`
     // and the writer at install-end already handles that case).
     let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
+    let mut lockfile_peer_context_authoritative = false;
     let mut needs_binary_upgrade = false;
 
     // `route_table` is built upstream of this fork (day-4.5
@@ -5532,6 +5546,8 @@ async fn run_with_options_under_store_lock(
                         fast_path.packages.len().to_string().bold()
                     ));
                 }
+                lockfile_peer_context_authoritative =
+                    fast_path.lockfile.metadata.lockfile_version >= lpm_lockfile::LOCKFILE_VERSION;
                 fast_path_lockfile = Some(fast_path.lockfile);
                 needs_binary_upgrade = fast_path.needs_binary_upgrade;
                 // Fast path doesn't run the resolver, so we have no
@@ -6190,24 +6206,29 @@ async fn run_with_options_under_store_lock(
     } else {
         Vec::new()
     };
-    // Why `!used_lockfile` instead of
+    // Why `v2_linking_can_prepare_before_fetch` instead of
     // `LinkPlanV2::all_targets_have_resolver_threaded_peers`:
     //   `LinkTarget.peers` is empty for THREE reasons documented on the
     //   field — (a) package declares no peer deps, (b) all declared
-    //   peers absent from install set, (c) lockfile fast-path didn't
-    //   thread peers. (a) + (b) are legitimate empty results from a
-    //   live resolver; (c) is the actual hazard the gate must catch.
+    //   peers absent from install set, (c) an old lockfile fast-path
+    //   didn't thread peers. (a) + (b) are legitimate empty results
+    //   from a live resolver or a current-schema lockfile; (c) is the
+    //   actual hazard the gate must catch.
     //   The library helper `all_targets_have_resolver_threaded_peers`
     //   uses `peers.is_empty()` as its sole signal, which conflates
-    //   (a)+(b) with (c) and would reject most fresh-resolution
-    //   installs (any package with no peer deps fails it). On a fresh
-    //   resolution (`!used_lockfile`), the resolver always traverses
-    //   peer-context, so any empty `peers` field is by construction
-    //   case (a) or (b) — `ensure_peer_context` would re-derive the
-    //   same empty set from `package.json`. On the lockfile fast-path
-    //   (`used_lockfile`), peers are NOT persisted today (per the
-    //   `LinkTarget.peers` doc), so we must fall back to serial v2.
-    let v2_event_driven = v2_mode && !serial_link && !v2_targets_pre.is_empty() && !used_lockfile;
+    //   (a)+(b) with (c) and would reject most installs (any package
+    //   with no peer deps fails it). On a fresh resolution, the
+    //   resolver always traverses peer-context. On a current-schema
+    //   lockfile fast path, the `peers` field is authoritative: empty
+    //   means "no resolved peers", not "unknown". Older lockfiles
+    //   remain conservative and fall back to serial v2.
+    let v2_event_driven = v2_linking_can_prepare_before_fetch(
+        v2_mode,
+        serial_link,
+        !v2_targets_pre.is_empty(),
+        used_lockfile,
+        lockfile_peer_context_authoritative,
+    );
 
     // Plan + per-key V2Target index — both shared across the cache-hit
     // dispatch loop and every per-pkg fetch task. `Arc<LinkPlanV2>`
@@ -6215,14 +6236,19 @@ async fn run_with_options_under_store_lock(
     // blocking tasks. Empty on the !v2_event_driven path; the link
     // stage falls through to `link_packages_v2` unchanged.
     let v2_plan: Option<std::sync::Arc<lpm_linker::v2::LinkPlanV2>> = if v2_event_driven {
-        let plan = lpm_linker::v2::link_v2_prepare(
-            project_dir,
-            v2_targets_pre,
-            store_v2_handle
-                .as_deref()
-                .expect("v2_event_driven implies v2 store"),
-            linker_mode,
-        )?;
+        let store_v2 = store_v2_handle
+            .as_deref()
+            .expect("v2_event_driven implies v2 store");
+        let plan = if used_lockfile && lockfile_peer_context_authoritative {
+            lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context(
+                project_dir,
+                v2_targets_pre,
+                store_v2,
+                linker_mode,
+            )?
+        } else {
+            lpm_linker::v2::link_v2_prepare(project_dir, v2_targets_pre, store_v2, linker_mode)?
+        };
         Some(std::sync::Arc::new(plan))
     } else {
         None
@@ -14590,6 +14616,20 @@ mod tests {
     fn confirm_prompt_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn v2_linking_can_prepare_before_fetch_allows_current_lockfile_peer_context() {
+        assert!(v2_linking_can_prepare_before_fetch(
+            true, false, true, true, true
+        ));
+    }
+
+    #[test]
+    fn v2_linking_can_prepare_before_fetch_rejects_legacy_lockfile_peer_context() {
+        assert!(!v2_linking_can_prepare_before_fetch(
+            true, false, true, true, false
+        ));
     }
 
     // ── local-tarball path traversal ─────────────
