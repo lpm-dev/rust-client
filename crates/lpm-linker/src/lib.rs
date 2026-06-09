@@ -84,11 +84,72 @@ pub struct FinalizeResult {
 ///
 /// Returns `true` if the name is safe to use as a directory name under `node_modules/`.
 fn is_valid_self_ref_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains("..")
-        && !name.contains('\\')
-        && !name.starts_with('/')
-        && !name.contains('\0')
+    is_safe_node_modules_entry_name(name)
+}
+
+fn is_safe_node_modules_entry_name(name: &str) -> bool {
+    if name.is_empty() || name.contains('\0') || name.contains('\\') {
+        return false;
+    }
+    let slash_count = name.matches('/').count();
+    if slash_count == 0 && name.starts_with('@') {
+        return false;
+    }
+    if slash_count > 1 || (slash_count == 1 && !name.starts_with('@')) {
+        return false;
+    }
+    name.split('/')
+        .all(|component| !matches!(component, "" | "." | ".."))
+}
+
+fn filter_node_modules_entry_name(
+    name: String,
+    package_name: &str,
+    version: &str,
+    context: &str,
+) -> Option<String> {
+    if is_safe_node_modules_entry_name(&name) {
+        Some(name)
+    } else {
+        tracing::warn!("skipping unsafe {context} name {name:?} for {package_name}@{version}");
+        None
+    }
+}
+
+fn ensure_real_dir(path: &Path, label: &str) -> Result<(), LpmError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to inspect {label} directory at {}: {e}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(LpmError::Store(format!(
+            "refusing to write {label} through symlinked directory {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(LpmError::Store(format!(
+            "refusing to write {label} through non-directory {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_child_dir(dir: &Path, label: &str) -> Result<(), LpmError> {
+    match dir.symlink_metadata() {
+        Ok(_) => ensure_real_dir(dir, label),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+            ensure_real_dir(dir, label)
+        }
+        Err(error) => Err(LpmError::Store(format!(
+            "failed to inspect {label} directory at {}: {error}",
+            dir.display()
+        ))),
+    }
 }
 
 /// System binaries that packages should not shadow without warning.
@@ -850,6 +911,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
     // parent). They're now disjoint paths, so each gets its
     // own create.
     std::fs::create_dir_all(&node_modules)?;
+    ensure_real_dir(&node_modules, "node_modules")?;
     std::fs::create_dir_all(&lpm_dir)?;
 
     // D6: layout schema version. Written best-effort — if the write
@@ -931,10 +993,17 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
             if name == ".lpm" || name.starts_with('.') {
                 continue;
             }
+            let entry_path = entry.path();
+            let Ok(entry_metadata) = entry_path.symlink_metadata() else {
+                continue;
+            };
             // For scoped packages, check the full path
-            let full_name = if entry.path().is_dir() && name.starts_with('@') {
+            let full_name = if entry_metadata.is_dir()
+                && !entry_metadata.file_type().is_symlink()
+                && name.starts_with('@')
+            {
                 // Check children of scope dir
-                if let Ok(scope_entries) = std::fs::read_dir(entry.path()) {
+                if let Ok(scope_entries) = std::fs::read_dir(&entry_path) {
                     for se in scope_entries.flatten() {
                         let se_path = se.path();
                         let scoped_name = format!("{name}/{}", se.file_name().to_string_lossy());
@@ -963,10 +1032,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
             } else {
                 name.clone()
             };
-            let entry_path = entry.path();
-            let is_symlink = entry_path
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink());
+            let is_symlink = entry_metadata.file_type().is_symlink();
             if !is_symlink {
                 continue;
             }
@@ -1278,16 +1344,28 @@ pub fn link_one_package(
     // dedup is one of the levers identified in the close-out.
     let mut scope_dirs_created: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for dep in &target.dependencies {
+        if !is_safe_node_modules_entry_name(&dep.local) {
+            tracing::warn!(
+                "skipping unsafe dependency local name {:?} for {}@{}",
+                dep.local,
+                target.name,
+                target.version
+            );
+            continue;
+        }
         if let Some((scope, _)) = dep.local.split_once('/')
             && scope.starts_with('@')
             && scope_dirs_created.insert(scope)
         {
-            std::fs::create_dir_all(pkg_nm_dir.join(scope))?;
+            ensure_child_dir(&pkg_nm_dir.join(scope), "dependency scope")?;
         }
     }
 
     for dep in &target.dependencies {
         let dep_local = dep.local.as_str();
+        if !is_safe_node_modules_entry_name(dep_local) {
+            continue;
+        }
         let dep_link = pkg_nm_dir.join(dep_local);
 
         if dep_link.exists() || dep_link.symlink_metadata().is_ok() {
@@ -1378,7 +1456,10 @@ pub fn link_finalize(
                 (None, true) => vec![pkg.name.clone()],
                 (None, false) => default_link.clone(),
             };
-            names.into_iter().map(move |n| (pkg, n))
+            names.into_iter().filter_map(move |n| {
+                filter_node_modules_entry_name(n, &pkg.name, &pkg.version, "root link")
+                    .map(|name| (pkg, name))
+            })
         })
         .collect();
 
@@ -1400,7 +1481,7 @@ pub fn link_finalize(
             && scope.starts_with('@')
             && root_scope_dirs.insert(scope)
         {
-            std::fs::create_dir_all(node_modules.join(scope))?;
+            ensure_child_dir(&node_modules.join(scope), "root scope")?;
         }
     }
 
@@ -1464,7 +1545,7 @@ pub fn link_finalize(
                 if self_name.starts_with('@')
                     && let Some(scope_dir) = self_link.parent()
                 {
-                    let _ = std::fs::create_dir_all(scope_dir);
+                    ensure_child_dir(scope_dir, "self-reference scope")?;
                 }
                 // Symlink node_modules/{name} → project root
                 // For scoped packages, we need to go up one extra level
@@ -1563,7 +1644,7 @@ pub fn link_workspace_member(
     // (`@scope/name`) this creates the `@scope/` directory; for unscoped
     // packages this is a no-op because `node_modules/` itself is the parent.
     if let Some(link_parent) = link_path.parent() {
-        std::fs::create_dir_all(link_parent)?;
+        ensure_child_dir(link_parent, "workspace member scope")?;
     }
 
     // Defensive cleanup: any existing entry (file, dir, symlink) at the link
@@ -1702,7 +1783,10 @@ pub fn link_packages_hoisted(
             let name = entry.file_name();
             if name != ".bin" {
                 let path = entry.path();
-                if path.is_dir() {
+                if path
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                {
                     let _ = std::fs::remove_dir_all(&path);
                 } else {
                     let _ = std::fs::remove_file(&path);
@@ -1712,6 +1796,7 @@ pub fn link_packages_hoisted(
     }
 
     std::fs::create_dir_all(&node_modules)?;
+    ensure_real_dir(&node_modules, "node_modules")?;
 
     // Hoisted-symmetry: bootstrap the project-local hoisted state
     // directory so the metadata write at the bottom of this function
@@ -1871,10 +1956,15 @@ pub fn link_packages_hoisted(
     //     None) and direct deps that pre-date alias plumbing or
     //     deliberately use the canonical-only shape.
     let slots_for_pkg = |pkg: &LinkTarget| -> Vec<String> {
-        match &pkg.root_link_names {
+        let raw = match &pkg.root_link_names {
             Some(names) => names.clone(),
             None => vec![pkg.name.clone()],
-        }
+        };
+        raw.into_iter()
+            .filter_map(|slot| {
+                filter_node_modules_entry_name(slot, &pkg.name, &pkg.version, "hoisted root")
+            })
+            .collect()
     };
 
     for (idx, pkg) in packages.iter().enumerate() {
@@ -2060,7 +2150,7 @@ pub fn link_packages_hoisted(
             if name.starts_with('@')
                 && let Some(parent) = target_dir.parent()
             {
-                std::fs::create_dir_all(parent)?;
+                ensure_child_dir(parent, "hoisted root scope")?;
             }
 
             link_dir_recursive(&pkg.store_path, &target_dir)?;
@@ -2174,7 +2264,7 @@ pub fn link_packages_hoisted(
                     if self_name.starts_with('@')
                         && let Some(scope_dir) = self_link.parent()
                     {
-                        let _ = std::fs::create_dir_all(scope_dir);
+                        ensure_child_dir(scope_dir, "self-reference scope")?;
                     }
                     let depth = self_name.matches('/').count();
                     let mut target = PathBuf::new();
@@ -3750,6 +3840,42 @@ mod tests {
     }
 
     #[test]
+    fn hoisted_linker_skips_root_link_name_with_traversal() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let store_path = create_fake_store_package(store_dir.path(), "foo");
+
+        let packages = vec![LinkTarget {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: Some(vec!["../escape".to_string(), "foo".to_string()]),
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+            peers: Vec::new(),
+            patch_fingerprint: None,
+        }];
+
+        let result = link_packages_hoisted(project_dir.path(), &packages, false, None).unwrap();
+
+        assert_eq!(
+            result.linked, 1,
+            "only the safe hoisted root directory should be materialized",
+        );
+        assert!(
+            project_dir.path().join("node_modules").join("foo").exists(),
+            "safe hoisted root directory must still be created",
+        );
+        assert!(
+            !project_dir.path().join("escape").exists(),
+            "unsafe hoisted root name must not materialize outside node_modules",
+        );
+    }
+
+    #[test]
     fn hoisted_mode_nests_conflicts() {
         let store_dir = tempfile::tempdir().unwrap();
         let project_dir = tempfile::tempdir().unwrap();
@@ -4403,6 +4529,152 @@ mod tests {
         // No symlink created outside node_modules
         let evil_link = project_dir.path().join("node_modules/../../evil");
         assert!(evil_link.symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn isolated_linker_skips_root_link_name_with_traversal() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "foo");
+        let packages = vec![LinkTarget {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: Some(vec!["../escape".to_string(), "foo".to_string()]),
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+            peers: Vec::new(),
+            patch_fingerprint: None,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+
+        assert_eq!(
+            result.symlinked, 1,
+            "only the safe root link should be created",
+        );
+        assert!(
+            project_dir.path().join("node_modules").join("foo").exists(),
+            "safe root link must still be created",
+        );
+        assert!(
+            !project_dir.path().join("escape").exists(),
+            "unsafe root link must not create an entry outside node_modules",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_linker_does_not_write_through_symlinked_scope_parent() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let node_modules = project_dir.path().join("node_modules");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::os::unix::fs::symlink(outside.path(), node_modules.join("@scope")).unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "@scope/pkg");
+        let packages = vec![LinkTarget {
+            name: "@scope/pkg".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+            peers: Vec::new(),
+            patch_fingerprint: None,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+
+        assert!(
+            result.symlinked >= 1,
+            "safe root link should still be recreated after stale symlink cleanup",
+        );
+        assert!(
+            !outside.path().join("pkg").exists(),
+            "root link must not be created through a symlinked scope parent",
+        );
+        assert!(
+            project_dir
+                .path()
+                .join("node_modules")
+                .join("@scope")
+                .join("pkg")
+                .symlink_metadata()
+                .is_ok(),
+            "root link should be recreated under a real node_modules scope dir",
+        );
+    }
+
+    #[test]
+    fn isolated_linker_skips_dependency_local_name_with_traversal() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let store_path = create_fake_store_package(store_dir.path(), "foo");
+        let packages = vec![LinkTarget {
+            name: "foo".to_string(),
+            version: "1.0.0".to_string(),
+            store_path,
+            dependencies: vec![LinkDependency::registry("../../../../escape", "1.0.0")],
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: Materialization::CasBacked,
+            peers: Vec::new(),
+            patch_fingerprint: None,
+        }];
+
+        let result = link_packages(project_dir.path(), &packages, false, None).unwrap();
+
+        assert_eq!(
+            result.linked, 1,
+            "only package materialization/root link should count; unsafe dep edge is skipped",
+        );
+        assert!(
+            project_dir
+                .path()
+                .join("escape")
+                .symlink_metadata()
+                .is_err(),
+            "unsafe dependency local name must not create an entry outside the wrapper",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_member_link_rejects_symlinked_node_modules_root() {
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("project");
+        let member_source = root.path().join("packages").join("foo");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&member_source).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(member_source.join("package.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(&outside, project_dir.join("node_modules")).unwrap();
+
+        let err = link_workspace_member(&project_dir.join("node_modules"), "foo", &member_source)
+            .unwrap_err();
+
+        assert!(
+            format!("{err}").contains("symlinked directory"),
+            "error should reject symlinked node_modules root, got: {err}",
+        );
+        assert!(
+            outside.join("foo").symlink_metadata().is_err(),
+            "workspace link must not be created through symlinked node_modules",
+        );
     }
 
     // ---- Finding: Additional hoisted mode tests ----

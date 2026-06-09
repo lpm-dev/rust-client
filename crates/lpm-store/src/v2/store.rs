@@ -16,7 +16,9 @@ use lpm_common::{LpmError, LpmRoot};
 
 use crate::StageTimings;
 use crate::v2::graph_key::GraphKey;
-use crate::v2::link_meta::{LINK_META_FILENAME, LinkMeta, LinkMetaDep, LinkMetaPlatform};
+use crate::v2::link_meta::{
+    LINK_META_FILENAME, LinkMeta, LinkMetaDep, LinkMetaPlatform, validate_name_for_path_join,
+};
 
 /// v2 layout version segment under `~/.lpm/store/`. Bumped whenever
 /// the on-disk shape changes; lpm reading a higher-numbered store
@@ -1097,6 +1099,14 @@ fn create_sibling_symlink(
     dep: &DepLink,
     self_key: &GraphKey,
 ) -> Result<(), LpmError> {
+    if let Err(why) = validate_name_for_path_join(&dep.local) {
+        return Err(LpmError::Store(format!(
+            "unsafe dependency local name {:?} in v2 link entry for {}: {why}",
+            dep.local,
+            self_key.dir_name()
+        )));
+    }
+
     // Link path: `<...>/node_modules/<dep.local>/`.
     let link_path = node_modules.join(&dep.local);
 
@@ -2033,6 +2043,51 @@ mod tests {
         assert_eq!(sidecar.deps.len(), 1);
         assert_eq!(sidecar.deps[0].local, "debug");
         assert_eq!(sidecar.deps[0].target_graph_key, dep_key.digest_hex());
+    }
+
+    #[test]
+    fn populate_rejects_dependency_local_name_with_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let pkg_sri = synthetic_sri(b"populate_rejects_unsafe_dep/pkg");
+        let dep_sri = synthetic_sri(b"populate_rejects_unsafe_dep/dep");
+        let pkg_obj = write_object(&store, &pkg_sri, &[("package.json", b"{}")]);
+        write_object(&store, &dep_sri, &[("package.json", b"{}")]);
+
+        let pkg_key = arc_key("consumer", "1.0.0");
+        let dep_key = arc_key("debug", "4.3.4");
+        store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: dep_key.clone(),
+                source_sri: dep_sri.clone(),
+                object_dir: store.paths().object_dir(&dep_sri).unwrap(),
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+
+        let err = store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: pkg_key.clone(),
+                source_sri: pkg_sri,
+                object_dir: pkg_obj,
+                deps: vec![DepLink {
+                    local: "../../../../escape".into(),
+                    target: dep_key,
+                }],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap_err();
+
+        assert!(
+            format!("{err}").contains("unsafe dependency local name"),
+            "error should identify the unsafe local name, got: {err}",
+        );
+        assert!(
+            !store.paths().link_dir(&pkg_key).exists(),
+            "failed population must not publish a partial link entry",
+        );
     }
 
     #[test]
