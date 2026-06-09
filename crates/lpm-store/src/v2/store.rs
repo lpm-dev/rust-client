@@ -920,11 +920,10 @@ impl Store {
 
     /// Populate `objects/<sri>/` from a live local source directory.
     ///
-    /// The populated object is a per-file symlink tree pointing at the
-    /// source realpath, so link entries built from it stay live to
-    /// source edits without re-running install. The synthetic SRI is a
-    /// stable identity key rather than a content hash, so each populate
-    /// refreshes the symlink tree to pick up added and removed files.
+    /// The populated object is a real-file snapshot of the source
+    /// tree. The synthetic SRI is a stable identity key rather than a
+    /// content hash, so each populate refreshes the snapshot to pick
+    /// up added, changed, and removed files.
     pub fn populate_object_from_local_source(
         &self,
         source_dir: &Path,
@@ -1379,7 +1378,9 @@ fn walk_local_source_object(
         let ft = metadata.file_type();
         if ft.is_dir() {
             walk_local_source_object(source_root, &entry_src, &entry_dst, depth + 1)?;
-        } else if ft.is_file() || ft.is_symlink() {
+        } else if ft.is_file() {
+            materialize_local_source_file(&entry_src, &entry_dst)?;
+        } else if ft.is_symlink() {
             let abs_target = entry_src
                 .canonicalize()
                 .unwrap_or_else(|_| entry_src.clone());
@@ -1391,16 +1392,50 @@ fn walk_local_source_object(
                     "v2 local-source object: symlink escapes source root; exposing target as-is"
                 );
             }
-            create_fs_symlink(&abs_target, &entry_dst).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to stage v2 local-source symlink {} → {}: {e}",
-                    entry_dst.display(),
-                    abs_target.display()
-                ))
-            })?;
+            match std::fs::metadata(&abs_target) {
+                Ok(meta) if meta.is_file() => {
+                    materialize_local_source_file(&abs_target, &entry_dst)?;
+                }
+                _ => {
+                    create_fs_symlink(&abs_target, &entry_dst).map_err(|e| {
+                        LpmError::Store(format!(
+                            "failed to stage v2 local-source symlink {} → {}: {e}",
+                            entry_dst.display(),
+                            abs_target.display()
+                        ))
+                    })?;
+                }
+            }
         }
     }
 
+    Ok(())
+}
+
+fn materialize_local_source_file(src: &Path, dst: &Path) -> Result<(), LpmError> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to create v2 local-source object parent at {}: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    if let Err(e) = std::fs::hard_link(src, dst) {
+        tracing::trace!(
+            src = %src.display(),
+            dst = %dst.display(),
+            error = %e,
+            "v2 local-source object: hardlink failed, falling back to copy"
+        );
+        std::fs::copy(src, dst).map_err(|copy_err| {
+            LpmError::Store(format!(
+                "failed to copy v2 local-source file {} → {}: {copy_err}",
+                src.display(),
+                dst.display()
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -1793,7 +1828,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn populate_object_from_local_source_keeps_live_symlink_tree() {
+    fn populate_object_from_local_source_materializes_real_files_for_node_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
         let source = dir.path().join("source");
@@ -1813,12 +1848,22 @@ mod tests {
 
         assert!(object_dir.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file());
         assert!(
-            object_dir
+            !object_dir
                 .join("package.json")
                 .symlink_metadata()
                 .unwrap()
                 .file_type()
-                .is_symlink()
+                .is_symlink(),
+            "local-source package files must be real files so Node keeps module realpaths inside the v2 link entry"
+        );
+        assert!(
+            !object_dir
+                .join("index.js")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "local-source entrypoints must not be symlinks"
         );
         assert!(
             !object_dir.join("node_modules").exists(),
@@ -1827,14 +1872,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(object_dir.join("index.js")).unwrap(),
             "module.exports = 'before';\n"
-        );
-
-        std::fs::write(source.join("index.js"), b"module.exports = 'after';\n").unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(object_dir.join("index.js")).unwrap(),
-            "module.exports = 'after';\n",
-            "local-source object must stay live to source edits"
         );
     }
 

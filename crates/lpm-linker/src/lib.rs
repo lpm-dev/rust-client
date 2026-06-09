@@ -444,6 +444,63 @@ pub enum Materialization {
     DirectorySource,
 }
 
+/// One dependency edge inside a linked package.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LinkDependency {
+    /// Name used by the consumer package in `require()` / `import`.
+    pub local: String,
+    /// Canonical package name of the target package.
+    pub target_name: String,
+    /// Exact version of the target package.
+    pub target_version: String,
+    /// Source wrapper identity for non-registry targets. `None`
+    /// means the edge targets the registry/CAS-backed
+    /// `<target_name>@<target_version>` instance.
+    pub target_wrapper_id: Option<String>,
+}
+
+impl LinkDependency {
+    pub fn new(
+        local: impl Into<String>,
+        target_name: impl Into<String>,
+        target_version: impl Into<String>,
+        target_wrapper_id: Option<String>,
+    ) -> Self {
+        Self {
+            local: local.into(),
+            target_name: target_name.into(),
+            target_version: target_version.into(),
+            target_wrapper_id,
+        }
+    }
+
+    pub fn registry(local: impl Into<String>, target_version: impl Into<String>) -> Self {
+        let local = local.into();
+        Self {
+            target_name: local.clone(),
+            local,
+            target_version: target_version.into(),
+            target_wrapper_id: None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn graph_key_value(&self) -> &str {
+        self.target_wrapper_id
+            .as_deref()
+            .unwrap_or(&self.target_version)
+    }
+
+    #[inline]
+    fn wrapper_segment(&self) -> String {
+        let safe_target = self.target_name.replace('/', "+");
+        match self.target_wrapper_id.as_deref() {
+            Some(wrapper_id) => format!("{safe_target}+{wrapper_id}"),
+            None => format!("{safe_target}@{}", self.target_version),
+        }
+    }
+}
+
 /// A package to be linked into node_modules.
 #[derive(Debug, Clone)]
 pub struct LinkTarget {
@@ -455,21 +512,19 @@ pub struct LinkTarget {
     pub version: String,
     /// Path to the package in the global store.
     pub store_path: PathBuf,
-    /// Dependencies of this package: `(local_name_in_this_package, dep_version)`.
+    /// Dependencies of this package.
     ///
-    /// The local name is what appears as `node_modules/<local>/` inside
-    /// THIS package's `.lpm/<self>@<ver>/node_modules/`. For regular
-    /// deps the local name equals the child's canonical registry name.
-    /// For npm-alias edges, it is the alias key from this
-    /// package's `package.json` (e.g., `strip-ansi-cjs`), and
-    /// [`Self::aliases`] records the canonical registry name so the
-    /// linker can resolve the symlink target to `<target>@<ver>`.
-    pub dependencies: Vec<(String, String)>,
+    /// Each edge records the local import name plus the target's
+    /// package identity. Registry/CAS-backed edges target
+    /// `<target_name>@<target_version>`; source-backed edges also
+    /// carry `target_wrapper_id` so same-name same-version packages
+    /// from different sources remain distinct.
+    pub dependencies: Vec<LinkDependency>,
     /// npm-alias edges: `local_name → target_canonical_name`.
     /// Populated only for local names that refer to a different
     /// registry-canonical target than themselves (the common case is
-    /// empty). Lookup rule: `aliases.get(local).unwrap_or(local)`
-    /// produces the target used for the store path.
+    /// empty). Kept in the graph-key input so alias-shaped installs
+    /// do not share link entries with canonical-name installs.
     pub aliases: HashMap<String, String>,
     /// Whether this is a direct dependency of the root project.
     ///
@@ -720,11 +775,23 @@ fn compute_link_stamp(target: &LinkTarget) -> String {
     // regardless of `target.dependencies` / `target.aliases` iteration
     // order (Vec preserves insertion order; the resolver doesn't
     // guarantee a stable order across runs).
-    let mut deps_sorted: Vec<&(String, String)> = target.dependencies.iter().collect();
-    deps_sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut deps_sorted: Vec<&LinkDependency> = target.dependencies.iter().collect();
+    deps_sorted.sort_by(|a, b| {
+        a.local
+            .cmp(&b.local)
+            .then_with(|| a.target_name.cmp(&b.target_name))
+            .then_with(|| a.graph_key_value().cmp(b.graph_key_value()))
+    });
     let deps_str = deps_sorted
         .iter()
-        .map(|(n, v)| format!("{n}@{v}"))
+        .map(|dep| {
+            format!(
+                "{}=>{}@{}",
+                dep.local,
+                dep.target_name,
+                dep.graph_key_value()
+            )
+        })
         .collect::<Vec<_>>()
         .join(",");
 
@@ -1210,8 +1277,8 @@ pub fn link_one_package(
     // The samply warm-relink flamegraph shows mkdir at 20.5% of CPU; this
     // dedup is one of the levers identified in the close-out.
     let mut scope_dirs_created: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (dep_local, _) in &target.dependencies {
-        if let Some((scope, _)) = dep_local.split_once('/')
+    for dep in &target.dependencies {
+        if let Some((scope, _)) = dep.local.split_once('/')
             && scope.starts_with('@')
             && scope_dirs_created.insert(scope)
         {
@@ -1219,17 +1286,13 @@ pub fn link_one_package(
         }
     }
 
-    for (dep_local, dep_version) in &target.dependencies {
+    for dep in &target.dependencies {
+        let dep_local = dep.local.as_str();
         let dep_link = pkg_nm_dir.join(dep_local);
 
         if dep_link.exists() || dep_link.symlink_metadata().is_ok() {
             continue;
         }
-
-        let dep_target = target
-            .aliases
-            .get(dep_local)
-            .map_or(dep_local.as_str(), String::as_str);
 
         // Symlink to the dep's location in .lpm/
         // Base: ../../<dep_target>@<ver>/node_modules/<dep_target>
@@ -1238,39 +1301,14 @@ pub fn link_one_package(
         // deep — so we traverse one more `..`. The `..` depth is
         // computed from the LOCAL name (which decides where the
         // symlink FILE sits).
-        let safe_target = dep_target.replace('/', "+");
         let depth = 2 + dep_local.matches('/').count();
         let mut sym_target = PathBuf::new();
         for _ in 0..depth {
             sym_target.push("..");
         }
-        // Wrapper-segment shape branch. Targets whose `wrapper_id` is
-        // non-None use `<safe>+<wrapper_id>` instead of
-        // `<safe>@<version>`. The `dep_version` slot carries the
-        // resolved SemVer for Registry targets, and the source-id
-        // (`f-{16hex}` / `l-{16hex}` / `t-{16hex}`) for every other
-        // source kind. The `t-` arm exists so
-        // transitive Tarball deps (when they're tracked in a future
-        // phase) route to the same `<safe>+t-{16hex}` wrapper that
-        // immediate Tarball deps already use.
-        //
-        // The `<letter>-` prefix is the discriminator: SemVer
-        // versions never start with `f-` / `l-` / `t-` (`t-…` would
-        // need to be the major-version slot, which can't be
-        // alphabetic). Day-5 commit body documents this contract;
-        // if a future version-string shape ever collides, the
-        // escape hatch is a `dep_kinds` field on LinkTarget.
-        let is_source_id = dep_version.starts_with("f-")
-            || dep_version.starts_with("l-")
-            || dep_version.starts_with("t-");
-        let wrapper_segment = if is_source_id {
-            format!("{safe_target}+{dep_version}")
-        } else {
-            format!("{safe_target}@{dep_version}")
-        };
-        sym_target.push(wrapper_segment);
+        sym_target.push(dep.wrapper_segment());
         sym_target.push("node_modules");
-        sym_target.push(dep_target);
+        sym_target.push(&dep.target_name);
 
         create_symlink_or_junction(&sym_target, &dep_link)?;
         symlinks_created += 1;
@@ -1794,9 +1832,9 @@ pub fn link_packages_hoisted(
     // saved on a 266-package install like bench/fixture-large).
     let mut depended_by: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
     for (idx, pkg) in packages.iter().enumerate() {
-        for (dep_name, dep_ver) in &pkg.dependencies {
+        for dep in &pkg.dependencies {
             depended_by
-                .entry((dep_name.as_str(), dep_ver.as_str()))
+                .entry((dep.target_name.as_str(), dep.target_version.as_str()))
                 .or_default()
                 .push(idx);
         }
@@ -2984,7 +3022,7 @@ mod tests {
                 name: "express".to_string(),
                 version: "4.22.1".to_string(),
                 store_path: express_store,
-                dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                dependencies: vec![LinkDependency::registry("debug", "2.6.9")],
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
@@ -3566,7 +3604,7 @@ mod tests {
                 name: "express".to_string(),
                 version: "4.22.1".to_string(),
                 store_path: express_store,
-                dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                dependencies: vec![LinkDependency::registry("debug", "2.6.9")],
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
@@ -3579,7 +3617,7 @@ mod tests {
                 name: "debug".to_string(),
                 version: "2.6.9".to_string(),
                 store_path: debug_store,
-                dependencies: vec![("ms".to_string(), "2.0.0".to_string())],
+                dependencies: vec![LinkDependency::registry("ms", "2.0.0")],
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
@@ -3726,7 +3764,7 @@ mod tests {
                 name: "express".to_string(),
                 version: "4.22.1".to_string(),
                 store_path: express_store,
-                dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                dependencies: vec![LinkDependency::registry("debug", "2.6.9")],
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
@@ -3752,7 +3790,7 @@ mod tests {
                 name: "other".to_string(),
                 version: "1.0.0".to_string(),
                 store_path: other_store,
-                dependencies: vec![("debug".to_string(), "3.0.0".to_string())],
+                dependencies: vec![LinkDependency::registry("debug", "3.0.0")],
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
@@ -3808,7 +3846,7 @@ mod tests {
                 name: "parent".to_string(),
                 version: "1.0.0".to_string(),
                 store_path: parent_store,
-                dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                dependencies: vec![LinkDependency::registry("debug", "2.6.9")],
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
@@ -4428,8 +4466,8 @@ mod tests {
                 version: "1.0.0".to_string(),
                 store_path: a_store,
                 dependencies: vec![
-                    ("shared".to_string(), "1.0.0".to_string()),
-                    ("util".to_string(), "1.0.0".to_string()),
+                    LinkDependency::registry("shared", "1.0.0"),
+                    LinkDependency::registry("util", "1.0.0"),
                 ],
                 aliases: HashMap::new(),
                 is_direct: true,
@@ -4470,8 +4508,8 @@ mod tests {
                 version: "1.0.0".to_string(),
                 store_path: b_store,
                 dependencies: vec![
-                    ("shared".to_string(), "2.0.0".to_string()),
-                    ("util".to_string(), "2.0.0".to_string()),
+                    LinkDependency::registry("shared", "2.0.0"),
+                    LinkDependency::registry("util", "2.0.0"),
                 ],
                 aliases: HashMap::new(),
                 is_direct: true,
@@ -4574,7 +4612,7 @@ mod tests {
                 name: "anchor".to_string(),
                 version: "1.0.0".to_string(),
                 store_path: anchor_store,
-                dependencies: vec![("consumer".to_string(), "10.0.0".to_string())],
+                dependencies: vec![LinkDependency::registry("consumer", "10.0.0")],
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
@@ -4588,7 +4626,7 @@ mod tests {
                 name: "consumer".to_string(),
                 version: "3.0.0".to_string(),
                 store_path: consumer_v3_store,
-                dependencies: vec![("dep".to_string(), "1.0.0".to_string())],
+                dependencies: vec![LinkDependency::registry("dep", "1.0.0")],
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
@@ -4618,7 +4656,7 @@ mod tests {
                 name: "consumer".to_string(),
                 version: "10.0.0".to_string(),
                 store_path: consumer_v10_store,
-                dependencies: vec![("dep".to_string(), "5.0.0".to_string())],
+                dependencies: vec![LinkDependency::registry("dep", "5.0.0")],
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
@@ -5532,7 +5570,7 @@ mod tests {
                 name: "express".to_string(),
                 version: "4.22.1".to_string(),
                 store_path: express_store,
-                dependencies: vec![("debug".to_string(), "2.6.9".to_string())],
+                dependencies: vec![LinkDependency::registry("debug", "2.6.9")],
                 aliases: HashMap::new(),
                 is_direct: true,
                 root_link_names: None,
@@ -5601,8 +5639,8 @@ mod tests {
                 version: "1.0.0".to_string(),
                 store_path: direct_store,
                 dependencies: vec![
-                    ("trans".to_string(), "1.0.0".to_string()),
-                    ("debug".to_string(), "2.0.0".to_string()),
+                    LinkDependency::registry("trans", "1.0.0"),
+                    LinkDependency::registry("debug", "2.0.0"),
                 ],
                 aliases: HashMap::new(),
                 is_direct: true,
@@ -5616,7 +5654,7 @@ mod tests {
                 name: "trans".to_string(),
                 version: "1.0.0".to_string(),
                 store_path: trans_store,
-                dependencies: vec![("debug".to_string(), "3.0.0".to_string())],
+                dependencies: vec![LinkDependency::registry("debug", "3.0.0")],
                 aliases: HashMap::new(),
                 is_direct: false,
                 root_link_names: None,
@@ -6720,7 +6758,7 @@ mod tests {
             name: "foo".to_string(),
             version: "1.0.0".to_string(),
             store_path: pkg_a_store,
-            dependencies: vec![("leftpad".to_string(), "1.0.0".to_string())],
+            dependencies: vec![LinkDependency::registry("leftpad", "1.0.0")],
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: Some(vec!["foo".to_string()]),
@@ -6841,7 +6879,7 @@ mod tests {
             name: "foo".to_string(),
             version: "1.0.0".to_string(),
             store_path: foo_source.clone(),
-            dependencies: vec![("leftpad".to_string(), "1.0.0".to_string())],
+            dependencies: vec![LinkDependency::registry("leftpad", "1.0.0")],
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: Some(vec!["foo".to_string()]),
@@ -6870,7 +6908,7 @@ mod tests {
             name: "foo".to_string(),
             version: "1.0.0".to_string(),
             store_path: foo_source,
-            dependencies: vec![("leftpad".to_string(), "2.0.0".to_string())],
+            dependencies: vec![LinkDependency::registry("leftpad", "2.0.0")],
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: Some(vec!["foo".to_string()]),
@@ -7399,28 +7437,22 @@ mod tests {
     // ── dep-target wrapper-segment branch ────────────────────────────
 
     #[test]
-    fn link_one_package_dep_target_uses_plus_shape_for_f_prefix_dep_version() {
-        // F7-transitive contract: when an InstallPackage's
-        // `dependencies: Vec<(String, String)>` carries a
-        // `dep_version` starting with `f-` or `l-`, the dep symlink
-        // target is `<safe>+<dep_version>` (matching the linker's
-        // wrapper-segment shape for local-source deps), NOT
-        // `<safe>@<dep_version>`. Without the branch, transitive
-        // file:/link: deps from a directory source would point at
-        // `.lpm/<dep>@f-{16hex}/...` — a wrapper that doesn't exist.
+    fn link_one_package_dep_target_uses_plus_shape_for_file_source_edge() {
         let root = tempfile::tempdir().unwrap();
         let store_dir = root.path().join("store");
         let project_dir = root.path().join("project");
         let parent_store = create_fake_store_package(&store_dir, "parent");
 
-        // Parent has a transitive dep with a `f-`-prefixed version
-        // `apply_post_resolve_directory_link_fixup` produces this
-        // shape for FileDir transitives.
         let parent = LinkTarget {
             name: "parent".to_string(),
             version: "1.0.0".to_string(),
             store_path: parent_store,
-            dependencies: vec![("local-dep".to_string(), "f-deadbeef00000000".to_string())],
+            dependencies: vec![LinkDependency::new(
+                "local-dep",
+                "local-dep",
+                "0.1.0",
+                Some("f-deadbeef00000000".to_string()),
+            )],
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
@@ -7441,12 +7473,11 @@ mod tests {
             .join("local-dep+f-deadbeef00000000")
             .join("node_modules")
             .join("local-dep");
-        assert_eq!(target, expected, "f- prefix MUST route to + shape");
+        assert_eq!(target, expected, "file source edge must route to + shape");
     }
 
     #[test]
-    fn link_one_package_dep_target_uses_plus_shape_for_l_prefix_dep_version() {
-        // Same as above for `l-` prefix (link: deps).
+    fn link_one_package_dep_target_uses_plus_shape_for_link_source_edge() {
         let root = tempfile::tempdir().unwrap();
         let store_dir = root.path().join("store");
         let project_dir = root.path().join("project");
@@ -7456,7 +7487,12 @@ mod tests {
             name: "parent".to_string(),
             version: "1.0.0".to_string(),
             store_path: parent_store,
-            dependencies: vec![("linked-dep".to_string(), "l-cafebabe00000000".to_string())],
+            dependencies: vec![LinkDependency::new(
+                "linked-dep",
+                "linked-dep",
+                "0.1.0",
+                Some("l-cafebabe00000000".to_string()),
+            )],
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
@@ -7475,7 +7511,7 @@ mod tests {
             .join("linked-dep+l-cafebabe00000000")
             .join("node_modules")
             .join("linked-dep");
-        assert_eq!(target, expected, "l- prefix MUST route to + shape");
+        assert_eq!(target, expected, "link source edge must route to + shape");
     }
 
     #[test]
@@ -7492,7 +7528,7 @@ mod tests {
             name: "parent".to_string(),
             version: "1.0.0".to_string(),
             store_path: parent_store,
-            dependencies: vec![("lodash".to_string(), "4.17.21".to_string())],
+            dependencies: vec![LinkDependency::registry("lodash", "4.17.21")],
             aliases: HashMap::new(),
             is_direct: true,
             root_link_names: None,
