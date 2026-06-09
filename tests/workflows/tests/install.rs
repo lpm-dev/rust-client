@@ -3422,6 +3422,107 @@ async fn warm_v2_lockfile_peer_install_resolves_peer_after_relink() {
     );
 }
 
+#[tokio::test]
+async fn warm_v2_lockfile_install_preserves_blocked_metadata_when_registry_unavailable() {
+    const PUBLISHED_AT: &str = "2025-01-01T00:00:00.000Z";
+
+    fn blocked_published_at(project: &TempProject, package_name: &str) -> Option<String> {
+        let state: serde_json::Value =
+            serde_json::from_str(&project.read_file(".lpm/build-state.json"))
+                .expect("build-state.json should parse as JSON");
+        state["blocked_packages"]
+            .as_array()
+            .expect("blocked_packages should be an array")
+            .iter()
+            .find(|pkg| pkg["name"].as_str() == Some(package_name))
+            .and_then(|pkg| pkg["published_at"].as_str())
+            .map(ToString::to_string)
+    }
+
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "scripted-meta",
+            "version": "1.0.0",
+            "scripts": {
+                "postinstall": "node postinstall.js"
+            }
+        }),
+        &[(
+            "postinstall.js",
+            b"require('fs').writeFileSync('scripted-meta-built.txt', 'ok');\n",
+        )],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "warm-v2-blocked-metadata",
+  "version": "1.0.0",
+  "dependencies": {
+    "scripted-meta": "1.0.0"
+  }
+}"#,
+    );
+    let registry_url = mock.url();
+
+    let cold = lpm_with_registry(&project, &registry_url)
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run cold v2 install");
+    assert!(
+        cold.status.success(),
+        "cold v2 install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cold.stdout),
+        String::from_utf8_lossy(&cold.stderr),
+    );
+    assert_eq!(
+        blocked_published_at(&project, "scripted-meta").as_deref(),
+        Some(PUBLISHED_AT),
+        "cold install should enrich the blocked set from registry metadata",
+    );
+
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before warm relink");
+    drop(mock);
+
+    let warm = lpm_with_registry(&project, &registry_url)
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "--json",
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run warm v2 install");
+    assert!(
+        warm.status.success(),
+        "warm v2 install should succeed from the lockfile and store without registry metadata\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&warm.stderr),
+    );
+    let warm_json: serde_json::Value =
+        serde_json::from_slice(&warm.stdout).expect("warm install should emit JSON");
+    assert_eq!(
+        warm_json["used_lockfile"].as_bool(),
+        Some(true),
+        "second install should use the lockfile fast path",
+    );
+    assert_eq!(
+        blocked_published_at(&project, "scripted-meta").as_deref(),
+        Some(PUBLISHED_AT),
+        "warm lockfile install should replay prior blocked-set metadata",
+    );
+}
+
 /// Two independent fresh installs of the same package.json must produce
 /// byte-identical lpm.lock files. Non-determinism in the resolver or
 /// lockfile serializer would cause this test to fail via the snapshot.

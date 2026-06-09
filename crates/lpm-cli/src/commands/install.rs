@@ -7803,24 +7803,26 @@ async fn run_with_options_under_store_lock(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    // enrich the captured
-    // blocked-set with `published_at` and `behavioral_tags_hash` per
-    // package, drawing from the registry metadata the resolver
-    // already fetched (5-min TTL cache). On fresh resolutions this is
-    // effectively free; on offline / fast-path paths we pass empty
-    // metadata and the fields stay `None` (graceful degradation).
-    // Permanent perf diagnostic — see also similar tracers around
-    // `capture_blocked_set_after_install_with_metadata` and the trust
-    // snapshot block below. Surfaced via RUST_LOG=debug for post-stage
-    // performance investigations without re-instrumenting every time.
     let blocked_metadata_start = std::time::Instant::now();
-    let blocked_set_metadata =
-        build_blocked_set_metadata(arc_client.as_ref(), &route_table, &packages).await;
-    tracing::debug!(
-        "perf.build_blocked_set_metadata pkgs={} ms={}",
-        packages.len(),
-        blocked_metadata_start.elapsed().as_millis()
-    );
+    let blocked_set_metadata = if used_lockfile {
+        let metadata = blocked_set_metadata_from_previous_state(project_dir);
+        tracing::debug!(
+            "perf.reuse_blocked_set_metadata pkgs={} entries={} ms={}",
+            packages.len(),
+            metadata.by_pkg.len(),
+            blocked_metadata_start.elapsed().as_millis()
+        );
+        metadata
+    } else {
+        let metadata =
+            build_blocked_set_metadata(arc_client.as_ref(), &route_table, &packages).await;
+        tracing::debug!(
+            "perf.build_blocked_set_metadata pkgs={} ms={}",
+            packages.len(),
+            blocked_metadata_start.elapsed().as_millis()
+        );
+        metadata
+    };
     // Parse the project
     // capability request + user bound ONCE per install so the
     // install-time blocked-set capture, the autoBuild trust check
@@ -9704,6 +9706,38 @@ fn collect_amber_classification_requests(
         });
     }
     out
+}
+
+fn blocked_set_metadata_from_previous_state(
+    project_dir: &Path,
+) -> crate::build_state::BlockedSetMetadata {
+    let Some(previous) = crate::build_state::read_build_state(project_dir) else {
+        return crate::build_state::BlockedSetMetadata::default();
+    };
+
+    let mut metadata = crate::build_state::BlockedSetMetadata {
+        by_pkg: std::collections::HashMap::with_capacity(previous.blocked_packages.len()),
+    };
+    for package in previous.blocked_packages {
+        if package.published_at.is_none()
+            && package.behavioral_tags_hash.is_none()
+            && package.behavioral_tags.is_none()
+        {
+            continue;
+        }
+
+        metadata.insert(
+            package.name,
+            package.version,
+            crate::build_state::BlockedSetMetadataEntry {
+                published_at: package.published_at,
+                behavioral_tags_hash: package.behavioral_tags_hash,
+                behavioral_tags: package.behavioral_tags,
+                provenance_at_capture: None,
+            },
+        );
+    }
+    metadata
 }
 
 /// Never returns an error: metadata enrichment is best-effort and
@@ -14630,6 +14664,64 @@ mod tests {
         assert!(!v2_linking_can_prepare_before_fetch(
             true, false, true, true, false
         ));
+    }
+
+    #[test]
+    fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::build_state::write_build_state(
+            dir.path(),
+            &crate::build_state::BuildState {
+                state_version: crate::build_state::BUILD_STATE_VERSION,
+                blocked_set_fingerprint: "sha256-fixture".into(),
+                captured_at: "2026-06-09T00:00:00Z".into(),
+                blocked_packages: vec![
+                    crate::build_state::BlockedPackage {
+                        name: "scripted-meta".into(),
+                        version: "1.0.0".into(),
+                        integrity: Some("sha512-meta".into()),
+                        script_hash: Some("sha256-script".into()),
+                        phases_present: vec!["postinstall".into()],
+                        binding_drift: false,
+                        static_tier: None,
+                        provenance_at_capture: None,
+                        published_at: Some("2026-04-22T00:00:00Z".into()),
+                        behavioral_tags_hash: Some("sha256-tags".into()),
+                        behavioral_tags: Some(vec!["network".into(), "eval".into()]),
+                    },
+                    crate::build_state::BlockedPackage {
+                        name: "scripted-empty".into(),
+                        version: "1.0.0".into(),
+                        integrity: Some("sha512-empty".into()),
+                        script_hash: Some("sha256-empty".into()),
+                        phases_present: vec!["postinstall".into()],
+                        binding_drift: false,
+                        static_tier: None,
+                        provenance_at_capture: None,
+                        published_at: None,
+                        behavioral_tags_hash: None,
+                        behavioral_tags: None,
+                    },
+                ],
+                drift_ignore_override: None,
+            },
+        )
+        .unwrap();
+
+        let metadata = blocked_set_metadata_from_previous_state(dir.path());
+
+        assert_eq!(metadata.by_pkg.len(), 1);
+        let entry = metadata
+            .get("scripted-meta", "1.0.0")
+            .expect("metadata replay should include enriched prior rows");
+        assert_eq!(entry.published_at.as_deref(), Some("2026-04-22T00:00:00Z"));
+        assert_eq!(entry.behavioral_tags_hash.as_deref(), Some("sha256-tags"));
+        let tags = entry
+            .behavioral_tags
+            .as_deref()
+            .expect("metadata replay should preserve behavioral tag names");
+        assert_eq!(tags, ["network", "eval"]);
+        assert!(metadata.get("scripted-empty", "1.0.0").is_none());
     }
 
     // ── local-tarball path traversal ─────────────
