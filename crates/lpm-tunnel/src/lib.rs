@@ -20,6 +20,29 @@ pub mod ws_capture;
 
 pub use relay::resolve_relay_url;
 
+/// Plan and relay limits advertised by the tunnel service.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TunnelLimitMetadata {
+    /// Maximum simultaneously open tunnels for the account.
+    #[serde(default)]
+    pub max_concurrent: Option<u64>,
+    /// Per-session request limit per minute. Zero means unlimited.
+    #[serde(default)]
+    pub request_rate_limit_per_minute: Option<u64>,
+    /// Global relay request limit per minute per source IP.
+    #[serde(default)]
+    pub per_ip_rate_limit_per_minute: Option<u64>,
+    /// Maximum inbound request body size accepted by the relay.
+    #[serde(default)]
+    pub max_request_body_bytes: Option<u64>,
+    /// Number of custom tunnel domains the account can claim.
+    #[serde(default)]
+    pub max_custom_domains: Option<u64>,
+    /// Whether tunnel-auth headers are available for the account.
+    #[serde(default)]
+    pub tunnel_auth_available: Option<bool>,
+}
+
 /// Active tunnel session information.
 #[derive(Debug, Clone)]
 pub struct TunnelSession {
@@ -31,6 +54,18 @@ pub struct TunnelSession {
     pub session_id: String,
     /// Local port being tunneled.
     pub local_port: u16,
+    /// Account plan used by the relay for this session.
+    pub plan: Option<String>,
+    /// Base domain used by the assigned tunnel domain.
+    pub base_domain: Option<String>,
+    /// Assignment source: random, account default, or claimed custom domain.
+    pub domain_kind: Option<String>,
+    /// Epoch milliseconds when the relay will close the session.
+    pub session_expires_at: Option<u64>,
+    /// Maximum session lifetime in milliseconds. None means uncapped or not advertised.
+    pub session_max_ms: Option<u64>,
+    /// Relay limits applied to this session.
+    pub limits: Option<TunnelLimitMetadata>,
 }
 
 /// Default tunnel relay URL. Override per-process with the

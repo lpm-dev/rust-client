@@ -1,10 +1,10 @@
 use crate::install_ui;
-use lpm_common::LpmError;
+use lpm_common::{LpmError, format_bytes};
 use lpm_registry::RegistryClient;
 use std::fmt::Display;
 use std::io::IsTerminal;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Run the `lpm tunnel` command.
 ///
@@ -269,6 +269,12 @@ async fn run_start(
                         "domain": session.domain,
                         "local_port": session.local_port,
                         "session_id": session.session_id,
+                        "plan": session.plan,
+                        "base_domain": session.base_domain,
+                        "domain_kind": session.domain_kind,
+                        "session_expires_at": session.session_expires_at,
+                        "session_max_ms": session.session_max_ms,
+                        "limits": session.limits,
                         "tunnel_auth": tunnel_auth_display,
                         "inspector_url": inspector_url,
                         "auto_ack": auto_ack,
@@ -279,6 +285,15 @@ async fn run_start(
                 tunnel_detail("public URL", &session.tunnel_url);
                 if let Some(ref url) = inspector_url {
                     tunnel_detail("inspector", url);
+                }
+                if let Some(plan) = session.plan.as_deref() {
+                    tunnel_detail("plan", plan);
+                }
+                if let Some(expiry) = tunnel_session_expiry_summary(session) {
+                    tunnel_detail("expires", expiry);
+                }
+                if let Some(limits) = tunnel_limit_summary(session.limits.as_ref()) {
+                    tunnel_detail("limits", limits);
                 }
                 tunnel_detail("session", &session.session_id);
                 tunnel_detail("local", format!("localhost:{}", session.local_port));
@@ -723,6 +738,59 @@ fn tunnel_detail(label: &str, value: impl Display) {
     install_ui::detail(&format_tunnel_detail(label, value));
 }
 
+pub(crate) fn tunnel_session_expiry_summary(session: &lpm_tunnel::TunnelSession) -> Option<String> {
+    session
+        .session_expires_at
+        .map(|expires_at_ms| format_tunnel_expiry_at(expires_at_ms, current_time_millis()))
+}
+
+pub(crate) fn tunnel_limit_summary(
+    limits: Option<&lpm_tunnel::TunnelLimitMetadata>,
+) -> Option<String> {
+    let limits = limits?;
+    let mut parts = Vec::with_capacity(5);
+
+    if let Some(max_concurrent) = limits.max_concurrent {
+        parts.push(format!(
+            "{max_concurrent} {}",
+            plural(max_concurrent, "tunnel")
+        ));
+    }
+
+    if let Some(rate) = limits.request_rate_limit_per_minute {
+        if rate == 0 {
+            parts.push("requests unlimited".to_string());
+        } else {
+            parts.push(format!("{rate}/min"));
+        }
+    }
+
+    if let Some(max_body_bytes) = limits.max_request_body_bytes {
+        parts.push(format!("{} body", format_bytes(max_body_bytes)));
+    }
+
+    if let Some(max_custom_domains) = limits.max_custom_domains {
+        parts.push(format!(
+            "{max_custom_domains} custom {}",
+            plural(max_custom_domains, "domain")
+        ));
+    }
+
+    if let Some(per_ip_rate) = limits.per_ip_rate_limit_per_minute {
+        if per_ip_rate == 0 {
+            parts.push("per-IP unlimited".to_string());
+        } else {
+            parts.push(format!("{per_ip_rate}/min/IP"));
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
 fn format_tunnel_detail(label: &str, value: impl Display) -> String {
     let value = style_tunnel_detail_value(label, &value.to_string());
     format!("    {} {value}", install_ui::dim(&format!("{label:<11}")))
@@ -733,6 +801,54 @@ fn style_tunnel_detail_value(label: &str, value: &str) -> String {
         "public URL" | "inspector" | "browser" => install_ui::url(value),
         "local" => install_ui::yellow(value),
         _ => value.to_string(),
+    }
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn format_tunnel_expiry_at(expires_at_ms: u64, now_ms: u64) -> String {
+    if expires_at_ms <= now_ms {
+        return "now".to_string();
+    }
+    format!(
+        "in {}",
+        format_duration_compact_ms(expires_at_ms.saturating_sub(now_ms))
+    )
+}
+
+fn format_duration_compact_ms(ms: u64) -> String {
+    let seconds = ms.saturating_add(999) / 1000;
+    if seconds >= 3600 {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        if minutes > 0 {
+            format!("{hours}h {minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if seconds >= 60 {
+        let minutes = seconds / 60;
+        let remaining_seconds = seconds % 60;
+        if remaining_seconds > 0 {
+            format!("{minutes}m {remaining_seconds}s")
+        } else {
+            format!("{minutes}m")
+        }
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn plural(count: u64, singular: &str) -> String {
+    if count == 1 {
+        singular.to_string()
+    } else {
+        format!("{singular}s")
     }
 }
 
@@ -1264,6 +1380,55 @@ mod tests {
             format_tunnel_detail("session", "stripe-test"),
             "    session     stripe-test"
         );
+    }
+
+    #[test]
+    fn tunnel_limit_summary_includes_account_and_relay_caps() {
+        let limits = lpm_tunnel::TunnelLimitMetadata {
+            max_concurrent: Some(1),
+            request_rate_limit_per_minute: Some(100),
+            per_ip_rate_limit_per_minute: Some(600),
+            max_request_body_bytes: Some(10 * 1024 * 1024),
+            max_custom_domains: Some(0),
+            tunnel_auth_available: Some(false),
+        };
+
+        assert_eq!(
+            tunnel_limit_summary(Some(&limits)).as_deref(),
+            Some("1 tunnel · 100/min · 10.0 MB body · 0 custom domains · 600/min/IP")
+        );
+    }
+
+    #[test]
+    fn tunnel_limit_summary_displays_unlimited_request_rate() {
+        let limits = lpm_tunnel::TunnelLimitMetadata {
+            max_concurrent: Some(3),
+            request_rate_limit_per_minute: Some(0),
+            per_ip_rate_limit_per_minute: Some(600),
+            max_request_body_bytes: Some(100 * 1024 * 1024),
+            max_custom_domains: Some(3),
+            tunnel_auth_available: Some(true),
+        };
+
+        assert_eq!(
+            tunnel_limit_summary(Some(&limits)).as_deref(),
+            Some("3 tunnels · requests unlimited · 100.0 MB body · 3 custom domains · 600/min/IP")
+        );
+    }
+
+    #[test]
+    fn tunnel_expiry_formatter_shows_whole_hours() {
+        assert_eq!(format_tunnel_expiry_at(3_600_000, 0), "in 1h");
+    }
+
+    #[test]
+    fn tunnel_expiry_formatter_shows_remaining_minutes() {
+        assert_eq!(format_tunnel_expiry_at(3_660_000, 0), "in 1h 1m");
+    }
+
+    #[test]
+    fn tunnel_expiry_formatter_marks_past_expiry_as_now() {
+        assert_eq!(format_tunnel_expiry_at(5_000, 10_000), "now");
     }
 
     // ── Flag parsing ──

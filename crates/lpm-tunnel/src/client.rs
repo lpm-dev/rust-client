@@ -677,6 +677,12 @@ async fn try_connect(
                     domain: raw_domain,
                     tunnel_url,
                     session_id,
+                    plan,
+                    base_domain,
+                    domain_kind,
+                    session_expires_at,
+                    session_max_ms,
+                    limits,
                 } => {
                     // domain field from relay may be just the subdomain or full domain
                     // tunnel_url is always the full URL
@@ -713,6 +719,12 @@ async fn try_connect(
                         domain,
                         session_id,
                         local_port: options.local_port,
+                        plan,
+                        base_domain,
+                        domain_kind,
+                        session_expires_at,
+                        session_max_ms,
+                        limits,
                     }
                 }
                 ServerMessage::Error { message, code } => {
