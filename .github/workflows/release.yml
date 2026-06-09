@@ -232,11 +232,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Checkout CLI wrapper repo
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with:
-          repository: lpm-dev/cli
-          ref: main
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -250,42 +246,70 @@ jobs:
           echo "npx npm@11: $(npx npm@11.12.1 --version)"
 
       - name: Bump version and optionalDependencies, then publish
+        working-directory: npm/cli
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
 
           # Update wrapper version
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
-          # Update optionalDependencies + repository to match this repo.
-          # Uses --input-type=commonjs because the CLI repo has "type": "module"
-          # in package.json, but this inline script uses require().
-          node --input-type=commonjs -e "
-            const fs = require('fs');
+          # Update platform optionalDependencies to the same tag. The
+          # wrapper intentionally carries no runtime dependencies and no
+          # install scripts; npm's optional platform packages are the
+          # distribution mechanism.
+          node --input-type=module -e "
+            import fs from 'node:fs';
             const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
             const platforms = [
               '@lpm-registry/cli-darwin-arm64',
               '@lpm-registry/cli-darwin-x64',
-              '@lpm-registry/cli-linux-x64',
               '@lpm-registry/cli-linux-arm64',
+              '@lpm-registry/cli-linux-x64',
               '@lpm-registry/cli-win32-x64'
             ];
-            for (const p of platforms) {
-              if (pkg.optionalDependencies[p]) {
-                pkg.optionalDependencies[p] = '$VERSION';
-              }
+            pkg.optionalDependencies = Object.fromEntries(platforms.map(p => [p, '$VERSION']));
+            if (pkg.dependencies) {
+              throw new Error('@lpm-registry/cli wrapper must not publish runtime dependencies');
             }
-            if (pkg.bin?.lpm) {
-              pkg.bin.lpx = pkg.bin.lpm;
+            if (pkg.scripts?.postinstall || pkg.scripts?.install || pkg.scripts?.preinstall) {
+              throw new Error('@lpm-registry/cli wrapper must not publish install lifecycle scripts');
+            }
+            for (const p of platforms) {
+              if (pkg.optionalDependencies[p] !== '$VERSION') {
+                throw new Error('optional dependency version mismatch for ' + p);
+              }
             }
             pkg.repository = {
               type: 'git',
               url: 'https://github.com/lpm-dev/rust-client'
             };
-            fs.writeFileSync('package.json', JSON.stringify(pkg, null, '\t') + '\n');
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
 
+          npm test
+          npm run pack:check
+          TARBALL=$(npm pack --silent)
+          for attempt in 1 2 3 4 5; do
+            PREFIX=$(mktemp -d)
+            if npm install -g --prefix "$PREFIX" "$TARBALL"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::packed wrapper install failed after registry-propagation retries"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+          INSTALLED_VERSION=$("$PREFIX/bin/lpm" --version)
+          if ! echo "$INSTALLED_VERSION" | grep -q "$VERSION"; then
+            echo "::error::packed wrapper launched unexpected version: $INSTALLED_VERSION"
+            exit 1
+          fi
+          "$PREFIX/bin/lpx" --help >/dev/null
+          rm -f "$TARBALL"
+
           echo "Publishing @lpm-registry/cli@${VERSION}..."
-          npx npm@11.12.1 publish --provenance --access public --ignore-scripts 2>&1 | tee /tmp/npm-publish.log
+          npx npm@11.12.1 publish --provenance --access public 2>&1 | tee /tmp/npm-publish.log
           exit_code=${PIPESTATUS[0]}
           if [ $exit_code -ne 0 ]; then
             if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then

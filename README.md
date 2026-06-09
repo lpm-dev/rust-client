@@ -6,6 +6,10 @@ Fast, secure, all-in-one. Written in Rust.
 npm install -g @lpm-registry/cli
 ```
 
+The npm package is a dependency-free launcher for the native Rust binary. npm
+installs the matching platform package automatically through
+`optionalDependencies`; `lpm self-update` keeps using the same npm channel.
+
 <details>
 <summary>Other install methods</summary>
 
@@ -15,7 +19,8 @@ curl -fsSL https://lpm.dev/install.sh | sh       # Standalone
 cargo install --git https://github.com/lpm-dev/rust-client lpm-cli  # Source
 ```
 
-LPM verifies its own download integrity on every install.
+Standalone installs and self-updates verify release download integrity before
+swapping the binary.
 
 </details>
 
