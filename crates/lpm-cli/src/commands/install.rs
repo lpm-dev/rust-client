@@ -156,6 +156,69 @@ fn install_pkg_key(p: &InstallPackage) -> String {
     k
 }
 
+#[derive(Debug, Clone)]
+struct LinkDependencyTarget {
+    name: String,
+    version: String,
+    wrapper_id: String,
+}
+
+fn looks_like_source_dependency_key(value: &str) -> bool {
+    matches!(value.as_bytes(), [b'f' | b'l' | b't' | b'g', b'-', ..])
+}
+
+fn source_dependency_index(packages: &[InstallPackage]) -> HashMap<String, LinkDependencyTarget> {
+    let mut index = HashMap::with_capacity(packages.len());
+    for package in packages {
+        if let Some(wrapper_id) = package.wrapper_id_for_source() {
+            index
+                .entry(wrapper_id.clone())
+                .or_insert(LinkDependencyTarget {
+                    name: package.name.clone(),
+                    version: package.version.clone(),
+                    wrapper_id,
+                });
+        }
+    }
+    index
+}
+
+fn link_dependencies_for_package(
+    package: &InstallPackage,
+    source_index: &HashMap<String, LinkDependencyTarget>,
+) -> Result<Vec<lpm_linker::LinkDependency>, LpmError> {
+    let mut deps = Vec::with_capacity(package.dependencies.len());
+    for (local, value) in &package.dependencies {
+        if let Some(target) = source_index.get(value) {
+            deps.push(lpm_linker::LinkDependency::new(
+                local.clone(),
+                target.name.clone(),
+                target.version.clone(),
+                Some(target.wrapper_id.clone()),
+            ));
+            continue;
+        }
+        if looks_like_source_dependency_key(value) {
+            return Err(LpmError::Registry(format!(
+                "source dependency edge {local}@{value} of {}@{} has no matching package identity",
+                package.name, package.version
+            )));
+        }
+        let target_name = package
+            .aliases
+            .get(local)
+            .cloned()
+            .unwrap_or_else(|| local.clone());
+        deps.push(lpm_linker::LinkDependency::new(
+            local.clone(),
+            target_name,
+            value.clone(),
+            None,
+        ));
+    }
+    Ok(deps)
+}
+
 fn resolve_strict_peer_dependencies(
     cli_override: Option<bool>,
     pkg: &lpm_workspace::PackageJson,
@@ -2110,7 +2173,7 @@ enum FileKindClassification {
 /// - Recursively pre-resolve `Directory`/`Link` deps into nested
 ///   wrappers under `.lpm/`.
 /// - Drive the post-resolve fix-up of `InstallPackage.dependencies`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DepKind {
     /// Registry-style spec — `^1.2.3`, `npm:foo@^1`, `latest`,
     /// `workspace:*`, etc. Pubgrub/fusion handles it.
@@ -2129,10 +2192,6 @@ enum DepKind {
 /// post-resolve fix-up can populate the parent
 /// `InstallPackage.dependencies` field with resolved versions.
 ///
-/// The tuple `(local_name, raw_spec, kind)` is enough to drive both
-/// the recursive pre-resolve (use `local_name + raw_spec` to build
-/// nested InstallPackages) AND the fix-up (use `local_name + kind`
-/// to look up the resolved version in the merged `packages` vec).
 #[derive(Debug, Clone)]
 struct SourceDep {
     /// The dep KEY as it appears in the source's `package.json`.
@@ -2144,6 +2203,10 @@ struct SourceDep {
     /// Classification used to drive both the recursive pre-resolve
     /// and the post-resolve fix-up.
     kind: DepKind,
+    /// Exact `InstallPackage::source` string for a resolved
+    /// directory/link target. Registry-style dependencies leave this
+    /// empty and resolve through the registry package index.
+    target_source: Option<String>,
 }
 
 /// return shape for
@@ -2221,8 +2284,8 @@ fn expand_local_source_install_packages(
     json_output: bool,
 ) -> Result<LocalSourceExpansionResult, LpmError> {
     let mut source_deps_out: HashMap<String, Vec<SourceDep>> = HashMap::new();
-    let mut visited_realpaths: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::new();
+    let mut visited_realpaths: HashMap<PathBuf, String> =
+        HashMap::with_capacity(install_pkgs.len());
     for p in &*install_pkgs {
         if let Ok(s) = p.source_kind() {
             let path_opt = match s {
@@ -2233,7 +2296,9 @@ fn expand_local_source_install_packages(
             if let Some(path) = path_opt
                 && let Ok(rp) = project_dir.join(&path).canonicalize()
             {
-                visited_realpaths.insert(rp);
+                visited_realpaths
+                    .entry(rp)
+                    .or_insert_with(|| p.source.clone());
             }
         }
     }
@@ -3299,6 +3364,7 @@ fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>, LpmError> 
                 local_name: local_name.clone(),
                 raw_spec: raw_str.to_string(),
                 kind,
+                target_source: None,
             });
         }
     }
@@ -3573,7 +3639,7 @@ fn recurse_local_source_deps(
     consumer_deps_map: &mut HashMap<String, String>,
     install_pkgs_out: &mut Vec<InstallPackage>,
     source_deps_out: &mut HashMap<String, Vec<SourceDep>>,
-    visited: &mut std::collections::HashSet<PathBuf>,
+    visited: &mut HashMap<PathBuf, String>,
     current_depth: u32,
     max_depth: u32,
     // day-6 (F9 + F9a): workspace overlap detection +
@@ -3592,12 +3658,9 @@ fn recurse_local_source_deps(
     if current_depth > max_depth {
         return Ok(());
     }
-    let specs = read_source_dep_specs(source_dir)?;
+    let mut specs = read_source_dep_specs(source_dir)?;
 
-    // Stash for the post-resolve fix-up.
-    source_deps_out.insert(parent_source_string.to_string(), specs.clone());
-
-    for spec in specs {
+    for spec in specs.iter_mut() {
         match spec.kind {
             DepKind::Registry => {
                 // **audit response (round 3) — workspace
@@ -3674,7 +3737,7 @@ fn recurse_local_source_deps(
                 // v1 behavior; refinement is a 59.x concern.
                 consumer_deps_map
                     .entry(spec.local_name.clone())
-                    .or_insert(spec.raw_spec);
+                    .or_insert_with(|| spec.raw_spec.clone());
             }
             DepKind::FileDir | DepKind::Link => {
                 let path_str = if let Some(p) = spec.raw_spec.strip_prefix("file:") {
@@ -3690,11 +3753,8 @@ fn recurse_local_source_deps(
                     Ok(p) => p,
                     Err(_) => continue, // skipped — install pipeline surfaces real errors
                 };
-                if !visited.insert(realpath.clone()) {
-                    // Realpath already visited at a shallower depth;
-                    // skipping this branch is correct for cycle-
-                    // detect (A → B → A) AND for diamond-merging
-                    // (A → C, B → C produces a single C InstallPackage).
+                if let Some(existing_source) = visited.get(&realpath) {
+                    spec.target_source = Some(existing_source.clone());
                     continue;
                 }
                 let (real_name, real_version) = read_pkg_json_name_version(
@@ -3749,6 +3809,8 @@ fn recurse_local_source_deps(
                     DepKind::Link => format!("link+{path_str}"),
                     DepKind::Registry => unreachable!(),
                 };
+                spec.target_source = Some(source_string.clone());
+                visited.insert(realpath.clone(), source_string.clone());
                 install_pkgs_out.push(InstallPackage {
                     name: real_name,
                     version: real_version,
@@ -3788,6 +3850,7 @@ fn recurse_local_source_deps(
             }
         }
     }
+    source_deps_out.insert(parent_source_string.to_string(), specs);
     Ok(())
 }
 
@@ -3801,16 +3864,15 @@ fn recurse_local_source_deps(
 /// produced the registry portion.
 ///
 /// For each directory/link InstallPackage, looks up its source-deps
-/// in `source_deps` and produces the linker's
-/// `(local_name, target_segment_value)` tuples:
+/// in `source_deps` and produces `(local_name, target_segment_value)`
+/// pairs for the linker:
 ///
 /// - Registry dep → `(local_name, resolved_version)`. The resolved
 ///   version comes from another InstallPackage in `packages` whose
 ///   name matches. The linker uses this to build
 ///   `<safe>@<resolved_version>/...` symlink targets.
-/// - FileDir/Link dep → `(local_name, source_id)` where `source_id`
-///   is `"f-{16hex}"` / `"l-{16hex}"`. The linker uses this to
-///   build `<safe>+<source_id>/...` symlink targets.
+/// - FileDir/Link dep → `(local_name, source_id)` from the exact
+///   `target_source` recorded by the recursive local-source walker.
 ///
 /// Missing-from-packages registry deps are skipped (the resolver
 /// failed to provide a version, which is a separate bug surfaced
@@ -3821,51 +3883,18 @@ fn apply_post_resolve_directory_link_fixup(
     packages: &mut [InstallPackage],
     source_deps: &HashMap<String, Vec<SourceDep>>,
 ) {
-    // Build a name → resolved-version index of every CAS-backed
-    // package in the merged list. Only registry/tarball entries
-    // contribute; directory/link entries reference each other via
-    // source-id below, not by version.
+    // Build indexes over the merged list. Registry/tarball entries
+    // are still resolved by package name here; directory/link edges
+    // resolve by exact source string so same-name local forks do not
+    // collapse onto the first package encountered.
     let mut name_to_version: HashMap<String, String> = HashMap::new();
-    let mut name_to_source_id: HashMap<String, String> = HashMap::new();
+    let mut source_to_source_id: HashMap<String, String> = HashMap::new();
     for p in packages.iter() {
         if let Ok(s) = p.source_kind() {
             match s {
                 lpm_lockfile::Source::Directory { .. } | lpm_lockfile::Source::Link { .. } => {
                     if let Some(sid) = p.wrapper_id_for_source() {
-                        // First-encountered wins on name collision —
-                        // acceptable v1 (real collisions in v1 mean
-                        // two different paths exposed the same
-                        // package name; rare). Round-7 audit response:
-                        // surface a warning when the collision happens
-                        // so a reviewer can locate the second source
-                        // without grepping. Silent first-wins on a real
-                        // collision means later transitive `dependencies`
-                        // resolve to the FIRST source's wrapper, which
-                        // is almost never what the user wanted when two
-                        // paths share a name.
-                        match name_to_source_id.entry(p.name.clone()) {
-                            std::collections::hash_map::Entry::Vacant(v) => {
-                                v.insert(sid);
-                            }
-                            std::collections::hash_map::Entry::Occupied(existing) => {
-                                if existing.get() != &sid {
-                                    tracing::warn!(
-                                        name = %p.name,
-                                        kept_source_id = %existing.get(),
-                                        dropped_source_id = %sid,
-                                        dropped_source = %p.source,
-                                        "phase-59.1 fix-up: two local-source packages share name '{}' \
-                                         (source-ids {} kept, {} dropped from {}); transitive deps \
-                                         will resolve to the first source. Rename one or use \
-                                         distinct package.json `name` fields to disambiguate.",
-                                        p.name,
-                                        existing.get(),
-                                        sid,
-                                        p.source,
-                                    );
-                                }
-                            }
-                        }
+                        source_to_source_id.entry(p.source.clone()).or_insert(sid);
                     }
                 }
                 _ => {
@@ -3911,8 +3940,9 @@ fn apply_post_resolve_directory_link_fixup(
                     // wrapper.
                 }
                 DepKind::FileDir | DepKind::Link => {
-                    // Look up the source-id by the local name.
-                    if let Some(sid) = name_to_source_id.get(&spec.local_name) {
+                    if let Some(target_source) = &spec.target_source
+                        && let Some(sid) = source_to_source_id.get(target_source)
+                    {
                         deps_out.push((spec.local_name.clone(), sid.clone()));
                     }
                 }
@@ -6022,6 +6052,7 @@ async fn run_with_options_under_store_lock(
     // `LinkTarget` fields don't depend on fetch completion — just on
     // resolver output — so building them here is safe. Reused by both
     // the event-driven and serial link paths.
+    let source_index = Arc::new(source_dependency_index(&packages));
     let link_targets: Vec<LinkTarget> = packages
         .iter()
         .map(|p| -> Result<LinkTarget, LpmError> {
@@ -6039,7 +6070,7 @@ async fn run_with_options_under_store_lock(
                 name: p.name.clone(),
                 version: p.version.clone(),
                 store_path: p.store_path_or_err(&store, project_dir, None)?,
-                dependencies: p.dependencies.clone(),
+                dependencies: link_dependencies_for_package(p, &source_index)?,
                 aliases: p.aliases.clone(),
                 is_direct: p.is_direct,
                 root_link_names: p.root_link_names.clone(),
@@ -6417,7 +6448,7 @@ async fn run_with_options_under_store_lock(
                     name: p.name.clone(),
                     version: p.version.clone(),
                     store_path,
-                    dependencies: p.dependencies.clone(),
+                    dependencies: link_dependencies_for_package(p, &source_index)?,
                     aliases: p.aliases.clone(),
                     is_direct: p.is_direct,
                     root_link_names: p.root_link_names.clone(),
@@ -6650,16 +6681,14 @@ async fn run_with_options_under_store_lock(
                     continue;
                 }
                 let publish_time = if p.is_lpm {
-                    lpm_common::PackageName::parse(&p.name)
-                        .ok()
-                        .and_then(|pkg_name| {
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current()
-                                    .block_on(arc_client.get_package_metadata(&pkg_name))
-                            })
+                    match lpm_common::PackageName::parse(&p.name) {
+                        Ok(pkg_name) => arc_client
+                            .get_package_metadata(&pkg_name)
+                            .await
                             .ok()
-                        })
-                        .and_then(|meta| meta.time.get(&p.version).cloned())
+                            .and_then(|meta| meta.time.get(&p.version).cloned()),
+                        Err(_) => None,
+                    }
                 } else {
                     // day-4.5 follow-up: route via RouteTable so
                     // custom-registry packages don't leak names to public
@@ -6667,12 +6696,11 @@ async fn run_with_options_under_store_lock(
                     // name collisions. `get_npm_metadata_routed` honors
                     // the npmrc-driven destination + auth.
                     let route = route_table.route_for_package(&p.name);
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(arc_client.get_npm_metadata_routed(&p.name, route))
-                    })
-                    .ok()
-                    .and_then(|meta| meta.time.get(&p.version).cloned())
+                    arc_client
+                        .get_npm_metadata_routed(&p.name, route)
+                        .await
+                        .ok()
+                        .and_then(|meta| meta.time.get(&p.version).cloned())
                 };
                 if let Some(age) = lpm_security::publish_age_secs(publish_time.as_deref()) {
                     map.insert((p.name.clone(), p.version.clone()), age);
@@ -6844,37 +6872,34 @@ async fn run_with_options_under_store_lock(
                 // from the resolver's TTL cache (same pattern as the
                 // cooldown gate above).
                 let attestation_ref = if p.is_lpm {
-                    lpm_common::PackageName::parse(&p.name)
-                        .ok()
-                        .and_then(|pkg_name| {
-                            tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current()
-                                    .block_on(arc_client.get_package_metadata(&pkg_name))
-                            })
+                    match lpm_common::PackageName::parse(&p.name) {
+                        Ok(pkg_name) => arc_client
+                            .get_package_metadata(&pkg_name)
+                            .await
                             .ok()
                             .and_then(|meta| {
                                 meta.versions
                                     .get(&p.version)
                                     .and_then(|v| v.dist.as_ref())
                                     .and_then(|d| d.attestations.clone())
-                            })
-                        })
+                            }),
+                        Err(_) => None,
+                    }
                 } else {
                     // day-4.5 follow-up: route via RouteTable so
                     // the provenance-drift gate doesn't fall through to
                     // public npm for a custom-registry package.
                     let route = route_table.route_for_package(&p.name);
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(arc_client.get_npm_metadata_routed(&p.name, route))
-                    })
-                    .ok()
-                    .and_then(|meta| {
-                        meta.versions
-                            .get(&p.version)
-                            .and_then(|v| v.dist.as_ref())
-                            .and_then(|d| d.attestations.clone())
-                    })
+                    arc_client
+                        .get_npm_metadata_routed(&p.name, route)
+                        .await
+                        .ok()
+                        .and_then(|meta| {
+                            meta.versions
+                                .get(&p.version)
+                                .and_then(|v| v.dist.as_ref())
+                                .and_then(|d| d.attestations.clone())
+                        })
                 };
 
                 // When the operator skip-listed this name (CLI
@@ -6889,16 +6914,13 @@ async fn run_with_options_under_store_lock(
                 let now_snapshot: Option<lpm_workspace::ProvenanceSnapshot> = if verify_policy
                     .should_skip_verification_for(&p.name)
                 {
-                    let raw = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(
-                            crate::provenance_fetch::fetch_unverified_snapshot(
-                                &http,
-                                &p.name,
-                                &p.version,
-                                attestation_ref.as_ref(),
-                            ),
-                        )
-                    });
+                    let raw = crate::provenance_fetch::fetch_unverified_snapshot(
+                        &http,
+                        &p.name,
+                        &p.version,
+                        attestation_ref.as_ref(),
+                    )
+                    .await;
                     // Re-label `Unverified` → `Disabled` when fleet-
                     // wide `EnforceMode::Off` was the trigger, so the
                     // JSON envelope distinguishes wholesale opt-out
@@ -6921,18 +6943,15 @@ async fn run_with_options_under_store_lock(
                     // didn't run).
                     status.into_snapshot_for_binding(&p.name, &p.version)?
                 } else {
-                    let raw = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(
-                            crate::provenance_fetch::fetch_provenance_snapshot(
-                                &http,
-                                &cache_root,
-                                &p.name,
-                                &p.version,
-                                attestation_ref.as_ref(),
-                                None,
-                            ),
-                        )
-                    });
+                    let raw = crate::provenance_fetch::fetch_provenance_snapshot(
+                        &http,
+                        &cache_root,
+                        &p.name,
+                        &p.version,
+                        attestation_ref.as_ref(),
+                        None,
+                    )
+                    .await;
                     // Branch arms:
                     //   - `Ok(Some(snap))`: Verified (snap.present)
                     //     or Absent (registry served no attestation).
@@ -7190,6 +7209,7 @@ async fn run_with_options_under_store_lock(
             let patch_fingerprint_for_pkg = patch_fingerprints
                 .get(&(p.name.clone(), p.version.clone()))
                 .cloned();
+            let source_index_for_pkg = Arc::clone(&source_index);
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
@@ -7247,7 +7267,7 @@ async fn run_with_options_under_store_lock(
                         name: p.name.clone(),
                         version: p.version.clone(),
                         store_path,
-                        dependencies: p.dependencies.clone(),
+                        dependencies: link_dependencies_for_package(p, &source_index_for_pkg)?,
                         aliases: p.aliases.clone(),
                         is_direct: p.is_direct,
                         root_link_names: p.root_link_names.clone(),
@@ -10820,6 +10840,7 @@ async fn run_link_and_finish(
         .unwrap_or_default();
     let patch_fingerprints = compute_patch_fingerprints(&current_patches_for_link, project_dir)?;
 
+    let source_index = source_dependency_index(&packages);
     let link_targets: Vec<LinkTarget> = packages
         .iter()
         .map(|p| -> Result<LinkTarget, LpmError> {
@@ -10830,7 +10851,7 @@ async fn run_link_and_finish(
                 name: p.name.clone(),
                 version: p.version.clone(),
                 store_path: p.store_path_or_err(&store, project_dir, None)?,
-                dependencies: p.dependencies.clone(),
+                dependencies: link_dependencies_for_package(p, &source_index)?,
                 aliases: p.aliases.clone(),
                 is_direct: p.is_direct,
                 root_link_names: p.root_link_names.clone(),
@@ -11728,9 +11749,39 @@ async fn speculative_download_and_store(
     Ok(())
 }
 
-/// Resolve the tarball URL for a package, consulting registry metadata
-/// only when the resolver didn't already cache one. Shared by both the
-/// legacy (temp-file) and (streaming) fetch paths.
+struct ResolvedRegistryTarballUrl {
+    url: String,
+    metadata: Option<lpm_registry::PackageMetadata>,
+}
+
+async fn metadata_tarball_url_for_package(
+    client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
+    name: &str,
+    version: &str,
+    is_lpm: bool,
+) -> Result<(String, lpm_registry::PackageMetadata), LpmError> {
+    let metadata = if is_lpm {
+        let pkg =
+            lpm_common::PackageName::parse(name).map_err(|e| LpmError::Registry(e.to_string()))?;
+        client.get_package_metadata(&pkg).await?
+    } else {
+        let route = route_table.route_for_package(name);
+        client.get_npm_metadata_routed(name, route).await?
+    };
+    let ver_meta = metadata
+        .version(version)
+        .ok_or_else(|| LpmError::NotFound(format!("{name}@{version} not found in metadata")))?;
+    let url = ver_meta
+        .tarball_url()
+        .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
+        .to_string();
+    Ok((url, metadata))
+}
+
+/// Resolve the tarball URL for a registry package. Lockfile-provided
+/// registry tarball hints are only cache hints: before fetching them,
+/// bind them back to the package version's current registry metadata.
 ///
 /// the non-LPM branch now routes through
 /// [`RegistryClient::get_npm_metadata_routed`] using
@@ -11747,36 +11798,38 @@ async fn resolve_tarball_url(
     is_lpm: bool,
     cached_url: Option<&str>,
     metadata_checked_for_tarball: bool,
-) -> Result<String, LpmError> {
+) -> Result<ResolvedRegistryTarballUrl, LpmError> {
     if let Some(url) = cached_url {
-        return Ok(url.to_string());
+        if metadata_checked_for_tarball {
+            return Ok(ResolvedRegistryTarballUrl {
+                url: url.to_string(),
+                metadata: None,
+            });
+        }
+        let (metadata_url, metadata) =
+            metadata_tarball_url_for_package(client, route_table, name, version, is_lpm).await?;
+        if url != metadata_url {
+            return Err(LpmError::Registry(format!(
+                "registry lockfile tarball for {name}@{version} does not match registry metadata \
+                 dist.tarball; refusing lockfile hint"
+            )));
+        }
+        return Ok(ResolvedRegistryTarballUrl {
+            url: url.to_string(),
+            metadata: Some(metadata),
+        });
     }
     if metadata_checked_for_tarball {
         return Err(LpmError::NotFound(format!(
             "no tarball URL for {name}@{version}"
         )));
     }
-    if is_lpm {
-        let pkg =
-            lpm_common::PackageName::parse(name).map_err(|e| LpmError::Registry(e.to_string()))?;
-        let metadata = client.get_package_metadata(&pkg).await?;
-        let ver_meta = metadata
-            .version(version)
-            .ok_or_else(|| LpmError::NotFound(format!("{name}@{version} not found in metadata")))?;
-        return Ok(ver_meta
-            .tarball_url()
-            .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
-            .to_string());
-    }
-    let route = route_table.route_for_package(name);
-    let metadata = client.get_npm_metadata_routed(name, route).await?;
-    let ver_meta = metadata
-        .version(version)
-        .ok_or_else(|| LpmError::NotFound(format!("{name}@{version} not found in metadata")))?;
-    Ok(ver_meta
-        .tarball_url()
-        .ok_or_else(|| LpmError::NotFound(format!("no tarball URL for {name}@{version}")))?
-        .to_string())
+    let (url, metadata) =
+        metadata_tarball_url_for_package(client, route_table, name, version, is_lpm).await?;
+    Ok(ResolvedRegistryTarballUrl {
+        url,
+        metadata: Some(metadata),
+    })
 }
 
 /// Invalidate metadata cache for a package, routing through the
@@ -11800,15 +11853,23 @@ async fn verify_registry_signature_if_present(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     package: &InstallPackage,
+    metadata_hint: Option<&lpm_registry::PackageMetadata>,
 ) -> Result<(), LpmError> {
     if package.is_lpm || !install_package_is_registry_source(package) {
         return Ok(());
     }
 
     let route = route_table.route_for_package(&package.name);
-    let metadata = client
-        .get_npm_metadata_routed(&package.name, route.clone())
-        .await?;
+    let metadata_owned;
+    let metadata = match metadata_hint {
+        Some(metadata) => metadata,
+        None => {
+            metadata_owned = client
+                .get_npm_metadata_routed(&package.name, route.clone())
+                .await?;
+            &metadata_owned
+        }
+    };
     let version = metadata.version(&package.version).ok_or_else(|| {
         LpmError::NotFound(format!(
             "{}@{} not found in metadata",
@@ -11992,7 +12053,7 @@ async fn fetch_and_store_legacy(
     // aggregates any divergence from `p.tarball_url` into the
     // writeback `fresh_urls` map.
     let url_lookup_start = std::time::Instant::now();
-    let initial_url = match resolve_tarball_url(
+    let initial_resolution = match resolve_tarball_url(
         client,
         route_table,
         &p.name,
@@ -12017,9 +12078,16 @@ async fn fetch_and_store_legacy(
         Err(e) => return Err(e),
     };
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
+    let initial_url = initial_resolution.url.clone();
     let mut final_url = initial_url.clone();
 
-    verify_registry_signature_if_present(client, route_table, p).await?;
+    verify_registry_signature_if_present(
+        client,
+        route_table,
+        p,
+        initial_resolution.metadata.as_ref(),
+    )
+    .await?;
 
     let download_start = std::time::Instant::now();
     let downloaded = match client
@@ -12033,7 +12101,7 @@ async fn fetch_and_store_legacy(
             // ONCE with a freshly-resolved URL.
             invalidate_metadata_routed(client, route_table, &p.name);
             let retry_lookup_start = std::time::Instant::now();
-            let fresh_url = match resolve_tarball_url(
+            let fresh_resolution = match resolve_tarball_url(
                 client,
                 route_table,
                 &p.name,
@@ -12056,6 +12124,7 @@ async fn fetch_and_store_legacy(
                 }
             };
             url_lookup_ms += retry_lookup_start.elapsed().as_millis();
+            let fresh_url = fresh_resolution.url.clone();
             if fresh_url == initial_url {
                 // Loop guard — metadata still points at the same
                 // stale URL. Tarball is really gone, not just moved.
@@ -12067,7 +12136,13 @@ async fn fetch_and_store_legacy(
                     project_dir,
                 ));
             }
-            verify_registry_signature_if_present(client, route_table, p).await?;
+            verify_registry_signature_if_present(
+                client,
+                route_table,
+                p,
+                fresh_resolution.metadata.as_ref(),
+            )
+            .await?;
             match client
                 .download_tarball_routed(route_table, &p.name, &fresh_url)
                 .await
@@ -12307,7 +12382,7 @@ async fn fetch_and_store_streaming(
     // distinguishes metadata 404 (truly unpublished, no retry) from
     // a download 404 on a stored URL (stale cache, try recovery).
     let url_lookup_start = std::time::Instant::now();
-    let initial_url = match resolve_tarball_url(
+    let initial_resolution = match resolve_tarball_url(
         client,
         route_table,
         &p.name,
@@ -12330,9 +12405,16 @@ async fn fetch_and_store_streaming(
         Err(e) => return Err(e),
     };
     let mut url_lookup_ms = url_lookup_start.elapsed().as_millis();
+    let initial_url = initial_resolution.url.clone();
     let mut final_url = initial_url.clone();
 
-    verify_registry_signature_if_present(client, route_table, p).await?;
+    verify_registry_signature_if_present(
+        client,
+        route_table,
+        p,
+        initial_resolution.metadata.as_ref(),
+    )
+    .await?;
 
     let response = match client
         .download_tarball_streaming_routed(route_table, &p.name, &initial_url)
@@ -12346,7 +12428,7 @@ async fn fetch_and_store_streaming(
             // (minus the streaming-specific response handling).
             invalidate_metadata_routed(client, route_table, &p.name);
             let retry_lookup_start = std::time::Instant::now();
-            let fresh_url = match resolve_tarball_url(
+            let fresh_resolution = match resolve_tarball_url(
                 client,
                 route_table,
                 &p.name,
@@ -12369,6 +12451,7 @@ async fn fetch_and_store_streaming(
                 }
             };
             url_lookup_ms += retry_lookup_start.elapsed().as_millis();
+            let fresh_url = fresh_resolution.url.clone();
             if fresh_url == initial_url {
                 gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
                 return Err(handle_tarball_not_found(
@@ -12378,7 +12461,13 @@ async fn fetch_and_store_streaming(
                     project_dir,
                 ));
             }
-            verify_registry_signature_if_present(client, route_table, p).await?;
+            verify_registry_signature_if_present(
+                client,
+                route_table,
+                p,
+                fresh_resolution.metadata.as_ref(),
+            )
+            .await?;
             match client
                 .download_tarball_streaming_routed(route_table, &p.name, &fresh_url)
                 .await
@@ -20762,6 +20851,7 @@ mod tests {
         assert_eq!(a_specs.len(), 1);
         assert_eq!(a_specs[0].local_name, "b");
         assert_eq!(a_specs[0].kind, DepKind::FileDir);
+        assert_eq!(a_specs[0].target_source.as_deref(), Some("directory+../b"));
     }
 
     #[tokio::test]
@@ -21075,11 +21165,13 @@ mod tests {
                     local_name: "lodash".to_string(),
                     raw_spec: "^4.0.0".to_string(),
                     kind: DepKind::Registry,
+                    target_source: None,
                 },
                 SourceDep {
                     local_name: "b".to_string(),
                     raw_spec: "file:../b".to_string(),
                     kind: DepKind::FileDir,
+                    target_source: Some("directory+./packages/b".to_string()),
                 },
             ],
         );
@@ -21104,6 +21196,78 @@ mod tests {
             a.dependencies.contains(&("b".to_string(), b_source_id)),
             "A's deps must reference B by source-id, got {:?}",
             a.dependencies,
+        );
+    }
+
+    #[test]
+    fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
+        let fork_source = "directory+./packages/react-fork".to_string();
+        let fork_source_id = lpm_lockfile::Source::Directory {
+            path: "./packages/react-fork".to_string(),
+        }
+        .source_id();
+        let mut packages = vec![
+            InstallPackage {
+                name: "consumer".to_string(),
+                version: "1.0.0".to_string(),
+                source: "directory+./packages/consumer".to_string(),
+                dependencies: Vec::new(),
+                aliases: HashMap::new(),
+                root_link_names: Some(vec!["consumer".to_string()]),
+                is_direct: true,
+                is_lpm: false,
+                peers: Vec::new(),
+                integrity: None,
+                tarball_url: None,
+                metadata_checked_for_tarball: false,
+            },
+            InstallPackage {
+                name: "react".to_string(),
+                version: "19.0.0".to_string(),
+                source: "registry+https://registry.npmjs.org".to_string(),
+                dependencies: Vec::new(),
+                aliases: HashMap::new(),
+                root_link_names: None,
+                is_direct: true,
+                is_lpm: false,
+                peers: Vec::new(),
+                integrity: None,
+                tarball_url: None,
+                metadata_checked_for_tarball: false,
+            },
+            InstallPackage {
+                name: "react".to_string(),
+                version: "19.0.0".to_string(),
+                source: fork_source.clone(),
+                dependencies: Vec::new(),
+                aliases: HashMap::new(),
+                root_link_names: Some(Vec::new()),
+                is_direct: false,
+                is_lpm: false,
+                peers: Vec::new(),
+                integrity: None,
+                tarball_url: None,
+                metadata_checked_for_tarball: false,
+            },
+        ];
+
+        let mut source_deps = HashMap::new();
+        source_deps.insert(
+            "directory+./packages/consumer".to_string(),
+            vec![SourceDep {
+                local_name: "react".to_string(),
+                raw_spec: "file:../react-fork".to_string(),
+                kind: DepKind::FileDir,
+                target_source: Some(fork_source),
+            }],
+        );
+
+        apply_post_resolve_directory_link_fixup(&mut packages, &source_deps);
+
+        let consumer = packages.iter().find(|p| p.name == "consumer").unwrap();
+        assert_eq!(
+            consumer.dependencies,
+            vec![("react".to_string(), fork_source_id)]
         );
     }
 
@@ -21136,6 +21300,7 @@ mod tests {
                 local_name: "missing-from-resolver".to_string(),
                 raw_spec: "^1.0.0".to_string(),
                 kind: DepKind::Registry,
+                target_source: None,
             }],
         );
 

@@ -1182,7 +1182,7 @@ fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() 
     std::fs::write(pkg_b.join("index.js"), b"module.exports = 'b';").unwrap();
 
     // Mimic lpm-cli: A is immediate (root_link_names = ["a"], is_direct = true),
-    // its dependencies field is populated post-resolve with [(b, source-id-of-b)].
+    // its dependency edge is populated post-resolve with B's source identity.
     // B is transitive (root_link_names = vec![]).
     let b_source_id = "f-deadbeef00000000".to_string();
     let a_source_id = "f-cafebabe00000000".to_string();
@@ -1191,9 +1191,12 @@ fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() 
         name: "a".to_string(),
         version: "1.0.0".to_string(),
         store_path: pkg_a.canonicalize().unwrap(),
-        // Day-5 fix-up populates this with the transitive dep's
-        // source-id so the linker's `+`-shape branch fires.
-        dependencies: vec![("b".to_string(), b_source_id.clone())],
+        dependencies: vec![lpm_linker::LinkDependency::new(
+            "b",
+            "b",
+            "2.0.0",
+            Some(b_source_id.clone()),
+        )],
         aliases: HashMap::new(),
         is_direct: true,
         root_link_names: Some(vec!["a".to_string()]),

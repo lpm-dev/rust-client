@@ -3178,6 +3178,129 @@ async fn install_file_local_dependency_links_into_node_modules() {
     assert_eq!(pkg_json["version"].as_str(), Some("0.1.0"));
 }
 
+#[tokio::test]
+async fn install_v2_links_same_name_version_edges_to_their_declared_sources() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "react",
+            "version": "19.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = 'registry-react';\n")],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "source-identity-v2",
+  "version": "1.0.0",
+  "dependencies": {
+    "react": "19.0.0",
+    "consumer": "file:./packages/consumer"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/react-fork/package.json",
+        r#"{
+  "name": "react",
+  "version": "19.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file(
+        "packages/react-fork/index.js",
+        "module.exports = 'local-react';\n",
+    );
+    let react_fork_path = project.path().join("packages/react-fork");
+    let consumer_pkg = serde_json::json!({
+        "name": "consumer",
+        "version": "1.0.0",
+        "main": "index.js",
+        "dependencies": {
+            "react": format!("file:{}", react_fork_path.display())
+        }
+    });
+    project.write_file(
+        "packages/consumer/package.json",
+        &serde_json::to_string_pretty(&consumer_pkg).unwrap(),
+    );
+    project.write_file(
+        "packages/consumer/index.js",
+        "module.exports = require('react');\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run source identity v2 install");
+
+    assert!(
+        output.status.success(),
+        "v2 install must allow registry and file: react@19.0.0 in one graph\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let root_react = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('react'))")
+        .output()
+        .expect("run root react require");
+    assert!(
+        root_react.status.success(),
+        "root react require failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&root_react.stdout),
+        String::from_utf8_lossy(&root_react.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&root_react.stdout),
+        "registry-react",
+        "root dependency must resolve to the registry react package",
+    );
+
+    let consumer_realpath =
+        std::fs::canonicalize(project.path().join("node_modules").join("consumer"))
+            .expect("consumer symlink should resolve");
+    let consumer_sibling_react = consumer_realpath
+        .parent()
+        .expect("consumer package should have parent node_modules dir")
+        .join("react")
+        .join("index.js");
+    assert_eq!(
+        std::fs::read_to_string(&consumer_sibling_react)
+            .expect("consumer link entry should contain a react sibling"),
+        "module.exports = 'local-react';\n",
+        "consumer link entry's react sibling must point at the file: react package",
+    );
+
+    let nested_react = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('consumer'))")
+        .output()
+        .expect("run consumer require");
+    assert!(
+        nested_react.status.success(),
+        "consumer require failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&nested_react.stdout),
+        String::from_utf8_lossy(&nested_react.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&nested_react.stdout),
+        "local-react",
+        "consumer's react edge must resolve to its file: react package",
+    );
+}
+
 /// Two independent fresh installs of the same package.json must produce
 /// byte-identical lpm.lock files. Non-determinism in the resolver or
 /// lockfile serializer would cause this test to fail via the snapshot.
