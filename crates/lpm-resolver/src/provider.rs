@@ -146,13 +146,16 @@ impl StreamingBfsMetrics {
     }
 }
 
-/// Distribution info for a specific version: tarball URL and integrity hash.
+/// Distribution info for a specific version.
+///
 /// Extracted from registry metadata so the download phase doesn't need to
-/// re-fetch metadata just to get the URL.
+/// re-fetch metadata for tarball URL, integrity, or registry signatures.
 #[derive(Debug, Clone, Default)]
 pub struct CachedDistInfo {
     pub tarball_url: Option<String>,
     pub integrity: Option<String>,
+    pub signatures: Vec<lpm_registry::RegistrySignature>,
+    pub published_at: Option<String>,
 }
 
 /// Cached info about a package: available versions and their dependency maps.
@@ -939,6 +942,12 @@ pub(crate) fn parse_metadata_to_cache_info(
                 CachedDistInfo {
                     tarball_url: ver_meta.tarball_url().map(str::to_string),
                     integrity: ver_meta.integrity_or_shasum().map(|s| s.into_owned()),
+                    signatures: ver_meta
+                        .dist
+                        .as_ref()
+                        .and_then(|dist| dist.signatures.clone())
+                        .unwrap_or_default(),
+                    published_at: metadata.time.get(ver_str).cloned(),
                 },
             );
 

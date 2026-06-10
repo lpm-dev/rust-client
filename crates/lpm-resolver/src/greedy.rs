@@ -73,7 +73,7 @@ use ahash::{AHashMap, AHashSet};
 use lpm_registry::RouteMode;
 use lpm_registry::{RegistryClient, RouteTable, UpstreamRoute};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -427,13 +427,10 @@ pub async fn resolve_greedy_with_options(
 ///   and resume parked edges in stable `(parent_id, local_name)` order
 ///   so multi-version dedupe stays deterministic across runs.
 ///
-/// **Concurrency caps.** A single 256-permit semaphore (`npm_fanout`)
-/// gates outstanding metadata fetches. H2 single-connection multiplex
-/// caps at 256 streams; the resolver sits at the cap and lets the
-/// registry's flow control set the actual pace. Tarball downloads run
-/// through install.rs's existing 24-permit `fetch_semaphore` —
-/// independent of the metadata semaphore so a stalled tarball can't
-/// starve metadata fetches that would unblock the resolver.
+/// **Concurrency caps.** A single `npm_fanout` semaphore gates
+/// outstanding metadata fetches. Callers tune the fanout for their
+/// registry/network regime; tarball downloads run later in install.rs
+/// unless a caller explicitly supplies a speculation channel.
 ///
 /// **Counters.** `dispatcher_rpc_count`, `inflight_high_water`,
 /// `parked_max_depth`, `tarball_dispatched_count`, and
@@ -617,8 +614,6 @@ pub async fn resolve_greedy_fused_with_cache_options(
     let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
     let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
         tokio::task::JoinSet::new();
-    let mut inflight_order: BTreeMap<String, CanonicalKey> = BTreeMap::new();
-    let mut ready_metadata: BTreeMap<String, FetchResult> = BTreeMap::new();
 
     // High-water marks update at the boundary of each Phase A→B transition
     // so the post-loop value reflects the peak across the run, not just the
@@ -645,7 +640,6 @@ pub async fn resolve_greedy_fused_with_cache_options(
             let canonical = edge.canonical.clone();
             parked.entry(canonical.clone()).or_default().push(edge);
             if inflight.insert(canonical.clone()) {
-                inflight_order.insert(canonical.to_string(), canonical.clone());
                 let client_c = client.clone();
                 let permit = metadata_sem.clone();
                 let route_table_c = route_table.clone();
@@ -699,7 +693,6 @@ pub async fn resolve_greedy_fused_with_cache_options(
                 // returns None for these (nothing was parked) so the
                 // resume step is a no-op.
                 inflight.insert(canonical.clone());
-                inflight_order.insert(canonical.to_string(), canonical.clone());
                 let client_c = client.clone();
                 let permit = metadata_sem.clone();
                 let route_table_c = route_table.clone();
@@ -720,7 +713,7 @@ pub async fn resolve_greedy_fused_with_cache_options(
         // High-water samples. O(unique-canonicals-parked) per tick;
         // ~tens of entries × ~134 ticks on bench/fixture-large is
         // negligible vs the network wall.
-        let inflight_now = (metadata_jobs.len() + ready_metadata.len()) as u64;
+        let inflight_now = metadata_jobs.len() as u64;
         if inflight_now > inflight_high_water {
             inflight_high_water = inflight_now;
         }
@@ -738,11 +731,7 @@ pub async fn resolve_greedy_fused_with_cache_options(
         // peers, which re-arms the loop. The pass is a no-op when
         // `peer_requirements` is empty OR `auto_install_peers`
         // is false.
-        if metadata_jobs.is_empty()
-            && ready_metadata.is_empty()
-            && inflight_order.is_empty()
-            && state.task_queue.is_empty()
-        {
+        if metadata_jobs.is_empty() && state.task_queue.is_empty() {
             debug_assert!(
                 parked.is_empty(),
                 "greedy-fusion: non-empty parked at termination — invariant violated \
@@ -806,9 +795,13 @@ pub async fn resolve_greedy_fused_with_cache_options(
         }
 
         // ── Phase C — bounded await ──────────────────────────────
-        if let Some((canonical, result)) =
-            take_next_ready_metadata(&mut inflight_order, &mut ready_metadata)
-        {
+        // metadata_jobs is non-empty here (Phase B guards otherwise).
+        // Take the next completion; deterministic reuse is enforced in
+        // process_edge, so the network loop can keep completion-order
+        // throughput without making lockfiles arrival-order-dependent.
+        if let Some(joined) = metadata_jobs.join_next().await {
+            let (canonical, result) = joined
+                .map_err(|e| ResolveError::Internal(format!("metadata join failure: {e}")))?;
             inflight.remove(&canonical);
             complete_metadata_fetch(
                 canonical,
@@ -819,18 +812,6 @@ pub async fn resolve_greedy_fused_with_cache_options(
                 &mut parked,
                 &mut state,
             )?;
-            continue;
-        }
-
-        // metadata_jobs is non-empty here (Phase B guards otherwise).
-        // Take the next network completion, then buffer it until all
-        // earlier canonical fetches are also ready. Only the
-        // deterministic ready-pop above is allowed to mutate resolver
-        // state.
-        if let Some(joined) = metadata_jobs.join_next().await {
-            let (canonical, result) = joined
-                .map_err(|e| ResolveError::Internal(format!("metadata join failure: {e}")))?;
-            ready_metadata.insert(canonical.to_string(), result);
         }
     }
 
@@ -1365,6 +1346,17 @@ fn mark_node_required_closure(state: &mut ResolveState, node_id: NodeId) {
     }
 }
 
+fn newest_existing_satisfying_node(
+    nodes: &[(NpmVersion, NodeId)],
+    range: &NpmRange,
+) -> Option<NodeId> {
+    nodes
+        .iter()
+        .filter(|(version, _)| range.satisfies(version))
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, id)| *id)
+}
+
 /// Core reuse-or-allocate logic. The `forced` parameter, when present,
 /// carries (natural_version, optional_override) computed by the override
 /// branch in [`process_edge`]. When `None`, the function uses the
@@ -1391,13 +1383,10 @@ fn process_edge_inner(
         Some((natural, None)) => (natural, None),
         None => {
             // Hot path — no overrides parsed. Reuse-on-range-satisfies.
-            let existing_id: Option<NodeId> =
-                state.resolved.get(&edge.canonical).and_then(|nodes| {
-                    nodes
-                        .iter()
-                        .find(|(v, _)| edge.range.satisfies(v))
-                        .map(|(_, id)| *id)
-                });
+            let existing_id: Option<NodeId> = state
+                .resolved
+                .get(&edge.canonical)
+                .and_then(|nodes| newest_existing_satisfying_node(nodes, &edge.range));
             if let Some(id) = existing_id {
                 if !edge_is_optional_in_context(edge, state) {
                     mark_node_required_closure(state, id);
@@ -1451,10 +1440,7 @@ fn process_edge_inner(
                 .find(|(v, _)| v == &target_version)
                 .map(|(_, id)| *id)
         } else {
-            nodes
-                .iter()
-                .find(|(v, _)| edge.range.satisfies(v))
-                .map(|(_, id)| *id)
+            newest_existing_satisfying_node(nodes, &edge.range)
         }
     });
 
@@ -2509,18 +2495,6 @@ fn parse_fetched_metadata(metadata: lpm_registry::PackageMetadata) -> FetchedMet
     FetchedMetadata { metadata, info }
 }
 
-fn take_next_ready_metadata<V>(
-    inflight_order: &mut BTreeMap<String, CanonicalKey>,
-    ready_metadata: &mut BTreeMap<String, V>,
-) -> Option<(CanonicalKey, V)> {
-    let next_key = inflight_order.keys().next().cloned()?;
-    let ready = ready_metadata.remove(&next_key)?;
-    let canonical = inflight_order
-        .remove(&next_key)
-        .expect("ready metadata key must be tracked as inflight");
-    Some((canonical, ready))
-}
-
 fn complete_metadata_fetch(
     canonical: CanonicalKey,
     result: FetchResult,
@@ -2727,6 +2701,8 @@ mod tests {
                         CachedDistInfo {
                             tarball_url: Some(format!("https://example.invalid/{}.tgz", v)),
                             integrity: Some(format!("sha512-fake-{}", v)),
+                            signatures: Vec::new(),
+                            published_at: None,
                         },
                     )
                 })
@@ -3931,34 +3907,41 @@ mod tests {
     }
 
     #[test]
-    fn ready_metadata_waits_for_earliest_inflight_key() {
-        let mut inflight_order = BTreeMap::new();
-        inflight_order.insert("a".to_string(), CanonicalKey::npm("a"));
-        inflight_order.insert("b".to_string(), CanonicalKey::npm("b"));
+    fn process_edge_reuses_newest_existing_version_when_multiple_satisfy_range() {
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let shared = CanonicalKey::npm("shared");
+        let older = push_node(&mut state, shared.clone(), "1.2.0");
+        let newer = push_node(&mut state, shared.clone(), "1.9.0");
 
-        let mut ready_metadata = BTreeMap::new();
-        ready_metadata.insert("b".to_string(), 2_u8);
-        assert!(
-            take_next_ready_metadata(&mut inflight_order, &mut ready_metadata).is_none(),
-            "later completions must not mutate resolver state before earlier keys land"
+        state.resolved.insert(
+            shared.clone(),
+            vec![
+                (NpmVersion::parse("1.2.0").unwrap(), older),
+                (NpmVersion::parse("1.9.0").unwrap(), newer),
+            ],
         );
-        assert!(
-            inflight_order.contains_key("a") && inflight_order.contains_key("b"),
-            "a blocked pop must leave inflight order intact"
+
+        let edge = Edge {
+            parent: 0,
+            local_name: "shared".to_string(),
+            canonical: shared,
+            range: NpmRange::parse("^1.0.0").unwrap(),
+            behavior: DepBehavior {
+                required: true,
+                peer: false,
+                optional: false,
+            },
+        };
+        let info = mk_info(&["1.9.0", "1.2.0"], &[]);
+
+        process_edge(&edge, &info, &mut state).unwrap();
+
+        assert_eq!(
+            state.nodes[0].children,
+            vec![("shared".to_string(), newer)],
+            "reuse must be independent of the order compatible nodes were allocated"
         );
-
-        ready_metadata.insert("a".to_string(), 1_u8);
-        let (first_key, first_value) =
-            take_next_ready_metadata(&mut inflight_order, &mut ready_metadata)
-                .expect("earliest key is now ready");
-        assert_eq!(first_key, CanonicalKey::npm("a"));
-        assert_eq!(first_value, 1);
-
-        let (second_key, second_value) =
-            take_next_ready_metadata(&mut inflight_order, &mut ready_metadata)
-                .expect("second key is ready after earliest is consumed");
-        assert_eq!(second_key, CanonicalKey::npm("b"));
-        assert_eq!(second_value, 2);
     }
 
     #[test]

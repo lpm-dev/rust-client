@@ -240,8 +240,8 @@ pub struct StageTiming {
     pub dispatcher_rpc_count: u64,
     /// Peak `metadata_jobs.len()` observed at any Phase A→C
     /// transition of the fused dispatcher loop. Confirms the metadata
-    /// semaphore (256) is the binding constraint when
-    /// this approaches its cap; if it sits well below, the binding
+    /// semaphore is the binding constraint when this approaches the
+    /// configured fanout; if it sits well below, the binding
     /// constraint is something upstream (h2 single-connection flow
     /// control, h1-pool socket count, or a serialization in
     /// `process_edge`).
@@ -254,11 +254,9 @@ pub struct StageTiming {
     /// reading in the hundreds is a signal the registry is stalling
     /// on one specific package.
     pub parked_max_depth: u32,
-    /// Count of speculative tarball downloads dispatched
-    /// from inside `process_edge_with_tarball_dispatch`. Parity with
-    /// the pre-fusion `SpeculativeStats.spawned` metric. Zero on the
-    /// walker arm (where speculation runs through the separate
-    /// `spawn_speculation_dispatcher` instead).
+    /// Count of selected-version metadata frames emitted to an optional
+    /// install-side tarball speculation channel. Zero on the walker arm
+    /// and on fusion callers that do not pass a speculation channel.
     pub tarball_dispatched_count: u64,
     /// Count of speculative peer-manifest fetches the fused dispatcher
     /// dispatched concurrent with the regular dep walk. Each prefetch

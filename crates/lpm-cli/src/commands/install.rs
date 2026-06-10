@@ -9,8 +9,8 @@ use lpm_common::color::Painted;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::{GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url};
 use lpm_resolver::{
-    CompiledPeerRules, OverrideHit, OverrideSet, PeerConflictReport, PeerWarning, ResolvedPackage,
-    check_unmet_peers,
+    CachedPackageInfo, CanonicalKey, CompiledPeerRules, OverrideHit, OverrideSet,
+    PeerConflictReport, PeerWarning, ResolvedPackage, check_unmet_peers,
 };
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
@@ -847,6 +847,7 @@ impl SpeculativeStats {
 /// very deep single-chains). Matches the worker's own deep-walk cap so
 /// speculation doesn't ask for manifests the worker won't send.
 const SPECULATION_MAX_DEPTH: u32 = 5;
+const DEFAULT_FUSION_NPM_FANOUT: usize = 64;
 
 impl FetchBreakdown {
     /// Fold one task's timings into the running aggregate.
@@ -1952,6 +1953,11 @@ struct InstallPackage {
     peers: Vec<(String, String)>,
     /// SRI integrity hash for verification (e.g. "sha512-...")
     integrity: Option<String>,
+    /// Registry package-signature payload from `dist.signatures`.
+    registry_signatures: Vec<lpm_registry::RegistrySignature>,
+    /// Registry publish timestamp for the selected version, used when
+    /// checking signature key expiry.
+    registry_published_at: Option<String>,
     /// Platform restrictions declared by the selected package version.
     platform: Option<lpm_resolver::PlatformMeta>,
     /// True when this package is reachable only through optional dependency
@@ -2476,6 +2482,8 @@ fn pre_resolve_v2_direct_workspace_member_deps(
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: None,
@@ -2911,6 +2919,8 @@ async fn pre_resolve_non_registry_deps(
             is_lpm: false,
             peers: Vec::new(),
             integrity: Some(computed_sri),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: Some(url),
@@ -3010,6 +3020,8 @@ async fn pre_resolve_non_registry_deps(
             is_lpm: false,
             peers: Vec::new(),
             integrity: Some(integrity_sri),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             // tarball_url is fresh-URL writeback (registry-
@@ -3147,6 +3159,8 @@ async fn pre_resolve_non_registry_deps(
             // package.json content as the freshness signal instead.
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: None,
@@ -3249,6 +3263,8 @@ async fn pre_resolve_non_registry_deps(
             // content into the install-hash freshness signal.
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: None,
@@ -3945,6 +3961,8 @@ fn recurse_local_source_deps(
                     is_lpm: false,
                     peers: Vec::new(),
                     integrity: None,
+                    registry_signatures: Vec::new(),
+                    registry_published_at: None,
                     platform: None,
                     optional: false,
                     tarball_url: None,
@@ -5601,12 +5619,6 @@ async fn run_with_options_under_store_lock(
     // consumes it and makes the post-fetch drain a no-op (preplan
     //).
     let mut walker_join: Option<WalkerJoin> = None;
-    //: when set, the fusion dispatcher ran instead of the
-    // walker. Read at the post-fetch drain site to suppress the no-op
-    // walker stub's zeroed `streaming_bfs` summary in `--json` output
-    // (the fusion arm reports null streaming_bfs because there's no
-    // walker; substage detail lives under `timing.resolve.dispatcher.*`).
-    let mut fusion_enabled = false;
     // Post-lockfile metadata: which resolver actually ran.
     // Stamped into `lpm.lock`'s `resolved-with` field at the cold-
     // write site below. Defaults to the greedy-fusion install default
@@ -5735,43 +5747,15 @@ async fn run_with_options_under_store_lock(
                     u128,
                 ) = if fusion_enabled_local {
                     // ── FUSION PATH ─────────────────────────────────────
-                    fusion_enabled = true;
-
-                    // Speculation dispatcher reads from spec_rx; resolver
-                    // owns spec_tx and drops it on return, signaling the
-                    // dispatcher to drain and exit. Capacity 512 matches
-                    // the walker arm's channel size.
-                    let (spec_tx, spec_rx) =
-                        tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
-                    let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
-                        spec_rx,
-                        arc_client.clone(),
-                        route_table.clone(),
-                        store.clone(),
-                        fetch_semaphore.clone(),
-                        fetch_coord.clone(),
-                        deps.clone(),
-                        store_v2_handle.clone(),
-                    );
-
-                    // No-op walker stub keeps `WalkerJoin` shape uniform
-                    // so the post-fetch drain below doesn't need a fusion
-                    // branch. The drained `WalkerSummary::default()` is
-                    // suppressed at the JSON-emit site via `fusion_enabled`.
-                    let walker_handle = tokio::spawn(async {
-                        Ok::<_, lpm_resolver::WalkerError>(lpm_resolver::WalkerSummary::default())
-                    });
-
-                    // Metadata semaphore size. Pre-plan: 256 sits at
-                    // the H2 single-connection multiplex cap; lets the
-                    // registry's flow control set the actual pace.
-                    // `LPM_NPM_FANOUT` overrides for bench tuning, matches
-                    // the walker arm's env var.
+                    // Fusion resolves metadata fast enough that saturating
+                    // the registry's H2 stream cap can slow the following
+                    // tarball wave. Keep headroom by default; retain
+                    // `LPM_NPM_FANOUT` for benchmark tuning.
                     let npm_fanout = std::env::var("LPM_NPM_FANOUT")
                         .ok()
                         .and_then(|s| s.parse::<usize>().ok())
                         .filter(|&n| n > 0)
-                        .unwrap_or(256);
+                        .unwrap_or(DEFAULT_FUSION_NPM_FANOUT);
 
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
                     seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
@@ -5781,25 +5765,13 @@ async fn run_with_options_under_store_lock(
                         override_set.clone(),
                         route_table.clone(),
                         npm_fanout,
-                        Some(spec_tx),
+                        None,
                         shared_cache,
                         auto_install_peers,
                         !omit_policy.optional,
                     )
                     .await
                     .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
-
-                    walker_join = Some(WalkerJoin {
-                        walker: walker_handle,
-                        dispatcher: dispatcher_handle,
-                        dispatched: dispatcher_counters.dispatched,
-                        completed: dispatcher_counters.completed,
-                        task_ms_sum: dispatcher_counters.task_ms_sum,
-                        transitive_dispatched: dispatcher_counters.transitive_dispatched,
-                        max_depth_reached: dispatcher_counters.max_depth_reached,
-                        no_version_match: dispatcher_counters.no_version_match,
-                        unresolved_parked: dispatcher_counters.unresolved_parked,
-                    });
 
                     // initial_batch_ms is meaningless under fusion (no
                     // walker → no roots-ready boundary); 0 reads as
@@ -5956,15 +5928,10 @@ async fn run_with_options_under_store_lock(
 
                 let resolve_result = resolve_res?;
 
-                //: drain-wait removed. `speculation_join` is
-                // preserved on the outer scope and drained AFTER the fetch
-                // loop below, so speculative tarball downloads can overlap
-                // the real fetch loop (straggling specs race with the real
-                // fetches for the same 24-permit download pool). The
-                // `fetch_coord` serializes per-(name, version) work, so a
-                // real fetch for a package spec is still downloading just
-                // waits on the coord's per-key lock and returns as soon as
-                // spec's atomic-rename makes it visible.
+                // The legacy walker arm keeps its speculation join in
+                // `walker_join` and drains it after fetch. Fusion does not
+                // start install-side tarball speculation; the exact resolved
+                // graph feeds the authoritative fetch phase directly.
                 let ms = resolve_start.elapsed().as_millis();
 
                 // Post-resolution peer dependency check: warn about unmet peers
@@ -6063,6 +6030,7 @@ async fn run_with_options_under_store_lock(
                     &deps,
                     &resolve_result.root_aliases,
                     &resolve_result.ambient_peer_installs,
+                    &resolve_result.cache,
                     &route_table,
                     &all_workspace_members,
                     project_dir,
@@ -6155,6 +6123,7 @@ async fn run_with_options_under_store_lock(
         &direct_workspace_member_deps,
     );
 
+    let mut walker_summary_final: Option<lpm_resolver::WalkerSummary> = None;
     // Step 3: Download & store (parallel).: `store` is
     // already bound above — speculative dispatcher writes into it
     // during resolve, so by the time we reach here the store may hold
@@ -7657,45 +7626,26 @@ async fn run_with_options_under_store_lock(
 
     let fetch_ms = fetch_start.elapsed().as_millis();
 
-    //: drain speculation AFTER the real fetch loop, not
-    // before. Spec tarballs for correctly-predicted versions were
-    // consumed by the fetch coord's per-key lock (real fetch waited on
-    // them and short-circuited). What remains in-flight here is spec
-    // work for WRONG-version predictions — harmless wasted bandwidth
-    // that the resolver didn't want. We still await the dispatcher
-    // handle so its atomics can be read into `spec_stats` for --json,
-    // but it happens outside both `fetch_ms` and `link_ms` so stage
-    // times are not inflated by wasted speculation tails.
-    //: walker summary is folded into
+    // The legacy walker resolver keeps the post-fetch drain so tarball
+    // speculation can overlap its slower metadata walk. Fusion does not
+    // start the tarball speculation dispatcher; its exact graph goes
+    // straight to authoritative fetch.
+    //
+    // The walker summary is folded into
     // `timing.resolve.streaming_bfs` in the JSON-output block below.
     // `None` on warm lockfile-fast-path installs (walker never ran).
-    let walker_summary_final: Option<lpm_resolver::WalkerSummary> = if let Some(join) =
-        walker_join.take()
-    {
+    if let Some(join) = walker_join.take() {
         let summary = join.drain(&mut spec_stats).await;
-        if fusion_enabled {
-            //: fusion arm uses a no-op walker stub purely
-            // to keep `WalkerJoin` shape uniform for the spec-dispatcher
-            // drain. Its summary is the all-zero default — surfacing it
-            // in `streaming_bfs` would mislead readers into thinking a
-            // walker ran. Substage detail under fusion lives in
-            // `timing.resolve.dispatcher.*` (W1 plumbing). Suppress to
-            // null so `--json` consumers can detect arm by presence.
-            None
-        } else {
-            tracing::debug!(
-                "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={} walker_wall_ms={}",
-                summary.manifests_fetched,
-                summary.cache_hits,
-                summary.max_depth,
-                summary.spec_tx_send_wait_ms,
-                summary.walker_wall_ms,
-            );
-            Some(summary)
-        }
-    } else {
-        None
-    };
+        tracing::debug!(
+            "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={} walker_wall_ms={}",
+            summary.manifests_fetched,
+            summary.cache_hits,
+            summary.max_depth,
+            summary.spec_tx_send_wait_ms,
+            summary.walker_wall_ms,
+        );
+        walker_summary_final = Some(summary);
+    }
 
     // Fetch / cache-hit counters are recorded into `fetch_ms` etc. and
     // surfaced via the verbose footer and JSON envelope. The default
@@ -8755,8 +8705,8 @@ async fn run_with_options_under_store_lock(
                     "escape_hatch_rpc_count": resolver_stage_timing.escape_hatch_rpc_count,
                     "parse_ndjson_ms": resolver_stage_timing.parse_ndjson_ms,
                     "pubgrub_ms": resolver_stage_timing.pubgrub_ms,
-                    // — fused-dispatcher counters. Zero on the
-                    // walker arm; non-zero under `LPM_GREEDY_FUSION=1`.
+                    // — fused metadata-dispatcher counters. Zero on
+                    // the walker arm; populated under greedy fusion.
                     // Field shape:
                     //   rpc_count             — total metadata RPCs the
                     //                           dispatcher fired
@@ -8764,7 +8714,7 @@ async fn run_with_options_under_store_lock(
                     //                           escape_hatch on fusion).
                     //   inflight_high_water   — peak in-flight metadata
                     //                           fetches; approaching the
-                    //                           256 cap means the
+                    //                           configured fanout means the
                     //                           semaphore is binding.
                     //   parked_max_depth      — peak Vec length in the
                     //                           per-canonical park map;
@@ -8772,10 +8722,12 @@ async fn run_with_options_under_store_lock(
                     //                           hundreds = stalled CDN
                     //                           pin on one package.
                     //   tarball_dispatched    — speculative tarball
-                    //                           downloads fired from the
-                    //                           dispatcher (parity with
-                    //                           pre-fusion `speculative`
-                    //                           on the walker arm).
+                    //                           metadata frames emitted
+                    //                           by resolver arms that
+                    //                           enable CLI speculation.
+                    //                           Fusion leaves this at 0
+                    //                           by default and lets the
+                    //                           exact graph feed fetch.
                     //   peer_prefetch_count   — speculative
                     //                           peer-manifest fetches
                     //                           dispatched concurrent with
@@ -10763,6 +10715,8 @@ fn try_lockfile_fast_path(
                 is_lpm,
                 peers,
                 integrity: lp.integrity.clone(),
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
                 platform: platform_meta_from_lockfile(lp),
                 optional: lp.optional,
                 // — gate a stored URL against scheme/shape/
@@ -10909,6 +10863,7 @@ fn resolved_to_install_packages(
     root_aliases: &HashMap<String, String>,
     // (see function doc)
     ambient_peer_installs: &[String],
+    resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
     // (post-review) — supplied so the source string
     // reflects the actual registry the package was fetched from
     // (`.npmrc`-mapped private mirrors, etc.) rather than a
@@ -11009,6 +10964,12 @@ fn resolved_to_install_packages(
             if !seen.insert(rlk(&name, &version)) {
                 return None;
             }
+            let canonical = CanonicalKey::from(&r.package);
+            let (registry_signatures, registry_published_at) = resolver_cache
+                .get(&canonical)
+                .and_then(|info| info.dist.get(&version))
+                .map(|dist| (dist.signatures.clone(), dist.published_at.clone()))
+                .unwrap_or_default();
             let is_lpm = r.package.is_lpm();
             // (post-review): derive the wire-format source
             // string from the active route table, so a `.npmrc`-mapped
@@ -11033,6 +10994,8 @@ fn resolved_to_install_packages(
                 // `(peer_name, version)` list straight through.
                 peers: r.peers.clone(),
                 integrity: r.integrity.clone(),
+                registry_signatures,
+                registry_published_at,
                 platform: r.platform.clone(),
                 optional: r.optional,
                 tarball_url: r.tarball_url.clone(),
@@ -11042,11 +11005,13 @@ fn resolved_to_install_packages(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolved_to_install_packages_with_workspace_members(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
     root_aliases: &HashMap<String, String>,
     ambient_peer_installs: &[String],
+    resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
     route_table: &RouteTable,
     all_workspace_members: &[WorkspaceMemberLink],
     project_dir: &Path,
@@ -11056,6 +11021,7 @@ fn resolved_to_install_packages_with_workspace_members(
         deps,
         root_aliases,
         ambient_peer_installs,
+        resolver_cache,
         route_table,
     );
     rewrite_workspace_resolved_sources(&mut packages, all_workspace_members, project_dir);
@@ -12018,14 +11984,19 @@ async fn speculative_download_and_store(
         return Ok(());
     }
 
-    let _permit = semaphore
-        .acquire()
-        .await
-        .map_err(|_| LpmError::Registry("spec semaphore closed".into()))?;
+    // Speculation must never queue ahead of the authoritative fetch loop.
+    // If all permits are busy, skip this best-effort prefetch and let the
+    // real fetch path own the network slot.
+    let _permit = match semaphore.try_acquire() {
+        Ok(permit) => permit,
+        Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(()),
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            return Err(LpmError::Registry("spec semaphore closed".into()));
+        }
+    };
 
-    // day-4.5 — speculative tarball downloads also route via
-    // the auth-aware path so custom-registry speculation succeeds
-    // (and doesn't leak the LPM session bearer cross-origin).
+    // Keep speculative downloads on the auth-aware route so custom registries
+    // use the same credentials and origin checks as authoritative fetches.
     let response = client
         .download_tarball_streaming_routed(route_table, name, url)
         .await?;
@@ -12189,16 +12160,40 @@ async fn verify_registry_signature_if_present(
     }
 
     let route = route_table.route_for_package(&package.name);
-    let metadata_owned;
-    let metadata = match metadata_hint {
-        Some(metadata) => metadata,
-        None => {
-            metadata_owned = client
-                .get_npm_metadata_routed(&package.name, route.clone())
-                .await?;
-            &metadata_owned
-        }
-    };
+    if let Some(metadata) = metadata_hint {
+        return verify_registry_signature_from_metadata(client, &route, package, metadata).await;
+    }
+
+    if !package.registry_signatures.is_empty() {
+        let Some(integrity) = package.integrity.as_deref() else {
+            return Err(LpmError::Registry(format!(
+                "{}@{} has registry signatures but no dist.integrity to verify",
+                package.name, package.version
+            )));
+        };
+        return verify_registry_signature_payload(
+            client,
+            &route,
+            package,
+            &package.registry_signatures,
+            integrity,
+            package.registry_published_at.as_deref(),
+        )
+        .await;
+    }
+
+    let metadata = client
+        .get_npm_metadata_routed(&package.name, route.clone())
+        .await?;
+    verify_registry_signature_from_metadata(client, &route, package, &metadata).await
+}
+
+async fn verify_registry_signature_from_metadata(
+    client: &Arc<RegistryClient>,
+    route: &UpstreamRoute,
+    package: &InstallPackage,
+    metadata: &lpm_registry::PackageMetadata,
+) -> Result<(), LpmError> {
     let version = metadata.version(&package.version).ok_or_else(|| {
         LpmError::NotFound(format!(
             "{}@{} not found in metadata",
@@ -12218,14 +12213,33 @@ async fn verify_registry_signature_if_present(
         )));
     };
 
-    let keys = registry_signing_keys_for_route(client, &route, signatures).await?;
+    verify_registry_signature_payload(
+        client,
+        route,
+        package,
+        signatures,
+        integrity,
+        metadata.time.get(&package.version).map(String::as_str),
+    )
+    .await
+}
+
+async fn verify_registry_signature_payload(
+    client: &Arc<RegistryClient>,
+    route: &UpstreamRoute,
+    package: &InstallPackage,
+    signatures: &[lpm_registry::RegistrySignature],
+    integrity: &str,
+    published_at: Option<&str>,
+) -> Result<(), LpmError> {
+    let keys = registry_signing_keys_for_route(client, route, signatures).await?;
     let verification = lpm_registry::verify_registry_signatures(
         &package.name,
         &package.version,
         integrity,
         signatures,
         &keys,
-        metadata.time.get(&package.version).map(String::as_str),
+        published_at,
     )?;
     if let lpm_registry::RegistrySignatureVerification::Verified { count } = verification {
         tracing::debug!(
@@ -16610,6 +16624,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: None,
@@ -17849,6 +17865,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -17965,6 +17982,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -17992,6 +18010,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -18035,6 +18054,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -18054,6 +18074,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -18061,6 +18082,57 @@ mod tests {
         assert_eq!(
             installed[0].source, "registry+https://registry.npmjs.org",
             "no .npmrc override → npmjs.org default"
+        );
+    }
+
+    #[test]
+    fn resolved_to_install_packages_carries_registry_signature_metadata() {
+        let signature = lpm_registry::RegistrySignature {
+            keyid: Some("SHA256:test-key".to_string()),
+            sig: Some("base64-signature".to_string()),
+        };
+        let mut dist = HashMap::new();
+        dist.insert(
+            "1.0.0".to_string(),
+            lpm_resolver::CachedDistInfo {
+                tarball_url: Some("https://registry.npmjs.org/signed/-/signed-1.0.0.tgz".into()),
+                integrity: Some("sha512-test".to_string()),
+                signatures: vec![signature.clone()],
+                published_at: Some("2026-01-02T03:04:05.000Z".to_string()),
+            },
+        );
+        let mut resolver_cache = HashMap::new();
+        resolver_cache.insert(
+            lpm_resolver::CanonicalKey::npm("signed"),
+            Arc::new(lpm_resolver::CachedPackageInfo {
+                versions: vec![NpmVersion::parse("1.0.0").unwrap()],
+                deps: HashMap::new(),
+                peer_deps: HashMap::new(),
+                optional_dep_names: HashMap::new(),
+                optional_peer_names: HashMap::new(),
+                bundled_dep_names: HashMap::new(),
+                platform: HashMap::new(),
+                dist,
+                aliases: HashMap::new(),
+            }),
+        );
+
+        let resolved = vec![fake_resolved("signed", "1.0.0", None)];
+        let deps: HashMap<String, String> = [("signed".to_string(), "^1.0.0".to_string())].into();
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &[],
+            &resolver_cache,
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].registry_signatures, vec![signature]);
+        assert_eq!(
+            installed[0].registry_published_at.as_deref(),
+            Some("2026-01-02T03:04:05.000Z")
         );
     }
 
@@ -18085,6 +18157,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &route_table,
         );
 
@@ -18981,6 +19054,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: integrity.map(|s| s.to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: Some(url.to_string()),
@@ -20291,6 +20366,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
                 platform: None,
                 optional: false,
                 tarball_url: None,
@@ -20338,6 +20415,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: None,
@@ -20354,6 +20433,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: None,
@@ -20693,6 +20774,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: None,
@@ -20728,6 +20811,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: None,
@@ -21277,6 +21362,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: None,
@@ -21640,6 +21727,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
                 platform: None,
                 optional: false,
                 tarball_url: None,
@@ -21656,6 +21745,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
                 platform: None,
                 optional: false,
                 tarball_url: None,
@@ -21672,6 +21763,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
                 platform: None,
                 optional: false,
                 tarball_url: None,
@@ -21740,6 +21833,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
                 platform: None,
                 optional: false,
                 tarball_url: None,
@@ -21756,6 +21851,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
                 platform: None,
                 optional: false,
                 tarball_url: None,
@@ -21772,6 +21869,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
                 platform: None,
                 optional: false,
                 tarball_url: None,
@@ -21817,6 +21916,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             platform: None,
             optional: false,
             tarball_url: None,

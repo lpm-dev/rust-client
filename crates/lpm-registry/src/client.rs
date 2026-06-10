@@ -453,6 +453,9 @@ pub struct RegistryClient {
     /// the current token / trigger silent refresh without the caller
     /// threading a session in.
     session: Option<Arc<SessionManager>>,
+    /// Process-local cache for registry package-signing keys, keyed by
+    /// registry URL plus auth/mTLS principal.
+    registry_signing_keys_cache: Arc<tokio::sync::Mutex<HashMap<String, Vec<RegistrySigningKey>>>>,
     /// Precomputed ASCII-serialized origin of `base_url`.
     /// Avoids re-parsing + re-allocating on every `is_configured_origin` call.
     base_url_origin: String,
@@ -1076,6 +1079,7 @@ impl RegistryClient {
             synchronous_cache_writes: false,
             allow_insecure: false,
             session: None,
+            registry_signing_keys_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             base_url_origin: Self::url_origin(DEFAULT_REGISTRY_URL),
             npm_registry_url_origin: Self::url_origin(NPM_REGISTRY_URL),
         }
@@ -1430,6 +1434,7 @@ impl RegistryClient {
             synchronous_cache_writes: self.synchronous_cache_writes,
             allow_insecure: self.allow_insecure,
             session: self.session.clone(),
+            registry_signing_keys_cache: Arc::clone(&self.registry_signing_keys_cache),
             base_url_origin: self.base_url_origin.clone(),
             npm_registry_url_origin: self.npm_registry_url_origin.clone(),
         }
@@ -2326,6 +2331,15 @@ impl RegistryClient {
         }
 
         let url = format!("{}/-/npm/v1/keys", base_url.trim_end_matches('/'));
+        let cache_key = format!(
+            "registry-signing-keys:{}:{url}",
+            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+        );
+        let mut cache = self.registry_signing_keys_cache.lock().await;
+        if let Some(keys) = cache.get(&cache_key) {
+            return Ok(keys.clone());
+        }
+
         let req = self
             .http
             .for_url(&url)
@@ -2335,11 +2349,15 @@ impl RegistryClient {
         let req = apply_npmrc_auth(req, &url, auth)?;
         let response = match self.send_with_retry(req).await {
             Ok(response) => response,
-            Err(LpmError::NotFound(_)) => return Ok(Vec::new()),
+            Err(LpmError::NotFound(_)) => {
+                cache.insert(cache_key, Vec::new());
+                return Ok(Vec::new());
+            }
             Err(error) => return Err(error),
         };
         let keys =
             parse_capped_metadata::<KeysResponse>(response, "get_registry_signing_keys").await?;
+        cache.insert(cache_key, keys.keys.clone());
         Ok(keys.keys)
     }
 
@@ -8890,6 +8908,47 @@ mod tests {
             origin,
             credential: SecretString::from(b64.to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn registry_signing_keys_are_singleflight_cached() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "keys": [{
+                "expires": null,
+                "keyid": "SHA256:test-key",
+                "keytype": "ecdsa-sha2-nistp256",
+                "scheme": "ecdsa-sha2-nistp256",
+                "key": "public-key"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/-/npm/v1/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let server_uri = server.uri();
+        let (client, _tmp) = client_with_mock_server(&server_uri);
+        let (first, second) = tokio::join!(
+            client.get_registry_signing_keys(&server_uri, None),
+            client.get_registry_signing_keys(&server_uri, None)
+        );
+
+        let first = first.expect("first key lookup succeeds");
+        let second = second.expect("second key lookup succeeds");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+
+        let third = client
+            .get_registry_signing_keys(&server_uri, None)
+            .await
+            .expect("warm key lookup succeeds");
+        assert_eq!(third, first);
     }
 
     #[tokio::test]
