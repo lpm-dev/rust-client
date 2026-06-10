@@ -1202,8 +1202,8 @@ where
                     .unwrap_or(false);
                 out.insert(name, PeerDependencyMeta { optional });
             }
-            serde_json::Value::Bool(optional) => {
-                out.insert(name, PeerDependencyMeta { optional });
+            serde_json::Value::Bool(_) => {
+                out.insert(name, PeerDependencyMeta { optional: false });
             }
             serde_json::Value::Null => {}
             _ => {}
@@ -1465,7 +1465,7 @@ mod tests {
                 .peer_dependencies_meta
                 .get("ua-parser-js")
                 .map(|meta| meta.optional),
-            Some(true)
+            Some(false)
         );
         assert!(!dirty.peer_dependencies_meta.contains_key("ignored-null"));
         assert!(!dirty.peer_dependencies_meta.contains_key("ignored-string"));
