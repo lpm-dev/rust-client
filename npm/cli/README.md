@@ -8,7 +8,9 @@ npm install -g @lpm-registry/cli
 
 This package is the npm gateway for the native LPM CLI. It installs a small
 JavaScript launcher plus the matching platform package, such as
-`@lpm-registry/cli-darwin-arm64` or `@lpm-registry/cli-linux-x64`.
+`@lpm-registry/cli-darwin-arm64` or `@lpm-registry/cli-linux-x64`. A tiny
+`postinstall` verifier checks the native binary and wires the global command to
+it where the platform allows that.
 
 The JavaScript launcher does not implement package-manager behavior. All CLI
 commands run in the native Rust binary.
@@ -35,6 +37,9 @@ with optional dependencies enabled:
 ```bash
 npm install -g @lpm-registry/cli
 ```
+
+If install scripts were disabled, reinstall without `--ignore-scripts` so npm
+can validate the native binary during installation.
 
 Other install methods are documented at
 [github.com/lpm-dev/rust-client](https://github.com/lpm-dev/rust-client).
