@@ -2342,72 +2342,33 @@ mod tests {
     }
 
     #[test]
-    fn hoisted_graph_key_collapses_peers_silently_in_release() {
-        // Under hoisted mode, peers must not contribute to the graph
-        // key. The primitive
-        // enforces this regardless of caller normalization (silent
-        // collapse + debug_assert; this test exercises only the
-        // collapse part — the debug_assert path is exercised under
-        // `#[should_panic]` below).
-        //
-        // Two hoisted inputs that differ ONLY in `peers` MUST yield
-        // the same graph key. Anything else fragments the cross-
-        // project hoisted cache the rewrite is meant to unlock.
+    fn hoisted_graph_key_distinguishes_peers() {
+        // Hoisted link entries materialize peer sibling symlinks, so
+        // peer pinning is part of the shared-entry identity. Two
+        // hoisted inputs that differ only in peers must not reuse one
+        // link entry.
         let no_peers =
             GraphKeyInputs::new("react", "18.3.0", macos_arm64(), LinkerModeTag::Hoisted);
-        // Build the with-peers variant directly (skipping the
-        // `with_peers` path so the debug_assert in `derive` doesn't
-        // fire — we want to exercise the silent-collapse arm in
-        // release semantics).
-        let mut with_peers =
-            GraphKeyInputs::new("react", "18.3.0", macos_arm64(), LinkerModeTag::Hoisted);
-        // Only execute the inline assignment under cfg(not(debug_assertions))
-        // so cargo test --release-style runs cover this path. Tests
-        // running with debug_assertions on would panic via the
-        // debug_assert, which is the desired dev-time behavior.
-        if cfg!(not(debug_assertions)) {
-            with_peers.peers = vec![PeerEntry {
-                name: "react-dom".into(),
-                version: "18.3.0".into(),
-            }];
-            assert_eq!(GraphKey::derive(&no_peers), GraphKey::derive(&with_peers));
-        } else {
-            // In debug builds, just assert that the no-peers form
-            // hashes deterministically — the silent-collapse arm is
-            // exercised by release builds (CI runs both).
-            let a = GraphKey::derive(&no_peers);
-            let b = GraphKey::derive(&no_peers);
-            assert_eq!(a, b);
-        }
+        let with_peers =
+            GraphKeyInputs::new("react", "18.3.0", macos_arm64(), LinkerModeTag::Hoisted)
+                .with_peers([PeerEntry {
+                    name: "react-dom".into(),
+                    version: "18.3.0".into(),
+                }]);
+        assert_ne!(GraphKey::derive(&no_peers), GraphKey::derive(&with_peers));
     }
 
     #[test]
     fn isolated_graph_key_still_distinguishes_peers() {
-        // Symmetric guard for finding 2: the hoisted collapse must NOT
-        // affect isolated-mode keys. Two isolated inputs differing in
-        // peers MUST yield different graph keys.
+        // Isolated mode keeps the same peer identity contract as
+        // hoisted mode: different peer layouts get different link
+        // entries.
         let p1 = GraphKeyInputs::new("react", "18.3.0", macos_arm64(), LinkerModeTag::Isolated);
         let p2 = p1.clone().with_peers([PeerEntry {
             name: "react-dom".into(),
             version: "18.3.0".into(),
         }]);
         assert_ne!(GraphKey::derive(&p1), GraphKey::derive(&p2));
-    }
-
-    #[test]
-    #[should_panic(expected = "hoisted graph keys must not carry peers")]
-    #[cfg(debug_assertions)]
-    fn hoisted_with_peers_panics_in_debug() {
-        // The dev-time guard surfaces caller mistakes. Wrapped in
-        // cfg(debug_assertions) so the test is a no-op under release
-        // builds where the debug_assert is compiled out.
-        let mut input =
-            GraphKeyInputs::new("react", "18.3.0", macos_arm64(), LinkerModeTag::Hoisted);
-        input.peers = vec![PeerEntry {
-            name: "react-dom".into(),
-            version: "18.3.0".into(),
-        }];
-        let _ = GraphKey::derive(&input);
     }
 
     /// Build a small gzip+tar tarball with `package/<path>` entries —

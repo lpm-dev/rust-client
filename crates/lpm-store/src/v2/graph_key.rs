@@ -54,8 +54,8 @@ use crate::v2::platform::PlatformTuple;
 pub enum LinkerModeTag {
     /// pnpm-style isolated, sibling symlinks under `node_modules/`.
     Isolated,
-    /// npm-style hoisted, flat layout. Peer-context collapses to empty
-    /// (one canonical version per name) but dep edges still distinguish.
+    /// npm-style hoisted layout. Peer pinning still contributes because
+    /// link entries materialize peer siblings.
     Hoisted,
 }
 
@@ -256,7 +256,7 @@ impl std::hash::Hash for GraphKey {
 impl GraphKey {
     /// Schema version tag. Bump if the input layout changes — older
     /// wrappers will produce different keys and naturally GC.
-    const SCHEMA: &'static [u8] = b"v=2";
+    const SCHEMA: &'static [u8] = b"v=3";
 
     /// Length of the directory-name suffix in hex chars (16 = 64 bits
     /// of the BLAKE3 digest, ~10⁻¹⁹ collision probability for 10⁹ keys).
@@ -264,25 +264,12 @@ impl GraphKey {
 
     /// Compute the graph key from a complete [`GraphKeyInputs`] struct.
     ///
-    /// **Hoisted peer-collapse is enforced here, not at the caller.**
-    /// "Peers are empty in hoisted mode" is the invariant that lets
-    /// cross-project hoisted wrappers share — if the primitive trusted
-    /// callers, a single missed normalization site would silently
-    /// fragment the cache (one wrapper per peer-context instead of one
-    /// per name+edge-set). We collapse `inputs.peers` to empty when
-    /// `linker_mode == Hoisted` and `debug_assert!` to surface the
-    /// caller's mistake during dev/test builds.
+    /// Peer pinning contributes to the key for every linker mode that
+    /// materializes peer siblings inside the shared link entry. Without
+    /// this, two installs with the same package/dependency graph but
+    /// different peer versions could reuse one link entry and expose
+    /// the wrong peer layout.
     pub fn derive(inputs: &GraphKeyInputs) -> Self {
-        debug_assert!(
-            !matches!(inputs.linker_mode, LinkerModeTag::Hoisted) || inputs.peers.is_empty(),
-            "GraphKey::derive: hoisted graph keys must not carry peers \
-             (collapsing silently in release; caller should pass an \
-             empty Vec). Got {} peers for {}@{}.",
-            inputs.peers.len(),
-            inputs.name,
-            inputs.version,
-        );
-
         let mut hasher = blake3::Hasher::new();
         hasher.update(Self::SCHEMA);
         hasher.update(b"\0");
@@ -299,14 +286,7 @@ impl GraphKey {
             inputs.linker_mode.as_str().as_bytes(),
         );
 
-        // Defense-in-depth: even if a caller slips a non-empty peer
-        // list past the debug_assert (release build), peers do NOT
-        // contribute to the hoisted graph key.
-        let effective_peers: &[PeerEntry] = match inputs.linker_mode {
-            LinkerModeTag::Isolated => &inputs.peers,
-            LinkerModeTag::Hoisted => &[],
-        };
-        let peers_str = format_peers(effective_peers);
+        let peers_str = format_peers(&inputs.peers);
         write_field(&mut hasher, b"peers", peers_str.as_bytes());
 
         let edges_str = format_deps(&inputs.deps);
@@ -368,13 +348,6 @@ impl GraphKey {
         wrapper_id: Option<&str>,
         patch_fingerprint: Option<&str>,
     ) -> Self {
-        debug_assert!(
-            !matches!(linker_tag, LinkerModeTag::Hoisted) || peers.is_empty(),
-            "GraphKey::derive_raw: hoisted graph keys must not carry peers \
-             (collapsing silently in release). Got {} peers for {name}@{version}.",
-            peers.len(),
-        );
-
         let mut hasher = blake3::Hasher::new();
         hasher.update(Self::SCHEMA);
         hasher.update(b"\0");
@@ -385,11 +358,7 @@ impl GraphKey {
         write_platform_direct(&mut hasher, platform);
         write_field(&mut hasher, b"linker", linker_tag.as_str().as_bytes());
 
-        let effective_peers: &[(String, String)] = match linker_tag {
-            LinkerModeTag::Isolated => peers,
-            LinkerModeTag::Hoisted => &[],
-        };
-        write_peers_raw_direct(&mut hasher, effective_peers);
+        write_peers_raw_direct(&mut hasher, peers);
         write_deps_raw_direct(&mut hasher, raw_deps, aliases);
         write_aliases_raw_direct(&mut hasher, aliases);
 
