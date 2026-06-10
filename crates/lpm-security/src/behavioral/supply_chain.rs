@@ -42,13 +42,23 @@ pub struct SupplyChainMeta {
     pub url_domains: Vec<String>,
 }
 
-// ── Telemetry SDK detection ───────────────────────────────────
+const OBF_HEX_ESCAPES: usize = 0;
+const OBF_VAR_NAMES: usize = 1;
+const OBF_FROM_CHAR_CODE: usize = 2;
+const OBF_BUFFER_BASE64: usize = 3;
+const TELEMETRY_START: usize = 4;
+const TELEMETRY_END: usize = 12;
+const PROTESTWARE_START: usize = 12;
+const PROTESTWARE_END: usize = 16;
 
-/// Known telemetry/analytics SDK import patterns.
-fn telemetry_patterns() -> &'static RegexSet {
+fn supply_patterns() -> &'static RegexSet {
     static INSTANCE: OnceLock<RegexSet> = OnceLock::new();
     INSTANCE.get_or_init(|| {
         RegexSet::new([
+            r"\\x[0-9a-fA-F]{2}",
+            r"\b_0x[0-9a-f]{4,}\b",
+            r"String\.fromCharCode\s*\(",
+            r#"Buffer\.from\s*\([^)]*["']base64["']"#,
             r#"["'](?:@?segment(?:/analytics-node)?|analytics-node)["']"#,
             r#"["']mixpanel["']"#,
             r#"["']posthog-node["']"#,
@@ -57,30 +67,37 @@ fn telemetry_patterns() -> &'static RegexSet {
             r#"["']countly-sdk-nodejs["']"#,
             r"\bnavigator\.sendBeacon\s*\(",
             r#"\bnew\s+Image\s*\(\s*\)\s*\.src\s*=\s*["']https?://"#,
+            r"(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)[\s\S]{0,200}process\.exit",
+            r"process\.exit[\s\S]{0,200}(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)",
+            r"for\s*\(\s*let\s+\w+\s*=.*Infinity",
+            r"while\s*\(\s*true\s*\)[\s\S]{0,50}replace",
         ])
-        .expect("telemetry patterns must compile")
+        .expect("supply-chain patterns must compile")
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SupplyPatternSummary {
+    obfuscation: [bool; 4],
+    telemetry: bool,
+    protestware: bool,
+}
+
+fn supply_pattern_summary(stripped: &str) -> SupplyPatternSummary {
+    let matches = supply_patterns().matches(stripped);
+    SupplyPatternSummary {
+        obfuscation: [
+            matches.matched(OBF_HEX_ESCAPES),
+            matches.matched(OBF_VAR_NAMES),
+            matches.matched(OBF_FROM_CHAR_CODE),
+            matches.matched(OBF_BUFFER_BASE64),
+        ],
+        telemetry: (TELEMETRY_START..TELEMETRY_END).any(|idx| matches.matched(idx)),
+        protestware: (PROTESTWARE_START..PROTESTWARE_END).any(|idx| matches.matched(idx)),
+    }
 }
 
 // ── Obfuscation detection ─────────────────────────────────────
-
-/// Signals indicating obfuscated code. Any 2+ signals = obfuscated.
-fn obfuscation_patterns() -> &'static RegexSet {
-    static INSTANCE: OnceLock<RegexSet> = OnceLock::new();
-    INSTANCE.get_or_init(|| {
-        RegexSet::new([
-            // Signal 0: Hex escape sequences in string literals (>= 5 occurrences suggests obfuscation)
-            r"\\x[0-9a-fA-F]{2}",
-            // Signal 1: Obfuscator-style variable names (_0x followed by hex digits)
-            r"\b_0x[0-9a-f]{4,}\b",
-            // Signal 2: String construction from char codes
-            r"String\.fromCharCode\s*\(",
-            // Signal 3: Buffer.from with base64 decoding
-            r#"Buffer\.from\s*\([^)]*["']base64["']"#,
-        ])
-        .expect("obfuscation patterns must compile")
-    })
-}
 
 /// Obfuscation confidence score (0.0–1.0).
 ///
@@ -97,9 +114,14 @@ fn obfuscation_patterns() -> &'static RegexSet {
 /// - File is minified → density thresholds are higher, but obfuscation is not suppressed
 /// - Number of distinct signal types (2+ required)
 pub fn obfuscation_confidence(stripped: &str, is_minified: bool) -> f64 {
-    let patterns = obfuscation_patterns();
-    let matches = patterns.matches(stripped);
+    obfuscation_confidence_with_summary(stripped, is_minified, supply_pattern_summary(stripped))
+}
 
+fn obfuscation_confidence_with_summary(
+    stripped: &str,
+    is_minified: bool,
+    patterns: SupplyPatternSummary,
+) -> f64 {
     let line_count = stripped.lines().count().max(1);
     let per_1k = 1000.0 / line_count as f64;
 
@@ -107,7 +129,7 @@ pub fn obfuscation_confidence(stripped: &str, is_minified: bool) -> f64 {
     let mut signal_types = 0u32;
 
     // Signal 0: hex escapes — density-based threshold
-    if matches.matched(0) {
+    if patterns.obfuscation[OBF_HEX_ESCAPES] {
         let hex_count = stripped.matches("\\x").count();
         let density = hex_count as f64 * per_1k;
         // Threshold: >5 per 1000 lines for normal files, >20 for minified
@@ -119,7 +141,7 @@ pub fn obfuscation_confidence(stripped: &str, is_minified: bool) -> f64 {
     }
 
     // Signal 1: _0x style variable names — density-based
-    if matches.matched(1) {
+    if patterns.obfuscation[OBF_VAR_NAMES] {
         let re = _0x_var_regex();
         let count = re.find_iter(stripped).count();
         let density = count as f64 * per_1k;
@@ -132,7 +154,7 @@ pub fn obfuscation_confidence(stripped: &str, is_minified: bool) -> f64 {
     }
 
     // Signal 2: String.fromCharCode — density-based
-    if matches.matched(2) {
+    if patterns.obfuscation[OBF_FROM_CHAR_CODE] {
         let count = stripped.matches("String.fromCharCode").count();
         let density = count as f64 * per_1k;
         let threshold = if is_minified { 10.0 } else { 5.0 };
@@ -143,7 +165,7 @@ pub fn obfuscation_confidence(stripped: &str, is_minified: bool) -> f64 {
     }
 
     // Signal 3: Buffer.from base64
-    if matches.matched(3) {
+    if patterns.obfuscation[OBF_BUFFER_BASE64] {
         signal_types += 1;
         score += 0.1;
     }
@@ -207,24 +229,6 @@ fn detect_dispatcher_pattern(stripped: &str) -> bool {
 /// Wraps `obfuscation_confidence` for backward compatibility.
 pub fn detect_obfuscation(stripped: &str) -> bool {
     obfuscation_confidence(stripped, false) > 0.3
-}
-
-// ── Protestware detection ─────────────────────────────────────
-
-/// Compiled protestware pattern set.
-fn protestware_patterns() -> &'static RegexSet {
-    static INSTANCE: OnceLock<RegexSet> = OnceLock::new();
-    INSTANCE.get_or_init(|| {
-        RegexSet::new([
-			// process.exit near locale/timezone/IP conditional
-            r"(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)[\s\S]{0,200}process\.exit",
-            r"process\.exit[\s\S]{0,200}(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)",
-			// Infinite loop pattern (colors@1.4.1 style)
-			r"for\s*\(\s*let\s+\w+\s*=.*Infinity",
-			r"while\s*\(\s*true\s*\)[\s\S]{0,50}replace",
-		])
-		.expect("protestware patterns must compile")
-    })
 }
 
 // ── URL extraction ────────────────────────────────────────────
@@ -490,17 +494,26 @@ pub fn analyze_trivial(stripped: &str) -> TrivialAnalysis {
 /// Takes already-stripped source content. `raw_content` is the original
 /// file content before comment stripping (needed for minification detection).
 pub fn analyze_supply_chain(stripped: &str, raw_content: &[u8]) -> SupplyChainTags {
+    analyze_supply_chain_with_url_presence(stripped, raw_content, url_regex().is_match(stripped))
+}
+
+pub(crate) fn analyze_supply_chain_with_url_presence(
+    stripped: &str,
+    raw_content: &[u8],
+    has_url_strings: bool,
+) -> SupplyChainTags {
+    let patterns = supply_pattern_summary(stripped);
     let is_minified = detect_minified(raw_content);
-    let confidence = obfuscation_confidence(stripped, is_minified);
+    let confidence = obfuscation_confidence_with_summary(stripped, is_minified, patterns);
 
     SupplyChainTags {
         obfuscated: confidence > 0.3,
         high_entropy_strings: detect_high_entropy(stripped),
         minified: is_minified,
-        telemetry: telemetry_patterns().is_match(stripped),
-        url_strings: url_regex().is_match(stripped),
+        telemetry: patterns.telemetry,
+        url_strings: has_url_strings,
         trivial: false, // Set at package level, not file level
-        protestware: protestware_patterns().is_match(stripped),
+        protestware: patterns.protestware,
         obfuscation_confidence: confidence,
     }
 }
@@ -632,25 +645,25 @@ mod tests {
     #[test]
     fn detect_segment_import() {
         let code = r#"import analytics from "analytics-node""#;
-        assert!(telemetry_patterns().is_match(code));
+        assert!(supply_pattern_summary(code).telemetry);
     }
 
     #[test]
     fn detect_mixpanel_require() {
         let code = r#"const mp = require("mixpanel")"#;
-        assert!(telemetry_patterns().is_match(code));
+        assert!(supply_pattern_summary(code).telemetry);
     }
 
     #[test]
     fn detect_send_beacon() {
         let code = "navigator.sendBeacon('/analytics', data)";
-        assert!(telemetry_patterns().is_match(code));
+        assert!(supply_pattern_summary(code).telemetry);
     }
 
     #[test]
     fn no_false_positive_analytics_word() {
         let code = "const analytics = { track() {} }";
-        assert!(!telemetry_patterns().is_match(code));
+        assert!(!supply_pattern_summary(code).telemetry);
     }
 
     // ── URL strings ───────────────────────────────────────────
@@ -705,20 +718,20 @@ mod tests {
 				process.exit(1)
 			}
 		"#;
-        assert!(protestware_patterns().is_match(code));
+        assert!(supply_pattern_summary(code).protestware);
     }
 
     #[test]
     fn detect_infinite_loop_pattern() {
         let code = "for (let i = 666; i < Infinity; i++) { console.log(i) }";
-        assert!(protestware_patterns().is_match(code));
+        assert!(supply_pattern_summary(code).protestware);
     }
 
     #[test]
     fn no_false_positive_normal_locale() {
         // Normal i18n code shouldn't trigger
         let code = "const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;";
-        assert!(!protestware_patterns().is_match(code));
+        assert!(!supply_pattern_summary(code).protestware);
     }
 
     // ── Trivial package ───────────────────────────────────────
@@ -757,7 +770,7 @@ mod tests {
 			}
 		"#;
         assert!(
-            protestware_patterns().is_match(code),
+            supply_pattern_summary(code).protestware,
             "colors@1.4.1 Infinity loop pattern should be detected"
         );
     }
@@ -775,7 +788,7 @@ mod tests {
 			}
 		"#;
         assert!(
-            !protestware_patterns().is_match(code),
+            !supply_pattern_summary(code).protestware,
             "normal i18n locale usage must NOT be flagged as protestware"
         );
     }
@@ -789,7 +802,7 @@ mod tests {
 			}
 		"#;
         assert!(
-            !protestware_patterns().is_match(code),
+            !supply_pattern_summary(code).protestware,
             "generic locale properties near process.exit should not be flagged as protestware"
         );
     }

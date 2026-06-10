@@ -93,6 +93,12 @@ const DELEGATE_GRAPH_SEP: u8 = 0x1d;
 const MAX_DELEGATE_GRAPH_FILES: usize = 128;
 const MAX_DELEGATE_GRAPH_DEPTH: usize = 16;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptHashWithPhaseBodies {
+    pub hash: String,
+    pub phase_bodies: Vec<(String, String)>,
+}
+
 /// Compute the deterministic install-script hash for a package located at
 /// the given store directory.
 ///
@@ -108,25 +114,19 @@ const MAX_DELEGATE_GRAPH_DEPTH: usize = 16;
 /// The function is pure: it reads disk but writes nothing. It does not
 /// touch any state outside `store_pkg_dir/package.json`.
 pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
+    Some(compute_script_hash_with_phase_bodies(store_pkg_dir)?.hash)
+}
+
+pub fn compute_script_hash_with_phase_bodies(
+    store_pkg_dir: &Path,
+) -> Option<ScriptHashWithPhaseBodies> {
     let pkg_json_path = store_pkg_dir.join("package.json");
     let content = std::fs::read_to_string(&pkg_json_path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
     let scripts = parsed.get("scripts")?.as_object()?;
 
-    // Pre-scan: if NONE of the executed phases are present with a non-empty
-    // body, return None so callers can short-circuit. This is the same
-    // contract as `read_lifecycle_scripts` in build.rs.
-    let any_present = EXECUTED_INSTALL_PHASES.iter().any(|phase| {
-        scripts
-            .get(*phase)
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.is_empty())
-    });
-    if !any_present {
-        return None;
-    }
-
     let mut hasher = Sha256::new();
+    let mut phase_bodies = Vec::with_capacity(EXECUTED_INSTALL_PHASES.len());
     for (i, phase) in EXECUTED_INSTALL_PHASES.iter().enumerate() {
         if i > 0 {
             hasher.update([RECORD_SEP]);
@@ -139,6 +139,9 @@ pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
         // produce different hashes even though the concatenated bodies are
         // identical.
         let body = scripts.get(*phase).and_then(|v| v.as_str()).unwrap_or("");
+        if !body.is_empty() {
+            phase_bodies.push(((*phase).to_string(), body.to_string()));
+        }
         hasher.update(body.as_bytes());
 
         // Delegate-body extension. When the body matches a
@@ -162,7 +165,14 @@ pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
         }
     }
 
-    Some(format!("sha256-{}", hex_lower(&hasher.finalize())))
+    if phase_bodies.is_empty() {
+        return None;
+    }
+
+    Some(ScriptHashWithPhaseBodies {
+        hash: format!("sha256-{}", hex_lower(&hasher.finalize())),
+        phase_bodies,
+    })
 }
 
 fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str) {
@@ -389,6 +399,33 @@ mod tests {
             &serde_json::json!({"build": "tsc", "test": "vitest", "prepare": "husky"}),
         );
         assert!(compute_script_hash(dir.path()).is_none());
+    }
+
+    #[test]
+    fn compute_script_hash_with_phase_bodies_returns_canonical_non_empty_phases() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({
+                "postinstall": "echo post",
+                "install": "node install.js",
+                "preinstall": "",
+                "prepare": "ignored",
+            }),
+        );
+
+        let combined = compute_script_hash_with_phase_bodies(dir.path()).unwrap();
+        assert_eq!(
+            combined.hash,
+            compute_script_hash(dir.path()).expect("script hash")
+        );
+        assert_eq!(
+            combined.phase_bodies,
+            vec![
+                ("install".to_string(), "node install.js".to_string()),
+                ("postinstall".to_string(), "echo post".to_string()),
+            ]
+        );
     }
 
     #[test]
