@@ -627,6 +627,7 @@ async fn do_install(
         overrides.min_release_age_override,
         overrides.drift_ignore_policy.clone(),
         overrides.verify_policy.clone(),
+        crate::commands::install::InstallOmitPolicy::default(),
         // `lpm install -g` does not surface its
         // own sandbox-mode flags. The env / config / default chain
         // inside `rebuild::run` still applies — `LPM_STRICT_SANDBOX=1`

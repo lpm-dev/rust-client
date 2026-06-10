@@ -83,6 +83,9 @@ impl PackageKey {
 ///   "no ambient installs," NOT "field absent." Per-package `peers`
 ///   is also authoritative for v2 lockfiles, enabling deterministic
 ///   graph-key reproduction across cold-and-warm installs.
+/// - **v3**: per-package platform metadata (`os`, `cpu`, `libc`) and
+///   optional-reachability state. Warm installs can replay host
+///   filtering instead of reconstructing every locked package blindly.
 ///
 /// **Why this matters:** install.rs's lockfile fast path uses the
 /// version to decide whether the absence of `ambient-peer-installs`
@@ -90,7 +93,7 @@ impl PackageKey {
 /// could be a buggy-writer artifact, so the fast path is invalidated
 /// and a fresh resolve runs (which writes a v2 lockfile, restoring
 /// fast-path eligibility on subsequent installs).
-pub const LOCKFILE_VERSION: u32 = 2;
+pub const LOCKFILE_VERSION: u32 = 3;
 
 /// Default lockfile filename.
 pub const LOCKFILE_NAME: &str = "lpm.lock";
@@ -197,6 +200,19 @@ pub struct LockedPackage {
     /// SRI integrity hash (sha512-...). Populated when registry provides it.
     #[serde(default)]
     pub integrity: Option<String>,
+    /// OS restrictions from the package version's manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+    /// CPU restrictions from the package version's manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu: Vec<String>,
+    /// libc restrictions from the package version's manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub libc: Vec<String>,
+    /// True when the package is only reachable through optional
+    /// dependency edges.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub optional: bool,
     /// Direct dependencies of this package: `<local_name>@<version>`
     /// where `local_name` is what this package uses in its own
     /// `dependencies` map. For non-aliased deps the local name equals
@@ -763,6 +779,11 @@ mod tests {
             version: "1.1.1".to_string(),
             source: Some("registry+https://lpm.dev".to_string()),
             integrity: Some("sha512-abc123...".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["react@999.999.999".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
@@ -773,6 +794,11 @@ mod tests {
             version: "999.999.999".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -939,6 +965,11 @@ resolved-with = "greedy-fusion"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -949,6 +980,11 @@ resolved-with = "greedy-fusion"
             version: "2.0.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -975,6 +1011,11 @@ resolved-with = "greedy-fusion"
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-xyz".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1028,6 +1069,11 @@ resolved-with = "greedy-fusion"
             version: "4.22.1".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1038,6 +1084,11 @@ resolved-with = "greedy-fusion"
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1283,6 +1334,11 @@ version = "1.0.0"
             version: "6.0.1".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-abc".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["ansi-regex@5.0.1".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1293,6 +1349,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["strip-ansi-cjs@6.0.1".to_string()],
             alias_dependencies: vec![["strip-ansi-cjs".to_string(), "strip-ansi".to_string()]],
             peers: vec![],
@@ -1333,6 +1394,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1367,6 +1433,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1391,6 +1462,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1429,6 +1505,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-reviewed".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1444,6 +1525,11 @@ version = "1.0.0"
             version: "9.9.9".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-poisoned".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["payload@1.0.0".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1473,6 +1559,11 @@ version = "1.0.0"
             version: "9.9.9".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1546,6 +1637,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: source.map(|s| s.to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1634,6 +1730,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: source.map(|s| s.to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1810,6 +1911,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("tarball+file:./vendor/local-bundle-1.0.0.tgz".to_string()),
             integrity: Some("sha256-abc123def456".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1851,6 +1957,11 @@ version = "1.0.0"
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-lodash".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1861,6 +1972,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("tarball+https://e.com/remote-fork.tgz".to_string()),
             integrity: Some("sha512-remoteFork".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1871,6 +1987,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("tarball+file:./vendor/local-tarball.tgz".to_string()),
             integrity: Some("sha256-localTarball".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1881,6 +2002,11 @@ version = "1.0.0"
             version: "0.1.0".to_string(),
             source: Some("directory+./packages/local-dir".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1891,6 +2017,11 @@ version = "1.0.0"
             version: "0.1.0".to_string(),
             source: Some("link+../shared/linked".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2112,6 +2243,11 @@ version = "1.0.0"
             version: "1.0.0".into(),
             source: Some("registry+https://registry.npmjs.org".into()),
             integrity: Some("sha512-deadbeef".into()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2256,6 +2392,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2266,6 +2407,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("git+https://github.com/foo/bar.git".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2320,6 +2466,11 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2330,6 +2481,11 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2353,6 +2509,11 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2374,6 +2535,11 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2384,6 +2550,11 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2419,6 +2590,11 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-AAAAAAAAAA==".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2429,6 +2605,11 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
             integrity: Some("sha512-BBBBBBBBBB==".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2527,6 +2708,11 @@ version = "1.0.0"
             version: "9.2.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["use-sync-external-store@1.6.0".to_string()],
             alias_dependencies: vec![],
             peers: vec!["react@18.2.0".to_string(), "redux@5.0.1".to_string()],
@@ -2560,6 +2746,11 @@ version = "1.0.0"
             version: "4.17.21".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2610,6 +2801,11 @@ dependencies = []
             version: "18.2.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2636,6 +2832,11 @@ dependencies = []
             version: "9.2.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec!["react@18.2.0".to_string()],
@@ -2670,6 +2871,11 @@ dependencies = []
             version: "19.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2680,6 +2886,11 @@ dependencies = []
             version: "19.0.0".to_string(),
             source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],

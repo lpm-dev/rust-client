@@ -26,6 +26,11 @@ fn lockfile_toml_binary_roundtrip() {
             version: format!("{i}.0.0"),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-test".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: if i > 0 {
                 vec![format!("pkg-{:04}@{}.0.0", i - 1, i - 1)]
             } else {
@@ -64,6 +69,11 @@ fn lockfile_binary_corrupt_falls_back_to_toml() {
         version: "4.22.1".to_string(),
         source: None,
         integrity: None,
+        os: Vec::new(),
+        cpu: Vec::new(),
+        libc: Vec::new(),
+        optional: false,
+
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],

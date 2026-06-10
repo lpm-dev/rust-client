@@ -141,6 +141,12 @@ enum LinkerCli {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum InstallOmitCli {
+    Dev,
+    Optional,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum CheckEngine {
     Tsc,
     Tsgo,
@@ -374,6 +380,14 @@ enum Commands {
         #[arg(long, short = 'D')]
         save_dev: bool,
 
+        /// Omit dependency types from node_modules.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        omit: Vec<InstallOmitCli>,
+
+        /// Install production dependencies only.
+        #[arg(long, alias = "production")]
+        prod: bool,
+
         /// Install without network (use lockfile + global store only).
         #[arg(long)]
         offline: bool,
@@ -499,15 +513,15 @@ enum Commands {
         #[arg(long)]
         unverified_provenance_all: bool,
 
-        /// Linking mode: `hoisted` (default — npm v3+ flat layout) or
-        /// `isolated` (pnpm-style strict isolation).
+        /// Linking mode: `hoisted` (default — v2 hoisted virtual-store layout)
+        /// or `isolated` (pnpm-style strict isolation).
         /// Both materialize as project `node_modules/<dep>` symlinks
         /// into the global virtual store at `~/.lpm/store/v2/links/`,
         /// so warm-install latency is identical between modes; the
-        /// distinction is whether transitive deps are reachable at the
-        /// project root (hoisted: yes — npm-compat) or only through
-        /// each consumer's own siblings (isolated: no — phantom-dep
-        /// catcher). Unknown values are rejected by clap at parse
+        /// distinction is whether transitive deps are hoisted within shared
+        /// link entries (hoisted) or only through each consumer's own siblings
+        /// (isolated). v2 hoisted mode does not flatten every transitive to
+        /// the project root. Unknown values are rejected by clap at parse
         /// time. Overrides `package.json > lpm > linker`,
         /// `~/.lpm/config.toml > linker`, and `LPM_LINKER`.
         #[arg(long, value_enum)]
@@ -2915,6 +2929,23 @@ fn parse_workspace_concurrency(s: &str) -> Result<NonZeroUsize, String> {
     workspace_concurrency_config::parse_workspace_concurrency(s)
 }
 
+fn install_omit_policy_from_cli(
+    omit: &[InstallOmitCli],
+    prod: bool,
+) -> commands::install::InstallOmitPolicy {
+    let mut policy = commands::install::InstallOmitPolicy {
+        dev: prod,
+        optional: false,
+    };
+    for kind in omit {
+        match kind {
+            InstallOmitCli::Dev => policy.dev = true,
+            InstallOmitCli::Optional => policy.optional = true,
+        }
+    }
+    policy
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_install_global_overrides(
     allow_new: bool,
@@ -2971,6 +3002,7 @@ fn validate_global_install_project_scoped_flags(
     fail_if_no_match: bool,
     yes: bool,
     catalog: bool,
+    omit: bool,
 ) -> Result<(), lpm_common::LpmError> {
     // `--allow-new`, `--min-release-age`, and
     // `--ignore-provenance-drift[-all]` are now forwarded into the
@@ -2987,11 +3019,13 @@ fn validate_global_install_project_scoped_flags(
         || fail_if_no_match
         || yes
         || catalog
+        || omit
     {
         return Err(lpm_common::LpmError::Script(
             "`-g` is mutually exclusive with `-D` / `--filter` / `--filter-prod` / \
              `--changed-files-ignore-pattern` / `--test-pattern` / `-w` / \
-             `--fail-if-no-match` / `-y` / `--catalog` (those are project-scoped)."
+             `--fail-if-no-match` / `-y` / `--catalog` / `--omit` / `--prod` \
+             (those are project-scoped)."
                 .into(),
         ));
     }
@@ -3561,6 +3595,8 @@ async fn async_main() -> Result<()> {
         Commands::Install {
             packages,
             save_dev,
+            omit,
+            prod,
             offline,
             force,
             allow_new,
@@ -3608,6 +3644,15 @@ async fn async_main() -> Result<()> {
                     (false, true) => Some(false),
                     _ => None,
                 };
+            let omit_policy = install_omit_policy_from_cli(&omit, prod);
+            if save_dev && omit_policy.dev {
+                return Err(lpm_common::LpmError::Script(
+                    "`-D` / `--save-dev` cannot be combined with `--prod`, \
+                     `--production`, or `--omit dev`; a dev-only add would be \
+                     omitted from node_modules before it can be finalized."
+                        .into(),
+                ));
+            }
 
             // Route `lpm install --global` / `-g` to the persistent
             // IsolatedInstall pipeline. Supports fresh install, upgrade,
@@ -3643,6 +3688,7 @@ async fn async_main() -> Result<()> {
                     fail_if_no_match,
                     yes,
                     catalog.is_some(),
+                    omit_policy != commands::install::InstallOmitPolicy::default(),
                 )?;
                 // parse collision-resolution flags. Syntactic
                 // validation only (no lookup against marker commands —
@@ -3967,6 +4013,7 @@ async fn async_main() -> Result<()> {
                         min_release_age_override,
                         drift_ignore_policy,
                         verify_policy,
+                        omit_policy,
                         // collapse `--strict-sandbox`
                         // and its `--paranoid` alias into a single bool
                         // before the resolver (the chain inside
@@ -4004,6 +4051,7 @@ async fn async_main() -> Result<()> {
                     drift_ignore_policy,
                     verify_policy,
                     cli_strict_peer_dependencies,
+                    omit_policy,
                     strict_sandbox || paranoid,
                     no_sandbox,
                     cli.verbose,
@@ -4042,6 +4090,7 @@ async fn async_main() -> Result<()> {
                         drift_ignore_policy,
                         verify_policy,
                         cli_strict_peer_dependencies,
+                        omit_policy,
                         strict_sandbox || paranoid,
                         no_sandbox,
                         cli.verbose,
@@ -4065,6 +4114,7 @@ async fn async_main() -> Result<()> {
                         drift_ignore_policy,
                         verify_policy,
                         cli_strict_peer_dependencies,
+                        omit_policy,
                         strict_sandbox || paranoid,
                         no_sandbox,
                         cli.verbose,
@@ -7276,6 +7326,41 @@ mod tests {
     }
 
     #[test]
+    fn install_prod_and_omit_flags_parse() {
+        let cli = Cli::try_parse_from(["lpm", "install", "--prod"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install { omit, prod, .. } => {
+                assert!(omit.is_empty());
+                assert!(prod);
+                let policy = install_omit_policy_from_cli(&omit, prod);
+                assert!(policy.dev);
+                assert!(!policy.optional);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        let cli = Cli::try_parse_from(["lpm", "install", "--omit=dev,optional", "--omit", "dev"])
+            .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install { omit, prod, .. } => {
+                assert!(!prod);
+                let policy = install_omit_policy_from_cli(&omit, prod);
+                assert!(policy.dev);
+                assert!(policy.optional);
+            }
+            _ => panic!("expected Install command"),
+        }
+
+        let cli = Cli::try_parse_from(["lpm", "install", "--production"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install { prod, .. } => {
+                assert!(prod);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
     fn install_bare_with_no_packages_and_no_phase2_flags_parses() {
         // Sanity: `lpm install` with no flags must still parse —         // does not break the bare-refresh path.
         let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
@@ -7384,6 +7469,7 @@ mod tests {
                     fail_if_no_match,
                     yes,
                     false,
+                    false,
                 )
                 .unwrap_err();
 
@@ -7424,6 +7510,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .unwrap_err();
         match err {
@@ -7443,6 +7530,7 @@ mod tests {
             false,
             false,
             true,
+            false,
         )
         .unwrap_err();
         match err {
@@ -7460,6 +7548,7 @@ mod tests {
             &[],
             &[],
             &[],
+            false,
             false,
             false,
             false,

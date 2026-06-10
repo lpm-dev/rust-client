@@ -523,6 +523,7 @@ pub async fn run(
         // verify` config) so an operator who set warn / off via
         // `lpm install` gets the same posture here.
         crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+        crate::commands::install::InstallOmitPolicy::default(),
         // `lpm upgrade` does not
         // surface its own sandbox-mode flags. The chain inside
         // `rebuild::run` still walks env / config / default, so

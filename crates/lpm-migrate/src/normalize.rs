@@ -90,6 +90,10 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             version: pkg.version,
             source: Some(source),
             integrity: pkg.integrity,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies,
             // The migrate path consumes lockfiles produced by other
             // package managers and does not translate their alias

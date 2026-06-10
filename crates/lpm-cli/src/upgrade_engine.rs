@@ -347,6 +347,11 @@ mod tests {
                 version: version.to_string(),
                 source: None,
                 integrity: None,
+                os: Vec::new(),
+                cpu: Vec::new(),
+                libc: Vec::new(),
+                optional: false,
+
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],

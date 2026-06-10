@@ -1543,6 +1543,10 @@ pub async fn run(
         // operator-persistent posture chain (env + `[sigstore]
         // verify` config) for uniformity with `lpm install`.
         crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+        crate::commands::install::InstallOmitPolicy {
+            dev: false,
+            optional: no_optional,
+        },
         // `lpm deploy` does not surface its own
         // sandbox-mode flags. CI deployers can still flip strict
         // via `LPM_STRICT_SANDBOX=1`; the env tier of the chain
@@ -1552,7 +1556,6 @@ pub async fn run(
         false, // verbose: internal pipeline, no user-facing Done footer
         false, // audit_after_install: internal pipeline never runs audit
         lpm_common::LpmRoot::from_dir(plan.output_dir.join(".lpm")),
-        no_optional,
     )
     .await?;
 

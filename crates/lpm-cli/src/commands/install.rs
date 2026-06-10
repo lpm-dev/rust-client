@@ -15,12 +15,18 @@ use lpm_resolver::{
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InstallOmitPolicy {
+    pub dev: bool,
+    pub optional: bool,
+}
 
 /// Test-only deterministic-panic injection hook.
 ///
@@ -217,6 +223,63 @@ fn link_dependencies_for_package(
         ));
     }
     Ok(deps)
+}
+
+fn link_target_lookup_key(name: &str, version: &str) -> String {
+    let mut k = String::with_capacity(name.len() + 1 + version.len());
+    k.push_str(name);
+    k.push('\x00');
+    k.push_str(version);
+    k
+}
+
+fn local_source_sri_for_target(target: &LinkTarget) -> String {
+    let wrapper_id = target.wrapper_id.as_deref().unwrap_or("");
+    let seed = format!(
+        "lpm-v2-local-source\0{}\0{}\0{}\0{}",
+        target.name,
+        target.version,
+        wrapper_id,
+        target.store_path.display()
+    );
+    lpm_store::compute_sri_hash(seed.as_bytes())
+}
+
+fn build_v2_targets(
+    packages: &[InstallPackage],
+    link_targets: &[LinkTarget],
+) -> Result<Vec<lpm_linker::v2::V2Target>, LpmError> {
+    let sri_by_pkg: HashMap<String, String> = packages
+        .iter()
+        .filter_map(|p| {
+            p.integrity
+                .clone()
+                .map(|sri| (link_target_lookup_key(&p.name, &p.version), sri))
+        })
+        .collect();
+
+    let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
+    for target in link_targets {
+        let lookup_key = link_target_lookup_key(&target.name, &target.version);
+        let sri = match target.materialization {
+            lpm_linker::Materialization::CasBacked => sri_by_pkg.get(&lookup_key).cloned(),
+            lpm_linker::Materialization::DirectorySource => {
+                Some(local_source_sri_for_target(target))
+            }
+        }
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "v2 install: missing source SRI for {}@{}",
+                target.name, target.version
+            ))
+        })?;
+        v2_targets.push(lpm_linker::v2::V2Target {
+            target: target.clone(),
+            source_sri: sri,
+        });
+    }
+
+    Ok(v2_targets)
 }
 
 fn resolve_strict_peer_dependencies(
@@ -1889,6 +1952,11 @@ struct InstallPackage {
     peers: Vec<(String, String)>,
     /// SRI integrity hash for verification (e.g. "sha512-...")
     integrity: Option<String>,
+    /// Platform restrictions declared by the selected package version.
+    platform: Option<lpm_resolver::PlatformMeta>,
+    /// True when this package is reachable only through optional dependency
+    /// edges.
+    optional: bool,
     /// Tarball URL from resolution — avoids re-fetching metadata during download.
     tarball_url: Option<String>,
     /// Whether current metadata was already consulted for tarball lookup.
@@ -1950,6 +2018,32 @@ impl InstallPackage {
             }
             _ => store.has_package(&self.name, &self.version),
         }
+    }
+
+    fn store_has_for_install_layout(
+        &self,
+        store: &PackageStore,
+        store_v2: Option<&lpm_store::v2::Store>,
+        project_dir: &Path,
+    ) -> bool {
+        if let Some(v2_store) = store_v2 {
+            match self.source_kind() {
+                Ok(lpm_lockfile::Source::Directory { .. })
+                | Ok(lpm_lockfile::Source::Link { .. }) => {
+                    return self.store_has_source_aware(store, project_dir);
+                }
+                _ => {
+                    return self.integrity.as_deref().is_some_and(|sri| {
+                        v2_store
+                            .paths()
+                            .object_dir(sri)
+                            .is_ok_and(|object_dir| object_dir.exists())
+                    });
+                }
+            }
+        }
+
+        self.store_has_source_aware(store, project_dir)
     }
 
     /// Source-aware store path.
@@ -2382,6 +2476,8 @@ fn pre_resolve_v2_direct_workspace_member_deps(
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         });
@@ -2533,8 +2629,7 @@ async fn pre_resolve_non_registry_deps(
     project_dir: &Path,
     deps: &mut HashMap<String, String>,
     json_output: bool,
-    strict_integrity: bool,
-    // slice of
+    strict_integrity: bool, // slice of
     // workspace members extracted by `extract_workspace_protocol_deps`
     // before pre_resolve runs. Each member's `source_dir` is
     // realpath-compared against every directory/link dep's source
@@ -2816,6 +2911,8 @@ async fn pre_resolve_non_registry_deps(
             is_lpm: false,
             peers: Vec::new(),
             integrity: Some(computed_sri),
+            platform: None,
+            optional: false,
             tarball_url: Some(url),
             metadata_checked_for_tarball: false,
         });
@@ -2913,6 +3010,8 @@ async fn pre_resolve_non_registry_deps(
             is_lpm: false,
             peers: Vec::new(),
             integrity: Some(integrity_sri),
+            platform: None,
+            optional: false,
             // tarball_url is fresh-URL writeback (registry-
             // specific). Local tarballs have no remote URL, so leave
             // `None`. Documented day-1 caveat: warm-restart fast-path
@@ -3048,6 +3147,8 @@ async fn pre_resolve_non_registry_deps(
             // package.json content as the freshness signal instead.
             peers: Vec::new(),
             integrity: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         });
@@ -3148,6 +3249,8 @@ async fn pre_resolve_non_registry_deps(
             // content into the install-hash freshness signal.
             peers: Vec::new(),
             integrity: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         });
@@ -3842,6 +3945,8 @@ fn recurse_local_source_deps(
                     is_lpm: false,
                     peers: Vec::new(),
                     integrity: None,
+                    platform: None,
+                    optional: false,
                     tarball_url: None,
                     metadata_checked_for_tarball: false,
                 });
@@ -3978,8 +4083,7 @@ pub async fn run_with_options(
     // trust-on-first-use. Lockfile-resident integrity is still
     // trusted; only the manifest-boundary trust-on-first-use is
     // disabled.
-    strict_integrity: bool,
-    // CLI-level override for strict peer-dependency handling. `None`
+    strict_integrity: bool, // CLI-level override for strict peer-dependency handling. `None`
     // falls through to package.json / global config / default.
     strict_peer_dependencies_override: Option<bool>,
     // Already-resolved linker override from CLI / `~/.lpm/config.toml` / env.
@@ -4062,6 +4166,7 @@ pub async fn run_with_options(
     // one suppresses the *crypto* layer, the other suppresses the
     // *drift* layer.
     verify_policy: crate::provenance_fetch::VerifyPolicy,
+    omit_policy: InstallOmitPolicy,
     // CLI sandbox-mode overrides.
     // `strict_sandbox=true` flips outbound network denial on for the
     // auto-build call; `no_sandbox=true` drops all containment for
@@ -4108,12 +4213,12 @@ pub async fn run_with_options(
         min_release_age_override,
         drift_ignore_policy,
         verify_policy,
+        omit_policy,
         strict_sandbox,
         no_sandbox,
         verbose,
         audit_after_install,
         lpm_root,
-        false,
     )
     .await
 }
@@ -4141,12 +4246,12 @@ pub(crate) async fn run_with_options_with_lpm_root(
     min_release_age_override: Option<u64>,
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
     verify_policy: crate::provenance_fetch::VerifyPolicy,
+    omit_policy: InstallOmitPolicy,
     strict_sandbox: bool,
     no_sandbox: bool,
     verbose: bool,
     audit_after_install: bool,
     lpm_root: lpm_common::LpmRoot,
-    omit_optional_dependencies: bool,
 ) -> Result<(), LpmError> {
     // Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
@@ -4183,12 +4288,12 @@ pub(crate) async fn run_with_options_with_lpm_root(
             min_release_age_override,
             drift_ignore_policy,
             verify_policy,
+            omit_policy,
             strict_sandbox,
             no_sandbox,
             verbose,
             audit_after_install,
             &lpm_root,
-            omit_optional_dependencies,
         ),
     )
     .await
@@ -4222,6 +4327,7 @@ async fn run_with_options_under_store_lock(
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
     // see `run_with_options` for the contract.
     verify_policy: crate::provenance_fetch::VerifyPolicy,
+    omit_policy: InstallOmitPolicy,
     // rework  — see `run_with_options` for the
     // contract. Threaded down so the auto-build call below honors the
     // user's CLI sandbox-mode override.
@@ -4233,7 +4339,6 @@ async fn run_with_options_under_store_lock(
     // Resolved audit-after-install boolean — see [`run_with_options`].
     audit_after_install: bool,
     lpm_root: &lpm_common::LpmRoot,
-    omit_optional_dependencies: bool,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
     crate::security_floor::clear_recorded_suppressions();
@@ -4489,14 +4594,15 @@ async fn run_with_options_under_store_lock(
     // it should never be shadowed by a dev-only entry.
     //
     // `lpm deploy` strips `devDependencies` from the output manifest before
-    // re-entering this path, so the deploy closure stays prod-only. An
-    // explicit `--prod` / `--omit dev` surface for `lpm install` itself is
-    // tracked for a future phase, not hardcoded here.
+    // re-entering this path, so the deploy closure stays prod-only. `--prod`
+    // / `--omit dev` still resolve the full graph for lockfile parity, then
+    // filter dev-only packages before linking.
     for (name, range) in &pkg.dev_dependencies {
         deps.entry(name.clone()).or_insert_with(|| range.clone());
     }
     reject_workspace_self_dependency(&pkg)?;
 
+    let production_dependency_names: HashSet<String> = pkg.dependencies.keys().cloned().collect();
     let declared_deps = deps.clone();
 
     // Resolve `catalog:` protocols and EXTRACT `workspace:*` member references
@@ -5110,7 +5216,7 @@ async fn run_with_options_under_store_lock(
         // cannot detect whether the v1 lockfile was ever buggy or
         // always correct, so it has to assume the worst when
         // `auto_install_peers` is on.
-        if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) {
+        if lockfile_needs_peer_state_repair(&fast.lockfile, auto_install_peers) {
             return Err(LpmError::Registry(
                 "--offline cannot use a pre-R2.5 lockfile under \
                  `lpm.autoInstallPeers = true`: the lockfile may be missing \
@@ -5122,11 +5228,15 @@ async fn run_with_options_under_store_lock(
                     .into(),
             ));
         }
-        let locked = fast.packages; // Offline mode skips the writeback machinery —
+        let mut locked = fast.packages; // Offline mode skips the writeback machinery —
         // no fetch happens, no URLs diverge, and any v1
         // → v2 binary migration is deferred to the next
         // online install (intentional — `--offline` is
         // the "don't touch anything remote" mode).
+        if omit_policy.dev {
+            filter_dev_packages(&mut locked, &production_dependency_names);
+        }
+        let _platform_skipped = filter_platform_packages(&mut locked)?;
         if !json_output {
             output::info(&format!(
                 "Offline: using lockfile ({} packages)",
@@ -5136,6 +5246,7 @@ async fn run_with_options_under_store_lock(
 
         // Verify all packages are in the global store
         let store = PackageStore::from_root(lpm_root);
+        let store_v2 = requested_v2_mode.then(|| lpm_store::v2::Store::from_lpm_root(lpm_root));
         let mut missing = Vec::new();
         for p in &locked {
             // day-5.5 audit fix (HIGH-2 partial): source-
@@ -5146,7 +5257,7 @@ async fn run_with_options_under_store_lock(
             // recorded) is treated as missing — offline mode can't
             // legally fetch, so the install must abort with a clear
             // missing-package signal.
-            if !p.store_has_source_aware(&store, project_dir) {
+            if !p.store_has_for_install_layout(&store, store_v2.as_ref(), project_dir) {
                 missing.push(format!("{}@{}", p.name, p.version));
             }
         }
@@ -5282,7 +5393,7 @@ async fn run_with_options_under_store_lock(
             false,
         );
         match candidate {
-            Some(fast) if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) => {
+            Some(fast) if lockfile_needs_peer_state_repair(&fast.lockfile, auto_install_peers) => {
                 if !json_output {
                     output::info(
                         "Lockfile is in an older format; rebuilding to capture \
@@ -5537,7 +5648,7 @@ async fn run_with_options_under_store_lock(
     // arms; hoisted it further to above the empty-deps
     // short-circuit so TLS overrides + `strict-ssl=false` security
     // warning surface for empty-deps installs too).
-    let (mut packages, resolve_ms, used_lockfile, platform_skipped, latest_stable_versions) =
+    let (mut packages, resolve_ms, used_lockfile, mut platform_skipped, latest_stable_versions) =
         match lockfile_result {
             Some(fast_path) => {
                 if !json_output {
@@ -5546,8 +5657,8 @@ async fn run_with_options_under_store_lock(
                         fast_path.packages.len().to_string().bold()
                     ));
                 }
-                lockfile_peer_context_authoritative =
-                    fast_path.lockfile.metadata.lockfile_version >= lpm_lockfile::LOCKFILE_VERSION;
+                lockfile_peer_context_authoritative = fast_path.lockfile.metadata.lockfile_version
+                    >= MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE;
                 fast_path_lockfile = Some(fast_path.lockfile);
                 needs_binary_upgrade = fast_path.needs_binary_upgrade;
                 // Fast path doesn't run the resolver, so we have no
@@ -5673,7 +5784,7 @@ async fn run_with_options_under_store_lock(
                         Some(spec_tx),
                         shared_cache,
                         auto_install_peers,
-                        !omit_optional_dependencies,
+                        !omit_policy.optional,
                     )
                     .await
                     .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
@@ -5815,7 +5926,7 @@ async fn run_with_options_under_store_lock(
                             route_table.clone(),
                             streaming_metrics_for_resolve,
                             auto_install_peers,
-                            !omit_optional_dependencies,
+                            !omit_policy.optional,
                         )
                         .await
                         .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
@@ -6030,6 +6141,12 @@ async fn run_with_options_under_store_lock(
         );
     }
 
+    let packages_for_lockfile = packages.clone();
+    if omit_policy.dev {
+        filter_dev_packages(&mut packages, &production_dependency_names);
+    }
+    platform_skipped += filter_platform_packages(&mut packages)?;
+
     append_workspace_links_from_local_packages(
         project_dir,
         &packages,
@@ -6109,17 +6226,6 @@ async fn run_with_options_under_store_lock(
     // hot path for the default `lpm install`.
     let serial_link = std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
     let v2_mode = store_v2_handle.is_some();
-    let local_source_sri_for_target = |target: &LinkTarget| {
-        let wrapper_id = target.wrapper_id.as_deref().unwrap_or("");
-        let seed = format!(
-            "lpm-v2-local-source\0{}\0{}\0{}\0{}",
-            target.name,
-            target.version,
-            wrapper_id,
-            target.store_path.display()
-        );
-        lpm_store::compute_sri_hash(seed.as_bytes())
-    };
     if v2_mode {
         let store_v2 = store_v2_handle
             .as_deref()
@@ -7645,54 +7751,7 @@ async fn run_with_options_under_store_lock(
         let store_v2 = store_v2_handle
             .as_deref()
             .expect("v2_mode implies v2 store handle is available");
-        // — v2 path with unified source routing.
-        //
-        // CAS-backed sources (Registry, Tarball remote+local, Git)
-        // use extracted `objects/<sri>/`. Local directory/link
-        // sources use synthetic `objects/<synthetic-sri>/` symlink
-        // trees so they participate in GraphKey resolution while
-        // staying live to source edits.
-        // Key: "name\x00version" — single String avoids 2-clone tuple on
-        // both construction and per-package lookup.
-        let sri_by_pkg: HashMap<String, String> = packages
-            .iter()
-            .filter_map(|p| {
-                p.integrity.clone().map(|sri| {
-                    let mut k = String::with_capacity(p.name.len() + 1 + p.version.len());
-                    k.push_str(&p.name);
-                    k.push('\x00');
-                    k.push_str(&p.version);
-                    (k, sri)
-                })
-            })
-            .collect();
-
-        let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
-        for t in &link_targets {
-            let lookup_key = {
-                let mut k = String::with_capacity(t.name.len() + 1 + t.version.len());
-                k.push_str(&t.name);
-                k.push('\x00');
-                k.push_str(&t.version);
-                k
-            };
-            let sri = match t.materialization {
-                lpm_linker::Materialization::CasBacked => sri_by_pkg.get(&lookup_key).cloned(),
-                lpm_linker::Materialization::DirectorySource => {
-                    Some(local_source_sri_for_target(t))
-                }
-            }
-            .ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "v2 install: missing source SRI for {}@{}",
-                    t.name, t.version
-                ))
-            })?;
-            v2_targets.push(lpm_linker::v2::V2Target {
-                target: t.clone(),
-                source_sri: sri,
-            });
-        }
+        let v2_targets = build_v2_targets(&packages, &link_targets)?;
 
         // followup #6b — event-driven v2 path.
         //
@@ -8259,7 +8318,7 @@ async fn run_with_options_under_store_lock(
             .iter()
             .map(install_pkg_key)
             .collect();
-        let persisted_packages: Vec<InstallPackage> = packages
+        let persisted_packages: Vec<InstallPackage> = packages_for_lockfile
             .iter()
             .filter(|p| !ephemeral_workspace_pkg_keys.contains(&install_pkg_key(p)))
             .cloned()
@@ -8306,6 +8365,13 @@ async fn run_with_options_under_store_lock(
                 version: p.version.clone(),
                 source: Some(p.source.clone()),
                 integrity: p.integrity.clone(),
+                os: p.platform.as_ref().map_or_else(Vec::new, |m| m.os.clone()),
+                cpu: p.platform.as_ref().map_or_else(Vec::new, |m| m.cpu.clone()),
+                libc: p
+                    .platform
+                    .as_ref()
+                    .map_or_else(Vec::new, |m| m.libc.clone()),
+                optional: p.optional,
                 dependencies: dep_strings,
                 alias_dependencies: alias_pairs,
                 peers: peer_strings,
@@ -9944,35 +10010,14 @@ struct LockfileFastPath {
     needs_binary_upgrade: bool,
 }
 
-/// gate that decides whether a fast-path lockfile
-/// candidate must be discarded in favor of a fresh resolve so the
-/// the ambient-peer hole gets repaired.
-///
-/// The historical bug: auto-installed missing
-/// required peers but did not persist `ambient-peer-installs` or
-/// per-package `peers` to the lockfile.
-/// A user upgrading from one of those builds to/// lockfile that LOOKS legal under the new schema (the new fields
-/// have `#[serde(default)]`) but is silently missing data the v2
-/// linker needs to reproduce the cold-install tree. Without this
-/// gate, `rm -rf node_modules && lpm install` would replay the v1
-/// lockfile, skip surfacing the auto-installed peer at top level,
-/// and produce a tree where `require('react-redux')` fails because
-/// `node_modules/react/` is absent.
-///
-/// **The gate.** When `auto_install_peers` is on and the lockfile's
-/// metadata version is older than the current `LOCKFILE_VERSION`,
-/// we can't trust that an empty `ambient-peer-installs` field
-/// reflects truth (vs. "field was absent in source TOML"). Discard
-/// the fast path; the cold resolve below writes a v2 lockfile,
-/// restoring fast-path eligibility on subsequent installs.
-///
-/// **When this returns false (fast path proceeds):**
-/// - v2+ lockfile (authoritative empty-vs-non-empty distinction).
-/// - v1 lockfile under `auto_install_peers = false` — under opt-out,
-///   no ambient installs were ever performed, so the v1 lockfile
-///   is correct as-is.
-fn lockfile_needs_r25_repair(lockfile: &lpm_lockfile::Lockfile, auto_install_peers: bool) -> bool {
-    auto_install_peers && lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION
+const MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE: u32 = 2;
+
+fn lockfile_needs_peer_state_repair(
+    lockfile: &lpm_lockfile::Lockfile,
+    auto_install_peers: bool,
+) -> bool {
+    auto_install_peers
+        && lockfile.metadata.lockfile_version < MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE
 }
 
 fn catalog_protocol_error_to_lpm(error: lpm_workspace::CatalogProtocolError) -> LpmError {
@@ -10297,6 +10342,167 @@ fn install_package_is_direct(
     root_link_names.is_some_and(|names| names.iter().any(|local| deps.contains_key(local)))
 }
 
+fn platform_meta_from_lockfile(
+    lp: &lpm_lockfile::LockedPackage,
+) -> Option<lpm_resolver::PlatformMeta> {
+    if lp.os.is_empty() && lp.cpu.is_empty() && lp.libc.is_empty() {
+        return None;
+    }
+    Some(lpm_resolver::PlatformMeta {
+        os: lp.os.clone(),
+        cpu: lp.cpu.clone(),
+        libc: lp.libc.clone(),
+    })
+}
+
+fn package_platform_compatible(package: &InstallPackage) -> bool {
+    package
+        .platform
+        .as_ref()
+        .is_none_or(lpm_resolver::is_platform_compatible)
+}
+
+fn package_reference_keys(package: &InstallPackage) -> Vec<String> {
+    let mut keys = Vec::with_capacity(2);
+    keys.push(link_target_lookup_key(&package.name, &package.version));
+    if let Some(source_id) = package.wrapper_id_for_source() {
+        keys.push(link_target_lookup_key(&package.name, &source_id));
+    }
+    keys
+}
+
+fn filter_dev_packages(
+    packages: &mut Vec<InstallPackage>,
+    production_roots: &HashSet<String>,
+) -> usize {
+    if packages.is_empty() {
+        return 0;
+    }
+
+    let mut key_to_index = HashMap::with_capacity(packages.len() * 2);
+    for (idx, package) in packages.iter().enumerate() {
+        for key in package_reference_keys(package) {
+            key_to_index.entry(key).or_insert(idx);
+        }
+    }
+
+    let mut retained = HashSet::with_capacity(packages.len());
+    let mut queue = VecDeque::new();
+    for (idx, package) in packages.iter().enumerate() {
+        let is_prod_root = package
+            .root_link_names
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|name| production_roots.contains(name)));
+        if is_prod_root && retained.insert(idx) {
+            queue.push_back(idx);
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        let package = &packages[idx];
+        for (local_name, version) in &package.dependencies {
+            let target = package
+                .aliases
+                .get(local_name)
+                .map_or(local_name.as_str(), String::as_str);
+            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(target, version))
+                && retained.insert(*next_idx)
+            {
+                queue.push_back(*next_idx);
+            }
+        }
+        for (peer_name, version) in &package.peers {
+            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(peer_name, version))
+                && retained.insert(*next_idx)
+            {
+                queue.push_back(*next_idx);
+            }
+        }
+    }
+
+    let mut retained_keys = HashSet::with_capacity(retained.len() * 2);
+    let mut peer_root_names = HashSet::new();
+    for idx in &retained {
+        let package = &packages[*idx];
+        for key in package_reference_keys(package) {
+            retained_keys.insert(key);
+        }
+        for (peer_name, _) in &package.peers {
+            peer_root_names.insert(peer_name.clone());
+        }
+    }
+
+    let mut kept = Vec::with_capacity(retained.len());
+    let mut skipped = 0usize;
+    for (idx, mut package) in packages.drain(..).enumerate() {
+        if !retained.contains(&idx) {
+            skipped += 1;
+            continue;
+        }
+
+        if let Some(root_link_names) = &mut package.root_link_names {
+            root_link_names
+                .retain(|name| production_roots.contains(name) || peer_root_names.contains(name));
+            if root_link_names.is_empty() {
+                package.root_link_names = None;
+            }
+        }
+
+        package.dependencies.retain(|(local_name, version)| {
+            let target = package
+                .aliases
+                .get(local_name)
+                .map_or(local_name.as_str(), String::as_str);
+            retained_keys.contains(&link_target_lookup_key(target, version))
+        });
+        package.peers.retain(|(name, version)| {
+            retained_keys.contains(&link_target_lookup_key(name, version))
+        });
+        kept.push(package);
+    }
+
+    *packages = kept;
+    skipped
+}
+
+fn filter_platform_packages(packages: &mut Vec<InstallPackage>) -> Result<usize, LpmError> {
+    let mut skipped: HashSet<(String, String)> = HashSet::new();
+    let mut kept = Vec::with_capacity(packages.len());
+
+    for package in packages.drain(..) {
+        if package_platform_compatible(&package) {
+            kept.push(package);
+            continue;
+        }
+        if package.optional {
+            skipped.insert((package.name.clone(), package.version.clone()));
+            continue;
+        }
+        return Err(LpmError::Registry(format!(
+            "{}@{} is incompatible with this platform",
+            package.name, package.version
+        )));
+    }
+
+    if !skipped.is_empty() {
+        for package in &mut kept {
+            package.dependencies.retain(|(local, version)| {
+                let target = package
+                    .aliases
+                    .get(local)
+                    .map_or(local.as_str(), String::as_str);
+                !skipped.contains(&(target.to_string(), version.clone()))
+            });
+            package
+                .peers
+                .retain(|(name, version)| !skipped.contains(&(name.clone(), version.clone())));
+        }
+    }
+
+    *packages = kept;
+    Ok(skipped.len())
+}
+
 fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
@@ -10557,6 +10763,8 @@ fn try_lockfile_fast_path(
                 is_lpm,
                 peers,
                 integrity: lp.integrity.clone(),
+                platform: platform_meta_from_lockfile(lp),
+                optional: lp.optional,
                 // — gate a stored URL against scheme/shape/
                 // origin before reusing it. Any rejection downgrades
                 // to `None`, which forces on-demand lookup against
@@ -10825,6 +11033,8 @@ fn resolved_to_install_packages(
                 // `(peer_name, version)` list straight through.
                 peers: r.peers.clone(),
                 integrity: r.integrity.clone(),
+                platform: r.platform.clone(),
+                optional: r.optional,
                 tarball_url: r.tarball_url.clone(),
                 metadata_checked_for_tarball: true,
             })
@@ -10929,15 +11139,27 @@ async fn run_link_and_finish(
         .collect::<Result<_, _>>()?;
 
     let link_start = Instant::now();
-    let link_result = match linker_mode {
-        lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
+    let link_result = if lpm_store::StoreVersion::from_env().is_v2() {
+        let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
+        let v2_targets = build_v2_targets(&packages, &link_targets)?;
+        lpm_linker::v2::link_packages_v2(
             project_dir,
-            &link_targets,
-            force,
+            v2_targets,
+            &store_v2,
+            linker_mode,
             pkg.name.as_deref(),
-        )?,
-        lpm_linker::LinkerMode::Isolated => {
-            lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
+        )?
+    } else {
+        match linker_mode {
+            lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
+                project_dir,
+                &link_targets,
+                force,
+                pkg.name.as_deref(),
+            )?,
+            lpm_linker::LinkerMode::Isolated => {
+                lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
+            }
         }
     };
     let link_ms = link_start.elapsed().as_millis();
@@ -13470,6 +13692,7 @@ pub async fn run_add_packages(
     verify_policy: crate::provenance_fetch::VerifyPolicy,
     // forwarded strict peer-dependency override — see [`run_with_options`].
     strict_peer_dependencies_override: Option<bool>,
+    omit_policy: InstallOmitPolicy,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -13617,6 +13840,7 @@ pub async fn run_add_packages(
             min_release_age_override,
             drift_ignore_policy,
             verify_policy,
+            omit_policy,
             strict_sandbox,
             no_sandbox,
             verbose,
@@ -13697,6 +13921,7 @@ pub async fn run_install_filtered_add(
     verify_policy: crate::provenance_fetch::VerifyPolicy,
     // forwarded strict peer-dependency override — see [`run_with_options`].
     strict_peer_dependencies_override: Option<bool>,
+    omit_policy: InstallOmitPolicy,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -13985,6 +14210,7 @@ pub async fn run_install_filtered_add(
                 // `SkipPolicy` (HashSet of skip-listed names); cloning is
                 // bounded by the user-passed flag count.
                 verify_policy.clone(),
+                omit_policy,
                 strict_sandbox,
                 no_sandbox,
                 verbose,
@@ -16384,6 +16610,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         }
@@ -16748,7 +16976,8 @@ mod tests {
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
             crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
-            None,  // strict_peer_dependencies_override
+            None, // strict_peer_dependencies_override
+            InstallOmitPolicy::default(),
             false, // strict_sandbox
             false, // no_sandbox
             false, // verbose
@@ -16797,7 +17026,8 @@ mod tests {
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
             crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
-            None,  // strict_peer_dependencies_override
+            None, // strict_peer_dependencies_override
+            InstallOmitPolicy::default(),
             false, // strict_sandbox
             false, // no_sandbox
             false, // verbose
@@ -17595,6 +17825,8 @@ mod tests {
             peers: Vec::new(),
             tarball_url: None,
             integrity: None,
+            platform: None,
+            optional: false,
         }
     }
 
@@ -17662,26 +17894,26 @@ mod tests {
     }
 
     #[test]
-    fn r25_repair_gate_v2_lockfile_with_auto_install_takes_fast_path() {
+    fn peer_state_repair_gate_v2_lockfile_with_auto_install_takes_fast_path() {
         // The current happy path: v2 lockfile, auto-install on,
         // schema is authoritative. Don't repair.
-        let lf = make_lockfile_with_version(lpm_lockfile::LOCKFILE_VERSION);
+        let lf = make_lockfile_with_version(MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE);
         assert!(
-            !lockfile_needs_r25_repair(&lf, true),
+            !lockfile_needs_peer_state_repair(&lf, true),
             "v2 lockfile with auto-install on must take fast path — \
              empty ambient-peer-installs is authoritative"
         );
     }
 
     #[test]
-    fn r25_repair_gate_v1_lockfile_with_auto_install_forces_repair() {
+    fn peer_state_repair_gate_v1_lockfile_with_auto_install_forces_repair() {
         // The load-bearing test. A v1 lockfile under
         // `auto_install_peers = true` is suspect: it may be missing
         // peer-tracking state. Discard fast path so a
         // fresh resolve repopulates the new fields.
         let lf = make_lockfile_with_version(1);
         assert!(
-            lockfile_needs_r25_repair(&lf, true),
+            lockfile_needs_peer_state_repair(&lf, true),
             "v1 lockfile under auto_install_peers=true must force \
              fresh resolve — the silent ambient-peer-installs hole \
              that cannot be repaired any other way"
@@ -17689,36 +17921,32 @@ mod tests {
     }
 
     #[test]
-    fn r25_repair_gate_v1_lockfile_with_auto_install_off_takes_fast_path() {
+    fn peer_state_repair_gate_v1_lockfile_with_auto_install_off_takes_fast_path() {
         // The opt-out path: with `auto_install_peers = false`, no
         // ambient installs were ever performed, so a v1 lockfile is
         // correct as-is. Honor it.
         let lf = make_lockfile_with_version(1);
         assert!(
-            !lockfile_needs_r25_repair(&lf, false),
+            !lockfile_needs_peer_state_repair(&lf, false),
             "v1 lockfile under auto_install_peers=false must take \
              fast path — opt-out installs never produced ambient peers"
         );
     }
 
     #[test]
-    fn r25_repair_gate_v2_lockfile_with_auto_install_off_takes_fast_path() {
+    fn peer_state_repair_gate_v2_lockfile_with_auto_install_off_takes_fast_path() {
         // Sanity baseline: v2 + opt-out → trust fast path. Symmetric
         // with the v2 + on case above; covered for completeness so
         // no future logic branch can silently invert it.
-        let lf = make_lockfile_with_version(lpm_lockfile::LOCKFILE_VERSION);
-        assert!(!lockfile_needs_r25_repair(&lf, false));
+        let lf = make_lockfile_with_version(MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE);
+        assert!(!lockfile_needs_peer_state_repair(&lf, false));
     }
 
     #[test]
-    fn r25_lockfile_version_is_2() {
-        // The schema-bump anchor.        // on every fresh lockfile via `Lockfile::new`. If a future
-        // refactor drops this back to 1 without thinking through the
-        // gate's truth table, this test fails first. Keep paired with
-        // the gate tests above.
-        assert_eq!(lpm_lockfile::LOCKFILE_VERSION, 2);
+    fn fresh_lockfiles_use_current_schema_version() {
+        assert_eq!(lpm_lockfile::LOCKFILE_VERSION, 3);
         let lf = lpm_lockfile::Lockfile::new();
-        assert_eq!(lf.metadata.lockfile_version, 2);
+        assert_eq!(lf.metadata.lockfile_version, lpm_lockfile::LOCKFILE_VERSION);
     }
 
     #[test]
@@ -17936,6 +18164,10 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -17999,6 +18231,10 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18031,6 +18267,10 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18066,6 +18306,10 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18103,6 +18347,10 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18152,6 +18400,10 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-test".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18201,6 +18453,10 @@ mod tests {
                 version: "1.0.0".to_string(),
                 source: Some("registry+https://registry.npmjs.org".to_string()),
                 integrity: Some("sha512-test".to_string()),
+                os: Vec::new(),
+                cpu: Vec::new(),
+                libc: Vec::new(),
+                optional: false,
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
@@ -18265,6 +18521,10 @@ mod tests {
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-test".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18721,6 +18981,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: integrity.map(|s| s.to_string()),
+            platform: None,
+            optional: false,
             tarball_url: Some(url.to_string()),
             metadata_checked_for_tarball: false,
         }
@@ -20029,6 +20291,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             };
@@ -20074,6 +20338,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         };
@@ -20088,6 +20354,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         };
@@ -20425,6 +20693,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         };
@@ -20458,6 +20728,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         };
@@ -21005,6 +21277,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         };
@@ -21366,6 +21640,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21380,6 +21656,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21394,6 +21672,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21460,6 +21740,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21474,6 +21756,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21488,6 +21772,8 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21531,6 +21817,8 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         }];

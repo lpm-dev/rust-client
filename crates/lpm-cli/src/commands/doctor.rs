@@ -1851,6 +1851,7 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         None,  // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
         crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: doctor's auto-fix install honors env + config posture chain
+        crate::commands::install::InstallOmitPolicy::default(),
         // doctor's auto-fix install does not
         // surface its own sandbox-mode flags. Falls through the
         // env / config / default chain.
@@ -3834,6 +3835,10 @@ commands = []
             version: "18.0.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -3877,6 +3882,10 @@ commands = []
             version: "18.0.0".to_string(),
             source: None,
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -4048,6 +4057,10 @@ commands = []
             version: "18.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
