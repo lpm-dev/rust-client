@@ -7,8 +7,39 @@
 use super::cache::ProjectAuditCache;
 use super::discovery::{self, DiscoveredPackage, DiscoveryResult, ManagerKind, ScanMode};
 use lpm_security::behavioral::PackageAnalysis;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
+
+pub(crate) fn build_project_v2_baseline_index(
+    project_dir: &Path,
+    lpm_root: &lpm_common::LpmRoot,
+) -> Option<lpm_store::V2BaselineIndex> {
+    if lpm_store::StoreVersion::from_env() != lpm_store::StoreVersion::V2 {
+        return Some(lpm_store::V2BaselineIndex::default());
+    }
+    match lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root) {
+        Ok(index) => Some(index),
+        Err(e) => {
+            tracing::debug!("failed to build v2 baseline index: {e}");
+            None
+        }
+    }
+}
+
+pub(crate) fn find_project_baseline(
+    index: Option<&lpm_store::V2BaselineIndex>,
+    lpm_root: &lpm_common::LpmRoot,
+    name: &str,
+    version: &str,
+) -> Option<lpm_store::InstalledPackageBaseline> {
+    if let Some(index) = index {
+        return lpm_store::find_installed_package_baseline_indexed(index, lpm_root, name, version);
+    }
+    lpm_store::find_installed_package_baseline(lpm_root, name, version)
+        .ok()
+        .flatten()
+}
 
 /// A fully loaded package inventory ready for audit or query consumption.
 ///
@@ -21,6 +52,21 @@ pub struct PackageInventory {
     /// For LPM store packages: keyed by name (backward compat).
     /// For npm projects: keyed by node_modules path.
     pub analyses: HashMap<String, PackageAnalysis>,
+}
+
+struct LoadedAnalysis {
+    key: String,
+    analysis: PackageAnalysis,
+    cache_update: Option<CacheUpdate>,
+}
+
+struct CacheUpdate {
+    path: String,
+    name: String,
+    version: String,
+    integrity: Option<String>,
+    analysis: PackageAnalysis,
+    dependencies: Vec<(String, String)>,
 }
 
 impl PackageInventory {
@@ -78,73 +124,88 @@ impl PackageInventory {
         // Load project-level audit cache
         let mut project_cache = ProjectAuditCache::read(&discovery.project_root);
 
-        // S5c — v2-aware store lookup; see `audit/mod.rs` for the
-        // full rationale. Routes through `find_installed_package_baseline`
-        // (v2-first, v1-fallback) so v2-installed packages don't all
-        // fall through to the project_cache miss path.
         let lpm_root = lpm_common::LpmRoot::from_env().ok();
+        let baseline_index = lpm_root
+            .as_ref()
+            .and_then(|root| build_project_v2_baseline_index(&discovery.project_root, root));
 
-        for pkg in &scannable {
-            let analysis = if pkg.scan_mode == ScanMode::RegistryAndStore {
-                // LPM store: try store cache first, then project cache
-                lpm_root
-                    .as_ref()
-                    .and_then(|root| {
-                        lpm_store::find_installed_package_baseline(root, &pkg.name, &pkg.version)
-                            .ok()
-                            .flatten()
-                    })
-                    .and_then(|baseline| {
-                        lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
-                    })
-                    .or_else(|| {
-                        project_cache
-                            .as_ref()
-                            .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
-                            .cloned()
-                    })
-            } else {
-                // Non-store: check project cache
-                project_cache
-                    .as_ref()
-                    .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
-                    .cloned()
-            };
-
-            // Fallback: scan node_modules directly
-            let analysis = analysis.or_else(|| {
-                let abs_path = discovery.project_root.join(&pkg.path);
-                if abs_path.is_dir() {
-                    let analysis = lpm_security::behavioral::analyze_package(&abs_path);
-                    if project_cache.is_none() {
-                        project_cache =
-                            Some(ProjectAuditCache::new(&discovery.manager.to_string()));
-                    }
-                    if let Some(ref mut cache) = project_cache {
-                        cache.insert(
-                            pkg.path.clone(),
-                            pkg.name.clone(),
-                            pkg.version.clone(),
-                            pkg.integrity.clone(),
-                            analysis.clone(),
-                            pkg.dependencies.clone(),
-                        );
-                    }
-                    Some(analysis)
+        let project_cache_ref = project_cache.as_ref();
+        let loaded: Vec<LoadedAnalysis> = scannable
+            .par_iter()
+            .filter_map(|pkg| {
+                let cached_analysis = if pkg.scan_mode == ScanMode::RegistryAndStore {
+                    lpm_root
+                        .as_ref()
+                        .and_then(|root| {
+                            find_project_baseline(
+                                baseline_index.as_ref(),
+                                root,
+                                &pkg.name,
+                                &pkg.version,
+                            )
+                        })
+                        .and_then(|baseline| {
+                            lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
+                        })
+                        .or_else(|| {
+                            project_cache_ref
+                                .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
+                                .cloned()
+                        })
                 } else {
-                    None
-                }
-            });
+                    project_cache_ref
+                        .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
+                        .cloned()
+                };
 
-            if let Some(analysis) = analysis {
-                // Key by path for npm projects, by name for LPM (backward compat)
+                let abs_path = discovery.project_root.join(&pkg.path);
+                let (analysis, cache_update) = if let Some(analysis) = cached_analysis {
+                    (analysis, None)
+                } else if abs_path.is_dir() {
+                    let analysis = lpm_security::behavioral::analyze_package(&abs_path);
+                    let cache_update = CacheUpdate {
+                        path: pkg.path.clone(),
+                        name: pkg.name.clone(),
+                        version: pkg.version.clone(),
+                        integrity: pkg.integrity.clone(),
+                        analysis: analysis.clone(),
+                        dependencies: pkg.dependencies.clone(),
+                    };
+                    (analysis, Some(cache_update))
+                } else {
+                    return None;
+                };
+
                 let key = if discovery.manager == ManagerKind::Lpm {
                     pkg.name.clone()
                 } else {
                     pkg.path.clone()
                 };
-                analyses.insert(key, analysis);
+                Some(LoadedAnalysis {
+                    key,
+                    analysis,
+                    cache_update,
+                })
+            })
+            .collect();
+
+        for loaded in loaded {
+            if let Some(update) = loaded.cache_update {
+                if project_cache.is_none() {
+                    project_cache = Some(ProjectAuditCache::new(&discovery.manager.to_string()));
+                }
+                if let Some(ref mut cache) = project_cache {
+                    cache.insert(
+                        update.path,
+                        update.name,
+                        update.version,
+                        update.integrity,
+                        update.analysis,
+                        update.dependencies,
+                    );
+                }
             }
+            analyses.insert(loaded.key, loaded.analysis);
         }
 
         // Write cache back to disk

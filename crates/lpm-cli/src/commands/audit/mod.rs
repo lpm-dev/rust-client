@@ -1201,6 +1201,25 @@ fn run_behavioral_analysis(
     _json_output: bool,
     level: Option<&str>,
 ) -> BehavioralSummary {
+    use rayon::prelude::*;
+
+    struct LoadedBehavioralAnalysis {
+        name: String,
+        version: String,
+        source: &'static str,
+        analysis: lpm_security::behavioral::PackageAnalysis,
+        cache_update: Option<BehavioralCacheUpdate>,
+    }
+
+    struct BehavioralCacheUpdate {
+        path: String,
+        name: String,
+        version: String,
+        integrity: Option<String>,
+        analysis: lpm_security::behavioral::PackageAnalysis,
+        dependencies: Vec<(String, String)>,
+    }
+
     let scannable: Vec<&DiscoveredPackage> = discovery
         .packages
         .iter()
@@ -1235,87 +1254,96 @@ fn run_behavioral_analysis(
     // - lpm: fallback cache when store entries are missing
     let mut project_cache = ProjectAuditCache::read(&discovery.project_root);
 
-    // S5c — v2-aware store lookup. `find_installed_package_baseline`
-    // prefers v2 (default since 4b) and falls back to v1.
-    // Pre-fix this used the v1-only `PackageStore::package_dir` and
-    // every v2-installed package fell through to the slower
-    // project_cache path on every audit run. The clonefile that
-    // populates the v2 link entry copies the `.lpm-security.json`
-    // sidecar from the object dir into the link's `node_modules/<pkg>/`,
-    // so reading from the baseline-resolved path picks up the
-    // pre-computed analysis written at install time.
     let lpm_root = lpm_common::LpmRoot::from_env().ok();
+    let baseline_index = lpm_root
+        .as_ref()
+        .and_then(|root| inventory::build_project_v2_baseline_index(&discovery.project_root, root));
 
     let mut scanned = 0usize;
     let mut with_findings = 0usize;
 
-    for pkg in &scannable {
-        let is_lpm = lpm_names.contains(pkg.name.as_str());
-        let source = if is_lpm { "combined" } else { "local" };
-
-        // Get analysis — try each source in order of cost:
-        // 1. LPM store cache (cheapest — pre-computed at install time)
-        // 2. Project-level audit cache (cheap — from prior lpm audit run)
-        // 3. Fresh scan on node_modules/ directory (expensive — reads source files)
-        let analysis = if pkg.scan_mode == ScanMode::RegistryAndStore {
-            // Try LPM store first, then fall back to project cache.
-            lpm_root
-                .as_ref()
-                .and_then(|root| {
-                    lpm_store::find_installed_package_baseline(root, &pkg.name, &pkg.version)
-                        .ok()
-                        .flatten()
-                })
-                .and_then(|baseline| {
-                    lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
-                })
-                .or_else(|| {
-                    project_cache
-                        .as_ref()
-                        .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
-                        .cloned()
-                })
-        } else {
-            // Non-store packages: check project cache
-            project_cache
-                .as_ref()
-                .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
-                .cloned()
-        };
-
-        // Fallback: if no cached analysis found, scan node_modules/ directly.
-        // This handles both FullLocal packages and RegistryAndStore packages
-        // whose global store entry is missing (cleaned store, different machine).
-        let analysis = analysis.or_else(|| {
-            let abs_path = discovery.project_root.join(&pkg.path);
-            if abs_path.is_dir() {
-                let analysis = lpm_security::behavioral::analyze_package(&abs_path);
-                if project_cache.is_none() {
-                    project_cache = Some(ProjectAuditCache::new(&discovery.manager.to_string()));
-                }
-                if let Some(ref mut cache) = project_cache {
-                    cache.insert(
-                        pkg.path.clone(),
-                        pkg.name.clone(),
-                        pkg.version.clone(),
-                        pkg.integrity.clone(),
-                        analysis.clone(),
-                        pkg.dependencies.clone(),
-                    );
-                }
-                Some(analysis)
+    let project_cache_ref = project_cache.as_ref();
+    let loaded: Vec<LoadedBehavioralAnalysis> = scannable
+        .par_iter()
+        .filter_map(|pkg| {
+            let source = if lpm_names.contains(pkg.name.as_str()) {
+                "combined"
             } else {
-                None
-            }
-        });
+                "local"
+            };
+            let cached_analysis = if pkg.scan_mode == ScanMode::RegistryAndStore {
+                lpm_root
+                    .as_ref()
+                    .and_then(|root| {
+                        inventory::find_project_baseline(
+                            baseline_index.as_ref(),
+                            root,
+                            &pkg.name,
+                            &pkg.version,
+                        )
+                    })
+                    .and_then(|baseline| {
+                        lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
+                    })
+                    .or_else(|| {
+                        project_cache_ref
+                            .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
+                            .cloned()
+                    })
+            } else {
+                project_cache_ref
+                    .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
+                    .cloned()
+            };
 
-        let Some(analysis) = analysis else {
-            continue;
-        };
+            let abs_path = discovery.project_root.join(&pkg.path);
+            let (analysis, cache_update) = if let Some(analysis) = cached_analysis {
+                (analysis, None)
+            } else if abs_path.is_dir() {
+                let analysis = lpm_security::behavioral::analyze_package(&abs_path);
+                let cache_update = BehavioralCacheUpdate {
+                    path: pkg.path.clone(),
+                    name: pkg.name.clone(),
+                    version: pkg.version.clone(),
+                    integrity: pkg.integrity.clone(),
+                    analysis: analysis.clone(),
+                    dependencies: pkg.dependencies.clone(),
+                };
+                (analysis, Some(cache_update))
+            } else {
+                return None;
+            };
+
+            Some(LoadedBehavioralAnalysis {
+                name: pkg.name.clone(),
+                version: pkg.version.clone(),
+                source,
+                analysis,
+                cache_update,
+            })
+        })
+        .collect();
+
+    for loaded in loaded {
+        if let Some(update) = loaded.cache_update {
+            if project_cache.is_none() {
+                project_cache = Some(ProjectAuditCache::new(&discovery.manager.to_string()));
+            }
+            if let Some(ref mut cache) = project_cache {
+                cache.insert(
+                    update.path,
+                    update.name,
+                    update.version,
+                    update.integrity,
+                    update.analysis,
+                    update.dependencies,
+                );
+            }
+        }
 
         scanned += 1;
 
-        let mut issues = analysis_to_issues(&analysis, source);
+        let mut issues = analysis_to_issues(&loaded.analysis, loaded.source);
         if issues.is_empty() {
             continue;
         }
@@ -1333,7 +1361,7 @@ fn run_behavioral_analysis(
 
         // Merge into existing result (for @lpm.dev) or create new entry (npm).
         // Key by "name@version" so different versions of the same package stay separate.
-        let merge_key = format!("{}@{}", pkg.name, pkg.version);
+        let merge_key = format!("{}@{}", loaded.name, loaded.version);
         if let Some(&idx) = results_by_key.get(&merge_key) {
             // Dedup: don't add issues with the same message already present from registry
             let existing_messages: HashSet<String> = results[idx]
@@ -1349,8 +1377,8 @@ fn run_behavioral_analysis(
         } else {
             let idx = results.len();
             results.push(AuditResult {
-                name: pkg.name.clone(),
-                version: pkg.version.clone(),
+                name: loaded.name,
+                version: loaded.version,
                 quality_score: None,
                 issues,
             });
