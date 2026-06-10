@@ -602,6 +602,16 @@ pub async fn run(
                             session.local_port,
                         ),
                     );
+                    if let Some(expiry) =
+                        crate::commands::tunnel::tunnel_session_expiry_summary(session)
+                    {
+                        dev_ui::hint_line(&format!("Tunnel expires {expiry}"));
+                    }
+                    if let Some(limits) =
+                        crate::commands::tunnel::tunnel_limit_summary(session.limits.as_ref())
+                    {
+                        dev_ui::hint_line(&format!("Tunnel limits: {limits}"));
+                    }
                     if let Some(ref auth) = tunnel_auth_display {
                         dev_ui::hint_line(&format!(
                             "Auth required: add header X-Tunnel-Auth: {auth}"
