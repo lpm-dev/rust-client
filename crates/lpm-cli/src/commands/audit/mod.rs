@@ -604,6 +604,7 @@ pub async fn run_fix(
         None,  // min_release_age_override
         crate::provenance_fetch::DriftIgnorePolicy::default(),
         crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+        crate::commands::install::InstallOmitPolicy::default(),
         false, // strict_sandbox
         false, // no_sandbox
         false, // verbose
