@@ -205,7 +205,7 @@ pub struct CachedPackageInfo {
 }
 
 /// Platform restriction metadata for a specific package version.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlatformMeta {
     /// OS restrictions: e.g., ["darwin", "linux"] or ["!win32"].
     pub os: Vec<String>,
@@ -602,8 +602,8 @@ impl LpmDependencyProvider {
         }
     }
 
-    /// Get the list of versions for a package that are available on the
-    /// current platform.
+    /// Get the list of versions for a package. Platform compatibility is
+    /// applied after resolution so lockfiles stay portable across hosts.
     ///
     /// Canonicalizes before cache lookup — split-retry identities of the
     /// same canonical package share one cache entry.
@@ -613,17 +613,7 @@ impl LpmDependencyProvider {
         let key = CanonicalKey::from(package);
         self.cache
             .get(&key)
-            .map(|c| {
-                c.versions
-                    .iter()
-                    .filter(|version| {
-                        c.platform
-                            .get(&version.to_string())
-                            .is_none_or(is_platform_compatible)
-                    })
-                    .cloned()
-                    .collect()
-            })
+            .map(|c| c.versions.to_vec())
             .unwrap_or_default()
     }
 
@@ -660,8 +650,8 @@ impl LpmDependencyProvider {
     /// Extract the override hits AND the metadata cache in one shot. The
     /// two-stage `take_override_hits()` / `into_cache()` API is also
     /// available for callers that need only one of the two. Surfaces
-    /// `platform_skipped` and `root_aliases` so the resolver can
-    /// accumulate them across split-retry passes without separate borrows.
+    /// `platform_skipped`, `root_aliases`, and `root_deps` so the resolver can
+    /// accumulate pass-local state without separate borrows.
     // `Arc<CachedPackageInfo>` pushed the tuple over
     // clippy's type_complexity threshold (was `CachedPackageInfo` alone).
     // CLAUDE.md explicitly permits `#[allow(clippy::type_complexity)]`
@@ -676,10 +666,12 @@ impl LpmDependencyProvider {
         Vec<OverrideHit>,
         usize,
         HashMap<String, String>,
+        HashMap<String, String>,
     ) {
         let hits = self.overrides.take_hits();
         let platform_skipped = *self.platform_skipped.borrow();
         let root_aliases = self.root_aliases.into_inner();
+        let root_deps = self.root_deps;
         // Surface Arc<CachedPackageInfo> directly — deep-cloning each
         // entry's seven nested HashMaps moved ~7 MB per cold resolve on
         // `bench/fixture-large` (hidden inside `pubgrub_ms`). Arc::clone is
@@ -692,12 +684,11 @@ impl LpmDependencyProvider {
                 .map(|e| (e.key().clone(), Arc::clone(e.value())))
                 .collect(),
         };
-        (cache, hits, platform_skipped, root_aliases)
+        (cache, hits, platform_skipped, root_aliases, root_deps)
     }
 
     /// Pick the version the resolver would choose without any override applied.
-    /// Returns the newest version in the consumer's declared range that is
-    /// platform-compatible.
+    /// Returns the newest version in the consumer's declared range.
     ///
     /// Factored out of [`Self::choose_version`] so the override path can
     /// compute `from_version` for the apply trace AND fall back to this same
@@ -713,19 +704,6 @@ impl LpmDependencyProvider {
         // Versions are sorted newest-first; first match wins.
         for version in &info.versions {
             if !range.contains(version) {
-                continue;
-            }
-
-            if let Some(platform_meta) = info.platform.get(&version.to_string())
-                && !is_platform_compatible(platform_meta)
-            {
-                tracing::debug!(
-                    "pick_natural_version skipping {}@{}: platform incompatible (os: {:?}, cpu: {:?})",
-                    package.canonical_name(),
-                    version,
-                    platform_meta.os,
-                    platform_meta.cpu
-                );
                 continue;
             }
 
@@ -778,12 +756,6 @@ impl LpmDependencyProvider {
                         continue;
                     }
                     if !target_range.satisfies(v) {
-                        continue;
-                    }
-                    if !info.platform.is_empty()
-                        && let Some(platform_meta) = info.platform.get(&v.to_string())
-                        && !is_platform_compatible(platform_meta)
-                    {
                         continue;
                     }
                     return Some(v.clone());
@@ -1138,7 +1110,7 @@ fn check_platform_filter(entries: &[String], current: &str, field_name: &str) ->
 /// Check if a package version is compatible with the current platform.
 /// Empty os/cpu/libc means no restriction (compatible with all platforms).
 /// Entries starting with `!` are exclusions (e.g., `!win32` = all except win32).
-pub(crate) fn is_platform_compatible(meta: &PlatformMeta) -> bool {
+pub fn is_platform_compatible(meta: &PlatformMeta) -> bool {
     is_platform_compatible_for(meta, &Platform::current())
 }
 
@@ -1613,24 +1585,9 @@ impl DependencyProvider for LpmDependencyProvider {
             }
             let available = self.available_versions(&pkg);
 
-            // Unified platform-gate for optional deps. The previous check was
-            // `is_optional && available.is_empty()`, which only covered
-            // packages where ALL versions are platform-incompatible. It missed
-            // the bug shape where one old version has an ERRONEOUS os/cpu
-            // declaration (e.g., `@next/swc-linux-x64-musl@12.0.0` ships with
-            // `os: ["darwin"]` — a Next.js packaging bug from 2021). In that
-            // case `available.is_empty()` was false, the range intersection was
-            // empty (12.0.0 doesn't satisfy ^15), and PubGrub surfaced a
-            // NoSolution that bun/npm never hit.
-            //
-            // Fix: parse the range first, then check whether any
-            // platform-compatible version actually satisfies it. If not, skip
-            // the optional dep and bump the `platform_skipped` counter for
-            // `--json` observability. Required deps still fall through to
-            // pubgrub with an empty `Ranges`, producing the same loud error as
-            // before (see
-            // `resolve_regular_dep_with_no_platform_compatible_version_still_fails`
-            // in resolve.rs tests).
+            // Optional dependencies with no semver-satisfying candidate are
+            // omitted, while platform metadata on satisfying candidates is
+            // preserved for install-time filtering.
             let npm_range = match NpmRange::parse(dep_range_str) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1649,7 +1606,7 @@ impl DependencyProvider for LpmDependencyProvider {
                     let host = Platform::current();
                     tracing::debug!(
                         "skipping optional dep {dep_name}@{dep_range_str}: \
-                         no platform-compatible version satisfies range \
+                         no available version satisfies range \
                          (available={}, os={}, cpu={}, libc={})",
                         available.len(),
                         host.os,
@@ -2568,9 +2525,7 @@ mod tests {
     // === choose_version: platform filtering skips incompatible, selects next ===
 
     #[test]
-    fn choose_version_skips_incompatible_platform_selects_next() {
-        // 3 versions: 1.3.0 (win32-only), 1.2.0 (no restriction), 1.1.0 (no restriction)
-        // On non-win32: should skip 1.3.0 and select 1.2.0
+    fn choose_version_selects_newest_satisfying_before_platform_filtering() {
         let pkg = ResolverPackage::npm("win-pkg");
         let info = make_info(
             &["1.3.0", "1.2.0", "1.1.0"],
@@ -2585,26 +2540,15 @@ mod tests {
             .to_pubgrub_ranges(&provider.available_versions(&pkg));
 
         let chosen = provider.choose_version(&pkg, &range).unwrap();
-        let current_os = Platform::current().os;
-
-        if current_os == "win32" {
-            assert_eq!(
-                chosen.map(|v| v.to_string()),
-                Some("1.3.0".to_string()),
-                "on win32, 1.3.0 should be compatible and selected"
-            );
-        } else {
-            assert_eq!(
-                chosen.map(|v| v.to_string()),
-                Some("1.2.0".to_string()),
-                "on non-win32, 1.3.0 should be skipped, 1.2.0 selected"
-            );
-        }
+        assert_eq!(
+            chosen.map(|v| v.to_string()),
+            Some("1.3.0".to_string()),
+            "version choice is semver-first; install-time reify handles platform metadata"
+        );
     }
 
     #[test]
-    fn choose_version_all_incompatible_returns_none() {
-        // All versions are win32-only → on non-win32, should return None
+    fn choose_version_all_incompatible_still_selects_newest_satisfying() {
         let pkg = ResolverPackage::npm("win-only");
         let info = make_info(
             &["2.0.0", "1.0.0"],
@@ -2622,14 +2566,11 @@ mod tests {
             .to_pubgrub_ranges(&provider.available_versions(&pkg));
 
         let chosen = provider.choose_version(&pkg, &range).unwrap();
-        let current_os = Platform::current().os;
-
-        if current_os != "win32" {
-            assert!(
-                chosen.is_none(),
-                "on non-win32, all win32-only versions should be skipped"
-            );
-        }
+        assert_eq!(
+            chosen.map(|v| v.to_string()),
+            Some("2.0.0".to_string()),
+            "platform metadata must not hide the newest satisfying version from the lockfile"
+        );
     }
 
     // === get_dependencies: optional deps skip on failure ===
@@ -2725,7 +2666,7 @@ mod tests {
     }
 
     #[test]
-    fn get_dependencies_skips_optional_with_only_platform_incompatible_versions() {
+    fn get_dependencies_keeps_optional_with_only_platform_incompatible_versions() {
         let pkg = ResolverPackage::npm("my-app");
         let opt_dep = ResolverPackage::npm("fsevents");
         let reg_dep = ResolverPackage::npm("express");
@@ -2764,8 +2705,8 @@ mod tests {
                     "regular dep should be present"
                 );
                 assert!(
-                    !map.contains_key(&ResolverPackage::npm("fsevents")),
-                    "optional dep with only platform-incompatible versions should be silently skipped"
+                    map.contains_key(&ResolverPackage::npm("fsevents")),
+                    "resolver keeps platform metadata; install-time filtering skips incompatible optional deps"
                 );
             }
             _ => panic!("expected Available dependencies"),

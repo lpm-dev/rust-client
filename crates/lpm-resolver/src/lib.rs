@@ -27,7 +27,7 @@ pub use overrides::{
     OverrideSource, OverrideTarget, override_selector_target_name,
 };
 pub use package::{CanonicalKey, ResolverPackage};
-pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta};
+pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta, is_platform_compatible};
 pub use provider::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 pub use ranges::NpmRange;
 pub use resolve::{

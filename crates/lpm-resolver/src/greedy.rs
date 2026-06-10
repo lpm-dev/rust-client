@@ -65,13 +65,15 @@ use crate::provider::{
     parse_metadata_to_cache_info,
 };
 use crate::ranges::NpmRange;
-use crate::resolve::{ResolveError, ResolveResult, ResolvedPackage, StageTiming};
+use crate::resolve::{
+    ResolveError, ResolveResult, ResolvedPackage, StageTiming, resolve_peer_binding_version,
+};
 use ahash::{AHashMap, AHashSet};
 #[cfg(test)]
 use lpm_registry::RouteMode;
 use lpm_registry::{RegistryClient, RouteTable, UpstreamRoute};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -613,9 +615,10 @@ pub async fn resolve_greedy_fused_with_cache_options(
     // through. Slight over-allocation is cheaper than rehashing.
     let mut inflight: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
     let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
-    type FetchResult = Result<FetchedMetadata, ResolveError>;
     let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
         tokio::task::JoinSet::new();
+    let mut inflight_order: BTreeMap<String, CanonicalKey> = BTreeMap::new();
+    let mut ready_metadata: BTreeMap<String, FetchResult> = BTreeMap::new();
 
     // High-water marks update at the boundary of each Phase A→B transition
     // so the post-loop value reflects the peak across the run, not just the
@@ -642,6 +645,7 @@ pub async fn resolve_greedy_fused_with_cache_options(
             let canonical = edge.canonical.clone();
             parked.entry(canonical.clone()).or_default().push(edge);
             if inflight.insert(canonical.clone()) {
+                inflight_order.insert(canonical.to_string(), canonical.clone());
                 let client_c = client.clone();
                 let permit = metadata_sem.clone();
                 let route_table_c = route_table.clone();
@@ -695,6 +699,7 @@ pub async fn resolve_greedy_fused_with_cache_options(
                 // returns None for these (nothing was parked) so the
                 // resume step is a no-op.
                 inflight.insert(canonical.clone());
+                inflight_order.insert(canonical.to_string(), canonical.clone());
                 let client_c = client.clone();
                 let permit = metadata_sem.clone();
                 let route_table_c = route_table.clone();
@@ -715,7 +720,7 @@ pub async fn resolve_greedy_fused_with_cache_options(
         // High-water samples. O(unique-canonicals-parked) per tick;
         // ~tens of entries × ~134 ticks on bench/fixture-large is
         // negligible vs the network wall.
-        let inflight_now = metadata_jobs.len() as u64;
+        let inflight_now = (metadata_jobs.len() + ready_metadata.len()) as u64;
         if inflight_now > inflight_high_water {
             inflight_high_water = inflight_now;
         }
@@ -733,7 +738,11 @@ pub async fn resolve_greedy_fused_with_cache_options(
         // peers, which re-arms the loop. The pass is a no-op when
         // `peer_requirements` is empty OR `auto_install_peers`
         // is false.
-        if metadata_jobs.is_empty() && state.task_queue.is_empty() {
+        if metadata_jobs.is_empty()
+            && ready_metadata.is_empty()
+            && inflight_order.is_empty()
+            && state.task_queue.is_empty()
+        {
             debug_assert!(
                 parked.is_empty(),
                 "greedy-fusion: non-empty parked at termination — invariant violated \
@@ -797,60 +806,31 @@ pub async fn resolve_greedy_fused_with_cache_options(
         }
 
         // ── Phase C — bounded await ──────────────────────────────
+        if let Some((canonical, result)) =
+            take_next_ready_metadata(&mut inflight_order, &mut ready_metadata)
+        {
+            inflight.remove(&canonical);
+            complete_metadata_fetch(
+                canonical,
+                result,
+                &shared_cache,
+                spec_tx.as_ref(),
+                &mut tarball_dispatched_count,
+                &mut parked,
+                &mut state,
+            )?;
+            continue;
+        }
+
         // metadata_jobs is non-empty here (Phase B guards otherwise).
-        // Take the next completion; resume any parked edges for that
-        // canonical in deterministic order.
+        // Take the next network completion, then buffer it until all
+        // earlier canonical fetches are also ready. Only the
+        // deterministic ready-pop above is allowed to mutate resolver
+        // state.
         if let Some(joined) = metadata_jobs.join_next().await {
             let (canonical, result) = joined
                 .map_err(|e| ResolveError::Internal(format!("metadata join failure: {e}")))?;
-            inflight.remove(&canonical);
-            match result {
-                Ok(fetched) => {
-                    shared_cache.insert(canonical.clone(), fetched.info);
-                    if let Some(tx) = spec_tx.as_ref() {
-                        // `try_send`: speculation is best-effort. If
-                        // the channel is full (spec dispatcher is
-                        // backlogged), we'd rather skip the
-                        // speculation than block the resolver loop —
-                        // any package missed here is downloaded by
-                        // the real fetch loop on the post-resolve
-                        // pass. Matches the walker arm's handling of
-                        // spec_tx backpressure.
-                        if tx
-                            .try_send((canonical.to_string(), fetched.metadata))
-                            .is_ok()
-                        {
-                            tarball_dispatched_count += 1;
-                        }
-                    }
-                    if let Some(mut edges) = parked.remove(&canonical) {
-                        // Sort parked edges by (parent_id, local_name) for
-                        // deterministic resume order. Without this,
-                        // multi-version dedupe could allocate
-                        // `(canonical, version)` pairs in different orders
-                        // across runs, breaking byte-identical-lockfile
-                        // equality on bench/fixture-large.
-                        edges.sort_by(|a, b| {
-                            (a.parent, a.local_name.as_str())
-                                .cmp(&(b.parent, b.local_name.as_str()))
-                        });
-                        for e in edges {
-                            state.task_queue.push_back(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Manifest fetch failed for this canonical. Apply
-                    // optional/peer/required behavior to every parked
-                    // edge waiting on it. Required edges propagate;
-                    // optional + peer are dropped silently.
-                    if let Some(edges) = parked.remove(&canonical) {
-                        for edge in edges {
-                            propagate_fetch_error(&edge, &e, &mut state)?;
-                        }
-                    }
-                }
-            }
+            ready_metadata.insert(canonical.to_string(), result);
         }
     }
 
@@ -996,6 +976,7 @@ struct ResolveState {
 struct ResolvedNodeBuilder {
     canonical: CanonicalKey,
     version: NpmVersion,
+    optional: bool,
     /// Edges going OUT of this node: (local_name, child_node_id).
     children: Vec<(String, NodeId)>,
 }
@@ -1047,6 +1028,7 @@ impl ResolveState {
         self.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::Root,
             version: NpmVersion::new(0, 0, 0),
+            optional: false,
             children: Vec::new(),
         });
         // Root carries a sentinel canonical; it's never queried by an
@@ -1121,17 +1103,21 @@ impl ResolveState {
         let id_to_version: Vec<String> = self.nodes.iter().map(|n| n.version.to_string()).collect();
 
         // canonical-name → resolved-version lookup for peer resolution.
-        // Mirrors `format_solution`'s `resolved_versions`. Built from the
+        // Mirrors `format_solution`'s peer-candidate lookup. Built from the
         // same node table (filtered to non-root) so peer name-lookups
         // intersect the active install set. `CanonicalKey`'s Display impl
         // emits the canonical-name form (`@lpm.dev/owner.name` or `react`),
         // matching how `peerDependencies` keys are spelled in package.json.
-        let resolved_by_canonical: HashMap<String, String> = self
+        let resolved_by_canonical: HashMap<String, Vec<(Option<String>, String)>> = self
             .nodes
             .iter()
             .filter(|n| !matches!(n.canonical, CanonicalKey::Root))
-            .map(|n| (n.canonical.to_string(), n.version.to_string()))
-            .collect();
+            .fold(HashMap::new(), |mut acc, n| {
+                acc.entry(n.canonical.to_string())
+                    .or_default()
+                    .push((None, n.version.to_string()));
+                acc
+            });
 
         let mut out: Vec<ResolvedPackage> = self
             .nodes
@@ -1179,6 +1165,10 @@ impl ResolveState {
                     .and_then(|info| info.dist.get(&ver_str))
                     .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
                     .unwrap_or_default();
+                let platform = cache
+                    .get(&n.canonical)
+                    .and_then(|info| info.platform.get(&ver_str))
+                    .cloned();
 
                 // Surface resolved peers per package so the v2 GraphKey
                 // can fold them in. The resolved-versions lookup is built
@@ -1188,11 +1178,16 @@ impl ResolveState {
                     .and_then(|info| info.peer_deps.get(&ver_str))
                     .map(|peer_deps| {
                         let mut out: Vec<(String, String)> = peer_deps
-                            .keys()
-                            .filter_map(|peer_name| {
-                                resolved_by_canonical
-                                    .get(peer_name)
-                                    .map(|ver| (peer_name.clone(), ver.clone()))
+                            .iter()
+                            .filter_map(|(peer_name, peer_range)| {
+                                let parsed_range = NpmRange::parse(peer_range).ok();
+                                resolve_peer_binding_version(
+                                    &pkg,
+                                    peer_name,
+                                    parsed_range.as_ref(),
+                                    &resolved_by_canonical,
+                                )
+                                .map(|(ver, _)| (peer_name.clone(), ver.clone()))
                             })
                             .collect();
                         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1208,6 +1203,8 @@ impl ResolveState {
                     peers,
                     tarball_url,
                     integrity,
+                    platform,
+                    optional: n.optional,
                 }
             })
             .collect();
@@ -1289,7 +1286,7 @@ fn process_edge(
     let natural_pick = find_best_version(info, &edge.range);
     let natural_ver = match &natural_pick {
         VersionPick::Picked(v) => Some(v.clone()),
-        VersionPick::NoSatisfying | VersionPick::PlatformFiltered => None,
+        VersionPick::NoSatisfying => None,
     };
 
     // No natural version means there's nothing to evaluate the
@@ -1299,7 +1296,6 @@ fn process_edge(
     let Some(natural) = natural_ver else {
         return match natural_pick {
             VersionPick::NoSatisfying => handle_no_version(edge, info, false, state),
-            VersionPick::PlatformFiltered => handle_no_version(edge, info, true, state),
             VersionPick::Picked(_) => unreachable!(),
         };
     };
@@ -1349,6 +1345,26 @@ fn process_edge(
     process_edge_inner(edge, info, Some((natural, override_outcome)), state)
 }
 
+fn edge_is_optional_in_context(edge: &Edge, state: &ResolveState) -> bool {
+    edge.behavior.optional || state.nodes[edge.parent as usize].optional
+}
+
+fn mark_node_required_closure(state: &mut ResolveState, node_id: NodeId) {
+    let idx = node_id as usize;
+    if !state.nodes[idx].optional {
+        return;
+    }
+    state.nodes[idx].optional = false;
+    let children: Vec<NodeId> = state.nodes[idx]
+        .children
+        .iter()
+        .map(|(_, child_id)| *child_id)
+        .collect();
+    for child_id in children {
+        mark_node_required_closure(state, child_id);
+    }
+}
+
 /// Core reuse-or-allocate logic. The `forced` parameter, when present,
 /// carries (natural_version, optional_override) computed by the override
 /// branch in [`process_edge`]. When `None`, the function uses the
@@ -1383,6 +1399,9 @@ fn process_edge_inner(
                         .map(|(_, id)| *id)
                 });
             if let Some(id) = existing_id {
+                if !edge_is_optional_in_context(edge, state) {
+                    mark_node_required_closure(state, id);
+                }
                 state.nodes[edge.parent as usize]
                     .children
                     .push((edge.local_name.clone(), id));
@@ -1392,9 +1411,6 @@ fn process_edge_inner(
                 VersionPick::Picked(v) => v,
                 VersionPick::NoSatisfying => {
                     return handle_no_version(edge, info, false, state);
-                }
-                VersionPick::PlatformFiltered => {
-                    return handle_no_version(edge, info, true, state);
                 }
             };
             (version, None)
@@ -1443,12 +1459,19 @@ fn process_edge_inner(
     });
 
     let child_id = match existing_id {
-        Some(id) => id,
+        Some(id) => {
+            if !edge_is_optional_in_context(edge, state) {
+                mark_node_required_closure(state, id);
+            }
+            id
+        }
         None => {
             let new_id = state.nodes.len() as NodeId;
+            let incoming_optional = edge_is_optional_in_context(edge, state);
             state.nodes.push(ResolvedNodeBuilder {
                 canonical: edge.canonical.clone(),
                 version: target_version.clone(),
+                optional: incoming_optional,
                 children: Vec::new(),
             });
             state
@@ -1670,7 +1693,8 @@ fn enqueue_child_deps(
             }
         };
 
-        let optional = optional_names.is_some_and(|set| set.contains(local_name));
+        let optional = state.nodes[parent_id as usize].optional
+            || optional_names.is_some_and(|set| set.contains(local_name));
         if optional && !state.include_optional_dependencies {
             tracing::debug!(
                 "skipping optional dep {} of {}@{} by install option",
@@ -2358,15 +2382,10 @@ where
 /// current platform isn't compatible" so callers can increment
 /// `platform_skipped` precisely.
 enum VersionPick {
-    /// A satisfying, platform-compatible version was found.
+    /// A satisfying version was found.
     Picked(NpmVersion),
-    /// No version satisfies the range — even ignoring platform.
+    /// No version satisfies the range.
     NoSatisfying,
-    /// At least one version satisfies the range, but every such
-    /// version is filtered out by the current OS/CPU constraints.
-    /// Optional deps in this state are silently skipped and counted
-    /// in `ResolveResult.platform_skipped`.
-    PlatformFiltered,
 }
 
 /// Detect a leaked `workspace:` specifier before [`NpmRange::parse`] gets
@@ -2380,38 +2399,16 @@ fn is_workspace_specifier(range_str: &str) -> bool {
 /// Greedy first-match version pick. Iterates `info.versions` (sorted
 /// descending by semver in
 /// [`crate::provider::parse_metadata_to_cache_info`]) and returns the
-/// first version that both satisfies the range AND is compatible
-/// with the current OS/CPU. Mirrors bun's `npm.zig:1808-1819` plus
-/// the platform filter that `provider::available_versions` already
-/// applies for the PubGrub path.
-///
-/// **Platform filtering is essential** — without it, optional deps
-/// declared with `os`/`cpu` constraints (e.g. esbuild's per-platform
-/// binary tarballs in `optionalDependencies`) get over-installed,
-/// with the resolver picking versions the current platform can't
-/// use. This was a real W2 regression caught on `bench/fixture-large`:
-/// 47 extra `@esbuild/*` packages got installed before the platform
-/// filter landed.
+/// first version satisfying the range. Platform compatibility is applied
+/// after resolution so lockfiles remain portable across hosts.
 fn find_best_version(info: &CachedPackageInfo, range: &NpmRange) -> VersionPick {
-    let mut had_satisfying_but_filtered = false;
     for v in &info.versions {
         if !range.satisfies(v) {
             continue;
         }
-        let platform_ok = info
-            .platform
-            .get(&v.to_string())
-            .is_none_or(crate::provider::is_platform_compatible);
-        if platform_ok {
-            return VersionPick::Picked(v.clone());
-        }
-        had_satisfying_but_filtered = true;
+        return VersionPick::Picked(v.clone());
     }
-    if had_satisfying_but_filtered {
-        VersionPick::PlatformFiltered
-    } else {
-        VersionPick::NoSatisfying
-    }
+    VersionPick::NoSatisfying
 }
 
 /// Fast cache hit, then short-lived per-canonical wait, then escape-hatch
@@ -2496,6 +2493,8 @@ struct FetchedMetadata {
     info: Arc<CachedPackageInfo>,
 }
 
+type FetchResult = Result<FetchedMetadata, ResolveError>;
+
 async fn fetch_metadata_for_resolver(
     client: &RegistryClient,
     route_table: &RouteTable,
@@ -2508,6 +2507,57 @@ async fn fetch_metadata_for_resolver(
 fn parse_fetched_metadata(metadata: lpm_registry::PackageMetadata) -> FetchedMetadata {
     let info = Arc::new(parse_metadata_to_cache_info(&metadata));
     FetchedMetadata { metadata, info }
+}
+
+fn take_next_ready_metadata<V>(
+    inflight_order: &mut BTreeMap<String, CanonicalKey>,
+    ready_metadata: &mut BTreeMap<String, V>,
+) -> Option<(CanonicalKey, V)> {
+    let next_key = inflight_order.keys().next().cloned()?;
+    let ready = ready_metadata.remove(&next_key)?;
+    let canonical = inflight_order
+        .remove(&next_key)
+        .expect("ready metadata key must be tracked as inflight");
+    Some((canonical, ready))
+}
+
+fn complete_metadata_fetch(
+    canonical: CanonicalKey,
+    result: FetchResult,
+    shared_cache: &SharedCache,
+    spec_tx: Option<&tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    tarball_dispatched_count: &mut u64,
+    parked: &mut AHashMap<CanonicalKey, Vec<Edge>>,
+    state: &mut ResolveState,
+) -> Result<(), ResolveError> {
+    match result {
+        Ok(fetched) => {
+            shared_cache.insert(canonical.clone(), fetched.info);
+            if let Some(tx) = spec_tx
+                && tx
+                    .try_send((canonical.to_string(), fetched.metadata))
+                    .is_ok()
+            {
+                *tarball_dispatched_count += 1;
+            }
+            if let Some(mut edges) = parked.remove(&canonical) {
+                edges.sort_by(|a, b| {
+                    (a.parent, a.local_name.as_str()).cmp(&(b.parent, b.local_name.as_str()))
+                });
+                for e in edges {
+                    state.task_queue.push_back(e);
+                }
+            }
+        }
+        Err(e) => {
+            if let Some(edges) = parked.remove(&canonical) {
+                for edge in edges {
+                    propagate_fetch_error(&edge, &e, state)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Raw-metadata fetch, factored out so the fused resolver can forward the
@@ -2689,9 +2739,6 @@ mod tests {
         match p {
             VersionPick::Picked(v) => v,
             VersionPick::NoSatisfying => panic!("expected Picked, got NoSatisfying"),
-            VersionPick::PlatformFiltered => {
-                panic!("expected Picked, got PlatformFiltered")
-            }
         }
     }
 
@@ -2726,15 +2773,11 @@ mod tests {
     }
 
     #[test]
-    fn find_best_version_reports_platform_filter_when_only_match_is_incompatible() {
-        // The only version satisfying the range is platform-restricted to
-        // a host we're not on. The pick result must be `PlatformFiltered`,
-        // not `NoSatisfying`, so callers can increment platform_skipped
-        // precisely on optional deps.
+    fn find_best_version_ignores_platform_when_selecting_version() {
+        // Platform filtering happens after resolution so lockfiles stay
+        // portable. The newest semver-satisfying version wins even when
+        // it is incompatible with the current host.
         let mut info = mk_info(&["1.0.0"], &[]);
-        // Force this version to be incompatible regardless of host: include
-        // every OS as an exclusion. `check_platform_filter` reads `!<os>`
-        // entries as exclusion lists, so all hosts fail.
         info.platform.insert(
             "1.0.0".to_string(),
             crate::provider::PlatformMeta {
@@ -2754,10 +2797,10 @@ mod tests {
             },
         );
         let range = NpmRange::parse("^1.0.0").unwrap();
-        assert!(matches!(
-            find_best_version(&info, &range),
-            VersionPick::PlatformFiltered
-        ));
+        assert_eq!(
+            picked(find_best_version(&info, &range)).to_string(),
+            "1.0.0"
+        );
     }
 
     #[test]
@@ -2866,6 +2909,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("react"),
             version: NpmVersion::parse("18.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state.resolved.insert(
@@ -2927,6 +2971,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("legacy-shim"),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state.resolved.insert(
@@ -3112,6 +3157,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::Root,
             version: NpmVersion::new(0, 0, 0),
+            optional: false,
             children: Vec::new(),
         });
         state
@@ -3120,6 +3166,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("react"),
             version: NpmVersion::parse("18.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state.resolved.insert(
@@ -3219,6 +3266,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::Root,
             version: NpmVersion::new(0, 0, 0),
+            optional: false,
             children: Vec::new(),
         });
         state
@@ -3227,6 +3275,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("react"),
             version: NpmVersion::parse("18.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state.resolved.insert(
@@ -3236,6 +3285,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("redux"),
             version: NpmVersion::parse("4.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state.resolved.insert(
@@ -3324,6 +3374,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("parent"),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         enqueue_child_deps(
@@ -3362,6 +3413,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("parent"),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         enqueue_child_deps(
@@ -3397,6 +3449,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("parent"),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         enqueue_child_deps(
@@ -3455,6 +3508,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("parent"),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         enqueue_child_deps(
@@ -3545,6 +3599,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: parent_canonical.clone(),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         enqueue_child_deps(
@@ -3864,6 +3919,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: canonical.clone(),
             version: NpmVersion::parse(version).unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state
@@ -3872,6 +3928,72 @@ mod tests {
             .or_default()
             .push((NpmVersion::parse(version).unwrap(), id));
         id
+    }
+
+    #[test]
+    fn ready_metadata_waits_for_earliest_inflight_key() {
+        let mut inflight_order = BTreeMap::new();
+        inflight_order.insert("a".to_string(), CanonicalKey::npm("a"));
+        inflight_order.insert("b".to_string(), CanonicalKey::npm("b"));
+
+        let mut ready_metadata = BTreeMap::new();
+        ready_metadata.insert("b".to_string(), 2_u8);
+        assert!(
+            take_next_ready_metadata(&mut inflight_order, &mut ready_metadata).is_none(),
+            "later completions must not mutate resolver state before earlier keys land"
+        );
+        assert!(
+            inflight_order.contains_key("a") && inflight_order.contains_key("b"),
+            "a blocked pop must leave inflight order intact"
+        );
+
+        ready_metadata.insert("a".to_string(), 1_u8);
+        let (first_key, first_value) =
+            take_next_ready_metadata(&mut inflight_order, &mut ready_metadata)
+                .expect("earliest key is now ready");
+        assert_eq!(first_key, CanonicalKey::npm("a"));
+        assert_eq!(first_value, 1);
+
+        let (second_key, second_value) =
+            take_next_ready_metadata(&mut inflight_order, &mut ready_metadata)
+                .expect("second key is ready after earliest is consumed");
+        assert_eq!(second_key, CanonicalKey::npm("b"));
+        assert_eq!(second_value, 2);
+    }
+
+    #[test]
+    fn into_resolved_packages_binds_peer_by_consumer_range() {
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        push_node(&mut state, CanonicalKey::npm("plugin"), "1.0.0");
+        push_node(&mut state, CanonicalKey::npm("react"), "17.0.2");
+        push_node(&mut state, CanonicalKey::npm("react"), "18.2.0");
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            CanonicalKey::npm("plugin"),
+            Arc::new(mk_info_with_peers(
+                &["1.0.0"],
+                &[],
+                &[("react", "^17.0.0")],
+                &[],
+            )),
+        );
+        cache.insert(
+            CanonicalKey::npm("react"),
+            mk_info_arc(&["18.2.0", "17.0.2"], &[]),
+        );
+
+        let resolved = state.into_resolved_packages(&cache);
+        let plugin = resolved
+            .iter()
+            .find(|pkg| pkg.package.canonical_name() == "plugin")
+            .expect("plugin package present");
+        assert_eq!(
+            plugin.peers,
+            vec![("react".to_string(), "17.0.2".to_string())],
+            "greedy finalization should bind the peer version satisfying the consumer range"
+        );
     }
 
     #[tokio::test]
