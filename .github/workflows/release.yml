@@ -270,9 +270,9 @@ jobs:
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
           # Update platform optionalDependencies to the same tag. The
-          # wrapper intentionally carries no runtime dependencies and no
-          # install scripts; npm's optional platform packages are the
-          # distribution mechanism.
+          # wrapper intentionally carries no runtime dependencies; npm's
+          # optional platform packages plus the tiny postinstall verifier
+          # are the distribution mechanism.
           node --input-type=module -e "
             import fs from 'node:fs';
             const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
@@ -287,8 +287,11 @@ jobs:
             if (pkg.dependencies) {
               throw new Error('@lpm-registry/cli wrapper must not publish runtime dependencies');
             }
-            if (pkg.scripts?.postinstall || pkg.scripts?.install || pkg.scripts?.preinstall) {
-              throw new Error('@lpm-registry/cli wrapper must not publish install lifecycle scripts');
+            if (pkg.scripts?.preinstall || pkg.scripts?.install) {
+              throw new Error('@lpm-registry/cli wrapper must not publish preinstall/install lifecycle scripts');
+            }
+            if (pkg.scripts?.postinstall !== 'node scripts/install-binary.js') {
+              throw new Error('@lpm-registry/cli wrapper must publish the native binary postinstall verifier');
             }
             for (const p of platforms) {
               if (pkg.optionalDependencies[p] !== '$VERSION') {

@@ -10,6 +10,7 @@ import {
   platformKey,
   resolveNativeBinary,
 } from "../bin/native.js";
+import { installNativeBinaries } from "../scripts/install-binary.js";
 
 const repoPackageDir = path.dirname(fileURLToPath(import.meta.url));
 const wrapperRoot = path.resolve(repoPackageDir, "..");
@@ -28,7 +29,8 @@ test("published wrapper manifest stays dependency-free", () => {
   assert.equal(manifest.devDependencies, undefined);
   assert.equal(manifest.scripts?.preinstall, undefined);
   assert.equal(manifest.scripts?.install, undefined);
-  assert.equal(manifest.scripts?.postinstall, undefined);
+  assert.equal(manifest.scripts?.postinstall, "node scripts/install-binary.js");
+  assert.ok(manifest.files.includes("scripts"));
   assert.deepEqual(Object.keys(manifest.optionalDependencies).sort(), [
     "@lpm-registry/cli-darwin-arm64",
     "@lpm-registry/cli-darwin-x64",
@@ -185,6 +187,133 @@ test("lpx wrapper runs custom LPM_BINARY_PATH through dlx", () => {
   assert.deepEqual(payload.argv, ["dlx", "cowsay", "hello"]);
 });
 
+test("postinstall validates and hard-links unix binaries into bin targets", () => {
+  const tree = makeInstallTree("linux-x64", {
+    version: "1.2.3",
+    packageBinaryNames: ["lpm", "lpx"],
+  });
+
+  const result = installNativeBinaries({
+    wrapperRoot: tree.wrapperRoot,
+    platform: "linux",
+    arch: "x64",
+    requireFn: createFakeRequire(tree.root),
+    spawnSyncFn: createVersionSpawn("lpm 1.2.3"),
+    logFn() {},
+  });
+
+  assert.equal(result.status, "installed");
+  assert.deepEqual(
+    result.optimized.map(entry => [entry.command, entry.action]),
+    [
+      ["lpm", "link"],
+      ["lpx", "link"],
+    ],
+  );
+  assert.equal(
+    fs.statSync(path.join(tree.packageDir, "lpm")).ino,
+    fs.statSync(path.join(tree.wrapperRoot, "bin", "lpm.js")).ino,
+  );
+  assert.equal(
+    fs.statSync(path.join(tree.packageDir, "lpx")).ino,
+    fs.statSync(path.join(tree.wrapperRoot, "bin", "lpx.js")).ino,
+  );
+});
+
+test("postinstall copies unix binaries when hard-linking is unavailable", () => {
+  const tree = makeInstallTree("darwin-arm64", {
+    version: "2.0.0",
+    packageBinaryNames: ["lpm", "lpx"],
+  });
+  const fsModule = {
+    ...fs,
+    linkSync() {
+      const error = new Error("cross-device link");
+      error.code = "EXDEV";
+      throw error;
+    },
+  };
+
+  const result = installNativeBinaries({
+    wrapperRoot: tree.wrapperRoot,
+    platform: "darwin",
+    arch: "arm64",
+    requireFn: createFakeRequire(tree.root),
+    spawnSyncFn: createVersionSpawn("lpm 2.0.0"),
+    fsModule,
+    logFn() {},
+  });
+
+  assert.equal(result.status, "installed");
+  assert.deepEqual(
+    result.optimized.map(entry => [entry.command, entry.action]),
+    [
+      ["lpm", "copy"],
+      ["lpx", "copy"],
+    ],
+  );
+  assert.equal(
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"),
+    fs.readFileSync(path.join(tree.packageDir, "lpm"), "utf8"),
+  );
+});
+
+test("postinstall keeps windows JS shims and stages local exe binaries", () => {
+  const tree = makeInstallTree("win32-x64", {
+    version: "3.0.0",
+    packageBinaryNames: ["lpm.exe", "lpx.exe"],
+  });
+  const lpmShim = fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8");
+  const lpxShim = fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpx.js"), "utf8");
+
+  const result = installNativeBinaries({
+    wrapperRoot: tree.wrapperRoot,
+    platform: "win32",
+    arch: "x64",
+    requireFn: createFakeRequire(tree.root),
+    spawnSyncFn: createVersionSpawn("lpm 3.0.0"),
+    logFn() {},
+  });
+
+  assert.equal(result.status, "installed");
+  assert.deepEqual(
+    result.optimized.map(entry => [entry.command, entry.action]),
+    [
+      ["lpm", "copy"],
+      ["lpx", "copy"],
+    ],
+  );
+  assert.equal(fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"), lpmShim);
+  assert.equal(fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpx.js"), "utf8"), lpxShim);
+  assert.equal(
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.exe"), "utf8"),
+    fs.readFileSync(path.join(tree.packageDir, "lpm.exe"), "utf8"),
+  );
+});
+
+test("postinstall validation failure leaves JS shims in place", () => {
+  const tree = makeInstallTree("linux-x64", {
+    version: "4.0.0",
+    packageBinaryNames: ["lpm", "lpx"],
+  });
+  const shim = fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8");
+
+  assert.throws(
+    () =>
+      installNativeBinaries({
+        wrapperRoot: tree.wrapperRoot,
+        platform: "linux",
+        arch: "x64",
+        requireFn: createFakeRequire(tree.root),
+        spawnSyncFn: createVersionSpawn("lpm 3.9.9"),
+        logFn() {},
+      }),
+    /reported version/,
+  );
+
+  assert.equal(fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"), shim);
+});
+
 function makePackageTree(platform) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-wrapper-"));
   const pkgDir = path.join(
@@ -202,6 +331,44 @@ function makePackageTree(platform) {
     fs.writeFileSync(path.join(pkgDir, name), "");
   }
   return root;
+}
+
+function makeInstallTree(platform, { version, packageBinaryNames }) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-install-wrapper-"));
+  const wrapperRoot = path.join(root, "node_modules", "@lpm-registry", "cli");
+  const packageDir = path.join(
+    root,
+    "node_modules",
+    "@lpm-registry",
+    `cli-${platform}`,
+  );
+  fs.mkdirSync(path.join(wrapperRoot, "bin"), { recursive: true });
+  fs.mkdirSync(packageDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(wrapperRoot, "package.json"),
+    JSON.stringify({ name: "@lpm-registry/cli", version }),
+  );
+  fs.writeFileSync(path.join(wrapperRoot, "bin", "lpm.js"), "#!/usr/bin/env node\n");
+  fs.writeFileSync(path.join(wrapperRoot, "bin", "lpx.js"), "#!/usr/bin/env node\n");
+  fs.writeFileSync(
+    path.join(packageDir, "package.json"),
+    JSON.stringify({ name: `@lpm-registry/cli-${platform}`, version }),
+  );
+  for (const name of packageBinaryNames) {
+    fs.writeFileSync(path.join(packageDir, name), `native ${name} ${version}\n`);
+    fs.chmodSync(path.join(packageDir, name), 0o755);
+  }
+  return { root, wrapperRoot, packageDir };
+}
+
+function createVersionSpawn(stdout) {
+  return () => ({
+    status: 0,
+    signal: null,
+    error: undefined,
+    stdout,
+    stderr: "",
+  });
 }
 
 function createFakeRequire(root) {
