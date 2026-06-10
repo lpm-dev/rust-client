@@ -2,10 +2,10 @@
 //!
 //! Two formats:
 //! - `lpm.lock` (TOML) — human-readable, git-diffable, always written
-//! - `lpm.lockb` (binary) — mmap'd for zero-parse reads (~0.1ms vs ~10ms TOML)
+//! - `lpm.lockb` (binary) — generated companion for doctor validation/writeback
 //!
 //! The binary lockfile is written alongside TOML on every resolution.
-//! On read, the binary file is preferred when it exists and is newer than TOML.
+//! On read, commands use the reviewer-visible TOML as the authoritative input.
 //!
 //! Design principles (from research doc Section 8):
 //! - Sorted entries for deterministic diffs
@@ -513,7 +513,7 @@ impl Lockfile {
             }
 
             // Scope-pin `@lpm.dev/*` to the lpm.dev origin. The binary
-            // fast path runs the same check via `validate_loaded_packages`.
+            // reader runs the same check via `validate_loaded_packages`.
             if let Some(url) = pkg.lpm_scope_origin_mismatch() {
                 return Err(LockfileError::InvalidScopeOrigin {
                     package: pkg.name.clone(),
@@ -589,89 +589,13 @@ impl Lockfile {
         Ok(())
     }
 
-    /// Fast read: prefer binary lockfile (mmap) if it exists and is at least
-    /// as new as the TOML file. Falls back to TOML parsing.
+    /// Read the authoritative TOML lockfile.
     ///
-    /// M69: on any metadata read error, prefer the TOML form. The
-    /// pre-fix default was to prefer the binary on metadata error,
-    /// which created a malicious-PR vector: commit a clean
-    /// human-readable `lpm.lock` (passes review) plus a poisoned
-    /// `lpm.lockb`, then engineer a metadata read failure (e.g.,
-    /// permission flip on TOML) to force binary precedence. The
-    /// install pipeline would then consume the binary while the
-    /// reviewer-visible TOML diverged silently. Defaulting to TOML
-    /// on metadata error means a reviewer's diff is what runs.
+    /// `lpm.lockb` remains a generated companion that `doctor` and install
+    /// writeback can validate/regenerate, but it is not trusted as an install
+    /// input. A committed binary cache is opaque in code review, so the
+    /// reviewer-visible TOML form is what commands execute.
     pub fn read_fast(toml_path: &Path) -> Result<Self, LockfileError> {
-        let binary_path = toml_path.with_extension("lockb");
-        if binary_path.exists() {
-            let use_binary = match (toml_path.metadata(), binary_path.metadata()) {
-                (Ok(toml_meta), Ok(bin_meta)) => {
-                    match (toml_meta.modified(), bin_meta.modified()) {
-                        (Ok(toml_time), Ok(bin_time)) => bin_time >= toml_time,
-                        // mtime unavailable but both files exist — fall
-                        // back to TOML to surface a reviewer-visible
-                        // diff rather than the opaque binary form.
-                        _ => false,
-                    }
-                }
-                // Either metadata call failed. M69 prefers TOML here:
-                // the binary is opaque to PR review, so a metadata
-                // error should not be a free path to binary precedence.
-                _ => false,
-            };
-
-            if use_binary {
-                match BinaryLockfileReader::open(&binary_path) {
-                    Ok(Some(reader)) => {
-                        if let Ok(binary_lockfile) = reader.to_lockfile() {
-                            let toml_lockfile = Self::read_from_file(toml_path)?;
-                            if binary_cache_matches_toml(&binary_lockfile, &toml_lockfile) {
-                                return Ok(binary_lockfile);
-                            }
-                            tracing::warn!(
-                                "ignoring binary lockfile cache ({}): contents do not match authoritative TOML {}",
-                                binary_path.display(),
-                                toml_path.display()
-                            );
-                            return Ok(toml_lockfile);
-                        }
-                        // Cross-format invariant failed; fall through
-                        // to TOML so the same defect surfaces against
-                        // the reviewer-visible source.
-                    }
-                    Err(LockfileError::UnsupportedVersion { found, .. })
-                        if found < binary::BINARY_VERSION =>
-                    {
-                        // Stale binary from an OLDER client. Best-effort
-                        // delete so read-only commands (`lpm outdated`,
-                        // `lpm upgrade`) don't pay the TOML-fallback cost
-                        // on every invocation. Without this, old `lpm.lockb`
-                        // files would repeatedly open+reject until an
-                        // install fires its writeback.
-                        //
-                        // Restricted to `found < BINARY_VERSION`: a
-                        // FUTURE-version binary (found > BINARY_VERSION)
-                        // means the user likely has a newer LPM client on
-                        // this machine that wrote it. Deleting would force
-                        // regeneration on the next new-client install,
-                        // churning the cache. The newer format is
-                        // unreadable to us; falling through to TOML is
-                        // correct either way, but preserving the file
-                        // keeps the newer client's fast path intact.
-                        //
-                        // Swallow any delete failure (read-only FS,
-                        // permission denied) — correctness still holds
-                        // via the TOML fallback below.
-                        let _ = std::fs::remove_file(&binary_path);
-                    }
-                    // Future-version binaries AND any other error
-                    // (corrupted magic, structural validation, etc.)
-                    // fall through to TOML without deleting the binary.
-                    _ => {}
-                }
-            }
-        }
-
         Self::read_from_file(toml_path)
     }
 
@@ -722,41 +646,6 @@ impl Default for Lockfile {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn binary_cache_matches_toml(binary_lockfile: &Lockfile, toml_lockfile: &Lockfile) -> bool {
-    if !binary::binary_format_supports(toml_lockfile) {
-        return false;
-    }
-    if binary_lockfile.packages.len() != toml_lockfile.packages.len() {
-        return false;
-    }
-
-    let mut binary_packages: Vec<&LockedPackage> = binary_lockfile.packages.iter().collect();
-    let mut toml_packages: Vec<&LockedPackage> = toml_lockfile.packages.iter().collect();
-    binary_packages.sort_by(|a, b| lockfile_package_order(a, b));
-    toml_packages.sort_by(|a, b| lockfile_package_order(a, b));
-
-    binary_packages
-        .iter()
-        .zip(toml_packages.iter())
-        .all(|(binary, toml)| binary_package_fields_match(binary, toml))
-}
-
-fn lockfile_package_order(a: &LockedPackage, b: &LockedPackage) -> std::cmp::Ordering {
-    a.name
-        .cmp(&b.name)
-        .then_with(|| a.version.cmp(&b.version))
-        .then_with(|| a.source.cmp(&b.source))
-}
-
-fn binary_package_fields_match(binary: &LockedPackage, toml: &LockedPackage) -> bool {
-    binary.name == toml.name
-        && binary.version == toml.version
-        && binary.source == toml.source
-        && binary.integrity == toml.integrity
-        && binary.dependencies == toml.dependencies
-        && binary.tarball == toml.tarball
 }
 
 /// Ensure `.gitattributes` marks `lpm.lockb` as binary.
@@ -1430,9 +1319,7 @@ version = "1.0.0"
     /// The v1 binary format cannot express alias metadata;
     /// `binary::to_binary` rejects such lockfiles so callers fall
     /// back to TOML-only. `write_all` goes further and proactively
-    /// removes any stale binary file from a prior non-aliased install,
-    /// so `read_fast` never silently picks a binary that disagrees
-    /// with the authoritative TOML.
+    /// removes any stale binary file from a prior non-aliased install.
     #[test]
     fn write_all_skips_binary_when_root_aliases_present() {
         let dir = tempfile::tempdir().unwrap();
@@ -1515,33 +1402,23 @@ version = "1.0.0"
     }
 
     #[test]
-    fn read_fast_prefers_binary_when_newer() {
+    fn read_fast_reads_toml_when_binary_is_newer() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("lpm.lock");
         let binary_path = dir.path().join("lpm.lockb");
 
         let lf = sample_lockfile();
-
-        // Write TOML first
         lf.write_to_file(&toml_path).unwrap();
 
-        // Small delay so binary has a strictly newer mtime
         std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // Write binary
         binary::write_binary(&lf, &binary_path).unwrap();
 
-        // read_fast should succeed and return the same data
         let result = Lockfile::read_fast(&toml_path).unwrap();
-        assert_eq!(result.packages.len(), lf.packages.len());
-        for (orig, rest) in lf.packages.iter().zip(result.packages.iter()) {
-            assert_eq!(orig.name, rest.name);
-            assert_eq!(orig.version, rest.version);
-        }
+        assert_eq!(result, lf);
     }
 
     #[test]
-    fn read_fast_returns_toml_when_newer_binary_disagrees() {
+    fn read_fast_ignores_newer_binary_that_disagrees_with_toml() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("lpm.lock");
         let binary_path = dir.path().join("lpm.lockb");
@@ -1579,20 +1456,17 @@ version = "1.0.0"
     }
 
     #[test]
-    fn read_fast_falls_back_to_toml_when_binary_stale() {
+    fn read_fast_ignores_stale_binary() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("lpm.lock");
         let binary_path = dir.path().join("lpm.lockb");
 
         let lf = sample_lockfile();
 
-        // Write binary first (older)
         binary::write_binary(&lf, &binary_path).unwrap();
 
-        // Small delay so TOML has a strictly newer mtime
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // Write TOML with a different package to distinguish
         let mut lf2 = Lockfile::new();
         lf2.add_package(LockedPackage {
             name: "only-in-toml".to_string(),
@@ -1606,14 +1480,12 @@ version = "1.0.0"
         });
         lf2.write_to_file(&toml_path).unwrap();
 
-        // read_fast should fall back to TOML since binary is stale
         let result = Lockfile::read_fast(&toml_path).unwrap();
-        assert_eq!(result.packages.len(), 1);
-        assert_eq!(result.packages[0].name, "only-in-toml");
+        assert_eq!(result, lf2);
     }
 
     #[test]
-    fn read_fast_falls_back_when_binary_corrupt() {
+    fn read_fast_ignores_corrupt_binary() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("lpm.lock");
         let binary_path = dir.path().join("lpm.lockb");
@@ -1621,23 +1493,15 @@ version = "1.0.0"
         let lf = sample_lockfile();
         lf.write_to_file(&toml_path).unwrap();
 
-        // Write corrupt binary with bad magic (newer than TOML)
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&binary_path, b"BADMxxxxxxxxxxxxxxxxx").unwrap();
 
-        // read_fast should fall back to TOML since binary open fails
         let result = Lockfile::read_fast(&toml_path).unwrap();
-        assert_eq!(result.packages.len(), lf.packages.len());
+        assert_eq!(result, lf);
     }
 
     #[test]
-    fn read_fast_falls_back_to_toml_when_binary_is_v1() {
-        // Client upgrade scenario: user has a v1 `lpm.lockb` on disk
-        // (written by an old client) plus the v2-compatible TOML
-        // lockfile. The v2 reader must reject v1 and read_fast must
-        // fall through to TOML cleanly — otherwise the client would
-        // error out every install until something else triggered a
-        // lockfile rewrite.
+    fn read_fast_preserves_unsupported_binary_while_reading_toml() {
         let dir = tempfile::tempdir().unwrap();
         let toml_path = dir.path().join("lpm.lock");
         let binary_path = dir.path().join("lpm.lockb");
@@ -1645,115 +1509,17 @@ version = "1.0.0"
         let lf = sample_lockfile();
         lf.write_to_file(&toml_path).unwrap();
 
-        // Hand-roll a minimal v1 binary lockfile header (version=1).
-        // The reader rejects at version check; body doesn't need to
-        // be a valid v1 body. Use magic = b"LPMB" (same as v2 so the
-        // magic check passes, forcing the version check to fire).
         std::thread::sleep(std::time::Duration::from_millis(50));
         let mut v1_header = Vec::with_capacity(16);
         v1_header.extend_from_slice(b"LPMB");
-        v1_header.extend_from_slice(&1u32.to_le_bytes()); // version = 1
-        v1_header.extend_from_slice(&0u32.to_le_bytes()); // 0 packages
-        v1_header.extend_from_slice(&16u32.to_le_bytes()); // string_table_off
+        v1_header.extend_from_slice(&1u32.to_le_bytes());
+        v1_header.extend_from_slice(&0u32.to_le_bytes());
+        v1_header.extend_from_slice(&16u32.to_le_bytes());
         std::fs::write(&binary_path, &v1_header).unwrap();
 
-        // read_fast must succeed via the TOML fallback, not error out.
         let result = Lockfile::read_fast(&toml_path).unwrap();
-        assert_eq!(result.packages.len(), lf.packages.len());
-        // Stale v1 binary must be deleted — otherwise read-only
-        // commands (`lpm outdated`, `lpm upgrade`) would pay the
-        // failed-open + TOML-parse cost on every invocation. After
-        // deletion, subsequent read_fast calls skip the binary
-        // check entirely until the next install writeback creates
-        // the v2 file.
-        assert!(
-            !binary_path.exists(),
-            "stale v1 lpm.lockb must be deleted at read time so the \
-             regression doesn't persist across read-only commands"
-        );
-    }
-
-    #[test]
-    fn read_fast_preserves_binary_on_future_version() {
-        // A future binary format (found > BINARY_VERSION, written by
-        // a newer LPM client) must NOT be deleted — the newer
-        // client's fast path should stay intact. Deletion is scoped
-        // to `found < BINARY_VERSION` only.
-        let dir = tempfile::tempdir().unwrap();
-        let toml_path = dir.path().join("lpm.lock");
-        let binary_path = dir.path().join("lpm.lockb");
-
-        let lf = sample_lockfile();
-        lf.write_to_file(&toml_path).unwrap();
-
-        // Hand-roll a header that looks like a future v99 binary.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let mut v99_header = Vec::with_capacity(16);
-        v99_header.extend_from_slice(b"LPMB");
-        v99_header.extend_from_slice(&99u32.to_le_bytes()); // future version
-        v99_header.extend_from_slice(&0u32.to_le_bytes());
-        v99_header.extend_from_slice(&16u32.to_le_bytes());
-        std::fs::write(&binary_path, &v99_header).unwrap();
-
-        // read_fast must fall back to TOML cleanly.
-        let result = Lockfile::read_fast(&toml_path).unwrap();
-        assert_eq!(result.packages.len(), lf.packages.len());
-        // Future-version binary stays on disk — a newer client can
-        // use it on their next read.
-        assert!(
-            binary_path.exists(),
-            "future-version binary must be preserved for newer clients"
-        );
-    }
-
-    #[test]
-    fn read_fast_preserves_binary_on_non_version_errors() {
-        // Complement to the v1-delete behavior: only `UnsupportedVersion`
-        // triggers deletion. Structural corruption (bad magic, truncated
-        // body) leaves the file on disk in case the user wants to
-        // forensically inspect it. This guards against aggressive
-        // deletion creeping into other error paths.
-        let dir = tempfile::tempdir().unwrap();
-        let toml_path = dir.path().join("lpm.lock");
-        let binary_path = dir.path().join("lpm.lockb");
-
-        let lf = sample_lockfile();
-        lf.write_to_file(&toml_path).unwrap();
-
-        // Bad magic — NOT UnsupportedVersion.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        std::fs::write(&binary_path, b"BADMxxxxxxxxxxxxxxxx").unwrap();
-
-        let result = Lockfile::read_fast(&toml_path).unwrap();
-        assert_eq!(result.packages.len(), lf.packages.len());
-        assert!(
-            binary_path.exists(),
-            "non-version binary errors must leave the file on disk \
-             (forensic preservation)"
-        );
-    }
-
-    #[test]
-    fn read_fast_falls_back_when_binary_dependency_table_is_corrupt() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml_path = dir.path().join("lpm.lock");
-        let binary_path = dir.path().join("lpm.lockb");
-
-        let lf = sample_lockfile();
-        lf.write_to_file(&toml_path).unwrap();
-
-        let mut binary = binary::to_binary(&lf).unwrap();
-        let deps_off_pos = 16 + 24;
-        binary[deps_off_pos..deps_off_pos + 4].copy_from_slice(&1u32.to_le_bytes());
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        std::fs::write(&binary_path, &binary).unwrap();
-
-        let result = Lockfile::read_fast(&toml_path).unwrap();
-        assert_eq!(
-            result, lf,
-            "corrupt binary should be rejected so read_fast falls back to TOML"
-        );
+        assert_eq!(result, lf);
+        assert!(binary_path.exists());
     }
 
     #[test]

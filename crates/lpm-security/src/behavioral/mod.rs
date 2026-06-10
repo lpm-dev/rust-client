@@ -167,7 +167,10 @@ struct AccumulatedResult {
 }
 
 /// Analyze a single file. Returns None if the file should be skipped.
-fn analyze_single_file(file_path: &std::path::PathBuf) -> Option<FileAnalysisResult> {
+fn analyze_single_file(
+    file_path: &std::path::PathBuf,
+    comment_buf: &mut Vec<u8>,
+) -> Option<FileAnalysisResult> {
     let file_size = std::fs::metadata(file_path).ok()?.len();
     let filename = file_path.file_name()?.to_str()?.to_string();
 
@@ -179,7 +182,11 @@ fn analyze_single_file(file_path: &std::path::PathBuf) -> Option<FileAnalysisRes
     }
 
     let raw_content = std::fs::read(file_path).ok()?;
-    Some(analyze_bytes(&filename, &raw_content))
+    Some(analyze_bytes_with_scratch(
+        &filename,
+        &raw_content,
+        comment_buf,
+    ))
 }
 
 /// Core scan pass without the filesystem read — takes the file's name and
@@ -200,14 +207,26 @@ fn analyze_single_file(file_path: &std::path::PathBuf) -> Option<FileAnalysisRes
 /// Pure function: no I/O, no allocations beyond the comment-stripped
 /// scratch buffer. Safe to call from any thread, no runtime needed.
 pub fn analyze_bytes(filename: &str, raw_content: &[u8]) -> FileAnalysisResult {
-    let mut comment_buf = Vec::with_capacity(raw_content.len());
-    source::strip_comments(raw_content, &mut comment_buf);
-    let stripped = String::from_utf8_lossy(&comment_buf);
+    let mut comment_buf = Vec::new();
+    analyze_bytes_with_scratch(filename, raw_content, &mut comment_buf)
+}
+
+fn analyze_bytes_with_scratch(
+    filename: &str,
+    raw_content: &[u8],
+    comment_buf: &mut Vec<u8>,
+) -> FileAnalysisResult {
+    source::strip_comments(raw_content, comment_buf);
+    let stripped = String::from_utf8_lossy(comment_buf.as_slice());
 
     let file_source_tags = source::analyze_source(&stripped);
-    let mut file_supply_tags = supply_chain::analyze_supply_chain(&stripped, raw_content);
-    file_supply_tags.minified |= supply_chain::is_minified_filename(filename);
     let domains = supply_chain::extract_url_domains(&stripped);
+    let mut file_supply_tags = supply_chain::analyze_supply_chain_with_url_presence(
+        &stripped,
+        raw_content,
+        !domains.is_empty(),
+    );
+    file_supply_tags.minified |= supply_chain::is_minified_filename(filename);
     let trivial = supply_chain::analyze_trivial(&stripped);
 
     FileAnalysisResult {
@@ -249,13 +268,14 @@ fn analyze_files_sequential(files: &[std::path::PathBuf]) -> AccumulatedResult {
     let mut all_url_domains = Vec::new();
     let mut total_code_lines = 0usize;
     let mut total_export_count = 0usize;
+    let mut comment_buf = Vec::new();
 
     for file_path in files {
         if meta.files_scanned >= MAX_FILES_PER_PACKAGE {
             meta.limit_reached = true;
             break;
         }
-        if let Some(result) = analyze_single_file(file_path) {
+        if let Some(result) = analyze_single_file(file_path, &mut comment_buf) {
             if meta.bytes_scanned + result.bytes_scanned > MAX_TOTAL_SCAN_BYTES {
                 meta.limit_reached = true;
                 break;
@@ -292,7 +312,7 @@ fn analyze_files_parallel(files: &[std::path::PathBuf]) -> AccumulatedResult {
     // Analyze all files in parallel, collecting results
     let results: Vec<FileAnalysisResult> = files
         .par_iter()
-        .filter_map(|file_path| {
+        .map_init(Vec::new, |comment_buf, file_path| {
             // Approximate limit checks (may slightly overshoot — acceptable for safety limits)
             if files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE {
                 return None;
@@ -301,11 +321,12 @@ fn analyze_files_parallel(files: &[std::path::PathBuf]) -> AccumulatedResult {
                 return None;
             }
 
-            let result = analyze_single_file(file_path)?;
+            let result = analyze_single_file(file_path, comment_buf)?;
             files_scanned.fetch_add(result.files_scanned, Ordering::Relaxed);
             bytes_scanned.fetch_add(result.bytes_scanned, Ordering::Relaxed);
             Some(result)
         })
+        .filter_map(|result| result)
         .collect();
 
     // Merge all results

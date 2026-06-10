@@ -1766,7 +1766,7 @@ impl RegistryClient {
         let cache_key = format!("lpm:{}", name.scoped());
 
         // Tier 1: TTL-based cache hit (fast path, no HTTP)
-        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
             tracing::debug!("metadata cache hit: {}", name.scoped());
             return Ok(cached);
         }
@@ -1834,7 +1834,7 @@ impl RegistryClient {
         let cache_key = format!("npm:{name}");
 
         // Tier 1: TTL-based cache hit
-        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
             tracing::debug!("metadata cache hit: npm:{name}");
             return Ok(cached);
         }
@@ -1965,7 +1965,7 @@ impl RegistryClient {
         let cache_key = format!("npm:{name}");
 
         // Tier 1: TTL+HMAC cache hit (same as `get_npm_package_metadata`).
-        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
             tracing::debug!("metadata cache hit (direct): npm:{name}");
             return Ok(cached);
         }
@@ -2022,7 +2022,7 @@ impl RegistryClient {
         name: &str,
     ) -> Result<PackageMetadata, LpmError> {
         let cache_key = format!("npm:{name}");
-        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
             tracing::debug!("metadata cache hit (proxy-only): npm:{name}");
             return Ok(cached);
         }
@@ -2272,7 +2272,7 @@ impl RegistryClient {
         );
 
         // Tier 1: TTL+magic cache hit.
-        if let Some((cached, _etag)) = self.read_metadata_cache(&cache_key) {
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
             tracing::debug!("metadata cache hit (custom)");
             return Ok(cached);
         }
@@ -3660,8 +3660,27 @@ impl RegistryClient {
     /// Old cache files written in the `HMAC\nETag\ndata` format fail the
     /// magic check and are silently treated as misses — the next fetch
     /// rewrites the entry in the new format.
+    #[cfg(test)]
     fn read_metadata_cache(&self, key: &str) -> Option<(PackageMetadata, Option<String>)> {
         self.read_metadata_cache_as(key)
+    }
+
+    async fn read_metadata_cache_async(
+        &self,
+        key: &str,
+    ) -> Option<(PackageMetadata, Option<String>)> {
+        self.read_metadata_cache_as_async(key).await
+    }
+
+    async fn read_metadata_cache_as_async<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        key: &str,
+    ) -> Option<(T, Option<String>)> {
+        let path = self.cache_path(key)?;
+        tokio::task::spawn_blocking(move || Self::read_metadata_cache_path_as::<T>(&path))
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Generic variant of [`Self::read_metadata_cache`]: deserializes the cached
@@ -3680,9 +3699,15 @@ impl RegistryClient {
         &self,
         key: &str,
     ) -> Option<(T, Option<String>)> {
+        let path = self.cache_path(key)?;
+        Self::read_metadata_cache_path_as(&path)
+    }
+
+    fn read_metadata_cache_path_as<T: serde::de::DeserializeOwned>(
+        path: &std::path::Path,
+    ) -> Option<(T, Option<String>)> {
         use std::io::{BufRead as _, Read as _};
 
-        let path = self.cache_path(key)?;
         if !path.exists() {
             return None;
         }
@@ -3709,7 +3734,7 @@ impl RegistryClient {
 
         // Open with a buffered reader — avoids allocating the full file into
         // a Vec<u8> before deserialization.
-        let file = std::fs::File::open(&path).ok()?;
+        let file = std::fs::File::open(path).ok()?;
         // Bound the decoder's read window so a cache file that grows
         // between the metadata check and the open() (race with another
         // writer) still can't exceed the cap.

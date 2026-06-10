@@ -32,7 +32,8 @@
 
 use lpm_common::LpmError;
 use lpm_security::{
-    SecurityPolicy, TrustMatch, script_hash::compute_script_hash, triage::StaticTier,
+    SecurityPolicy, TrustMatch, script_hash::compute_script_hash_with_phase_bodies,
+    triage::StaticTier,
 };
 use lpm_store::PackageStore;
 use lpm_workspace::ProvenanceSnapshot;
@@ -549,21 +550,9 @@ fn compute_blocked_packages_with_metadata_and_baseline(
 
             let pkg_dir = resolve_blocked_package_dir(store, name, version, extras.baseline_index);
 
-            // Compute the script hash. None means "no install-phase scripts" —
-            // such a package is not blockable, skip.
-            let script_hash = compute_script_hash(&pkg_dir)?;
-
-            // What phases are present (for human display in
-            // approve-scripts) AND their bodies (for the
-            // static-gate classifier below)? One read/parse of
-            // package.json feeds both.
-            let phase_bodies = read_install_phase_bodies(&pkg_dir);
-            if phase_bodies.is_empty() {
-                // Defensive: compute_script_hash returned Some but we found no
-                // phases. Shouldn't happen given F3, but skip rather than emit
-                // a confusing entry.
-                return None;
-            }
+            let script_data = compute_script_hash_with_phase_bodies(&pkg_dir)?;
+            let script_hash = script_data.hash;
+            let phase_bodies = script_data.phase_bodies;
             let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
 
             //: classify each present phase and aggregate

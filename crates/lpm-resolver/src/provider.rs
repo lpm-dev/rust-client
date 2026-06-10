@@ -780,7 +780,8 @@ impl LpmDependencyProvider {
                     if !target_range.satisfies(v) {
                         continue;
                     }
-                    if let Some(platform_meta) = info.platform.get(&v.to_string())
+                    if !info.platform.is_empty()
+                        && let Some(platform_meta) = info.platform.get(&v.to_string())
                         && !is_platform_compatible(platform_meta)
                     {
                         continue;
