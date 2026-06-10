@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish for wrapper-only recovery, without the leading v"
+        required: true
 
 permissions:
   contents: write
@@ -20,6 +25,7 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.target }}
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -226,6 +232,7 @@ jobs:
   publish-npm-wrapper:
     name: Publish @lpm-registry/cli wrapper
     needs: publish-npm-platform
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.publish-npm-platform.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -247,8 +254,17 @@ jobs:
 
       - name: Bump version and optionalDependencies, then publish
         working-directory: npm/cli
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "::error::release version must look like 0.59.0, got '${VERSION}'"
+              exit 1
+              ;;
+          esac
 
           # Update wrapper version
           npm version "$VERSION" --no-git-tag-version --allow-same-version
@@ -288,25 +304,6 @@ jobs:
 
           npm test
           npm run pack:check
-          TARBALL=$(npm pack --silent)
-          for attempt in 1 2 3 4 5; do
-            PREFIX=$(mktemp -d)
-            if npm install -g --prefix "$PREFIX" "$TARBALL"; then
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "::error::packed wrapper install failed after registry-propagation retries"
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-          INSTALLED_VERSION=$("$PREFIX/bin/lpm" --version)
-          if ! echo "$INSTALLED_VERSION" | grep -q "$VERSION"; then
-            echo "::error::packed wrapper launched unexpected version: $INSTALLED_VERSION"
-            exit 1
-          fi
-          "$PREFIX/bin/lpx" --help >/dev/null
-          rm -f "$TARBALL"
 
           echo "Publishing @lpm-registry/cli@${VERSION}..."
           npx npm@11.12.1 publish --provenance --access public 2>&1 | tee /tmp/npm-publish.log
@@ -318,6 +315,30 @@ jobs:
               exit $exit_code
             fi
           fi
+
+          install_verified=0
+          for attempt in 1 2 3 4 5; do
+            PREFIX=$(mktemp -d)
+            if npm install -g --prefix "$PREFIX" "@lpm-registry/cli@${VERSION}" &&
+               INSTALLED_VERSION=$("$PREFIX/bin/lpm" --version 2>/tmp/lpm-wrapper-smoke.log) &&
+               echo "$INSTALLED_VERSION" | grep -q "$VERSION" &&
+               "$PREFIX/bin/lpx" --help >/dev/null 2>>/tmp/lpm-wrapper-smoke.log; then
+              install_verified=1
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::published wrapper install/launch failed after registry-propagation retries"
+              cat /tmp/lpm-wrapper-smoke.log 2>/dev/null || true
+              exit 1
+            fi
+            rm -rf "$PREFIX"
+            sleep $((attempt * 5))
+          done
+          if [ "$install_verified" -ne 1 ]; then
+            echo "::error::published wrapper install/launch verification did not complete"
+            exit 1
+          fi
+          rm -rf "$PREFIX"
 
   update-homebrew:
     name: Update Homebrew Formula
