@@ -1,4 +1,4 @@
-//! Binary lockfile format (`lpm.lockb`) for zero-parse-cost reads.
+//! Binary lockfile format (`lpm.lockb`) for generated cache validation.
 //!
 //! Layout (v2):
 //! ```text
@@ -38,12 +38,10 @@
 //! differs across versions — a v2 reader decoding v1 30-byte entries
 //! as 36-byte entries would read package N's `name_off`/`name_len`
 //! as package N-1's (nonexistent) tarball pair and produce garbage.
-//! On rejection, `read_fast` falls back to parsing the TOML
-//! lockfile, and the next `write_all` rewrites `lpm.lockb` as the
-//! current version — so the migration completes transparently on
-//! any install that writes the lockfile — fast-path installs that
-//! open `lpm.lockb` also trigger a rewrite on first run after
-//! an upgrade.
+//! On rejection, install writeback rewrites `lpm.lockb` as the
+//! current version. `Lockfile::read_fast` reads the TOML lockfile
+//! directly so an opaque committed binary cache cannot override the
+//! reviewer-visible source.
 //!
 //! ## Null vs empty strings for optional fields
 //!
@@ -62,10 +60,7 @@ const MAGIC: &[u8; 4] = b"LPMB";
 /// Binary lockfile wire-format version. Bumped 1 → 2 when the
 /// `(tarball_off, tarball_len)` pair was appended to every
 /// `PackageEntry` (see layout docstring above). `pub` so
-/// `read_fast` can distinguish older-version rejections (which
-/// trigger best-effort cleanup of stale binaries) from
-/// future-version rejections (which preserve the file for a
-/// newer client's fast path).
+/// install writeback can report the generated binary format version.
 pub const BINARY_VERSION: u32 = 2;
 const HEADER_SIZE: usize = 16;
 /// Per-package entry size. v1 was 30 bytes; v2 adds 6 bytes
@@ -953,8 +948,8 @@ mod tests {
     }
 
     // ── Cross-source collision in binary lockfile ──
-    // The binary lockfile fast path must offer the same source-aware
-    // disambiguation guarantee as the TOML path. Without
+    // The binary reader must offer the same source-aware disambiguation
+    // guarantee as the TOML path. Without
     // `find_package_by_key`, a direct binary `find_package(name)`
     // call under a cross-source collision returns whichever entry
     // the binary search lands on — silently shadowing one side.
@@ -1077,9 +1072,8 @@ mod tests {
 
     #[test]
     fn binary_find_package_by_key_matches_toml_find_package_by_key() {
-        // Drift-lock: any divergence between the binary fast path
-        // and the TOML path would let `read_fast` return one answer
-        // while `read_from_file` returns another.
+        // Drift-lock: keep the binary lookup API aligned with the TOML
+        // source-aware lookup even though command reads are TOML-authoritative.
         let lf = cross_source_collision_lockfile();
         let dir = tempfile::tempdir().unwrap();
         let bin_path = dir.path().join("lpm.lockb");
