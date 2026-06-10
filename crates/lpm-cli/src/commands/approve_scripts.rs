@@ -380,10 +380,19 @@ pub async fn run(
     // flow reads store package dirs to inspect prior installs and
     // diff scripts. A concurrent `lpm cache prune --apply` could remove an
     // entry mid-walk without this gate.
-    let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
+    let lpm_root = lpm_common::LpmRoot::from_env()?;
+    let lock_path = lpm_root.store_lock();
     lpm_common::with_shared_lock_async(
         lock_path,
-        run_under_store_lock(project_dir, package, yes, list, dry_run, json_output),
+        run_under_store_lock(
+            project_dir,
+            package,
+            yes,
+            list,
+            dry_run,
+            json_output,
+            lpm_root,
+        ),
     )
     .await
 }
@@ -405,6 +414,7 @@ async fn run_under_store_lock(
     // preview-of-listing from plain-listing at parse time.
     dry_run: bool,
     json_output: bool,
+    lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     // ── Argument validation ─────────────────────────────────────────
     //
@@ -537,6 +547,8 @@ async fn run_under_store_lock(
         blocked_packages: effective,
         drift_ignore_override: None,
     };
+    let baseline_index =
+        crate::commands::audit::inventory::build_project_v2_baseline_index(project_dir, &lpm_root);
 
     // ── — pre-fetch provenance for the effective set ────
     //
@@ -628,7 +640,12 @@ async fn run_under_store_lock(
             // alongside the regular card when this is an UPDATE
             // (prior binding under same name exists). No-op for
             // first-time review.
-            print_version_diff_card_for_blocked(target, &trusted);
+            print_version_diff_card_for_blocked(
+                target,
+                &trusted,
+                baseline_index.as_ref(),
+                &lpm_root,
+            );
             let prompt = if trusted
                 .latest_binding_for_name(&target.name, &target.version)
                 .is_some()
@@ -741,7 +758,14 @@ async fn run_under_store_lock(
     // ── --list (read-only) ──────────────────────────────────────────
 
     if list {
-        print_listing(&effective_state, &trusted, dry_run, json_output);
+        print_listing(
+            &effective_state,
+            &trusted,
+            dry_run,
+            json_output,
+            baseline_index.as_ref(),
+            &lpm_root,
+        );
         return Ok(());
     }
 
@@ -860,7 +884,7 @@ async fn run_under_store_lock(
         // render the version-diff card for
         // updates (no-op when no prior binding exists for the same
         // package name).
-        print_version_diff_card_for_blocked(blocked, &trusted);
+        print_version_diff_card_for_blocked(blocked, &trusted, baseline_index.as_ref(), &lpm_root);
 
         // branch the Select on whether this is
         // a first-time review or an update. The two branches share
@@ -923,7 +947,7 @@ async fn run_under_store_lock(
                 }
                 None => match choice {
                     InteractiveChoice::View => {
-                        print_full_script(project_dir, blocked);
+                        print_full_script(blocked, baseline_index.as_ref(), &lpm_root);
                         // Loop back: rebuild Select and re-prompt
                         continue;
                     }
@@ -1086,7 +1110,12 @@ impl InteractiveChoice {
 /// Emits to stdout (cliclack TUI is stdout-driven; `--json` mode
 /// can never reach this path because the interactive walk refuses
 /// to combine with `--json` upstream).
-fn print_version_diff_card_for_blocked(blocked: &BlockedPackage, trusted: &TrustedDependencies) {
+fn print_version_diff_card_for_blocked(
+    blocked: &BlockedPackage,
+    trusted: &TrustedDependencies,
+    baseline_index: Option<&lpm_store::V2BaselineIndex>,
+    lpm_root: &lpm_common::LpmRoot,
+) {
     let Some((prior_version, binding)) =
         trusted.latest_binding_for_name(&blocked.name, &blocked.version)
     else {
@@ -1096,30 +1125,14 @@ fn print_version_diff_card_for_blocked(blocked: &BlockedPackage, trusted: &Trust
     if !diff.is_drift() {
         return;
     }
-    // confidence-followup S5a — v2-aware lookup. Pre-fix, the
-    // PackageStore::package_dir paths below were v1-only — under the
-    // v2-default install pipeline, both `prior` and `candidate`
-    // resolved to non-existent paths, so `read_install_phase_bodies`
-    // returned empty vecs and the version-diff card silently degraded
-    // to the "scripts not in store" fallback for every v2 install.
-    let lpm_root = match lpm_common::LpmRoot::from_env() {
-        Ok(r) => r,
-        Err(_) => {
-            if let Some(card) =
-                crate::version_diff::render_preflight_card(&diff, &blocked.name, None, None)
-            {
-                println!();
-                println!("{card}");
-                println!();
-            }
-            return;
-        }
-    };
     let store_dir_for = |version: &str| -> Option<std::path::PathBuf> {
-        lpm_store::find_installed_package_baseline(&lpm_root, &blocked.name, version)
-            .ok()
-            .flatten()
-            .map(|b| b.package_dir)
+        crate::commands::audit::inventory::find_project_baseline(
+            baseline_index,
+            lpm_root,
+            &blocked.name,
+            version,
+        )
+        .map(|b| b.package_dir)
     };
     let prior_pairs = match store_dir_for(prior_version) {
         Some(dir) => crate::build_state::read_install_phase_bodies(&dir),
@@ -1498,34 +1511,23 @@ fn truncate_for_display(s: &str, max: usize) -> String {
 /// the interactive walk. Read from the store (not from `node_modules`) to
 /// match what the build pipeline executes — same source-of-truth as the
 /// script-hash function.
-fn print_full_script(_project_dir: &Path, blocked: &BlockedPackage) {
-    // confidence-followup S5a — `find_installed_package_baseline`
-    // (v2-first, v1-fallback) replaces the v1-only `PackageStore::package_dir`
-    // call. Pre-fix, "View full script" emitted "could not read
-    // package.json from store" for every v2-installed package because
-    // the v1 path didn't exist.
-    let lpm_root = match lpm_common::LpmRoot::from_env() {
-        Ok(r) => r,
-        Err(e) => {
-            output::warn(&format!("could not resolve lpm root: {e}"));
-            return;
-        }
-    };
-    let pkg_dir = match lpm_store::find_installed_package_baseline(
-        &lpm_root,
+fn print_full_script(
+    blocked: &BlockedPackage,
+    baseline_index: Option<&lpm_store::V2BaselineIndex>,
+    lpm_root: &lpm_common::LpmRoot,
+) {
+    let pkg_dir = match crate::commands::audit::inventory::find_project_baseline(
+        baseline_index,
+        lpm_root,
         &blocked.name,
         &blocked.version,
     ) {
-        Ok(Some(b)) => b.package_dir,
-        Ok(None) => {
+        Some(b) => b.package_dir,
+        None => {
             output::warn(&format!(
                 "{}@{}: not found in store (workspace/file/link source, or corrupt install)",
                 blocked.name, blocked.version
             ));
-            return;
-        }
-        Err(e) => {
-            output::warn(&format!("could not query store: {e}"));
             return;
         }
     };
@@ -1577,6 +1579,8 @@ fn print_listing(
     // read `envelope.dry_run` without branching on mode.
     dry_run: bool,
     json_output: bool,
+    baseline_index: Option<&lpm_store::V2BaselineIndex>,
+    lpm_root: &lpm_common::LpmRoot,
 ) {
     if json_output {
         let body = serde_json::json!({
@@ -1605,7 +1609,7 @@ fn print_listing(
         // alongside each entry's regular card. No-op for entries
         // without a prior binding under the same name (first-time
         // review — nothing to diff against).
-        print_version_diff_card_for_blocked(blocked, trusted);
+        print_version_diff_card_for_blocked(blocked, trusted, baseline_index, lpm_root);
     }
     println!();
     output::info(

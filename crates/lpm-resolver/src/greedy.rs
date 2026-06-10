@@ -583,10 +583,12 @@ pub async fn resolve_greedy_fused_with_cache_options(
                     if !matches!(canonical, crate::package::CanonicalKey::Lpm { .. }) {
                         continue;
                     }
-                    let info_arc = Arc::new(parse_metadata_to_cache_info(&meta));
-                    shared_cache.insert(canonical.clone(), info_arc);
+                    let fetched = parse_fetched_metadata(meta);
+                    shared_cache.insert(canonical.clone(), fetched.info);
                     if let Some(tx) = spec_tx.as_ref()
-                        && tx.try_send((canonical.to_string(), meta)).is_ok()
+                        && tx
+                            .try_send((canonical.to_string(), fetched.metadata))
+                            .is_ok()
                     {
                         tarball_dispatched_count += 1;
                     }
@@ -611,8 +613,8 @@ pub async fn resolve_greedy_fused_with_cache_options(
     // through. Slight over-allocation is cheaper than rehashing.
     let mut inflight: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
     let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
-    type FetchResult = Result<lpm_registry::PackageMetadata, ResolveError>;
-    let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, bool, FetchResult)> =
+    type FetchResult = Result<FetchedMetadata, ResolveError>;
+    let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
         tokio::task::JoinSet::new();
 
     // High-water marks update at the boundary of each Phase A→B transition
@@ -642,7 +644,6 @@ pub async fn resolve_greedy_fused_with_cache_options(
             if inflight.insert(canonical.clone()) {
                 let client_c = client.clone();
                 let permit = metadata_sem.clone();
-                let is_npm = matches!(canonical, CanonicalKey::Npm { .. });
                 let route_table_c = route_table.clone();
                 metadata_jobs.spawn(async move {
                     // Acquire the metadata permit inside the task so
@@ -655,8 +656,9 @@ pub async fn resolve_greedy_fused_with_cache_options(
                         .acquire_owned()
                         .await
                         .expect("metadata semaphore must outlive the resolver");
-                    let result = fetch_metadata_raw(&client_c, &route_table_c, &canonical).await;
-                    (canonical, is_npm, result)
+                    let result =
+                        fetch_metadata_for_resolver(&client_c, &route_table_c, &canonical).await;
+                    (canonical, result)
                 });
                 dispatcher_rpc_count += 1;
             }
@@ -695,15 +697,15 @@ pub async fn resolve_greedy_fused_with_cache_options(
                 inflight.insert(canonical.clone());
                 let client_c = client.clone();
                 let permit = metadata_sem.clone();
-                let is_npm = matches!(canonical, CanonicalKey::Npm { .. });
                 let route_table_c = route_table.clone();
                 metadata_jobs.spawn(async move {
                     let _p = permit
                         .acquire_owned()
                         .await
                         .expect("metadata semaphore must outlive the resolver");
-                    let result = fetch_metadata_raw(&client_c, &route_table_c, &canonical).await;
-                    (canonical, is_npm, result)
+                    let result =
+                        fetch_metadata_for_resolver(&client_c, &route_table_c, &canonical).await;
+                    (canonical, result)
                 });
                 dispatcher_rpc_count += 1;
                 peer_prefetch_count += 1;
@@ -799,20 +801,12 @@ pub async fn resolve_greedy_fused_with_cache_options(
         // Take the next completion; resume any parked edges for that
         // canonical in deterministic order.
         if let Some(joined) = metadata_jobs.join_next().await {
-            let (canonical, is_npm, result) = joined
+            let (canonical, result) = joined
                 .map_err(|e| ResolveError::Internal(format!("metadata join failure: {e}")))?;
             inflight.remove(&canonical);
             match result {
-                Ok(meta) => {
-                    // Parse-then-send-by-move ordering: parse
-                    // borrows `&meta`, then we move `meta` into the
-                    // spec_tx send. Avoids cloning the ~50 KB
-                    // metadata blob (~6.7 MB allocator churn at 134
-                    // packages on bench/fixture-large).
-                    let info = parse_metadata_to_cache_info(&meta);
-                    let _ = is_npm; // 2026-05-07: prerelease filter removed; param retained on caller for future use
-                    let info_arc = Arc::new(info);
-                    shared_cache.insert(canonical.clone(), info_arc);
+                Ok(fetched) => {
+                    shared_cache.insert(canonical.clone(), fetched.info);
                     if let Some(tx) = spec_tx.as_ref() {
                         // `try_send`: speculation is best-effort. If
                         // the channel is full (spec dispatcher is
@@ -822,7 +816,10 @@ pub async fn resolve_greedy_fused_with_cache_options(
                         // the real fetch loop on the post-resolve
                         // pass. Matches the walker arm's handling of
                         // spec_tx backpressure.
-                        if tx.try_send((canonical.to_string(), meta)).is_ok() {
+                        if tx
+                            .try_send((canonical.to_string(), fetched.metadata))
+                            .is_ok()
+                        {
                             tarball_dispatched_count += 1;
                         }
                     }
@@ -1228,12 +1225,7 @@ impl ResolveState {
         // insertion order, which under fusion follows manifest-arrival order
         // rather than walker-arm alphabetic-BFS order. Sorting by version on
         // tie makes the total order deterministic and arm-independent.
-        out.sort_by(|a, b| {
-            a.package
-                .to_string()
-                .cmp(&b.package.to_string())
-                .then_with(|| a.version.cmp(&b.version))
-        });
+        out.sort_by_cached_key(|pkg| (pkg.package.to_string(), pkg.version.clone()));
         out
     }
 }
@@ -1531,10 +1523,11 @@ fn apply_override_target_greedy(
                 if !target_range.satisfies(v) {
                     continue;
                 }
-                let platform_ok = info
-                    .platform
-                    .get(&v.to_string())
-                    .is_none_or(crate::provider::is_platform_compatible);
+                let platform_ok = info.platform.is_empty()
+                    || info
+                        .platform
+                        .get(&v.to_string())
+                        .is_none_or(crate::provider::is_platform_compatible);
                 if !platform_ok {
                     continue;
                 }
@@ -1888,10 +1881,11 @@ fn find_version_satisfying_all(
         // Platform filter — same gate the regular dep path uses, so
         // an ambient install never lands a tarball the current OS/CPU
         // can't use.
-        let platform_ok = info
-            .platform
-            .get(&v.to_string())
-            .is_none_or(crate::provider::is_platform_compatible);
+        let platform_ok = info.platform.is_empty()
+            || info
+                .platform
+                .get(&v.to_string())
+                .is_none_or(crate::provider::is_platform_compatible);
         if !platform_ok {
             continue;
         }
@@ -1936,10 +1930,11 @@ fn find_version_satisfying_most<'a>(
 
     let mut best: Option<(NpmVersion, usize, Vec<usize>)> = None;
     for v in &info.versions {
-        let platform_ok = info
-            .platform
-            .get(&v.to_string())
-            .is_none_or(crate::provider::is_platform_compatible);
+        let platform_ok = info.platform.is_empty()
+            || info
+                .platform
+                .get(&v.to_string())
+                .is_none_or(crate::provider::is_platform_compatible);
         if !platform_ok {
             continue;
         }
@@ -2496,12 +2491,28 @@ async fn direct_fetch(
     Ok(parse_metadata_to_cache_info(&metadata))
 }
 
-/// Raw-metadata fetch, factored out of [`direct_fetch`] so the fused
-/// dispatcher in [`resolve_greedy_fused`] can hold the unparsed
-/// [`lpm_registry::PackageMetadata`] long enough to forward it on `spec_tx`
-/// for tarball speculation BEFORE parsing into [`CachedPackageInfo`]. The
-/// parse-then-send-by-move sequencing in the fused loop avoids cloning the
-/// metadata (~50 KB per package).
+struct FetchedMetadata {
+    metadata: lpm_registry::PackageMetadata,
+    info: Arc<CachedPackageInfo>,
+}
+
+async fn fetch_metadata_for_resolver(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+) -> Result<FetchedMetadata, ResolveError> {
+    let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
+    Ok(parse_fetched_metadata(metadata))
+}
+
+fn parse_fetched_metadata(metadata: lpm_registry::PackageMetadata) -> FetchedMetadata {
+    let info = Arc::new(parse_metadata_to_cache_info(&metadata));
+    FetchedMetadata { metadata, info }
+}
+
+/// Raw-metadata fetch, factored out so the fused resolver can forward the
+/// original [`lpm_registry::PackageMetadata`] to `spec_tx` for tarball
+/// speculation while caching the parsed [`CachedPackageInfo`] form.
 ///
 /// Both NPM routes go through the abbreviated packument endpoint
 /// (`application/vnd.npm.install-v1+json`), so wire-byte savings already

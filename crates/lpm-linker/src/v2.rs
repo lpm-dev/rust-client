@@ -258,12 +258,9 @@ pub fn link_packages_v2(
 ///
 /// Runs the post-resolve, pre-fetch sync work that the install pipeline
 /// can complete without any object on disk:
-/// 1. [`cleanup_v1_state`] — wipes legacy `<project>/.lpm/wrappers/`,
-///    `<project>/.lpm/hoisted/`, and `<project>/node_modules/`. v2 always
-///    rebuilds the project tree from scratch; per-package
-///    [`link_v2_one`] tasks only write under
-///    `~/.lpm/store/v2/links/<key>/`, so wiping early frees us to spawn
-///    them in parallel with fetch.
+/// 1. [`cleanup_v1_state`] — wipes legacy `<project>/.lpm/wrappers/`
+///    and `<project>/.lpm/hoisted/` state. Project `node_modules`
+///    root entries are reconciled during finalize.
 /// 2. [`ensure_peer_context`] — best-effort fill-in for targets whose
 ///    [`LinkTarget::peers`] arrived empty. Reads `package.json` from
 ///    extracted `objects/<sri>/`. Pre-fetch callers that already have
@@ -435,12 +432,14 @@ pub fn link_v2_finalize(
     )
     .entered();
     let augmented_slice = &plan.augmented_targets[..];
+    reconcile_project_node_modules(project_dir, augmented_slice, self_package_name)?;
     let symlinked = {
         let _s = tracing::info_span!("linker.finalize.root_symlinks").entered();
         create_root_symlinks(project_dir, augmented_slice, store, &plan.key_map)?
     };
     let bin_count = {
         let _s = tracing::info_span!("linker.finalize.bin_shims").entered();
+        clear_bin_dir(project_dir)?;
         create_bin_links_v2(project_dir, augmented_slice, store, &plan.key_map)?
     };
     let self_referenced = if let Some(self_name) = self_package_name {
@@ -868,7 +867,7 @@ fn derive_graph_keys(
     })
 }
 
-/// Wipe v1-style project link state so the v2 install starts clean.
+/// Wipe legacy project link state so the v2 install starts clean.
 fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
     // `<project>/.lpm/wrappers/` — the v1 isolated layout.
     let v1_wrappers = project_dir.join(".lpm").join("wrappers");
@@ -890,21 +889,111 @@ fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
             ))
         })?;
     }
-    // `<project>/node_modules/` — wipe completely. v2 always rebuilds
-    // from scratch; under v1 the linker also wipes stale entries via
-    // `cleanup_stale_entries`. Wiping the whole tree is simpler and
-    // `.bin/` must be wiped — bin shims regenerate from the active
-    // install layout.
+    Ok(())
+}
+
+fn reconcile_project_node_modules(
+    project_dir: &Path,
+    targets: &[V2Target],
+    self_package_name: Option<&str>,
+) -> Result<(), LpmError> {
     let nm = project_dir.join("node_modules");
-    if nm.exists() {
-        std::fs::remove_dir_all(&nm).map_err(|e| {
-            LpmError::Store(format!(
-                "v2 linker: failed to wipe project node_modules at {}: {e}",
-                nm.display()
-            ))
-        })?;
+    if !nm.exists() {
+        return Ok(());
+    }
+
+    let mut desired = HashSet::new();
+    for v2t in targets {
+        desired.extend(root_link_names(&v2t.target));
+    }
+    if let Some(self_name) = self_package_name
+        && is_safe_root_link_name(self_name)
+    {
+        desired.insert(self_name.to_string());
+    }
+
+    let entries = std::fs::read_dir(&nm).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to read project node_modules at {}: {e}",
+            nm.display()
+        ))
+    })?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".bin" {
+            continue;
+        }
+        let is_real_dir = path
+            .symlink_metadata()
+            .map(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if name.starts_with('@') && is_real_dir {
+            reconcile_scoped_root_dir(&path, &name, &desired)?;
+            if std::fs::read_dir(&path)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_dir(&path);
+            }
+            continue;
+        }
+        if !desired.contains(name.as_ref()) {
+            remove_node_modules_entry(&path, "stale root entry")?;
+        }
+    }
+
+    Ok(())
+}
+
+fn reconcile_scoped_root_dir(
+    scope_dir: &Path,
+    scope_name: &str,
+    desired: &HashSet<String>,
+) -> Result<(), LpmError> {
+    let entries = std::fs::read_dir(scope_dir).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to read scoped node_modules dir at {}: {e}",
+            scope_dir.display()
+        ))
+    })?;
+    for entry in entries.flatten() {
+        let child_path = entry.path();
+        let child_name = entry.file_name();
+        let full_name = format!("{scope_name}/{}", child_name.to_string_lossy());
+        if !desired.contains(&full_name) {
+            remove_node_modules_entry(&child_path, "stale scoped root entry")?;
+        }
     }
     Ok(())
+}
+
+fn clear_bin_dir(project_dir: &Path) -> Result<(), LpmError> {
+    let bin_dir = project_dir.join("node_modules").join(".bin");
+    if bin_dir.symlink_metadata().is_err() {
+        return Ok(());
+    }
+    remove_node_modules_entry(&bin_dir, "stale bin directory")
+}
+
+fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), LpmError> {
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(()),
+    };
+    let result = if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    result.map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to remove {label} at {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 /// Create `<project>/node_modules/<root_link_name>` symlinks pointing
@@ -940,6 +1029,10 @@ fn create_root_symlinks(
             link_path.push(&nm);
             link_path.push(&root_name);
             ensure_link_parent_dir(&nm, &link_path, "root symlink")?;
+            if symlink_points_to(&link_path, &target_path) {
+                count += 1;
+                continue;
+            }
             // Best-effort cleanup: if a stale symlink/file is at the
             // slot, remove before re-creating. Should be a no-op after
             // `cleanup_v1_state` already wiped node_modules — defensive
@@ -979,6 +1072,21 @@ fn create_root_symlinks(
         }
     }
     Ok(count)
+}
+
+fn symlink_points_to(link_path: &Path, target_path: &Path) -> bool {
+    let Ok(existing_target) = std::fs::read_link(link_path) else {
+        return false;
+    };
+    if existing_target == target_path {
+        return true;
+    }
+    if existing_target.is_relative()
+        && let Some(parent) = link_path.parent()
+    {
+        return parent.join(existing_target) == target_path;
+    }
+    false
 }
 
 /// Resolve a target's root-symlink filenames. Mirrors v1's contract
@@ -1668,6 +1776,54 @@ mod tests {
             link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap();
         assert_eq!(result.symlinked, 0);
         assert!(!project.join("node_modules").join("a").exists());
+    }
+
+    #[test]
+    fn link_packages_v2_removes_stale_root_symlinks_without_wiping_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let a_sri = synthetic_sri(b"v2/reconcile/a");
+        let b_sri = synthetic_sri(b"v2/reconcile/b");
+        write_object(
+            &store,
+            &a_sri,
+            &[("package.json", b"{\"name\":\"a\",\"version\":\"1.0.0\"}")],
+        );
+        write_object(
+            &store,
+            &b_sri,
+            &[("package.json", b"{\"name\":\"b\",\"version\":\"1.0.0\"}")],
+        );
+
+        link_packages_v2(
+            &project,
+            vec![
+                target("a", "1.0.0", &a_sri, true),
+                target("b", "1.0.0", &b_sri, true),
+            ],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+        assert!(project.join("node_modules").join("a").exists());
+        assert!(project.join("node_modules").join("b").exists());
+
+        link_packages_v2(
+            &project,
+            vec![target("a", "1.0.0", &a_sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert!(project.join("node_modules").join("a").exists());
+        assert!(!project.join("node_modules").join("b").exists());
+        assert!(project.join("node_modules").exists());
     }
 
     #[test]
@@ -2413,6 +2569,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn link_packages_v2_removes_stale_bin_shims_when_bins_disappear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let with_bin_sri = synthetic_sri(b"v2/stale-bin/with");
+        write_object(
+            &store,
+            &with_bin_sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"a","version":"1.0.0","bin":{"a":"cli.js"}}"#,
+                ),
+                ("cli.js", b"#!/usr/bin/env node\nconsole.log('hi');\n"),
+            ],
+        );
+        link_packages_v2(
+            &project,
+            vec![target("a", "1.0.0", &with_bin_sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+        assert!(project.join("node_modules").join(".bin").join("a").exists());
+
+        let without_bin_sri = synthetic_sri(b"v2/stale-bin/without");
+        write_object(
+            &store,
+            &without_bin_sri,
+            &[("package.json", b"{\"name\":\"a\",\"version\":\"2.0.0\"}")],
+        );
+        link_packages_v2(
+            &project,
+            vec![target("a", "2.0.0", &without_bin_sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert!(!project.join("node_modules").join(".bin").join("a").exists());
+    }
+
     /// M16: the root-symlink writer does `remove_dir_all(&link_path)`
     /// before creating the symlink, where `link_path` is
     /// `<project>/node_modules/<root_link_name>`. A `..` in the
@@ -2497,7 +2700,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn link_v2_finalize_rejects_symlinked_scope_parent_before_root_symlink_write() {
+    fn link_v2_finalize_replaces_symlinked_scope_parent_before_root_symlink_write() {
         let tmp = tempfile::tempdir().unwrap();
         let store = V2Store::at(tmp.path().join("store"));
         let project = tmp.path().join("project");
@@ -2528,15 +2731,41 @@ mod tests {
         let scope_dir = project.join("node_modules").join("@scope");
         std::os::unix::fs::symlink(&outside, &scope_dir).unwrap();
 
-        let result = link_v2_finalize(&project, &plan, &store, None);
+        let result = link_v2_finalize(&project, &plan, &store, None).unwrap();
 
+        assert_eq!(result.symlinked, 1);
         assert!(
-            result.is_err(),
-            "finalize must reject a symlinked scope parent instead of writing through it",
+            scope_dir.symlink_metadata().unwrap().file_type().is_dir(),
+            "finalize must replace a symlinked scope parent with a real directory",
+        );
+        assert!(
+            !scope_dir
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "scope parent must not remain a symlink",
         );
         assert!(
             !outside.join("pkg").exists(),
             "root symlink must not be created through a symlinked scope parent",
+        );
+        let root_link = scope_dir.join("pkg");
+        assert!(
+            root_link
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "scoped root link must be recreated under the real scope directory",
+        );
+        let key = plan
+            .key_map
+            .get_for(&plan.augmented_targets[0].target)
+            .unwrap();
+        assert!(
+            symlink_points_to(&root_link, &store.paths().link_package_dir(key)),
+            "scoped root link should point at the v2 link package dir",
         );
     }
 }
