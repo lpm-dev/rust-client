@@ -4329,12 +4329,11 @@ async fn run_with_options_under_store_lock(
     // hoisted. A persisted peer-conflict auto-isolation flag can override
     // that final default on warm installs without taking over explicit
     // linker choices.
-    let global_cfg = crate::commands::config::GlobalConfig::load();
     let (configured_linker_mode, linker_source) =
         crate::linker_config::resolve_effective_linker_with_source(
             linker_override,
             &pkg,
-            &global_cfg,
+            &global_config,
             project_dir,
         )
         .map_err(|e| {
@@ -5244,6 +5243,7 @@ async fn run_with_options_under_store_lock(
             &workspace_member_deps,
             script_policy_override,
             lpm_root,
+            &global_config,
         )
         .await;
     }
@@ -7833,7 +7833,6 @@ async fn run_with_options_under_store_lock(
     // compute_blocked_packages_with_metadata filter) — the
     // reviewer's High finding. Fix makes install-time capture
     // consistent with 6c's runtime enforcement.
-    let install_capability_cfg = crate::commands::config::GlobalConfig::load();
     let install_requested_capabilities =
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
@@ -7896,7 +7895,7 @@ async fn run_with_options_under_store_lock(
     let advisor_session =
         if step10_effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
             let triage_advisor_pkg_json = step10_script_policy_cfg.triage_advisor.as_deref();
-            let triage_advisor_global = install_capability_cfg.get_str("triage-advisor");
+            let triage_advisor_global = global_config.get_str("triage-advisor");
             let mut session = crate::triage_advisor_session::AdvisorSession::preflight(
                 advisor_override.as_deref(),
                 triage_advisor_pkg_json,
@@ -7959,7 +7958,7 @@ async fn run_with_options_under_store_lock(
     // — its purpose is to decide whether autoBuild should fire, and
     // an advisor-approved amber correctly counts as trusted for
     // that gate.
-    let force_security_floor = install_capability_cfg
+    let force_security_floor = global_config
         .get_bool("force-security-floor")
         .unwrap_or(false);
     let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
@@ -10230,7 +10229,12 @@ fn select_locked_package_for_requested_spec<'a>(
         None;
     let mut best_any: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> = None;
 
-    for candidate in lockfile.packages.iter().filter(|pkg| pkg.name == target) {
+    let start = lockfile
+        .packages
+        .partition_point(|pkg| pkg.name.as_str() < target);
+    let end = start + lockfile.packages[start..].partition_point(|pkg| pkg.name.as_str() == target);
+
+    for candidate in &lockfile.packages[start..end] {
         if first_match.is_none() {
             first_match = Some(candidate);
         }
@@ -10873,11 +10877,10 @@ async fn run_link_and_finish(
     // is `triage`.
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     lpm_root: &lpm_common::LpmRoot,
+    global_config: &crate::commands::config::GlobalConfig,
 ) -> Result<(), LpmError> {
     crate::security_floor::clear_recorded_suppressions();
-    let force_security_floor = crate::security_floor::force_security_floor_enabled(
-        &crate::commands::config::GlobalConfig::load(),
-    );
+    let force_security_floor = crate::security_floor::force_security_floor_enabled(global_config);
     let mut packages = packages;
     if !ephemeral_packages.is_empty() {
         packages.extend(ephemeral_packages.iter().cloned());
@@ -11252,7 +11255,45 @@ async fn run_link_and_finish(
     Ok(())
 }
 
-///: pick the highest version in a `PackageMetadata` that
+#[derive(Debug)]
+struct SpeculativePackageMetadata {
+    dist_tags: HashMap<String, String>,
+    versions: HashMap<String, SpeculativeVersionMetadata>,
+}
+
+#[derive(Debug)]
+struct SpeculativeVersionMetadata {
+    parsed_version: Option<lpm_resolver::NpmVersion>,
+    tarball_url: Option<String>,
+    integrity: Option<String>,
+    dependencies: HashMap<String, String>,
+}
+
+impl From<lpm_registry::PackageMetadata> for SpeculativePackageMetadata {
+    fn from(meta: lpm_registry::PackageMetadata) -> Self {
+        let mut versions = HashMap::with_capacity(meta.versions.len());
+        for (version, version_meta) in meta.versions {
+            let parsed_version = lpm_resolver::NpmVersion::parse(&version).ok();
+            let tarball_url = version_meta.tarball_url().map(ToOwned::to_owned);
+            let integrity = version_meta.integrity_or_shasum().map(|s| s.into_owned());
+            versions.insert(
+                version,
+                SpeculativeVersionMetadata {
+                    parsed_version,
+                    tarball_url,
+                    integrity,
+                    dependencies: version_meta.dependencies,
+                },
+            );
+        }
+        Self {
+            dist_tags: meta.dist_tags,
+            versions,
+        }
+    }
+}
+
+/// Pick the highest version in a slim speculation packument that
 /// satisfies the given npm range string. Returns the concrete
 /// `(version, tarball_url, integrity)` tuple so the caller can dispatch
 /// a speculative download without waiting for PubGrub.
@@ -11267,39 +11308,35 @@ async fn run_link_and_finish(
 /// short-circuiting range parsing. Invalid ranges return `None` and the
 /// dispatcher skips the package.
 fn pick_speculative_version(
-    meta: &lpm_registry::PackageMetadata,
+    meta: &SpeculativePackageMetadata,
     range_str: &str,
 ) -> Option<(String, String, Option<String>)> {
     // dist-tag path (e.g. "latest", "next", "beta")
     if let Some(pinned) = meta.dist_tags.get(range_str)
         && let Some(vm) = meta.versions.get(pinned)
-        && let Some(url) = vm.tarball_url()
+        && let Some(url) = vm.tarball_url.as_deref()
     {
-        return Some((
-            pinned.clone(),
-            url.to_string(),
-            vm.integrity_or_shasum().map(|s| s.into_owned()),
-        ));
+        return Some((pinned.clone(), url.to_string(), vm.integrity.clone()));
     }
 
     let range = lpm_resolver::NpmRange::parse(range_str).ok()?;
     let mut best: Option<(lpm_resolver::NpmVersion, &str)> = None;
-    for (v_str, _vm) in meta.versions.iter() {
-        let Ok(v) = lpm_resolver::NpmVersion::parse(v_str) else {
+    for (v_str, vm) in meta.versions.iter() {
+        let Some(v) = vm.parsed_version.as_ref() else {
             continue;
         };
-        if !range.satisfies(&v) {
+        if !range.satisfies(v) {
             continue;
         }
-        let better = best.as_ref().is_none_or(|(b, _)| v > *b);
+        let better = best.as_ref().is_none_or(|(b, _)| v > b);
         if better {
-            best = Some((v, v_str.as_str()));
+            best = Some((v.clone(), v_str.as_str()));
         }
     }
     let (_v, v_str) = best?;
     let vm = meta.versions.get(v_str)?;
-    let url = vm.tarball_url()?.to_string();
-    let integrity = vm.integrity_or_shasum().map(|s| s.into_owned());
+    let url = vm.tarball_url.clone()?;
+    let integrity = vm.integrity.clone();
     Some((v_str.to_string(), url, integrity))
 }
 
@@ -11463,7 +11500,7 @@ fn spawn_speculation_dispatcher(
         // SPECULATION_MAX_DEPTH.
         let mut work_queue: Vec<(String, String, u32, bool)> = Vec::new();
         // Packages whose manifest has arrived.
-        let mut metadata: HashMap<String, lpm_registry::PackageMetadata> = HashMap::new();
+        let mut metadata: HashMap<String, SpeculativePackageMetadata> = HashMap::new();
         // Ranges waiting on a specific package's manifest to arrive.
         // Keyed by package name; values are (range, depth, is_root).
         let mut parked: HashMap<String, Vec<(String, u32, bool)>> = HashMap::new();
@@ -11485,7 +11522,7 @@ fn spawn_speculation_dispatcher(
              range: String,
              depth: u32,
              is_root: bool,
-             metadata: &HashMap<String, lpm_registry::PackageMetadata>,
+             metadata: &HashMap<String, SpeculativePackageMetadata>,
              parked: &mut HashMap<String, Vec<(String, u32, bool)>>,
              already_dispatched: &mut std::collections::HashSet<String>,
              work_queue: &mut Vec<(String, String, u32, bool)>,
@@ -11516,8 +11553,18 @@ fn spawn_speculation_dispatcher(
                     UpstreamRoute::Custom { auth: Some(_), .. }
                 );
 
-                // Already-in-store: free store hit, no speculation needed.
-                if store_spec.has_package(&name, &version) {
+                let already_present = if let (Some(store_v2), Some(sri)) =
+                    (store_v2_spec.as_deref(), integrity.as_deref())
+                {
+                    store_v2
+                        .paths()
+                        .object_dir(sri)
+                        .ok()
+                        .is_some_and(|dir| dir.exists())
+                } else {
+                    store_spec.has_package(&name, &version)
+                };
+                if already_present {
                     return;
                 }
 
@@ -11612,7 +11659,7 @@ fn spawn_speculation_dispatcher(
 
             match rx.recv().await {
                 Some((name, meta)) => {
-                    metadata.insert(name.clone(), meta);
+                    metadata.insert(name.clone(), SpeculativePackageMetadata::from(meta));
                     // the roots-ready signal is owned by
                     // the walker now — the dispatcher is a pure
                     // consumer of `(name, PackageMetadata)` frames.
@@ -14650,6 +14697,69 @@ mod tests {
     fn confirm_prompt_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    fn registry_metadata(value: serde_json::Value) -> lpm_registry::PackageMetadata {
+        serde_json::from_value(value).expect("valid registry metadata")
+    }
+
+    #[test]
+    fn speculative_picker_uses_slim_metadata_for_dist_tags_and_transitive_deps() {
+        let slim = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+            "name": "fixture",
+            "description": "large field that speculation does not need",
+            "readme": "also intentionally dropped",
+            "dist-tags": {
+                "latest": "2.0.0"
+            },
+            "versions": {
+                "1.0.0": {
+                    "name": "fixture",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "left-pad": "^1.0.0"
+                    },
+                    "dist": {
+                        "tarball": "https://registry.example/fixture-1.0.0.tgz",
+                        "integrity": "sha512-one"
+                    }
+                },
+                "2.0.0": {
+                    "name": "fixture",
+                    "version": "2.0.0",
+                    "dependencies": {
+                        "chalk": "^5.0.0"
+                    },
+                    "dist": {
+                        "tarball": "https://registry.example/fixture-2.0.0.tgz",
+                        "integrity": "sha512-two"
+                    }
+                }
+            }
+        })));
+
+        assert_eq!(
+            pick_speculative_version(&slim, "latest"),
+            Some((
+                "2.0.0".to_string(),
+                "https://registry.example/fixture-2.0.0.tgz".to_string(),
+                Some("sha512-two".to_string()),
+            ))
+        );
+        assert_eq!(
+            pick_speculative_version(&slim, "^1.0.0"),
+            Some((
+                "1.0.0".to_string(),
+                "https://registry.example/fixture-1.0.0.tgz".to_string(),
+                Some("sha512-one".to_string()),
+            ))
+        );
+        assert_eq!(
+            slim.versions
+                .get("1.0.0")
+                .and_then(|version| version.dependencies.get("left-pad")),
+            Some(&"^1.0.0".to_string())
+        );
     }
 
     #[test]
