@@ -58,6 +58,35 @@ async fn parse_capped_platform_json_or_unknown(response: reqwest::Response) -> s
     }
 }
 
+fn print_json_value(value: &serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).expect("JSON value should serialize")
+    );
+}
+
+fn success_envelope(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(mut map) => {
+            map.insert("success".to_string(), serde_json::json!(true));
+            if !map.contains_key("count")
+                && let Some(count) = map
+                    .get("platforms")
+                    .or_else(|| map.get("vaults"))
+                    .and_then(|items| items.as_array())
+                    .map(Vec::len)
+            {
+                map.insert("count".to_string(), serde_json::json!(count));
+            }
+            serde_json::Value::Object(map)
+        }
+        other => serde_json::json!({
+            "success": true,
+            "result": other,
+        }),
+    }
+}
+
 fn build_sync_environments(
     all_envs: &HashMap<String, HashMap<String, String>>,
     env_map: &HashMap<String, String>,
@@ -721,7 +750,9 @@ pub async fn run(
             let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
-            output::info("pushing vault to cloud...");
+            if !json_output {
+                output::info("pushing vault to cloud...");
+            }
 
             let secrets_json = serde_json::to_string(&secrets_for_sync)
                 .map_err(|e| LpmError::Script(format!("failed to serialize: {e}")))?;
@@ -752,14 +783,11 @@ pub async fn run(
             }
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "success": true,
-                        "status": result.status,
-                        "version": result.version,
-                    })
-                );
+                print_json_value(&serde_json::json!({
+                    "success": true,
+                    "status": result.status,
+                    "version": result.version,
+                }));
             } else {
                 output::success(&format!(
                     "vault synced (version {})",
@@ -801,7 +829,9 @@ pub async fn run(
                 let private_key =
                     ensure_sharing_key_ready_for_org_op(&registry_url, &auth_token, "pull").await?;
 
-                output::info(&format!("pulling vault from org {}...", org_slug.bold()));
+                if !json_output {
+                    output::info(&format!("pulling vault from org {}...", org_slug.bold()));
+                }
 
                 let (raw_json, version) = lpm_vault::sync::pull_org(
                     &registry_url,
@@ -861,10 +891,13 @@ pub async fn run(
                     .map_err(LpmError::Script)?;
 
                 if json_output {
-                    println!(
-                        "{}",
-                        serde_json::json!({"success": true, "status": "pulled", "org": org_slug, "version": version, "count": total_keys})
-                    );
+                    print_json_value(&serde_json::json!({
+                        "success": true,
+                        "status": "pulled",
+                        "org": org_slug,
+                        "version": version,
+                        "count": total_keys,
+                    }));
                 } else {
                     output::success(&format!(
                         "pulled {} key{} from org {} (version {})",
@@ -898,7 +931,9 @@ pub async fn run(
             let registry_url = lpm_common::resolve_lpm_registry_url();
             let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
 
-            output::info("pulling vault from cloud...");
+            if !json_output {
+                output::info("pulling vault from cloud...");
+            }
 
             let (raw_json, version) =
                 lpm_vault::sync::pull_raw(&registry_url, &auth_token, &vault_id)
@@ -915,15 +950,12 @@ pub async fn run(
                 .map_err(LpmError::Script)?;
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "success": true,
-                        "status": "pulled",
-                        "version": version,
-                        "count": total_keys,
-                    })
-                );
+                print_json_value(&serde_json::json!({
+                    "success": true,
+                    "status": "pulled",
+                    "version": version,
+                    "count": total_keys,
+                }));
             } else {
                 output::success(&format!(
                     "pulled {} key{} (version {})",
@@ -949,10 +981,14 @@ pub async fn run(
             let entries = result.entries.unwrap_or_default();
 
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({"success": true, "entries": entries.iter().map(|e| serde_json::json!({
-					"action": e.action,
-					"created_at": e.created_at,
-				})).collect::<Vec<_>>()})).unwrap());
+                print_json_value(&serde_json::json!({
+                    "success": true,
+                    "count": entries.len(),
+                    "entries": entries.iter().map(|e| serde_json::json!({
+                        "action": e.action,
+                        "created_at": e.created_at,
+                    })).collect::<Vec<_>>(),
+                }));
             } else if entries.is_empty() {
                 output::info("No audit log entries");
             } else {
@@ -1027,12 +1063,14 @@ pub async fn run(
                 schema: schema_value.as_ref(),
             };
 
-            output::info(&format!(
-                "sharing vault with org {} ({} keys across {} environments)...",
-                org_slug.bold(),
-                total_keys,
-                all_envs.len()
-            ));
+            if !json_output {
+                output::info(&format!(
+                    "sharing vault with org {} ({} keys across {} environments)...",
+                    org_slug.bold(),
+                    total_keys,
+                    all_envs.len()
+                ));
+            }
 
             let result = lpm_vault::sync::push_org_with_keys(
                 &registry_url,
@@ -1052,15 +1090,12 @@ pub async fn run(
             }
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "success": true,
-                        "status": result.status,
-                        "org": org_slug,
-                        "version": result.version,
-                    })
-                );
+                print_json_value(&serde_json::json!({
+                    "success": true,
+                    "status": result.status,
+                    "org": org_slug,
+                    "version": result.version,
+                }));
             } else {
                 output::success(&format!(
                     "vault shared with org {} (version {})",
@@ -1082,7 +1117,9 @@ pub async fn run(
                 return Err(LpmError::Script("vault is empty, nothing to rotate".into()));
             }
 
-            output::info("rotating vault encryption key...");
+            if !json_output {
+                output::info("rotating vault encryption key...");
+            }
 
             // Re-encrypt with new key and push
             let result =
@@ -1096,14 +1133,11 @@ pub async fn run(
             }
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "success": true,
-                        "status": "rotated",
-                        "version": result.version,
-                    })
-                );
+                print_json_value(&serde_json::json!({
+                    "success": true,
+                    "status": "rotated",
+                    "version": result.version,
+                }));
             } else {
                 output::success(&format!(
                     "encryption key rotated (version {})",
@@ -2194,7 +2228,7 @@ async fn vars_connect(
         {
             linked_env = Some(next);
             i += 1;
-        } else if args[i].starts_with("--") {
+        } else if args[i].starts_with("--") && !json_output {
             output::warn(&format!("unknown flag '{}' — ignored", args[i]));
         }
         i += 1;
@@ -2237,7 +2271,9 @@ async fn vars_connect(
         connection_config["linkedEnv"] = serde_json::Value::String(resolved.canonical);
     }
 
-    output::info(&format!("connecting to {platform}..."));
+    if !json_output {
+        output::info(&format!("connecting to {platform}..."));
+    }
 
     // Send to server
     let client = reqwest::Client::new();
@@ -2269,10 +2305,7 @@ async fn vars_connect(
     let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        print_json_value(&success_envelope(result));
     } else {
         let status = result["status"].as_str().unwrap_or("connected");
         output::success(&format!(
@@ -2351,7 +2384,9 @@ async fn vars_platform_push(
     // Convert to string-string map for JSON serialization
     let vars: std::collections::HashMap<String, String> = env_vars;
 
-    output::info(&format!("comparing with {platform}..."));
+    if !json_output {
+        output::info(&format!("comparing with {platform}..."));
+    }
 
     // Step 1: Dry-run to get diff
     let client = reqwest::Client::new();
@@ -2389,10 +2424,11 @@ async fn vars_platform_push(
 
     if added == 0 && changed == 0 && removed == 0 {
         if json_output {
-            println!(
-                "{}",
-                serde_json::json!({"status": "no_changes", "platform": platform})
-            );
+            print_json_value(&serde_json::json!({
+                "success": true,
+                "status": "no_changes",
+                "platform": platform,
+            }));
         } else {
             output::success(&format!("{platform} is already in sync"));
             if orphans > 0 {
@@ -2473,7 +2509,9 @@ async fn vars_platform_push(
     }
 
     // Step 2: Apply
-    output::info(&format!("pushing to {platform}..."));
+    if !json_output {
+        output::info(&format!("pushing to {platform}..."));
+    }
 
     let push_response = client
         .post(format!("{registry_url}/api/vault/platforms/push"))
@@ -2500,10 +2538,7 @@ async fn vars_platform_push(
     let result: serde_json::Value = parse_capped_platform_json(push_response).await?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        print_json_value(&success_envelope(result));
     } else {
         let added_count = result["added"].as_u64().unwrap_or(0);
         let updated_count = result["updated"].as_u64().unwrap_or(0);
@@ -2576,7 +2611,9 @@ async fn vars_platform_status(
         }
     }
 
-    output::info("checking platform status...");
+    if !json_output {
+        output::info("checking platform status...");
+    }
 
     let client = reqwest::Client::new();
     let response = client
@@ -2605,10 +2642,7 @@ async fn vars_platform_status(
     let result: serde_json::Value = parse_capped_platform_json(response).await?;
 
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        print_json_value(&success_envelope(result));
         return Ok(());
     }
 
@@ -3537,16 +3571,15 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
 
         if json_output {
             let json: Vec<serde_json::Value> = vaults
-				.iter()
-				.map(|v| serde_json::json!({"vault_id": v.vault_id, "version": v.version, "updated_at": v.updated_at, "org": slug}))
-				.collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &serde_json::json!({"success": true, "org": slug, "vaults": json})
-                )
-                .unwrap()
-            );
+                .iter()
+                .map(|v| serde_json::json!({"vault_id": v.vault_id, "version": v.version, "updated_at": v.updated_at, "org": slug}))
+                .collect();
+            print_json_value(&serde_json::json!({
+                "success": true,
+                "org": slug,
+                "count": json.len(),
+                "vaults": json,
+            }));
             return Ok(());
         }
 
@@ -3595,11 +3628,11 @@ async fn vars_list_remote(org_slug: Option<&str>, json_output: bool) -> Result<(
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({"success": true, "vaults": json}))
-                .unwrap()
-        );
+        print_json_value(&serde_json::json!({
+            "success": true,
+            "count": json.len(),
+            "vaults": json,
+        }));
         return Ok(());
     }
 

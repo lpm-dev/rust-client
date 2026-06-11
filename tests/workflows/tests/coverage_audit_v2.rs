@@ -3,16 +3,16 @@
 //! Why v2 exists:
 //!
 //! v1 ([coverage_audit.rs](tests/workflows/tests/coverage_audit.rs)) tracks
-//! a binary "does any test exist for this surface" flag per row. That
-//! metric saturated at 97.8% workflow / 70% JSON contract during the
-//! 2026-05-14 coverage push without reflecting:
+//! surface-level coverage and an accounted JSON contract status per row.
+//! That coarse metric saturated at 97.8% workflow / 70% JSON contract
+//! during the 2026-05-14 coverage push without reflecting:
 //!
 //! - **Scenario depth.** A surface with 1 trivial test and one with 50
 //!   thorough tests get the same v1 flag.
 //! - **Failure-mode coverage.** Which of the known failure modes for a
 //!   surface are actually exercised by tests, and which are gaps?
 //! - **JSON contract depth.** "Locked via insta snapshot" vs "checked
-//!   one field semantically" all flip the same v1 `json_contract: true`.
+//!   one field semantically" both count as covered in v1.
 //! - **Cross-command flow membership.** Single-command tests don't
 //!   catch state-consistency bugs between commands.
 //!
@@ -52,7 +52,8 @@ mod v1;
 #[path = "support/coverage_audit_v2_baseline.rs"]
 mod v2;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use v1::JsonContractStatus;
 use v2::{CROSS_COMMAND_FLOWS, JsonContractDepth, SURFACES_V2};
 
 /// Locks in the surface backfill. When `true`, the
@@ -96,30 +97,48 @@ fn v2_ids_reference_real_v1_surfaces() {
 }
 
 #[test]
-fn login_v2_json_contract_depth_matches_v1_json_contract_bit() {
-    let mut mismatches = Vec::new();
-    let login_surface_ids = [34, 35, 36, 37];
-
-    for surface in SURFACES_V2
+fn v2_json_contract_depth_matches_v1_json_contract_status() {
+    let v2_by_id: HashMap<u16, &v2::SurfaceV2> = SURFACES_V2
         .iter()
-        .filter(|surface| login_surface_ids.contains(&surface.id))
-    {
-        let v1_row = v1::SURFACES
-            .iter()
-            .find(|s| s.id == surface.id)
-            .expect("validated by `v2_ids_reference_real_v1_surfaces`");
-        let v2_has_json_contract = !matches!(surface.json_contract_depth, JsonContractDepth::None);
-        if v1_row.json_contract != v2_has_json_contract {
+        .map(|surface| (surface.id, surface))
+        .collect();
+    let mut mismatches = Vec::new();
+
+    for v1_row in v1::SURFACES {
+        let Some(v2_row) = v2_by_id.get(&v1_row.id) else {
             mismatches.push(format!(
-                "#{} {}: v1 json_contract={} but v2 json_contract_depth={:?}",
-                surface.id, v1_row.name, v1_row.json_contract, surface.json_contract_depth,
+                "#{} {}: v1 json_contract={:?} but no v2 row exists",
+                v1_row.id, v1_row.name, v1_row.json_contract,
             ));
+            continue;
+        };
+        let v2_has_json_contract = !matches!(v2_row.json_contract_depth, JsonContractDepth::None);
+        match v1_row.json_contract {
+            JsonContractStatus::Covered if !v2_has_json_contract => {
+                mismatches.push(format!(
+                    "#{} {}: v1 says Covered but v2 json_contract_depth={:?}",
+                    v1_row.id, v1_row.name, v2_row.json_contract_depth,
+                ));
+            }
+            JsonContractStatus::NotApplicable if v2_has_json_contract => {
+                mismatches.push(format!(
+                    "#{} {}: v1 says NotApplicable but v2 json_contract_depth={:?}",
+                    v1_row.id, v1_row.name, v2_row.json_contract_depth,
+                ));
+            }
+            JsonContractStatus::Missing => {
+                mismatches.push(format!(
+                    "#{} {}: v1 still marks JSON contract Missing",
+                    v1_row.id, v1_row.name,
+                ));
+            }
+            _ => {}
         }
     }
 
     assert!(
         mismatches.is_empty(),
-        "v1/v2 login JSON contract coverage drifted:\n{}",
+        "v1/v2 JSON contract coverage drifted:\n{}",
         mismatches.join("\n"),
     );
 }
