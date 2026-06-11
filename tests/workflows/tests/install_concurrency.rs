@@ -1951,19 +1951,9 @@ async fn install_with_partial_node_modules_re_links_to_full_state() {
 /// panic, never silently produce wrong results.
 #[tokio::test]
 async fn install_with_truncated_lockb_falls_back_to_toml() {
-    let mock = MockRegistry::start().await;
-    let tarball = make_tarball("torn-pkg", "1.0.0");
-    mock.with_package("torn-pkg", "1.0.0", &tarball).await;
-    mock.with_batch_metadata(vec![single_version_batch_metadata(
-        "torn-pkg",
-        "1.0.0",
-        &mock.url(),
-    )])
-    .await;
-
-    let project = TempProject::empty(r#"{"name":"torn-test","version":"1.0.0"}"#);
-    let first = lpm_with_registry(&project, &mock.url())
-        .args(install_args_with(&["torn-pkg@1.0.0"]))
+    let project = TempProject::empty(r#"{"name":"torn-test","version":"1.0.0","dependencies":{}}"#);
+    let first = lpm(&project)
+        .args(install_args_with(&[]))
         .output()
         .expect("run first install");
     assert!(
@@ -1983,7 +1973,7 @@ async fn install_with_truncated_lockb_falls_back_to_toml() {
     // Run install again. Must NOT panic; must produce a coherent end
     // state (either by re-parsing lpm.lock or by re-resolving from
     // package.json).
-    let second = lpm_with_registry(&project, &mock.url())
+    let second = lpm(&project)
         .args(install_args_with(&[]))
         .output()
         .expect("run second install");

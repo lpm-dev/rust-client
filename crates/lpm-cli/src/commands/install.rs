@@ -1254,12 +1254,16 @@ fn workspace_member_cache_info(
 
     let mut aliases_by_version = HashMap::new();
     if !aliases.is_empty() {
-        aliases_by_version.insert(version_str, aliases);
+        aliases_by_version.insert(version_str.clone(), aliases);
     }
 
+    let mut dist = HashMap::with_capacity(1);
+    dist.insert(version_str, lpm_resolver::CachedDistInfo::default());
+
     Some(lpm_resolver::CachedPackageInfo {
-        modified: None,
-        trust_metadata_complete: false,
+        // Local workspace metadata is authoritative; avoid registry upgrade probes under policy checks.
+        modified: Some("1970-01-01T00:00:00.000Z".to_string()),
+        trust_metadata_complete: true,
         versions: vec![version],
         deps: deps_by_version,
         peer_deps,
@@ -1267,7 +1271,7 @@ fn workspace_member_cache_info(
         optional_peer_names,
         bundled_dep_names: HashMap::new(),
         platform: HashMap::new(),
-        dist: HashMap::new(),
+        dist,
         aliases: aliases_by_version,
     })
 }
@@ -4401,9 +4405,6 @@ async fn run_with_options_under_store_lock(
     let global_config = crate::commands::config::GlobalConfig::load();
     let verify_registry_signatures = registry_signature_verification_enabled(&global_config);
     let force_security_floor = crate::security_floor::force_security_floor_enabled(&global_config);
-    let release_age_floor_secs =
-        crate::security_floor::current_release_age_floor_secs(&global_config);
-    let mut allow_new = allow_new;
     let mut drift_ignore_policy = drift_ignore_policy;
     let mut verify_policy = verify_policy;
 
@@ -4432,12 +4433,24 @@ async fn run_with_options_under_store_lock(
         min_release_age_override,
         json_output,
     )?;
+    if allow_new && effective_min_age_secs > 0 {
+        crate::security_approval::ensure_project_unlock(
+            crate::security_approval::ApprovalScope::CooldownBypass,
+            project_dir,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+            "This install bypasses the minimum release age for this project.",
+            Some(0),
+            &[],
+        )?;
+    }
+    let resolver_min_age_secs = if allow_new { 0 } else { effective_min_age_secs };
     let resolver_trust_policy = match global_config.get_trust_policy().as_deref() {
         Some("no-downgrade") => lpm_resolver::TrustPolicyMode::NoDowngrade,
         _ => lpm_resolver::TrustPolicyMode::Off,
     };
     let resolver_policy =
-        lpm_resolver::ResolverPolicy::new(effective_min_age_secs, resolver_trust_policy);
+        lpm_resolver::ResolverPolicy::new(resolver_min_age_secs, resolver_trust_policy);
 
     //  Hoisted
     // here (above the empty-deps short-circuit, the lockfile fast
@@ -6663,54 +6676,6 @@ async fn run_with_options_under_store_lock(
         }
     }
 
-    //: resolve the effective cooldown window through the
-    // full precedence chain (CLI `--min-release-age` > package.json >
-    // `~/.lpm/config.toml` > 24h default). A malformed global config
-    // surfaces a file-pathed error here — that's the one new fail mode
-    // introduces relative to pre-P3 behaviour, and it's
-    // intentional: silent fall-through on a broken global file is
-    // exactly the bug the path-aware loader prevents.
-    //
-    // Option B: pulled out of the `if !allow_new` block so
-    // the resolved threshold is available for the L1 classifier's
-    // cooldown defense-in-depth even when the user opted out of the
-    // install-level cooldown halt via `--allow-new`. The two axes
-    // (cooldown halt + Lever #4 widening) need the same threshold
-    // input.
-    let authorized_release_age_floor =
-        crate::security_approval::load_effective_authorized_posture()?
-            .posture
-            .minimum_release_age_secs();
-    let allow_new_unlock_authorized = if allow_new && authorized_release_age_floor > 0 {
-        crate::security_approval::ensure_project_unlock(
-            crate::security_approval::ApprovalScope::CooldownBypass,
-            project_dir,
-            json_output,
-            crate::security_approval::ApprovalSource::CliFlag,
-            "This install bypasses the minimum release age for this project.",
-            Some(0),
-            &[],
-        )?;
-        true
-    } else {
-        false
-    };
-    if force_security_floor
-        && allow_new
-        && release_age_floor_secs > 0
-        && !allow_new_unlock_authorized
-    {
-        crate::security_floor::record_suppression(
-            crate::security_floor::SuppressionRecord::new(
-                crate::security_floor::GuardedControl::CooldownBypass,
-                crate::security_floor::SuppressionSource::Cli,
-                "allow-new",
-                format!("minimum-release-age-secs={release_age_floor_secs}"),
-            ),
-            json_output,
-        );
-        allow_new = false;
-    }
     let drift_ignore_packages: Vec<String> = match &drift_ignore_policy {
         crate::provenance_fetch::DriftIgnorePolicy::IgnoreNames(names) => {
             let mut values: Vec<_> = names.iter().cloned().collect();

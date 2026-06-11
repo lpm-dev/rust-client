@@ -40,7 +40,7 @@ lpm search <query>             # Search packages
 lpm info <package>             # Package details
 lpm quality <package>          # Quality report
 lpm query <selector>           # CSS-like selector queries on installed packages
-lpm rebuild                    # Run lifecycle scripts (phase 2 of install)
+lpm rebuild                    # Run dependency lifecycle scripts (phase 2 of install)
 lpm approve-scripts            # Approve packages blocked by default-deny script policy
 lpm trust                      # Manage `trustedDependencies` in package.json
 lpm patch <package>            # Generate a local patch, `patch-package` style
@@ -154,7 +154,7 @@ Plus: dev tunnels, HTTPS certs, secrets vault, task caching, AI agent skills, Sw
 >
 > **⁴ Script overhead / lint / fmt — `bench/project`** — Script overhead is the cost of invoking the package runner itself. The lint and format rows compare `lpm`'s built-ins against `npx oxlint` and `npx biome`.
 >
-> **Script-policy footing.** `lpm install` skips lifecycle scripts by default. `npm`, `pnpm`, and `bun` run them during install. For like-for-like comparisons on script-heavy fixtures, compare skip-vs-skip (`bun install --ignore-scripts`) or run-vs-run (`lpm install --yolo --auto-build`).
+> **Script-policy footing.** `lpm install` runs the root project's install lifecycle (`pnpm:devPreinstall`, then `preinstall`/`install`/`postinstall`/`preprepare`/`prepare`/`postprepare`) on bare installs. Dependency lifecycle scripts stay blocked by default and run only through the trust-gated rebuild/auto-build path. For like-for-like comparisons on script-heavy fixtures, compare dependency skip-vs-skip (`bun install --ignore-scripts`) or dependency run-vs-run (`lpm install --yolo --auto-build`).
 >
 > **Bench setup.** Rows ¹-² use a `RUNS=20` cold-install sweep. Rows ³-⁴ come from the `bench/project` sweep.
 

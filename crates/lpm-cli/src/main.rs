@@ -1296,15 +1296,16 @@ enum Commands {
         format: String,
     },
 
-    /// Execute lifecycle scripts for installed packages (phase 2 of install).
+    /// Execute dependency lifecycle scripts for installed packages (phase 2 of install).
     ///
-    /// `lpm install` downloads and links packages without running any scripts.
-    /// `lpm rebuild` selectively runs lifecycle scripts based on the trust
-    /// policy in `package.json`.
+    /// `lpm install` runs root-project lifecycle scripts on bare installs.
+    /// Dependency lifecycle scripts remain separate: `lpm rebuild` selectively
+    /// runs them based on the trust policy in `package.json`.
     ///
     /// Executed phases (in order): `preinstall`, `install`, `postinstall`.
-    /// Other lifecycle names like `prepare` / `prepublishOnly` are recognized
-    /// for detection and audit, but never executed by the install pipeline.
+    /// Other dependency lifecycle names like `prepare` / `prepublishOnly` are
+    /// recognized for detection and audit, but never executed by the dependency
+    /// rebuild pipeline.
     ///
     /// Scripts run inside the default sandbox — filesystem-write
     /// containment + env scrubbing, outbound network allowed. Strict mode
@@ -3993,6 +3994,9 @@ async fn async_main() -> Result<()> {
                     // without each call site re-implementing it.
                     let cli_linker = linker.map(LinkerCli::into_linker_mode);
 
+                    let root_lifecycle = commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?;
+                    root_lifecycle.run_dev_preinstall(&cwd, cli.json)?;
+
                     commands::install::run_with_options(
                         &client,
                         &cwd,
@@ -4026,7 +4030,10 @@ async fn async_main() -> Result<()> {
                         cli.verbose,
                         eff_audit_after_install,
                     )
-                    .await
+                    .await?;
+
+                    commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?
+                        .run_after_successful_install(&cwd, cli.json)
                 }
             } else if !filter.is_empty() || !filter_prod.is_empty() || workspace_root {
                 // explicit filter or -w flag → workspace-aware path.
