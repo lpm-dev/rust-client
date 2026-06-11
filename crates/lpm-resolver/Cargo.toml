@@ -22,6 +22,7 @@ sha2 = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 ahash = "0.8"
+time = { version = "0.3", features = ["parsing"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

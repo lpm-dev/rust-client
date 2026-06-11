@@ -803,11 +803,7 @@ fn derive_graph_keys(
     let mut by_coords: HashMap<String, CoordEntry> = HashMap::with_capacity(targets.len());
 
     for v2t in targets {
-        let graph_key_peers: &[(String, String)] = if matches!(linker_tag, LinkerModeTag::Hoisted) {
-            &[]
-        } else {
-            &v2t.target.peers
-        };
+        let graph_key_peers: &[(String, String)] = &v2t.target.peers;
         let mut graph_key_deps: Vec<(String, String)> =
             Vec::with_capacity(v2t.target.dependencies.len());
         graph_key_deps.extend(
@@ -2150,6 +2146,84 @@ mod tests {
         assert_eq!(result.linked, 2);
         assert_eq!(result.symlinked, 1);
         assert!(project.join("node_modules").join("consumer").exists());
+    }
+
+    #[test]
+    fn link_packages_v2_hoisted_mode_splits_peer_divergent_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+
+        let consumer_sri = synthetic_sri(b"hoisted_peer_divergent/consumer");
+        write_object(
+            &store,
+            &consumer_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"consumer\",\"version\":\"1.0.0\"}",
+            )],
+        );
+
+        let react_18_sri = synthetic_sri(b"hoisted_peer_divergent/react@18");
+        write_object(
+            &store,
+            &react_18_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"18.3.1\"}",
+            )],
+        );
+        let react_19_sri = synthetic_sri(b"hoisted_peer_divergent/react@19");
+        write_object(
+            &store,
+            &react_19_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"19.0.0\"}",
+            )],
+        );
+
+        let project_18 = tmp.path().join("project-18");
+        std::fs::create_dir_all(&project_18).unwrap();
+        let mut consumer_18 = target("consumer", "1.0.0", &consumer_sri, true);
+        consumer_18.target.peers = vec![("react".into(), "18.3.1".into())];
+        let result_18 = link_packages_v2(
+            &project_18,
+            vec![consumer_18, target("react", "18.3.1", &react_18_sri, false)],
+            &store,
+            LinkerMode::Hoisted,
+            None,
+        )
+        .unwrap();
+
+        let project_19 = tmp.path().join("project-19");
+        std::fs::create_dir_all(&project_19).unwrap();
+        let mut consumer_19 = target("consumer", "1.0.0", &consumer_sri, true);
+        consumer_19.target.peers = vec![("react".into(), "19.0.0".into())];
+        let result_19 = link_packages_v2(
+            &project_19,
+            vec![consumer_19, target("react", "19.0.0", &react_19_sri, false)],
+            &store,
+            LinkerMode::Hoisted,
+            None,
+        )
+        .unwrap();
+
+        let consumer_dest_18 = result_18
+            .materialized
+            .iter()
+            .find(|m| m.name == "consumer")
+            .map(|m| m.destination.clone())
+            .expect("consumer materialized with react 18");
+        let consumer_dest_19 = result_19
+            .materialized
+            .iter()
+            .find(|m| m.name == "consumer")
+            .map(|m| m.destination.clone())
+            .expect("consumer materialized with react 19");
+        assert_ne!(
+            consumer_dest_18, consumer_dest_19,
+            "hoisted v2 link entries must include peer pinning when peer siblings are materialized"
+        );
     }
 
     #[test]

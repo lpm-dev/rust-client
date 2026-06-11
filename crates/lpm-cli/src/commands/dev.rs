@@ -1555,6 +1555,7 @@ async fn auto_install_if_stale(
             None,  // min_release_age_override: `lpm dev` uses the chain
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dev` enforces drift
             crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: `lpm dev` honors env + config posture chain
+            crate::commands::install::InstallOmitPolicy::default(),
             // `lpm dev` does not surface its own
             // sandbox-mode flags. The env / config / default chain
             // inside `rebuild::run` still applies.

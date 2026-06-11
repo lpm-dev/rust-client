@@ -8,6 +8,7 @@
 use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet, OverrideTarget};
 use crate::package::{CanonicalKey, ResolverPackage};
+use crate::policy::{ReleaseTimeStatus, ResolverPolicy, TrustEvidence, parse_npm_time_unix};
 use crate::ranges::NpmRange;
 use dashmap::DashMap;
 use lpm_registry::{RegistryClient, RouteMode, RouteTable, UpstreamRoute};
@@ -146,18 +147,29 @@ impl StreamingBfsMetrics {
     }
 }
 
-/// Distribution info for a specific version: tarball URL and integrity hash.
+/// Distribution info for a specific version.
+///
 /// Extracted from registry metadata so the download phase doesn't need to
-/// re-fetch metadata just to get the URL.
+/// re-fetch metadata for tarball URL, integrity, or registry signatures.
 #[derive(Debug, Clone, Default)]
 pub struct CachedDistInfo {
     pub tarball_url: Option<String>,
     pub integrity: Option<String>,
+    pub signatures: Vec<lpm_registry::RegistrySignature>,
+    pub published_at: Option<String>,
+    pub trust_evidence: Option<TrustEvidence>,
 }
 
 /// Cached info about a package: available versions and their dependency maps.
 #[derive(Debug, Clone)]
 pub struct CachedPackageInfo {
+    /// Package-level `modified` timestamp from npm metadata. Abbreviated
+    /// packuments often omit per-version `time` but keep this upper bound.
+    pub modified: Option<String>,
+    /// True when this cache entry came from a full packument fetch, so
+    /// missing trust evidence can be treated as genuinely absent rather
+    /// than "not present in abbreviated metadata."
+    pub trust_metadata_complete: bool,
     /// Available versions, sorted descending (newest first).
     pub versions: Vec<NpmVersion>,
     /// Regular dependencies for each version: version_string → { dep_name → range_string }.
@@ -204,8 +216,26 @@ pub struct CachedPackageInfo {
     pub aliases: HashMap<String, HashMap<String, String>>,
 }
 
+impl CachedPackageInfo {
+    pub fn needs_policy_metadata(&self, policy: &ResolverPolicy) -> bool {
+        if policy.requires_trust_history() && !self.trust_metadata_complete {
+            return true;
+        }
+        if !policy.release_age_active() {
+            return false;
+        }
+        let missing_version_time = self.versions.iter().any(|version| {
+            self.dist
+                .get(&version.to_string())
+                .and_then(|dist| dist.published_at.as_deref())
+                .is_none()
+        });
+        missing_version_time && policy.metadata_modified_after_cutoff(self.modified.as_deref())
+    }
+}
+
 /// Platform restriction metadata for a specific package version.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlatformMeta {
     /// OS restrictions: e.g., ["darwin", "linux"] or ["!win32"].
     pub os: Vec<String>,
@@ -270,6 +300,7 @@ pub struct LpmDependencyProvider {
     /// Drained via [`Self::platform_skipped_count`] after `pubgrub::resolve`
     /// returns so the resolver can expose it in `ResolveResult.platform_skipped`.
     platform_skipped: RefCell<usize>,
+    policy: ResolverPolicy,
     /// Root-level npm-alias edges accumulated as `get_dependencies(Root)`
     /// walks `self.root_deps`. Shape: `local_name → target_canonical_name`.
     /// Surfaced via `into_parts()` so `ResolveResult.root_aliases` carries
@@ -325,6 +356,7 @@ impl LpmDependencyProvider {
             overrides: OverrideSet::empty(),
             batch_disabled: RefCell::new(false),
             platform_skipped: RefCell::new(0),
+            policy: ResolverPolicy::default(),
             root_aliases: RefCell::new(HashMap::new()),
             range_cache: RefCell::new(HashMap::new()),
             include_optional_dependencies: true,
@@ -355,6 +387,7 @@ impl LpmDependencyProvider {
             overrides: OverrideSet::empty(),
             batch_disabled: RefCell::new(false),
             platform_skipped: RefCell::new(0),
+            policy: ResolverPolicy::default(),
             root_aliases: RefCell::new(HashMap::new()),
             range_cache: RefCell::new(HashMap::new()),
             include_optional_dependencies: true,
@@ -363,6 +396,11 @@ impl LpmDependencyProvider {
 
     pub fn with_include_optional_dependencies(mut self, include: bool) -> Self {
         self.include_optional_dependencies = include;
+        self
+    }
+
+    pub fn with_policy(mut self, policy: ResolverPolicy) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -465,7 +503,7 @@ impl LpmDependencyProvider {
         let key = CanonicalKey::from(package);
         // Fast path (step 2).
         if self.cache.contains_key(&key) {
-            return Ok(());
+            return self.ensure_policy_metadata(package, &key);
         }
 
         let _span = tracing::debug_span!("ensure_cached", pkg = %package).entered();
@@ -498,7 +536,7 @@ impl LpmDependencyProvider {
                 let mut notified = Box::pin(notify.notified());
                 notified.as_mut().enable();
                 if self.cache.contains_key(&key) {
-                    return Ok(());
+                    return self.ensure_policy_metadata(package, &key);
                 }
                 if self.walker_done.load(Ordering::Acquire) {
                     // Walker has terminated and confirmed this key was
@@ -528,6 +566,30 @@ impl LpmDependencyProvider {
 
         // Escape-hatch fetch (step 4).
         self.direct_fetch_and_cache(package)
+    }
+
+    fn ensure_policy_metadata(
+        &self,
+        package: &ResolverPackage,
+        key: &CanonicalKey,
+    ) -> Result<(), ProviderError> {
+        let needs_upgrade = self
+            .cache
+            .get(key)
+            .is_some_and(|info| info.needs_policy_metadata(&self.policy));
+        if !needs_upgrade {
+            return Ok(());
+        }
+        let ResolverPackage::Npm { name, .. } = package else {
+            return Ok(());
+        };
+        let route = self.route_table.route_for_package(name);
+        let metadata = self
+            .rt
+            .block_on(self.client.get_npm_metadata_routed_full(name, route))
+            .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
+        self.insert_and_notify(key.clone(), parse_full_metadata_to_cache_info(&metadata));
+        Ok(())
     }
 
     /// Synchronous fetch of a single package, keyed + cached under its
@@ -562,7 +624,7 @@ impl LpmDependencyProvider {
             }
             ResolverPackage::Npm { name, .. } => {
                 let route = self.route_table.route_for_package(name);
-                let metadata = match route {
+                let metadata = match &route {
                     UpstreamRoute::LpmWorker => {
                         self.rt.block_on(self.client.get_npm_package_metadata(name))
                     }
@@ -581,9 +643,14 @@ impl LpmDependencyProvider {
                 }
                 .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
 
-                // Use shared parser. Prereleases are kept; the range matcher
-                // handles npm prerelease semantics.
-                let info = parse_metadata_to_cache_info(&metadata);
+                let mut info = parse_metadata_to_cache_info(&metadata);
+                if info.needs_policy_metadata(&self.policy) {
+                    let full = self
+                        .rt
+                        .block_on(self.client.get_npm_metadata_routed_full(name, route))
+                        .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
+                    info = parse_full_metadata_to_cache_info(&full);
+                }
                 tracing::debug!("npm package {name}: {} versions", info.versions.len());
                 self.insert_and_notify(key, info);
                 Ok(())
@@ -602,8 +669,8 @@ impl LpmDependencyProvider {
         }
     }
 
-    /// Get the list of versions for a package that are available on the
-    /// current platform.
+    /// Get the list of versions for a package. Platform compatibility is
+    /// applied after resolution so lockfiles stay portable across hosts.
     ///
     /// Canonicalizes before cache lookup — split-retry identities of the
     /// same canonical package share one cache entry.
@@ -614,13 +681,10 @@ impl LpmDependencyProvider {
         self.cache
             .get(&key)
             .map(|c| {
-                c.versions
+                let info = c.value();
+                info.versions
                     .iter()
-                    .filter(|version| {
-                        c.platform
-                            .get(&version.to_string())
-                            .is_none_or(is_platform_compatible)
-                    })
+                    .filter(|version| version_allowed_by_policy(info, version, &self.policy))
                     .cloned()
                     .collect()
             })
@@ -660,8 +724,8 @@ impl LpmDependencyProvider {
     /// Extract the override hits AND the metadata cache in one shot. The
     /// two-stage `take_override_hits()` / `into_cache()` API is also
     /// available for callers that need only one of the two. Surfaces
-    /// `platform_skipped` and `root_aliases` so the resolver can
-    /// accumulate them across split-retry passes without separate borrows.
+    /// `platform_skipped`, `root_aliases`, and `root_deps` so the resolver can
+    /// accumulate pass-local state without separate borrows.
     // `Arc<CachedPackageInfo>` pushed the tuple over
     // clippy's type_complexity threshold (was `CachedPackageInfo` alone).
     // CLAUDE.md explicitly permits `#[allow(clippy::type_complexity)]`
@@ -676,10 +740,12 @@ impl LpmDependencyProvider {
         Vec<OverrideHit>,
         usize,
         HashMap<String, String>,
+        HashMap<String, String>,
     ) {
         let hits = self.overrides.take_hits();
         let platform_skipped = *self.platform_skipped.borrow();
         let root_aliases = self.root_aliases.into_inner();
+        let root_deps = self.root_deps;
         // Surface Arc<CachedPackageInfo> directly — deep-cloning each
         // entry's seven nested HashMaps moved ~7 MB per cold resolve on
         // `bench/fixture-large` (hidden inside `pubgrub_ms`). Arc::clone is
@@ -692,12 +758,11 @@ impl LpmDependencyProvider {
                 .map(|e| (e.key().clone(), Arc::clone(e.value())))
                 .collect(),
         };
-        (cache, hits, platform_skipped, root_aliases)
+        (cache, hits, platform_skipped, root_aliases, root_deps)
     }
 
     /// Pick the version the resolver would choose without any override applied.
-    /// Returns the newest version in the consumer's declared range that is
-    /// platform-compatible.
+    /// Returns the newest version in the consumer's declared range.
     ///
     /// Factored out of [`Self::choose_version`] so the override path can
     /// compute `from_version` for the apply trace AND fall back to this same
@@ -709,23 +774,14 @@ impl LpmDependencyProvider {
     ) -> Option<NpmVersion> {
         let key = CanonicalKey::from(package);
         let info = self.cache.get(&key)?;
+        let info = info.value();
 
         // Versions are sorted newest-first; first match wins.
         for version in &info.versions {
             if !range.contains(version) {
                 continue;
             }
-
-            if let Some(platform_meta) = info.platform.get(&version.to_string())
-                && !is_platform_compatible(platform_meta)
-            {
-                tracing::debug!(
-                    "pick_natural_version skipping {}@{}: platform incompatible (os: {:?}, cpu: {:?})",
-                    package.canonical_name(),
-                    version,
-                    platform_meta.os,
-                    platform_meta.cpu
-                );
+            if !version_allowed_by_policy(info, version, &self.policy) {
                 continue;
             }
 
@@ -755,7 +811,11 @@ impl LpmDependencyProvider {
     ) -> Option<NpmVersion> {
         match target {
             OverrideTarget::PinnedVersion { version, .. } => {
-                if range.contains(version) {
+                let key = CanonicalKey::from(package);
+                let allowed = self.cache.get(&key).is_some_and(|info| {
+                    version_allowed_by_policy(info.value(), version, &self.policy)
+                });
+                if range.contains(version) && allowed {
                     Some(version.clone())
                 } else {
                     None
@@ -771,6 +831,7 @@ impl LpmDependencyProvider {
                 // is over the canonical version list.
                 let key = CanonicalKey::from(package);
                 let info = self.cache.get(&key)?;
+                let info = info.value();
                 for v in &info.versions {
                     // versions are sorted newest-first, so the first
                     // match is the newest match.
@@ -780,10 +841,7 @@ impl LpmDependencyProvider {
                     if !target_range.satisfies(v) {
                         continue;
                     }
-                    if !info.platform.is_empty()
-                        && let Some(platform_meta) = info.platform.get(&v.to_string())
-                        && !is_platform_compatible(platform_meta)
-                    {
+                    if !version_allowed_by_policy(info, v, &self.policy) {
                         continue;
                     }
                     return Some(v.clone());
@@ -813,6 +871,19 @@ impl LpmDependencyProvider {
 /// `no version satisfies range (versions available: 1)`.
 pub(crate) fn parse_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
+) -> CachedPackageInfo {
+    parse_metadata_to_cache_info_inner(metadata, false)
+}
+
+pub(crate) fn parse_full_metadata_to_cache_info(
+    metadata: &lpm_registry::PackageMetadata,
+) -> CachedPackageInfo {
+    parse_metadata_to_cache_info_inner(metadata, true)
+}
+
+fn parse_metadata_to_cache_info_inner(
+    metadata: &lpm_registry::PackageMetadata,
+    trust_metadata_complete: bool,
 ) -> CachedPackageInfo {
     let version_count = metadata.versions.len();
     let mut versions: Vec<NpmVersion> = Vec::with_capacity(version_count);
@@ -967,6 +1038,13 @@ pub(crate) fn parse_metadata_to_cache_info(
                 CachedDistInfo {
                     tarball_url: ver_meta.tarball_url().map(str::to_string),
                     integrity: ver_meta.integrity_or_shasum().map(|s| s.into_owned()),
+                    signatures: ver_meta
+                        .dist
+                        .as_ref()
+                        .and_then(|dist| dist.signatures.clone())
+                        .unwrap_or_default(),
+                    published_at: metadata.time.get(ver_str).cloned(),
+                    trust_evidence: detect_trust_evidence(ver_meta),
                 },
             );
 
@@ -978,6 +1056,8 @@ pub(crate) fn parse_metadata_to_cache_info(
     versions.reverse(); // Newest first
 
     CachedPackageInfo {
+        modified: metadata.modified.clone(),
+        trust_metadata_complete,
         versions,
         deps,
         peer_deps,
@@ -988,6 +1068,109 @@ pub(crate) fn parse_metadata_to_cache_info(
         dist: dist_info,
         aliases,
     }
+}
+
+fn detect_trust_evidence(ver_meta: &lpm_registry::VersionMetadata) -> Option<TrustEvidence> {
+    let has_provenance = ver_meta
+        .dist
+        .as_ref()
+        .and_then(|dist| dist.attestations.as_ref())
+        .and_then(|att| att.provenance.as_ref())
+        .is_some();
+    if ver_meta
+        .npm_user
+        .as_ref()
+        .is_some_and(lpm_registry::NpmUserMetadata::has_approver)
+    {
+        return Some(TrustEvidence::StagedPublish);
+    }
+    if has_provenance
+        && ver_meta
+            .npm_user
+            .as_ref()
+            .is_some_and(lpm_registry::NpmUserMetadata::has_trusted_publisher)
+    {
+        return Some(TrustEvidence::TrustedPublisher);
+    }
+    has_provenance.then_some(TrustEvidence::Provenance)
+}
+
+pub(crate) fn release_age_status_for_version(
+    info: &CachedPackageInfo,
+    version: &NpmVersion,
+    policy: &ResolverPolicy,
+) -> ReleaseTimeStatus {
+    info.dist
+        .get(&version.to_string())
+        .and_then(|dist| dist.published_at.as_deref())
+        .map_or_else(
+            || policy.release_time_status(None),
+            |published_at| policy.release_time_status(Some(published_at)),
+        )
+}
+
+pub(crate) fn trust_downgrade_violation(
+    info: &CachedPackageInfo,
+    version: &NpmVersion,
+) -> Option<String> {
+    let version_str = version.to_string();
+    let current = info.dist.get(&version_str)?;
+    let published_at = current.published_at.as_deref()?;
+    let published_unix = parse_npm_time_unix(published_at)?;
+    let current_evidence = current.trust_evidence;
+    let exclude_prerelease = !version.is_prerelease();
+
+    let mut strongest_prior: Option<TrustEvidence> = None;
+    for candidate in &info.versions {
+        if exclude_prerelease && candidate.is_prerelease() {
+            continue;
+        }
+        let candidate_str = candidate.to_string();
+        if candidate_str == version_str {
+            continue;
+        }
+        let Some(dist) = info.dist.get(&candidate_str) else {
+            continue;
+        };
+        let Some(candidate_published) = dist.published_at.as_deref().and_then(parse_npm_time_unix)
+        else {
+            continue;
+        };
+        if candidate_published >= published_unix {
+            continue;
+        }
+        let Some(evidence) = dist.trust_evidence else {
+            continue;
+        };
+        if strongest_prior.is_none_or(|prior| evidence > prior) {
+            strongest_prior = Some(evidence);
+            if evidence == TrustEvidence::StagedPublish {
+                break;
+            }
+        }
+    }
+
+    let prior = strongest_prior?;
+    if current_evidence.is_some_and(|current| current >= prior) {
+        return None;
+    }
+    let current_label = current_evidence.map_or("no trust evidence", TrustEvidence::label);
+    Some(format!(
+        "{version_str} has {current_label}; an earlier published version had {}",
+        prior.label()
+    ))
+}
+
+pub(crate) fn version_allowed_by_policy(
+    info: &CachedPackageInfo,
+    version: &NpmVersion,
+    policy: &ResolverPolicy,
+) -> bool {
+    matches!(
+        release_age_status_for_version(info, version, policy),
+        ReleaseTimeStatus::Allowed
+    ) && (!policy.trust_policy().is_no_downgrade()
+        || trust_downgrade_violation(info, version).is_none())
 }
 
 /// Validate a dependency name from registry metadata.
@@ -1138,7 +1321,7 @@ fn check_platform_filter(entries: &[String], current: &str, field_name: &str) ->
 /// Check if a package version is compatible with the current platform.
 /// Empty os/cpu/libc means no restriction (compatible with all platforms).
 /// Entries starting with `!` are exclusions (e.g., `!win32` = all except win32).
-pub(crate) fn is_platform_compatible(meta: &PlatformMeta) -> bool {
+pub fn is_platform_compatible(meta: &PlatformMeta) -> bool {
     is_platform_compatible_for(meta, &Platform::current())
 }
 
@@ -1613,24 +1796,9 @@ impl DependencyProvider for LpmDependencyProvider {
             }
             let available = self.available_versions(&pkg);
 
-            // Unified platform-gate for optional deps. The previous check was
-            // `is_optional && available.is_empty()`, which only covered
-            // packages where ALL versions are platform-incompatible. It missed
-            // the bug shape where one old version has an ERRONEOUS os/cpu
-            // declaration (e.g., `@next/swc-linux-x64-musl@12.0.0` ships with
-            // `os: ["darwin"]` — a Next.js packaging bug from 2021). In that
-            // case `available.is_empty()` was false, the range intersection was
-            // empty (12.0.0 doesn't satisfy ^15), and PubGrub surfaced a
-            // NoSolution that bun/npm never hit.
-            //
-            // Fix: parse the range first, then check whether any
-            // platform-compatible version actually satisfies it. If not, skip
-            // the optional dep and bump the `platform_skipped` counter for
-            // `--json` observability. Required deps still fall through to
-            // pubgrub with an empty `Ranges`, producing the same loud error as
-            // before (see
-            // `resolve_regular_dep_with_no_platform_compatible_version_still_fails`
-            // in resolve.rs tests).
+            // Optional dependencies with no semver-satisfying candidate are
+            // omitted, while platform metadata on satisfying candidates is
+            // preserved for install-time filtering.
             let npm_range = match NpmRange::parse(dep_range_str) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1649,7 +1817,7 @@ impl DependencyProvider for LpmDependencyProvider {
                     let host = Platform::current();
                     tracing::debug!(
                         "skipping optional dep {dep_name}@{dep_range_str}: \
-                         no platform-compatible version satisfies range \
+                         no available version satisfies range \
                          (available={}, os={}, cpu={}, libc={})",
                         available.len(),
                         host.os,
@@ -1792,6 +1960,8 @@ mod tests {
         peer_deps.insert("2.0.0".to_string(), v2_peers);
 
         let info = CachedPackageInfo {
+            modified: None,
+            trust_metadata_complete: false,
             versions: vec![
                 NpmVersion::parse("2.0.0").unwrap(),
                 NpmVersion::parse("1.0.0").unwrap(),
@@ -2199,6 +2369,8 @@ mod tests {
         platform: Vec<(&str, Vec<&str>, Vec<&str>)>,
     ) -> CachedPackageInfo {
         CachedPackageInfo {
+            modified: None,
+            trust_metadata_complete: false,
             versions: versions
                 .iter()
                 .filter_map(|v| NpmVersion::parse(v).ok())
@@ -2568,9 +2740,7 @@ mod tests {
     // === choose_version: platform filtering skips incompatible, selects next ===
 
     #[test]
-    fn choose_version_skips_incompatible_platform_selects_next() {
-        // 3 versions: 1.3.0 (win32-only), 1.2.0 (no restriction), 1.1.0 (no restriction)
-        // On non-win32: should skip 1.3.0 and select 1.2.0
+    fn choose_version_selects_newest_satisfying_before_platform_filtering() {
         let pkg = ResolverPackage::npm("win-pkg");
         let info = make_info(
             &["1.3.0", "1.2.0", "1.1.0"],
@@ -2585,26 +2755,15 @@ mod tests {
             .to_pubgrub_ranges(&provider.available_versions(&pkg));
 
         let chosen = provider.choose_version(&pkg, &range).unwrap();
-        let current_os = Platform::current().os;
-
-        if current_os == "win32" {
-            assert_eq!(
-                chosen.map(|v| v.to_string()),
-                Some("1.3.0".to_string()),
-                "on win32, 1.3.0 should be compatible and selected"
-            );
-        } else {
-            assert_eq!(
-                chosen.map(|v| v.to_string()),
-                Some("1.2.0".to_string()),
-                "on non-win32, 1.3.0 should be skipped, 1.2.0 selected"
-            );
-        }
+        assert_eq!(
+            chosen.map(|v| v.to_string()),
+            Some("1.3.0".to_string()),
+            "version choice is semver-first; install-time reify handles platform metadata"
+        );
     }
 
     #[test]
-    fn choose_version_all_incompatible_returns_none() {
-        // All versions are win32-only → on non-win32, should return None
+    fn choose_version_all_incompatible_still_selects_newest_satisfying() {
         let pkg = ResolverPackage::npm("win-only");
         let info = make_info(
             &["2.0.0", "1.0.0"],
@@ -2622,14 +2781,11 @@ mod tests {
             .to_pubgrub_ranges(&provider.available_versions(&pkg));
 
         let chosen = provider.choose_version(&pkg, &range).unwrap();
-        let current_os = Platform::current().os;
-
-        if current_os != "win32" {
-            assert!(
-                chosen.is_none(),
-                "on non-win32, all win32-only versions should be skipped"
-            );
-        }
+        assert_eq!(
+            chosen.map(|v| v.to_string()),
+            Some("2.0.0".to_string()),
+            "platform metadata must not hide the newest satisfying version from the lockfile"
+        );
     }
 
     // === get_dependencies: optional deps skip on failure ===
@@ -2725,7 +2881,7 @@ mod tests {
     }
 
     #[test]
-    fn get_dependencies_skips_optional_with_only_platform_incompatible_versions() {
+    fn get_dependencies_keeps_optional_with_only_platform_incompatible_versions() {
         let pkg = ResolverPackage::npm("my-app");
         let opt_dep = ResolverPackage::npm("fsevents");
         let reg_dep = ResolverPackage::npm("express");
@@ -2764,8 +2920,8 @@ mod tests {
                     "regular dep should be present"
                 );
                 assert!(
-                    !map.contains_key(&ResolverPackage::npm("fsevents")),
-                    "optional dep with only platform-incompatible versions should be silently skipped"
+                    map.contains_key(&ResolverPackage::npm("fsevents")),
+                    "resolver keeps platform metadata; install-time filtering skips incompatible optional deps"
                 );
             }
             _ => panic!("expected Available dependencies"),

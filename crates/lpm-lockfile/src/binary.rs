@@ -98,17 +98,15 @@ fn read_u16_le(bytes: &[u8], off: usize) -> u16 {
 /// Binary format capability check — does this lockfile fit the wire format?
 ///
 /// Does this lockfile fit the binary wire format? The binary format
-/// has no section for alias metadata (neither v1 nor v2 has an alias
-/// slot). Projects with any npm-alias edges (root or transitive)
-/// would be written with their alias info SILENTLY DROPPED, producing
-/// a binary lockfile that disagrees with the TOML lockfile and a warm
-/// install that re-creates `node_modules/<target>/` instead of
-/// `node_modules/<local>/`. The install writer MUST check this
-/// before calling `to_binary` and skip the binary write (falling
-/// back to TOML-only) when aliases are present.
+/// has no section for TOML-only metadata such as alias, peer,
+/// platform, catalog, or registry-signature state. Writing those
+/// lockfiles as binary would silently drop data and make the generated
+/// companion disagree with the reviewer-visible TOML lockfile. The
+/// install writer MUST check this before calling `to_binary` and skip
+/// the binary write when unsupported metadata is present.
 ///
-/// Returns `true` for alias-free lockfiles; `false` the moment any
-/// alias field is populated.
+/// Returns `true` for lockfiles whose metadata fits the current binary
+/// slots; `false` the moment any TOML-only field is populated.
 pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
     if !lockfile.root_aliases.is_empty() {
         return false;
@@ -129,10 +127,16 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
     if !lockfile.catalogs.is_empty() {
         return false;
     }
-    lockfile
-        .packages
-        .iter()
-        .all(|p| p.alias_dependencies.is_empty() && p.peers.is_empty())
+    lockfile.packages.iter().all(|p| {
+        p.alias_dependencies.is_empty()
+            && p.peers.is_empty()
+            && p.os.is_empty()
+            && p.cpu.is_empty()
+            && p.libc.is_empty()
+            && !p.optional
+            && p.registry_signatures.is_empty()
+            && p.registry_published_at.is_none()
+    })
 }
 
 /// Serialize a `Lockfile` into the binary format.
@@ -144,7 +148,7 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
 pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
     if !binary_format_supports(lockfile) {
         return Err(LockfileError::Serialize(
-            "binary lockfile format cannot represent npm-alias metadata; \
+            "binary lockfile format cannot represent TOML-only metadata; \
              writer must fall back to TOML-only output"
                 .to_string(),
         ));
@@ -764,6 +768,12 @@ impl<'a> PackageEntryView<'a> {
             version: self.version().to_string(),
             source: self.source().map(|s| s.to_string()),
             integrity: self.integrity().map(|s| s.to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: self.dependencies().iter().map(|s| s.to_string()).collect(),
             // The binary format doesn't encode alias metadata;
             // callers needing alias round-trip must use the TOML
@@ -864,6 +874,13 @@ mod tests {
             version: "1.1.1".to_string(),
             source: Some("registry+https://lpm.dev".to_string()),
             integrity: Some("sha512-abc123".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["react@18.2.0".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
@@ -874,6 +891,13 @@ mod tests {
             version: "18.2.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -962,6 +986,13 @@ mod tests {
             version: "19.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-registry".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["loose-envify@1.4.0".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
@@ -973,6 +1004,13 @@ mod tests {
             version: "19.0.0".to_string(),
             source: Some("tarball+https://example.com/react-fork-19.0.0.tgz".to_string()),
             integrity: Some("sha512-fork".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1334,6 +1372,13 @@ mod tests {
                 version: format!("{}.0.0", i),
                 source: Some("registry+https://registry.npmjs.org".to_string()),
                 integrity: Some("sha512-test".to_string()),
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                os: Vec::new(),
+                cpu: Vec::new(),
+                libc: Vec::new(),
+                optional: false,
+
                 dependencies: if i > 0 {
                     vec![format!("pkg-{:04}@{}.0.0", i - 1, i - 1)]
                 } else {
@@ -1367,6 +1412,13 @@ mod tests {
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: deps,
             alias_dependencies: vec![],
             peers: vec![],
@@ -1378,6 +1430,13 @@ mod tests {
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                os: Vec::new(),
+                cpu: Vec::new(),
+                libc: Vec::new(),
+                optional: false,
+
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
@@ -1404,6 +1463,13 @@ mod tests {
                 version: format!("{}.0.0", i),
                 source: Some("registry+https://registry.npmjs.org".to_string()),
                 integrity: Some("sha512-abcdef1234567890".to_string()),
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                os: Vec::new(),
+                cpu: Vec::new(),
+                libc: Vec::new(),
+                optional: false,
+
                 dependencies: if i > 0 {
                     vec![format!("pkg-{:05}@{}.0.0", i - 1, i - 1)]
                 } else {
@@ -1595,6 +1661,13 @@ mod tests {
                 version: "1.0.0".to_string(),
                 source: Some(source.to_string()),
                 integrity: Some(integrity.to_string()),
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                os: Vec::new(),
+                cpu: Vec::new(),
+                libc: Vec::new(),
+                optional: false,
+
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
@@ -1692,6 +1765,13 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-xyz".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1727,6 +1807,13 @@ mod tests {
             version: "4.22.1".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1737,6 +1824,13 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1767,6 +1861,13 @@ mod tests {
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1794,6 +1895,13 @@ mod tests {
             version: "1.0.0".to_string(),
             source: Some(String::new()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1811,6 +1919,13 @@ mod tests {
             version: "1.0.0".to_string(),
             source: None,
             integrity: Some(String::new()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1880,6 +1995,13 @@ mod tests {
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1919,6 +2041,13 @@ mod tests {
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                os: Vec::new(),
+                cpu: Vec::new(),
+                libc: Vec::new(),
+                optional: false,
+
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
@@ -1956,6 +2085,13 @@ mod tests {
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1988,6 +2124,13 @@ mod tests {
             version: "0.1.0".to_string(),
             source: Some("directory+./packages/foo".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2015,6 +2158,13 @@ mod tests {
             version: "0.1.0".to_string(),
             source: Some("link+../shared/linked".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2043,6 +2193,13 @@ mod tests {
             version: "1.0.0".to_string(),
             source: Some("tarball+file:./vendor/local-bundle.tgz".to_string()),
             integrity: Some("sha256-deadbeefcafebabe".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2077,6 +2234,13 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-lodash".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2087,6 +2251,13 @@ mod tests {
             version: "1.0.0".to_string(),
             source: Some("tarball+https://e.com/remote.tgz".to_string()),
             integrity: Some("sha512-remote".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2097,6 +2268,13 @@ mod tests {
             version: "1.0.0".to_string(),
             source: Some("tarball+file:./vendor/local.tgz".to_string()),
             integrity: Some("sha256-local".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2107,6 +2285,13 @@ mod tests {
             version: "0.1.0".to_string(),
             source: Some("directory+./packages/local-dir".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2117,6 +2302,13 @@ mod tests {
             version: "0.1.0".to_string(),
             source: Some("link+../shared/linked".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],

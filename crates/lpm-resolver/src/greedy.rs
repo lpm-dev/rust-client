@@ -60,12 +60,16 @@
 use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet, OverrideTarget};
 use crate::package::{CanonicalKey, ResolverPackage};
+use crate::policy::{ReleaseTimeStatus, ResolverPolicy};
 use crate::provider::{
     CachedPackageInfo, NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone,
-    parse_metadata_to_cache_info,
+    parse_full_metadata_to_cache_info, parse_metadata_to_cache_info,
+    release_age_status_for_version, trust_downgrade_violation,
 };
 use crate::ranges::NpmRange;
-use crate::resolve::{ResolveError, ResolveResult, ResolvedPackage, StageTiming};
+use crate::resolve::{
+    ResolveError, ResolveResult, ResolvedPackage, StageTiming, resolve_peer_binding_version,
+};
 use ahash::{AHashMap, AHashSet};
 #[cfg(test)]
 use lpm_registry::RouteMode;
@@ -248,6 +252,38 @@ pub async fn resolve_greedy_with_options(
     auto_install_peers: bool,
     include_optional_dependencies: bool,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_greedy_with_options_and_policy(
+        client,
+        dependencies,
+        overrides,
+        shared_cache,
+        notify_map,
+        walker_done,
+        fetch_wait_timeout,
+        route_table,
+        metrics,
+        auto_install_peers,
+        include_optional_dependencies,
+        ResolverPolicy::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_greedy_with_options_and_policy(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    shared_cache: SharedCache,
+    notify_map: NotifyMap,
+    walker_done: WalkerDone,
+    fetch_wait_timeout: Duration,
+    route_table: RouteTable,
+    metrics: StreamingBfsMetrics,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policy: ResolverPolicy,
+) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!("resolve_greedy", n_deps = dependencies.len()).entered();
     let pass_start = Instant::now();
 
@@ -257,8 +293,12 @@ pub async fn resolve_greedy_with_options(
     crate::profile::reset_all();
     lpm_registry::timing::reset();
 
-    let mut state =
-        ResolveState::new_with_options(dependencies, overrides, include_optional_dependencies);
+    let mut state = ResolveState::new_with_options_and_policy(
+        dependencies,
+        overrides,
+        include_optional_dependencies,
+        policy.clone(),
+    );
     state.seed_root_edges()?;
 
     // ── Main task_queue + peer-drain fixed-point loop ──────────────
@@ -281,6 +321,7 @@ pub async fn resolve_greedy_with_options(
                 &walker_done,
                 fetch_wait_timeout,
                 &metrics,
+                &policy,
             )
             .await?;
             process_edge(&edge, &info, &mut state)?;
@@ -295,6 +336,7 @@ pub async fn resolve_greedy_with_options(
         let notify_map_drain = notify_map.clone();
         let walker_done_drain = walker_done.clone();
         let metrics_drain = metrics.clone();
+        let policy_drain = policy.clone();
         let synthesized = drain_peer_requirements_one_pass(
             &mut state,
             auto_install_peers,
@@ -305,6 +347,7 @@ pub async fn resolve_greedy_with_options(
                 let notify_map = notify_map_drain.clone();
                 let walker_done = walker_done_drain.clone();
                 let metrics = metrics_drain.clone();
+                let policy = policy_drain.clone();
                 async move {
                     ensure_manifest(
                         &canonical,
@@ -315,6 +358,7 @@ pub async fn resolve_greedy_with_options(
                         &walker_done,
                         fetch_wait_timeout,
                         &metrics,
+                        &policy,
                     )
                     .await
                 }
@@ -425,13 +469,10 @@ pub async fn resolve_greedy_with_options(
 ///   and resume parked edges in stable `(parent_id, local_name)` order
 ///   so multi-version dedupe stays deterministic across runs.
 ///
-/// **Concurrency caps.** A single 256-permit semaphore (`npm_fanout`)
-/// gates outstanding metadata fetches. H2 single-connection multiplex
-/// caps at 256 streams; the resolver sits at the cap and lets the
-/// registry's flow control set the actual pace. Tarball downloads run
-/// through install.rs's existing 24-permit `fetch_semaphore` —
-/// independent of the metadata semaphore so a stalled tarball can't
-/// starve metadata fetches that would unblock the resolver.
+/// **Concurrency caps.** A single `npm_fanout` semaphore gates
+/// outstanding metadata fetches. Callers tune the fanout for their
+/// registry/network regime; tarball downloads run later in install.rs
+/// unless a caller explicitly supplies a speculation channel.
 ///
 /// **Counters.** `dispatcher_rpc_count`, `inflight_high_water`,
 /// `parked_max_depth`, `tarball_dispatched_count`, and
@@ -503,6 +544,34 @@ pub async fn resolve_greedy_fused_with_cache_options(
     auto_install_peers: bool,
     include_optional_dependencies: bool,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_greedy_fused_with_cache_options_and_policy(
+        client,
+        dependencies,
+        overrides,
+        route_table,
+        npm_fanout,
+        spec_tx,
+        shared_cache,
+        auto_install_peers,
+        include_optional_dependencies,
+        ResolverPolicy::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_greedy_fused_with_cache_options_and_policy(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    route_table: RouteTable,
+    npm_fanout: usize,
+    spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    shared_cache: SharedCache,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policy: ResolverPolicy,
+) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!(
         "resolve_greedy_fused",
         n_deps = dependencies.len(),
@@ -517,8 +586,12 @@ pub async fn resolve_greedy_fused_with_cache_options(
     crate::profile::reset_all();
     lpm_registry::timing::reset();
 
-    let mut state =
-        ResolveState::new_with_options(dependencies, overrides, include_optional_dependencies);
+    let mut state = ResolveState::new_with_options_and_policy(
+        dependencies,
+        overrides,
+        include_optional_dependencies,
+        policy.clone(),
+    );
     state.seed_root_edges()?;
 
     // Loop-local state, owned by this single task. No Arcs needed
@@ -613,7 +686,6 @@ pub async fn resolve_greedy_fused_with_cache_options(
     // through. Slight over-allocation is cheaper than rehashing.
     let mut inflight: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
     let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
-    type FetchResult = Result<FetchedMetadata, ResolveError>;
     let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
         tokio::task::JoinSet::new();
 
@@ -631,6 +703,15 @@ pub async fn resolve_greedy_fused_with_cache_options(
             // refcount bump on the Arc<CachedPackageInfo>. The shard
             // lock is released before `process_edge` mutates state.
             if let Some(info_arc) = shared_cache.get(&edge.canonical).map(|e| e.value().clone()) {
+                let info_arc = ensure_policy_metadata_for_cached_manifest(
+                    &edge.canonical,
+                    info_arc,
+                    &client,
+                    &route_table,
+                    &shared_cache,
+                    &policy,
+                )
+                .await?;
                 process_edge(&edge, &info_arc, &mut state)?;
                 continue;
             }
@@ -645,6 +726,7 @@ pub async fn resolve_greedy_fused_with_cache_options(
                 let client_c = client.clone();
                 let permit = metadata_sem.clone();
                 let route_table_c = route_table.clone();
+                let policy_c = policy.clone();
                 metadata_jobs.spawn(async move {
                     // Acquire the metadata permit inside the task so
                     // the queue cap (256) limits in-flight HTTP calls,
@@ -656,8 +738,13 @@ pub async fn resolve_greedy_fused_with_cache_options(
                         .acquire_owned()
                         .await
                         .expect("metadata semaphore must outlive the resolver");
-                    let result =
-                        fetch_metadata_for_resolver(&client_c, &route_table_c, &canonical).await;
+                    let result = fetch_metadata_for_resolver(
+                        &client_c,
+                        &route_table_c,
+                        &canonical,
+                        &policy_c,
+                    )
+                    .await;
                     (canonical, result)
                 });
                 dispatcher_rpc_count += 1;
@@ -698,13 +785,19 @@ pub async fn resolve_greedy_fused_with_cache_options(
                 let client_c = client.clone();
                 let permit = metadata_sem.clone();
                 let route_table_c = route_table.clone();
+                let policy_c = policy.clone();
                 metadata_jobs.spawn(async move {
                     let _p = permit
                         .acquire_owned()
                         .await
                         .expect("metadata semaphore must outlive the resolver");
-                    let result =
-                        fetch_metadata_for_resolver(&client_c, &route_table_c, &canonical).await;
+                    let result = fetch_metadata_for_resolver(
+                        &client_c,
+                        &route_table_c,
+                        &canonical,
+                        &policy_c,
+                    )
+                    .await;
                     (canonical, result)
                 });
                 dispatcher_rpc_count += 1;
@@ -750,6 +843,7 @@ pub async fn resolve_greedy_fused_with_cache_options(
             let client_drain = client.clone();
             let route_table_drain = route_table.clone();
             let shared_cache_drain = shared_cache.clone();
+            let policy_drain = policy.clone();
             let synthesized = drain_peer_requirements_one_pass(
                 &mut state,
                 auto_install_peers,
@@ -757,12 +851,21 @@ pub async fn resolve_greedy_fused_with_cache_options(
                     let client = client_drain.clone();
                     let route_table = route_table_drain.clone();
                     let shared_cache = shared_cache_drain.clone();
+                    let policy = policy_drain.clone();
                     async move {
                         // Cache hit: refcount bump, return immediately.
                         if let Some(info_arc) =
                             shared_cache.get(&canonical).map(|e| e.value().clone())
                         {
-                            return Ok(info_arc);
+                            return ensure_policy_metadata_for_cached_manifest(
+                                &canonical,
+                                info_arc,
+                                &client,
+                                &route_table,
+                                &shared_cache,
+                                &policy,
+                            )
+                            .await;
                         }
                         // Cache miss: direct fetch + parse + insert.
                         // Peer manifests are typically a small tail
@@ -770,9 +873,10 @@ pub async fn resolve_greedy_fused_with_cache_options(
                         // direct dep), so the serial fetch here is
                         // bounded by the count of unmet-peer canonicals
                         // — usually 0–3.
-                        let meta = fetch_metadata_raw(&client, &route_table, &canonical).await?;
-                        let info = parse_metadata_to_cache_info(&meta);
-                        let info_arc = Arc::new(info);
+                        let fetched =
+                            fetch_metadata_for_resolver(&client, &route_table, &canonical, &policy)
+                                .await?;
+                        let info_arc = fetched.info;
                         shared_cache.insert(canonical.clone(), info_arc.clone());
                         Ok(info_arc)
                     }
@@ -798,59 +902,22 @@ pub async fn resolve_greedy_fused_with_cache_options(
 
         // ── Phase C — bounded await ──────────────────────────────
         // metadata_jobs is non-empty here (Phase B guards otherwise).
-        // Take the next completion; resume any parked edges for that
-        // canonical in deterministic order.
+        // Take the next completion; deterministic reuse is enforced in
+        // process_edge, so the network loop can keep completion-order
+        // throughput without making lockfiles arrival-order-dependent.
         if let Some(joined) = metadata_jobs.join_next().await {
             let (canonical, result) = joined
                 .map_err(|e| ResolveError::Internal(format!("metadata join failure: {e}")))?;
             inflight.remove(&canonical);
-            match result {
-                Ok(fetched) => {
-                    shared_cache.insert(canonical.clone(), fetched.info);
-                    if let Some(tx) = spec_tx.as_ref() {
-                        // `try_send`: speculation is best-effort. If
-                        // the channel is full (spec dispatcher is
-                        // backlogged), we'd rather skip the
-                        // speculation than block the resolver loop —
-                        // any package missed here is downloaded by
-                        // the real fetch loop on the post-resolve
-                        // pass. Matches the walker arm's handling of
-                        // spec_tx backpressure.
-                        if tx
-                            .try_send((canonical.to_string(), fetched.metadata))
-                            .is_ok()
-                        {
-                            tarball_dispatched_count += 1;
-                        }
-                    }
-                    if let Some(mut edges) = parked.remove(&canonical) {
-                        // Sort parked edges by (parent_id, local_name) for
-                        // deterministic resume order. Without this,
-                        // multi-version dedupe could allocate
-                        // `(canonical, version)` pairs in different orders
-                        // across runs, breaking byte-identical-lockfile
-                        // equality on bench/fixture-large.
-                        edges.sort_by(|a, b| {
-                            (a.parent, a.local_name.as_str())
-                                .cmp(&(b.parent, b.local_name.as_str()))
-                        });
-                        for e in edges {
-                            state.task_queue.push_back(e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Manifest fetch failed for this canonical. Apply
-                    // optional/peer/required behavior to every parked
-                    // edge waiting on it. Required edges propagate;
-                    // optional + peer are dropped silently.
-                    if let Some(edges) = parked.remove(&canonical) {
-                        for edge in edges {
-                            propagate_fetch_error(&edge, &e, &mut state)?;
-                        }
-                    }
-                }
-            }
+            complete_metadata_fetch(
+                canonical,
+                result,
+                &shared_cache,
+                spec_tx.as_ref(),
+                &mut tarball_dispatched_count,
+                &mut parked,
+                &mut state,
+            )?;
         }
     }
 
@@ -988,6 +1055,7 @@ struct ResolveState {
     /// passes don't recompute the same manifest decision.
     peer_resolution_cache: dashmap::DashMap<PeerResolutionCacheKey, CachedPeerResolution>,
     include_optional_dependencies: bool,
+    policy: ResolverPolicy,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -996,6 +1064,7 @@ struct ResolveState {
 struct ResolvedNodeBuilder {
     canonical: CanonicalKey,
     version: NpmVersion,
+    optional: bool,
     /// Edges going OUT of this node: (local_name, child_node_id).
     children: Vec<(String, NodeId)>,
 }
@@ -1006,10 +1075,25 @@ impl ResolveState {
         Self::new_with_options(root_deps, overrides, true)
     }
 
+    #[cfg(test)]
     fn new_with_options(
         root_deps: HashMap<String, String>,
         overrides: OverrideSet,
         include_optional_dependencies: bool,
+    ) -> Self {
+        Self::new_with_options_and_policy(
+            root_deps,
+            overrides,
+            include_optional_dependencies,
+            ResolverPolicy::default(),
+        )
+    }
+
+    fn new_with_options_and_policy(
+        root_deps: HashMap<String, String>,
+        overrides: OverrideSet,
+        include_optional_dependencies: bool,
+        policy: ResolverPolicy,
     ) -> Self {
         ResolveState {
             root_deps,
@@ -1032,6 +1116,7 @@ impl ResolveState {
             peer_conflicts: Vec::new(),
             peer_resolution_cache: dashmap::DashMap::with_capacity(64),
             include_optional_dependencies,
+            policy,
         }
     }
 
@@ -1047,6 +1132,7 @@ impl ResolveState {
         self.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::Root,
             version: NpmVersion::new(0, 0, 0),
+            optional: false,
             children: Vec::new(),
         });
         // Root carries a sentinel canonical; it's never queried by an
@@ -1121,17 +1207,21 @@ impl ResolveState {
         let id_to_version: Vec<String> = self.nodes.iter().map(|n| n.version.to_string()).collect();
 
         // canonical-name → resolved-version lookup for peer resolution.
-        // Mirrors `format_solution`'s `resolved_versions`. Built from the
+        // Mirrors `format_solution`'s peer-candidate lookup. Built from the
         // same node table (filtered to non-root) so peer name-lookups
         // intersect the active install set. `CanonicalKey`'s Display impl
         // emits the canonical-name form (`@lpm.dev/owner.name` or `react`),
         // matching how `peerDependencies` keys are spelled in package.json.
-        let resolved_by_canonical: HashMap<String, String> = self
+        let resolved_by_canonical: HashMap<String, Vec<(Option<String>, String)>> = self
             .nodes
             .iter()
             .filter(|n| !matches!(n.canonical, CanonicalKey::Root))
-            .map(|n| (n.canonical.to_string(), n.version.to_string()))
-            .collect();
+            .fold(HashMap::new(), |mut acc, n| {
+                acc.entry(n.canonical.to_string())
+                    .or_default()
+                    .push((None, n.version.to_string()));
+                acc
+            });
 
         let mut out: Vec<ResolvedPackage> = self
             .nodes
@@ -1179,6 +1269,10 @@ impl ResolveState {
                     .and_then(|info| info.dist.get(&ver_str))
                     .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
                     .unwrap_or_default();
+                let platform = cache
+                    .get(&n.canonical)
+                    .and_then(|info| info.platform.get(&ver_str))
+                    .cloned();
 
                 // Surface resolved peers per package so the v2 GraphKey
                 // can fold them in. The resolved-versions lookup is built
@@ -1188,11 +1282,16 @@ impl ResolveState {
                     .and_then(|info| info.peer_deps.get(&ver_str))
                     .map(|peer_deps| {
                         let mut out: Vec<(String, String)> = peer_deps
-                            .keys()
-                            .filter_map(|peer_name| {
-                                resolved_by_canonical
-                                    .get(peer_name)
-                                    .map(|ver| (peer_name.clone(), ver.clone()))
+                            .iter()
+                            .filter_map(|(peer_name, peer_range)| {
+                                let parsed_range = NpmRange::parse(peer_range).ok();
+                                resolve_peer_binding_version(
+                                    &pkg,
+                                    peer_name,
+                                    parsed_range.as_ref(),
+                                    &resolved_by_canonical,
+                                )
+                                .map(|(ver, _)| (peer_name.clone(), ver.clone()))
                             })
                             .collect();
                         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1208,6 +1307,8 @@ impl ResolveState {
                     peers,
                     tarball_url,
                     integrity,
+                    platform,
+                    optional: n.optional,
                 }
             })
             .collect();
@@ -1286,10 +1387,12 @@ fn process_edge(
     };
     let canonical_name = edge.canonical.to_string();
 
-    let natural_pick = find_best_version(info, &edge.range);
+    let natural_pick = find_best_version_with_policy(info, &edge.range, &state.policy);
     let natural_ver = match &natural_pick {
         VersionPick::Picked(v) => Some(v.clone()),
-        VersionPick::NoSatisfying | VersionPick::PlatformFiltered => None,
+        VersionPick::NoSatisfying
+        | VersionPick::BlockedByReleaseAge { .. }
+        | VersionPick::BlockedByTrustPolicy { .. } => None,
     };
 
     // No natural version means there's nothing to evaluate the
@@ -1299,7 +1402,19 @@ fn process_edge(
     let Some(natural) = natural_ver else {
         return match natural_pick {
             VersionPick::NoSatisfying => handle_no_version(edge, info, false, state),
-            VersionPick::PlatformFiltered => handle_no_version(edge, info, true, state),
+            VersionPick::BlockedByReleaseAge {
+                version,
+                remaining_secs,
+            } => handle_policy_blocked(
+                edge,
+                PolicyBlock::ReleaseAge {
+                    version,
+                    remaining_secs,
+                },
+            ),
+            VersionPick::BlockedByTrustPolicy { version, reason } => {
+                handle_policy_blocked(edge, PolicyBlock::TrustPolicy { version, reason })
+            }
             VersionPick::Picked(_) => unreachable!(),
         };
     };
@@ -1310,43 +1425,76 @@ fn process_edge(
         &natural,
         parent_ctx_ref,
     ) {
-        Some(entry) => match apply_override_target_greedy(info, &entry.target, &edge.range) {
-            Some(forced) => {
-                let hit = OverrideHit {
-                    raw_key: entry.raw_key.clone(),
-                    source: entry.source,
-                    package: canonical_name.clone(),
-                    from_version: natural.to_string(),
-                    to_version: forced.to_string(),
-                    via_parent: parent_ctx_ref.map(str::to_string),
-                };
-                tracing::debug!(
-                    "override applied: {} {} → {} (via {})",
-                    hit.package,
-                    hit.from_version,
-                    hit.to_version,
-                    hit.source_display()
-                );
-                Some((forced, hit))
+        Some(entry) => {
+            match apply_override_target_greedy(info, &entry.target, &edge.range, &state.policy) {
+                Some(forced) => {
+                    let hit = OverrideHit {
+                        raw_key: entry.raw_key.clone(),
+                        source: entry.source,
+                        package: canonical_name.clone(),
+                        from_version: natural.to_string(),
+                        to_version: forced.to_string(),
+                        via_parent: parent_ctx_ref.map(str::to_string),
+                    };
+                    tracing::debug!(
+                        "override applied: {} {} → {} (via {})",
+                        hit.package,
+                        hit.from_version,
+                        hit.to_version,
+                        hit.source_display()
+                    );
+                    Some((forced, hit))
+                }
+                None => {
+                    // Mirrors pubgrub arm's "irreconcilable override" warn:
+                    // target is outside the consumer range. We fall through
+                    // to the natural version — DO NOT silently pretend the
+                    // override applied. Fall through to the natural version.
+                    tracing::warn!(
+                        "override {} could not be satisfied: target {} is outside consumer range for {}",
+                        entry.raw_key,
+                        entry.target.raw(),
+                        canonical_name
+                    );
+                    None
+                }
             }
-            None => {
-                // Mirrors pubgrub arm's "irreconcilable override" warn:
-                // target is outside the consumer range. We fall through
-                // to the natural version — DO NOT silently pretend the
-                // override applied. Fall through to the natural version.
-                tracing::warn!(
-                    "override {} could not be satisfied: target {} is outside consumer range for {}",
-                    entry.raw_key,
-                    entry.target.raw(),
-                    canonical_name
-                );
-                None
-            }
-        },
+        }
         None => None,
     };
 
     process_edge_inner(edge, info, Some((natural, override_outcome)), state)
+}
+
+fn edge_is_optional_in_context(edge: &Edge, state: &ResolveState) -> bool {
+    edge.behavior.optional || state.nodes[edge.parent as usize].optional
+}
+
+fn mark_node_required_closure(state: &mut ResolveState, node_id: NodeId) {
+    let idx = node_id as usize;
+    if !state.nodes[idx].optional {
+        return;
+    }
+    state.nodes[idx].optional = false;
+    let children: Vec<NodeId> = state.nodes[idx]
+        .children
+        .iter()
+        .map(|(_, child_id)| *child_id)
+        .collect();
+    for child_id in children {
+        mark_node_required_closure(state, child_id);
+    }
+}
+
+fn newest_existing_satisfying_node(
+    nodes: &[(NpmVersion, NodeId)],
+    range: &NpmRange,
+) -> Option<NodeId> {
+    nodes
+        .iter()
+        .filter(|(version, _)| range.satisfies(version))
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, id)| *id)
 }
 
 /// Core reuse-or-allocate logic. The `forced` parameter, when present,
@@ -1375,31 +1523,79 @@ fn process_edge_inner(
         Some((natural, None)) => (natural, None),
         None => {
             // Hot path — no overrides parsed. Reuse-on-range-satisfies.
-            let existing_id: Option<NodeId> =
-                state.resolved.get(&edge.canonical).and_then(|nodes| {
-                    nodes
-                        .iter()
-                        .find(|(v, _)| edge.range.satisfies(v))
-                        .map(|(_, id)| *id)
-                });
+            let existing_id: Option<NodeId> = state
+                .resolved
+                .get(&edge.canonical)
+                .and_then(|nodes| newest_existing_satisfying_node(nodes, &edge.range));
             if let Some(id) = existing_id {
+                if !edge_is_optional_in_context(edge, state) {
+                    mark_node_required_closure(state, id);
+                }
                 state.nodes[edge.parent as usize]
                     .children
                     .push((edge.local_name.clone(), id));
                 return Ok(());
             }
-            let version = match find_best_version(info, &edge.range) {
+            let version = match find_best_version_with_policy(info, &edge.range, &state.policy) {
                 VersionPick::Picked(v) => v,
                 VersionPick::NoSatisfying => {
                     return handle_no_version(edge, info, false, state);
                 }
-                VersionPick::PlatformFiltered => {
-                    return handle_no_version(edge, info, true, state);
+                VersionPick::BlockedByReleaseAge {
+                    version,
+                    remaining_secs,
+                } => {
+                    return handle_policy_blocked(
+                        edge,
+                        PolicyBlock::ReleaseAge {
+                            version,
+                            remaining_secs,
+                        },
+                    );
+                }
+                VersionPick::BlockedByTrustPolicy { version, reason } => {
+                    return handle_policy_blocked(
+                        edge,
+                        PolicyBlock::TrustPolicy { version, reason },
+                    );
                 }
             };
             (version, None)
         }
     };
+
+    match release_age_status_for_version(info, &target_version, &state.policy) {
+        ReleaseTimeStatus::Allowed => {}
+        ReleaseTimeStatus::Missing => {
+            return handle_policy_blocked(
+                edge,
+                PolicyBlock::ReleaseAge {
+                    version: target_version,
+                    remaining_secs: state.policy.minimum_release_age_secs(),
+                },
+            );
+        }
+        ReleaseTimeStatus::TooNew { remaining_secs } => {
+            return handle_policy_blocked(
+                edge,
+                PolicyBlock::ReleaseAge {
+                    version: target_version,
+                    remaining_secs,
+                },
+            );
+        }
+    }
+    if state.policy.trust_policy().is_no_downgrade()
+        && let Some(reason) = trust_downgrade_violation(info, &target_version)
+    {
+        return handle_policy_blocked(
+            edge,
+            PolicyBlock::TrustPolicy {
+                version: target_version,
+                reason,
+            },
+        );
+    }
 
     // Reuse-or-allocate against `target_version`.
     //
@@ -1435,20 +1631,24 @@ fn process_edge_inner(
                 .find(|(v, _)| v == &target_version)
                 .map(|(_, id)| *id)
         } else {
-            nodes
-                .iter()
-                .find(|(v, _)| edge.range.satisfies(v))
-                .map(|(_, id)| *id)
+            newest_existing_satisfying_node(nodes, &edge.range)
         }
     });
 
     let child_id = match existing_id {
-        Some(id) => id,
+        Some(id) => {
+            if !edge_is_optional_in_context(edge, state) {
+                mark_node_required_closure(state, id);
+            }
+            id
+        }
         None => {
             let new_id = state.nodes.len() as NodeId;
+            let incoming_optional = edge_is_optional_in_context(edge, state);
             state.nodes.push(ResolvedNodeBuilder {
                 canonical: edge.canonical.clone(),
                 version: target_version.clone(),
+                optional: incoming_optional,
                 children: Vec::new(),
             });
             state
@@ -1500,10 +1700,18 @@ fn apply_override_target_greedy(
     info: &CachedPackageInfo,
     target: &OverrideTarget,
     range: &NpmRange,
+    policy: &ResolverPolicy,
 ) -> Option<NpmVersion> {
     match target {
         OverrideTarget::PinnedVersion { version, .. } => {
-            if range.satisfies(version) {
+            if range.satisfies(version)
+                && matches!(
+                    release_age_status_for_version(info, version, policy),
+                    ReleaseTimeStatus::Allowed
+                )
+                && (!policy.trust_policy().is_no_downgrade()
+                    || trust_downgrade_violation(info, version).is_none())
+            {
                 Some(version.clone())
             } else {
                 None
@@ -1523,6 +1731,17 @@ fn apply_override_target_greedy(
                 if !target_range.satisfies(v) {
                     continue;
                 }
+                if !matches!(
+                    release_age_status_for_version(info, v, policy),
+                    ReleaseTimeStatus::Allowed
+                ) {
+                    continue;
+                }
+                if policy.trust_policy().is_no_downgrade()
+                    && trust_downgrade_violation(info, v).is_some()
+                {
+                    continue;
+                }
                 let platform_ok = info.platform.is_empty()
                     || info
                         .platform
@@ -1536,6 +1755,44 @@ fn apply_override_target_greedy(
             None
         }
     }
+}
+
+enum PolicyBlock {
+    ReleaseAge {
+        version: NpmVersion,
+        remaining_secs: u64,
+    },
+    TrustPolicy {
+        version: NpmVersion,
+        reason: String,
+    },
+}
+
+fn handle_policy_blocked(edge: &Edge, block: PolicyBlock) -> Result<(), ResolveError> {
+    if edge.behavior.optional {
+        tracing::debug!(
+            "optional dep {} skipped by resolver policy (range={})",
+            edge.canonical,
+            edge.range,
+        );
+        return Ok(());
+    }
+    let detail = match block {
+        PolicyBlock::ReleaseAge {
+            version,
+            remaining_secs,
+        } => format!(
+            "{version} published too recently for minimumReleaseAge; {remaining_secs}s remaining"
+        ),
+        PolicyBlock::TrustPolicy { version, reason } => {
+            format!("{version} blocked by trust-policy no-downgrade: {reason}")
+        }
+    };
+    Err(ResolveError::DependencyFetch {
+        package: edge.canonical.to_string(),
+        version: edge.range.to_string(),
+        detail,
+    })
 }
 
 fn handle_no_version(
@@ -1670,7 +1927,8 @@ fn enqueue_child_deps(
             }
         };
 
-        let optional = optional_names.is_some_and(|set| set.contains(local_name));
+        let optional = state.nodes[parent_id as usize].optional
+            || optional_names.is_some_and(|set| set.contains(local_name));
         if optional && !state.include_optional_dependencies {
             tracing::debug!(
                 "skipping optional dep {} of {}@{} by install option",
@@ -2358,15 +2616,17 @@ where
 /// current platform isn't compatible" so callers can increment
 /// `platform_skipped` precisely.
 enum VersionPick {
-    /// A satisfying, platform-compatible version was found.
+    /// A satisfying version was found.
     Picked(NpmVersion),
-    /// No version satisfies the range — even ignoring platform.
+    /// No version satisfies the range.
     NoSatisfying,
-    /// At least one version satisfies the range, but every such
-    /// version is filtered out by the current OS/CPU constraints.
-    /// Optional deps in this state are silently skipped and counted
-    /// in `ResolveResult.platform_skipped`.
-    PlatformFiltered,
+    /// A satisfying version exists but is blocked by release-age.
+    BlockedByReleaseAge {
+        version: NpmVersion,
+        remaining_secs: u64,
+    },
+    /// The selected candidate would reduce publisher/provenance trust.
+    BlockedByTrustPolicy { version: NpmVersion, reason: String },
 }
 
 /// Detect a leaked `workspace:` specifier before [`NpmRange::parse`] gets
@@ -2380,38 +2640,55 @@ fn is_workspace_specifier(range_str: &str) -> bool {
 /// Greedy first-match version pick. Iterates `info.versions` (sorted
 /// descending by semver in
 /// [`crate::provider::parse_metadata_to_cache_info`]) and returns the
-/// first version that both satisfies the range AND is compatible
-/// with the current OS/CPU. Mirrors bun's `npm.zig:1808-1819` plus
-/// the platform filter that `provider::available_versions` already
-/// applies for the PubGrub path.
-///
-/// **Platform filtering is essential** — without it, optional deps
-/// declared with `os`/`cpu` constraints (e.g. esbuild's per-platform
-/// binary tarballs in `optionalDependencies`) get over-installed,
-/// with the resolver picking versions the current platform can't
-/// use. This was a real W2 regression caught on `bench/fixture-large`:
-/// 47 extra `@esbuild/*` packages got installed before the platform
-/// filter landed.
+/// first version satisfying the range. Platform compatibility is applied
+/// after resolution so lockfiles remain portable across hosts.
+#[cfg(test)]
 fn find_best_version(info: &CachedPackageInfo, range: &NpmRange) -> VersionPick {
-    let mut had_satisfying_but_filtered = false;
+    find_best_version_with_policy(info, range, &ResolverPolicy::default())
+}
+
+fn find_best_version_with_policy(
+    info: &CachedPackageInfo,
+    range: &NpmRange,
+    policy: &ResolverPolicy,
+) -> VersionPick {
+    let mut first_policy_block: Option<VersionPick> = None;
     for v in &info.versions {
         if !range.satisfies(v) {
             continue;
         }
-        let platform_ok = info
-            .platform
-            .get(&v.to_string())
-            .is_none_or(crate::provider::is_platform_compatible);
-        if platform_ok {
-            return VersionPick::Picked(v.clone());
+        match release_age_status_for_version(info, v, policy) {
+            ReleaseTimeStatus::Allowed => {}
+            ReleaseTimeStatus::Missing => {
+                return VersionPick::BlockedByReleaseAge {
+                    version: v.clone(),
+                    remaining_secs: policy.minimum_release_age_secs(),
+                };
+            }
+            ReleaseTimeStatus::TooNew { remaining_secs } => {
+                if first_policy_block.is_none() {
+                    first_policy_block = Some(VersionPick::BlockedByReleaseAge {
+                        version: v.clone(),
+                        remaining_secs,
+                    });
+                }
+                continue;
+            }
         }
-        had_satisfying_but_filtered = true;
+        if policy.trust_policy().is_no_downgrade()
+            && let Some(reason) = trust_downgrade_violation(info, v)
+        {
+            if first_policy_block.is_none() {
+                first_policy_block = Some(VersionPick::BlockedByTrustPolicy {
+                    version: v.clone(),
+                    reason,
+                });
+            }
+            continue;
+        }
+        return VersionPick::Picked(v.clone());
     }
-    if had_satisfying_but_filtered {
-        VersionPick::PlatformFiltered
-    } else {
-        VersionPick::NoSatisfying
-    }
+    first_policy_block.unwrap_or(VersionPick::NoSatisfying)
 }
 
 /// Fast cache hit, then short-lived per-canonical wait, then escape-hatch
@@ -2427,6 +2704,7 @@ async fn ensure_manifest(
     walker_done: &WalkerDone,
     fetch_wait_timeout: Duration,
     metrics: &StreamingBfsMetrics,
+    policy: &ResolverPolicy,
 ) -> Result<Arc<CachedPackageInfo>, ResolveError> {
     // Fast path. Cache values are Arc-wrapped, so the clone here is a
     // refcount bump rather than a deep clone of the 7-HashMap struct.
@@ -2434,7 +2712,15 @@ async fn ensure_manifest(
     // greedy resolver cloned popular packuments per edge, burning ~5 sec
     // per cold install.
     if let Some(entry) = shared_cache.get(canonical) {
-        return Ok(entry.value().clone());
+        return ensure_policy_metadata_for_cached_manifest(
+            canonical,
+            entry.value().clone(),
+            &client,
+            route_table,
+            shared_cache,
+            policy,
+        )
+        .await;
     }
 
     // Wait-loop (only when walker is attached and timeout > 0).
@@ -2452,7 +2738,15 @@ async fn ensure_manifest(
         // Re-check: walker may have inserted between the fast-path miss
         // and now.
         if let Some(entry) = shared_cache.get(canonical) {
-            return Ok(entry.value().clone());
+            return ensure_policy_metadata_for_cached_manifest(
+                canonical,
+                entry.value().clone(),
+                &client,
+                route_table,
+                shared_cache,
+                policy,
+            )
+            .await;
         }
         // Walker may have flipped done — if so, fetch directly without
         // burning the timeout. Matches `provider.rs::ensure_cached`'s
@@ -2461,7 +2755,15 @@ async fn ensure_manifest(
             match tokio::time::timeout(fetch_wait_timeout, notified).await {
                 Ok(()) => {
                     if let Some(entry) = shared_cache.get(canonical) {
-                        return Ok(entry.value().clone());
+                        return ensure_policy_metadata_for_cached_manifest(
+                            canonical,
+                            entry.value().clone(),
+                            &client,
+                            route_table,
+                            shared_cache,
+                            policy,
+                        )
+                        .await;
                     }
                 }
                 Err(_) => {
@@ -2473,8 +2775,7 @@ async fn ensure_manifest(
 
     // Escape hatch: direct fetch.
     metrics_incr_escape_hatch(metrics);
-    let info = direct_fetch(&client, route_table, canonical).await?;
-    let info_arc = Arc::new(info);
+    let info_arc = direct_fetch(&client, route_table, canonical, policy).await?;
     shared_cache.insert(canonical.clone(), info_arc.clone());
     if let Some(n) = notify_map.get(canonical) {
         n.notify_waiters();
@@ -2486,9 +2787,10 @@ async fn direct_fetch(
     client: &RegistryClient,
     route_table: &RouteTable,
     canonical: &CanonicalKey,
-) -> Result<CachedPackageInfo, ResolveError> {
-    let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
-    Ok(parse_metadata_to_cache_info(&metadata))
+    policy: &ResolverPolicy,
+) -> Result<Arc<CachedPackageInfo>, ResolveError> {
+    let fetched = fetch_metadata_for_resolver(client, route_table, canonical, policy).await?;
+    Ok(fetched.info)
 }
 
 struct FetchedMetadata {
@@ -2496,18 +2798,90 @@ struct FetchedMetadata {
     info: Arc<CachedPackageInfo>,
 }
 
+type FetchResult = Result<FetchedMetadata, ResolveError>;
+
 async fn fetch_metadata_for_resolver(
     client: &RegistryClient,
     route_table: &RouteTable,
     canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
 ) -> Result<FetchedMetadata, ResolveError> {
     let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
-    Ok(parse_fetched_metadata(metadata))
+    let fetched = parse_fetched_metadata(metadata);
+    if !fetched.info.needs_policy_metadata(policy) {
+        return Ok(fetched);
+    }
+    let full = fetch_full_metadata_raw(client, route_table, canonical).await?;
+    Ok(parse_full_fetched_metadata(full))
 }
 
 fn parse_fetched_metadata(metadata: lpm_registry::PackageMetadata) -> FetchedMetadata {
     let info = Arc::new(parse_metadata_to_cache_info(&metadata));
     FetchedMetadata { metadata, info }
+}
+
+fn parse_full_fetched_metadata(metadata: lpm_registry::PackageMetadata) -> FetchedMetadata {
+    let info = Arc::new(parse_full_metadata_to_cache_info(&metadata));
+    FetchedMetadata { metadata, info }
+}
+
+async fn ensure_policy_metadata_for_cached_manifest(
+    canonical: &CanonicalKey,
+    info: Arc<CachedPackageInfo>,
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    shared_cache: &SharedCache,
+    policy: &ResolverPolicy,
+) -> Result<Arc<CachedPackageInfo>, ResolveError> {
+    if !info.needs_policy_metadata(policy) {
+        return Ok(info);
+    }
+    if !matches!(canonical, CanonicalKey::Npm { .. }) {
+        return Ok(info);
+    }
+    let full = fetch_full_metadata_raw(client, route_table, canonical).await?;
+    let full_info = Arc::new(parse_full_metadata_to_cache_info(&full));
+    shared_cache.insert(canonical.clone(), full_info.clone());
+    Ok(full_info)
+}
+
+fn complete_metadata_fetch(
+    canonical: CanonicalKey,
+    result: FetchResult,
+    shared_cache: &SharedCache,
+    spec_tx: Option<&tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    tarball_dispatched_count: &mut u64,
+    parked: &mut AHashMap<CanonicalKey, Vec<Edge>>,
+    state: &mut ResolveState,
+) -> Result<(), ResolveError> {
+    match result {
+        Ok(fetched) => {
+            shared_cache.insert(canonical.clone(), fetched.info);
+            if let Some(tx) = spec_tx
+                && tx
+                    .try_send((canonical.to_string(), fetched.metadata))
+                    .is_ok()
+            {
+                *tarball_dispatched_count += 1;
+            }
+            if let Some(mut edges) = parked.remove(&canonical) {
+                edges.sort_by(|a, b| {
+                    (a.parent, a.local_name.as_str()).cmp(&(b.parent, b.local_name.as_str()))
+                });
+                for e in edges {
+                    state.task_queue.push_back(e);
+                }
+            }
+        }
+        Err(e) => {
+            if let Some(edges) = parked.remove(&canonical) {
+                for edge in edges {
+                    propagate_fetch_error(&edge, &e, state)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Raw-metadata fetch, factored out so the fused resolver can forward the
@@ -2557,6 +2931,40 @@ async fn fetch_metadata_raw(
                 version: "*".to_string(),
                 detail: e.to_string(),
             })
+        }
+    }
+}
+
+async fn fetch_full_metadata_raw(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+) -> Result<lpm_registry::PackageMetadata, ResolveError> {
+    match canonical {
+        CanonicalKey::Root => Err(ResolveError::Internal(
+            "fetch_full_metadata_raw called for root".to_string(),
+        )),
+        CanonicalKey::Lpm { owner, name } => {
+            let pkg_name = lpm_common::PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))
+                .map_err(|e| ResolveError::Internal(e.to_string()))?;
+            client.get_package_metadata(&pkg_name).await.map_err(|e| {
+                ResolveError::DependencyFetch {
+                    package: canonical.to_string(),
+                    version: "*".to_string(),
+                    detail: e.to_string(),
+                }
+            })
+        }
+        CanonicalKey::Npm { name } => {
+            let route = route_table.route_for_package(name);
+            client
+                .get_npm_metadata_routed_full(name, route)
+                .await
+                .map_err(|e| ResolveError::DependencyFetch {
+                    package: canonical.to_string(),
+                    version: "*".to_string(),
+                    detail: e.to_string(),
+                })
         }
     }
 }
@@ -2662,6 +3070,8 @@ mod tests {
             deps_map.insert(latest.to_string(), latest_deps);
         }
         CachedPackageInfo {
+            modified: None,
+            trust_metadata_complete: false,
             versions: parsed,
             deps: deps_map,
             peer_deps: HashMap::new(),
@@ -2677,6 +3087,9 @@ mod tests {
                         CachedDistInfo {
                             tarball_url: Some(format!("https://example.invalid/{}.tgz", v)),
                             integrity: Some(format!("sha512-fake-{}", v)),
+                            signatures: Vec::new(),
+                            published_at: None,
+                            trust_evidence: None,
                         },
                     )
                 })
@@ -2689,8 +3102,11 @@ mod tests {
         match p {
             VersionPick::Picked(v) => v,
             VersionPick::NoSatisfying => panic!("expected Picked, got NoSatisfying"),
-            VersionPick::PlatformFiltered => {
-                panic!("expected Picked, got PlatformFiltered")
+            VersionPick::BlockedByReleaseAge { version, .. } => {
+                panic!("expected Picked, got release-age block for {version}")
+            }
+            VersionPick::BlockedByTrustPolicy { version, reason } => {
+                panic!("expected Picked, got trust-policy block for {version}: {reason}")
             }
         }
     }
@@ -2726,15 +3142,11 @@ mod tests {
     }
 
     #[test]
-    fn find_best_version_reports_platform_filter_when_only_match_is_incompatible() {
-        // The only version satisfying the range is platform-restricted to
-        // a host we're not on. The pick result must be `PlatformFiltered`,
-        // not `NoSatisfying`, so callers can increment platform_skipped
-        // precisely on optional deps.
+    fn find_best_version_ignores_platform_when_selecting_version() {
+        // Platform filtering happens after resolution so lockfiles stay
+        // portable. The newest semver-satisfying version wins even when
+        // it is incompatible with the current host.
         let mut info = mk_info(&["1.0.0"], &[]);
-        // Force this version to be incompatible regardless of host: include
-        // every OS as an exclusion. `check_platform_filter` reads `!<os>`
-        // entries as exclusion lists, so all hosts fail.
         info.platform.insert(
             "1.0.0".to_string(),
             crate::provider::PlatformMeta {
@@ -2754,9 +3166,45 @@ mod tests {
             },
         );
         let range = NpmRange::parse("^1.0.0").unwrap();
+        assert_eq!(
+            picked(find_best_version(&info, &range)).to_string(),
+            "1.0.0"
+        );
+    }
+
+    #[test]
+    fn find_best_version_skips_trust_downgrade_when_older_candidate_satisfies_range() {
+        let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
+        info.dist.get_mut("1.0.0").unwrap().published_at =
+            Some("2025-01-01T00:00:00.000Z".to_string());
+        info.dist.get_mut("1.0.0").unwrap().trust_evidence =
+            Some(crate::policy::TrustEvidence::TrustedPublisher);
+        info.dist.get_mut("1.1.0").unwrap().published_at =
+            Some("2025-01-02T00:00:00.000Z".to_string());
+        let policy = ResolverPolicy::new(0, crate::policy::TrustPolicyMode::NoDowngrade);
+        let range = NpmRange::parse("^1.0.0").unwrap();
+
+        assert_eq!(
+            picked(find_best_version_with_policy(&info, &range, &policy)).to_string(),
+            "1.0.0"
+        );
+    }
+
+    #[test]
+    fn find_best_version_blocks_exact_trust_downgrade() {
+        let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
+        info.dist.get_mut("1.0.0").unwrap().published_at =
+            Some("2025-01-01T00:00:00.000Z".to_string());
+        info.dist.get_mut("1.0.0").unwrap().trust_evidence =
+            Some(crate::policy::TrustEvidence::TrustedPublisher);
+        info.dist.get_mut("1.1.0").unwrap().published_at =
+            Some("2025-01-02T00:00:00.000Z".to_string());
+        let policy = ResolverPolicy::new(0, crate::policy::TrustPolicyMode::NoDowngrade);
+        let range = NpmRange::parse("1.1.0").unwrap();
+
         assert!(matches!(
-            find_best_version(&info, &range),
-            VersionPick::PlatformFiltered
+            find_best_version_with_policy(&info, &range, &policy),
+            VersionPick::BlockedByTrustPolicy { .. }
         ));
     }
 
@@ -2866,6 +3314,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("react"),
             version: NpmVersion::parse("18.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state.resolved.insert(
@@ -2927,6 +3376,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("legacy-shim"),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state.resolved.insert(
@@ -3112,6 +3562,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::Root,
             version: NpmVersion::new(0, 0, 0),
+            optional: false,
             children: Vec::new(),
         });
         state
@@ -3120,6 +3571,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("react"),
             version: NpmVersion::parse("18.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state.resolved.insert(
@@ -3219,6 +3671,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::Root,
             version: NpmVersion::new(0, 0, 0),
+            optional: false,
             children: Vec::new(),
         });
         state
@@ -3227,6 +3680,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("react"),
             version: NpmVersion::parse("18.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state.resolved.insert(
@@ -3236,6 +3690,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("redux"),
             version: NpmVersion::parse("4.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state.resolved.insert(
@@ -3324,6 +3779,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("parent"),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         enqueue_child_deps(
@@ -3362,6 +3818,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("parent"),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         enqueue_child_deps(
@@ -3397,6 +3854,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("parent"),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         enqueue_child_deps(
@@ -3455,6 +3913,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: CanonicalKey::npm("parent"),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         enqueue_child_deps(
@@ -3545,6 +4004,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: parent_canonical.clone(),
             version: NpmVersion::parse("1.0.0").unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         enqueue_child_deps(
@@ -3864,6 +4324,7 @@ mod tests {
         state.nodes.push(ResolvedNodeBuilder {
             canonical: canonical.clone(),
             version: NpmVersion::parse(version).unwrap(),
+            optional: false,
             children: Vec::new(),
         });
         state
@@ -3872,6 +4333,79 @@ mod tests {
             .or_default()
             .push((NpmVersion::parse(version).unwrap(), id));
         id
+    }
+
+    #[test]
+    fn process_edge_reuses_newest_existing_version_when_multiple_satisfy_range() {
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        let shared = CanonicalKey::npm("shared");
+        let older = push_node(&mut state, shared.clone(), "1.2.0");
+        let newer = push_node(&mut state, shared.clone(), "1.9.0");
+
+        state.resolved.insert(
+            shared.clone(),
+            vec![
+                (NpmVersion::parse("1.2.0").unwrap(), older),
+                (NpmVersion::parse("1.9.0").unwrap(), newer),
+            ],
+        );
+
+        let edge = Edge {
+            parent: 0,
+            local_name: "shared".to_string(),
+            canonical: shared,
+            range: NpmRange::parse("^1.0.0").unwrap(),
+            behavior: DepBehavior {
+                required: true,
+                peer: false,
+                optional: false,
+            },
+        };
+        let info = mk_info(&["1.9.0", "1.2.0"], &[]);
+
+        process_edge(&edge, &info, &mut state).unwrap();
+
+        assert_eq!(
+            state.nodes[0].children,
+            vec![("shared".to_string(), newer)],
+            "reuse must be independent of the order compatible nodes were allocated"
+        );
+    }
+
+    #[test]
+    fn into_resolved_packages_binds_peer_by_consumer_range() {
+        let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+        push_node(&mut state, CanonicalKey::Root, "0.0.0");
+        push_node(&mut state, CanonicalKey::npm("plugin"), "1.0.0");
+        push_node(&mut state, CanonicalKey::npm("react"), "17.0.2");
+        push_node(&mut state, CanonicalKey::npm("react"), "18.2.0");
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            CanonicalKey::npm("plugin"),
+            Arc::new(mk_info_with_peers(
+                &["1.0.0"],
+                &[],
+                &[("react", "^17.0.0")],
+                &[],
+            )),
+        );
+        cache.insert(
+            CanonicalKey::npm("react"),
+            mk_info_arc(&["18.2.0", "17.0.2"], &[]),
+        );
+
+        let resolved = state.into_resolved_packages(&cache);
+        let plugin = resolved
+            .iter()
+            .find(|pkg| pkg.package.canonical_name() == "plugin")
+            .expect("plugin package present");
+        assert_eq!(
+            plugin.peers,
+            vec![("react".to_string(), "17.0.2".to_string())],
+            "greedy finalization should bind the peer version satisfying the consumer range"
+        );
     }
 
     #[tokio::test]

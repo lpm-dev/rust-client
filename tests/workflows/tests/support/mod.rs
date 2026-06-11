@@ -271,13 +271,12 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     // Phase-4d default flip to v2 changes these to symlinks-into-the-
     // global-store, which would break shape assertions wholesale.
     //
-    // Pin every workflow test to v1 explicitly. v2's regression
-    // coverage lives in the audit-fixture CI matrix (see
-    // `bench/audit-fixtures/run-all.sh` + `.github/workflows/ci.yml`),
-    // which runs the same 18-fixture suite under both `LPM_STORE_VERSION`
-    // values and gates on no-asymmetric-outcomes. Tests that
-    // intentionally exercise the v2 shape re-set this on their own
-    // command builder.
+    // Pin the legacy workflow default to v1 explicitly. v2 regression
+    // coverage lives in explicit workflow tests that opt into or restore
+    // the shipped default, plus the audit-fixture CI matrix (see
+    // `bench/audit-fixtures/run-all.sh` + `.github/workflows/ci.yml`).
+    // Tests that intentionally exercise the v2 shape re-set or remove this
+    // env on their own command builder.
     cmd.set_env("LPM_STORE_VERSION", OsStr::new("v1"));
 
     // Disable color for deterministic output in assertions

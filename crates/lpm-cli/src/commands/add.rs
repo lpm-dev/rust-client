@@ -2580,6 +2580,7 @@ async fn handle_dependencies(
                 // `[sigstore] verify` config) for uniformity with
                 // `lpm install`.
                 crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+                crate::commands::install::InstallOmitPolicy::default(),
                 // `lpm add` does not surface its
                 // own sandbox-mode flags. The env / config / default
                 // chain inside `rebuild::run` still applies.
@@ -2830,6 +2831,12 @@ mod tests {
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                os: Vec::new(),
+                cpu: Vec::new(),
+                libc: Vec::new(),
+                optional: false,
                 dependencies: Vec::new(),
                 alias_dependencies: vec![],
                 peers: vec![],

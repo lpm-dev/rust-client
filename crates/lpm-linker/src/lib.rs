@@ -356,8 +356,9 @@ use lpm_common::symlink::validate_cmd_path;
 /// - Cold-install win — hoisted is ~497 ms faster than isolated
 ///   on `bench/fixture-large` cold/full.
 /// - Same warm-install (post-v2 — see above).
-/// - Phantom-dep accessibility for tooling that relied on
-///   npm-style flat node_modules (most ecosystem projects).
+/// - npm-compatible root links for declared dependencies while keeping
+///   v2 transitives inside their shared link entries instead of
+///   flattening every transitive to the project root.
 ///
 /// [`Isolated`] remains a valid opt-in via `LPM_LINKER=isolated`,
 /// `package.json > lpm > linker`, `~/.lpm/config.toml > linker`,
@@ -370,7 +371,9 @@ pub enum LinkerMode {
     /// Available via explicit `--linker isolated` /
     /// `LPM_LINKER=isolated` / `package.json > lpm > linker`.
     Isolated,
-    /// npm v3+ style hoisted layout. Flat, phantom deps accessible. Default.
+    /// v2 hoisted virtual-store layout. Root dependencies are linked at
+    /// project `node_modules`, while transitives are hoisted within shared
+    /// link entries rather than flattened to the project root. Default.
     #[default]
     Hoisted,
 }

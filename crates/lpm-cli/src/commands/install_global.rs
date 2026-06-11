@@ -627,6 +627,7 @@ async fn do_install(
         overrides.min_release_age_override,
         overrides.drift_ignore_policy.clone(),
         overrides.verify_policy.clone(),
+        crate::commands::install::InstallOmitPolicy::default(),
         // `lpm install -g` does not surface its
         // own sandbox-mode flags. The env / config / default chain
         // inside `rebuild::run` still applies — `LPM_STRICT_SANDBOX=1`
@@ -2210,6 +2211,7 @@ mod tests {
                 .map(|version| (version.version.clone(), version))
                 .collect(),
             time: Default::default(),
+            modified: None,
             downloads: None,
             distribution_mode: None,
             package_type: None,
@@ -2533,6 +2535,7 @@ mod tests {
             dist_tags: BTreeMap::new().into_iter().collect(),
             versions: versions.into_iter().collect(),
             time: Default::default(),
+            modified: None,
             downloads: None,
             distribution_mode: None,
             package_type: None,
@@ -2553,6 +2556,7 @@ mod tests {
             dist_tags,
             versions: Default::default(),
             time: Default::default(),
+            modified: None,
             downloads: None,
             distribution_mode: None,
             package_type: None,
@@ -2575,6 +2579,7 @@ mod tests {
             dist_tags: Default::default(),
             versions,
             time: Default::default(),
+            modified: None,
             downloads: None,
             distribution_mode: None,
             package_type: None,
@@ -2593,6 +2598,7 @@ mod tests {
             dist_tags: Default::default(),
             versions: Default::default(),
             time: Default::default(),
+            modified: None,
             downloads: None,
             distribution_mode: None,
             package_type: None,

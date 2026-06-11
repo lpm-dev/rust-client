@@ -52,6 +52,209 @@ fn config_set_writes_value_into_isolated_home() {
 }
 
 #[test]
+fn config_set_signatures_true_persists_boolean() {
+    let project = TempProject::empty(r#"{"name":"config-signatures","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "signatures", "true"])
+        .output()
+        .expect("failed to run lpm config set signatures true");
+
+    assert!(
+        output.status.success(),
+        "lpm config set signatures true failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "config set signatures --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["value"], serde_json::json!(true));
+
+    let content = std::fs::read_to_string(config_path(&project))
+        .expect("config set must create ~/.lpm/config.toml in the isolated HOME");
+    assert!(
+        content.contains("signatures = true"),
+        "signatures config must persist as a TOML boolean, got:\n{content}"
+    );
+}
+
+#[test]
+fn config_get_signatures_json_returns_boolean() {
+    let project = TempProject::empty(r#"{"name":"config-signatures","version":"1.0.0"}"#);
+    seed_config(&project, "signatures = true\n");
+
+    let output = lpm(&project)
+        .args(["--json", "config", "get", "signatures"])
+        .output()
+        .expect("failed to run lpm config get signatures");
+
+    assert!(
+        output.status.success(),
+        "lpm config get signatures failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "config get signatures --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["signatures"], serde_json::json!(true));
+}
+
+#[test]
+fn config_signatures_set_false_preserves_unrelated_keys() {
+    let project = TempProject::empty(r#"{"name":"config-signatures","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "registry = \"https://registry.example.test\"\nsignatures = true\n",
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "config", "signatures", "--set", "false"])
+        .output()
+        .expect("failed to run lpm config signatures --set false");
+
+    assert!(
+        output.status.success(),
+        "lpm config signatures --set false failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "config signatures --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["signatures"], serde_json::json!(false));
+
+    let content = std::fs::read_to_string(config_path(&project)).expect("config file must exist");
+    assert!(
+        content.contains("registry = \"https://registry.example.test\""),
+        "signatures wizard must preserve unrelated keys, got:\n{content}"
+    );
+    assert!(
+        content.contains("signatures = false"),
+        "signatures wizard must persist false as a TOML boolean, got:\n{content}"
+    );
+}
+
+#[test]
+fn config_set_trust_policy_no_downgrade_persists_string() {
+    let project = TempProject::empty(r#"{"name":"config-trust-policy","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "trust-policy", "no-downgrade"])
+        .output()
+        .expect("failed to run lpm config set trust-policy no-downgrade");
+
+    assert!(
+        output.status.success(),
+        "lpm config set trust-policy no-downgrade failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "config set trust-policy --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["value"], serde_json::json!("no-downgrade"));
+
+    let content = std::fs::read_to_string(config_path(&project))
+        .expect("config set must create ~/.lpm/config.toml in the isolated HOME");
+    assert!(
+        content.contains("trust-policy = \"no-downgrade\""),
+        "trust-policy config must persist as a TOML string, got:\n{content}"
+    );
+}
+
+#[test]
+fn config_trust_policy_set_off_preserves_unrelated_keys() {
+    let project = TempProject::empty(r#"{"name":"config-trust-policy","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "registry = \"https://registry.example.test\"\ntrust-policy = \"no-downgrade\"\n",
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "config", "trust-policy", "--set", "off"])
+        .output()
+        .expect("failed to run lpm config trust-policy --set off");
+
+    assert!(
+        output.status.success(),
+        "lpm config trust-policy --set off failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "config trust-policy --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["trust-policy"], serde_json::json!("off"));
+
+    let content = std::fs::read_to_string(config_path(&project)).expect("config file must exist");
+    assert!(
+        content.contains("registry = \"https://registry.example.test\""),
+        "trust-policy wizard must preserve unrelated keys, got:\n{content}"
+    );
+    assert!(
+        content.contains("trust-policy = \"off\""),
+        "trust-policy wizard must persist off as a TOML string, got:\n{content}"
+    );
+}
+
+#[test]
+fn config_set_trust_policy_rejects_unknown_value() {
+    let project = TempProject::empty(r#"{"name":"config-trust-policy","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "trust-policy", "warn"])
+        .output()
+        .expect("failed to run lpm config set trust-policy warn");
+
+    assert!(
+        !output.status.success(),
+        "invalid trust-policy must fail:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("invalid trust-policy") && combined.contains("no-downgrade"),
+        "invalid trust-policy error must name accepted values; got:\n{combined}"
+    );
+    assert!(
+        !config_path(&project).exists(),
+        "invalid trust-policy must not create config.toml"
+    );
+}
+
+#[test]
 fn config_set_human_uses_slim_success() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
 
