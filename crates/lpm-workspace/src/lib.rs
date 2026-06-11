@@ -1687,11 +1687,9 @@ impl TrustedDependencies {
     /// `HashMap` iteration order is non-deterministic. Selecting "the first
     /// match" would make the drift verdict flip across runs when multiple
     /// provenance-bearing approvals for the same package carry different
-    /// identities. Instead, this selects the entry with the lexicographically-
-    /// maximum version string — deterministic and correct for consistent-digit-
-    /// width versions; wrong for `1.10.0` vs `1.9.0` (lex picks `1.9.0`).
-    /// Proper semver ordering can replace this later; determinism is the
-    /// load-bearing property here.
+    /// identities. Instead, this selects the semver-highest entry when both
+    /// versions parse, with lexical ordering as a deterministic fallback for
+    /// unusual version strings.
     pub fn provenance_reference_for_name(
         &self,
         name: &str,
@@ -1708,11 +1706,61 @@ impl TrustedDependencies {
                     None
                 }
             })
-            .max_by(|(v1, _), (v2, _)| v1.cmp(v2))
+            .max_by(|(v1, _), (v2, _)| compare_version_strings(v1, v2))
+    }
+
+    /// Find the provenance snapshot that should be used to evaluate
+    /// drift for a concrete candidate version.
+    ///
+    /// Exact rich bindings win. If `package.json` already carries
+    /// `name@candidate_version`, that binding is the user's approval
+    /// record for this candidate and no other version may override it.
+    /// When no exact binding exists, use the greatest approved version
+    /// lower than the candidate so upgrades still compare against the
+    /// most recent prior approval.
+    pub fn provenance_reference_for_candidate(
+        &self,
+        name: &str,
+        candidate_version: &str,
+    ) -> Option<(&str, &TrustedDependencyBinding)> {
+        let TrustedDependencies::Rich(map) = self else {
+            return None;
+        };
+
+        let mut has_exact_binding = false;
+        for (key, binding) in map {
+            let Some((n, v)) = key.rsplit_once('@') else {
+                continue;
+            };
+            if n == name && v == candidate_version {
+                has_exact_binding = true;
+                if binding.provenance_at_approval.is_some() {
+                    return Some((v, binding));
+                }
+            }
+        }
+        if has_exact_binding {
+            return None;
+        }
+
+        map.iter()
+            .filter_map(|(key, binding)| {
+                let (n, v) = key.rsplit_once('@')?;
+                if n == name
+                    && v != "*"
+                    && version_string_precedes(v, candidate_version)
+                    && binding.provenance_at_approval.is_some()
+                {
+                    Some((v, binding))
+                } else {
+                    None
+                }
+            })
+            .max_by(|(v1, _), (v2, _)| compare_version_strings(v1, v2))
     }
 
     /// Find the approved binding for this package name whose version is the
-    /// lexicographic-max STRICTLY LESS THAN the given candidate version.
+    /// highest known version STRICTLY LESS THAN the given candidate version.
     /// Returns `(version, binding)` as the reference point for the version-diff UI.
     ///
     /// Differences from [`Self::provenance_reference_for_name`]:
@@ -1723,9 +1771,10 @@ impl TrustedDependencies {
     /// - Skips `@*` legacy preserve-key entries — they're migration sentinels,
     ///   not concrete prior approvals with binding metadata to diff.
     ///
-    /// Lex-max selection (same as [`Self::provenance_reference_for_name`])
-    /// keeps the diff UI and the drift gate in sync on which version is the
-    /// "prior approval."
+    /// Semver-aware selection keeps the diff UI and the drift gate in sync
+    /// on which version is the "prior approval." Non-semver strings fall
+    /// back to lexical ordering so unusual package versions still get a
+    /// deterministic result.
     pub fn latest_binding_for_name(
         &self,
         name: &str,
@@ -1742,13 +1791,13 @@ impl TrustedDependencies {
                 // every concrete version under lex-max (`*` > any
                 // digit). Pre-filter so the preserve key can't poison
                 // the reduction.
-                if n == name && v != "*" && v < candidate_version {
+                if n == name && v != "*" && version_string_precedes(v, candidate_version) {
                     Some((v, binding))
                 } else {
                     None
                 }
             })
-            .max_by(|(v1, _), (v2, _)| v1.cmp(v2))
+            .max_by(|(v1, _), (v2, _)| compare_version_strings(v1, v2))
     }
 
     /// Look up an existing rich-form binding by exact `name@version`
@@ -1786,6 +1835,24 @@ impl TrustedDependencies {
             }
         }
     }
+}
+
+fn parse_version_for_order(version: &str) -> Option<lpm_semver::Version> {
+    lpm_semver::Version::parse(version).ok()
+}
+
+fn compare_version_strings(left: &str, right: &str) -> std::cmp::Ordering {
+    match (
+        parse_version_for_order(left),
+        parse_version_for_order(right),
+    ) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
+fn version_string_precedes(left: &str, right: &str) -> bool {
+    compare_version_strings(left, right).is_lt()
 }
 
 /// Discover the workspace from a starting directory.
@@ -5329,7 +5396,8 @@ catalogs:
     //
     // The selector must be deterministic: HashMap iteration order isn't,
     // so `map.iter().find(...)` would pick different entries across runs
-    // when multiple matches exist. Policy: lexicographic-max on version.
+    // when multiple matches exist. Policy: semver-highest version, with
+    // lexical fallback for versions outside npm semver.
 
     fn trusted_dep_binding_with_provenance(publisher: &str) -> TrustedDependencyBinding {
         TrustedDependencyBinding {
@@ -5431,21 +5499,15 @@ catalogs:
         assert_eq!(version, "1.14.0");
     }
 
-    /// **Reviewer finding — Finding 2 primary regression guard.** With
-    /// multiple provenance-bearing approvals for the same name, the
-    /// selector MUST return a deterministic choice. Sensible
-    /// deterministic rule: lexicographic-max version string. Without
-    /// determinism the drift verdict itself can flip across runs
-    /// when the matched entries carry different identities.
     #[test]
-    fn provenance_reference_picks_lex_max_version_deterministically() {
+    fn provenance_reference_picks_semver_highest_version_deterministically() {
         let mut map = HashMap::new();
         map.insert(
-            "axios@1.14.0".to_string(),
+            "axios@1.9.0".to_string(),
             trusted_dep_binding_with_provenance("github:axios/axios"),
         );
         map.insert(
-            "axios@2.0.0".to_string(),
+            "axios@1.10.0".to_string(),
             trusted_dep_binding_with_provenance("github:axios/axios-next"),
         );
         map.insert(
@@ -5454,17 +5516,15 @@ catalogs:
         );
         let trusted = TrustedDependencies::Rich(map);
 
-        // Run the selector multiple times — must always pick
-        // `2.0.0` (lex-max). In the pre-fix HashMap-order impl this
-        // would be non-deterministic across runs (and even within a
-        // run given `#[repr(...)]`-induced hash-state changes).
+        // Run the selector multiple times — must always pick the same
+        // semver-highest entry regardless of HashMap iteration order.
         for _ in 0..8 {
             let (version, binding) = trusted
                 .provenance_reference_for_name("axios")
                 .expect("at least one match");
             assert_eq!(
-                version, "2.0.0",
-                "selector must always pick lex-max; got {version}",
+                version, "1.13.5",
+                "selector must always pick semver-highest; got {version}",
             );
             assert_eq!(
                 binding
@@ -5473,10 +5533,89 @@ catalogs:
                     .unwrap()
                     .publisher
                     .as_deref(),
-                Some("github:axios/axios-next"),
-                "binding returned must correspond to the lex-max key",
+                Some("github:axios/axios"),
+                "binding returned must correspond to the semver-highest key",
             );
         }
+    }
+
+    #[test]
+    fn provenance_reference_for_candidate_prefers_exact_approval_over_higher_version() {
+        let mut map = HashMap::new();
+        map.insert(
+            "esbuild@0.25.12".to_string(),
+            TrustedDependencyBinding {
+                provenance_at_approval: Some(ProvenanceSnapshot {
+                    present: false,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        map.insert(
+            "esbuild@0.28.0".to_string(),
+            trusted_dep_binding_with_provenance("github:evanw/esbuild"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let (version, binding) = trusted
+            .provenance_reference_for_candidate("esbuild", "0.25.12")
+            .expect("exact approval is the drift reference");
+
+        assert_eq!(version, "0.25.12");
+        assert_eq!(
+            binding
+                .provenance_at_approval
+                .as_ref()
+                .map(|snapshot| snapshot.present),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn provenance_reference_for_candidate_does_not_use_higher_version_as_reference() {
+        let mut map = HashMap::new();
+        map.insert(
+            "esbuild@0.28.0".to_string(),
+            trusted_dep_binding_with_provenance("github:evanw/esbuild"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        assert!(
+            trusted
+                .provenance_reference_for_candidate("esbuild", "0.25.12")
+                .is_none(),
+            "a future approved version must not be used as the drift reference for an older candidate",
+        );
+    }
+
+    #[test]
+    fn provenance_reference_for_candidate_uses_prior_approval_for_upgrade() {
+        let mut map = HashMap::new();
+        map.insert(
+            "axios@1.9.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/old"),
+        );
+        map.insert(
+            "axios@1.10.0".to_string(),
+            trusted_dep_binding_with_provenance("github:axios/current"),
+        );
+        let trusted = TrustedDependencies::Rich(map);
+
+        let (version, binding) = trusted
+            .provenance_reference_for_candidate("axios", "1.11.0")
+            .expect("prior approval is the drift reference");
+
+        assert_eq!(version, "1.10.0");
+        assert_eq!(
+            binding
+                .provenance_at_approval
+                .as_ref()
+                .unwrap()
+                .publisher
+                .as_deref(),
+            Some("github:axios/current"),
+        );
     }
 
     /// Scoped package names (`@scope/pkg`) must split cleanly at the
