@@ -1,0 +1,144 @@
+use super::*;
+
+/// Hard cap on the number of bytes we will buffer from a single metadata
+/// response body. Real packuments — even for the largest npm packages
+/// like `react` or `lodash` — top out at ~10-20 MB; LPM requests the
+/// abbreviated packument format (`application/vnd.npm.install-v1+json`)
+/// which trims further. 100 MB is several×-headroom over any
+/// legitimate metadata response and orders of magnitude below a
+/// memory-exhaustion attack from a compromised mirror or MITM.
+pub(super) const MAX_METADATA_BYTES: usize = 100 * 1024 * 1024;
+
+/// Hard cap for non-metadata API responses (whoami, token check,
+/// quality/skills, tunnel domain ops, publish ack, error bodies).
+/// These payloads are kilobytes in practice; 10 MB gives several
+/// orders of magnitude of headroom over the legitimate envelope and
+/// stops a hostile / compromised mirror from OOM-ing the CLI on a
+/// path that never needed metadata-sized buffers.
+pub(super) const MAX_API_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+pub(super) const UTF8_BOM_BYTES: &[u8] = b"\xEF\xBB\xBF";
+
+pub(super) fn strip_json_bom_bytes(content: &[u8]) -> &[u8] {
+    content.strip_prefix(UTF8_BOM_BYTES).unwrap_or(content)
+}
+
+/// Drain a response body with a two-stage size cap.
+///
+/// Stage 1 (pre-stream): refuse when the server's declared
+/// `Content-Length` exceeds `cap` — no bytes are allocated for a
+/// hostile-declared-length response.
+///
+/// Stage 2 (mid-stream): for chunked / undeclared-length responses,
+/// accumulate `bytes_stream()` chunks into a bounded `Vec` and abort
+/// the moment another chunk would cross `cap`. Closing the response
+/// at that point drops the underlying connection.
+pub(super) async fn read_capped_body(
+    response: reqwest::Response,
+    cap: usize,
+    context: &str,
+) -> Result<Vec<u8>, LpmError> {
+    use futures::StreamExt;
+
+    if let Some(declared) = response.content_length()
+        && declared as usize > cap
+    {
+        return Err(LpmError::Registry(format!(
+            "{context}: declared body length {declared} exceeds cap {cap}"
+        )));
+    }
+
+    let mut buf: Vec<u8> = Vec::with_capacity(std::cmp::min(64 * 1024, cap));
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| LpmError::Registry(format!("{context}: body read error: {e}")))?;
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(LpmError::Registry(format!(
+                "{context}: streamed body exceeded cap {cap}"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Read a metadata-shaped JSON response with the metadata cap.
+///
+/// Wraps [`read_capped_body`] with the metadata-tier ceiling and
+/// `serde_json::from_slice`. Lets the metadata path share one
+/// streaming-cap implementation with the smaller-tier API path.
+pub(super) async fn parse_capped_metadata<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T, LpmError> {
+    let buf = read_capped_body(response, MAX_METADATA_BYTES, context).await?;
+    serde_json::from_slice(strip_json_bom_bytes(&buf))
+        .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
+}
+
+/// Read a non-metadata JSON response (whoami, token check, etc.) with
+/// the smaller API-tier cap. Exposed for callers outside this module
+/// (e.g., the `token` command, the `dlx` resolver) that operate on a
+/// raw `reqwest::Response` returned by [`RegistryClient::post_json_raw`]
+/// and would otherwise reach for `.json()` directly.
+pub async fn parse_capped_api_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T, LpmError> {
+    let buf = read_capped_body(response, MAX_API_RESPONSE_BYTES, context).await?;
+    serde_json::from_slice(strip_json_bom_bytes(&buf))
+        .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
+}
+
+/// Read an error-body response as UTF-8 text under the API-tier cap.
+///
+/// Returns the empty string on cap-overflow or read errors so the
+/// caller can still construct a typed error variant — the previous
+/// `response.text().await.unwrap_or_default()` shape is preserved
+/// but the buffer is now bounded.
+pub(super) async fn read_capped_error_text(response: reqwest::Response) -> String {
+    match read_capped_body(response, MAX_API_RESPONSE_BYTES, "error body").await {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+pub(super) fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = json_string_field(&value, "error")?;
+
+    match error {
+        "blocked_by_lpm_firewall" => {
+            let package = json_string_field(&value, "package").unwrap_or("requested package");
+            let verdict = json_string_field(&value, "verdict").unwrap_or("unknown");
+            let reason = json_string_field(&value, "reason")
+                .unwrap_or("the registry policy refused this download");
+            Some(LpmError::NpmFirewallBlocked {
+                package: package.to_owned(),
+                verdict: verdict.to_owned(),
+                reason: reason.to_owned(),
+                decision_id: json_string_field(&value, "decisionId").map(str::to_owned),
+                match_source: json_string_field(&value, "matchSource").map(str::to_owned),
+            })
+        }
+        "upstream_proxy_entitlement_required" => {
+            let message = json_string_field(&value, "message")
+                .unwrap_or("A Pro account or active org membership is required.");
+            Some(LpmError::UpstreamProxyEntitlementRequired {
+                message: message.to_owned(),
+                reason: json_string_field(&value, "reason").map(str::to_owned),
+                entitlement_source: json_string_field(&value, "entitlementSource")
+                    .map(str::to_owned),
+            })
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn forbidden_error_from_body(body: String) -> LpmError {
+    parse_lpm_worker_error_body(&body).unwrap_or(LpmError::Forbidden(body))
+}
+
+pub(super) fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(serde_json::Value::as_str)
+}
