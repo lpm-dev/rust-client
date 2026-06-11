@@ -4443,22 +4443,22 @@ mod tests {
     }
 
     #[test]
-    fn p6_chunk1_auto_build_call_site_threads_effective_policy() {
+    fn auto_build_call_site_threads_effective_policy() {
         // Pin the install → auto-build handoff: the `rebuild::run` call
-        // in install.rs must carry the resolved effective policy into
+        // in install/mod.rs must carry the resolved effective policy into
         // `rebuild::run`'s last arg. Without this invariant the
         // tier-promotion logic would never see triage at the auto-
-        // build site (install.rs today resolves effective_policy for
+        // build site (install/mod.rs today resolves effective_policy for
         // the blocked-hint block only).
         let src = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/commands/install.rs"
+            "/src/commands/install/mod.rs"
         ));
         const MARKER: &str = "step10_effective_policy";
         let count = src.matches(MARKER).count();
         assert!(
             count >= 3,
-            "expected at least 3 references to `{MARKER}` in install.rs (the \
+            "expected at least 3 references to `{MARKER}` in install/mod.rs (the \
              `let` binding + `all_scripted_packages_trusted` arg + `rebuild::run` \
              arg). Found {count}. If the auto-build handoff was refactored, \
              update this assertion — but make sure both callees still receive \
