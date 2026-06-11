@@ -2,8 +2,9 @@
 //!
 //! Key policies (following pnpm v10 and Bun best practices):
 //!
-//! 1. **Lifecycle scripts blocked by default** — `preinstall`, `install`, `postinstall`
-//!    scripts are NOT executed unless the package is in `trustedDependencies`.
+//! 1. **Dependency lifecycle scripts blocked by default** — `preinstall`, `install`,
+//!    `postinstall` scripts are NOT executed for dependencies unless the package
+//!    is in `trustedDependencies`.
 //!    This prevents supply chain attacks via malicious postinstall scripts.
 //!
 //! 2. **Trusted dependencies allowlist** — packages in `"lpm": { "trustedDependencies": [...] }`
@@ -32,10 +33,10 @@ use time::format_description::well_known::Iso8601;
 // `lpm-workspace` (the schema crate) but used most heavily here.
 pub use lpm_workspace::{TrustMatch, TrustedDependencies, TrustedDependencyBinding};
 
-/// Lifecycle script names that are blocked by default.
+/// Dependency lifecycle script names that are blocked by default.
 ///
-/// This is the BROAD set — every phase that LPM refuses to execute by
-/// default at install time. It is a strict superset of
+/// This is the BROAD set — every dependency phase that LPM refuses to
+/// execute by default at install time. It is a strict superset of
 /// [`EXECUTED_INSTALL_PHASES`] (which is the narrow set the build pipeline
 /// actually runs) so that detection in source manifests catches every
 /// dangerous phase even if some are inert in the current pipeline.
@@ -50,14 +51,15 @@ const BLOCKED_SCRIPTS: &[&str] = &[
     "prepublishOnly",
 ];
 
-/// Lifecycle script phases that the install-time `lpm rebuild` pipeline
+/// Dependency lifecycle script phases that the install-time `lpm rebuild` pipeline
 /// **actually runs**, in execution order.
 ///
 /// The `script_hash` approval binding covers EXACTLY these scripts.
-/// Editing a non-executed script like `prepare` does NOT invalidate
-/// approvals because that script never runs at install time. Conversely,
-/// any change to one of these three DOES invalidate approvals because
-/// that's bytes the user previously trusted to execute.
+/// Editing a non-executed dependency script like `prepare` does NOT
+/// invalidate approvals because that dependency script never runs in the
+/// rebuild pipeline. Conversely, any change to one of these three DOES
+/// invalidate approvals because that's bytes the user previously trusted to
+/// execute.
 ///
 /// This const is the SINGLE source of truth — `lpm-cli/src/commands/build.rs`
 /// imports it instead of defining its own `SCRIPT_PHASES` list, and

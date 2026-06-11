@@ -26,7 +26,6 @@ use std::sync::{Mutex, OnceLock};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GuardedControl {
-    CooldownBypass,
     CooldownWindow,
     ProvenanceDriftWaiver,
     UnverifiedProvenance,
@@ -40,7 +39,6 @@ pub enum GuardedControl {
 impl GuardedControl {
     fn as_str(self) -> &'static str {
         match self {
-            Self::CooldownBypass => "cooldown_bypass",
             Self::CooldownWindow => "cooldown_window",
             Self::ProvenanceDriftWaiver => "provenance_drift_waiver",
             Self::UnverifiedProvenance => "unverified_provenance",
@@ -365,16 +363,16 @@ mod tests {
     fn suppressions_are_deduped() {
         clear_recorded_suppressions_for_tests();
         let record = SuppressionRecord::new(
-            GuardedControl::CooldownBypass,
+            GuardedControl::CooldownWindow,
             SuppressionSource::Cli,
-            "allow-new",
+            "0",
             "floor=86400",
         );
         record_suppression(record.clone(), true);
         record_suppression(record, true);
         let got = recorded_suppressions();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].control, GuardedControl::CooldownBypass);
+        assert_eq!(got[0].control, GuardedControl::CooldownWindow);
         clear_recorded_suppressions_for_tests();
     }
 }

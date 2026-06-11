@@ -71,7 +71,7 @@ jobs:
       # modules (Chunk 4 caught two pre-existing `assert_eq!(x, false)`
       # lints in build_state.rs that this stricter invocation surfaces).
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Check formatting
         run: cargo fmt --check
@@ -133,16 +133,16 @@ jobs:
         uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
 
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Unit and integration tests (non-workflow, non-CLI)
-        run: cargo nextest run --workspace --exclude lpm-integration-tests --exclude lpm-workflows --exclude lpm-cli --no-fail-fast --status-level slow --final-status-level fail
+        run: cargo nextest run --locked --workspace --exclude lpm-integration-tests --exclude lpm-workflows --exclude lpm-cli --no-fail-fast --status-level slow --final-status-level fail
 
       - name: CLI unit tests (serial libtest)
-        run: cargo test -p lpm-cli --bin lpm-rs -- --test-threads=1
+        run: cargo test --locked -p lpm-cli --bin lpm-rs -- --test-threads=1
 
       - name: CLI binary-surface tests
-        run: cargo nextest run -p lpm-cli -E 'not binary_id(/bin\/lpm-rs/)' --no-fail-fast --status-level slow --final-status-level fail
+        run: cargo nextest run --locked -p lpm-cli -E 'not binary_id(/bin\/lpm-rs/)' --no-fail-fast --status-level slow --final-status-level fail
 
   full-nextest:
     name: Full isolated nextest
@@ -163,6 +163,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-full-nextest-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-full-nextest-${{ env.RUST_TOOLCHAIN }}-
 
@@ -196,10 +197,10 @@ jobs:
           npx --yes "verdaccio@$VERDACCIO_VERSION" --version
 
       - name: Full workspace nextest
-        run: cargo nextest run --workspace --exclude lpm-integration-tests --ignore-default-filter --no-fail-fast --status-level slow --final-status-level fail
+        run: cargo nextest run --locked --workspace --exclude lpm-integration-tests --ignore-default-filter --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Audit-scale workflow fixtures
-        run: cargo nextest run -P audit -p lpm-workflows --test install_realworld --run-ignored only --no-fail-fast --status-level slow --final-status-level fail
+        run: cargo nextest run --locked -P audit -p lpm-workflows --test install_realworld --run-ignored only --no-fail-fast --status-level slow --final-status-level fail
 
   windows-platform-backends:
     name: Windows platform backend runtime checks
@@ -229,16 +230,16 @@ jobs:
           node-version: "22"
 
       - name: Windows port backend tests
-        run: cargo test -p lpm-runner ports::tests
+        run: cargo test --locked -p lpm-runner ports::tests
 
       - name: Windows proxy named-pipe tests
-        run: cargo test -p lpm-proxy named_pipe
+        run: cargo test --locked -p lpm-proxy named_pipe
 
       - name: Build CLI for workflow backend test
-        run: cargo build -p lpm-cli
+        run: cargo build --locked -p lpm-cli
 
       - name: Windows live port kill workflow test
-        run: cargo test -p lpm-workflows --test ports ports_kill_range_json_with_yes_terminates_live_listener_process
+        run: cargo test --locked -p lpm-workflows --test ports ports_kill_range_json_with_yes_terminates_live_listener_process
 
   audit-fixtures:
     name: Hoisted-mode compat audit (${{ matrix.os }} / ${{ matrix.store_version }})
@@ -317,7 +318,7 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: Build lpm-rs (release)
-        run: cargo build --release -p lpm-cli
+        run: cargo build --locked --release -p lpm-cli
 
       - name: Install audit security policy
         if: runner.os == 'Linux'
@@ -385,7 +386,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Build lpm-rs (release)
-        run: cargo build --release -p lpm-cli
+        run: cargo build --locked --release -p lpm-cli
 
       - name: Install audit security policy
         run: sudo ./bench/install-audit-security-policy.sh
@@ -448,7 +449,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Build lpm-rs (release)
-        run: cargo build --release -p lpm-cli
+        run: cargo build --locked --release -p lpm-cli
 
       - name: Install audit security policy
         run: sudo ./bench/install-audit-security-policy.sh
@@ -499,7 +500,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-bench-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Run benchmarks
-        run: cargo bench -p lpm-security 2>&1 | grep -E '^test |^Benchmarking' | tee bench-output.txt
+        run: cargo bench --locked -p lpm-security 2>&1 | grep -E '^test |^Benchmarking' | tee bench-output.txt
 
       - name: Verify benchmarks ran
         run: |
