@@ -641,30 +641,18 @@ where
                 }
             };
 
-            // Strip first component (e.g., "package/src/index.js" → "src/index.js")
-            let stripped = strip_first_component(&original_path);
-            let Some(relative_path) = stripped else {
-                continue;
+            let relative_path = match sanitize_entry_path(&original_path) {
+                Ok(Some(path)) => path,
+                Ok(None) => continue,
+                Err(error) => {
+                    return rollback_extraction(
+                        &extraction_root,
+                        &extracted_files,
+                        &created_dirs,
+                        error,
+                    );
+                }
             };
-
-            if relative_path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )
-            }) {
-                return rollback_extraction(
-                    &extraction_root,
-                    &extracted_files,
-                    &created_dirs,
-                    LpmError::Registry(format!(
-                        "path traversal detected in tarball: {}",
-                        original_path.display()
-                    )),
-                );
-            }
 
             let target_path = match prepare_output_path(
                 &extraction_root,
@@ -1122,7 +1110,7 @@ where
             let entry = entry_result?;
             if entry.header().entry_type().is_file() {
                 let path = entry.path()?.into_owned();
-                if let Some(stripped) = strip_first_component(&path) {
+                if let Some(stripped) = sanitize_entry_path(&path)? {
                     files.push(stripped);
                 }
             }
@@ -1144,6 +1132,33 @@ fn strip_first_component(path: &Path) -> Option<PathBuf> {
     } else {
         Some(rest)
     }
+}
+
+/// Convert a tar entry path into a package-relative extraction path.
+///
+/// npm package tarballs conventionally wrap files under a first `package/`
+/// component. The returned path has that component stripped and rejects any
+/// remaining traversal, root, or platform-prefix components.
+pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
+    let Some(relative_path) = strip_first_component(path) else {
+        return Ok(None);
+    };
+
+    if relative_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(LpmError::Registry(format!(
+            "path traversal detected in tarball: {}",
+            path.display()
+        )));
+    }
+
+    Ok(Some(relative_path))
 }
 
 #[cfg(test)]
@@ -1550,6 +1565,27 @@ mod tests {
         );
         // Just the prefix directory itself → None
         assert_eq!(strip_first_component(Path::new("package")), None);
+    }
+
+    #[test]
+    fn sanitize_entry_path_strips_package_prefix() {
+        assert_eq!(
+            sanitize_entry_path(Path::new("package/src/index.js")).unwrap(),
+            Some(PathBuf::from("src/index.js"))
+        );
+        assert_eq!(sanitize_entry_path(Path::new("package")).unwrap(), None);
+    }
+
+    #[test]
+    fn sanitize_entry_path_rejects_traversal_after_prefix() {
+        let error = sanitize_entry_path(Path::new("package/../outside.txt"))
+            .expect_err("path traversal must be rejected")
+            .to_string();
+
+        assert!(
+            error.contains("path traversal detected"),
+            "expected traversal diagnostic, got: {error}"
+        );
     }
 
     #[test]
