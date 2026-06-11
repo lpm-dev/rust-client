@@ -469,9 +469,8 @@ pub(super) fn read_trusted_deps_from_manifest(
 ///
 /// Mirrors the worst-of reduction in
 /// [`crate::build_state::compute_blocked_packages_with_metadata`]
-/// and [`crate::commands::rebuild::evaluate_trust_unsuspended`] so
-/// the advisor pass agrees with both downstream consumers on which
-/// packages are amber-eligible.
+/// and the rebuild trust evaluator so the advisor pass agrees with
+/// both downstream consumers on which packages are amber-eligible.
 pub(super) fn collect_amber_classification_requests(
     store: &lpm_store::PackageStore,
     packages: &[(String, String, Option<String>)],
