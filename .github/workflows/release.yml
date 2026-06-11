@@ -46,6 +46,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-release-verify-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-verify-${{ env.RUST_TOOLCHAIN }}-
 
@@ -79,13 +80,13 @@ jobs:
           npx --yes "verdaccio@$VERDACCIO_VERSION" --version
 
       - name: Build workspace
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: Full workspace nextest
-        run: cargo nextest run --workspace --exclude lpm-integration-tests --ignore-default-filter --no-fail-fast --status-level slow --final-status-level fail
+        run: cargo nextest run --locked --workspace --exclude lpm-integration-tests --ignore-default-filter --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Audit-scale workflow fixtures
-        run: cargo nextest run -P audit -p lpm-workflows --test install_realworld --run-ignored only --no-fail-fast --status-level slow --final-status-level fail
+        run: cargo nextest run --locked -P audit -p lpm-workflows --test install_realworld --run-ignored only --no-fail-fast --status-level slow --final-status-level fail
 
   build:
     name: Build ${{ matrix.target }}
@@ -134,7 +135,7 @@ jobs:
           echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p lpm-cli
+        run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-cli
 
       # Phase 46.3 PR-2: the Windows runtime ships an additional
       # binary, `lpm-sandbox-helper.exe`, that delivers AppContainer
@@ -146,7 +147,7 @@ jobs:
       # the helper is a Windows-only sandbox backend.
       - name: Build sandbox helper (Windows)
         if: runner.os == 'Windows'
-        run: cargo build --release --target ${{ matrix.target }} -p lpm-sandbox --bin lpm-sandbox-helper
+        run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-sandbox --bin lpm-sandbox-helper
 
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'

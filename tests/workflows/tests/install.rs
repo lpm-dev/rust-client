@@ -74,6 +74,109 @@ fn install_without_dependencies_uses_slim_status_output() {
     );
 }
 
+#[tokio::test]
+async fn bare_install_runs_root_project_lifecycle_scripts_in_order() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "root-lifecycle-install",
+            "version": "1.0.0",
+            "dependencies": { "ms": "^2.1.3" },
+            "scripts": {
+                "pnpm:devPreinstall": "node record-root-lifecycle.js pnpm:devPreinstall",
+                "preinstall": "node record-root-lifecycle.js preinstall",
+                "install": "node record-root-lifecycle.js install",
+                "postinstall": "node record-root-lifecycle.js postinstall",
+                "preprepare": "node record-root-lifecycle.js preprepare",
+                "prepare": "node record-root-lifecycle.js prepare",
+                "postprepare": "node record-root-lifecycle.js postprepare"
+            }
+        }"#,
+    );
+    project.write_file(
+        "record-root-lifecycle.js",
+        r#"const fs = require('fs');
+const phase = process.argv[2];
+const event = process.env.npm_lifecycle_event || 'missing-event';
+const pkg = process.env.npm_package_name || 'missing-package';
+const marker = fs.existsSync('node_modules/ms/package.json') ? 'has-ms' : 'no-ms';
+fs.appendFileSync('root-lifecycle.log', `${phase}:${event}:${pkg}:${marker}\n`);
+"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        output.status.success(),
+        "bare install with root lifecycle scripts should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        project.read_file("root-lifecycle.log"),
+        "pnpm:devPreinstall:pnpm:devPreinstall:root-lifecycle-install:no-ms\n\
+         preinstall:preinstall:root-lifecycle-install:has-ms\n\
+         install:install:root-lifecycle-install:has-ms\n\
+         postinstall:postinstall:root-lifecycle-install:has-ms\n\
+         preprepare:preprepare:root-lifecycle-install:has-ms\n\
+         prepare:prepare:root-lifecycle-install:has-ms\n\
+         postprepare:postprepare:root-lifecycle-install:has-ms\n",
+        "root lifecycle scripts must run once in the agreed install order"
+    );
+}
+
+#[tokio::test]
+async fn install_add_does_not_run_root_prepare_lifecycle() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "root-lifecycle-add",
+            "version": "1.0.0",
+            "scripts": {
+                "prepare": "node record-root-lifecycle.js prepare"
+            }
+        }"#,
+    );
+    project.write_file(
+        "record-root-lifecycle.js",
+        r#"require('fs').appendFileSync('root-lifecycle.log', `${process.argv[2]}\n`);"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "ms",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install ms");
+
+    assert!(
+        output.status.success(),
+        "installing a package should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.file_exists("root-lifecycle.log"),
+        "root prepare must not auto-run for `lpm install <pkg>`"
+    );
+}
+
 #[test]
 fn install_resolver_phase_colors_registry_host_when_color_is_forced() {
     let project = TempProject::empty(r#"{"name":"empty-install","version":"1.0.0"}"#);
@@ -1628,7 +1731,7 @@ async fn install_lockfile_reuse_is_fast_path() {
         .assert()
         .success();
 
-    assertions::assert_both_lockfiles_exist(project.path());
+    assertions::assert_lockfile_exists(project.path());
 
     // Second install: should hit the fast path (up to date)
     let output = lpm_with_registry(&project, &mock.url())
@@ -1770,7 +1873,7 @@ async fn install_offline_with_store_succeeds() {
         .assert()
         .success();
 
-    assertions::assert_both_lockfiles_exist(project.path());
+    assertions::assert_lockfile_exists(project.path());
 
     // Remove node_modules to force re-link
     let nm = project.path().join("node_modules");

@@ -356,8 +356,23 @@ pub fn run_command_buffered(
     env_mode: Option<&str>,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
+    run_command_buffered_with_envs(project_dir, command, extra_args, env_mode, &[], bin_hint)
+}
+
+/// Run an explicit command with fully captured output and additional env vars.
+pub fn run_command_buffered_with_envs(
+    project_dir: &Path,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    for (key, value) in extra_envs {
+        env_vars.insert(key.clone(), value.clone());
+    }
     mark_script_child_env(&mut env_vars);
 
     let full_cmd = assemble_shell_command(command, extra_args);
@@ -480,8 +495,23 @@ pub fn run_command(
     env_mode: Option<&str>,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
+    run_command_with_envs(project_dir, command, extra_args, env_mode, &[], bin_hint)
+}
+
+/// Run an explicit command string with additional environment variables.
+pub fn run_command_with_envs(
+    project_dir: &Path,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<(), LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
     let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    for (key, value) in extra_envs {
+        env_vars.insert(key.clone(), value.clone());
+    }
     mark_script_child_env(&mut env_vars);
 
     let full_cmd = assemble_shell_command(command, extra_args);

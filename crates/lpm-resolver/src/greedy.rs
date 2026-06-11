@@ -1405,11 +1405,13 @@ fn process_edge(
             VersionPick::BlockedByReleaseAge {
                 version,
                 remaining_secs,
+                minimum_secs,
             } => handle_policy_blocked(
                 edge,
                 PolicyBlock::ReleaseAge {
                     version,
                     remaining_secs,
+                    minimum_secs,
                 },
             ),
             VersionPick::BlockedByTrustPolicy { version, reason } => {
@@ -1544,12 +1546,14 @@ fn process_edge_inner(
                 VersionPick::BlockedByReleaseAge {
                     version,
                     remaining_secs,
+                    minimum_secs,
                 } => {
                     return handle_policy_blocked(
                         edge,
                         PolicyBlock::ReleaseAge {
                             version,
                             remaining_secs,
+                            minimum_secs,
                         },
                     );
                 }
@@ -1572,6 +1576,7 @@ fn process_edge_inner(
                 PolicyBlock::ReleaseAge {
                     version: target_version,
                     remaining_secs: state.policy.minimum_release_age_secs(),
+                    minimum_secs: state.policy.minimum_release_age_secs(),
                 },
             );
         }
@@ -1581,6 +1586,7 @@ fn process_edge_inner(
                 PolicyBlock::ReleaseAge {
                     version: target_version,
                     remaining_secs,
+                    minimum_secs: state.policy.minimum_release_age_secs(),
                 },
             );
         }
@@ -1761,6 +1767,7 @@ enum PolicyBlock {
     ReleaseAge {
         version: NpmVersion,
         remaining_secs: u64,
+        minimum_secs: u64,
     },
     TrustPolicy {
         version: NpmVersion,
@@ -1781,8 +1788,9 @@ fn handle_policy_blocked(edge: &Edge, block: PolicyBlock) -> Result<(), ResolveE
         PolicyBlock::ReleaseAge {
             version,
             remaining_secs,
+            minimum_secs,
         } => format!(
-            "{version} published too recently for minimumReleaseAge; {remaining_secs}s remaining"
+            "{version} published too recently for minimumReleaseAge; {remaining_secs}s remaining (minimumReleaseAge={minimum_secs}s)"
         ),
         PolicyBlock::TrustPolicy { version, reason } => {
             format!("{version} blocked by trust-policy no-downgrade: {reason}")
@@ -2624,6 +2632,7 @@ enum VersionPick {
     BlockedByReleaseAge {
         version: NpmVersion,
         remaining_secs: u64,
+        minimum_secs: u64,
     },
     /// The selected candidate would reduce publisher/provenance trust.
     BlockedByTrustPolicy { version: NpmVersion, reason: String },
@@ -2663,6 +2672,7 @@ fn find_best_version_with_policy(
                 return VersionPick::BlockedByReleaseAge {
                     version: v.clone(),
                     remaining_secs: policy.minimum_release_age_secs(),
+                    minimum_secs: policy.minimum_release_age_secs(),
                 };
             }
             ReleaseTimeStatus::TooNew { remaining_secs } => {
@@ -2670,6 +2680,7 @@ fn find_best_version_with_policy(
                     first_policy_block = Some(VersionPick::BlockedByReleaseAge {
                         version: v.clone(),
                         remaining_secs,
+                        minimum_secs: policy.minimum_release_age_secs(),
                     });
                 }
                 continue;

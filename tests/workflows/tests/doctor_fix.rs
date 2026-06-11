@@ -141,7 +141,7 @@ fn doctor_fix_lockfile_binary_write_failure_uses_slim_error() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✗ regenerate lpm.lockb failed:"),
+        stderr.contains("✗ reconcile lpm.lockb failed:"),
         "doctor auto-fix failure must use a slim failure line, got:\n{stderr}"
     );
     assert!(

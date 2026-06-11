@@ -52,6 +52,7 @@ pub mod registry_reads;
 pub mod remote_cache;
 pub mod remove;
 pub mod resolve;
+pub mod root_lifecycle;
 pub mod run;
 pub mod sbom;
 pub mod schema;
