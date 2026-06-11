@@ -2953,6 +2953,7 @@ mod tests {
     use crate::build_state::{BUILD_STATE_VERSION, BlockedPackage, BuildState};
     use crate::provenance_fetch::{EnforceMode, SkipPolicy, VerifyPolicy};
     use lpm_workspace::TrustedDependencyBinding;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -2960,23 +2961,84 @@ mod tests {
 
     // ── snapshot_for_binding_with_mode (rollout knob) ───
 
-    fn ensure_security_test_backend() {
+    const TEST_SECURITY_AUTH_RESULT_ENV: &str = "LPM_TEST_SECURITY_AUTH_RESULT";
+    const TEST_SECURITY_DIR_ENV: &str = "LPM_SECURITY_DIR";
+    const TEST_SECURITY_SECRET_ENV: &str = "LPM_TEST_SECURITY_SECRET_HEX";
+    const TEST_SECURITY_SECRET: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn security_test_dir() -> &'static PathBuf {
         static SECURITY_DIR: OnceLock<PathBuf> = OnceLock::new();
-        let dir = SECURITY_DIR.get_or_init(|| {
+        SECURITY_DIR.get_or_init(|| {
             let dir = tempfile::tempdir().expect("security backend tempdir");
             let path = dir.path().to_path_buf();
             std::mem::forget(dir);
-            unsafe {
-                std::env::set_var("LPM_SECURITY_DIR", &path);
-                std::env::set_var(
-                    "LPM_TEST_SECURITY_SECRET_HEX",
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                );
-                std::env::set_var("LPM_TEST_SECURITY_AUTH_RESULT", "approve");
-            }
             path
-        });
-        let _ = dir;
+        })
+    }
+
+    fn security_test_env_vars() -> [(&'static str, OsString); 3] {
+        [
+            (
+                TEST_SECURITY_DIR_ENV,
+                security_test_dir().as_os_str().to_owned(),
+            ),
+            (TEST_SECURITY_SECRET_ENV, TEST_SECURITY_SECRET.into()),
+            (TEST_SECURITY_AUTH_RESULT_ENV, "approve".into()),
+        ]
+    }
+
+    fn ensure_security_test_backend() -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::set(security_test_env_vars())
+    }
+
+    fn scoped_lpm_home_with_security(path: &Path) -> crate::test_env::ScopedEnv {
+        let mut vars = security_test_env_vars().to_vec();
+        vars.push(("LPM_HOME", path.as_os_str().to_owned()));
+        crate::test_env::ScopedEnv::set(vars)
+    }
+
+    struct RawEnvRestore {
+        key: &'static str,
+        value: Option<OsString>,
+    }
+
+    impl RawEnvRestore {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                value: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for RawEnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.value {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_security_test_backend_restores_auto_approval_env() {
+        let _restore = RawEnvRestore::capture(TEST_SECURITY_AUTH_RESULT_ENV);
+        unsafe {
+            std::env::remove_var(TEST_SECURITY_AUTH_RESULT_ENV);
+        }
+
+        {
+            let _security_backend = ensure_security_test_backend();
+            assert_eq!(
+                std::env::var(TEST_SECURITY_AUTH_RESULT_ENV).as_deref(),
+                Ok("approve"),
+            );
+        }
+
+        assert!(std::env::var_os(TEST_SECURITY_AUTH_RESULT_ENV).is_none());
     }
 
     fn verified_status() -> ProvenanceStatus {
@@ -3242,7 +3304,6 @@ mod tests {
     }
 
     fn write_state(project_dir: &Path, blocked: Vec<BlockedPackage>) {
-        ensure_security_test_backend();
         let state = BuildState {
             state_version: BUILD_STATE_VERSION,
             blocked_set_fingerprint: "sha256-test".to_string(),
@@ -3254,7 +3315,6 @@ mod tests {
     }
 
     fn write_default_manifest(dir: &Path) {
-        ensure_security_test_backend();
         write_manifest(
             &dir.join("package.json"),
             &serde_json::json!({"name": "test", "version": "0.0.0"}),
@@ -3338,6 +3398,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_scripts_yes_approves_everything_and_writes_rich_form() {
+        let _security_backend = ensure_security_test_backend();
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(
@@ -3368,6 +3429,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_scripts_yes_emits_warning_in_json_mode() {
+        let _security_backend = ensure_security_test_backend();
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -3383,6 +3445,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_scripts_yes_legacy_array_upgrades_to_rich() {
+        let _security_backend = ensure_security_test_backend();
         let dir = tempdir().unwrap();
         write_manifest(
             &dir.path().join("package.json"),
@@ -3412,6 +3475,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_scripts_yes_preserves_unrelated_manifest_fields() {
+        let _security_backend = ensure_security_test_backend();
         let dir = tempdir().unwrap();
         write_manifest(
             &dir.path().join("package.json"),
@@ -3444,6 +3508,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_scripts_specific_package_by_name_approves_only_that_one() {
+        let _security_backend = ensure_security_test_backend();
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(
@@ -3475,6 +3540,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_scripts_specific_package_with_at_version_approves_only_that_one() {
+        let _security_backend = ensure_security_test_backend();
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -3530,6 +3596,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_scripts_writes_atomic_via_temp_file_rename() {
+        let _security_backend = ensure_security_test_backend();
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -3985,6 +4052,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_install_block_review_approve_yes_then_install_is_silent() {
+        let _security_backend = ensure_security_test_backend();
         // The canonical happy path: blocked → approve --yes → silent.
         let project = tempdir().unwrap();
         let store_root = tempdir().unwrap();
@@ -4055,6 +4123,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_install_block_approve_specific_then_install_is_silent() {
+        let _security_backend = ensure_security_test_backend();
         // Same as the --yes flow but using `<pkg>` for a single approval.
         let project = tempdir().unwrap();
         let store_root = tempdir().unwrap();
@@ -4099,6 +4168,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_install_block_approve_then_script_drift_re_blocks() {
+        let _security_backend = ensure_security_test_backend();
         // The CRITICAL invariant — script_hash binding actually catches
         // post-approval drift. Approve, then mutate the script in the
         // store, then re-run install: package re-blocked with binding_drift = true.
@@ -4215,7 +4285,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_install_with_legacy_then_approve_yes_upgrades_to_rich() {
-        ensure_security_test_backend();
+        let _security_backend = ensure_security_test_backend();
         // Migration path: project starts with the legacy array form, a
         // NEW package gets installed that needs approval, --yes upgrades
         // the manifest to the rich form AND preserves the existing legacy
@@ -4358,6 +4428,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_yes_approves_all_green_and_does_not_refuse() {
+        let _security_backend = ensure_security_test_backend();
         // Inverse contract: an all-green blocked set passes the
         // gate and --yes approves as before.
         let project = tempdir().unwrap();
@@ -4402,6 +4473,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_yes_passes_through_when_static_tier_is_none_legacy_state() {
+        let _security_backend = ensure_security_test_backend();
         // Pre-P2 upgrade path: if the persisted BuildState predates
         // (static_tier = None on every entry), --yes must still
         // work so upgrading LPM doesn't silently break existing
@@ -4670,6 +4742,7 @@ mod tests {
     /// packages and not re-write them.
     #[tokio::test]
     async fn approve_scripts_yes_skips_packages_already_strict_approved_in_manifest() {
+        let _security_backend = ensure_security_test_backend();
         let dir = tempdir().unwrap();
         write_state(
             dir.path(),
@@ -4805,6 +4878,7 @@ mod tests {
     /// set (this is the whole point of script-hash binding).
     #[tokio::test]
     async fn approve_scripts_yes_does_not_skip_packages_with_binding_drift() {
+        let _security_backend = ensure_security_test_backend();
         let dir = tempdir().unwrap();
         // State file claims script_hash = sha256-NEW
         let mut blocked = make_blocked("esbuild", "0.25.1");
@@ -4860,6 +4934,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_scripts_yes_json_emits_warning_only_in_json_warnings_field() {
+        let _security_backend = ensure_security_test_backend();
         let dir = tempdir().unwrap();
         write_default_manifest(dir.path());
         write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
@@ -4917,7 +4992,6 @@ mod tests {
         top_level_version: &str,
         blocked_rows: Vec<AggregateBlockedRow>,
     ) {
-        ensure_security_test_backend();
         let rel_root = format!("installs/{}@{}", top_level, top_level_version);
         let install_root = root.global_root().join(&rel_root);
         std::fs::create_dir_all(&install_root).unwrap();
@@ -5122,7 +5196,7 @@ mod tests {
     /// detect bulk-approval flows.
     #[tokio::test]
     async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
-        ensure_security_test_backend();
+        let _security_backend = ensure_security_test_backend();
         let tmp = tempdir().unwrap();
         let root = lpm_common::LpmRoot::from_dir(tmp.path());
         let agg = AggregateBlockedSet {
@@ -5146,7 +5220,7 @@ mod tests {
     /// file, leaving other rows unapproved.
     #[tokio::test]
     async fn run_global_named_approves_only_the_matched_row() {
-        ensure_security_test_backend();
+        let _security_backend = ensure_security_test_backend();
         let tmp = tempdir().unwrap();
         let root = lpm_common::LpmRoot::from_dir(tmp.path());
         let agg = AggregateBlockedSet {
@@ -5412,9 +5486,8 @@ mod tests {
     /// silent clobber is observable as a missing binding.
     #[tokio::test]
     async fn global_named_approvals_do_not_clobber_each_other() {
-        ensure_security_test_backend();
         let tmp = tempdir().unwrap();
-        let _env = scoped_lpm_home(tmp.path());
+        let _env = scoped_lpm_home_with_security(tmp.path());
         let root_path = tmp.path().to_path_buf();
         let agg = AggregateBlockedSet {
             rows: vec![
