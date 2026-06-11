@@ -1,0 +1,757 @@
+use super::*;
+
+/// Decide whether `lpm install` should auto-fire `rebuild::run` after
+/// the install completes.
+///
+/// Triggers (any one is sufficient):
+/// - `--auto-build` CLI flag.
+/// - `lpm.scripts.autoBuild: true` in package.json.
+/// - All packages with unbuilt scripts are individually trusted (per
+///   strict binding / scope trust / capability gate). Triage policy
+///   green-tier promotion lands here via `evaluate_trust`.
+/// - `effective_policy == ScriptPolicy::Allow`. The user
+///   explicitly opted into "run all lifecycle scripts" via `--yolo`,
+///   `--policy=allow`, `package.json > lpm > scriptPolicy = "allow"`,
+///   or `~/.lpm/config.toml > script-policy = "allow"`. Today's
+///   pre-existing behavior required a SECOND `--auto-build` flag to
+///   actually run the scripts; that two-step was an apples-to-oranges
+///   gap vs `npm`/`pnpm`/`bun` (which all run scripts during install
+///   by default) AND was redundant ceremony given the user already
+///   consented via `--policy=allow`.
+///
+/// Triage policy is unchanged: greens auto-trust via `evaluate_trust`
+/// and ride the `all_trusted` path; ambers/reds still require explicit
+/// `--auto-build` or `lpm approve-scripts` review. That asymmetry is
+/// intentional — Triage's gate IS the safety mechanism, and "run
+/// greens automatically without an explicit second consent" is the
+/// existing semantic that ships.
+pub(super) fn should_auto_build(
+    auto_build_flag: bool,
+    config_auto_build: bool,
+    all_trusted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+) -> bool {
+    auto_build_flag
+        || config_auto_build
+        || all_trusted
+        || effective_policy == crate::script_policy_config::ScriptPolicy::Allow
+}
+
+/// Decide what advisor
+/// approval view (if any) should be forwarded to
+/// [`crate::build_state::capture_blocked_set_after_install_with_metadata`].
+///
+/// Why this is its own function rather than an inline ternary:
+///
+/// The advisor's `Approve` verdict has two coupled effects in an
+/// install — (1) the package's scripts execute via the
+/// `AdvisorApprovedThisRun` trust path during autoBuild, and (2) the
+/// package is omitted from the persisted blocked set so post-install
+/// messaging + `lpm approve-scripts` don't report stale "still
+/// blocked" state. Effect (2) is only correct when (1) actually
+/// fires.
+///
+/// In a mixed-triage install where the advisor approves package A
+/// but leaves package B blocked, with `--auto-build=false` and
+/// `lpm.scripts.autoBuild=false`, `all_trusted` is false →
+/// `auto_build_attempted` is false → no scripts run, AND A vanishes
+/// from `build-state.json` → no path back through
+/// `approve-scripts`. The user is left with "not executed, not
+/// reviewable" — a stranded approval. This helper closes that hole.
+///
+/// Returns the input view unchanged when autoBuild will actually
+/// execute approved scripts this run. Otherwise returns `None`, so
+/// approved-but-not-run packages stay in the blocked set and remain
+/// reviewable on a later `lpm approve-scripts` invocation. (The
+/// ephemeral approval set itself is discarded at end of run — by
+/// design.)
+///
+/// Takes the borrowed approvals view directly (rather than the full
+/// `AdvisorSession`) so the install caller can compose:
+/// `select_approvals_for_capture(auto_build_attempted,
+/// advisor_session.as_ref().map(|s| s.approvals()))`, and tests can
+/// pass a hand-built `HashSet` without constructing a real session.
+pub(super) fn select_approvals_for_capture(
+    auto_build_attempted: bool,
+    approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> Option<&std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>> {
+    if auto_build_attempted {
+        approvals
+    } else {
+        None
+    }
+}
+
+/// — decision half of the post-auto-build
+/// canonical pointer. Pure — returns the message string to emit, or
+/// `None` when no pointer should fire. I/O lives in
+/// [`maybe_emit_post_auto_build_triage_pointer`] below.
+///
+/// Gates (all must be true for a Some): (a) auto-build was actually
+/// attempted this run — a falsy predicate + `autoBuild: false` path
+/// never triggered `rebuild::run` and a pointer would misrepresent
+/// what happened; (b) `effective_policy` is
+/// [`crate::script_policy_config::ScriptPolicy::Triage`] — deny /
+/// allow keep pre- UX, with deny routing users through the
+/// pre-auto-build blocked hint and allow running everything (no
+/// blocked set in the canonical case); (c) `json_output` is false —
+/// JSON mode's channel is the per-entry `static_tier` enrichment in
+/// the `blocked_packages` array, so a stdout line would muddle that
+/// contract for agents; (d) `amber + red` count in the pre-auto-build
+/// capture is > 0 — if every blocked entry was green, the auto-build
+/// path built them all and nothing remains to review.
+///
+/// Counts come from the blocked set captured BEFORE auto-build ran.
+/// Under autoBuild+triage, the predicate trusts green+strict+scope
+/// entries, so the packages whose `.lpm-built` marker will NOT exist
+/// after auto-build are exactly the amber + red tier entries. This
+/// avoids a post-auto-build FS scan.
+pub(super) fn compute_post_auto_build_triage_pointer(
+    auto_build_attempted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) -> Option<String> {
+    if !auto_build_attempted {
+        return None;
+    }
+    if effective_policy != crate::script_policy_config::ScriptPolicy::Triage {
+        return None;
+    }
+    if json_output {
+        return None;
+    }
+    let (_green, amber, red) =
+        crate::build_state::count_blocked_by_tier(&blocked_capture.state.blocked_packages);
+    let remaining = amber + red;
+    if remaining == 0 {
+        return None;
+    }
+    Some(format!(
+        "{remaining} package(s) remain blocked after auto-build \
+         ({amber} amber, {red} red). Run `lpm approve-scripts` to review."
+    ))
+}
+
+/// — I/O half. See
+/// [`compute_post_auto_build_triage_pointer`] for the decision
+/// contract.
+pub(super) fn maybe_emit_post_auto_build_triage_pointer(
+    auto_build_attempted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) {
+    if let Some(msg) = compute_post_auto_build_triage_pointer(
+        auto_build_attempted,
+        effective_policy,
+        blocked_capture,
+        json_output,
+    ) {
+        output::warn(&msg);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn maybe_emit_post_install_lifecycle_hint(
+    lpm_root: &lpm_common::LpmRoot,
+    packages: &[InstallPackage],
+    policy: &lpm_security::SecurityPolicy,
+    project_dir: &Path,
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if json_output || !blocked_capture.should_emit_warning {
+        return Ok(());
+    }
+
+    if blocked_capture.all_clear_banner {
+        output::success(
+            "All previously-blocked packages have been approved. Run `lpm rebuild` to execute their scripts.",
+        );
+        return Ok(());
+    }
+
+    let script_policy_cfg =
+        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+    let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
+        project_dir,
+        script_policy_override,
+        &script_policy_cfg,
+        json_output,
+    )?;
+
+    match effective_policy {
+        crate::script_policy_config::ScriptPolicy::Triage => {
+            println!();
+            println!(
+                "{}",
+                crate::build_state::format_triage_summary_line(
+                    &blocked_capture.state.blocked_packages
+                )
+            );
+        }
+        crate::script_policy_config::ScriptPolicy::Allow => {}
+        crate::script_policy_config::ScriptPolicy::Deny => {
+            let all_pkgs: Vec<(String, String, Option<String>)> = packages
+                .iter()
+                .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+                .collect();
+            crate::commands::rebuild::show_install_build_hint(
+                lpm_root,
+                &all_pkgs,
+                policy,
+                project_dir,
+                requested_capabilities,
+                user_bound,
+            );
+            output::info(
+                "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
+            );
+        }
+    }
+
+    maybe_emit_post_install_version_diff_hints(project_dir, blocked_capture, json_output);
+    Ok(())
+}
+
+/// Compute per-package terse version-diff
+/// hints for the post-install blocked-set warning.
+///
+/// Iterates `blocked_capture.state.blocked_packages`; for each entry
+/// whose prior-approved binding exists under the same package name
+/// (via [`lpm_workspace::TrustedDependencies::latest_binding_for_name`]),
+/// computes the diff and renders a terse one-liner. Skips entries
+/// with no prior binding (first-time review — nothing to diff
+/// against) and entries whose reason is
+/// [`crate::version_diff::VersionDiffReason::NoChange`].
+///
+/// Pure: no I/O. Returned `Vec<String>` lines are ready for a
+/// stderr emitter. Entries are in `blocked_packages` order
+/// (already sorted by `(name, version)` — see
+/// [`crate::build_state::compute_blocked_packages_with_metadata`]).
+pub(super) fn compute_post_install_version_diff_hints(
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    trusted: &lpm_workspace::TrustedDependencies,
+) -> Vec<String> {
+    let mut hints = Vec::new();
+    for bp in &blocked_capture.state.blocked_packages {
+        let Some((prior_version, binding)) = trusted.latest_binding_for_name(&bp.name, &bp.version)
+        else {
+            continue;
+        };
+        let diff = crate::version_diff::compute_version_diff(prior_version, binding, bp);
+        if let Some(line) = crate::version_diff::render_terse_hint(&diff, &bp.name) {
+            hints.push(line);
+        }
+    }
+    hints
+}
+
+/// Emit the per-package version-diff
+/// hints from [`compute_post_install_version_diff_hints`] to stderr
+/// beneath the existing post-install blocked-set warning.
+///
+/// Suppressed under `json_output=true` (C4 will enrich the JSON
+/// shape with a structured `version_diff` object per entry; the
+/// human lines on stdout would break `JSON.parse` on the machine
+/// channel — same stream-separation discipline as structured JSON output).
+///
+/// Reads `trustedDependencies` from `<project_dir>/package.json`.
+/// Fails gracefully on I/O / parse error: the diff hints are a
+/// UX enrichment, not a gate, so a missing or malformed manifest
+/// just suppresses them rather than failing the install.
+pub(super) fn maybe_emit_post_install_version_diff_hints(
+    project_dir: &Path,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) {
+    if json_output {
+        return;
+    }
+    if blocked_capture.state.blocked_packages.is_empty() {
+        return;
+    }
+    let Some(trusted) = read_trusted_deps_from_manifest(project_dir) else {
+        return;
+    };
+    let hints = compute_post_install_version_diff_hints(blocked_capture, &trusted);
+    if hints.is_empty() {
+        return;
+    }
+    // Stream-separation: stderr for human output. Matches the
+    // fix (`eprintln!`) so `--json` consumers never see the
+    // hints interleaved with machine output.
+    eprintln!();
+    eprintln!("  Changes since prior approval:");
+    for line in &hints {
+        eprintln!("{line}");
+    }
+}
+
+/// For greens about to
+/// auto-execute under `script-policy = "triage"` + `autoBuild: true`,
+/// emit a unified-diff preflight card before any script runs.
+///
+/// Gates (all must be true):
+/// - `auto_build_attempted`: the auto-build path is actually running
+///   (if `rebuild::run` isn't about to fire, a preflight is premature).
+/// - `effective_policy` is
+///   [`crate::script_policy_config::ScriptPolicy::Triage`]:
+///   under `deny` nothing auto-executes, under `allow` every
+///   scripted package runs (the "manual install then `lpm rebuild`"
+///   flow that C3's TUI covers more fully).
+/// - `!json_output`: human cards on stdout would corrupt the JSON
+///   channel. Machine output routes through C4's `version_diff`
+///   object in the blocked-set JSON.
+///
+/// Iterates `blocked_capture.state.blocked_packages` and renders a
+/// preflight card for each entry that (a) classifies as `Green` tier
+/// (under triage+autoBuild, greens are what `rebuild::run` auto-
+/// promotes and executes per), and (b) has a prior binding for a
+/// strictly-lesser version via `latest_binding_for_name`. Under (a)
+/// the script will auto-execute imminently; under (b) there's
+/// something to diff against.
+///
+/// Reads store bodies for both sides via
+/// [`crate::build_state::read_install_phase_bodies`]; the prior
+/// side gracefully degrades to "(prior not in store)" when the
+/// cache has been cleaned or the extractor hasn't populated
+/// `<store>/{name}@{prior}/`.
+pub(super) fn maybe_emit_pre_autobuild_version_diff_cards(
+    project_dir: &Path,
+    store: &lpm_store::PackageStore,
+    auto_build_attempted: bool,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) {
+    if !auto_build_attempted {
+        return;
+    }
+    if effective_policy != crate::script_policy_config::ScriptPolicy::Triage {
+        return;
+    }
+    if json_output {
+        return;
+    }
+    let Some(trusted) = read_trusted_deps_from_manifest(project_dir) else {
+        return;
+    };
+
+    let mut cards: Vec<String> = Vec::new();
+    for bp in &blocked_capture.state.blocked_packages {
+        // Only greens auto-execute under triage+autoBuild per; the
+        // preflight card is scoped to that execution path because
+        // amber/red will route through approve-scripts (C3) where the
+        // full card renders anyway. Entries with `static_tier = None`
+        // are treated as non-green (same conservative bias as the
+        // `--yes` refusal gate: unknown tier → don't claim the
+        // auto-execute path).
+        if !matches!(
+            bp.static_tier,
+            Some(lpm_security::triage::StaticTier::Green)
+        ) {
+            continue;
+        }
+        let Some((prior_version, binding)) = trusted.latest_binding_for_name(&bp.name, &bp.version)
+        else {
+            continue;
+        };
+        let diff = crate::version_diff::compute_version_diff(prior_version, binding, bp);
+        if !diff.is_drift() {
+            continue;
+        }
+
+        let candidate_pkg_dir = store.package_dir(&bp.name, &bp.version);
+        let prior_pkg_dir = store.package_dir(&bp.name, prior_version);
+        let candidate_bodies = crate::version_diff::phase_bodies_from_pairs(
+            crate::build_state::read_install_phase_bodies(&candidate_pkg_dir),
+        );
+        let prior_pairs = crate::build_state::read_install_phase_bodies(&prior_pkg_dir);
+        let prior_bodies = if prior_pairs.is_empty() {
+            // Empty-vec result collapses two real cases: (a) prior
+            // store dir missing entirely (cache clean / fresh clone),
+            // and (b) prior version had no scripts. Case (b) still
+            // wouldn't produce script-hash drift because the hash
+            // would be None on that side; we only reach this emitter
+            // when `diff.is_drift()` is true, so an empty prior here
+            // is effectively "prior not in store." Degrade to None
+            // so the renderer uses its "prior not in store" note.
+            None
+        } else {
+            Some(crate::version_diff::phase_bodies_from_pairs(prior_pairs))
+        };
+        let candidate_bodies_opt = if candidate_bodies.is_empty() {
+            None
+        } else {
+            Some(candidate_bodies)
+        };
+
+        if let Some(card) = crate::version_diff::render_preflight_card(
+            &diff,
+            &bp.name,
+            prior_bodies.as_ref(),
+            candidate_bodies_opt.as_ref(),
+        ) {
+            cards.push(card);
+        }
+    }
+
+    if cards.is_empty() {
+        return;
+    }
+    // Stream-separation: stderr (same discipline as the post-install
+    // hints). The "PREFLIGHT" tag makes the block grep-able and
+    // distinguishes it from the post-install warning above.
+    eprintln!();
+    eprintln!("  PREFLIGHT — auto-build will execute the following green-tier scripts:");
+    for card in &cards {
+        eprintln!();
+        eprintln!("{card}");
+    }
+    eprintln!();
+}
+
+/// Read `trustedDependencies` from the
+/// project manifest without failing the install on malformed input.
+///
+/// Returns `None` on any failure (missing file, unreadable,
+/// malformed JSON, absent key). Callers treat `None` as "no prior
+/// approvals to diff against" — the enrichment is UX, not a
+/// gate, so the install pipeline must be tolerant.
+///
+/// Reuses the same parsing shape the `approve_builds` command uses
+/// so a drifted or upgraded manifest still yields the same view.
+pub(super) fn read_trusted_deps_from_manifest(
+    project_dir: &Path,
+) -> Option<lpm_workspace::TrustedDependencies> {
+    let pkg_json_path = project_dir.join("package.json");
+    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
+    // `trustedDependencies` sits under `lpm.trustedDependencies` per
+    // the manifest schema; also accept it at the top level for
+    // leniency against older package.json shapes the test suite
+    // fixtures might use.
+    let raw = manifest
+        .get("lpm")
+        .and_then(|lpm| lpm.get("trustedDependencies"))
+        .or_else(|| manifest.get("trustedDependencies"))?;
+    serde_json::from_value::<lpm_workspace::TrustedDependencies>(raw.clone()).ok()
+}
+
+/// build the metadata map that
+/// enriches [`crate::build_state::BlockedPackage`] entries with
+/// `published_at` (RFC 3339) and `behavioral_tags_hash` (SHA-256 over
+/// the sorted set of active behavioral tags).
+///
+/// Fetches registry metadata via the existing client API which is
+/// backed by a 5-min TTL cache. On fresh resolutions the resolver
+/// already populated that cache, so this is a memory-local lookup.
+/// On offline installs or registry-unreachable installs, fetches
+/// return `Err`; we silently drop those packages from the map and
+/// the captured fields stay `None` — documented graceful
+/// degradation (see [`crate::build_state::BlockedSetMetadata`]).
+///
+/// Walk the install set, classify every
+/// lifecycle script through Layer 1, and emit one
+/// [`crate::triage_advisor_session::AmberPackageRequest`] per
+/// package that has at least one amber phase. Green-only packages
+/// auto-run via the existing GreenTierUnderTriage path and don't
+/// need an advisor call; red-only packages are hard-blocked
+/// regardless of the advisor; packages with no scripts have nothing
+/// to advise on.
+///
+/// Mirrors the worst-of reduction in
+/// [`crate::build_state::compute_blocked_packages_with_metadata`]
+/// and [`crate::commands::rebuild::evaluate_trust_unsuspended`] so
+/// the advisor pass agrees with both downstream consumers on which
+/// packages are amber-eligible.
+pub(super) fn collect_amber_classification_requests(
+    store: &lpm_store::PackageStore,
+    packages: &[(String, String, Option<String>)],
+    publish_ages: &std::collections::HashMap<(String, String), u64>,
+    min_release_age_secs: u64,
+) -> Vec<crate::triage_advisor_session::AmberPackageRequest> {
+    use lpm_security::static_gate::ManifestContext;
+    use lpm_security::triage::StaticTier;
+    let mut out = Vec::new();
+    for (name, version, integrity) in packages {
+        let pkg_dir = store.package_dir(name, version);
+        let bodies = crate::build_state::read_install_phase_bodies(&pkg_dir);
+        if bodies.is_empty() {
+            continue;
+        }
+        // Read the package's `repository` URL from the same store package.json.
+        // It feeds both the advisor prompt and the classifier widening that
+        // converts delegate-to-local-file + matching identity into Green.
+        //
+        // Feed the package's publish age + the configured
+        // `minimum_release_age_secs` into the classifier context so
+        // identity-match widening can apply
+        // the cooldown defense-in-depth (refuses to widen recent
+        // publishes even when `--allow-new` bypassed the
+        // install-level halt).
+        let repository = crate::build_state::read_manifest_repository(&pkg_dir);
+        let publish_age = publish_ages.get(&(name.clone(), version.clone())).copied();
+        let ctx = ManifestContext {
+            package_name: name.as_str(),
+            repository: repository.as_deref(),
+            bin_names: &[],
+            publish_age_secs: publish_age,
+            min_release_age_secs,
+        };
+        // Classify each phase independently; collect those that
+        // resolve to Amber/AmberLlm. The advisor needs the per-phase
+        // body to make a per-phase judgement; the session then
+        // worst-ofs across phases for the package-level outcome.
+        let amber_phases: Vec<(String, String)> = bodies
+            .into_iter()
+            .filter(|(_, body)| {
+                matches!(
+                    lpm_security::static_gate::classify_with_context(body, Some(&ctx)),
+                    StaticTier::Amber | StaticTier::AmberLlm
+                )
+            })
+            .collect();
+        if amber_phases.is_empty() {
+            continue;
+        }
+        // The integrity slot carries source identity. Workspace /
+        // file / link sources are `None`; registry sources carry the
+        // resolved integrity hash. The same (name, version) from two
+        // different sources produces TWO distinct approval keys
+        // downstream — required so an approval on one source cannot
+        // leak to a sibling source in the same install.
+        //
+        // Scan each amber phase body for files it delegates to and read them
+        // with the runbook's caps
+        // (depth 1, ≤ 32 KB, safe-relative only, non-text rejected).
+        // Deduplicate by filename across phases so a body that says
+        // `node install.js` for both preinstall and postinstall
+        // doesn't emit the same content twice.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut referenced_scripts: Vec<(String, String)> = Vec::new();
+        for (_phase, body) in &amber_phases {
+            for (filename, content) in
+                crate::build_state::collect_referenced_scripts(&pkg_dir, body)
+            {
+                if seen.insert(filename.clone()) {
+                    referenced_scripts.push((filename, content));
+                }
+            }
+        }
+        out.push(crate::triage_advisor_session::AmberPackageRequest {
+            name: name.clone(),
+            version: version.clone(),
+            integrity: integrity.clone(),
+            repository,
+            amber_phases,
+            referenced_scripts,
+        });
+    }
+    out
+}
+
+pub(super) fn blocked_set_metadata_from_previous_state(
+    project_dir: &Path,
+) -> crate::build_state::BlockedSetMetadata {
+    let Some(previous) = crate::build_state::read_build_state(project_dir) else {
+        return crate::build_state::BlockedSetMetadata::default();
+    };
+
+    let mut metadata = crate::build_state::BlockedSetMetadata {
+        by_pkg: std::collections::HashMap::with_capacity(previous.blocked_packages.len()),
+    };
+    for package in previous.blocked_packages {
+        if package.published_at.is_none()
+            && package.behavioral_tags_hash.is_none()
+            && package.behavioral_tags.is_none()
+        {
+            continue;
+        }
+
+        metadata.insert(
+            package.name,
+            package.version,
+            crate::build_state::BlockedSetMetadataEntry {
+                published_at: package.published_at,
+                behavioral_tags_hash: package.behavioral_tags_hash,
+                behavioral_tags: package.behavioral_tags,
+                provenance_at_capture: None,
+            },
+        );
+    }
+    metadata
+}
+
+/// Never returns an error: metadata enrichment is best-effort and
+/// must not fail an otherwise-successful install. Any fetch error
+/// is recorded as "no entry for this package" and the install
+/// proceeds.
+pub(super) async fn build_blocked_set_metadata(
+    client: &lpm_registry::RegistryClient,
+    route_table: &RouteTable,
+    packages: &[InstallPackage],
+) -> crate::build_state::BlockedSetMetadata {
+    let mut out = crate::build_state::BlockedSetMetadata::default();
+
+    // — provenance capture moved out of install.
+    //
+    // Pre-W2: this function fetched per-package attestation bundles in
+    // parallel and persisted the parsed snapshot into
+    // `BlockedSetMetadataEntry.provenance_at_capture`, which approve-
+    // scripts later forwarded into `TrustedDependencyBinding.
+    // provenance_at_approval`. W1b's `perf.prov_ns_split`
+    // measured 99.98 % of that cost as HTTP (12.7 s summed across 24
+    // permits → ~550 ms cold wall on the 266-pkg fixture, 0.02 % parse).
+    //
+    // The empirical finding (unblocker investigation) is
+    // that the only end-consumer of `provenance_at_capture` is
+    // `approve-scripts` — install reads it back from `build-state.json`
+    // and copies it into the binding. Since `approve-scripts` is a
+    // user-driven action that typically processes 1–10 scripted
+    // packages out of an install set of hundreds, fetching at approval
+    // time is strictly less work AND removes the cost from the cold
+    // install critical path. Drift detection is unaffected: the drift
+    // gate (install.rs:1810) re-fetches candidate attestations
+    // independently and reads `provenance_at_approval` (the value
+    // approve-scripts now stamps from a fresh fetch) as its reference.
+    //
+    // The `provenance_at_capture` field on `BlockedSetMetadataEntry`
+    // is retained as `Option<>` for schema compat with persisted
+    // build-state.json files — install always writes `None` here from
+    // onward; approve-scripts ignores any value the field
+    // may carry. Future cleanup may remove the field entirely after a
+    // transition window.
+    //
+    // Run every package's metadata fetch CONCURRENTLY. The metadata is
+    // still required for `published_at` and `behavioral_tags{,_hash}`,
+    // which ship at install time (used by the version-diff card and
+    // the static-tier fingerprint). Fetching in parallel keeps the metadata
+    // path below the rest of the install pipeline on cold runs.
+    let meta_ns = std::sync::atomic::AtomicU64::new(0);
+    let meta_ns_ref = &meta_ns;
+    let entry_futures = packages.iter().map(|p| async move {
+        if install_package_is_local_source(p) {
+            return None;
+        }
+        // Grab the full PackageMetadata for `time[version]` (→
+        // `published_at`) and `versions[version]._behavioralTags` (→
+        // `behavioral_tags_hash` + `behavioral_tags`). Errors are
+        // swallowed per the graceful-degradation contract above.
+        let meta_start = std::time::Instant::now();
+        // `get_npm_blocked_set_meta` deserializes only `time` + `_behavioralTags`
+        // on cache hits, avoiding the full `PackageMetadata` allocation cost.
+        let meta: Option<lpm_registry::types::BlockedSetPackageMeta> = if p.is_lpm {
+            match lpm_common::PackageName::parse(&p.name) {
+                Ok(pkg_name) => client
+                    .get_package_metadata(&pkg_name)
+                    .await
+                    .ok()
+                    .map(|full| lpm_registry::types::BlockedSetPackageMeta {
+                        time: full.time,
+                        versions: full
+                            .versions
+                            .into_iter()
+                            .map(|(k, v)| {
+                                (
+                                    k,
+                                    lpm_registry::types::BlockedSetVersionMeta {
+                                        behavioral_tags: v.behavioral_tags,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    }),
+                Err(_) => None,
+            }
+        } else {
+            // follow-up: route via RouteTable so
+            // blocked-set metadata capture for custom-registry
+            // packages doesn't fall through to public npm.
+            let route = route_table.route_for_package(&p.name);
+            client.get_npm_blocked_set_meta(&p.name, route).await
+        };
+        meta_ns_ref.fetch_add(
+            meta_start.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        let meta = meta?;
+
+        let published_at = meta.time.get(&p.version).cloned();
+
+        // Extract behavioral tags if present and hash them into the
+        // canonical form. `active_tag_names` returns sorted canonical
+        // names; `hash_behavioral_tag_set` hashes them deterministically.
+        //
+        //: also persist the raw name set alongside the hash.
+        // The hash gives the version-diff fast equality / fingerprint;
+        // the names enable rendering the *delta* (`gained network, eval`)
+        // without a registry re-fetch — required by ship
+        // criterion 2 and lets the diff work offline. Both are computed
+        // from the same `active_tag_names()` call so they cannot drift.
+        let (behavioral_tags_hash, behavioral_tags) = meta
+            .versions
+            .get(&p.version)
+            .and_then(|v| v.behavioral_tags.as_ref())
+            .map_or((None, None), |tags| {
+                let names = tags.active_tag_names();
+                let hash = lpm_security::triage::hash_behavioral_tag_set(&names);
+                let owned: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+                (Some(hash), Some(owned))
+            });
+
+        // Only materialize an entry if at least ONE field is populated
+        // — empty entries just waste map memory. Callers get `None` for
+        // absent keys either way.
+        if published_at.is_some() || behavioral_tags_hash.is_some() {
+            Some((
+                p.name.clone(),
+                p.version.clone(),
+                crate::build_state::BlockedSetMetadataEntry {
+                    published_at,
+                    behavioral_tags_hash,
+                    behavioral_tags,
+                    //: install no longer captures
+                    // provenance; approve-scripts fetches at approval
+                    // time. Field retained for schema compat.
+                    provenance_at_capture: None,
+                },
+            ))
+        } else {
+            None
+        }
+    });
+
+    // Sequential insert into `out` after the concurrent fetches land.
+    // Order is deterministic because `join_all` preserves the input order
+    // and the downstream `BlockedSetMetadata` is keyed by (name, version)
+    // — identical output to the serial loop.
+    for (name, version, e) in futures::future::join_all(entry_futures)
+        .await
+        .into_iter()
+        .flatten()
+    {
+        out.insert(name, version, e);
+    }
+
+    // Permanent perf diagnostic. dropped the `prov_sum_ms`
+    // dimension — install no longer fetches provenance, so the field
+    // would always be `0` and adding noise to the line. The
+    // `perf.prov_ns_split` line is correspondingly removed.
+    tracing::debug!(
+        "perf.blocked_set_metadata_split pkgs={} meta_sum_ms={}",
+        packages.len(),
+        meta_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+    );
+    out
+}
+
+// is_install_up_to_date() moved to crate::install_state::check_install_state()
