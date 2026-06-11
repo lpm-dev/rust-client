@@ -2,7 +2,7 @@
 //!
 //! This is the lightweight 65.1 enforcement pass:
 //! - the corrected 137-row surface inventory is checked into the repo
-//! - every top-level `Commands` variant is pinned against `main.rs`
+//! - every top-level `Commands` variant is pinned against `cli/args.rs`
 //! - every surface marked as covered must still point at live evidence files
 //!
 //! It intentionally does NOT require the currently-uncovered rows to gain
@@ -144,10 +144,10 @@ fn covered_surfaces_still_have_live_evidence_paths() {
 
 #[test]
 fn commands_enum_variants_match_audit_baseline() {
-    let main_rs = std::fs::read_to_string(workspace_root().join("crates/lpm-cli/src/main.rs"))
-        .expect("failed to read crates/lpm-cli/src/main.rs");
+    let args_rs = std::fs::read_to_string(workspace_root().join("crates/lpm-cli/src/cli/args.rs"))
+        .expect("failed to read crates/lpm-cli/src/cli/args.rs");
 
-    let actual = extract_command_variants(&main_rs);
+    let actual = extract_command_variants(&args_rs);
     let expected: BTreeSet<&str> = EXPECTED_COMMAND_VARIANTS.iter().copied().collect();
 
     assert_eq!(
@@ -176,8 +176,8 @@ fn supplemental_references(surface_id: u16) -> &'static [&'static str] {
     // (formerly `lpm store gc` at id 52). Anything that was ≥ 50 in the
     // original command matrix has shifted down by one.
     match surface_id {
-        10 => &["crates/lpm-cli/src/commands/doctor.rs"],
-        17 => &["crates/lpm-cli/src/commands/install.rs"],
+        10 => &["crates/lpm-cli/src/commands/doctor/mod.rs"],
+        17 => &["crates/lpm-cli/src/commands/install/mod.rs"],
         21 => &["crates/lpm-cli/src/commands/uninstall.rs"],
         48 => &["crates/lpm-cli/src/commands/cache.rs"],
         50 | 52 => &["crates/lpm-cli/src/commands/store.rs"],

@@ -1,6 +1,6 @@
 // Generated from the coverage matrix. See the audit doc at
 
-// Update the phase doc first, then re-generate this file when the audited
+// Update the command matrix first, then re-generate this file when the audited
 // command-surface baseline changes.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,7 +211,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: true,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/doctor.rs",
+            "crates/lpm-cli/src/commands/doctor/mod.rs",
             "tests/workflows/tests/doctor_list.rs",
             "tests/workflows/tests/json_output.rs",
             "crates/lpm-cli/tests/global_install_state_mutation.rs",
@@ -246,7 +246,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: false,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/install.rs",
+            "crates/lpm-cli/src/commands/install/mod.rs",
             "tests/workflows/tests/install.rs",
             "tests/workflows/tests/install_overrides.rs",
             "tests/workflows/tests/install_patches.rs",
@@ -884,7 +884,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: false,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/rebuild.rs",
+            "crates/lpm-cli/src/commands/rebuild/mod.rs",
             "tests/workflows/tests/approve_scripts.rs",
             "tests/workflows/tests/cross_command_flows.rs",
             "tests/workflows/tests/rebuild.rs",
@@ -1656,16 +1656,12 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/install.rs"],
     },
-    // ── Phase-65 v2-taxonomy refinement: split install.rs orphan tests ──
-    //
-    // These two surfaces were carved out of `lpm install`'s catch-all
-    // umbrella during the 2026-05-14 v2 partition pass when install.rs
-    // had 27 unclaimed tests with no v2 surface home. They cover
-    // install-pipeline behavior that's orthogonal to lockfile fast-path
-    // (id 12), add-and-install (id 13), --offline (id 14), workspace
-    // (id 15), policy (id 17), strict-integrity (id 18), or strict-ssl
-    // (id 135), so a generic id-12 fold would have made id 12's
-    // failure_modes_tested list useless as a guide.
+    // These two surfaces cover install-pipeline behavior that's
+    // orthogonal to lockfile fast-path (id 12), add-and-install
+    // (id 13), --offline (id 14), workspace (id 15), policy (id 17),
+    // strict-integrity (id 18), or strict-ssl (id 135). Folding them
+    // into id 12 would make id 12's failure_modes_tested list too
+    // broad to guide the coverage audit.
     SurfaceBaseline {
         id: 136,
         name: "`lpm install` pnpm migration warnings (cross-cmd)",
