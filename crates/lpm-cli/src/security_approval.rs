@@ -144,6 +144,7 @@ pub enum ApprovalSource {
     GlobalConfig,
     ConfigMutation,
     SecurityCommand,
+    ApproveScripts,
 }
 
 impl ApprovalSource {
@@ -155,6 +156,7 @@ impl ApprovalSource {
             Self::GlobalConfig => "global-config",
             Self::ConfigMutation => "config-mutation",
             Self::SecurityCommand => "security-command",
+            Self::ApproveScripts => "approve-scripts",
         }
     }
 }
@@ -1785,12 +1787,13 @@ fn verify_audit_envelope(
 }
 
 fn legacy_audit_entry_hash(parsed: &serde_json::Value) -> Result<String, LpmError> {
-    let signature = parsed
-        .get("signature")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            LpmError::Registry("legacy security audit log entry is missing a signature".into())
+    let Some(signature) = parsed.get("signature").and_then(|value| value.as_str()) else {
+        let _: AuditEvent = serde_json::from_value(parsed.clone()).map_err(|e| {
+            LpmError::Registry(format!("legacy security audit log entry parse error: {e}"))
         })?;
+        return hash_json_value(parsed);
+    };
+
     let payload = parsed.get("payload").cloned().ok_or_else(|| {
         LpmError::Registry("legacy security audit log entry is missing a payload".into())
     })?;
@@ -2629,6 +2632,32 @@ pub fn ensure_project_trust_candidate_authorized(
 ) -> Result<(), LpmError> {
     let current = candidate_project_policy_state(project_dir, trusted)?;
     ensure_project_policy_candidate_authorized(project_dir, &current, json_output, source)
+}
+
+pub(crate) fn record_project_trust_candidate_authorized_from_managed_flow(
+    project_dir: &Path,
+    trusted: &lpm_workspace::TrustedDependencies,
+    source: ApprovalSource,
+) -> Result<(), LpmError> {
+    let current = candidate_project_policy_state(project_dir, trusted)?;
+    let approved = load_approved_project_policy_state(project_dir)?;
+    let required_scopes = project_policy_required_scopes(&current, &approved);
+
+    persist_project_policy_state(project_dir, &current)?;
+    record_audit_event(
+        AuditRecord::new(
+            "project-policy-authorized",
+            true,
+            required_scopes
+                .iter()
+                .map(|scope| scope.as_str().to_string())
+                .collect(),
+        )
+        .project_root(canonical_project_root(project_dir))
+        .source(source)
+        .detail("persisted approved project trust/capability state from managed approval flow"),
+    );
+    Ok(())
 }
 
 pub fn ensure_global_trust_authorized(
@@ -4235,6 +4264,47 @@ script-policy = "deny"
     }
 
     #[test]
+    fn managed_approval_flow_persists_project_trust_without_unlock() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        with_test_env(temp.path(), || {
+            let mut bindings = std::collections::HashMap::new();
+            bindings.insert(
+                "esbuild@0.25.1".to_string(),
+                lpm_workspace::TrustedDependencyBinding {
+                    integrity: Some("sha512-demo".to_string()),
+                    script_hash: Some("sha256-demo".to_string()),
+                    ..Default::default()
+                },
+            );
+            let trusted = lpm_workspace::TrustedDependencies::Rich(bindings);
+
+            record_project_trust_candidate_authorized_from_managed_flow(
+                &project,
+                &trusted,
+                ApprovalSource::ApproveScripts,
+            )
+            .unwrap();
+
+            let approved = load_approved_project_policy_state(&project).unwrap();
+            assert!(approved.trusted_dependencies.contains_key("esbuild@0.25.1"));
+            assert!(
+                !read_active_unlocks()
+                    .unwrap()
+                    .iter()
+                    .any(|grant| { grant.scopes.contains(&ApprovalScope::TrustBulkApprove) })
+            );
+        });
+    }
+
+    #[test]
     fn package_scoped_unlock_only_matches_granted_packages() {
         let temp = tempdir().unwrap();
         let project = temp.path().join("project");
@@ -4427,6 +4497,38 @@ script-policy = "deny"
 
             let err = append_audit_event(&event).unwrap_err();
             assert!(err.to_string().contains("signed audit head"));
+        });
+    }
+
+    #[test]
+    fn audit_log_appends_after_unsigned_legacy_entries() {
+        let temp = tempdir().unwrap();
+
+        with_test_env(temp.path(), || {
+            let event = AuditEvent {
+                schema_version: AUDIT_EVENT_SCHEMA_VERSION,
+                occurred_at: Utc::now(),
+                event: "guarded-attempt".into(),
+                allowed: false,
+                scopes: vec![ApprovalScope::TrustBulkApprove.as_str().to_string()],
+                project_root: None,
+                packages: Vec::new(),
+                source: Some(ApprovalSource::CliFlag.as_str().to_string()),
+                unlock_id: None,
+                detail: Some("legacy unsigned".into()),
+            };
+            let log_path = audit_log_path().unwrap();
+            std::fs::write(
+                &log_path,
+                format!("{}\n", serde_json::to_string(&event).unwrap()),
+            )
+            .unwrap();
+
+            append_audit_event(&event).unwrap();
+
+            let (tail, count) = read_audit_log_tail(&log_path).unwrap();
+            assert!(tail.is_some());
+            assert_eq!(count, 2);
         });
     }
 

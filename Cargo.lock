@@ -3518,6 +3518,7 @@ version = "0.59.1"
 dependencies = [
  "glob",
  "lpm-common",
+ "lpm-semver",
  "serde",
  "serde_json",
  "serde_yaml",
