@@ -286,6 +286,43 @@ async fn install_default_policy_blocks_postinstall_scripts() {
 }
 
 #[tokio::test]
+async fn install_default_policy_prints_approve_scripts_hint_after_done_summary() {
+    let project = empty_project_with_dep("scripted-pkg");
+    let mock = MockRegistry::start().await;
+    mount_scripted_pkg(&mock, "scripted-pkg").await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install"])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        output.status.success(),
+        "install with default policy on a scripted package must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let done_idx = stderr.find("Done · installed").unwrap_or_else(|| {
+        panic!("install output must include final Done summary; stderr:\n{stderr}")
+    });
+    let script_hint_idx = stderr
+        .find("package(s) have install scripts")
+        .unwrap_or_else(|| {
+            panic!("install output must include lifecycle script summary; stderr:\n{stderr}")
+        });
+    let approve_idx = stderr.find("Run `lpm approve-scripts`").unwrap_or_else(|| {
+        panic!("install output must include approve-scripts pointer; stderr:\n{stderr}")
+    });
+
+    assert!(
+        done_idx < script_hint_idx && script_hint_idx < approve_idx,
+        "lifecycle approval hint must print after final install summary; stderr:\n{stderr}",
+    );
+}
+
+#[tokio::test]
 async fn install_default_policy_blocks_postinstall_scripts_under_v2_store() {
     let project = empty_project_with_dep("scripted-pkg");
     let mock = MockRegistry::start().await;

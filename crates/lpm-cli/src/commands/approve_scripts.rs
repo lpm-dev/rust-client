@@ -112,6 +112,28 @@ fn approval_metadata_preserving_existing_provenance(
     meta
 }
 
+fn authorize_project_trust_write(
+    project_dir: &Path,
+    trusted: &TrustedDependencies,
+    json_output: bool,
+    reviewed_by_prompt: bool,
+) -> Result<(), LpmError> {
+    if reviewed_by_prompt {
+        crate::security_approval::record_project_trust_candidate_authorized_from_managed_flow(
+            project_dir,
+            trusted,
+            crate::security_approval::ApprovalSource::ApproveScripts,
+        )
+    } else {
+        crate::security_approval::ensure_project_trust_candidate_authorized(
+            project_dir,
+            trusted,
+            json_output,
+            crate::security_approval::ApprovalSource::CliFlag,
+        )
+    }
+}
+
 /// Fetch attestation snapshots for an effective
 /// blocked set at approval time.
 ///
@@ -631,10 +653,8 @@ async fn run_under_store_lock(
             }
         };
 
-        // Confirm in TTY mode unless json_output (which always proceeds)
-        let confirmed = if json_output || !is_tty() {
-            true
-        } else {
+        let reviewed_by_prompt = !json_output && is_tty();
+        let confirmed = if reviewed_by_prompt {
             print_package_card(target);
             // surface the version diff card
             // alongside the regular card when this is an UPDATE
@@ -657,6 +677,8 @@ async fn run_under_store_lock(
             cliclack::confirm(prompt)
                 .interact()
                 .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
+        } else {
+            true
         };
 
         if confirmed {
@@ -688,11 +710,11 @@ async fn run_under_store_lock(
             // sees "would approve X" with the same JSON envelope
             // shape as a live run.
             if !dry_run {
-                crate::security_approval::ensure_project_trust_candidate_authorized(
+                authorize_project_trust_write(
                     project_dir,
                     &trusted,
                     json_output,
-                    crate::security_approval::ApprovalSource::CliFlag,
+                    reviewed_by_prompt,
                 )?;
                 write_back(&pkg_json_path, &mut manifest, &trusted)?;
             }
@@ -819,12 +841,7 @@ async fn run_under_store_lock(
         }
         // close-out short-circuit under `--dry-run`.
         if !dry_run {
-            crate::security_approval::ensure_project_trust_candidate_authorized(
-                project_dir,
-                &trusted,
-                json_output,
-                crate::security_approval::ApprovalSource::CliFlag,
-            )?;
+            authorize_project_trust_write(project_dir, &trusted, json_output, false)?;
             write_back(&pkg_json_path, &mut manifest, &trusted)?;
         }
         print_summary(
@@ -1014,12 +1031,7 @@ async fn run_under_store_lock(
     // write; `approved` / `skipped` still fed into `print_summary`
     // so the agent sees the would-approve count.
     if !approved.is_empty() && !dry_run {
-        crate::security_approval::ensure_project_trust_candidate_authorized(
-            project_dir,
-            &trusted,
-            json_output,
-            crate::security_approval::ApprovalSource::CliFlag,
-        )?;
+        authorize_project_trust_write(project_dir, &trusted, json_output, true)?;
         write_back(&pkg_json_path, &mut manifest, &trusted)?;
     }
 
@@ -3039,6 +3051,54 @@ mod tests {
         }
 
         assert!(std::env::var_os(TEST_SECURITY_AUTH_RESULT_ENV).is_none());
+    }
+
+    fn trusted_esbuild_binding() -> TrustedDependencies {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "esbuild@0.25.1".to_string(),
+            lpm_workspace::TrustedDependencyBinding {
+                integrity: Some("sha512-esbuild-integrity".to_string()),
+                script_hash: Some("sha256-esbuild-hash".to_string()),
+                ..Default::default()
+            },
+        );
+        TrustedDependencies::Rich(bindings)
+    }
+
+    #[test]
+    fn reviewed_project_trust_write_records_managed_approval() {
+        let _security_backend = ensure_security_test_backend();
+        let dir = tempdir().unwrap();
+        write_default_manifest(dir.path());
+        let trusted = trusted_esbuild_binding();
+
+        authorize_project_trust_write(dir.path(), &trusted, true, true).unwrap();
+
+        crate::security_approval::ensure_project_trust_candidate_authorized(
+            dir.path(),
+            &trusted,
+            true,
+            crate::security_approval::ApprovalSource::ProjectConfig,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unreviewed_project_trust_write_still_requires_security_approval() {
+        let _restore = RawEnvRestore::capture(TEST_SECURITY_AUTH_RESULT_ENV);
+        let _security_backend = ensure_security_test_backend();
+        unsafe {
+            std::env::remove_var(TEST_SECURITY_AUTH_RESULT_ENV);
+        }
+        let dir = tempdir().unwrap();
+        write_default_manifest(dir.path());
+        let trusted = trusted_esbuild_binding();
+
+        let err = authorize_project_trust_write(dir.path(), &trusted, true, false)
+            .expect_err("unreviewed trust mutation must stay guarded");
+
+        assert_eq!(err.error_code(), "security_approval_required");
     }
 
     fn verified_status() -> ProvenanceStatus {

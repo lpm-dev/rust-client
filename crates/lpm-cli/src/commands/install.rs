@@ -7000,7 +7000,7 @@ async fn run_with_options_under_store_lock(
 
             for p in &packages {
                 let Some((approved_version, reference_binding)) =
-                    trusted.provenance_reference_for_name(&p.name)
+                    trusted.provenance_reference_for_candidate(&p.name, &p.version)
                 else {
                     continue;
                 };
@@ -8082,80 +8082,6 @@ async fn run_with_options_under_store_lock(
             "perf.trust_snapshot ms={}",
             trust_snap_start.elapsed().as_millis()
         );
-    }
-
-    // Show build hint for packages with lifecycle scripts (two-phase model).
-    // Scripts are NEVER executed during install — use `lpm rebuild` instead.
-    // the hint is now gated on the blocked-set
-    // fingerprint changing — repeated installs of the same blocked set are silent.
-    //
-    // under `script-policy = "triage"`, the
-    // multi-line hint is replaced by a single summary line showing
-    // the per-tier blocked-set breakdown. `deny` and `allow` keep
-    // the existing multi-line hint unchanged.
-    if !json_output && blocked_capture.should_emit_warning {
-        if blocked_capture.all_clear_banner {
-            output::success(
-                "All previously-blocked packages have been approved. Run `lpm rebuild` to execute their scripts.",
-            );
-        } else {
-            let script_policy_cfg =
-                crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
-            let effective_policy =
-                crate::script_policy_config::resolve_script_policy_with_security(
-                    project_dir,
-                    script_policy_override,
-                    &script_policy_cfg,
-                    json_output,
-                )?;
-            if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
-                println!();
-                println!(
-                    "{}",
-                    crate::build_state::format_triage_summary_line(
-                        &blocked_capture.state.blocked_packages
-                    )
-                );
-            } else if effective_policy == crate::script_policy_config::ScriptPolicy::Allow {
-                // under Allow the install-time hint and its
-                // "Run `lpm approve-scripts`" guidance would mislead —
-                // auto-build is about to fire and run every scripted
-                // package per `widen_to_build_by_policy`'s Allow branch.
-                // Skipping the hint keeps the post-install output focused
-                // on what actually happens next (the rebuild::run output).
-            } else {
-                //: include integrity so the hint's strict gate
-                // matches what `rebuild::run` will do. Previously we passed
-                // only (name, version) and the lenient name-only gate
-                // could show drifted rich bindings as trusted ✓.
-                let all_pkgs: Vec<(String, String, Option<String>)> = packages
-                    .iter()
-                    .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-                    .collect();
-                crate::commands::rebuild::show_install_build_hint(
-                    lpm_root,
-                    &all_pkgs,
-                    &policy,
-                    project_dir,
-                    // reuse
-                    // the already-parsed capability inputs from the
-                    // earlier capture call so the hint's trust label
-                    // matches what rebuild::run will actually do.
-                    &install_requested_capabilities,
-                    &install_user_bound,
-                );
-                output::info(
-                    "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
-                );
-            }
-            //: per-package terse version-diff hints for any
-            // blocked entry that has a prior-approved binding under the
-            // same package name. Surfaces drift visibility BEFORE the
-            // user enters approve-scripts (where C3's TUI shows the
-            // fuller card). Stream-separation: stderr + json_output
-            // suppression both inside the helper.
-            maybe_emit_post_install_version_diff_hints(project_dir, &blocked_capture, json_output);
-        }
     }
 
     // Step 7: LPM-Native Intelligence
@@ -9252,6 +9178,18 @@ async fn run_with_options_under_store_lock(
         }
     }
 
+    maybe_emit_post_install_lifecycle_hint(
+        lpm_root,
+        &packages,
+        &policy,
+        project_dir,
+        script_policy_override,
+        &install_requested_capabilities,
+        &install_user_bound,
+        &blocked_capture,
+        json_output,
+    )?;
+
     // Write install-hash so `lpm dev` knows deps are up to date.
     // uses the shared compute_install_hash from install_state.
     // Must re-read because save semantics may have modified both
@@ -9436,6 +9374,72 @@ fn maybe_emit_post_auto_build_triage_pointer(
     ) {
         output::warn(&msg);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_emit_post_install_lifecycle_hint(
+    lpm_root: &lpm_common::LpmRoot,
+    packages: &[InstallPackage],
+    policy: &lpm_security::SecurityPolicy,
+    project_dir: &Path,
+    script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    blocked_capture: &crate::build_state::BlockedSetCapture,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if json_output || !blocked_capture.should_emit_warning {
+        return Ok(());
+    }
+
+    if blocked_capture.all_clear_banner {
+        output::success(
+            "All previously-blocked packages have been approved. Run `lpm rebuild` to execute their scripts.",
+        );
+        return Ok(());
+    }
+
+    let script_policy_cfg =
+        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+    let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
+        project_dir,
+        script_policy_override,
+        &script_policy_cfg,
+        json_output,
+    )?;
+
+    match effective_policy {
+        crate::script_policy_config::ScriptPolicy::Triage => {
+            println!();
+            println!(
+                "{}",
+                crate::build_state::format_triage_summary_line(
+                    &blocked_capture.state.blocked_packages
+                )
+            );
+        }
+        crate::script_policy_config::ScriptPolicy::Allow => {}
+        crate::script_policy_config::ScriptPolicy::Deny => {
+            let all_pkgs: Vec<(String, String, Option<String>)> = packages
+                .iter()
+                .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
+                .collect();
+            crate::commands::rebuild::show_install_build_hint(
+                lpm_root,
+                &all_pkgs,
+                policy,
+                project_dir,
+                requested_capabilities,
+                user_bound,
+            );
+            output::info(
+                "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
+            );
+        }
+    }
+
+    maybe_emit_post_install_version_diff_hints(project_dir, blocked_capture, json_output);
+    Ok(())
 }
 
 /// Compute per-package terse version-diff
@@ -11276,70 +11280,6 @@ async fn run_link_and_finish(
         );
     }
 
-    // mirrors the `run_with_options`
-    // branching — under triage, emit the single-line summary;
-    // under deny/allow, show the legacy multi-line hint.
-    if !json_output && blocked_capture.should_emit_warning {
-        if blocked_capture.all_clear_banner {
-            output::success(
-                "All previously-blocked packages have been approved. Run `lpm rebuild` to execute their scripts.",
-            );
-        } else {
-            let script_policy_cfg =
-                crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
-            let effective_policy =
-                crate::script_policy_config::resolve_script_policy_with_security(
-                    project_dir,
-                    script_policy_override,
-                    &script_policy_cfg,
-                    json_output,
-                )?;
-            if effective_policy == crate::script_policy_config::ScriptPolicy::Triage {
-                println!();
-                println!(
-                    "{}",
-                    crate::build_state::format_triage_summary_line(
-                        &blocked_capture.state.blocked_packages
-                    )
-                );
-            } else if effective_policy == crate::script_policy_config::ScriptPolicy::Allow {
-                // under Allow the install-time hint and its
-                // "Run `lpm approve-scripts`" guidance would mislead —
-                // auto-build is about to fire and run every scripted
-                // package per `widen_to_build_by_policy`'s Allow branch.
-                // Skipping the hint keeps the post-install output focused
-                // on what actually happens next (the rebuild::run output).
-            } else {
-                //: include integrity so the hint's strict gate
-                // matches what `rebuild::run` will do. Previously we passed
-                // only (name, version) and the lenient name-only gate
-                // could show drifted rich bindings as trusted ✓.
-                let all_pkgs: Vec<(String, String, Option<String>)> = packages
-                    .iter()
-                    .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
-                    .collect();
-                crate::commands::rebuild::show_install_build_hint(
-                    lpm_root,
-                    &all_pkgs,
-                    &policy,
-                    project_dir,
-                    // reuse
-                    // the offline-path capability inputs parsed
-                    // earlier at the capture call site.
-                    &offline_requested_capabilities,
-                    &offline_user_bound,
-                );
-                output::info(
-                    "Run `lpm approve-scripts` to review and approve their lifecycle scripts.",
-                );
-            }
-            //: terse version-diff hints per blocked entry
-            // with a prior binding. Mirrors the run_with_options
-            // site; same stream-separation discipline.
-            maybe_emit_post_install_version_diff_hints(project_dir, &blocked_capture, json_output);
-        }
-    }
-
     let elapsed = start.elapsed();
 
     // persist patch state in offline mode too.
@@ -11492,6 +11432,18 @@ async fn run_link_and_finish(
         );
         println!();
     }
+
+    maybe_emit_post_install_lifecycle_hint(
+        lpm_root,
+        &packages,
+        &policy,
+        project_dir,
+        script_policy_override,
+        &offline_requested_capabilities,
+        &offline_user_bound,
+        &blocked_capture,
+        json_output,
+    )?;
 
     Ok(())
 }
