@@ -496,13 +496,15 @@ impl PackageStore {
     /// The caller pipes a tarball byte stream into `reader` (typically a
     /// [`tokio::io::SyncIoBridge`] over a [`tokio_util::io::StreamReader`]
     /// built from `reqwest::Response::bytes_stream()`). This method runs
-    /// synchronously inside a `spawn_blocking` task because `flate2` +
+    /// synchronously inside a `spawn_blocking` task because gzip decode +
     /// `tar::Archive` are sync and CPU-bound.
     ///
     /// ## Pipeline
     /// ```text
-    /// reader  ──►  SizeLimitedReader  ──►  HashingReader  ──►  GzDecoder
-    ///           (500 MB ceiling)        (SHA-512 tee)        (flate2/zlib-rs)
+    /// reader  ──►  SizeLimitedReader  ──►  HashingReader  ──►  extractor
+    ///           (500 MB ceiling)        (SHA-512 tee)        (libdeflate buffer
+    ///                                                         with GzDecoder
+    ///                                                         fallback)
     ///                                                                │
     ///                                                                ▼
     ///                                              tar::Archive ──► staging dir
@@ -649,17 +651,12 @@ impl PackageStore {
             return Err(error);
         }
 
-        // Critical for SRI correctness: drain any trailing bytes through the
-        // hasher. `tar::Archive` stops pulling from its inner `GzDecoder` as
-        // soon as it hits the two-zero-block end-of-archive marker, and
-        // `GzDecoder` may in turn have buffered but not fully consumed the
-        // underlying stream. Any gzip trailer bytes / tar padding / block
-        // alignment past the archive end are part of the compressed `.tgz`
-        // the registry hashed — miss them and the computed SRI diverges from
-        // the registry's, causing the per-package integrity check to spuriously
-        // fail (reproduced on ~20% of 51-package installs before this drain
-        // was added). `io::sink()` discards the bytes; the hasher update
-        // inside `HashingReader::read` still fires on every byte.
+        // Critical for SRI correctness: drain any raw compressed bytes the
+        // extractor did not need to pull. The buffered libdeflate path usually
+        // drains the stream before the tar walk; the streaming fallback can
+        // stop after the gzip member, leaving trailing bytes for this final
+        // hash pass. `io::sink()` discards the bytes; the hasher update inside
+        // `HashingReader::read` still fires on every byte.
         if let Err(e) = std::io::copy(&mut hashing_reader, &mut std::io::sink()) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             let _ = hashing_reader.finalize();
