@@ -67,10 +67,13 @@ use lpm_store::v2::{
 };
 
 #[cfg(unix)]
-use crate::make_bin_target_executable;
+use crate::platform::make_bin_target_executable;
+use crate::validation::{
+    ensure_real_dir_with_prefix, is_safe_node_modules_entry_name as is_safe_root_link_name,
+    validate_bin_target,
+};
 use crate::{
     LinkDependency, LinkResult, LinkTarget, LinkerMode, MaterializedPackage, validate_bin_name,
-    validate_bin_target,
 };
 
 /// One LinkTarget plus the source SRI needed to resolve its v2 object
@@ -484,10 +487,9 @@ pub fn link_v2_finalize(
 /// per-target peer edges.
 fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), LpmError> {
     // Build a name → version lookup so the fallback derivation can
-    // intersect declared peers against the install set. The
-    // single-version-per-name shape is correct for the audit-fixture
-    // scope; multi-source-same-name disambiguation flows through
-    // wrapper_id at the GraphKey level.
+    // intersect declared peers against the install set. Multi-source
+    // same-name disambiguation flows through wrapper_id at the GraphKey
+    // level.
     let mut by_name: HashMap<String, String> = HashMap::with_capacity(targets.len());
     for v2t in targets.iter() {
         by_name
@@ -1127,33 +1129,6 @@ fn root_link_names(target: &LinkTarget) -> Vec<String> {
         .collect()
 }
 
-/// Reject root-symlink names whose components could escape the
-/// project's `node_modules/` directory: empty, `..`, anything with a
-/// `/`/`\\` separator or null byte. Scoped names like `@scope/pkg`
-/// are intentionally accepted — the writer handles their
-/// `@scope/` parent dir creation explicitly.
-fn is_safe_root_link_name(name: &str) -> bool {
-    if name.is_empty() || name.contains('\0') {
-        return false;
-    }
-    if name.contains('\\') {
-        return false;
-    }
-    let slash_count = name.matches('/').count();
-    if slash_count == 0 && name.starts_with('@') {
-        return false;
-    }
-    if slash_count > 1 || (slash_count == 1 && !name.starts_with('@')) {
-        return false;
-    }
-    for component in name.split('/') {
-        if component == ".." || component == "." || component.is_empty() {
-            return false;
-        }
-    }
-    true
-}
-
 /// `.bin/` shim creation for the v2 layout. Walks each direct dep's
 /// `package.json` from inside the link entry's package dir
 /// (`<store>/links/<graph-key>/node_modules/<name>/package.json`)
@@ -1403,25 +1378,7 @@ fn ensure_link_parent_dir(root: &Path, link_path: &Path, label: &str) -> Result<
 }
 
 fn ensure_real_dir(path: &Path, label: &str) -> Result<(), LpmError> {
-    let metadata = path.symlink_metadata().map_err(|e| {
-        LpmError::Store(format!(
-            "v2 linker: failed to inspect {label} directory at {}: {e}",
-            path.display()
-        ))
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(LpmError::Store(format!(
-            "v2 linker: refusing to write {label} through symlinked directory {}",
-            path.display()
-        )));
-    }
-    if !metadata.is_dir() {
-        return Err(LpmError::Store(format!(
-            "v2 linker: refusing to write {label} through non-directory {}",
-            path.display()
-        )));
-    }
-    Ok(())
+    ensure_real_dir_with_prefix(path, label, "v2 linker: ")
 }
 
 #[cfg(test)]
