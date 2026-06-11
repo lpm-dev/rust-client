@@ -847,7 +847,42 @@ impl SpeculativeStats {
 /// very deep single-chains). Matches the worker's own deep-walk cap so
 /// speculation doesn't ask for manifests the worker won't send.
 const SPECULATION_MAX_DEPTH: u32 = 5;
-const DEFAULT_FUSION_NPM_FANOUT: usize = 64;
+const DEFAULT_FUSION_NPM_FANOUT: usize = lpm_resolver::DEFAULT_NPM_FANOUT;
+const DEFAULT_FUSION_SPECULATION_PERMITS: usize = DEFAULT_MAX_CONCURRENT_DOWNLOADS;
+const ENV_FUSION_SPECULATION_PERMITS: &str = "LPM_FUSION_SPECULATION_PERMITS";
+const ENV_VERIFY_REGISTRY_SIGNATURES: &str = "LPM_VERIFY_REGISTRY_SIGNATURES";
+
+fn parse_positive_usize_or_default(value: &str, default: usize) -> usize {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+fn positive_usize_env_or_default(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().map_or(default, |value| {
+        parse_positive_usize_or_default(&value, default)
+    })
+}
+
+fn parse_bool_env_value(value: &str, default: bool) -> bool {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+fn bool_env_or_default(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map_or(default, |value| parse_bool_env_value(&value, default))
+}
+
+fn registry_signature_verification_enabled() -> bool {
+    bool_env_or_default(ENV_VERIFY_REGISTRY_SIGNATURES, false)
+}
 
 impl FetchBreakdown {
     /// Fold one task's timings into the running aggregate.
@@ -5604,7 +5639,7 @@ async fn run_with_options_under_store_lock(
         &all_workspace_members,
     )?;
 
-    // stats — filled by the walker + dispatcher drain.
+    // stats — filled by the speculation dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
 
     //: shared fetch coordinator — serializes per-key fetch
@@ -5612,13 +5647,10 @@ async fn run_with_options_under_store_lock(
     // now that the drain-wait between them is gone.
     let fetch_coord: Arc<FetchCoordinator> = Arc::new(FetchCoordinator::default());
 
-    // walker + dispatcher join handles hoisted out of the
-    // fresh-resolve arm so the main task drains them AFTER the real
-    // fetch loop — preserves the speculation overlap the
-    // hoist enabled. NOT awaited here: awaiting either handle early
-    // consumes it and makes the post-fetch drain a no-op (preplan
-    //).
-    let mut walker_join: Option<WalkerJoin> = None;
+    // Speculation handles are hoisted out of the fresh-resolve arm so
+    // the main task drains them after the real fetch loop. Awaiting
+    // the dispatcher early removes the resolve/fetch overlap.
+    let mut speculation_join: Option<SpeculationJoin> = None;
     // Post-lockfile metadata: which resolver actually ran.
     // Stamped into `lpm.lock`'s `resolved-with` field at the cold-
     // write site below. Defaults to the greedy-fusion install default
@@ -5747,25 +5779,35 @@ async fn run_with_options_under_store_lock(
                     u128,
                 ) = if fusion_enabled_local {
                     // ── FUSION PATH ─────────────────────────────────────
-                    // Fusion resolves metadata fast enough that saturating
-                    // the registry's H2 stream cap can slow the following
-                    // tarball wave. Keep headroom by default; retain
-                    // `LPM_NPM_FANOUT` for benchmark tuning.
-                    let npm_fanout = std::env::var("LPM_NPM_FANOUT")
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .filter(|&n| n > 0)
-                        .unwrap_or(DEFAULT_FUSION_NPM_FANOUT);
+                    let npm_fanout =
+                        positive_usize_env_or_default("LPM_NPM_FANOUT", DEFAULT_FUSION_NPM_FANOUT);
+                    let speculation_permits = positive_usize_env_or_default(
+                        ENV_FUSION_SPECULATION_PERMITS,
+                        DEFAULT_FUSION_SPECULATION_PERMITS,
+                    );
 
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
                     seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
+                    let (spec_tx, spec_rx) =
+                        tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
+                    let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
+                        spec_rx,
+                        arc_client.clone(),
+                        route_table.clone(),
+                        store.clone(),
+                        fetch_semaphore.clone(),
+                        Some(Arc::new(Semaphore::new(speculation_permits))),
+                        fetch_coord.clone(),
+                        deps.clone(),
+                        store_v2_handle.clone(),
+                    );
                     let res = lpm_resolver::resolve_greedy_fused_with_cache_options(
                         arc_client.clone(),
                         deps.clone(),
                         override_set.clone(),
                         route_table.clone(),
                         npm_fanout,
-                        None,
+                        Some(spec_tx),
                         shared_cache,
                         auto_install_peers,
                         !omit_policy.optional,
@@ -5778,6 +5820,17 @@ async fn run_with_options_under_store_lock(
                     // "lockfile fast path" in --json which is technically
                     // wrong but harmless — the real story is in
                     // `timing.resolve.dispatcher.*` (W1 plumbing).
+                    speculation_join = Some(SpeculationJoin {
+                        producer: None,
+                        dispatcher: dispatcher_handle,
+                        dispatched: dispatcher_counters.dispatched,
+                        completed: dispatcher_counters.completed,
+                        task_ms_sum: dispatcher_counters.task_ms_sum,
+                        transitive_dispatched: dispatcher_counters.transitive_dispatched,
+                        max_depth_reached: dispatcher_counters.max_depth_reached,
+                        no_version_match: dispatcher_counters.no_version_match,
+                        unresolved_parked: dispatcher_counters.unresolved_parked,
+                    });
                     (res, 0u128)
                 } else {
                     // ── LEGACY PATH (walker + spec dispatcher) ──
@@ -5792,7 +5845,7 @@ async fn run_with_options_under_store_lock(
                     // roots_ready_rx then solves against the shared cache.
                     //
                     // Critically: walker + dispatcher `JoinHandle`s are NOT
-                    // awaited here. They're bundled into `WalkerJoin` below
+                    // awaited here. They're bundled into `SpeculationJoin` below
                     // and drained at the existing post-fetch drain point —
                     // preserving the speculation overlap and
                     // matching preplan's "tail drains post-fetch, not
@@ -5823,7 +5876,7 @@ async fn run_with_options_under_store_lock(
                         // No deps → fire roots_ready immediately + flip the
                         // walker_done flag so any (vacuously-empty) wait-loop
                         // sleeper short-circuits, then spawn a no-op task so
-                        // the `WalkerJoin` shape stays uniform.
+                        // the `SpeculationJoin` shape stays uniform.
                         let _ = roots_ready_tx.send(());
                         walker_done.store(true, std::sync::atomic::Ordering::Release);
                         tokio::spawn(async { Ok(lpm_resolver::WalkerSummary::default()) })
@@ -5850,6 +5903,7 @@ async fn run_with_options_under_store_lock(
                         route_table.clone(),
                         store.clone(),
                         fetch_semaphore.clone(),
+                        None,
                         fetch_coord.clone(),
                         deps.clone(),
                         store_v2_handle.clone(),
@@ -5910,8 +5964,8 @@ async fn run_with_options_under_store_lock(
                     }
                     .await;
 
-                    walker_join = Some(WalkerJoin {
-                        walker: walker_handle,
+                    speculation_join = Some(SpeculationJoin {
+                        producer: Some(walker_handle),
                         dispatcher: dispatcher_handle,
                         dispatched: dispatcher_counters.dispatched,
                         completed: dispatcher_counters.completed,
@@ -5928,10 +5982,9 @@ async fn run_with_options_under_store_lock(
 
                 let resolve_result = resolve_res?;
 
-                // The legacy walker arm keeps its speculation join in
-                // `walker_join` and drains it after fetch. Fusion does not
-                // start install-side tarball speculation; the exact resolved
-                // graph feeds the authoritative fetch phase directly.
+                // The speculation join drains after fetch so downloads
+                // dispatched during resolution can overlap the authoritative
+                // fetch phase without being awaited early.
                 let ms = resolve_start.elapsed().as_millis();
 
                 // Post-resolution peer dependency check: warn about unmet peers
@@ -7255,6 +7308,7 @@ async fn run_with_options_under_store_lock(
     // temp-file spool (kept as an escape hatch for debugging fetch
     // regressions or non-sha512 integrity edge cases).
     let streaming_fetch = std::env::var("LPM_STREAM_FETCH").map_or(true, |v| v != "0");
+    let verify_registry_signatures = registry_signature_verification_enabled();
     if !to_download.is_empty() {
         let overall = ProgressBar::new(to_download.len() as u64);
         overall.set_style(
@@ -7311,6 +7365,7 @@ async fn run_with_options_under_store_lock(
                 .get(&(p.name.clone(), p.version.clone()))
                 .cloned();
             let source_index_for_pkg = Arc::clone(&source_index);
+            let verify_signatures = verify_registry_signatures;
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
@@ -7338,6 +7393,10 @@ async fn run_with_options_under_store_lock(
                 // real fetch entirely (zero bandwidth, zero CPU).
                 let key_lock = coord.lock_for(install_pkg_key(&p)).await;
                 let _key_guard = key_lock.lock().await;
+
+                if verify_signatures {
+                    verify_registry_signature_if_present(&client, &route_table_c, &p, None).await?;
+                }
 
                 // Spawn the per-pkg link task once the tarball is in the
                 // store. Used in both the sibling-skip path and the normal
@@ -7626,15 +7685,14 @@ async fn run_with_options_under_store_lock(
 
     let fetch_ms = fetch_start.elapsed().as_millis();
 
-    // The legacy walker resolver keeps the post-fetch drain so tarball
-    // speculation can overlap its slower metadata walk. Fusion does not
-    // start the tarball speculation dispatcher; its exact graph goes
-    // straight to authoritative fetch.
+    // Drain any speculation tail after the authoritative fetch phase.
+    // This preserves resolve/fetch overlap while making completed
+    // speculation visible in the JSON counters.
     //
     // The walker summary is folded into
     // `timing.resolve.streaming_bfs` in the JSON-output block below.
     // `None` on warm lockfile-fast-path installs (walker never ran).
-    if let Some(join) = walker_join.take() {
+    if let Some(join) = speculation_join.take() {
         let summary = join.drain(&mut spec_stats).await;
         tracing::debug!(
             "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={} walker_wall_ms={}",
@@ -11546,16 +11604,17 @@ fn pick_speculative_version(
 /// shape per npm data) see every downloaded package match what PubGrub
 /// ultimately picks. Pathological cases that mismatch still converge
 /// correctly via the real fetch loop.
-/// replacement for `SpeculativeJoin`. Bundles the still-live
-/// walker + dispatcher `JoinHandle`s plus the dispatcher's atomic
-/// counters so `drain` at the post-fetch point returns a
-/// `WalkerSummary` and folds speculation stats into the report shape.
+/// Bundles the still-live metadata producer, dispatcher `JoinHandle`,
+/// and dispatcher's atomic counters so `drain` at the post-fetch point
+/// folds speculation stats into the report shape.
 ///
-/// Invariant: both `walker` and `dispatcher` are UNAWAITED at construction.
-/// Awaiting either before `drain()` consumes the handle and makes the
-/// post-fetch drain a no-op — the very bug preplan warns about.
-struct WalkerJoin {
-    walker: tokio::task::JoinHandle<Result<lpm_resolver::WalkerSummary, lpm_resolver::WalkerError>>,
+/// Invariant: all handles are unawaited at construction. Awaiting any
+/// before `drain()` consumes the handle and makes the post-fetch drain
+/// a no-op.
+struct SpeculationJoin {
+    producer: Option<
+        tokio::task::JoinHandle<Result<lpm_resolver::WalkerSummary, lpm_resolver::WalkerError>>,
+    >,
     dispatcher: tokio::task::JoinHandle<()>,
     dispatched: Arc<std::sync::atomic::AtomicU64>,
     completed: Arc<std::sync::atomic::AtomicU64>,
@@ -11566,8 +11625,8 @@ struct WalkerJoin {
     unresolved_parked: Arc<std::sync::atomic::AtomicU64>,
 }
 
-impl WalkerJoin {
-    /// Await walker + dispatcher tails and fold dispatcher counters
+impl SpeculationJoin {
+    /// Await producer + dispatcher tails and fold dispatcher counters
     /// into `stats`. Consumes `self` so the handles can only be
     /// drained once.
     ///
@@ -11577,11 +11636,15 @@ impl WalkerJoin {
     /// at drain-call time measures "spawn → drain," which includes
     /// any post-walker fetch-overlap tail — not the metadata-producer
     /// window the field is documented as. The walker-owned measurement
-    /// is invariant to when the caller chooses to `.await` the
-    /// JoinHandle.
+    /// is invariant to when the caller chooses to `.await` the handle.
+    /// Fusion has no separate walker, so it reports the default summary
+    /// while still folding dispatcher counters.
     async fn drain(self, stats: &mut SpeculativeStats) -> lpm_resolver::WalkerSummary {
         use std::sync::atomic::Ordering::Relaxed;
-        let walker_res = self.walker.await;
+        let producer_res = match self.producer {
+            Some(producer) => Some(producer.await),
+            None => None,
+        };
         let _dispatcher_res = self.dispatcher.await;
         stats.dispatched = self.dispatched.load(Relaxed);
         stats.completed = self.completed.load(Relaxed);
@@ -11590,16 +11653,17 @@ impl WalkerJoin {
         stats.max_depth_reached = self.max_depth_reached.load(Relaxed);
         stats.no_version_match = self.no_version_match.load(Relaxed);
         stats.unresolved_parked = self.unresolved_parked.load(Relaxed);
-        let summary = match walker_res {
-            Ok(Ok(summary)) => summary,
-            Ok(Err(e)) => {
-                tracing::warn!("walker finished with error: {e}");
+        let summary = match producer_res {
+            Some(Ok(Ok(summary))) => summary,
+            Some(Ok(Err(e))) => {
+                tracing::warn!("metadata producer finished with error: {e}");
                 lpm_resolver::WalkerSummary::default()
             }
-            Err(join_err) => {
-                tracing::warn!("walker task join failed: {join_err}");
+            Some(Err(join_err)) => {
+                tracing::warn!("metadata producer task join failed: {join_err}");
                 lpm_resolver::WalkerSummary::default()
             }
+            None => lpm_resolver::WalkerSummary::default(),
         };
         stats.streaming_batch_ms = summary.walker_wall_ms;
         summary
@@ -11632,6 +11696,7 @@ fn spawn_speculation_dispatcher(
     route_table: RouteTable,
     store: PackageStore,
     semaphore: Arc<Semaphore>,
+    speculation_semaphore: Option<Arc<Semaphore>>,
     coord: Arc<FetchCoordinator>,
     deps: HashMap<String, String>,
     // — under v2 mode the dispatcher routes downloaded
@@ -11648,6 +11713,7 @@ fn spawn_speculation_dispatcher(
     let route_table_spec = route_table;
     let store_spec = store;
     let sem_spec = semaphore;
+    let speculation_sem_spec = speculation_semaphore;
     let coord_spec = coord;
     let store_v2_spec = store_v2;
 
@@ -11794,6 +11860,7 @@ fn spawn_speculation_dispatcher(
                 let rt = route_table_spec.clone();
                 let s = store_spec.clone();
                 let sem = sem_spec.clone();
+                let spec_sem = speculation_sem_spec.clone();
                 let coord = coord_spec.clone();
                 let completed_task = completed_c.clone();
                 let task_ms_task = task_ms_c.clone();
@@ -11806,6 +11873,7 @@ fn spawn_speculation_dispatcher(
                     &s,
                     store_v2_task.as_deref(),
                     &sem,
+                    spec_sem.as_ref(),
                     &coord,
                     &name,
                     &version,
@@ -11926,6 +11994,7 @@ async fn speculative_download_and_store(
     // gets its own clone of the `Arc<Store>`.
     store_v2: Option<&lpm_store::v2::Store>,
     semaphore: &Arc<Semaphore>,
+    speculation_semaphore: Option<&Arc<Semaphore>>,
     coord: &Arc<FetchCoordinator>,
     name: &str,
     version: &str,
@@ -11984,9 +12053,22 @@ async fn speculative_download_and_store(
         return Ok(());
     }
 
+    let _speculation_permit = match speculation_semaphore {
+        Some(limiter) => match limiter.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(()),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(LpmError::Registry(
+                    "speculation limiter semaphore closed".into(),
+                ));
+            }
+        },
+        None => None,
+    };
+
     // Speculation must never queue ahead of the authoritative fetch loop.
-    // If all permits are busy, skip this best-effort prefetch and let the
-    // real fetch path own the network slot.
+    // If all shared download permits are busy, skip this best-effort
+    // prefetch and let the real fetch path own the network slot.
     let _permit = match semaphore.try_acquire() {
         Ok(permit) => permit,
         Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(()),
@@ -12051,7 +12133,6 @@ async fn speculative_download_and_store(
 
 struct ResolvedRegistryTarballUrl {
     url: String,
-    metadata: Option<lpm_registry::PackageMetadata>,
 }
 
 async fn metadata_tarball_url_for_package(
@@ -12103,10 +12184,9 @@ async fn resolve_tarball_url(
         if metadata_checked_for_tarball {
             return Ok(ResolvedRegistryTarballUrl {
                 url: url.to_string(),
-                metadata: None,
             });
         }
-        let (metadata_url, metadata) =
+        let (metadata_url, _metadata) =
             metadata_tarball_url_for_package(client, route_table, name, version, is_lpm).await?;
         if url != metadata_url {
             return Err(LpmError::Registry(format!(
@@ -12116,7 +12196,6 @@ async fn resolve_tarball_url(
         }
         return Ok(ResolvedRegistryTarballUrl {
             url: url.to_string(),
-            metadata: Some(metadata),
         });
     }
     if metadata_checked_for_tarball {
@@ -12124,12 +12203,9 @@ async fn resolve_tarball_url(
             "no tarball URL for {name}@{version}"
         )));
     }
-    let (url, metadata) =
+    let (url, _metadata) =
         metadata_tarball_url_for_package(client, route_table, name, version, is_lpm).await?;
-    Ok(ResolvedRegistryTarballUrl {
-        url,
-        metadata: Some(metadata),
-    })
+    Ok(ResolvedRegistryTarballUrl { url })
 }
 
 /// Invalidate metadata cache for a package, routing through the
@@ -12424,14 +12500,6 @@ async fn fetch_and_store_legacy(
     let initial_url = initial_resolution.url.clone();
     let mut final_url = initial_url.clone();
 
-    verify_registry_signature_if_present(
-        client,
-        route_table,
-        p,
-        initial_resolution.metadata.as_ref(),
-    )
-    .await?;
-
     let download_start = std::time::Instant::now();
     let downloaded = match client
         .download_tarball_routed(route_table, &p.name, &initial_url)
@@ -12479,13 +12547,6 @@ async fn fetch_and_store_legacy(
                     project_dir,
                 ));
             }
-            verify_registry_signature_if_present(
-                client,
-                route_table,
-                p,
-                fresh_resolution.metadata.as_ref(),
-            )
-            .await?;
             match client
                 .download_tarball_routed(route_table, &p.name, &fresh_url)
                 .await
@@ -12751,14 +12812,6 @@ async fn fetch_and_store_streaming(
     let initial_url = initial_resolution.url.clone();
     let mut final_url = initial_url.clone();
 
-    verify_registry_signature_if_present(
-        client,
-        route_table,
-        p,
-        initial_resolution.metadata.as_ref(),
-    )
-    .await?;
-
     let response = match client
         .download_tarball_streaming_routed(route_table, &p.name, &initial_url)
         .await
@@ -12804,13 +12857,6 @@ async fn fetch_and_store_streaming(
                     project_dir,
                 ));
             }
-            verify_registry_signature_if_present(
-                client,
-                route_table,
-                p,
-                fresh_resolution.metadata.as_ref(),
-            )
-            .await?;
             match client
                 .download_tarball_streaming_routed(route_table, &p.name, &fresh_url)
                 .await
@@ -16735,6 +16781,25 @@ mod tests {
             &signatures,
             &npm_keys
         ));
+    }
+
+    #[test]
+    fn parse_bool_env_value_accepts_common_flag_spellings() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(parse_bool_env_value(value, false), "{value:?}");
+        }
+        for value in ["0", "false", "FALSE", " no ", "off"] {
+            assert!(!parse_bool_env_value(value, true), "{value:?}");
+        }
+        assert!(parse_bool_env_value("maybe", true));
+        assert!(!parse_bool_env_value("maybe", false));
+    }
+
+    #[test]
+    fn parse_positive_usize_or_default_rejects_zero_and_invalid_values() {
+        assert_eq!(parse_positive_usize_or_default("8", 3), 8);
+        assert_eq!(parse_positive_usize_or_default("0", 3), 3);
+        assert_eq!(parse_positive_usize_or_default("not-a-number", 3), 3);
     }
 
     #[tokio::test]
