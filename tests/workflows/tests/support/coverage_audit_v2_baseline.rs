@@ -1,8 +1,9 @@
 //! Coverage matrix **v2** — depth + scenario metrics.
 //!
-//! v1 (`coverage_audit_baseline.rs`) tracks binary "does any test exist
-//! for this surface" flags. That metric saturated at 97.8% workflow /
-//! 70% JSON during the 2026-05-14 coverage push but doesn't reflect:
+//! v1 (`coverage_audit_baseline.rs`) tracks surface-level coverage and
+//! an accounted JSON contract status per row. That coarse metric
+//! saturated at 97.8% workflow / 70% JSON during the 2026-05-14 coverage
+//! push but doesn't reflect:
 //!
 //! - **Scenario depth.** A surface with 1 trivial test and one with 50
 //!   thorough tests get the same v1 flag.
@@ -10,7 +11,7 @@
 //!   modes are actually exercised by tests, and which are gaps?
 //! - **JSON contract depth.** "Locked via insta snapshot" vs "checked
 //!   one field semantically" vs "test calls --json but never reads
-//!   the envelope" all flip the same v1 `json_contract: true` bit.
+//!   the envelope" are distinct in v2.
 //!
 //! ## Schema
 //!
@@ -122,10 +123,9 @@ pub struct CrossCommandFlow {
 // 77 patch) are the depth-rich examples. Every other v1-covered
 // surface follows the same schema with scenario / failure-mode arrays
 // derived from the test fns actually shipped in `tests/workflows/tests/`.
-// The two v1-uncovered surfaces (id 102 `env share`, id 105
-// `env connect / status / log / rotate-key / list-remote`) are
-// intentionally absent — adding rows for surfaces with no tests would
-// make the schema-integrity assert spuriously pass.
+// Rows with `JsonContractDepth::None` are intentionally non-JSON
+// surfaces; every JSON-capable surface has either semantic assertions
+// or a snapshot row.
 
 pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 1: lpm info <pkg> ──
@@ -2220,6 +2220,24 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         last_audited_at: "2026-05-14",
     },
+    // ── id 102: lpm env share ──
+    SurfaceV2 {
+        id: 102,
+        scenarios: 2,
+        failure_modes_tested: &[
+            "share --force fails before vault or network access",
+            "share --force under --json emits error envelope on stdout",
+        ],
+        failure_modes_known: &[
+            "empty vault refusal under --json",
+            "not logged in under --json",
+            "org version conflict with pull-then-retry remediation",
+            "sharing-key rotation-required refusal",
+        ],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 2)],
+        last_audited_at: "2026-06-11",
+    },
     // ── id 103: lpm env pair ──
     SurfaceV2 {
         id: 103,
@@ -2267,6 +2285,28 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             ("tests/workflows/tests/env_local.rs", 1),
         ],
         last_audited_at: "2026-05-14",
+    },
+    // ── id 105: lpm env connect / status / log / rotate-key / list-remote ──
+    SurfaceV2 {
+        id: 105,
+        scenarios: 5,
+        failure_modes_tested: &[
+            "connect --json success envelope carries success + status + platform",
+            "status --json success envelope carries success + count + platforms",
+            "log without vault under --json emits error envelope on stdout",
+            "rotate-key without vault under --json emits error envelope on stdout",
+            "list-remote without auth under --json emits error envelope on stdout",
+        ],
+        failure_modes_known: &[
+            "connect network failure after auth",
+            "status response with malformed platform entries",
+            "audit log pagination cursor handling",
+            "rotate-key push conflict",
+            "list-remote org route with multiple vaults",
+        ],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 5)],
+        last_audited_at: "2026-06-11",
     },
     // ── id 106: lpm env oidc allow ──
     SurfaceV2 {
