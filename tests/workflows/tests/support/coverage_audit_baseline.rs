@@ -3,6 +3,23 @@
 // Update the phase doc first, then re-generate this file when the audited
 // command-surface baseline changes.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonContractStatus {
+    Covered,
+    NotApplicable,
+    Missing,
+}
+
+impl JsonContractStatus {
+    pub const fn has_contract(self) -> bool {
+        matches!(self, Self::Covered)
+    }
+
+    pub const fn is_accounted_for(self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+}
+
 #[derive(Debug)]
 pub struct SurfaceBaseline {
     pub id: u16,
@@ -11,13 +28,17 @@ pub struct SurfaceBaseline {
     pub integration: bool,
     pub workflow: bool,
     pub cli_binary: bool,
-    pub json_contract: bool,
+    pub json_contract: JsonContractStatus,
     pub references: &'static [&'static str],
 }
 
 impl SurfaceBaseline {
     pub const fn has_any_coverage(&self) -> bool {
-        self.unit || self.integration || self.workflow || self.cli_binary || self.json_contract
+        self.unit
+            || self.integration
+            || self.workflow
+            || self.cli_binary
+            || self.json_contract.has_contract()
     }
 }
 
@@ -105,7 +126,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/json_output.rs"],
     },
     SurfaceBaseline {
@@ -115,7 +136,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/search.rs"],
     },
     SurfaceBaseline {
@@ -125,7 +146,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/quality.rs"],
     },
     SurfaceBaseline {
@@ -135,7 +156,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/auth_lifecycle.rs",
             "tests/workflows/tests/json_output.rs",
@@ -148,7 +169,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/json_output.rs"],
     },
     SurfaceBaseline {
@@ -158,7 +179,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/download.rs"],
     },
     SurfaceBaseline {
@@ -168,7 +189,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/resolve.rs"],
     },
     SurfaceBaseline {
@@ -178,7 +199,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/outdated.rs"],
     },
     SurfaceBaseline {
@@ -188,7 +209,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/doctor.rs",
             "tests/workflows/tests/doctor_list.rs",
@@ -203,7 +224,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/doctor_fix.rs"],
     },
     SurfaceBaseline {
@@ -213,7 +234,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/init.rs"],
     },
     SurfaceBaseline {
@@ -223,7 +244,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/install.rs",
             "tests/workflows/tests/install.rs",
@@ -239,7 +260,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/install.rs"],
     },
     SurfaceBaseline {
@@ -249,7 +270,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/install.rs",
             "tests/workflows/tests/install_offline_capability_roundtrip.rs",
@@ -262,7 +283,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/install.rs"],
     },
     SurfaceBaseline {
@@ -272,7 +293,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/install_global.rs",
             "crates/lpm-cli/tests/global_install_state_mutation.rs",
@@ -287,7 +308,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/install_policy.rs"],
     },
     SurfaceBaseline {
@@ -297,7 +318,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/install_provenance.rs",
             "tests/workflows/tests/install.rs",
@@ -310,7 +331,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/uninstall.rs",
             "tests/workflows/tests/uninstall.rs",
@@ -323,7 +344,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/uninstall_global.rs",
             "crates/lpm-cli/tests/global_install_state_mutation.rs",
@@ -337,7 +358,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/uninstall.rs"],
     },
     SurfaceBaseline {
@@ -347,7 +368,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/add.rs",
             "tests/workflows/tests/add.rs",
@@ -360,7 +381,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/remove.rs"],
     },
     SurfaceBaseline {
@@ -370,7 +391,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/upgrade.rs",
             "tests/workflows/tests/upgrade.rs",
@@ -383,7 +404,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/upgrade.rs"],
     },
     SurfaceBaseline {
@@ -393,7 +414,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/upgrade.rs"],
     },
     SurfaceBaseline {
@@ -403,7 +424,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/publish.rs",
             "tests/workflows/tests/publish.rs",
@@ -417,7 +438,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/publish_npm.rs",
             "crates/lpm-cli/tests/oidc_publish_auto_exchange_contract.rs",
@@ -431,7 +452,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/publish.rs"],
     },
     SurfaceBaseline {
@@ -441,7 +462,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/publish.rs"],
     },
     SurfaceBaseline {
@@ -451,7 +472,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/publish.rs"],
     },
     SurfaceBaseline {
@@ -461,7 +482,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/publish.rs",
             "crates/lpm-cli/tests/oidc_publish_auto_exchange_contract.rs",
@@ -474,7 +495,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/publish.rs",
             "crates/lpm-cli/tests/oidc_publish_auto_exchange_contract.rs",
@@ -487,7 +508,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/auth_lifecycle.rs",
             "tests/workflows/tests/json_output.rs",
@@ -500,7 +521,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/auth_lifecycle.rs",
             "tests/workflows/tests/npmrc.rs",
@@ -513,7 +534,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/auth_lifecycle.rs",
             "crates/lpm-cli/tests/oidc_setup_snippet_contract.rs",
@@ -526,7 +547,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/auth_lifecycle.rs"],
     },
     SurfaceBaseline {
@@ -536,7 +557,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/auth_lifecycle.rs"],
     },
     SurfaceBaseline {
@@ -546,7 +567,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/auth_lifecycle.rs"],
     },
     SurfaceBaseline {
@@ -556,7 +577,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/token_rotate.rs"],
     },
     SurfaceBaseline {
@@ -566,7 +587,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/tests/oidc_setup_snippet_contract.rs",
             "tests/workflows/tests/setup_ci.rs",
@@ -579,7 +600,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/setup_local.rs"],
     },
     SurfaceBaseline {
@@ -589,7 +610,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/config.rs"],
     },
     SurfaceBaseline {
@@ -599,7 +620,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/config.rs"],
     },
     SurfaceBaseline {
@@ -609,7 +630,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/config.rs"],
     },
     SurfaceBaseline {
@@ -619,7 +640,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/config.rs"],
     },
     SurfaceBaseline {
@@ -629,7 +650,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/cache.rs",
             "tests/workflows/tests/cache.rs",
@@ -642,7 +663,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/cache.rs"],
     },
     SurfaceBaseline {
@@ -652,7 +673,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/store.rs",
             "tests/workflows/tests/store.rs",
@@ -665,7 +686,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/store.rs"],
     },
     SurfaceBaseline {
@@ -675,7 +696,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/cache_prune.rs",
             "tests/workflows/tests/cache_prune.rs",
@@ -688,7 +709,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/store.rs"],
     },
     SurfaceBaseline {
@@ -698,7 +719,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/global.rs",
             "crates/lpm-cli/tests/global_install_state_mutation.rs",
@@ -712,7 +733,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/tests/global_install_state_mutation.rs",
             "tests/workflows/tests/global.rs",
@@ -725,7 +746,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/global.rs"],
     },
     SurfaceBaseline {
@@ -735,7 +756,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/global.rs"],
     },
     SurfaceBaseline {
@@ -745,7 +766,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/tests/global_install_state_mutation.rs",
             "tests/workflows/tests/global.rs",
@@ -758,7 +779,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/update_global.rs",
             "crates/lpm-cli/tests/global_install_state_mutation.rs",
@@ -772,7 +793,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/trust.rs",
             "tests/workflows/tests/trust.rs",
@@ -785,7 +806,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/trust.rs"],
     },
     SurfaceBaseline {
@@ -795,7 +816,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/pool.rs"],
     },
     SurfaceBaseline {
@@ -805,7 +826,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/audit/mod.rs",
             "tests/workflows/tests/audit.rs",
@@ -818,7 +839,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/audit.rs"],
     },
     SurfaceBaseline {
@@ -828,7 +849,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/audit.rs"],
     },
     SurfaceBaseline {
@@ -838,7 +859,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/query.rs",
             "tests/workflows/tests/query.rs",
@@ -851,7 +872,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/query.rs"],
     },
     SurfaceBaseline {
@@ -861,7 +882,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/rebuild.rs",
             "tests/workflows/tests/approve_scripts.rs",
@@ -877,7 +898,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/rebuild.rs"],
     },
     SurfaceBaseline {
@@ -887,7 +908,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/rebuild.rs"],
     },
     SurfaceBaseline {
@@ -897,7 +918,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/rebuild.rs"],
     },
     SurfaceBaseline {
@@ -907,7 +928,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: false,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/approve_scripts.rs",
             "crates/lpm-cli/tests/approve_scripts_interactive_tty.rs",
@@ -920,7 +941,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
@@ -930,7 +951,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
@@ -940,7 +961,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
@@ -950,7 +971,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/approve_scripts.rs",
             "tests/workflows/tests/install_global_security.rs",
@@ -963,7 +984,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/approve_scripts.rs"],
     },
     SurfaceBaseline {
@@ -973,7 +994,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/patch.rs",
             "tests/workflows/tests/patch.rs",
@@ -986,7 +1007,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/patch.rs"],
     },
     SurfaceBaseline {
@@ -996,7 +1017,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/filter.rs",
             "tests/workflows/tests/filter.rs",
@@ -1009,7 +1030,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/deploy.rs",
             "tests/workflows/tests/deploy.rs",
@@ -1022,7 +1043,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/plugin.rs"],
     },
     SurfaceBaseline {
@@ -1032,7 +1053,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: true,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/skills.rs",
             "tests/integration/tests/output_parity.rs",
@@ -1046,7 +1067,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/run.rs",
             "tests/workflows/tests/run.rs",
@@ -1060,7 +1081,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/run.rs"],
     },
     SurfaceBaseline {
@@ -1070,7 +1091,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/exec.rs"],
     },
     SurfaceBaseline {
@@ -1080,7 +1101,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/dlx.rs"],
     },
     SurfaceBaseline {
@@ -1090,7 +1111,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/tools.rs",
             "tests/workflows/tests/tools.rs",
@@ -1103,7 +1124,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/tools.rs"],
     },
     SurfaceBaseline {
@@ -1113,7 +1134,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/tools.rs"],
     },
     SurfaceBaseline {
@@ -1123,7 +1144,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/check_typescript.rs",
             "tests/workflows/tests/tools.rs",
@@ -1136,7 +1157,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/tools.rs"],
     },
     SurfaceBaseline {
@@ -1146,7 +1167,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/tools.rs"],
     },
     SurfaceBaseline {
@@ -1156,7 +1177,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::NotApplicable,
         references: &["tests/workflows/tests/ci.rs"],
     },
     SurfaceBaseline {
@@ -1166,7 +1187,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/ci.rs"],
     },
     SurfaceBaseline {
@@ -1176,7 +1197,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/tests/oidc_setup_snippet_contract.rs",
             "tests/workflows/tests/ci.rs",
@@ -1189,7 +1210,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/env.rs",
             "tests/workflows/tests/env_local.rs",
@@ -1202,7 +1223,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/env_local.rs"],
     },
     SurfaceBaseline {
@@ -1212,7 +1233,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/env_local.rs"],
     },
     SurfaceBaseline {
@@ -1222,7 +1243,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/env_local.rs"],
     },
     SurfaceBaseline {
@@ -1232,7 +1253,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/env_local.rs"],
     },
     SurfaceBaseline {
@@ -1242,7 +1263,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/cross_command_flows.rs",
             "tests/workflows/tests/env_vault.rs",
@@ -1253,10 +1274,10 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         name: "`lpm env share`",
         unit: true,
         integration: false,
-        workflow: false,
+        workflow: true,
         cli_binary: false,
-        json_contract: false,
-        references: &[],
+        json_contract: JsonContractStatus::Covered,
+        references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
         id: 103,
@@ -1265,7 +1286,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
@@ -1275,7 +1296,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/env_local.rs",
             "tests/workflows/tests/env_vault.rs",
@@ -1286,10 +1307,10 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         name: "`lpm env connect / status / log / rotate-key / list-remote`",
         unit: true,
         integration: false,
-        workflow: false,
+        workflow: true,
         cli_binary: false,
-        json_contract: false,
-        references: &[],
+        json_contract: JsonContractStatus::Covered,
+        references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
         id: 106,
@@ -1298,7 +1319,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
@@ -1308,7 +1329,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
@@ -1318,7 +1339,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/env_vault.rs"],
     },
     SurfaceBaseline {
@@ -1328,7 +1349,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::NotApplicable,
         references: &[
             "crates/lpm-cli/src/commands/dev.rs",
             "tests/workflows/tests/dev_tunnel.rs",
@@ -1341,7 +1362,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::NotApplicable,
         references: &["tests/workflows/tests/dev_tunnel.rs"],
     },
     SurfaceBaseline {
@@ -1351,7 +1372,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/cert.rs"],
     },
     SurfaceBaseline {
@@ -1361,7 +1382,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/graph.rs",
             "tests/workflows/tests/graph.rs",
@@ -1374,7 +1395,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
@@ -1384,7 +1405,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
@@ -1394,7 +1415,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
@@ -1404,7 +1425,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/graph.rs"],
     },
     SurfaceBaseline {
@@ -1414,7 +1435,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/ports.rs",
             "crates/lpm-runner/src/ports.rs",
@@ -1428,7 +1449,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/tunnel.rs",
             "tests/workflows/tests/dev_tunnel.rs",
@@ -1441,7 +1462,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/dev_tunnel.rs"],
     },
     SurfaceBaseline {
@@ -1451,7 +1472,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/dev_tunnel.rs"],
     },
     SurfaceBaseline {
@@ -1461,7 +1482,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: true,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/migrate_overrides.rs",
             "crates/lpm-cli/src/commands/migrate_patches.rs",
@@ -1477,7 +1498,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: true,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/integration/tests/core.rs",
             "tests/workflows/tests/migrate.rs",
@@ -1490,7 +1511,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "tests/workflows/tests/migrate.rs",
             "tests/workflows/tests/json_output.rs",
@@ -1503,7 +1524,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/migrate.rs"],
     },
     SurfaceBaseline {
@@ -1513,7 +1534,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/vault.rs"],
     },
     SurfaceBaseline {
@@ -1523,7 +1544,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/self_update.rs",
             "tests/workflows/tests/self_update.rs",
@@ -1536,7 +1557,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::NotApplicable,
         references: &["tests/workflows/tests/dev_tunnel.rs"],
     },
     SurfaceBaseline {
@@ -1546,7 +1567,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/swift_registry.rs",
             "tests/workflows/tests/swift.rs",
@@ -1559,7 +1580,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/mcp.rs",
             "tests/workflows/tests/mcp.rs",
@@ -1572,7 +1593,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/use.rs",
             "tests/workflows/tests/use.rs",
@@ -1585,7 +1606,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/use.rs"],
     },
     SurfaceBaseline {
@@ -1595,7 +1616,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: false,
+        json_contract: JsonContractStatus::NotApplicable,
         references: &["tests/workflows/tests/completions.rs"],
     },
     SurfaceBaseline {
@@ -1605,7 +1626,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/schema.rs",
             "crates/lpm-cli/tests/schema_drift.rs",
@@ -1619,7 +1640,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/tests/schema_drift.rs",
             "tests/workflows/tests/schema.rs",
@@ -1632,7 +1653,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/install.rs"],
     },
     // ── Phase-65 v2-taxonomy refinement: split install.rs orphan tests ──
@@ -1652,7 +1673,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/install.rs"],
     },
     SurfaceBaseline {
@@ -1662,7 +1683,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/install.rs"],
     },
     SurfaceBaseline {
@@ -1672,7 +1693,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/bundle.rs",
             "tests/workflows/tests/bundle.rs",
@@ -1685,7 +1706,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/pack.rs",
             "tests/workflows/tests/pack.rs",
@@ -1698,7 +1719,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/pnpm_compat_catalog.rs"],
     },
     SurfaceBaseline {
@@ -1708,7 +1729,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/pnpm_compat_catalog.rs"],
     },
     SurfaceBaseline {
@@ -1718,7 +1739,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/patch.rs",
             "tests/workflows/tests/patch.rs",
@@ -1731,7 +1752,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/sbom.rs",
             "tests/workflows/tests/sbom.rs",
@@ -1744,7 +1765,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: true,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/proxy.rs",
             "crates/lpm-cli/tests/proxy_status_contract.rs",
@@ -1759,7 +1780,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/hosts.rs",
             "crates/lpm-runner/src/local_domains.rs",
@@ -1773,7 +1794,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/npm_stage.rs",
             "crates/lpm-cli/src/commands/stage.rs",
@@ -1787,7 +1808,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &["tests/workflows/tests/stage.rs"],
     },
     SurfaceBaseline {
@@ -1797,7 +1818,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/npm_stage.rs",
             "tests/workflows/tests/stage.rs",
@@ -1810,7 +1831,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/npm_stage.rs",
             "tests/workflows/tests/stage.rs",
@@ -1823,7 +1844,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/npm_stage.rs",
             "tests/workflows/tests/stage.rs",
@@ -1836,7 +1857,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/npm_stage.rs",
             "tests/workflows/tests/stage.rs",
@@ -1849,7 +1870,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: true,
+        json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/npm_stage.rs",
             "tests/workflows/tests/stage.rs",

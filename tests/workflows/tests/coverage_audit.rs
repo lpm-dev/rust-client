@@ -13,7 +13,8 @@
 mod coverage_audit_baseline;
 
 use coverage_audit_baseline::{
-    EXPECTED_COMMAND_VARIANTS, EXPECTED_SURFACE_COUNT, SURFACES, SurfaceBaseline,
+    EXPECTED_COMMAND_VARIANTS, EXPECTED_SURFACE_COUNT, JsonContractStatus, SURFACES,
+    SurfaceBaseline,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -55,6 +56,39 @@ fn coverage_audit_baseline_shape_matches_command_matrix() {
     assert_eq!(
         uncovered, 0,
         "no surface should be uncovered after the env+vault tranche"
+    );
+}
+
+#[test]
+fn json_contract_statuses_are_fully_accounted_for() {
+    assert!(
+        !JsonContractStatus::Missing.is_accounted_for(),
+        "the Missing sentinel must keep failing the JSON-accounted guard"
+    );
+
+    let missing: Vec<String> = SURFACES
+        .iter()
+        .filter(|surface| !surface.json_contract.is_accounted_for())
+        .map(render_surface)
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "JSON contract inventory still has missing surfaces:\n{}",
+        missing.join("\n")
+    );
+
+    let not_applicable: Vec<String> = SURFACES
+        .iter()
+        .filter(|surface| matches!(surface.json_contract, JsonContractStatus::NotApplicable))
+        .map(render_surface)
+        .collect();
+
+    assert_eq!(
+        not_applicable.len(),
+        5,
+        "the intentionally non-JSON surface set changed; update v2 KEEP_NONE rationale rows:\n{}",
+        not_applicable.join("\n")
     );
 }
 

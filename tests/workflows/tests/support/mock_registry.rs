@@ -828,6 +828,46 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_platform_connect_success(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        platform: &str,
+        project_id: &str,
+        response: serde_json::Value,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/platforms/connect"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains(format!("\"platform\":\"{platform}\"")))
+            .and(body_string_contains(format!(
+                "\"projectId\":\"{project_id}\""
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_platform_status_success(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        response: serde_json::Value,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/platforms/status"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a successful wrapping-key escrow upload.
     pub async fn with_escrow_upload_success(&self, bearer_token: &str, vault_id: &str) -> &Self {
         Mock::given(method("POST"))

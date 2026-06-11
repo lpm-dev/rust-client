@@ -60,6 +60,16 @@ fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serd
         .expect("failed to write encrypted local vault file");
 }
 
+fn parse_clean_json_stdout(output: &std::process::Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim_start().starts_with('{'),
+        "JSON mode must not prefix stdout with human text:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    parse_json_output(&output.stdout)
+}
+
 #[test]
 fn doctor_json_reports_file_vault_fallback_when_forced_file_backend_is_active() {
     let project = TempProject::empty(r#"{"name":"vault-doctor","version":"1.0.0"}"#);
@@ -2724,6 +2734,157 @@ async fn env_share_refuses_force_flag_with_actionable_remediation() {
         combined.contains("lpm env pull --org"),
         "expected the pull-then-retry remediation hint; got: {combined}"
     );
+}
+
+#[tokio::test]
+async fn env_share_force_under_json_emits_error_envelope_on_stdout() {
+    let project = TempProject::empty(r#"{"name":"share-force-json","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "env", "share", "--org", "acme", "--force"])
+        .output()
+        .expect("failed to run lpm env share --force --json");
+
+    assert!(
+        !output.status.success(),
+        "share --force --json must fail with a non-zero exit:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let json = parse_clean_json_stdout(&output);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error_code"], "script");
+    let error = json["error"].as_str().expect("error should be a string");
+    assert!(error.contains("`lpm env share --force` is not supported"));
+    assert!(error.contains("lpm env pull --org"));
+}
+
+#[tokio::test]
+async fn env_platform_json_success_paths_emit_success_envelopes() {
+    let project = TempProject::empty(r#"{"name":"platform-json-contract","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let bearer_token = "platform-json-session-token";
+    let vault_id = "vault-platform-json-123";
+
+    project.write_file("lpm.json", &format!(r#"{{"vault":"{vault_id}"}}"#));
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some(bearer_token),
+            refresh_token: Some("platform-json-refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    mock.with_platform_connect_success(
+        bearer_token,
+        vault_id,
+        "vercel",
+        "project-123",
+        serde_json::json!({
+            "status": "connected",
+            "platform": "vercel",
+            "projectId": "project-123",
+        }),
+    )
+    .await;
+    mock.with_platform_status_success(
+        bearer_token,
+        vault_id,
+        serde_json::json!({
+            "platforms": [
+                {
+                    "platform": "vercel",
+                    "label": "production",
+                    "env": "default",
+                    "status": "synced",
+                    "lastPushAt": "2030-01-01T00:00:00Z"
+                }
+            ]
+        }),
+    )
+    .await;
+
+    let connect = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args([
+            "--json",
+            "env",
+            "connect",
+            "vercel",
+            "--project",
+            "project-123",
+            "--token",
+            "vercel-token",
+            "--label",
+            "production",
+        ])
+        .output()
+        .expect("failed to run lpm env connect --json");
+    assert!(
+        connect.status.success(),
+        "env connect --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&connect.stdout),
+        String::from_utf8_lossy(&connect.stderr),
+    );
+    let connect_json = parse_clean_json_stdout(&connect);
+    assert_eq!(connect_json["success"], true);
+    assert_eq!(connect_json["status"], "connected");
+    assert_eq!(connect_json["platform"], "vercel");
+
+    let status = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "status"])
+        .output()
+        .expect("failed to run lpm env status --json");
+    assert!(
+        status.status.success(),
+        "env status --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+    );
+    let status_json = parse_clean_json_stdout(&status);
+    assert_eq!(status_json["success"], true);
+    assert_eq!(status_json["count"], 1);
+    assert_eq!(status_json["platforms"][0]["platform"], "vercel");
+}
+
+#[tokio::test]
+async fn env_platform_json_error_paths_emit_error_envelopes_on_stdout() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["--json", "env", "log"], "no vault configured"),
+        (&["--json", "env", "rotate-key"], "no vault configured"),
+        (&["--json", "env", "list-remote"], "not logged in"),
+    ];
+
+    for (args, expected_error) in cases {
+        let project = TempProject::empty(r#"{"name":"platform-json-errors","version":"1.0.0"}"#);
+        let output = lpm(&project)
+            .args(*args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run lpm {args:?}: {error}"));
+
+        assert!(
+            !output.status.success(),
+            "lpm {args:?} unexpectedly succeeded:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let json = parse_clean_json_stdout(&output);
+        assert_eq!(json["success"], false, "lpm {args:?} envelope: {json}");
+        assert_eq!(
+            json["error_code"], "script",
+            "lpm {args:?} envelope: {json}"
+        );
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(expected_error)),
+            "lpm {args:?} should mention {expected_error:?}; got {json}",
+        );
+    }
 }
 
 #[tokio::test]
