@@ -1,0 +1,29 @@
+[package]
+name = "lpm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lpm-extractor = { path = "../crates/lpm-extractor" }
+lpm-semver = { path = "../crates/lpm-semver" }
+
+[workspace]
+
+[[bin]]
+name = "semver_version_req_parse"
+path = "fuzz_targets/semver_version_req_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extractor_entry_path_sanitizer"
+path = "fuzz_targets/extractor_entry_path_sanitizer.rs"
+test = false
+doc = false
+bench = false

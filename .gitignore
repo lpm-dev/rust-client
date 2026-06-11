@@ -29,6 +29,9 @@ AGENTS
 /bench/sandbox-network-audit/.cache/
 /bench/sandbox-network-audit/results/
 
+/fuzz/artifacts/
+/fuzz/target/
+
 /reproduction
 
 /private
