@@ -1517,7 +1517,7 @@ pub async fn run(
         json_output,
         false, // offline
         false, // force — don't force re-link, the output dir is fresh
-        true,  // allow_new — deploy bypasses minimumReleaseAge
+        false, // allow_new — deploy should not bypass minimumReleaseAge
         false, // strict_integrity — deploy uses lockfile, integrity is recorded
         None,  // strict_peer_dependencies_override
         None,  // linker_override
@@ -1530,12 +1530,11 @@ pub async fn run(
         None, // requested_add_count: deploy is not an add-path install
         None, // script_policy_override: `lpm deploy` does not expose policy flags
         None, // advisor_override: `lpm deploy` does not expose `--advisor`
-        None, // min_release_age_override: deploy already bypasses via allow_new=true above
+        None, // min_release_age_override: use install defaults
         // drift-ignore: deploy captures an already-resolved tree;
-        // `allow_new=true` above bypasses cooldown but drift is an
-        // orthogonal gate. Deploy inherits the same default "enforce";
-        // the output dir carries whatever
-        // trustedDependencies the project defined, so legitimately-
+        // drift is an orthogonal gate. Deploy inherits the same
+        // default "enforce"; the output dir carries whatever
+        // trustedDependencies the project defined, so legitimately
         // identical identities pass normally.
         crate::provenance_fetch::DriftIgnorePolicy::default(),
         // verify-policy: `lpm deploy` does not surface its own
@@ -2083,6 +2082,10 @@ mod tests {
 
     #[tokio::test]
     async fn run_full_pipeline_with_empty_deps_member_succeeds_human_mode() {
+        let _approval_env = crate::test_env::ScopedEnv::update([(
+            "LPM_TEST_SECURITY_AUTH_RESULT",
+            Option::<std::ffi::OsString>::None,
+        )]);
         // Member has no dependencies → install pipeline short-circuits.
         // Deploy should produce a successful end-to-end run.
         let tmp = tempfile::tempdir().unwrap();
