@@ -2015,6 +2015,137 @@ impl RegistryClient {
         finish!(Ok(metadata))
     }
 
+    /// Fetch a full npm packument through the proxy/direct fallback chain.
+    ///
+    /// Kept separate from [`Self::get_npm_package_metadata`] so installs that
+    /// need release-age or trust-policy metadata do not poison the default
+    /// abbreviated cache with a much larger document.
+    pub async fn get_npm_package_metadata_full(
+        &self,
+        name: &str,
+    ) -> Result<PackageMetadata, LpmError> {
+        let cache_key = format!("npm-full:{name}");
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            tracing::debug!("metadata cache hit: npm-full:{name}");
+            return Ok(cached);
+        }
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
+        let req = self
+            .build_get(&proxy_url)
+            .await?
+            .header("Accept", "application/json");
+
+        match self.send_with_retry(req).await {
+            Ok(response) if response.status().is_success() => {
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                if let Ok(metadata) = parse_capped_metadata::<PackageMetadata>(
+                    response,
+                    &format!("get_npm_package_metadata_full (proxy) {name}"),
+                )
+                .await
+                {
+                    if metadata.name == name || metadata.versions.values().any(|v| v.name == name) {
+                        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+                        return finish!(Ok(metadata));
+                    }
+                    return finish!(Err(LpmError::Registry(format!(
+                        "proxy returned metadata for unexpected package '{}' when requesting '{name}'",
+                        metadata.name
+                    ))));
+                }
+            }
+            Ok(_) | Err(LpmError::NotFound(_)) | Err(LpmError::AuthRequired) => {}
+            Err(error) => return finish!(Err(error)),
+        }
+
+        let npm_url = format!("{}/{}", self.npm_registry_url, name);
+        let response = match self
+            .send_with_retry(
+                self.http
+                    .for_url(&npm_url)
+                    .await?
+                    .get(&npm_url)
+                    .header("Accept", "application/json"),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_package_metadata_full (direct) {name}"),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => return finish!(Err(e)),
+        };
+        self.write_metadata_cache(&cache_key, &metadata, None);
+        finish!(Ok(metadata))
+    }
+
+    /// Fetch a full npm packument directly from `registry.npmjs.org`.
+    pub async fn get_npm_metadata_direct_full(
+        &self,
+        name: &str,
+    ) -> Result<PackageMetadata, LpmError> {
+        let cache_key = format!("npm-full:{name}");
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            tracing::debug!("metadata cache hit (direct): npm-full:{name}");
+            return Ok(cached);
+        }
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let npm_url = format!("{}/{}", self.npm_registry_url, name);
+        let response = match self
+            .send_with_retry(
+                self.http
+                    .for_url(&npm_url)
+                    .await?
+                    .get(&npm_url)
+                    .header("Accept", "application/json"),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_metadata_direct_full {name}"),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => return finish!(Err(e)),
+        };
+        self.write_metadata_cache(&cache_key, &metadata, None);
+        finish!(Ok(metadata))
+    }
+
     /// Fetch npm package metadata from the configured LPM Worker proxy
     /// without falling back to public npm.
     ///
@@ -2125,6 +2256,23 @@ impl RegistryClient {
             crate::UpstreamRoute::NpmDirect => self.get_npm_metadata_direct(name).await,
             crate::UpstreamRoute::Custom { target, auth } => {
                 self.get_npm_metadata_from(&target.base_url, name, auth.as_ref())
+                    .await
+            }
+        }
+    }
+
+    /// Fetch full npm metadata honoring the same routing policy as
+    /// [`Self::get_npm_metadata_routed`].
+    pub async fn get_npm_metadata_routed_full(
+        &self,
+        name: &str,
+        route: crate::UpstreamRoute,
+    ) -> Result<PackageMetadata, LpmError> {
+        match route {
+            crate::UpstreamRoute::LpmWorker => self.get_npm_package_metadata_full(name).await,
+            crate::UpstreamRoute::NpmDirect => self.get_npm_metadata_direct_full(name).await,
+            crate::UpstreamRoute::Custom { target, auth } => {
+                self.get_npm_metadata_from_full(&target.base_url, name, auth.as_ref())
                     .await
             }
         }
@@ -2309,6 +2457,63 @@ impl RegistryClient {
         let metadata = match parse_capped_metadata::<PackageMetadata>(
             response,
             &format!("get_npm_metadata_from {name} @ {base_url}"),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => return finish!(Err(e)),
+        };
+        self.write_metadata_cache(&cache_key, &metadata, None);
+        finish!(Ok(metadata))
+    }
+
+    /// Fetch a full packument from a configured custom registry.
+    pub async fn get_npm_metadata_from_full(
+        &self,
+        base_url: &str,
+        name: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<PackageMetadata, LpmError> {
+        let url = format!("{base_url}/{name}");
+        let dest_origin = crate::npmrc::OriginKey::from_request_url(&url).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "invalid registry URL '{url}' — must be http(s) with a host"
+            ))
+        })?;
+        let _ = &dest_origin;
+        let cache_key = format!(
+            "npm-full:{}:{url}",
+            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+        );
+
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            tracing::debug!("metadata cache hit (custom full)");
+            return Ok(cached);
+        }
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let req = self
+            .http
+            .for_url(&url)
+            .await?
+            .get(&url)
+            .header("Accept", "application/json");
+        let req = apply_npmrc_auth(req, &url, auth)?;
+        let response = match self.send_with_retry(req).await {
+            Ok(r) => r,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_metadata_from_full {name} @ {base_url}"),
         )
         .await
         {
@@ -5024,6 +5229,7 @@ mod tests {
             },
             versions: std::collections::HashMap::new(),
             time: std::collections::HashMap::new(),
+            modified: None,
             downloads: Some(42),
             distribution_mode: None,
             package_type: None,

@@ -874,14 +874,15 @@ fn parse_bool_env_value(value: &str, default: bool) -> bool {
     }
 }
 
-fn bool_env_or_default(name: &str, default: bool) -> bool {
-    std::env::var(name)
+fn registry_signature_verification_enabled(
+    global_config: &crate::commands::config::GlobalConfig,
+) -> bool {
+    std::env::var(ENV_VERIFY_REGISTRY_SIGNATURES)
         .ok()
-        .map_or(default, |value| parse_bool_env_value(&value, default))
-}
-
-fn registry_signature_verification_enabled() -> bool {
-    bool_env_or_default(ENV_VERIFY_REGISTRY_SIGNATURES, false)
+        .map_or_else(
+            || global_config.get_bool("signatures").unwrap_or(false),
+            |value| parse_bool_env_value(&value, false),
+        )
 }
 
 impl FetchBreakdown {
@@ -1257,6 +1258,8 @@ fn workspace_member_cache_info(
     }
 
     Some(lpm_resolver::CachedPackageInfo {
+        modified: None,
+        trust_metadata_complete: false,
         versions: vec![version],
         deps: deps_by_version,
         peer_deps,
@@ -4396,6 +4399,7 @@ async fn run_with_options_under_store_lock(
     let start = Instant::now();
     crate::security_floor::clear_recorded_suppressions();
     let global_config = crate::commands::config::GlobalConfig::load();
+    let verify_registry_signatures = registry_signature_verification_enabled(&global_config);
     let force_security_floor = crate::security_floor::force_security_floor_enabled(&global_config);
     let release_age_floor_secs =
         crate::security_floor::current_release_age_floor_secs(&global_config);
@@ -4422,6 +4426,18 @@ async fn run_with_options_under_store_lock(
         json_output,
         crate::security_approval::ApprovalSource::ProjectConfig,
     )?;
+
+    let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
+        project_dir,
+        min_release_age_override,
+        json_output,
+    )?;
+    let resolver_trust_policy = match global_config.get_trust_policy().as_deref() {
+        Some("no-downgrade") => lpm_resolver::TrustPolicyMode::NoDowngrade,
+        _ => lpm_resolver::TrustPolicyMode::Off,
+    };
+    let resolver_policy =
+        lpm_resolver::ResolverPolicy::new(effective_min_age_secs, resolver_trust_policy);
 
     //  Hoisted
     // here (above the empty-deps short-circuit, the lockfile fast
@@ -5383,6 +5399,16 @@ async fn run_with_options_under_store_lock(
             &all_workspace_members,
         )?;
         enforce_registry_integrity_policy(&locked, strict_integrity, json_output)?;
+        if verify_registry_signatures {
+            enforce_registry_signature_policy(
+                Arc::clone(&arc_client),
+                &route_table,
+                &locked,
+                json_output,
+                false,
+            )
+            .await?;
+        }
 
         // Go directly to link step (skip resolution and download).
         // forward the already-resolved
@@ -5801,7 +5827,7 @@ async fn run_with_options_under_store_lock(
                         deps.clone(),
                         store_v2_handle.clone(),
                     );
-                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options(
+                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy(
                         arc_client.clone(),
                         deps.clone(),
                         override_set.clone(),
@@ -5811,6 +5837,7 @@ async fn run_with_options_under_store_lock(
                         shared_cache,
                         auto_install_peers,
                         !omit_policy.optional,
+                        resolver_policy.clone(),
                     )
                     .await
                     .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
@@ -5941,7 +5968,7 @@ async fn run_with_options_under_store_lock(
                         let _ = roots_ready_rx.await;
                         let roots_ready_at = batch_start.elapsed().as_millis();
                         let w2_resolve_start = Instant::now();
-                        let result = lpm_resolver::resolve_with_shared_cache_options(
+                        let result = lpm_resolver::resolve_with_shared_cache_options_and_policy(
                             resolve_client,
                             resolve_deps,
                             resolve_overrides,
@@ -5953,6 +5980,7 @@ async fn run_with_options_under_store_lock(
                             streaming_metrics_for_resolve,
                             auto_install_peers,
                             !omit_policy.optional,
+                            resolver_policy.clone(),
                         )
                         .await
                         .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
@@ -6175,6 +6203,17 @@ async fn run_with_options_under_store_lock(
         &all_workspace_members,
         &direct_workspace_member_deps,
     );
+
+    if verify_registry_signatures {
+        enforce_registry_signature_policy(
+            Arc::clone(&arc_client),
+            &route_table,
+            &packages,
+            json_output,
+            true,
+        )
+        .await?;
+    }
 
     let mut walker_summary_final: Option<lpm_resolver::WalkerSummary> = None;
     // Step 3: Download & store (parallel).: `store` is
@@ -6794,11 +6833,6 @@ async fn run_with_options_under_store_lock(
         );
         verify_policy.skip = crate::provenance_fetch::SkipPolicy::None;
     }
-    let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
-        project_dir,
-        min_release_age_override,
-        json_output,
-    )?;
     let cooldown_policy = lpm_security::SecurityPolicy::with_resolved_min_age(
         &project_dir.join("package.json"),
         effective_min_age_secs,
@@ -7308,7 +7342,6 @@ async fn run_with_options_under_store_lock(
     // temp-file spool (kept as an escape hatch for debugging fetch
     // regressions or non-sha512 integrity edge cases).
     let streaming_fetch = std::env::var("LPM_STREAM_FETCH").map_or(true, |v| v != "0");
-    let verify_registry_signatures = registry_signature_verification_enabled();
     if !to_download.is_empty() {
         let overall = ProgressBar::new(to_download.len() as u64);
         overall.set_style(
@@ -7365,7 +7398,6 @@ async fn run_with_options_under_store_lock(
                 .get(&(p.name.clone(), p.version.clone()))
                 .cloned();
             let source_index_for_pkg = Arc::clone(&source_index);
-            let verify_signatures = verify_registry_signatures;
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
@@ -7393,10 +7425,6 @@ async fn run_with_options_under_store_lock(
                 // real fetch entirely (zero bandwidth, zero CPU).
                 let key_lock = coord.lock_for(install_pkg_key(&p)).await;
                 let _key_guard = key_lock.lock().await;
-
-                if verify_signatures {
-                    verify_registry_signature_if_present(&client, &route_table_c, &p, None).await?;
-                }
 
                 // Spawn the per-pkg link task once the tarball is in the
                 // store. Used in both the sibling-skip path and the normal
@@ -8373,6 +8401,8 @@ async fn run_with_options_under_store_lock(
                 version: p.version.clone(),
                 source: Some(p.source.clone()),
                 integrity: p.integrity.clone(),
+                registry_signatures: lockfile_registry_signatures(&p.registry_signatures),
+                registry_published_at: p.registry_published_at.clone(),
                 os: p.platform.as_ref().map_or_else(Vec::new, |m| m.os.clone()),
                 cpu: p.platform.as_ref().map_or_else(Vec::new, |m| m.cpu.clone()),
                 libc: p
@@ -10773,8 +10803,8 @@ fn try_lockfile_fast_path(
                 is_lpm,
                 peers,
                 integrity: lp.integrity.clone(),
-                registry_signatures: Vec::new(),
-                registry_published_at: None,
+                registry_signatures: install_registry_signatures(&lp.registry_signatures),
+                registry_published_at: lp.registry_published_at.clone(),
                 platform: platform_meta_from_lockfile(lp),
                 optional: lp.optional,
                 // — gate a stored URL against scheme/shape/
@@ -12225,176 +12255,6 @@ fn invalidate_metadata_routed(client: &Arc<RegistryClient>, route_table: &RouteT
     }
 }
 
-async fn verify_registry_signature_if_present(
-    client: &Arc<RegistryClient>,
-    route_table: &RouteTable,
-    package: &InstallPackage,
-    metadata_hint: Option<&lpm_registry::PackageMetadata>,
-) -> Result<(), LpmError> {
-    if package.is_lpm || !install_package_is_registry_source(package) {
-        return Ok(());
-    }
-
-    let route = route_table.route_for_package(&package.name);
-    if let Some(metadata) = metadata_hint {
-        return verify_registry_signature_from_metadata(client, &route, package, metadata).await;
-    }
-
-    if !package.registry_signatures.is_empty() {
-        let Some(integrity) = package.integrity.as_deref() else {
-            return Err(LpmError::Registry(format!(
-                "{}@{} has registry signatures but no dist.integrity to verify",
-                package.name, package.version
-            )));
-        };
-        return verify_registry_signature_payload(
-            client,
-            &route,
-            package,
-            &package.registry_signatures,
-            integrity,
-            package.registry_published_at.as_deref(),
-        )
-        .await;
-    }
-
-    let metadata = client
-        .get_npm_metadata_routed(&package.name, route.clone())
-        .await?;
-    verify_registry_signature_from_metadata(client, &route, package, &metadata).await
-}
-
-async fn verify_registry_signature_from_metadata(
-    client: &Arc<RegistryClient>,
-    route: &UpstreamRoute,
-    package: &InstallPackage,
-    metadata: &lpm_registry::PackageMetadata,
-) -> Result<(), LpmError> {
-    let version = metadata.version(&package.version).ok_or_else(|| {
-        LpmError::NotFound(format!(
-            "{}@{} not found in metadata",
-            package.name, package.version
-        ))
-    })?;
-    let Some(dist) = version.dist.as_ref() else {
-        return Ok(());
-    };
-    let Some(signatures) = dist.signatures.as_deref().filter(|s| !s.is_empty()) else {
-        return Ok(());
-    };
-    let Some(integrity) = dist.integrity.as_deref() else {
-        return Err(LpmError::Registry(format!(
-            "{}@{} has registry signatures but no dist.integrity to verify",
-            package.name, package.version
-        )));
-    };
-
-    verify_registry_signature_payload(
-        client,
-        route,
-        package,
-        signatures,
-        integrity,
-        metadata.time.get(&package.version).map(String::as_str),
-    )
-    .await
-}
-
-async fn verify_registry_signature_payload(
-    client: &Arc<RegistryClient>,
-    route: &UpstreamRoute,
-    package: &InstallPackage,
-    signatures: &[lpm_registry::RegistrySignature],
-    integrity: &str,
-    published_at: Option<&str>,
-) -> Result<(), LpmError> {
-    let keys = registry_signing_keys_for_route(client, route, signatures).await?;
-    let verification = lpm_registry::verify_registry_signatures(
-        &package.name,
-        &package.version,
-        integrity,
-        signatures,
-        &keys,
-        published_at,
-    )?;
-    if let lpm_registry::RegistrySignatureVerification::Verified { count } = verification {
-        tracing::debug!(
-            target: "lpm_cli::install",
-            package = %package.name,
-            version = %package.version,
-            count,
-            "verified registry package signatures"
-        );
-    }
-    Ok(())
-}
-
-async fn registry_signing_keys_for_route(
-    client: &Arc<RegistryClient>,
-    route: &UpstreamRoute,
-    signatures: &[lpm_registry::RegistrySignature],
-) -> Result<Vec<lpm_registry::RegistrySigningKey>, LpmError> {
-    match route {
-        UpstreamRoute::Custom { target, auth } => {
-            match client
-                .get_registry_signing_keys(&target.base_url, auth.as_ref())
-                .await
-            {
-                Ok(mut keys) => {
-                    if !registry_signatures_have_matching_key(signatures, &keys) {
-                        keys.extend(
-                            client
-                                .get_registry_signing_keys(client.npm_registry_url(), None)
-                                .await?,
-                        );
-                    }
-                    Ok(keys)
-                }
-                Err(custom_error) => {
-                    let npm_keys = match client
-                        .get_registry_signing_keys(client.npm_registry_url(), None)
-                        .await
-                    {
-                        Ok(keys) => keys,
-                        Err(npm_error) => {
-                            return Err(LpmError::Registry(format!(
-                                "custom registry signing keys unavailable ({custom_error}); \
-                                 npm signing-key fallback failed ({npm_error})"
-                            )));
-                        }
-                    };
-                    if registry_signatures_have_matching_key(signatures, &npm_keys) {
-                        tracing::debug!(
-                            target: "lpm_cli::install",
-                            custom_registry = %target.base_url,
-                            error = %custom_error,
-                            "custom registry signing keys unavailable; using npm public keys for npm registry signatures"
-                        );
-                        Ok(npm_keys)
-                    } else {
-                        Err(custom_error)
-                    }
-                }
-            }
-        }
-        UpstreamRoute::LpmWorker | UpstreamRoute::NpmDirect => {
-            client
-                .get_registry_signing_keys(client.npm_registry_url(), None)
-                .await
-        }
-    }
-}
-
-fn registry_signatures_have_matching_key(
-    signatures: &[lpm_registry::RegistrySignature],
-    keys: &[lpm_registry::RegistrySigningKey],
-) -> bool {
-    signatures
-        .iter()
-        .filter_map(|signature| signature.keyid.as_deref())
-        .any(|keyid| keys.iter().any(|key| key.keyid == keyid))
-}
-
 /// Shared 404-handling: when a tarball URL 404s and the same-run
 /// retry can't recover it either, the metadata cache is stale —
 /// nuke the lockfiles so the next `lpm install` re-resolves and
@@ -13266,6 +13126,119 @@ fn enforce_registry_integrity_policy(
         }
     }
     Ok(())
+}
+
+async fn enforce_registry_signature_policy(
+    client: Arc<RegistryClient>,
+    route_table: &RouteTable,
+    packages: &[InstallPackage],
+    json_output: bool,
+    allow_metadata_hydration: bool,
+) -> Result<(), LpmError> {
+    let inputs = registry_signature_inputs_from_install_packages(packages);
+    if inputs.is_empty() {
+        return Ok(());
+    }
+
+    let report = crate::registry_signatures::verify_packages(
+        client,
+        route_table.clone(),
+        inputs,
+        allow_metadata_hydration,
+    )
+    .await;
+
+    if report.has_failures() {
+        if !json_output {
+            install_ui::warn(&format!(
+                "Registry signatures · {} verified · {} not verified",
+                report.verified(),
+                report.not_verified()
+            ));
+            for package in report.not_verified_packages().take(10) {
+                let reason = package
+                    .reason
+                    .as_ref()
+                    .map_or_else(|| "not verified".to_string(), |reason| reason.human());
+                install_ui::detail(&format!("  {}  {}", package.package_id().yellow(), reason));
+            }
+        }
+        return Err(LpmError::Registry(registry_signature_failure_message(
+            &report,
+        )));
+    }
+
+    if !json_output {
+        install_ui::done(&format!(
+            "Registry signatures verified · {} verified",
+            report.verified()
+        ));
+    }
+    Ok(())
+}
+
+fn registry_signature_failure_message(
+    report: &crate::registry_signatures::RegistrySignatureReport,
+) -> String {
+    let sample = report
+        .not_verified_packages()
+        .take(5)
+        .map(|package| {
+            let reason = package
+                .reason
+                .as_ref()
+                .map_or_else(|| "not verified".to_string(), |reason| reason.human());
+            format!("{} ({reason})", package.package_id())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "registry signature verification failed for {} package(s): {}",
+        report.not_verified(),
+        sample
+    )
+}
+
+fn registry_signature_inputs_from_install_packages(
+    packages: &[InstallPackage],
+) -> Vec<crate::registry_signatures::RegistrySignatureInput> {
+    packages
+        .iter()
+        .map(
+            |package| crate::registry_signatures::RegistrySignatureInput {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                source: Some(package.source.clone()),
+                integrity: package.integrity.clone(),
+                signatures: package.registry_signatures.clone(),
+                published_at: package.registry_published_at.clone(),
+            },
+        )
+        .collect()
+}
+
+fn lockfile_registry_signatures(
+    signatures: &[lpm_registry::RegistrySignature],
+) -> Vec<lpm_lockfile::LockedRegistrySignature> {
+    signatures
+        .iter()
+        .map(|signature| lpm_lockfile::LockedRegistrySignature {
+            keyid: signature.keyid.clone(),
+            sig: signature.sig.clone(),
+        })
+        .collect()
+}
+
+fn install_registry_signatures(
+    signatures: &[lpm_lockfile::LockedRegistrySignature],
+) -> Vec<lpm_registry::RegistrySignature> {
+    signatures
+        .iter()
+        .map(|signature| lpm_registry::RegistrySignature {
+            keyid: signature.keyid.clone(),
+            sig: signature.sig.clone(),
+        })
+        .collect()
 }
 
 fn install_package_is_registry_source(package: &InstallPackage) -> bool {
@@ -15522,6 +15495,7 @@ mod tests {
                     lpm_config: None,
                     ecosystem: Some("swift".to_string()),
                     swift_meta: None,
+                    npm_user: None,
                     behavioral_tags: None,
                     lifecycle_scripts: None,
                     security_findings: None,
@@ -15540,6 +15514,7 @@ mod tests {
             dist_tags,
             versions: version_map,
             time: Default::default(),
+            modified: None,
             downloads: None,
             distribution_mode: None,
             package_type: None,
@@ -16773,14 +16748,18 @@ mod tests {
             key: String::new(),
         }];
 
-        assert!(!registry_signatures_have_matching_key(
-            &signatures,
-            &custom_keys
-        ));
-        assert!(registry_signatures_have_matching_key(
-            &signatures,
-            &npm_keys
-        ));
+        assert!(
+            !crate::registry_signatures::registry_signatures_have_matching_key(
+                &signatures,
+                &custom_keys
+            )
+        );
+        assert!(
+            crate::registry_signatures::registry_signatures_have_matching_key(
+                &signatures,
+                &npm_keys
+            )
+        );
     }
 
     #[test]
@@ -16844,9 +16823,13 @@ mod tests {
             sig: Some("MEUCIQD".to_string()),
         }];
 
-        let keys = registry_signing_keys_for_route(&client, &route, &signatures)
-            .await
-            .expect("npm keyid match should allow npm key fallback");
+        let keys = crate::registry_signatures::registry_signing_keys_for_route(
+            client.as_ref(),
+            &route,
+            &signatures,
+        )
+        .await
+        .expect("npm keyid match should allow npm key fallback");
 
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].keyid, "SHA256:npm");
@@ -16894,9 +16877,13 @@ mod tests {
             sig: Some("MEUCIQD".to_string()),
         }];
 
-        let error = registry_signing_keys_for_route(&client, &route, &signatures)
-            .await
-            .expect_err("non-matching npm keys must not hide the custom registry error");
+        let error = crate::registry_signatures::registry_signing_keys_for_route(
+            client.as_ref(),
+            &route,
+            &signatures,
+        )
+        .await
+        .expect_err("non-matching npm keys must not hide the custom registry error");
 
         assert!(
             matches!(error, LpmError::Http { status: 400, .. }),
@@ -18026,7 +18013,7 @@ mod tests {
 
     #[test]
     fn fresh_lockfiles_use_current_schema_version() {
-        assert_eq!(lpm_lockfile::LOCKFILE_VERSION, 3);
+        assert_eq!(lpm_lockfile::LOCKFILE_VERSION, 4);
         let lf = lpm_lockfile::Lockfile::new();
         assert_eq!(lf.metadata.lockfile_version, lpm_lockfile::LOCKFILE_VERSION);
     }
@@ -18164,12 +18151,15 @@ mod tests {
                 integrity: Some("sha512-test".to_string()),
                 signatures: vec![signature.clone()],
                 published_at: Some("2026-01-02T03:04:05.000Z".to_string()),
+                trust_evidence: None,
             },
         );
         let mut resolver_cache = HashMap::new();
         resolver_cache.insert(
             lpm_resolver::CanonicalKey::npm("signed"),
             Arc::new(lpm_resolver::CachedPackageInfo {
+                modified: None,
+                trust_metadata_complete: false,
                 versions: vec![NpmVersion::parse("1.0.0").unwrap()],
                 deps: HashMap::new(),
                 peer_deps: HashMap::new(),
@@ -18302,6 +18292,8 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
@@ -18369,6 +18361,8 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
@@ -18405,6 +18399,8 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
@@ -18444,6 +18440,8 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
@@ -18485,6 +18483,8 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
@@ -18538,6 +18538,8 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-test".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),
@@ -18570,6 +18572,56 @@ mod tests {
         assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
     }
 
+    #[test]
+    fn try_lockfile_fast_path_restores_registry_signature_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+        let signature = lpm_lockfile::LockedRegistrySignature {
+            keyid: Some("SHA256:test-key".to_string()),
+            sig: Some("base64-signature".to_string()),
+        };
+
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "signed-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-test".to_string()),
+            registry_signatures: vec![signature.clone()],
+            registry_published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        });
+        lf.write_all(&lockfile_path).unwrap();
+
+        let deps: HashMap<String, String> =
+            [("signed-pkg".to_string(), "^1.0.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed on signed lockfile");
+
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(
+            result.packages[0].registry_signatures,
+            vec![lpm_registry::RegistrySignature {
+                keyid: signature.keyid,
+                sig: signature.sig,
+            }]
+        );
+        assert_eq!(
+            result.packages[0].registry_published_at.as_deref(),
+            Some("2025-01-01T00:00:00.000Z")
+        );
+    }
+
     ///3-2 **failing-test-first retrofit** .
     ///
     /// Complement to the acceptance test: gate-REJECTED URLs must
@@ -18591,6 +18643,8 @@ mod tests {
                 version: "1.0.0".to_string(),
                 source: Some("registry+https://registry.npmjs.org".to_string()),
                 integrity: Some("sha512-test".to_string()),
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
@@ -18659,6 +18713,8 @@ mod tests {
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-test".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
             os: Vec::new(),
             cpu: Vec::new(),
             libc: Vec::new(),

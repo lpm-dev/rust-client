@@ -8,6 +8,7 @@
 use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet};
 use crate::package::{CanonicalKey, ResolverPackage};
+use crate::policy::ResolverPolicy;
 use crate::provider::{
     CachedPackageInfo, LpmDependencyProvider, NotifyMap, PlatformMeta, SharedCache,
     StreamingBfsMetrics,
@@ -429,6 +430,38 @@ pub async fn resolve_with_shared_cache_options(
     auto_install_peers: bool,
     include_optional_dependencies: bool,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_with_shared_cache_options_and_policy(
+        client,
+        dependencies,
+        overrides,
+        shared_cache,
+        notify_map,
+        walker_done,
+        fetch_wait_timeout,
+        route_table,
+        metrics,
+        auto_install_peers,
+        include_optional_dependencies,
+        ResolverPolicy::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_with_shared_cache_options_and_policy(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    shared_cache: SharedCache,
+    notify_map: NotifyMap,
+    walker_done: crate::provider::WalkerDone,
+    fetch_wait_timeout: Duration,
+    route_table: RouteTable,
+    metrics: StreamingBfsMetrics,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policy: ResolverPolicy,
+) -> Result<ResolveResult, ResolveError> {
     // Greedy is the default; users opt out to the legacy
     // PubGrub-with-split-retry resolver via `LPM_RESOLVER=pubgrub`.
     // The flag dispatches at the public entry-point so every caller —
@@ -440,7 +473,7 @@ pub async fn resolve_with_shared_cache_options(
     // See install.rs `fusion_enabled_local` for the resolver-dispatch
     // matrix.
     if std::env::var("LPM_RESOLVER").as_deref() != Ok("pubgrub") {
-        return crate::greedy::resolve_greedy_with_options(
+        return crate::greedy::resolve_greedy_with_options_and_policy(
             client,
             dependencies,
             overrides,
@@ -452,6 +485,7 @@ pub async fn resolve_with_shared_cache_options(
             metrics,
             auto_install_peers,
             include_optional_dependencies,
+            policy,
         )
         .await;
     }
@@ -490,6 +524,7 @@ pub async fn resolve_with_shared_cache_options(
         let overrides_for_pass = overrides.clone();
         let split_packages_for_pass = split_packages.clone();
         let route_table_for_pass = route_table.clone();
+        let policy_for_pass = policy.clone();
         // Same Arc shared across retry passes. The walker's Arc is the
         // same Arc as the provider's Arc on every pass, so any
         // metadata already fetched is immediately visible without a
@@ -526,7 +561,8 @@ pub async fn resolve_with_shared_cache_options(
             )
             .with_route_table(route_table_for_pass)
             .with_streaming_metrics(metrics_for_pass)
-            .with_include_optional_dependencies(include_optional_dependencies_for_pass);
+            .with_include_optional_dependencies(include_optional_dependencies_for_pass)
+            .with_policy(policy_for_pass);
 
             match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
                 Ok(solution) => Ok((solution, provider)),
@@ -2274,6 +2310,8 @@ these are incompatible
         // the test helper wraps once at construction time. Tests insert
         // the returned Arc directly with no further changes.
         std::sync::Arc::new(CachedPackageInfo {
+            modified: None,
+            trust_metadata_complete: false,
             versions: versions
                 .iter()
                 .map(|v| NpmVersion::parse(v).unwrap())
@@ -2349,6 +2387,7 @@ these are incompatible
                 .map(|version| (version.version.clone(), version))
                 .collect(),
             time: HashMap::new(),
+            modified: None,
             downloads: None,
             distribution_mode: None,
             package_type: None,

@@ -7,7 +7,9 @@
 
 mod support;
 
-use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
+use support::mock_registry::{
+    MockRegistry, RegistrySigningFixture, make_tarball, make_tarball_from_pkg_json,
+};
 use support::{TempProject, lpm, lpm_with_registry};
 
 fn strip_ansi(s: &str) -> String {
@@ -176,6 +178,175 @@ async fn install_one_with_pkg_json(
         ])
         .assert()
         .success();
+}
+
+async fn install_signature_fixture_project(
+    project: &TempProject,
+    mock: &MockRegistry,
+    include_unsigned: bool,
+) {
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+
+    let signer = RegistrySigningFixture::new();
+    mock.with_registry_signing_keys(&signer).await;
+
+    let signed_tarball = make_tarball("signed-pkg", "1.0.0");
+    let signed_metadata =
+        mock.signed_package_metadata("signed-pkg", "1.0.0", &signed_tarball, &signer);
+    mock.with_package_metadata(
+        "signed-pkg",
+        "1.0.0",
+        &signed_tarball,
+        signed_metadata.clone(),
+    )
+    .await;
+
+    let mut batch = vec![signed_metadata];
+    if include_unsigned {
+        let unsigned_tarball = make_tarball("unsigned-pkg", "1.0.0");
+        let unsigned_metadata = mock.package_metadata("unsigned-pkg", "1.0.0", &unsigned_tarball);
+        mock.with_package_metadata(
+            "unsigned-pkg",
+            "1.0.0",
+            &unsigned_tarball,
+            unsigned_metadata.clone(),
+        )
+        .await;
+        batch.push(unsigned_metadata);
+    }
+
+    mock.with_batch_metadata(batch).await;
+
+    lpm_with_registry(project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+}
+
+#[tokio::test]
+async fn audit_signatures_json_reports_verified_and_not_verified_packages() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"audit-signatures",
+            "version":"1.0.0",
+            "dependencies":{
+                "signed-pkg":"1.0.0",
+                "unsigned-pkg":"1.0.0"
+            }
+        }"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_signature_fixture_project(&project, &mock, true).await;
+
+    let out = run_audit_json(&project, &mock, &["signatures"]);
+    assert!(
+        !out.status.success(),
+        "audit signatures must exit non-zero when any registry package is not verified; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "audit signatures --json must emit JSON: {e}\nstdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["scanned"], serde_json::json!(2));
+    assert_eq!(envelope["verified"], serde_json::json!(1));
+    assert_eq!(envelope["not_verified"], serde_json::json!(1));
+    assert_eq!(envelope["skipped"], serde_json::json!(0));
+
+    let packages = envelope["packages"]
+        .as_array()
+        .expect("packages must be an array");
+    assert!(
+        packages.iter().any(|pkg| {
+            pkg["name"] == "signed-pkg" && pkg["version"] == "1.0.0" && pkg["status"] == "verified"
+        }),
+        "signed package must be reported as verified: {envelope}",
+    );
+    assert!(
+        packages.iter().any(|pkg| {
+            pkg["name"] == "unsigned-pkg"
+                && pkg["version"] == "1.0.0"
+                && pkg["status"] == "not_verified"
+                && pkg["reason"] == "missing_signatures"
+        }),
+        "unsigned package must be reported as not_verified with missing_signatures: {envelope}",
+    );
+}
+
+#[tokio::test]
+async fn audit_signatures_human_reports_slim_summary_and_failed_rows() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"audit-signatures-human",
+            "version":"1.0.0",
+            "dependencies":{
+                "signed-pkg":"1.0.0",
+                "unsigned-pkg":"1.0.0"
+            }
+        }"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_signature_fixture_project(&project, &mock, true).await;
+
+    let out = run_audit(&project, &mock, &["signatures"]);
+    assert!(
+        !out.status.success(),
+        "audit signatures must exit non-zero when any registry package is not verified; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stdout.trim().is_empty(),
+        "human audit signatures output must stay on stderr; stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("! Registry signatures · 1 verified · 1 not verified")
+            && stderr.contains("unsigned-pkg@1.0.0")
+            && stderr.contains("missing dist.signatures"),
+        "audit signatures must use slim summary plus failed rows, got:\n{stderr}",
+    );
+}
+
+#[tokio::test]
+async fn audit_signatures_verified_tree_exits_zero() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"audit-signatures-clean",
+            "version":"1.0.0",
+            "dependencies":{"signed-pkg":"1.0.0"}
+        }"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_signature_fixture_project(&project, &mock, false).await;
+
+    let out = run_audit(&project, &mock, &["signatures"]);
+    assert!(
+        out.status.success(),
+        "audit signatures must exit zero when all registry packages verify; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        stderr.contains("✓ Registry signatures verified · 1 verified"),
+        "clean audit signatures must use slim success summary, got:\n{stderr}",
+    );
 }
 
 async fn install_vulnerable_direct_dep_with_fixed_version(

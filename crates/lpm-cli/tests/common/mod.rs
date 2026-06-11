@@ -3,7 +3,7 @@
 //! These are the canonical implementations of:
 //!
 //! - [`run_lpm`] / [`run_lpm_with_env`] — spawn the real `lpm-rs`
-//!   binary with HOME / `LPM_HOME` / `PATH` / `LPM_REGISTRY_URL` /
+//!   binary with HOME / `LPM_HOME` / `PATH` / mock-registry routing /
 //!   `NO_COLOR` / telemetry env isolation.
 //! - [`strip_ansi`] — best-effort ANSI escape stripping for
 //!   assertions over CLI stdout/stderr.
@@ -128,9 +128,11 @@ pub fn lpm_command_with_env(
     match registry_url {
         Some(url) => {
             command.env("LPM_REGISTRY_URL", url);
+            command.env("LPM_NPM_ROUTE", "proxy");
         }
         None => {
             command.env_remove("LPM_REGISTRY_URL");
+            command.env_remove("LPM_NPM_ROUTE");
         }
     }
     for (key, value) in extra_env {
@@ -293,6 +295,7 @@ fn make_package_metadata(name: &str, versions: Vec<VersionMetadata>) -> PackageM
             .map(|version| (version.version.clone(), version))
             .collect(),
         time: Default::default(),
+        modified: None,
         downloads: None,
         distribution_mode: None,
         package_type: None,

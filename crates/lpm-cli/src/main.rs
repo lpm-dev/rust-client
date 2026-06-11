@@ -37,6 +37,7 @@ mod prompt;
 mod provenance;
 mod provenance_fetch;
 mod quality;
+mod registry_signatures;
 mod release_age_config;
 mod release_lookup;
 mod sandbox_config;
@@ -1107,19 +1108,20 @@ enum Commands {
     /// Manage CLI configuration.
     Config {
         /// Action: get, set, delete, list, scripts, triage, sandbox,
-        /// sigstore, release-age.
+        /// sigstore, signatures, release-age.
         action: String,
         /// Config key (for get/set/delete).
         key: Option<String>,
         /// Config value (for set).
         value: Option<String>,
         /// Non-interactive value for the `scripts` / `triage` /
-        /// `sandbox` / `sigstore` / `release-age` wizards. Required when stdin is not
+        /// `sandbox` / `sigstore` / `signatures` / `release-age` wizards. Required when stdin is not
         /// a TTY. Examples:
         ///   `lpm config scripts --set triage`
         ///   `lpm config triage --set claude-cli`
         ///   `lpm config sandbox --set strict`
         ///   `lpm config sigstore --set deny`
+        ///   `lpm config signatures --set true`
         ///   `lpm config release-age --set 3d`
         #[arg(long = "set", value_name = "VALUE")]
         set: Option<String>,
@@ -4586,7 +4588,7 @@ async fn async_main() -> Result<()> {
             dry_run,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            if let Some(commands::audit::AuditCmd::Fix { dry_run }) = action {
+            if let Some(commands::audit::AuditCmd::Fix { dry_run }) = action.as_ref() {
                 if fix {
                     return Err(lpm_common::LpmError::Script(
                         "use either `lpm audit fix` or `lpm audit --fix`, not both".into(),
@@ -4597,7 +4599,19 @@ async fn async_main() -> Result<()> {
                         "`lpm audit fix` cannot be combined with `--secrets`".into(),
                     ));
                 }
-                commands::audit::run_fix(&client, &cwd, cli.json, dry_run).await
+                commands::audit::run_fix(&client, &cwd, cli.json, *dry_run).await
+            } else if let Some(commands::audit::AuditCmd::Signatures) = action.as_ref() {
+                if fix {
+                    return Err(lpm_common::LpmError::Script(
+                        "`lpm audit signatures` cannot be combined with `--fix`".into(),
+                    ));
+                }
+                if secrets {
+                    return Err(lpm_common::LpmError::Script(
+                        "`lpm audit signatures` cannot be combined with `--secrets`".into(),
+                    ));
+                }
+                commands::audit::run_signatures(&client, &cwd, cli.json).await
             } else if fix {
                 commands::audit::run_fix(&client, &cwd, cli.json, dry_run).await
             } else if secrets {

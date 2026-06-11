@@ -7,7 +7,8 @@ mod support;
 
 use support::assertions;
 use support::mock_registry::{
-    MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json,
+    MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
+    make_tarball_from_pkg_json,
 };
 use support::{TempProject, lpm, lpm_with_registry};
 use wiremock::matchers::{method, path};
@@ -5712,6 +5713,8 @@ fn install_no_strict_ssl_setting_emits_no_warning() {
 
 const RELEASE_AGE_PKG: &str = "@lpm.dev/acme.widget";
 const RELEASE_AGE_VERSION: &str = "1.0.0";
+const RELEASE_AGE_RANGE_PKG: &str = "release-age-range-pkg";
+const TRUST_DOWNGRADE_PKG: &str = "trust-drop-pkg";
 
 /// ISO-8601 UTC timestamp `n_secs` ago. The cooldown parser accepts
 /// `2025-01-01T00:00:00.000Z`-style strings.
@@ -5806,6 +5809,355 @@ fn assert_cooldown_not_blocked(out: &std::process::Output) {
         !combined.contains("blocked by minimumReleaseAge")
             && !combined.contains("published too recently"),
         "cooldown must not fire but the block message appeared; got:\n{combined}"
+    );
+}
+
+fn write_signatures_global_config(project: &TempProject, enabled: bool) {
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(
+        lpm_dir.join("config.toml"),
+        format!("signatures = {enabled}\n"),
+    )
+    .unwrap();
+}
+
+fn write_trust_policy_global_config(project: &TempProject, policy: &str) {
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(
+        lpm_dir.join("config.toml"),
+        format!("trust-policy = \"{policy}\"\n"),
+    )
+    .unwrap();
+}
+
+async fn mount_release_age_range_pkg(mock: &MockRegistry) {
+    let v1_0_0 = make_tarball(RELEASE_AGE_RANGE_PKG, "1.0.0");
+    let v1_1_0 = make_tarball(RELEASE_AGE_RANGE_PKG, "1.1.0");
+    let metadata = serde_json::json!({
+        "name": RELEASE_AGE_RANGE_PKG,
+        "dist-tags": { "latest": "1.1.0" },
+        "modified": iso8601_n_secs_ago(60),
+        "versions": {
+            "1.0.0": {
+                "name": RELEASE_AGE_RANGE_PKG,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_RANGE_PKG, "1.0.0"),
+                    "integrity": compute_integrity(&v1_0_0),
+                },
+                "dependencies": {}
+            },
+            "1.1.0": {
+                "name": RELEASE_AGE_RANGE_PKG,
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_RANGE_PKG, "1.1.0"),
+                    "integrity": compute_integrity(&v1_1_0),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.1.0": iso8601_n_secs_ago(3_600)
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        RELEASE_AGE_RANGE_PKG,
+        metadata,
+        &[("1.0.0", v1_0_0), ("1.1.0", v1_1_0)],
+    )
+    .await;
+}
+
+async fn mount_trust_downgrade_pkg(mock: &MockRegistry) {
+    let v1_0_0 = make_tarball(TRUST_DOWNGRADE_PKG, "1.0.0");
+    let v1_1_0 = make_tarball(TRUST_DOWNGRADE_PKG, "1.1.0");
+    let metadata = serde_json::json!({
+        "name": TRUST_DOWNGRADE_PKG,
+        "dist-tags": { "latest": "1.1.0" },
+        "modified": "2025-01-03T00:00:00.000Z",
+        "versions": {
+            "1.0.0": {
+                "name": TRUST_DOWNGRADE_PKG,
+                "version": "1.0.0",
+                "_npmUser": {
+                    "trustedPublisher": {
+                        "issuer": "https://token.actions.githubusercontent.com",
+                        "subject": "repo:example/trusted-package:ref:refs/heads/main"
+                    }
+                },
+                "dist": {
+                    "tarball": mock.tarball_url(TRUST_DOWNGRADE_PKG, "1.0.0"),
+                    "integrity": compute_integrity(&v1_0_0),
+                    "attestations": {
+                        "url": "https://registry.npmjs.org/-/npm/v1/attestations/trust-drop-pkg@1.0.0",
+                        "provenance": { "predicateType": "https://slsa.dev/provenance/v1" }
+                    }
+                },
+                "dependencies": {}
+            },
+            "1.1.0": {
+                "name": TRUST_DOWNGRADE_PKG,
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url(TRUST_DOWNGRADE_PKG, "1.1.0"),
+                    "integrity": compute_integrity(&v1_1_0)
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2025-01-02T00:00:00.000Z"
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        TRUST_DOWNGRADE_PKG,
+        metadata,
+        &[("1.0.0", v1_0_0), ("1.1.0", v1_1_0)],
+    )
+    .await;
+}
+
+async fn mount_unsigned_signature_pkg(mock: &MockRegistry) {
+    let tarball = make_tarball("unsigned-pkg", "1.0.0");
+    let metadata = mock.package_metadata("unsigned-pkg", "1.0.0", &tarball);
+    mock.with_package_metadata("unsigned-pkg", "1.0.0", &tarball, metadata.clone())
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+}
+
+async fn mount_signed_signature_pkg(mock: &MockRegistry) {
+    let signer = RegistrySigningFixture::new();
+    mock.with_registry_signing_keys(&signer).await;
+    let tarball = make_tarball("signed-pkg", "1.0.0");
+    let metadata = mock.signed_package_metadata("signed-pkg", "1.0.0", &tarball, &signer);
+    mock.with_package_metadata("signed-pkg", "1.0.0", &tarball, metadata.clone())
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+}
+
+#[tokio::test]
+async fn install_does_not_verify_registry_signatures_by_default() {
+    let project = TempProject::empty(
+        r#"{"name":"signatures-default","version":"1.0.0","dependencies":{"unsigned-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    mount_unsigned_signature_pkg(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "install must not require registry signatures unless enabled; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[tokio::test]
+async fn install_config_signatures_true_blocks_unsigned_registry_package() {
+    let project = TempProject::empty(
+        r#"{"name":"signatures-enabled","version":"1.0.0","dependencies":{"unsigned-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    write_signatures_global_config(&project, true);
+    mount_unsigned_signature_pkg(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        !out.status.success(),
+        "signatures=true must block unsigned registry packages; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("unsigned-pkg@1.0.0") && combined.contains("missing dist.signatures"),
+        "install failure must identify the unsigned package and reason; got:\n{combined}",
+    );
+}
+
+#[tokio::test]
+async fn install_config_signatures_true_accepts_signed_registry_package() {
+    let project = TempProject::empty(
+        r#"{"name":"signatures-enabled","version":"1.0.0","dependencies":{"signed-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    write_signatures_global_config(&project, true);
+    mount_signed_signature_pkg(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "signatures=true must allow packages with valid registry signatures; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Registry signatures verified · 1 verified"),
+        "install should emit one slim signature summary when verification is enabled; got:\n{stderr}",
+    );
+}
+
+#[tokio::test]
+async fn install_config_signatures_true_persists_registry_signature_metadata_in_lockfile() {
+    let project = TempProject::empty(
+        r#"{"name":"signatures-lockfile","version":"1.0.0","dependencies":{"signed-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    write_signatures_global_config(&project, true);
+    mount_signed_signature_pkg(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "signed install must succeed before checking lpm.lock; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("registry-published-at = \"2025-01-01T00:00:00.000Z\""),
+        "lpm.lock must persist the publish timestamp used for registry signature verification:\n{lockfile}"
+    );
+    assert!(
+        lockfile.contains("[[packages.registry-signatures]]"),
+        "lpm.lock must persist registry signatures under the locked package:\n{lockfile}"
+    );
+    assert!(
+        lockfile.contains("keyid = ") && lockfile.contains("sig = "),
+        "lpm.lock must persist both registry signature fields:\n{lockfile}"
+    );
+}
+
+#[tokio::test]
+async fn install_range_selects_older_version_when_latest_is_inside_release_age_window() {
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name":"release-age-range",
+            "version":"1.0.0",
+            "dependencies":{{"{RELEASE_AGE_RANGE_PKG}":"^1.0.0"}},
+            "lpm":{{"minimumReleaseAge":86400}}
+        }}"#
+    ));
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    mount_release_age_range_pkg(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "range install must fall back to the latest mature version; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let installed = project.read_file(&format!(
+        "node_modules/{RELEASE_AGE_RANGE_PKG}/package.json"
+    ));
+    let manifest: serde_json::Value =
+        serde_json::from_str(&installed).expect("installed package.json must parse");
+    assert_eq!(manifest["version"], serde_json::json!("1.0.0"));
+}
+
+#[tokio::test]
+async fn install_trust_policy_no_downgrade_blocks_exact_version_that_drops_trust_evidence() {
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name":"trust-policy-install",
+            "version":"1.0.0",
+            "dependencies":{{"{TRUST_DOWNGRADE_PKG}":"1.1.0"}}
+        }}"#
+    ));
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    write_trust_policy_global_config(&project, "no-downgrade");
+    mount_trust_downgrade_pkg(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        !out.status.success(),
+        "trust-policy no-downgrade must block the exact downgraded version; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains(TRUST_DOWNGRADE_PKG)
+            && combined.contains("1.1.0")
+            && combined.contains("trust-policy no-downgrade")
+            && combined.contains("trusted publisher"),
+        "install failure must identify the trust downgrade; got:\n{combined}",
     );
 }
 

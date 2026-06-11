@@ -347,6 +347,8 @@ mod tests {
                 version: version.to_string(),
                 source: None,
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
                 os: Vec::new(),
                 cpu: Vec::new(),
                 libc: Vec::new(),
