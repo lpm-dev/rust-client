@@ -83,6 +83,13 @@ impl PackageKey {
 ///   "no ambient installs," NOT "field absent." Per-package `peers`
 ///   is also authoritative for v2 lockfiles, enabling deterministic
 ///   graph-key reproduction across cold-and-warm installs.
+/// - **v3**: per-package platform metadata (`os`, `cpu`, `libc`) and
+///   optional-reachability state. Warm installs can replay host
+///   filtering instead of reconstructing every locked package blindly.
+/// - **v4**: per-package registry signature metadata
+///   (`registry-signatures`, `registry-published-at`). Warm installs
+///   can verify package signatures from the lockfile without
+///   rehydrating package metadata.
 ///
 /// **Why this matters:** install.rs's lockfile fast path uses the
 /// version to decide whether the absence of `ambient-peer-installs`
@@ -90,7 +97,7 @@ impl PackageKey {
 /// could be a buggy-writer artifact, so the fast path is invalidated
 /// and a fresh resolve runs (which writes a v2 lockfile, restoring
 /// fast-path eligibility on subsequent installs).
-pub const LOCKFILE_VERSION: u32 = 2;
+pub const LOCKFILE_VERSION: u32 = 4;
 
 /// Default lockfile filename.
 pub const LOCKFILE_NAME: &str = "lpm.lock";
@@ -107,6 +114,19 @@ pub struct CatalogSnapshotEntry {
     pub version: String,
     /// Consumer-side catalog protocol reference, e.g. `catalog:` or `catalog:testing`.
     pub reference: String,
+}
+
+/// One npm registry package signature persisted from a package's
+/// `dist.signatures` metadata.
+///
+/// Fields are optional for serde tolerance, matching the registry wire
+/// type. Signature verification treats partial entries as unusable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LockedRegistrySignature {
+    #[serde(default)]
+    pub keyid: Option<String>,
+    #[serde(default)]
+    pub sig: Option<String>,
 }
 
 /// The full lockfile structure.
@@ -197,6 +217,33 @@ pub struct LockedPackage {
     /// SRI integrity hash (sha512-...). Populated when registry provides it.
     #[serde(default)]
     pub integrity: Option<String>,
+    /// Registry package signatures from npm-compatible `dist.signatures`.
+    #[serde(
+        default,
+        rename = "registry-signatures",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub registry_signatures: Vec<LockedRegistrySignature>,
+    /// Version publish timestamp used when checking registry signing-key expiry.
+    #[serde(
+        default,
+        rename = "registry-published-at",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub registry_published_at: Option<String>,
+    /// OS restrictions from the package version's manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os: Vec<String>,
+    /// CPU restrictions from the package version's manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu: Vec<String>,
+    /// libc restrictions from the package version's manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub libc: Vec<String>,
+    /// True when the package is only reachable through optional
+    /// dependency edges.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub optional: bool,
     /// Direct dependencies of this package: `<local_name>@<version>`
     /// where `local_name` is what this package uses in its own
     /// `dependencies` map. For non-aliased deps the local name equals
@@ -569,7 +616,7 @@ impl Lockfile {
     /// Write both TOML and binary lockfiles atomically.
     /// The binary file is written alongside the TOML file as `lpm.lockb`.
     ///
-    /// The v1 binary format has no section for some TOML metadata,
+    /// The binary format has no section for some TOML metadata,
     /// so we gate the binary write on [`binary::binary_format_supports`].
     /// When the lockfile uses TOML-only fields, the binary file is skipped
     /// and any stale binary file from a prior install is removed so
@@ -582,7 +629,7 @@ impl Lockfile {
         } else if binary_path.exists() {
             let _ = std::fs::remove_file(&binary_path);
             tracing::debug!(
-                "removed stale binary lockfile ({}): lockfile has TOML-only metadata not expressible in v1 binary format",
+                "removed stale binary lockfile ({}): lockfile has TOML-only metadata not expressible in binary format",
                 binary_path.display()
             );
         }
@@ -763,6 +810,13 @@ mod tests {
             version: "1.1.1".to_string(),
             source: Some("registry+https://lpm.dev".to_string()),
             integrity: Some("sha512-abc123...".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["react@999.999.999".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
@@ -773,6 +827,13 @@ mod tests {
             version: "999.999.999".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -939,6 +1000,13 @@ resolved-with = "greedy-fusion"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -949,6 +1017,13 @@ resolved-with = "greedy-fusion"
             version: "2.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -975,6 +1050,13 @@ resolved-with = "greedy-fusion"
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-xyz".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1028,6 +1110,13 @@ resolved-with = "greedy-fusion"
             version: "4.22.1".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1038,6 +1127,13 @@ resolved-with = "greedy-fusion"
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1054,6 +1150,59 @@ resolved-with = "greedy-fusion"
         assert_eq!(
             lodash.tarball.as_deref(),
             Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz")
+        );
+    }
+
+    #[test]
+    fn registry_signature_metadata_roundtrips_as_reviewer_visible_toml() {
+        let toml = r#"
+[metadata]
+lockfile-version = 3
+resolved-with = "greedy-fusion"
+
+[[packages]]
+name = "signed-pkg"
+version = "1.0.0"
+source = "registry+https://registry.npmjs.org"
+integrity = "sha512-signed"
+registry-published-at = "2025-01-01T00:00:00.000Z"
+dependencies = []
+
+[[packages.registry-signatures]]
+keyid = "SHA256:abc123"
+sig = "MEUCIQDregistrySignature"
+"#;
+
+        let lf = Lockfile::from_toml(toml).unwrap();
+        let package = &lf.packages[0];
+        assert_eq!(
+            package.registry_published_at.as_deref(),
+            Some("2025-01-01T00:00:00.000Z")
+        );
+        assert_eq!(package.registry_signatures.len(), 1);
+        assert_eq!(
+            package.registry_signatures[0].keyid.as_deref(),
+            Some("SHA256:abc123")
+        );
+        assert_eq!(
+            package.registry_signatures[0].sig.as_deref(),
+            Some("MEUCIQDregistrySignature")
+        );
+
+        let serialized = lf.to_toml().unwrap();
+
+        assert!(
+            serialized.contains("registry-published-at = \"2025-01-01T00:00:00.000Z\""),
+            "registry publish timestamp must survive a lockfile roundtrip:\n{serialized}"
+        );
+        assert!(
+            serialized.contains("[[packages.registry-signatures]]"),
+            "registry signatures must remain nested under the package entry:\n{serialized}"
+        );
+        assert!(
+            serialized.contains("keyid = \"SHA256:abc123\"")
+                && serialized.contains("sig = \"MEUCIQDregistrySignature\""),
+            "registry signature key id and payload must survive a lockfile roundtrip:\n{serialized}"
         );
     }
 
@@ -1283,6 +1432,13 @@ version = "1.0.0"
             version: "6.0.1".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-abc".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["ansi-regex@5.0.1".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1293,6 +1449,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["strip-ansi-cjs@6.0.1".to_string()],
             alias_dependencies: vec![["strip-ansi-cjs".to_string(), "strip-ansi".to_string()]],
             peers: vec![],
@@ -1316,7 +1479,7 @@ version = "1.0.0"
         );
     }
 
-    /// The v1 binary format cannot express alias metadata;
+    /// The binary format cannot express alias metadata;
     /// `binary::to_binary` rejects such lockfiles so callers fall
     /// back to TOML-only. `write_all` goes further and proactively
     /// removes any stale binary file from a prior non-aliased install.
@@ -1333,6 +1496,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1367,6 +1537,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1391,6 +1568,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1429,6 +1613,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-reviewed".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1444,6 +1635,13 @@ version = "1.0.0"
             version: "9.9.9".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-poisoned".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["payload@1.0.0".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1473,6 +1671,13 @@ version = "1.0.0"
             version: "9.9.9".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1546,6 +1751,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: source.map(|s| s.to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1634,6 +1846,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: source.map(|s| s.to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1810,6 +2029,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("tarball+file:./vendor/local-bundle-1.0.0.tgz".to_string()),
             integrity: Some("sha256-abc123def456".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1851,6 +2077,13 @@ version = "1.0.0"
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-lodash".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1861,6 +2094,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("tarball+https://e.com/remote-fork.tgz".to_string()),
             integrity: Some("sha512-remoteFork".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1871,6 +2111,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("tarball+file:./vendor/local-tarball.tgz".to_string()),
             integrity: Some("sha256-localTarball".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1881,6 +2128,13 @@ version = "1.0.0"
             version: "0.1.0".to_string(),
             source: Some("directory+./packages/local-dir".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -1891,6 +2145,13 @@ version = "1.0.0"
             version: "0.1.0".to_string(),
             source: Some("link+../shared/linked".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2112,6 +2373,13 @@ version = "1.0.0"
             version: "1.0.0".into(),
             source: Some("registry+https://registry.npmjs.org".into()),
             integrity: Some("sha512-deadbeef".into()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2256,6 +2524,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2266,6 +2541,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: Some("git+https://github.com/foo/bar.git".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2320,6 +2602,13 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2330,6 +2619,13 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2353,6 +2649,13 @@ version = "1.0.0"
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2374,6 +2677,13 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2384,6 +2694,13 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2419,6 +2736,13 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-AAAAAAAAAA==".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2429,6 +2753,13 @@ version = "1.0.0"
             version: "19.0.0".to_string(),
             source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
             integrity: Some("sha512-BBBBBBBBBB==".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2527,6 +2858,13 @@ version = "1.0.0"
             version: "9.2.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec!["use-sync-external-store@1.6.0".to_string()],
             alias_dependencies: vec![],
             peers: vec!["react@18.2.0".to_string(), "redux@5.0.1".to_string()],
@@ -2560,6 +2898,13 @@ version = "1.0.0"
             version: "4.17.21".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2610,6 +2955,13 @@ dependencies = []
             version: "18.2.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2636,6 +2988,13 @@ dependencies = []
             version: "9.2.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec!["react@18.2.0".to_string()],
@@ -2660,6 +3019,36 @@ dependencies = []
     }
 
     #[test]
+    fn registry_signature_metadata_triggers_binary_fallback() {
+        let mut lf = Lockfile::new();
+        lf.add_package(LockedPackage {
+            name: "signed-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-signed".to_string()),
+            registry_signatures: vec![LockedRegistrySignature {
+                keyid: Some("SHA256:abc123".to_string()),
+                sig: Some("MEUCIQDregistrySignature".to_string()),
+            }],
+            registry_published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        });
+
+        assert!(
+            !crate::binary::binary_format_supports(&lf),
+            "registry signature metadata must stay in reviewer-visible TOML"
+        );
+    }
+
+    #[test]
     fn legacy_find_package_returns_a_match_under_collision_but_audit_warns() {
         // Documents the pre-existing name-only behavior: returns
         // *some* match but doesn't disambiguate. Callers that need
@@ -2670,6 +3059,13 @@ dependencies = []
             version: "19.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -2680,6 +3076,13 @@ dependencies = []
             version: "19.0.0".to_string(),
             source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],

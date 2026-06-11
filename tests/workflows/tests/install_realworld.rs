@@ -277,6 +277,7 @@ fn parse_peak_rss(time_output: &str) -> Option<u64> {
 /// requires every optional dep would break this install on every
 /// platform. The implicit "install succeeds" assertion catches that.
 #[tokio::test]
+#[ignore = "audit-scale fixture; run with `cargo nextest run -P audit --run-ignored only`"]
 async fn install_realworld_nextjs_fixture_succeeds_through_verdaccio() {
     // Pre-flight: refuse to start Verdaccio if we can clearly tell
     // it won't work (no `npx` on PATH). The `VerdaccioRegistry::start`

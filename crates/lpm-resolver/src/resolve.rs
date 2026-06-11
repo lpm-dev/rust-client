@@ -8,12 +8,15 @@
 use crate::npm_version::NpmVersion;
 use crate::overrides::{OverrideHit, OverrideSet};
 use crate::package::{CanonicalKey, ResolverPackage};
+use crate::policy::ResolverPolicy;
 use crate::provider::{
-    CachedPackageInfo, LpmDependencyProvider, NotifyMap, SharedCache, StreamingBfsMetrics,
+    CachedPackageInfo, LpmDependencyProvider, NotifyMap, PlatformMeta, SharedCache,
+    StreamingBfsMetrics,
 };
+use crate::ranges::NpmRange;
 use lpm_registry::{RegistryClient, RouteMode, RouteTable};
 use pubgrub::{DefaultStringReporter, Reporter};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -63,6 +66,12 @@ pub struct ResolvedPackage {
     pub tarball_url: Option<String>,
     /// SRI integrity hash (e.g. "sha512-...") from registry metadata.
     pub integrity: Option<String>,
+    /// Platform restrictions declared by the selected package version.
+    pub platform: Option<PlatformMeta>,
+    /// True when this package is reachable only through optional dependency
+    /// edges. Install-time platform filtering skips incompatible optional
+    /// packages while failing required ones.
+    pub optional: bool,
 }
 
 /// Internal type for PubGrub result + provider (to extract cache).
@@ -232,8 +241,8 @@ pub struct StageTiming {
     pub dispatcher_rpc_count: u64,
     /// Peak `metadata_jobs.len()` observed at any Phase A→C
     /// transition of the fused dispatcher loop. Confirms the metadata
-    /// semaphore (256) is the binding constraint when
-    /// this approaches its cap; if it sits well below, the binding
+    /// semaphore is the binding constraint when this approaches the
+    /// configured fanout; if it sits well below, the binding
     /// constraint is something upstream (h2 single-connection flow
     /// control, h1-pool socket count, or a serialization in
     /// `process_edge`).
@@ -246,11 +255,9 @@ pub struct StageTiming {
     /// reading in the hundreds is a signal the registry is stalling
     /// on one specific package.
     pub parked_max_depth: u32,
-    /// Count of speculative tarball downloads dispatched
-    /// from inside `process_edge_with_tarball_dispatch`. Parity with
-    /// the pre-fusion `SpeculativeStats.spawned` metric. Zero on the
-    /// walker arm (where speculation runs through the separate
-    /// `spawn_speculation_dispatcher` instead).
+    /// Count of selected-version metadata frames emitted to an optional
+    /// install-side tarball speculation channel. Zero on the walker arm
+    /// and on fusion callers that do not pass a speculation channel.
     pub tarball_dispatched_count: u64,
     /// Count of speculative peer-manifest fetches the fused dispatcher
     /// dispatched concurrent with the regular dep walk. Each prefetch
@@ -423,6 +430,38 @@ pub async fn resolve_with_shared_cache_options(
     auto_install_peers: bool,
     include_optional_dependencies: bool,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_with_shared_cache_options_and_policy(
+        client,
+        dependencies,
+        overrides,
+        shared_cache,
+        notify_map,
+        walker_done,
+        fetch_wait_timeout,
+        route_table,
+        metrics,
+        auto_install_peers,
+        include_optional_dependencies,
+        ResolverPolicy::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_with_shared_cache_options_and_policy(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    shared_cache: SharedCache,
+    notify_map: NotifyMap,
+    walker_done: crate::provider::WalkerDone,
+    fetch_wait_timeout: Duration,
+    route_table: RouteTable,
+    metrics: StreamingBfsMetrics,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policy: ResolverPolicy,
+) -> Result<ResolveResult, ResolveError> {
     // Greedy is the default; users opt out to the legacy
     // PubGrub-with-split-retry resolver via `LPM_RESOLVER=pubgrub`.
     // The flag dispatches at the public entry-point so every caller —
@@ -434,7 +473,7 @@ pub async fn resolve_with_shared_cache_options(
     // See install.rs `fusion_enabled_local` for the resolver-dispatch
     // matrix.
     if std::env::var("LPM_RESOLVER").as_deref() != Ok("pubgrub") {
-        return crate::greedy::resolve_greedy_with_options(
+        return crate::greedy::resolve_greedy_with_options_and_policy(
             client,
             dependencies,
             overrides,
@@ -446,6 +485,7 @@ pub async fn resolve_with_shared_cache_options(
             metrics,
             auto_install_peers,
             include_optional_dependencies,
+            policy,
         )
         .await;
     }
@@ -484,6 +524,7 @@ pub async fn resolve_with_shared_cache_options(
         let overrides_for_pass = overrides.clone();
         let split_packages_for_pass = split_packages.clone();
         let route_table_for_pass = route_table.clone();
+        let policy_for_pass = policy.clone();
         // Same Arc shared across retry passes. The walker's Arc is the
         // same Arc as the provider's Arc on every pass, so any
         // metadata already fetched is immediately visible without a
@@ -520,7 +561,8 @@ pub async fn resolve_with_shared_cache_options(
             )
             .with_route_table(route_table_for_pass)
             .with_streaming_metrics(metrics_for_pass)
-            .with_include_optional_dependencies(include_optional_dependencies_for_pass);
+            .with_include_optional_dependencies(include_optional_dependencies_for_pass)
+            .with_policy(policy_for_pass);
 
             match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
                 Ok(solution) => Ok((solution, provider)),
@@ -536,9 +578,9 @@ pub async fn resolve_with_shared_cache_options(
 
         match result {
             Ok((solution, provider)) => {
-                let (cache, applied_overrides, platform_skipped, root_aliases) =
+                let (cache, applied_overrides, platform_skipped, root_aliases, root_deps) =
                     provider.into_parts();
-                let packages = format_solution(solution, &cache);
+                let packages = format_solution(solution, &cache, &root_deps, &root_aliases);
                 // Snapshot substage counters at the tail of the happy
                 // path. The registry-side atomics were reset at the
                 // top of this call, so they now reflect only follow-up
@@ -641,6 +683,8 @@ pub async fn resolve_with_shared_cache_options(
 fn format_solution(
     solution: pubgrub::SelectedDependencies<LpmDependencyProvider>,
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
+    root_deps: &HashMap<String, String>,
+    root_aliases: &HashMap<String, String>,
 ) -> Vec<ResolvedPackage> {
     // Build a lookup: canonical_name → resolved_version for cross-referencing deps
     let resolved_versions: HashMap<String, String> = solution
@@ -648,6 +692,15 @@ fn format_solution(
         .filter(|(pkg, _)| !pkg.is_root())
         .map(|(pkg, ver)| (pkg.canonical_name(), ver.to_string()))
         .collect();
+    let resolved_peer_versions: HashMap<String, Vec<(Option<String>, String)>> = solution
+        .iter()
+        .filter(|(pkg, _)| !pkg.is_root())
+        .fold(HashMap::new(), |mut acc, (pkg, ver)| {
+            acc.entry(pkg.canonical_name())
+                .or_default()
+                .push((pkg.context().map(str::to_string), ver.to_string()));
+            acc
+        });
 
     let mut resolved: Vec<ResolvedPackage> = solution
         .into_iter()
@@ -710,6 +763,10 @@ fn format_solution(
                 .and_then(|info| info.dist.get(&ver_str))
                 .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
                 .unwrap_or_default();
+            let platform = cache
+                .get(&key)
+                .and_then(|info| info.platform.get(&ver_str))
+                .cloned();
 
             // Surface resolved peers per package. The resolver already
             // proved each peer's range was satisfied (or surfaced a
@@ -718,7 +775,7 @@ fn format_solution(
             // versions lookup. Missing peers simply don't appear in
             // the output Vec — the linker / GraphKey only cares about
             // peers that ARE present.
-            let peers = compute_resolved_peers(&package, &ver_str, cache, &resolved_versions);
+            let peers = compute_resolved_peers(&package, &ver_str, cache, &resolved_peer_versions);
 
             ResolvedPackage {
                 package,
@@ -728,12 +785,86 @@ fn format_solution(
                 peers,
                 tarball_url,
                 integrity,
+                platform,
+                optional: false,
             }
         })
         .collect();
+    mark_optional_reachability(&mut resolved, cache, root_deps, root_aliases);
     dedupe_peer_superset_packages(&mut resolved);
     resolved.sort_by_key(|a| a.package.to_string());
     resolved
+}
+
+fn mark_optional_reachability(
+    packages: &mut [ResolvedPackage],
+    cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
+    root_deps: &HashMap<String, String>,
+    root_aliases: &HashMap<String, String>,
+) {
+    if packages.is_empty() {
+        return;
+    }
+
+    let mut by_name: HashMap<String, Vec<usize>> = HashMap::with_capacity(packages.len());
+    let mut by_name_version: HashMap<(String, String), Vec<usize>> =
+        HashMap::with_capacity(packages.len());
+    for (idx, package) in packages.iter().enumerate() {
+        let name = package.package.canonical_name();
+        let version = package.version.to_string();
+        by_name.entry(name.clone()).or_default().push(idx);
+        by_name_version
+            .entry((name, version))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut required = vec![false; packages.len()];
+    let mut queue = VecDeque::new();
+    for local_name in root_deps.keys() {
+        let target = root_aliases
+            .get(local_name)
+            .map_or(local_name.as_str(), String::as_str);
+        if let Some(indices) = by_name.get(target) {
+            for &idx in indices {
+                if !required[idx] {
+                    required[idx] = true;
+                    queue.push_back(idx);
+                }
+            }
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        let package = &packages[idx];
+        let key = CanonicalKey::from(&package.package);
+        let version = package.version.to_string();
+        let optional_names = cache
+            .get(&key)
+            .and_then(|info| info.optional_dep_names.get(&version));
+
+        for (local_name, dep_version) in &package.dependencies {
+            if optional_names.is_some_and(|names| names.contains(local_name)) {
+                continue;
+            }
+            let target = package
+                .aliases
+                .get(local_name)
+                .map_or(local_name.as_str(), String::as_str);
+            if let Some(indices) = by_name_version.get(&(target.to_string(), dep_version.clone())) {
+                for &next_idx in indices {
+                    if !required[next_idx] {
+                        required[next_idx] = true;
+                        queue.push_back(next_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    for (package, is_required) in packages.iter_mut().zip(required) {
+        package.optional = !is_required;
+    }
 }
 
 /// Collapse same-package/same-version rows when one materialization graph can
@@ -857,7 +988,7 @@ fn compute_resolved_peers(
     consumer: &ResolverPackage,
     consumer_version: &str,
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
-    resolved_versions: &HashMap<String, String>,
+    resolved_versions: &HashMap<String, Vec<(Option<String>, String)>>,
 ) -> Vec<(String, String)> {
     let key = CanonicalKey::from(consumer);
     let Some(peer_deps) = cache
@@ -867,15 +998,80 @@ fn compute_resolved_peers(
         return Vec::new();
     };
     let mut peers: Vec<(String, String)> = peer_deps
-        .keys()
+        .iter()
         .filter_map(|peer_name| {
-            resolved_versions
-                .get(peer_name)
-                .map(|ver| (peer_name.clone(), ver.clone()))
+            let (peer_name, peer_range) = peer_name;
+            let parsed_range = NpmRange::parse(peer_range).ok();
+            resolve_peer_binding_version(
+                consumer,
+                peer_name,
+                parsed_range.as_ref(),
+                resolved_versions,
+            )
+            .map(|(version, _)| (peer_name.clone(), version.clone()))
         })
         .collect();
     peers.sort_by(|a, b| a.0.cmp(&b.0));
     peers
+}
+
+pub(crate) fn resolve_peer_binding_version<'a>(
+    consumer: &ResolverPackage,
+    peer_name: &str,
+    peer_range: Option<&NpmRange>,
+    resolved_versions: &'a HashMap<String, Vec<(Option<String>, String)>>,
+) -> Option<(&'a String, bool)> {
+    let candidates = resolved_versions.get(peer_name)?;
+
+    if let Some(context) = consumer.context() {
+        let same_context: Vec<&(Option<String>, String)> = candidates
+            .iter()
+            .filter(|(candidate_context, _)| candidate_context.as_deref() == Some(context))
+            .collect();
+        if let Some(selected) = select_peer_candidate(&same_context, peer_range) {
+            return Some(selected);
+        }
+    }
+
+    let unsplit: Vec<&(Option<String>, String)> = candidates
+        .iter()
+        .filter(|(candidate_context, _)| candidate_context.is_none())
+        .collect();
+    if let Some(selected) = select_peer_candidate(&unsplit, peer_range) {
+        return Some(selected);
+    }
+
+    let all_candidates: Vec<&(Option<String>, String)> = candidates.iter().collect();
+    select_peer_candidate(&all_candidates, peer_range)
+}
+
+fn select_peer_candidate<'a>(
+    candidates: &[&'a (Option<String>, String)],
+    peer_range: Option<&NpmRange>,
+) -> Option<(&'a String, bool)> {
+    match candidates {
+        [] => None,
+        [(_, version)] => Some((version, peer_version_satisfies(version, peer_range))),
+        _ => {
+            let mut satisfying = candidates.iter().filter_map(|(_, version)| {
+                peer_version_satisfies(version, peer_range).then_some(version)
+            });
+            let first = satisfying.next()?;
+            if satisfying.next().is_none() {
+                Some((first, true))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn peer_version_satisfies(version: &str, peer_range: Option<&NpmRange>) -> bool {
+    peer_range.is_none_or(|range| {
+        NpmVersion::parse(version)
+            .ok()
+            .is_some_and(|parsed| range.satisfies(&parsed))
+    })
 }
 
 /// A warning about an unmet peer dependency.
@@ -1495,18 +1691,6 @@ pub fn check_unmet_peers(
             acc
         });
 
-    // Build fast lookup for unsplit peers that can be shared globally.
-    let unsplit_versions: HashMap<String, String> = resolved
-        .iter()
-        .filter(|package| package.package.context().is_none())
-        .map(|package| {
-            (
-                package.package.canonical_name(),
-                package.version.to_string(),
-            )
-        })
-        .collect();
-
     let mut warnings = Vec::new();
 
     for resolved_pkg in resolved {
@@ -1533,21 +1717,18 @@ pub fn check_unmet_peers(
         let optional_peers = info.and_then(|i| i.optional_peer_names.get(&ver_str));
 
         for (peer_name, peer_range_str) in peer_deps {
-            let resolved_peer_ver = resolve_peer_version(
+            let parsed_range = NpmRange::parse(peer_range_str).ok();
+            let resolved_peer_ver = resolve_peer_binding_version(
                 &resolved_pkg.package,
                 peer_name,
+                parsed_range.as_ref(),
                 &resolved_versions,
-                &unsplit_versions,
             );
 
             match resolved_peer_ver {
-                Some(resolved_ver) => {
+                Some((resolved_ver, satisfies)) => {
                     // Peer is in the tree — check if the resolved version satisfies the range
                     let parsed_resolved = NpmVersion::parse(resolved_ver).ok();
-                    let satisfies = NpmRange::parse(peer_range_str)
-                        .ok()
-                        .and_then(|range| parsed_resolved.as_ref().map(|v| range.satisfies(v)))
-                        .unwrap_or(false);
 
                     if !satisfies {
                         // peerDependencyRules filter: allow_any
@@ -1610,33 +1791,6 @@ pub fn check_unmet_peers(
     // Sort for deterministic output
     warnings.sort_by(|a, b| a.package.cmp(&b.package).then(a.peer.cmp(&b.peer)));
     warnings
-}
-
-fn resolve_peer_version<'a>(
-    consumer: &ResolverPackage,
-    peer_name: &str,
-    resolved_versions: &'a HashMap<String, Vec<(Option<String>, String)>>,
-    unsplit_versions: &'a HashMap<String, String>,
-) -> Option<&'a String> {
-    let candidates = resolved_versions.get(peer_name)?;
-
-    if let Some(context) = consumer.context()
-        && let Some((_, version)) = candidates
-            .iter()
-            .find(|(candidate_context, _)| candidate_context.as_deref() == Some(context))
-    {
-        return Some(version);
-    }
-
-    if let Some(version) = unsplit_versions.get(peer_name) {
-        return Some(version);
-    }
-
-    if candidates.len() == 1 {
-        return Some(&candidates[0].1);
-    }
-
-    None
 }
 
 fn map_pubgrub_error(e: pubgrub::PubGrubError<LpmDependencyProvider>) -> ResolveError {
@@ -2015,6 +2169,8 @@ these are incompatible
                 .collect(),
             tarball_url: None,
             integrity: None,
+            platform: None,
+            optional: false,
         }
     }
 
@@ -2154,6 +2310,8 @@ these are incompatible
         // the test helper wraps once at construction time. Tests insert
         // the returned Arc directly with no further changes.
         std::sync::Arc::new(CachedPackageInfo {
+            modified: None,
+            trust_metadata_complete: false,
             versions: versions
                 .iter()
                 .map(|v| NpmVersion::parse(v).unwrap())
@@ -2229,6 +2387,7 @@ these are incompatible
                 .map(|version| (version.version.clone(), version))
                 .collect(),
             time: HashMap::new(),
+            modified: None,
             downloads: None,
             distribution_mode: None,
             package_type: None,
@@ -2238,7 +2397,7 @@ these are incompatible
     }
 
     #[tokio::test]
-    async fn resolve_with_prefetch_skips_platform_incompatible_optional_registry_metadata() {
+    async fn resolve_with_prefetch_preserves_platform_incompatible_optional_registry_metadata() {
         let platform = Platform::current();
         let compatible_optional = format!("@esbuild/{}-{}", platform.os, platform.cpu);
         let (incompatible_optional, incompatible_os, incompatible_cpu) = if platform.os == "darwin"
@@ -2312,16 +2471,37 @@ these are incompatible
             .collect();
         assert!(resolved_names.contains("esbuild"));
         assert!(resolved_names.contains(&compatible_optional));
-        assert!(!resolved_names.contains(&incompatible_optional));
+        assert!(resolved_names.contains(&incompatible_optional));
 
         let esbuild = result
             .packages
             .iter()
             .find(|package| package.package.canonical_name() == "esbuild")
             .expect("esbuild should be in the resolved tree");
+        assert!(
+            esbuild
+                .dependencies
+                .contains(&(compatible_optional, "0.28.0".to_string()))
+        );
+        assert!(
+            esbuild
+                .dependencies
+                .contains(&(incompatible_optional.clone(), "0.28.0".to_string()))
+        );
+
+        let incompatible = result
+            .packages
+            .iter()
+            .find(|package| package.package.canonical_name() == incompatible_optional)
+            .expect("incompatible optional should remain in the resolver output");
+        assert!(incompatible.optional);
         assert_eq!(
-            esbuild.dependencies,
-            vec![(compatible_optional, "0.28.0".to_string())]
+            incompatible.platform,
+            Some(PlatformMeta {
+                os: vec![incompatible_os.to_string()],
+                cpu: vec![incompatible_cpu.to_string()],
+                libc: vec![],
+            })
         );
     }
 
@@ -2403,20 +2583,12 @@ these are incompatible
     }
 
     /// Regression: a platform-gated optional dep has one old version with
-    /// an ERRONEOUS `os`/`cpu` declaration that makes it look
-    /// platform-compatible, but that version doesn't satisfy the declared
-    /// range. The resolver passed this version through `available_versions`
-    /// (because the platform filter matched), then produced an empty pubgrub
-    /// `Ranges` (because the version was outside the range), which surfaced
-    /// as a hard `NoSolution` error instead of an optional-dep skip.
-    ///
-    /// Real-world repro: `@next/swc-linux-x64-musl@12.0.0` ships with
-    /// `os: ["darwin"]` (a Next.js packaging bug from 2021), but the declared
-    /// range on `next@15.x` is `15.x`. The old `@next/swc-*` platform binaries
-    /// are all in `optionalDependencies`, so bun/npm skip them cleanly; lpm
-    /// blew up resolution.
+    /// an erroneous `os`/`cpu` declaration that makes it look compatible,
+    /// but that version doesn't satisfy the declared range. Resolution must
+    /// still pick the newest satisfying version and carry platform metadata
+    /// forward so install-time filtering can skip it.
     #[tokio::test]
-    async fn resolve_with_prefetch_skips_optional_when_erroneous_platform_match_is_out_of_range() {
+    async fn resolve_with_prefetch_selects_newest_optional_when_platform_match_is_out_of_range() {
         let platform = Platform::current();
         let incompatible_optional = if platform.os == "darwin" {
             "@next/swc-linux-x64-musl".to_string()
@@ -2428,10 +2600,6 @@ these are incompatible
         // The dep has two versions in the registry:
         //   - 15.5.15: declares the correct (incompatible) platform
         //   - 12.0.0: declares the current platform erroneously (Next.js packaging bug)
-        // Neither of these should be installed on the current platform: 15.5.15
-        // because the platform filter rejects it, 12.0.0 because the range
-        // rejects it. Pre-P1 we blew up; post-P1 the whole optional dep is
-        // skipped.
         let prefetched = HashMap::from([
             (
                 "next".to_string(),
@@ -2494,8 +2662,7 @@ these are incompatible
         )
         .await
         .expect(
-            "resolver must skip optional dep when no platform-compatible version \
-             satisfies the declared range (Next.js-style erroneous 12.0.0 version)",
+            "resolver must pick the newest satisfying optional dep and defer platform filtering",
         );
 
         let resolved_names: HashSet<String> = result
@@ -2508,14 +2675,17 @@ these are incompatible
             "root dep `next` must be resolved"
         );
         assert!(
-            !resolved_names.contains(&incompatible_optional),
-            "platform-gated optional dep must not be resolved even when an \
-             erroneously-tagged version exists outside the declared range"
+            resolved_names.contains(&incompatible_optional),
+            "platform-gated optional dep must be present for install-time filtering"
         );
-        assert!(
-            result.platform_skipped >= 1,
-            "platform_skipped counter must record the skip for observability"
-        );
+
+        let optional = result
+            .packages
+            .iter()
+            .find(|package| package.package.canonical_name() == incompatible_optional)
+            .expect("platform-gated optional dep should resolve");
+        assert_eq!(optional.version.to_string(), "15.5.15");
+        assert!(optional.optional);
     }
 
     /// npm-alias root dep: the consumer declares
@@ -2671,13 +2841,12 @@ these are incompatible
         );
     }
 
-    /// Regression: a non-optional dep with no platform-compatible version
-    /// still fails (doesn't silently skip). Protects against accidentally
-    /// extending the optional-skip to regular deps, which would hide real
-    /// bugs (e.g., a package that declared os: ["win32"] for a regular dep
-    /// on linux must still surface as a resolution failure).
+    /// Regression: a non-optional dep with no compatible platform version
+    /// still resolves so install-time filtering can produce the required
+    /// hard platform error instead of hiding the selected package from the
+    /// lockfile.
     #[tokio::test]
-    async fn resolve_regular_dep_with_no_platform_compatible_version_still_fails() {
+    async fn resolve_regular_dep_with_no_platform_compatible_version_still_resolves() {
         let platform = Platform::current();
         let incompatible_dep = if platform.os == "darwin" {
             "some-linux-only-dep".to_string()
@@ -2726,13 +2895,16 @@ these are incompatible
             OverrideSet::empty(),
             Some(prefetched),
         )
-        .await;
+        .await
+        .expect("resolver must defer required platform errors to install-time filtering");
 
-        assert!(
-            result.is_err(),
-            "regular dep with no platform-compatible version must still fail resolution; \
-             optional-skip semantics must not leak into required deps"
-        );
+        let dep = result
+            .packages
+            .iter()
+            .find(|package| package.package.canonical_name() == incompatible_dep)
+            .expect("required incompatible dep should be present in resolver output");
+        assert!(!dep.optional);
+        assert!(dep.platform.is_some());
     }
 
     #[tokio::test]
@@ -3037,6 +3209,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_pkg.clone(),
@@ -3046,6 +3220,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
 
@@ -3086,6 +3262,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_pkg.clone(),
@@ -3095,6 +3273,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
 
@@ -3135,6 +3315,8 @@ these are incompatible
             peers: Vec::new(),
             tarball_url: None,
             integrity: None,
+            platform: None,
+            optional: false,
         }];
 
         let mut cache = HashMap::new();
@@ -3177,6 +3359,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_pkg.clone(),
@@ -3186,6 +3370,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
 
@@ -3230,6 +3416,8 @@ these are incompatible
             peers: Vec::new(),
             tarball_url: None,
             integrity: None,
+            platform: None,
+            optional: false,
         }];
 
         let mut cache = HashMap::new();
@@ -3276,6 +3464,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_pkg.clone(),
@@ -3285,6 +3475,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
 
@@ -3328,6 +3520,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_host_a.clone(),
@@ -3337,6 +3531,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_host_b.clone(),
@@ -3346,6 +3542,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
 
@@ -3375,6 +3573,83 @@ these are incompatible
     }
 
     #[test]
+    fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
+        let plugin_pkg = ResolverPackage::npm("plugin");
+        let react_pkg = ResolverPackage::npm("react");
+
+        let resolved = vec![
+            ResolvedPackage {
+                package: plugin_pkg.clone(),
+                version: NpmVersion::parse("1.0.0").unwrap(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                peers: Vec::new(),
+                tarball_url: None,
+                integrity: None,
+                platform: None,
+                optional: false,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("17.0.2").unwrap(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                peers: Vec::new(),
+                tarball_url: None,
+                integrity: None,
+                platform: None,
+                optional: false,
+            },
+            ResolvedPackage {
+                package: react_pkg.clone(),
+                version: NpmVersion::parse("18.2.0").unwrap(),
+                dependencies: vec![],
+                aliases: HashMap::new(),
+                peers: Vec::new(),
+                tarball_url: None,
+                integrity: None,
+                platform: None,
+                optional: false,
+            },
+        ];
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            CanonicalKey::from(&plugin_pkg),
+            make_cached_info(
+                &["1.0.0"],
+                vec![],
+                vec![("1.0.0", vec![("react", "^17.0.0")])],
+            ),
+        );
+        cache.insert(
+            CanonicalKey::from(&react_pkg),
+            make_cached_info(&["18.2.0", "17.0.2"], vec![], vec![]),
+        );
+
+        let peer_candidates: HashMap<String, Vec<(Option<String>, String)>> =
+            resolved.iter().fold(HashMap::new(), |mut acc, pkg| {
+                acc.entry(pkg.package.canonical_name()).or_default().push((
+                    pkg.package.context().map(str::to_string),
+                    pkg.version.to_string(),
+                ));
+                acc
+            });
+        let bound_peers = compute_resolved_peers(&plugin_pkg, "1.0.0", &cache, &peer_candidates);
+        assert_eq!(
+            bound_peers,
+            vec![("react".to_string(), "17.0.2".to_string())],
+            "graph/link peer binding must choose the version satisfying the consumer range"
+        );
+
+        let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+        assert!(
+            warnings.is_empty(),
+            "warning path and graph binding should agree that react@17 satisfies plugin: {warnings:?}"
+        );
+    }
+
+    #[test]
     fn peer_check_multiple_packages_multiple_peers() {
         // Two packages with different peers
         let pkg_a = ResolverPackage::npm("pkg-a");
@@ -3390,6 +3665,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: pkg_b.clone(),
@@ -3399,6 +3676,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_pkg.clone(),
@@ -3408,6 +3687,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
 
@@ -3462,6 +3743,8 @@ these are incompatible
             peers: Vec::new(),
             tarball_url: None,
             integrity: None,
+            platform: None,
+            optional: false,
         }];
 
         let mut cache = HashMap::new();
@@ -3575,6 +3858,8 @@ these are incompatible
             peers: Vec::new(),
             tarball_url: None,
             integrity: None,
+            platform: None,
+            optional: false,
         }];
 
         let mut cache = HashMap::new();
@@ -3624,6 +3909,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_pkg.clone(),
@@ -3633,6 +3920,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
 
@@ -3699,6 +3988,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: babel_pkg.clone(),
@@ -3708,6 +3999,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
 
@@ -3720,6 +4013,8 @@ these are incompatible
             peers: Vec::new(),
             tarball_url: None,
             integrity: None,
+            platform: None,
+            optional: false,
         }];
 
         let mut cache = HashMap::new();
@@ -3895,6 +4190,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: card_pkg.clone(),
@@ -3904,6 +4201,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_pkg.clone(),
@@ -3913,6 +4212,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
 
@@ -3974,6 +4275,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_pkg.clone(),
@@ -3983,6 +4286,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
         // Variant B: foo@1.5 (out of range) → rule doesn't apply → warning.
@@ -3995,6 +4300,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
             ResolvedPackage {
                 package: react_pkg.clone(),
@@ -4004,6 +4311,8 @@ these are incompatible
                 peers: Vec::new(),
                 tarball_url: None,
                 integrity: None,
+                platform: None,
+                optional: false,
             },
         ];
 

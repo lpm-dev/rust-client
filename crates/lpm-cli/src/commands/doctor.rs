@@ -798,11 +798,11 @@ pub async fn run(
                 }
                 "lockfile_binary_stale" | "lockfile_binary_corrupt" | "lockfile_binary_missing" => {
                     if !json_output {
-                        install_ui::phase("fixing: regenerating lpm.lockb from lpm.lock");
+                        install_ui::phase("fixing: reconciling lpm.lockb with lpm.lock");
                     }
                     match fix_binary_lockfile(project_dir) {
-                        Ok(()) => fixes_applied.push("regenerated lpm.lockb".into()),
-                        Err(e) => render_autofix_failed("regenerate lpm.lockb", &e),
+                        Ok(()) => fixes_applied.push("reconciled lpm.lockb".into()),
+                        Err(e) => render_autofix_failed("reconcile lpm.lockb", &e),
                     }
                 }
                 "gitattributes_missing" | "gitattributes_lockb_unmarked" => {
@@ -1748,7 +1748,21 @@ fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
     if lockfile.exists() {
         checks.push(Check::pass(&doctor_catalog::LOCKFILE_PRESENT, "lpm.lock"));
 
+        let lockfile_data = lpm_lockfile::Lockfile::read_from_file(&lockfile).ok();
+        let binary_supported = match lockfile_data.as_ref() {
+            Some(lockfile_data) => lpm_lockfile::binary::binary_format_supports(lockfile_data),
+            None => true,
+        };
+
         if lockb_path.exists() {
+            if !binary_supported {
+                checks.push(Check::warn(
+                    &doctor_catalog::LOCKFILE_BINARY_STALE,
+                    "lpm.lockb is stale for TOML-only lockfile metadata — run lpm install to remove",
+                ));
+                return checks;
+            }
+
             // Binary exists — check if in sync
             let toml_mtime = lockfile.metadata().and_then(|m| m.modified()).ok();
             let bin_mtime = lockb_path.metadata().and_then(|m| m.modified()).ok();
@@ -1779,7 +1793,7 @@ fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
                     }
                 }
             }
-        } else {
+        } else if binary_supported {
             checks.push(Check::warn(
                 &doctor_catalog::LOCKFILE_BINARY_MISSING,
                 "lpm.lockb missing — run lpm install to generate",
@@ -1851,6 +1865,7 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
         None,  // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
         crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: doctor's auto-fix install honors env + config posture chain
+        crate::commands::install::InstallOmitPolicy::default(),
         // doctor's auto-fix install does not
         // surface its own sandbox-mode flags. Falls through the
         // env / config / default chain.
@@ -1862,17 +1877,16 @@ async fn run_doctor_install(client: &RegistryClient, project_dir: &Path) -> Resu
     .await
 }
 
-/// Fix: regenerate `lpm.lockb` from `lpm.lock`.
+/// Fix: reconcile `lpm.lockb` with `lpm.lock`.
 fn fix_binary_lockfile(project_dir: &Path) -> Result<(), String> {
     let lock_path = project_dir.join("lpm.lock");
     if !lock_path.exists() {
-        return Err("lpm.lock not found — cannot regenerate lpm.lockb".into());
+        return Err("lpm.lock not found — cannot reconcile lpm.lockb".into());
     }
     let lf = lpm_lockfile::Lockfile::read_from_file(&lock_path)
         .map_err(|e| format!("read lpm.lock failed: {e}"))?;
-    let lockb = project_dir.join("lpm.lockb");
-    lpm_lockfile::binary::write_binary(&lf, &lockb)
-        .map_err(|e| format!("write lpm.lockb failed: {e}"))
+    lf.write_all(&lock_path)
+        .map_err(|e| format!("write lockfiles failed: {e}"))
 }
 
 /// Fix: ensure `.gitattributes` marks `lpm.lockb` as binary.
@@ -3834,6 +3848,12 @@ commands = []
             version: "18.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -3877,6 +3897,12 @@ commands = []
             version: "18.0.0".to_string(),
             source: None,
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -3921,7 +3947,7 @@ commands = []
     }
 
     #[test]
-    fn lockfile_check_toml_only_warns_missing_binary() {
+    fn lockfile_check_representable_toml_warns_missing_binary() {
         let dir = tempfile::tempdir().unwrap();
         let lf = lpm_lockfile::Lockfile::new();
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
@@ -3933,6 +3959,56 @@ commands = []
         assert_eq!(checks[1].name(), "Binary lockfile");
         assert!(matches!(checks[1].severity, Severity::Warn));
         assert!(checks[1].detail.contains("missing"));
+    }
+
+    fn lockfile_with_platform_metadata() -> lpm_lockfile::Lockfile {
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "native-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: vec!["darwin".to_string()],
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: true,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        });
+        lf
+    }
+
+    #[test]
+    fn lockfile_check_toml_only_metadata_allows_missing_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = lockfile_with_platform_metadata();
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+
+        let checks = check_lockfile_state(dir.path());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name(), "Lockfile");
+        assert!(matches!(checks[0].severity, Severity::Pass));
+    }
+
+    #[test]
+    fn lockfile_check_toml_only_metadata_warns_on_stale_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let representable = lpm_lockfile::Lockfile::new();
+        lpm_lockfile::binary::write_binary(&representable, &dir.path().join("lpm.lockb")).unwrap();
+
+        let lf = lockfile_with_platform_metadata();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+
+        let checks = check_lockfile_state(dir.path());
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[1].name(), "Binary lockfile");
+        assert!(matches!(checks[1].severity, Severity::Warn));
+        assert!(checks[1].detail.contains("TOML-only"));
     }
 
     #[test]
@@ -4048,6 +4124,12 @@ commands = []
             version: "18.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -4089,6 +4171,18 @@ commands = []
                 .unwrap()
                 .unwrap();
         assert_eq!(reader.package_count(), 0);
+    }
+
+    #[test]
+    fn fix_binary_lockfile_removes_stale_binary_for_toml_only_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let lf = lockfile_with_platform_metadata();
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+        std::fs::write(dir.path().join("lpm.lockb"), b"GARBAGE_DATA").unwrap();
+
+        fix_binary_lockfile(dir.path()).unwrap();
+
+        assert!(!dir.path().join("lpm.lockb").exists());
     }
 
     #[test]

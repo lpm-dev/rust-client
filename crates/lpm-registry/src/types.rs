@@ -36,6 +36,13 @@ pub struct PackageMetadata {
     #[serde(default)]
     pub description: Option<String>,
 
+    /// npm abbreviated metadata exposes this package-level timestamp
+    /// even when it omits per-version `time`. It is an upper bound on
+    /// every version publish time and lets clients avoid a full-packument
+    /// fetch when the package has not changed since a release-age cutoff.
+    #[serde(default)]
+    pub modified: Option<String>,
+
     #[serde(default, rename = "dist-tags")]
     pub dist_tags: HashMap<String, String>,
 
@@ -137,6 +144,9 @@ pub struct VersionMetadata {
 
     #[serde(default, rename = "_swiftMeta")]
     pub swift_meta: Option<SwiftMeta>,
+
+    #[serde(default, rename = "_npmUser")]
+    pub npm_user: Option<NpmUserMetadata>,
 
     // Security metadata for post-install warnings
     #[serde(default, rename = "_behavioralTags")]
@@ -389,6 +399,32 @@ pub struct DistInfo {
     /// The LPM registry does not expose this field today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestations: Option<AttestationRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NpmUserMetadata {
+    #[serde(default, rename = "trustedPublisher")]
+    pub trusted_publisher: Option<serde_json::Value>,
+    #[serde(default)]
+    pub approver: Option<serde_json::Value>,
+}
+
+impl NpmUserMetadata {
+    pub fn has_trusted_publisher(&self) -> bool {
+        json_signal_is_present(self.trusted_publisher.as_ref())
+    }
+
+    pub fn has_approver(&self) -> bool {
+        json_signal_is_present(self.approver.as_ref())
+    }
+}
+
+fn json_signal_is_present(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Null) | None => false,
+        Some(serde_json::Value::Bool(false)) => false,
+        Some(_) => true,
+    }
 }
 
 /// Per-key detached signature over the tarball integrity hash, as
@@ -1202,8 +1238,8 @@ where
                     .unwrap_or(false);
                 out.insert(name, PeerDependencyMeta { optional });
             }
-            serde_json::Value::Bool(optional) => {
-                out.insert(name, PeerDependencyMeta { optional });
+            serde_json::Value::Bool(_) => {
+                out.insert(name, PeerDependencyMeta { optional: false });
             }
             serde_json::Value::Null => {}
             _ => {}
@@ -1465,7 +1501,7 @@ mod tests {
                 .peer_dependencies_meta
                 .get("ua-parser-js")
                 .map(|meta| meta.optional),
-            Some(true)
+            Some(false)
         );
         assert!(!dirty.peer_dependencies_meta.contains_key("ignored-null"));
         assert!(!dirty.peer_dependencies_meta.contains_key("ignored-string"));

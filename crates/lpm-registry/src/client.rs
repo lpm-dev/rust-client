@@ -453,6 +453,9 @@ pub struct RegistryClient {
     /// the current token / trigger silent refresh without the caller
     /// threading a session in.
     session: Option<Arc<SessionManager>>,
+    /// Process-local cache for registry package-signing keys, keyed by
+    /// registry URL plus auth/mTLS principal.
+    registry_signing_keys_cache: Arc<tokio::sync::Mutex<HashMap<String, Vec<RegistrySigningKey>>>>,
     /// Precomputed ASCII-serialized origin of `base_url`.
     /// Avoids re-parsing + re-allocating on every `is_configured_origin` call.
     base_url_origin: String,
@@ -1076,6 +1079,7 @@ impl RegistryClient {
             synchronous_cache_writes: false,
             allow_insecure: false,
             session: None,
+            registry_signing_keys_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             base_url_origin: Self::url_origin(DEFAULT_REGISTRY_URL),
             npm_registry_url_origin: Self::url_origin(NPM_REGISTRY_URL),
         }
@@ -1430,6 +1434,7 @@ impl RegistryClient {
             synchronous_cache_writes: self.synchronous_cache_writes,
             allow_insecure: self.allow_insecure,
             session: self.session.clone(),
+            registry_signing_keys_cache: Arc::clone(&self.registry_signing_keys_cache),
             base_url_origin: self.base_url_origin.clone(),
             npm_registry_url_origin: self.npm_registry_url_origin.clone(),
         }
@@ -2010,6 +2015,137 @@ impl RegistryClient {
         finish!(Ok(metadata))
     }
 
+    /// Fetch a full npm packument through the proxy/direct fallback chain.
+    ///
+    /// Kept separate from [`Self::get_npm_package_metadata`] so installs that
+    /// need release-age or trust-policy metadata do not poison the default
+    /// abbreviated cache with a much larger document.
+    pub async fn get_npm_package_metadata_full(
+        &self,
+        name: &str,
+    ) -> Result<PackageMetadata, LpmError> {
+        let cache_key = format!("npm-full:{name}");
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            tracing::debug!("metadata cache hit: npm-full:{name}");
+            return Ok(cached);
+        }
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
+        let req = self
+            .build_get(&proxy_url)
+            .await?
+            .header("Accept", "application/json");
+
+        match self.send_with_retry(req).await {
+            Ok(response) if response.status().is_success() => {
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                if let Ok(metadata) = parse_capped_metadata::<PackageMetadata>(
+                    response,
+                    &format!("get_npm_package_metadata_full (proxy) {name}"),
+                )
+                .await
+                {
+                    if metadata.name == name || metadata.versions.values().any(|v| v.name == name) {
+                        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+                        return finish!(Ok(metadata));
+                    }
+                    return finish!(Err(LpmError::Registry(format!(
+                        "proxy returned metadata for unexpected package '{}' when requesting '{name}'",
+                        metadata.name
+                    ))));
+                }
+            }
+            Ok(_) | Err(LpmError::NotFound(_)) | Err(LpmError::AuthRequired) => {}
+            Err(error) => return finish!(Err(error)),
+        }
+
+        let npm_url = format!("{}/{}", self.npm_registry_url, name);
+        let response = match self
+            .send_with_retry(
+                self.http
+                    .for_url(&npm_url)
+                    .await?
+                    .get(&npm_url)
+                    .header("Accept", "application/json"),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_package_metadata_full (direct) {name}"),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => return finish!(Err(e)),
+        };
+        self.write_metadata_cache(&cache_key, &metadata, None);
+        finish!(Ok(metadata))
+    }
+
+    /// Fetch a full npm packument directly from `registry.npmjs.org`.
+    pub async fn get_npm_metadata_direct_full(
+        &self,
+        name: &str,
+    ) -> Result<PackageMetadata, LpmError> {
+        let cache_key = format!("npm-full:{name}");
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            tracing::debug!("metadata cache hit (direct): npm-full:{name}");
+            return Ok(cached);
+        }
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let npm_url = format!("{}/{}", self.npm_registry_url, name);
+        let response = match self
+            .send_with_retry(
+                self.http
+                    .for_url(&npm_url)
+                    .await?
+                    .get(&npm_url)
+                    .header("Accept", "application/json"),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_metadata_direct_full {name}"),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => return finish!(Err(e)),
+        };
+        self.write_metadata_cache(&cache_key, &metadata, None);
+        finish!(Ok(metadata))
+    }
+
     /// Fetch npm package metadata from the configured LPM Worker proxy
     /// without falling back to public npm.
     ///
@@ -2120,6 +2256,23 @@ impl RegistryClient {
             crate::UpstreamRoute::NpmDirect => self.get_npm_metadata_direct(name).await,
             crate::UpstreamRoute::Custom { target, auth } => {
                 self.get_npm_metadata_from(&target.base_url, name, auth.as_ref())
+                    .await
+            }
+        }
+    }
+
+    /// Fetch full npm metadata honoring the same routing policy as
+    /// [`Self::get_npm_metadata_routed`].
+    pub async fn get_npm_metadata_routed_full(
+        &self,
+        name: &str,
+        route: crate::UpstreamRoute,
+    ) -> Result<PackageMetadata, LpmError> {
+        match route {
+            crate::UpstreamRoute::LpmWorker => self.get_npm_package_metadata_full(name).await,
+            crate::UpstreamRoute::NpmDirect => self.get_npm_metadata_direct_full(name).await,
+            crate::UpstreamRoute::Custom { target, auth } => {
+                self.get_npm_metadata_from_full(&target.base_url, name, auth.as_ref())
                     .await
             }
         }
@@ -2314,6 +2467,63 @@ impl RegistryClient {
         finish!(Ok(metadata))
     }
 
+    /// Fetch a full packument from a configured custom registry.
+    pub async fn get_npm_metadata_from_full(
+        &self,
+        base_url: &str,
+        name: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<PackageMetadata, LpmError> {
+        let url = format!("{base_url}/{name}");
+        let dest_origin = crate::npmrc::OriginKey::from_request_url(&url).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "invalid registry URL '{url}' — must be http(s) with a host"
+            ))
+        })?;
+        let _ = &dest_origin;
+        let cache_key = format!(
+            "npm-full:{}:{url}",
+            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+        );
+
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            tracing::debug!("metadata cache hit (custom full)");
+            return Ok(cached);
+        }
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let req = self
+            .http
+            .for_url(&url)
+            .await?
+            .get(&url)
+            .header("Accept", "application/json");
+        let req = apply_npmrc_auth(req, &url, auth)?;
+        let response = match self.send_with_retry(req).await {
+            Ok(r) => r,
+            Err(e) => return finish!(Err(e)),
+        };
+        let metadata = match parse_capped_metadata::<PackageMetadata>(
+            response,
+            &format!("get_npm_metadata_from_full {name} @ {base_url}"),
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => return finish!(Err(e)),
+        };
+        self.write_metadata_cache(&cache_key, &metadata, None);
+        finish!(Ok(metadata))
+    }
+
     pub async fn get_registry_signing_keys(
         &self,
         base_url: &str,
@@ -2326,6 +2536,15 @@ impl RegistryClient {
         }
 
         let url = format!("{}/-/npm/v1/keys", base_url.trim_end_matches('/'));
+        let cache_key = format!(
+            "registry-signing-keys:{}:{url}",
+            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+        );
+        let mut cache = self.registry_signing_keys_cache.lock().await;
+        if let Some(keys) = cache.get(&cache_key) {
+            return Ok(keys.clone());
+        }
+
         let req = self
             .http
             .for_url(&url)
@@ -2335,11 +2554,15 @@ impl RegistryClient {
         let req = apply_npmrc_auth(req, &url, auth)?;
         let response = match self.send_with_retry(req).await {
             Ok(response) => response,
-            Err(LpmError::NotFound(_)) => return Ok(Vec::new()),
+            Err(LpmError::NotFound(_)) => {
+                cache.insert(cache_key, Vec::new());
+                return Ok(Vec::new());
+            }
             Err(error) => return Err(error),
         };
         let keys =
             parse_capped_metadata::<KeysResponse>(response, "get_registry_signing_keys").await?;
+        cache.insert(cache_key, keys.keys.clone());
         Ok(keys.keys)
     }
 
@@ -5006,6 +5229,7 @@ mod tests {
             },
             versions: std::collections::HashMap::new(),
             time: std::collections::HashMap::new(),
+            modified: None,
             downloads: Some(42),
             distribution_mode: None,
             package_type: None,
@@ -8890,6 +9114,47 @@ mod tests {
             origin,
             credential: SecretString::from(b64.to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn registry_signing_keys_are_singleflight_cached() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "keys": [{
+                "expires": null,
+                "keyid": "SHA256:test-key",
+                "keytype": "ecdsa-sha2-nistp256",
+                "scheme": "ecdsa-sha2-nistp256",
+                "key": "public-key"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/-/npm/v1/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let server_uri = server.uri();
+        let (client, _tmp) = client_with_mock_server(&server_uri);
+        let (first, second) = tokio::join!(
+            client.get_registry_signing_keys(&server_uri, None),
+            client.get_registry_signing_keys(&server_uri, None)
+        );
+
+        let first = first.expect("first key lookup succeeds");
+        let second = second.expect("second key lookup succeeds");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+
+        let third = client
+            .get_registry_signing_keys(&server_uri, None)
+            .await
+            .expect("warm key lookup succeeds");
+        assert_eq!(third, first);
     }
 
     #[tokio::test]

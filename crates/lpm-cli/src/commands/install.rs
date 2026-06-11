@@ -9,18 +9,24 @@ use lpm_common::color::Painted;
 use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::{GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url};
 use lpm_resolver::{
-    CompiledPeerRules, OverrideHit, OverrideSet, PeerConflictReport, PeerWarning, ResolvedPackage,
-    check_unmet_peers,
+    CachedPackageInfo, CanonicalKey, CompiledPeerRules, OverrideHit, OverrideSet,
+    PeerConflictReport, PeerWarning, ResolvedPackage, check_unmet_peers,
 };
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InstallOmitPolicy {
+    pub dev: bool,
+    pub optional: bool,
+}
 
 /// Test-only deterministic-panic injection hook.
 ///
@@ -217,6 +223,63 @@ fn link_dependencies_for_package(
         ));
     }
     Ok(deps)
+}
+
+fn link_target_lookup_key(name: &str, version: &str) -> String {
+    let mut k = String::with_capacity(name.len() + 1 + version.len());
+    k.push_str(name);
+    k.push('\x00');
+    k.push_str(version);
+    k
+}
+
+fn local_source_sri_for_target(target: &LinkTarget) -> String {
+    let wrapper_id = target.wrapper_id.as_deref().unwrap_or("");
+    let seed = format!(
+        "lpm-v2-local-source\0{}\0{}\0{}\0{}",
+        target.name,
+        target.version,
+        wrapper_id,
+        target.store_path.display()
+    );
+    lpm_store::compute_sri_hash(seed.as_bytes())
+}
+
+fn build_v2_targets(
+    packages: &[InstallPackage],
+    link_targets: &[LinkTarget],
+) -> Result<Vec<lpm_linker::v2::V2Target>, LpmError> {
+    let sri_by_pkg: HashMap<String, String> = packages
+        .iter()
+        .filter_map(|p| {
+            p.integrity
+                .clone()
+                .map(|sri| (link_target_lookup_key(&p.name, &p.version), sri))
+        })
+        .collect();
+
+    let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
+    for target in link_targets {
+        let lookup_key = link_target_lookup_key(&target.name, &target.version);
+        let sri = match target.materialization {
+            lpm_linker::Materialization::CasBacked => sri_by_pkg.get(&lookup_key).cloned(),
+            lpm_linker::Materialization::DirectorySource => {
+                Some(local_source_sri_for_target(target))
+            }
+        }
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "v2 install: missing source SRI for {}@{}",
+                target.name, target.version
+            ))
+        })?;
+        v2_targets.push(lpm_linker::v2::V2Target {
+            target: target.clone(),
+            source_sri: sri,
+        });
+    }
+
+    Ok(v2_targets)
 }
 
 fn resolve_strict_peer_dependencies(
@@ -784,6 +847,43 @@ impl SpeculativeStats {
 /// very deep single-chains). Matches the worker's own deep-walk cap so
 /// speculation doesn't ask for manifests the worker won't send.
 const SPECULATION_MAX_DEPTH: u32 = 5;
+const DEFAULT_FUSION_NPM_FANOUT: usize = lpm_resolver::DEFAULT_NPM_FANOUT;
+const DEFAULT_FUSION_SPECULATION_PERMITS: usize = DEFAULT_MAX_CONCURRENT_DOWNLOADS;
+const ENV_FUSION_SPECULATION_PERMITS: &str = "LPM_FUSION_SPECULATION_PERMITS";
+const ENV_VERIFY_REGISTRY_SIGNATURES: &str = "LPM_VERIFY_REGISTRY_SIGNATURES";
+
+fn parse_positive_usize_or_default(value: &str, default: usize) -> usize {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+fn positive_usize_env_or_default(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().map_or(default, |value| {
+        parse_positive_usize_or_default(&value, default)
+    })
+}
+
+fn parse_bool_env_value(value: &str, default: bool) -> bool {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+fn registry_signature_verification_enabled(
+    global_config: &crate::commands::config::GlobalConfig,
+) -> bool {
+    std::env::var(ENV_VERIFY_REGISTRY_SIGNATURES)
+        .ok()
+        .map_or_else(
+            || global_config.get_bool("signatures").unwrap_or(false),
+            |value| parse_bool_env_value(&value, false),
+        )
+}
 
 impl FetchBreakdown {
     /// Fold one task's timings into the running aggregate.
@@ -1158,6 +1258,8 @@ fn workspace_member_cache_info(
     }
 
     Some(lpm_resolver::CachedPackageInfo {
+        modified: None,
+        trust_metadata_complete: false,
         versions: vec![version],
         deps: deps_by_version,
         peer_deps,
@@ -1889,6 +1991,16 @@ struct InstallPackage {
     peers: Vec<(String, String)>,
     /// SRI integrity hash for verification (e.g. "sha512-...")
     integrity: Option<String>,
+    /// Registry package-signature payload from `dist.signatures`.
+    registry_signatures: Vec<lpm_registry::RegistrySignature>,
+    /// Registry publish timestamp for the selected version, used when
+    /// checking signature key expiry.
+    registry_published_at: Option<String>,
+    /// Platform restrictions declared by the selected package version.
+    platform: Option<lpm_resolver::PlatformMeta>,
+    /// True when this package is reachable only through optional dependency
+    /// edges.
+    optional: bool,
     /// Tarball URL from resolution — avoids re-fetching metadata during download.
     tarball_url: Option<String>,
     /// Whether current metadata was already consulted for tarball lookup.
@@ -1950,6 +2062,32 @@ impl InstallPackage {
             }
             _ => store.has_package(&self.name, &self.version),
         }
+    }
+
+    fn store_has_for_install_layout(
+        &self,
+        store: &PackageStore,
+        store_v2: Option<&lpm_store::v2::Store>,
+        project_dir: &Path,
+    ) -> bool {
+        if let Some(v2_store) = store_v2 {
+            match self.source_kind() {
+                Ok(lpm_lockfile::Source::Directory { .. })
+                | Ok(lpm_lockfile::Source::Link { .. }) => {
+                    return self.store_has_source_aware(store, project_dir);
+                }
+                _ => {
+                    return self.integrity.as_deref().is_some_and(|sri| {
+                        v2_store
+                            .paths()
+                            .object_dir(sri)
+                            .is_ok_and(|object_dir| object_dir.exists())
+                    });
+                }
+            }
+        }
+
+        self.store_has_source_aware(store, project_dir)
     }
 
     /// Source-aware store path.
@@ -2382,6 +2520,10 @@ fn pre_resolve_v2_direct_workspace_member_deps(
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         });
@@ -2533,8 +2675,7 @@ async fn pre_resolve_non_registry_deps(
     project_dir: &Path,
     deps: &mut HashMap<String, String>,
     json_output: bool,
-    strict_integrity: bool,
-    // slice of
+    strict_integrity: bool, // slice of
     // workspace members extracted by `extract_workspace_protocol_deps`
     // before pre_resolve runs. Each member's `source_dir` is
     // realpath-compared against every directory/link dep's source
@@ -2816,6 +2957,10 @@ async fn pre_resolve_non_registry_deps(
             is_lpm: false,
             peers: Vec::new(),
             integrity: Some(computed_sri),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: Some(url),
             metadata_checked_for_tarball: false,
         });
@@ -2913,6 +3058,10 @@ async fn pre_resolve_non_registry_deps(
             is_lpm: false,
             peers: Vec::new(),
             integrity: Some(integrity_sri),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             // tarball_url is fresh-URL writeback (registry-
             // specific). Local tarballs have no remote URL, so leave
             // `None`. Documented day-1 caveat: warm-restart fast-path
@@ -3048,6 +3197,10 @@ async fn pre_resolve_non_registry_deps(
             // package.json content as the freshness signal instead.
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         });
@@ -3148,6 +3301,10 @@ async fn pre_resolve_non_registry_deps(
             // content into the install-hash freshness signal.
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         });
@@ -3842,6 +3999,10 @@ fn recurse_local_source_deps(
                     is_lpm: false,
                     peers: Vec::new(),
                     integrity: None,
+                    registry_signatures: Vec::new(),
+                    registry_published_at: None,
+                    platform: None,
+                    optional: false,
                     tarball_url: None,
                     metadata_checked_for_tarball: false,
                 });
@@ -3978,8 +4139,7 @@ pub async fn run_with_options(
     // trust-on-first-use. Lockfile-resident integrity is still
     // trusted; only the manifest-boundary trust-on-first-use is
     // disabled.
-    strict_integrity: bool,
-    // CLI-level override for strict peer-dependency handling. `None`
+    strict_integrity: bool, // CLI-level override for strict peer-dependency handling. `None`
     // falls through to package.json / global config / default.
     strict_peer_dependencies_override: Option<bool>,
     // Already-resolved linker override from CLI / `~/.lpm/config.toml` / env.
@@ -4062,6 +4222,7 @@ pub async fn run_with_options(
     // one suppresses the *crypto* layer, the other suppresses the
     // *drift* layer.
     verify_policy: crate::provenance_fetch::VerifyPolicy,
+    omit_policy: InstallOmitPolicy,
     // CLI sandbox-mode overrides.
     // `strict_sandbox=true` flips outbound network denial on for the
     // auto-build call; `no_sandbox=true` drops all containment for
@@ -4108,12 +4269,12 @@ pub async fn run_with_options(
         min_release_age_override,
         drift_ignore_policy,
         verify_policy,
+        omit_policy,
         strict_sandbox,
         no_sandbox,
         verbose,
         audit_after_install,
         lpm_root,
-        false,
     )
     .await
 }
@@ -4141,12 +4302,12 @@ pub(crate) async fn run_with_options_with_lpm_root(
     min_release_age_override: Option<u64>,
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
     verify_policy: crate::provenance_fetch::VerifyPolicy,
+    omit_policy: InstallOmitPolicy,
     strict_sandbox: bool,
     no_sandbox: bool,
     verbose: bool,
     audit_after_install: bool,
     lpm_root: lpm_common::LpmRoot,
-    omit_optional_dependencies: bool,
 ) -> Result<(), LpmError> {
     // Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
@@ -4183,12 +4344,12 @@ pub(crate) async fn run_with_options_with_lpm_root(
             min_release_age_override,
             drift_ignore_policy,
             verify_policy,
+            omit_policy,
             strict_sandbox,
             no_sandbox,
             verbose,
             audit_after_install,
             &lpm_root,
-            omit_optional_dependencies,
         ),
     )
     .await
@@ -4222,6 +4383,7 @@ async fn run_with_options_under_store_lock(
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
     // see `run_with_options` for the contract.
     verify_policy: crate::provenance_fetch::VerifyPolicy,
+    omit_policy: InstallOmitPolicy,
     // rework  — see `run_with_options` for the
     // contract. Threaded down so the auto-build call below honors the
     // user's CLI sandbox-mode override.
@@ -4233,11 +4395,11 @@ async fn run_with_options_under_store_lock(
     // Resolved audit-after-install boolean — see [`run_with_options`].
     audit_after_install: bool,
     lpm_root: &lpm_common::LpmRoot,
-    omit_optional_dependencies: bool,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
     crate::security_floor::clear_recorded_suppressions();
     let global_config = crate::commands::config::GlobalConfig::load();
+    let verify_registry_signatures = registry_signature_verification_enabled(&global_config);
     let force_security_floor = crate::security_floor::force_security_floor_enabled(&global_config);
     let release_age_floor_secs =
         crate::security_floor::current_release_age_floor_secs(&global_config);
@@ -4264,6 +4426,18 @@ async fn run_with_options_under_store_lock(
         json_output,
         crate::security_approval::ApprovalSource::ProjectConfig,
     )?;
+
+    let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
+        project_dir,
+        min_release_age_override,
+        json_output,
+    )?;
+    let resolver_trust_policy = match global_config.get_trust_policy().as_deref() {
+        Some("no-downgrade") => lpm_resolver::TrustPolicyMode::NoDowngrade,
+        _ => lpm_resolver::TrustPolicyMode::Off,
+    };
+    let resolver_policy =
+        lpm_resolver::ResolverPolicy::new(effective_min_age_secs, resolver_trust_policy);
 
     //  Hoisted
     // here (above the empty-deps short-circuit, the lockfile fast
@@ -4489,14 +4663,15 @@ async fn run_with_options_under_store_lock(
     // it should never be shadowed by a dev-only entry.
     //
     // `lpm deploy` strips `devDependencies` from the output manifest before
-    // re-entering this path, so the deploy closure stays prod-only. An
-    // explicit `--prod` / `--omit dev` surface for `lpm install` itself is
-    // tracked for a future phase, not hardcoded here.
+    // re-entering this path, so the deploy closure stays prod-only. `--prod`
+    // / `--omit dev` still resolve the full graph for lockfile parity, then
+    // filter dev-only packages before linking.
     for (name, range) in &pkg.dev_dependencies {
         deps.entry(name.clone()).or_insert_with(|| range.clone());
     }
     reject_workspace_self_dependency(&pkg)?;
 
+    let production_dependency_names: HashSet<String> = pkg.dependencies.keys().cloned().collect();
     let declared_deps = deps.clone();
 
     // Resolve `catalog:` protocols and EXTRACT `workspace:*` member references
@@ -5110,7 +5285,7 @@ async fn run_with_options_under_store_lock(
         // cannot detect whether the v1 lockfile was ever buggy or
         // always correct, so it has to assume the worst when
         // `auto_install_peers` is on.
-        if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) {
+        if lockfile_needs_peer_state_repair(&fast.lockfile, auto_install_peers) {
             return Err(LpmError::Registry(
                 "--offline cannot use a pre-R2.5 lockfile under \
                  `lpm.autoInstallPeers = true`: the lockfile may be missing \
@@ -5122,11 +5297,15 @@ async fn run_with_options_under_store_lock(
                     .into(),
             ));
         }
-        let locked = fast.packages; // Offline mode skips the writeback machinery —
+        let mut locked = fast.packages; // Offline mode skips the writeback machinery —
         // no fetch happens, no URLs diverge, and any v1
         // → v2 binary migration is deferred to the next
         // online install (intentional — `--offline` is
         // the "don't touch anything remote" mode).
+        if omit_policy.dev {
+            filter_dev_packages(&mut locked, &production_dependency_names);
+        }
+        let _platform_skipped = filter_platform_packages(&mut locked)?;
         if !json_output {
             output::info(&format!(
                 "Offline: using lockfile ({} packages)",
@@ -5136,6 +5315,7 @@ async fn run_with_options_under_store_lock(
 
         // Verify all packages are in the global store
         let store = PackageStore::from_root(lpm_root);
+        let store_v2 = requested_v2_mode.then(|| lpm_store::v2::Store::from_lpm_root(lpm_root));
         let mut missing = Vec::new();
         for p in &locked {
             // day-5.5 audit fix (HIGH-2 partial): source-
@@ -5146,7 +5326,7 @@ async fn run_with_options_under_store_lock(
             // recorded) is treated as missing — offline mode can't
             // legally fetch, so the install must abort with a clear
             // missing-package signal.
-            if !p.store_has_source_aware(&store, project_dir) {
+            if !p.store_has_for_install_layout(&store, store_v2.as_ref(), project_dir) {
                 missing.push(format!("{}@{}", p.name, p.version));
             }
         }
@@ -5219,6 +5399,16 @@ async fn run_with_options_under_store_lock(
             &all_workspace_members,
         )?;
         enforce_registry_integrity_policy(&locked, strict_integrity, json_output)?;
+        if verify_registry_signatures {
+            enforce_registry_signature_policy(
+                Arc::clone(&arc_client),
+                &route_table,
+                &locked,
+                json_output,
+                false,
+            )
+            .await?;
+        }
 
         // Go directly to link step (skip resolution and download).
         // forward the already-resolved
@@ -5282,7 +5472,7 @@ async fn run_with_options_under_store_lock(
             false,
         );
         match candidate {
-            Some(fast) if lockfile_needs_r25_repair(&fast.lockfile, auto_install_peers) => {
+            Some(fast) if lockfile_needs_peer_state_repair(&fast.lockfile, auto_install_peers) => {
                 if !json_output {
                     output::info(
                         "Lockfile is in an older format; rebuilding to capture \
@@ -5475,7 +5665,7 @@ async fn run_with_options_under_store_lock(
         &all_workspace_members,
     )?;
 
-    // stats — filled by the walker + dispatcher drain.
+    // stats — filled by the speculation dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
 
     //: shared fetch coordinator — serializes per-key fetch
@@ -5483,19 +5673,10 @@ async fn run_with_options_under_store_lock(
     // now that the drain-wait between them is gone.
     let fetch_coord: Arc<FetchCoordinator> = Arc::new(FetchCoordinator::default());
 
-    // walker + dispatcher join handles hoisted out of the
-    // fresh-resolve arm so the main task drains them AFTER the real
-    // fetch loop — preserves the speculation overlap the
-    // hoist enabled. NOT awaited here: awaiting either handle early
-    // consumes it and makes the post-fetch drain a no-op (preplan
-    //).
-    let mut walker_join: Option<WalkerJoin> = None;
-    //: when set, the fusion dispatcher ran instead of the
-    // walker. Read at the post-fetch drain site to suppress the no-op
-    // walker stub's zeroed `streaming_bfs` summary in `--json` output
-    // (the fusion arm reports null streaming_bfs because there's no
-    // walker; substage detail lives under `timing.resolve.dispatcher.*`).
-    let mut fusion_enabled = false;
+    // Speculation handles are hoisted out of the fresh-resolve arm so
+    // the main task drains them after the real fetch loop. Awaiting
+    // the dispatcher early removes the resolve/fetch overlap.
+    let mut speculation_join: Option<SpeculationJoin> = None;
     // Post-lockfile metadata: which resolver actually ran.
     // Stamped into `lpm.lock`'s `resolved-with` field at the cold-
     // write site below. Defaults to the greedy-fusion install default
@@ -5537,7 +5718,7 @@ async fn run_with_options_under_store_lock(
     // arms; hoisted it further to above the empty-deps
     // short-circuit so TLS overrides + `strict-ssl=false` security
     // warning surface for empty-deps installs too).
-    let (mut packages, resolve_ms, used_lockfile, platform_skipped, latest_stable_versions) =
+    let (mut packages, resolve_ms, used_lockfile, mut platform_skipped, latest_stable_versions) =
         match lockfile_result {
             Some(fast_path) => {
                 if !json_output {
@@ -5546,8 +5727,8 @@ async fn run_with_options_under_store_lock(
                         fast_path.packages.len().to_string().bold()
                     ));
                 }
-                lockfile_peer_context_authoritative =
-                    fast_path.lockfile.metadata.lockfile_version >= lpm_lockfile::LOCKFILE_VERSION;
+                lockfile_peer_context_authoritative = fast_path.lockfile.metadata.lockfile_version
+                    >= MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE;
                 fast_path_lockfile = Some(fast_path.lockfile);
                 needs_binary_upgrade = fast_path.needs_binary_upgrade;
                 // Fast path doesn't run the resolver, so we have no
@@ -5624,12 +5805,15 @@ async fn run_with_options_under_store_lock(
                     u128,
                 ) = if fusion_enabled_local {
                     // ── FUSION PATH ─────────────────────────────────────
-                    fusion_enabled = true;
+                    let npm_fanout =
+                        positive_usize_env_or_default("LPM_NPM_FANOUT", DEFAULT_FUSION_NPM_FANOUT);
+                    let speculation_permits = positive_usize_env_or_default(
+                        ENV_FUSION_SPECULATION_PERMITS,
+                        DEFAULT_FUSION_SPECULATION_PERMITS,
+                    );
 
-                    // Speculation dispatcher reads from spec_rx; resolver
-                    // owns spec_tx and drops it on return, signaling the
-                    // dispatcher to drain and exit. Capacity 512 matches
-                    // the walker arm's channel size.
+                    let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
+                    seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
                     let (spec_tx, spec_rx) =
                         tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
                     let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
@@ -5638,33 +5822,12 @@ async fn run_with_options_under_store_lock(
                         route_table.clone(),
                         store.clone(),
                         fetch_semaphore.clone(),
+                        Some(Arc::new(Semaphore::new(speculation_permits))),
                         fetch_coord.clone(),
                         deps.clone(),
                         store_v2_handle.clone(),
                     );
-
-                    // No-op walker stub keeps `WalkerJoin` shape uniform
-                    // so the post-fetch drain below doesn't need a fusion
-                    // branch. The drained `WalkerSummary::default()` is
-                    // suppressed at the JSON-emit site via `fusion_enabled`.
-                    let walker_handle = tokio::spawn(async {
-                        Ok::<_, lpm_resolver::WalkerError>(lpm_resolver::WalkerSummary::default())
-                    });
-
-                    // Metadata semaphore size. Pre-plan: 256 sits at
-                    // the H2 single-connection multiplex cap; lets the
-                    // registry's flow control set the actual pace.
-                    // `LPM_NPM_FANOUT` overrides for bench tuning, matches
-                    // the walker arm's env var.
-                    let npm_fanout = std::env::var("LPM_NPM_FANOUT")
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .filter(|&n| n > 0)
-                        .unwrap_or(256);
-
-                    let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
-                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options(
+                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy(
                         arc_client.clone(),
                         deps.clone(),
                         override_set.clone(),
@@ -5673,13 +5836,19 @@ async fn run_with_options_under_store_lock(
                         Some(spec_tx),
                         shared_cache,
                         auto_install_peers,
-                        !omit_optional_dependencies,
+                        !omit_policy.optional,
+                        resolver_policy.clone(),
                     )
                     .await
                     .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
 
-                    walker_join = Some(WalkerJoin {
-                        walker: walker_handle,
+                    // initial_batch_ms is meaningless under fusion (no
+                    // walker → no roots-ready boundary); 0 reads as
+                    // "lockfile fast path" in --json which is technically
+                    // wrong but harmless — the real story is in
+                    // `timing.resolve.dispatcher.*` (W1 plumbing).
+                    speculation_join = Some(SpeculationJoin {
+                        producer: None,
                         dispatcher: dispatcher_handle,
                         dispatched: dispatcher_counters.dispatched,
                         completed: dispatcher_counters.completed,
@@ -5689,12 +5858,6 @@ async fn run_with_options_under_store_lock(
                         no_version_match: dispatcher_counters.no_version_match,
                         unresolved_parked: dispatcher_counters.unresolved_parked,
                     });
-
-                    // initial_batch_ms is meaningless under fusion (no
-                    // walker → no roots-ready boundary); 0 reads as
-                    // "lockfile fast path" in --json which is technically
-                    // wrong but harmless — the real story is in
-                    // `timing.resolve.dispatcher.*` (W1 plumbing).
                     (res, 0u128)
                 } else {
                     // ── LEGACY PATH (walker + spec dispatcher) ──
@@ -5709,7 +5872,7 @@ async fn run_with_options_under_store_lock(
                     // roots_ready_rx then solves against the shared cache.
                     //
                     // Critically: walker + dispatcher `JoinHandle`s are NOT
-                    // awaited here. They're bundled into `WalkerJoin` below
+                    // awaited here. They're bundled into `SpeculationJoin` below
                     // and drained at the existing post-fetch drain point —
                     // preserving the speculation overlap and
                     // matching preplan's "tail drains post-fetch, not
@@ -5740,7 +5903,7 @@ async fn run_with_options_under_store_lock(
                         // No deps → fire roots_ready immediately + flip the
                         // walker_done flag so any (vacuously-empty) wait-loop
                         // sleeper short-circuits, then spawn a no-op task so
-                        // the `WalkerJoin` shape stays uniform.
+                        // the `SpeculationJoin` shape stays uniform.
                         let _ = roots_ready_tx.send(());
                         walker_done.store(true, std::sync::atomic::Ordering::Release);
                         tokio::spawn(async { Ok(lpm_resolver::WalkerSummary::default()) })
@@ -5767,6 +5930,7 @@ async fn run_with_options_under_store_lock(
                         route_table.clone(),
                         store.clone(),
                         fetch_semaphore.clone(),
+                        None,
                         fetch_coord.clone(),
                         deps.clone(),
                         store_v2_handle.clone(),
@@ -5804,7 +5968,7 @@ async fn run_with_options_under_store_lock(
                         let _ = roots_ready_rx.await;
                         let roots_ready_at = batch_start.elapsed().as_millis();
                         let w2_resolve_start = Instant::now();
-                        let result = lpm_resolver::resolve_with_shared_cache_options(
+                        let result = lpm_resolver::resolve_with_shared_cache_options_and_policy(
                             resolve_client,
                             resolve_deps,
                             resolve_overrides,
@@ -5815,7 +5979,8 @@ async fn run_with_options_under_store_lock(
                             route_table.clone(),
                             streaming_metrics_for_resolve,
                             auto_install_peers,
-                            !omit_optional_dependencies,
+                            !omit_policy.optional,
+                            resolver_policy.clone(),
                         )
                         .await
                         .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
@@ -5827,8 +5992,8 @@ async fn run_with_options_under_store_lock(
                     }
                     .await;
 
-                    walker_join = Some(WalkerJoin {
-                        walker: walker_handle,
+                    speculation_join = Some(SpeculationJoin {
+                        producer: Some(walker_handle),
                         dispatcher: dispatcher_handle,
                         dispatched: dispatcher_counters.dispatched,
                         completed: dispatcher_counters.completed,
@@ -5845,15 +6010,9 @@ async fn run_with_options_under_store_lock(
 
                 let resolve_result = resolve_res?;
 
-                //: drain-wait removed. `speculation_join` is
-                // preserved on the outer scope and drained AFTER the fetch
-                // loop below, so speculative tarball downloads can overlap
-                // the real fetch loop (straggling specs race with the real
-                // fetches for the same 24-permit download pool). The
-                // `fetch_coord` serializes per-(name, version) work, so a
-                // real fetch for a package spec is still downloading just
-                // waits on the coord's per-key lock and returns as soon as
-                // spec's atomic-rename makes it visible.
+                // The speculation join drains after fetch so downloads
+                // dispatched during resolution can overlap the authoritative
+                // fetch phase without being awaited early.
                 let ms = resolve_start.elapsed().as_millis();
 
                 // Post-resolution peer dependency check: warn about unmet peers
@@ -5952,6 +6111,7 @@ async fn run_with_options_under_store_lock(
                     &deps,
                     &resolve_result.root_aliases,
                     &resolve_result.ambient_peer_installs,
+                    &resolve_result.cache,
                     &route_table,
                     &all_workspace_members,
                     project_dir,
@@ -6030,6 +6190,12 @@ async fn run_with_options_under_store_lock(
         );
     }
 
+    let packages_for_lockfile = packages.clone();
+    if omit_policy.dev {
+        filter_dev_packages(&mut packages, &production_dependency_names);
+    }
+    platform_skipped += filter_platform_packages(&mut packages)?;
+
     append_workspace_links_from_local_packages(
         project_dir,
         &packages,
@@ -6038,6 +6204,18 @@ async fn run_with_options_under_store_lock(
         &direct_workspace_member_deps,
     );
 
+    if verify_registry_signatures {
+        enforce_registry_signature_policy(
+            Arc::clone(&arc_client),
+            &route_table,
+            &packages,
+            json_output,
+            true,
+        )
+        .await?;
+    }
+
+    let mut walker_summary_final: Option<lpm_resolver::WalkerSummary> = None;
     // Step 3: Download & store (parallel).: `store` is
     // already bound above — speculative dispatcher writes into it
     // during resolve, so by the time we reach here the store may hold
@@ -6109,17 +6287,6 @@ async fn run_with_options_under_store_lock(
     // hot path for the default `lpm install`.
     let serial_link = std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
     let v2_mode = store_v2_handle.is_some();
-    let local_source_sri_for_target = |target: &LinkTarget| {
-        let wrapper_id = target.wrapper_id.as_deref().unwrap_or("");
-        let seed = format!(
-            "lpm-v2-local-source\0{}\0{}\0{}\0{}",
-            target.name,
-            target.version,
-            wrapper_id,
-            target.store_path.display()
-        );
-        lpm_store::compute_sri_hash(seed.as_bytes())
-    };
     if v2_mode {
         let store_v2 = store_v2_handle
             .as_deref()
@@ -6666,11 +6833,6 @@ async fn run_with_options_under_store_lock(
         );
         verify_policy.skip = crate::provenance_fetch::SkipPolicy::None;
     }
-    let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
-        project_dir,
-        min_release_age_override,
-        json_output,
-    )?;
     let cooldown_policy = lpm_security::SecurityPolicy::with_resolved_min_age(
         &project_dir.join("package.json"),
         effective_min_age_secs,
@@ -7551,45 +7713,25 @@ async fn run_with_options_under_store_lock(
 
     let fetch_ms = fetch_start.elapsed().as_millis();
 
-    //: drain speculation AFTER the real fetch loop, not
-    // before. Spec tarballs for correctly-predicted versions were
-    // consumed by the fetch coord's per-key lock (real fetch waited on
-    // them and short-circuited). What remains in-flight here is spec
-    // work for WRONG-version predictions — harmless wasted bandwidth
-    // that the resolver didn't want. We still await the dispatcher
-    // handle so its atomics can be read into `spec_stats` for --json,
-    // but it happens outside both `fetch_ms` and `link_ms` so stage
-    // times are not inflated by wasted speculation tails.
-    //: walker summary is folded into
+    // Drain any speculation tail after the authoritative fetch phase.
+    // This preserves resolve/fetch overlap while making completed
+    // speculation visible in the JSON counters.
+    //
+    // The walker summary is folded into
     // `timing.resolve.streaming_bfs` in the JSON-output block below.
     // `None` on warm lockfile-fast-path installs (walker never ran).
-    let walker_summary_final: Option<lpm_resolver::WalkerSummary> = if let Some(join) =
-        walker_join.take()
-    {
+    if let Some(join) = speculation_join.take() {
         let summary = join.drain(&mut spec_stats).await;
-        if fusion_enabled {
-            //: fusion arm uses a no-op walker stub purely
-            // to keep `WalkerJoin` shape uniform for the spec-dispatcher
-            // drain. Its summary is the all-zero default — surfacing it
-            // in `streaming_bfs` would mislead readers into thinking a
-            // walker ran. Substage detail under fusion lives in
-            // `timing.resolve.dispatcher.*` (W1 plumbing). Suppress to
-            // null so `--json` consumers can detect arm by presence.
-            None
-        } else {
-            tracing::debug!(
-                "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={} walker_wall_ms={}",
-                summary.manifests_fetched,
-                summary.cache_hits,
-                summary.max_depth,
-                summary.spec_tx_send_wait_ms,
-                summary.walker_wall_ms,
-            );
-            Some(summary)
-        }
-    } else {
-        None
-    };
+        tracing::debug!(
+            "walker summary: manifests_fetched={} cache_hits={} max_depth={} spec_tx_send_wait_ms={} walker_wall_ms={}",
+            summary.manifests_fetched,
+            summary.cache_hits,
+            summary.max_depth,
+            summary.spec_tx_send_wait_ms,
+            summary.walker_wall_ms,
+        );
+        walker_summary_final = Some(summary);
+    }
 
     // Fetch / cache-hit counters are recorded into `fetch_ms` etc. and
     // surfaced via the verbose footer and JSON envelope. The default
@@ -7645,54 +7787,7 @@ async fn run_with_options_under_store_lock(
         let store_v2 = store_v2_handle
             .as_deref()
             .expect("v2_mode implies v2 store handle is available");
-        // — v2 path with unified source routing.
-        //
-        // CAS-backed sources (Registry, Tarball remote+local, Git)
-        // use extracted `objects/<sri>/`. Local directory/link
-        // sources use synthetic `objects/<synthetic-sri>/` symlink
-        // trees so they participate in GraphKey resolution while
-        // staying live to source edits.
-        // Key: "name\x00version" — single String avoids 2-clone tuple on
-        // both construction and per-package lookup.
-        let sri_by_pkg: HashMap<String, String> = packages
-            .iter()
-            .filter_map(|p| {
-                p.integrity.clone().map(|sri| {
-                    let mut k = String::with_capacity(p.name.len() + 1 + p.version.len());
-                    k.push_str(&p.name);
-                    k.push('\x00');
-                    k.push_str(&p.version);
-                    (k, sri)
-                })
-            })
-            .collect();
-
-        let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
-        for t in &link_targets {
-            let lookup_key = {
-                let mut k = String::with_capacity(t.name.len() + 1 + t.version.len());
-                k.push_str(&t.name);
-                k.push('\x00');
-                k.push_str(&t.version);
-                k
-            };
-            let sri = match t.materialization {
-                lpm_linker::Materialization::CasBacked => sri_by_pkg.get(&lookup_key).cloned(),
-                lpm_linker::Materialization::DirectorySource => {
-                    Some(local_source_sri_for_target(t))
-                }
-            }
-            .ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "v2 install: missing source SRI for {}@{}",
-                    t.name, t.version
-                ))
-            })?;
-            v2_targets.push(lpm_linker::v2::V2Target {
-                target: t.clone(),
-                source_sri: sri,
-            });
-        }
+        let v2_targets = build_v2_targets(&packages, &link_targets)?;
 
         // followup #6b — event-driven v2 path.
         //
@@ -8259,7 +8354,7 @@ async fn run_with_options_under_store_lock(
             .iter()
             .map(install_pkg_key)
             .collect();
-        let persisted_packages: Vec<InstallPackage> = packages
+        let persisted_packages: Vec<InstallPackage> = packages_for_lockfile
             .iter()
             .filter(|p| !ephemeral_workspace_pkg_keys.contains(&install_pkg_key(p)))
             .cloned()
@@ -8306,6 +8401,15 @@ async fn run_with_options_under_store_lock(
                 version: p.version.clone(),
                 source: Some(p.source.clone()),
                 integrity: p.integrity.clone(),
+                registry_signatures: lockfile_registry_signatures(&p.registry_signatures),
+                registry_published_at: p.registry_published_at.clone(),
+                os: p.platform.as_ref().map_or_else(Vec::new, |m| m.os.clone()),
+                cpu: p.platform.as_ref().map_or_else(Vec::new, |m| m.cpu.clone()),
+                libc: p
+                    .platform
+                    .as_ref()
+                    .map_or_else(Vec::new, |m| m.libc.clone()),
+                optional: p.optional,
                 dependencies: dep_strings,
                 alias_dependencies: alias_pairs,
                 peers: peer_strings,
@@ -8689,8 +8793,8 @@ async fn run_with_options_under_store_lock(
                     "escape_hatch_rpc_count": resolver_stage_timing.escape_hatch_rpc_count,
                     "parse_ndjson_ms": resolver_stage_timing.parse_ndjson_ms,
                     "pubgrub_ms": resolver_stage_timing.pubgrub_ms,
-                    // — fused-dispatcher counters. Zero on the
-                    // walker arm; non-zero under `LPM_GREEDY_FUSION=1`.
+                    // — fused metadata-dispatcher counters. Zero on
+                    // the walker arm; populated under greedy fusion.
                     // Field shape:
                     //   rpc_count             — total metadata RPCs the
                     //                           dispatcher fired
@@ -8698,7 +8802,7 @@ async fn run_with_options_under_store_lock(
                     //                           escape_hatch on fusion).
                     //   inflight_high_water   — peak in-flight metadata
                     //                           fetches; approaching the
-                    //                           256 cap means the
+                    //                           configured fanout means the
                     //                           semaphore is binding.
                     //   parked_max_depth      — peak Vec length in the
                     //                           per-canonical park map;
@@ -8706,10 +8810,12 @@ async fn run_with_options_under_store_lock(
                     //                           hundreds = stalled CDN
                     //                           pin on one package.
                     //   tarball_dispatched    — speculative tarball
-                    //                           downloads fired from the
-                    //                           dispatcher (parity with
-                    //                           pre-fusion `speculative`
-                    //                           on the walker arm).
+                    //                           metadata frames emitted
+                    //                           by resolver arms that
+                    //                           enable CLI speculation.
+                    //                           Fusion leaves this at 0
+                    //                           by default and lets the
+                    //                           exact graph feed fetch.
                     //   peer_prefetch_count   — speculative
                     //                           peer-manifest fetches
                     //                           dispatched concurrent with
@@ -9944,35 +10050,14 @@ struct LockfileFastPath {
     needs_binary_upgrade: bool,
 }
 
-/// gate that decides whether a fast-path lockfile
-/// candidate must be discarded in favor of a fresh resolve so the
-/// the ambient-peer hole gets repaired.
-///
-/// The historical bug: auto-installed missing
-/// required peers but did not persist `ambient-peer-installs` or
-/// per-package `peers` to the lockfile.
-/// A user upgrading from one of those builds to/// lockfile that LOOKS legal under the new schema (the new fields
-/// have `#[serde(default)]`) but is silently missing data the v2
-/// linker needs to reproduce the cold-install tree. Without this
-/// gate, `rm -rf node_modules && lpm install` would replay the v1
-/// lockfile, skip surfacing the auto-installed peer at top level,
-/// and produce a tree where `require('react-redux')` fails because
-/// `node_modules/react/` is absent.
-///
-/// **The gate.** When `auto_install_peers` is on and the lockfile's
-/// metadata version is older than the current `LOCKFILE_VERSION`,
-/// we can't trust that an empty `ambient-peer-installs` field
-/// reflects truth (vs. "field was absent in source TOML"). Discard
-/// the fast path; the cold resolve below writes a v2 lockfile,
-/// restoring fast-path eligibility on subsequent installs.
-///
-/// **When this returns false (fast path proceeds):**
-/// - v2+ lockfile (authoritative empty-vs-non-empty distinction).
-/// - v1 lockfile under `auto_install_peers = false` — under opt-out,
-///   no ambient installs were ever performed, so the v1 lockfile
-///   is correct as-is.
-fn lockfile_needs_r25_repair(lockfile: &lpm_lockfile::Lockfile, auto_install_peers: bool) -> bool {
-    auto_install_peers && lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION
+const MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE: u32 = 2;
+
+fn lockfile_needs_peer_state_repair(
+    lockfile: &lpm_lockfile::Lockfile,
+    auto_install_peers: bool,
+) -> bool {
+    auto_install_peers
+        && lockfile.metadata.lockfile_version < MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE
 }
 
 fn catalog_protocol_error_to_lpm(error: lpm_workspace::CatalogProtocolError) -> LpmError {
@@ -10297,6 +10382,167 @@ fn install_package_is_direct(
     root_link_names.is_some_and(|names| names.iter().any(|local| deps.contains_key(local)))
 }
 
+fn platform_meta_from_lockfile(
+    lp: &lpm_lockfile::LockedPackage,
+) -> Option<lpm_resolver::PlatformMeta> {
+    if lp.os.is_empty() && lp.cpu.is_empty() && lp.libc.is_empty() {
+        return None;
+    }
+    Some(lpm_resolver::PlatformMeta {
+        os: lp.os.clone(),
+        cpu: lp.cpu.clone(),
+        libc: lp.libc.clone(),
+    })
+}
+
+fn package_platform_compatible(package: &InstallPackage) -> bool {
+    package
+        .platform
+        .as_ref()
+        .is_none_or(lpm_resolver::is_platform_compatible)
+}
+
+fn package_reference_keys(package: &InstallPackage) -> Vec<String> {
+    let mut keys = Vec::with_capacity(2);
+    keys.push(link_target_lookup_key(&package.name, &package.version));
+    if let Some(source_id) = package.wrapper_id_for_source() {
+        keys.push(link_target_lookup_key(&package.name, &source_id));
+    }
+    keys
+}
+
+fn filter_dev_packages(
+    packages: &mut Vec<InstallPackage>,
+    production_roots: &HashSet<String>,
+) -> usize {
+    if packages.is_empty() {
+        return 0;
+    }
+
+    let mut key_to_index = HashMap::with_capacity(packages.len() * 2);
+    for (idx, package) in packages.iter().enumerate() {
+        for key in package_reference_keys(package) {
+            key_to_index.entry(key).or_insert(idx);
+        }
+    }
+
+    let mut retained = HashSet::with_capacity(packages.len());
+    let mut queue = VecDeque::new();
+    for (idx, package) in packages.iter().enumerate() {
+        let is_prod_root = package
+            .root_link_names
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|name| production_roots.contains(name)));
+        if is_prod_root && retained.insert(idx) {
+            queue.push_back(idx);
+        }
+    }
+
+    while let Some(idx) = queue.pop_front() {
+        let package = &packages[idx];
+        for (local_name, version) in &package.dependencies {
+            let target = package
+                .aliases
+                .get(local_name)
+                .map_or(local_name.as_str(), String::as_str);
+            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(target, version))
+                && retained.insert(*next_idx)
+            {
+                queue.push_back(*next_idx);
+            }
+        }
+        for (peer_name, version) in &package.peers {
+            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(peer_name, version))
+                && retained.insert(*next_idx)
+            {
+                queue.push_back(*next_idx);
+            }
+        }
+    }
+
+    let mut retained_keys = HashSet::with_capacity(retained.len() * 2);
+    let mut peer_root_names = HashSet::new();
+    for idx in &retained {
+        let package = &packages[*idx];
+        for key in package_reference_keys(package) {
+            retained_keys.insert(key);
+        }
+        for (peer_name, _) in &package.peers {
+            peer_root_names.insert(peer_name.clone());
+        }
+    }
+
+    let mut kept = Vec::with_capacity(retained.len());
+    let mut skipped = 0usize;
+    for (idx, mut package) in packages.drain(..).enumerate() {
+        if !retained.contains(&idx) {
+            skipped += 1;
+            continue;
+        }
+
+        if let Some(root_link_names) = &mut package.root_link_names {
+            root_link_names
+                .retain(|name| production_roots.contains(name) || peer_root_names.contains(name));
+            if root_link_names.is_empty() {
+                package.root_link_names = None;
+            }
+        }
+
+        package.dependencies.retain(|(local_name, version)| {
+            let target = package
+                .aliases
+                .get(local_name)
+                .map_or(local_name.as_str(), String::as_str);
+            retained_keys.contains(&link_target_lookup_key(target, version))
+        });
+        package.peers.retain(|(name, version)| {
+            retained_keys.contains(&link_target_lookup_key(name, version))
+        });
+        kept.push(package);
+    }
+
+    *packages = kept;
+    skipped
+}
+
+fn filter_platform_packages(packages: &mut Vec<InstallPackage>) -> Result<usize, LpmError> {
+    let mut skipped: HashSet<(String, String)> = HashSet::new();
+    let mut kept = Vec::with_capacity(packages.len());
+
+    for package in packages.drain(..) {
+        if package_platform_compatible(&package) {
+            kept.push(package);
+            continue;
+        }
+        if package.optional {
+            skipped.insert((package.name.clone(), package.version.clone()));
+            continue;
+        }
+        return Err(LpmError::Registry(format!(
+            "{}@{} is incompatible with this platform",
+            package.name, package.version
+        )));
+    }
+
+    if !skipped.is_empty() {
+        for package in &mut kept {
+            package.dependencies.retain(|(local, version)| {
+                let target = package
+                    .aliases
+                    .get(local)
+                    .map_or(local.as_str(), String::as_str);
+                !skipped.contains(&(target.to_string(), version.clone()))
+            });
+            package
+                .peers
+                .retain(|(name, version)| !skipped.contains(&(name.clone(), version.clone())));
+        }
+    }
+
+    *packages = kept;
+    Ok(skipped.len())
+}
+
 fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
@@ -10557,6 +10803,10 @@ fn try_lockfile_fast_path(
                 is_lpm,
                 peers,
                 integrity: lp.integrity.clone(),
+                registry_signatures: install_registry_signatures(&lp.registry_signatures),
+                registry_published_at: lp.registry_published_at.clone(),
+                platform: platform_meta_from_lockfile(lp),
+                optional: lp.optional,
                 // — gate a stored URL against scheme/shape/
                 // origin before reusing it. Any rejection downgrades
                 // to `None`, which forces on-demand lookup against
@@ -10701,6 +10951,7 @@ fn resolved_to_install_packages(
     root_aliases: &HashMap<String, String>,
     // (see function doc)
     ambient_peer_installs: &[String],
+    resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
     // (post-review) — supplied so the source string
     // reflects the actual registry the package was fetched from
     // (`.npmrc`-mapped private mirrors, etc.) rather than a
@@ -10801,6 +11052,12 @@ fn resolved_to_install_packages(
             if !seen.insert(rlk(&name, &version)) {
                 return None;
             }
+            let canonical = CanonicalKey::from(&r.package);
+            let (registry_signatures, registry_published_at) = resolver_cache
+                .get(&canonical)
+                .and_then(|info| info.dist.get(&version))
+                .map(|dist| (dist.signatures.clone(), dist.published_at.clone()))
+                .unwrap_or_default();
             let is_lpm = r.package.is_lpm();
             // (post-review): derive the wire-format source
             // string from the active route table, so a `.npmrc`-mapped
@@ -10825,6 +11082,10 @@ fn resolved_to_install_packages(
                 // `(peer_name, version)` list straight through.
                 peers: r.peers.clone(),
                 integrity: r.integrity.clone(),
+                registry_signatures,
+                registry_published_at,
+                platform: r.platform.clone(),
+                optional: r.optional,
                 tarball_url: r.tarball_url.clone(),
                 metadata_checked_for_tarball: true,
             })
@@ -10832,11 +11093,13 @@ fn resolved_to_install_packages(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolved_to_install_packages_with_workspace_members(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
     root_aliases: &HashMap<String, String>,
     ambient_peer_installs: &[String],
+    resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
     route_table: &RouteTable,
     all_workspace_members: &[WorkspaceMemberLink],
     project_dir: &Path,
@@ -10846,6 +11109,7 @@ fn resolved_to_install_packages_with_workspace_members(
         deps,
         root_aliases,
         ambient_peer_installs,
+        resolver_cache,
         route_table,
     );
     rewrite_workspace_resolved_sources(&mut packages, all_workspace_members, project_dir);
@@ -10929,15 +11193,27 @@ async fn run_link_and_finish(
         .collect::<Result<_, _>>()?;
 
     let link_start = Instant::now();
-    let link_result = match linker_mode {
-        lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
+    let link_result = if lpm_store::StoreVersion::from_env().is_v2() {
+        let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
+        let v2_targets = build_v2_targets(&packages, &link_targets)?;
+        lpm_linker::v2::link_packages_v2(
             project_dir,
-            &link_targets,
-            force,
+            v2_targets,
+            &store_v2,
+            linker_mode,
             pkg.name.as_deref(),
-        )?,
-        lpm_linker::LinkerMode::Isolated => {
-            lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
+        )?
+    } else {
+        match linker_mode {
+            lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
+                project_dir,
+                &link_targets,
+                force,
+                pkg.name.as_deref(),
+            )?,
+            lpm_linker::LinkerMode::Isolated => {
+                lpm_linker::link_packages(project_dir, &link_targets, force, pkg.name.as_deref())?
+            }
         }
     };
     let link_ms = link_start.elapsed().as_millis();
@@ -11358,16 +11634,17 @@ fn pick_speculative_version(
 /// shape per npm data) see every downloaded package match what PubGrub
 /// ultimately picks. Pathological cases that mismatch still converge
 /// correctly via the real fetch loop.
-/// replacement for `SpeculativeJoin`. Bundles the still-live
-/// walker + dispatcher `JoinHandle`s plus the dispatcher's atomic
-/// counters so `drain` at the post-fetch point returns a
-/// `WalkerSummary` and folds speculation stats into the report shape.
+/// Bundles the still-live metadata producer, dispatcher `JoinHandle`,
+/// and dispatcher's atomic counters so `drain` at the post-fetch point
+/// folds speculation stats into the report shape.
 ///
-/// Invariant: both `walker` and `dispatcher` are UNAWAITED at construction.
-/// Awaiting either before `drain()` consumes the handle and makes the
-/// post-fetch drain a no-op — the very bug preplan warns about.
-struct WalkerJoin {
-    walker: tokio::task::JoinHandle<Result<lpm_resolver::WalkerSummary, lpm_resolver::WalkerError>>,
+/// Invariant: all handles are unawaited at construction. Awaiting any
+/// before `drain()` consumes the handle and makes the post-fetch drain
+/// a no-op.
+struct SpeculationJoin {
+    producer: Option<
+        tokio::task::JoinHandle<Result<lpm_resolver::WalkerSummary, lpm_resolver::WalkerError>>,
+    >,
     dispatcher: tokio::task::JoinHandle<()>,
     dispatched: Arc<std::sync::atomic::AtomicU64>,
     completed: Arc<std::sync::atomic::AtomicU64>,
@@ -11378,8 +11655,8 @@ struct WalkerJoin {
     unresolved_parked: Arc<std::sync::atomic::AtomicU64>,
 }
 
-impl WalkerJoin {
-    /// Await walker + dispatcher tails and fold dispatcher counters
+impl SpeculationJoin {
+    /// Await producer + dispatcher tails and fold dispatcher counters
     /// into `stats`. Consumes `self` so the handles can only be
     /// drained once.
     ///
@@ -11389,11 +11666,15 @@ impl WalkerJoin {
     /// at drain-call time measures "spawn → drain," which includes
     /// any post-walker fetch-overlap tail — not the metadata-producer
     /// window the field is documented as. The walker-owned measurement
-    /// is invariant to when the caller chooses to `.await` the
-    /// JoinHandle.
+    /// is invariant to when the caller chooses to `.await` the handle.
+    /// Fusion has no separate walker, so it reports the default summary
+    /// while still folding dispatcher counters.
     async fn drain(self, stats: &mut SpeculativeStats) -> lpm_resolver::WalkerSummary {
         use std::sync::atomic::Ordering::Relaxed;
-        let walker_res = self.walker.await;
+        let producer_res = match self.producer {
+            Some(producer) => Some(producer.await),
+            None => None,
+        };
         let _dispatcher_res = self.dispatcher.await;
         stats.dispatched = self.dispatched.load(Relaxed);
         stats.completed = self.completed.load(Relaxed);
@@ -11402,16 +11683,17 @@ impl WalkerJoin {
         stats.max_depth_reached = self.max_depth_reached.load(Relaxed);
         stats.no_version_match = self.no_version_match.load(Relaxed);
         stats.unresolved_parked = self.unresolved_parked.load(Relaxed);
-        let summary = match walker_res {
-            Ok(Ok(summary)) => summary,
-            Ok(Err(e)) => {
-                tracing::warn!("walker finished with error: {e}");
+        let summary = match producer_res {
+            Some(Ok(Ok(summary))) => summary,
+            Some(Ok(Err(e))) => {
+                tracing::warn!("metadata producer finished with error: {e}");
                 lpm_resolver::WalkerSummary::default()
             }
-            Err(join_err) => {
-                tracing::warn!("walker task join failed: {join_err}");
+            Some(Err(join_err)) => {
+                tracing::warn!("metadata producer task join failed: {join_err}");
                 lpm_resolver::WalkerSummary::default()
             }
+            None => lpm_resolver::WalkerSummary::default(),
         };
         stats.streaming_batch_ms = summary.walker_wall_ms;
         summary
@@ -11444,6 +11726,7 @@ fn spawn_speculation_dispatcher(
     route_table: RouteTable,
     store: PackageStore,
     semaphore: Arc<Semaphore>,
+    speculation_semaphore: Option<Arc<Semaphore>>,
     coord: Arc<FetchCoordinator>,
     deps: HashMap<String, String>,
     // — under v2 mode the dispatcher routes downloaded
@@ -11460,6 +11743,7 @@ fn spawn_speculation_dispatcher(
     let route_table_spec = route_table;
     let store_spec = store;
     let sem_spec = semaphore;
+    let speculation_sem_spec = speculation_semaphore;
     let coord_spec = coord;
     let store_v2_spec = store_v2;
 
@@ -11606,6 +11890,7 @@ fn spawn_speculation_dispatcher(
                 let rt = route_table_spec.clone();
                 let s = store_spec.clone();
                 let sem = sem_spec.clone();
+                let spec_sem = speculation_sem_spec.clone();
                 let coord = coord_spec.clone();
                 let completed_task = completed_c.clone();
                 let task_ms_task = task_ms_c.clone();
@@ -11618,6 +11903,7 @@ fn spawn_speculation_dispatcher(
                     &s,
                     store_v2_task.as_deref(),
                     &sem,
+                    spec_sem.as_ref(),
                     &coord,
                     &name,
                     &version,
@@ -11738,6 +12024,7 @@ async fn speculative_download_and_store(
     // gets its own clone of the `Arc<Store>`.
     store_v2: Option<&lpm_store::v2::Store>,
     semaphore: &Arc<Semaphore>,
+    speculation_semaphore: Option<&Arc<Semaphore>>,
     coord: &Arc<FetchCoordinator>,
     name: &str,
     version: &str,
@@ -11796,14 +12083,32 @@ async fn speculative_download_and_store(
         return Ok(());
     }
 
-    let _permit = semaphore
-        .acquire()
-        .await
-        .map_err(|_| LpmError::Registry("spec semaphore closed".into()))?;
+    let _speculation_permit = match speculation_semaphore {
+        Some(limiter) => match limiter.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(()),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(LpmError::Registry(
+                    "speculation limiter semaphore closed".into(),
+                ));
+            }
+        },
+        None => None,
+    };
 
-    // day-4.5 — speculative tarball downloads also route via
-    // the auth-aware path so custom-registry speculation succeeds
-    // (and doesn't leak the LPM session bearer cross-origin).
+    // Speculation must never queue ahead of the authoritative fetch loop.
+    // If all shared download permits are busy, skip this best-effort
+    // prefetch and let the real fetch path own the network slot.
+    let _permit = match semaphore.try_acquire() {
+        Ok(permit) => permit,
+        Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(()),
+        Err(tokio::sync::TryAcquireError::Closed) => {
+            return Err(LpmError::Registry("spec semaphore closed".into()));
+        }
+    };
+
+    // Keep speculative downloads on the auth-aware route so custom registries
+    // use the same credentials and origin checks as authoritative fetches.
     let response = client
         .download_tarball_streaming_routed(route_table, name, url)
         .await?;
@@ -11858,7 +12163,6 @@ async fn speculative_download_and_store(
 
 struct ResolvedRegistryTarballUrl {
     url: String,
-    metadata: Option<lpm_registry::PackageMetadata>,
 }
 
 async fn metadata_tarball_url_for_package(
@@ -11910,10 +12214,9 @@ async fn resolve_tarball_url(
         if metadata_checked_for_tarball {
             return Ok(ResolvedRegistryTarballUrl {
                 url: url.to_string(),
-                metadata: None,
             });
         }
-        let (metadata_url, metadata) =
+        let (metadata_url, _metadata) =
             metadata_tarball_url_for_package(client, route_table, name, version, is_lpm).await?;
         if url != metadata_url {
             return Err(LpmError::Registry(format!(
@@ -11923,7 +12226,6 @@ async fn resolve_tarball_url(
         }
         return Ok(ResolvedRegistryTarballUrl {
             url: url.to_string(),
-            metadata: Some(metadata),
         });
     }
     if metadata_checked_for_tarball {
@@ -11931,12 +12233,9 @@ async fn resolve_tarball_url(
             "no tarball URL for {name}@{version}"
         )));
     }
-    let (url, metadata) =
+    let (url, _metadata) =
         metadata_tarball_url_for_package(client, route_table, name, version, is_lpm).await?;
-    Ok(ResolvedRegistryTarballUrl {
-        url,
-        metadata: Some(metadata),
-    })
+    Ok(ResolvedRegistryTarballUrl { url })
 }
 
 /// Invalidate metadata cache for a package, routing through the
@@ -11954,133 +12253,6 @@ fn invalidate_metadata_routed(client: &Arc<RegistryClient>, route_table: &RouteT
             client.invalidate_metadata_cache(name);
         }
     }
-}
-
-async fn verify_registry_signature_if_present(
-    client: &Arc<RegistryClient>,
-    route_table: &RouteTable,
-    package: &InstallPackage,
-    metadata_hint: Option<&lpm_registry::PackageMetadata>,
-) -> Result<(), LpmError> {
-    if package.is_lpm || !install_package_is_registry_source(package) {
-        return Ok(());
-    }
-
-    let route = route_table.route_for_package(&package.name);
-    let metadata_owned;
-    let metadata = match metadata_hint {
-        Some(metadata) => metadata,
-        None => {
-            metadata_owned = client
-                .get_npm_metadata_routed(&package.name, route.clone())
-                .await?;
-            &metadata_owned
-        }
-    };
-    let version = metadata.version(&package.version).ok_or_else(|| {
-        LpmError::NotFound(format!(
-            "{}@{} not found in metadata",
-            package.name, package.version
-        ))
-    })?;
-    let Some(dist) = version.dist.as_ref() else {
-        return Ok(());
-    };
-    let Some(signatures) = dist.signatures.as_deref().filter(|s| !s.is_empty()) else {
-        return Ok(());
-    };
-    let Some(integrity) = dist.integrity.as_deref() else {
-        return Err(LpmError::Registry(format!(
-            "{}@{} has registry signatures but no dist.integrity to verify",
-            package.name, package.version
-        )));
-    };
-
-    let keys = registry_signing_keys_for_route(client, &route, signatures).await?;
-    let verification = lpm_registry::verify_registry_signatures(
-        &package.name,
-        &package.version,
-        integrity,
-        signatures,
-        &keys,
-        metadata.time.get(&package.version).map(String::as_str),
-    )?;
-    if let lpm_registry::RegistrySignatureVerification::Verified { count } = verification {
-        tracing::debug!(
-            target: "lpm_cli::install",
-            package = %package.name,
-            version = %package.version,
-            count,
-            "verified registry package signatures"
-        );
-    }
-    Ok(())
-}
-
-async fn registry_signing_keys_for_route(
-    client: &Arc<RegistryClient>,
-    route: &UpstreamRoute,
-    signatures: &[lpm_registry::RegistrySignature],
-) -> Result<Vec<lpm_registry::RegistrySigningKey>, LpmError> {
-    match route {
-        UpstreamRoute::Custom { target, auth } => {
-            match client
-                .get_registry_signing_keys(&target.base_url, auth.as_ref())
-                .await
-            {
-                Ok(mut keys) => {
-                    if !registry_signatures_have_matching_key(signatures, &keys) {
-                        keys.extend(
-                            client
-                                .get_registry_signing_keys(client.npm_registry_url(), None)
-                                .await?,
-                        );
-                    }
-                    Ok(keys)
-                }
-                Err(custom_error) => {
-                    let npm_keys = match client
-                        .get_registry_signing_keys(client.npm_registry_url(), None)
-                        .await
-                    {
-                        Ok(keys) => keys,
-                        Err(npm_error) => {
-                            return Err(LpmError::Registry(format!(
-                                "custom registry signing keys unavailable ({custom_error}); \
-                                 npm signing-key fallback failed ({npm_error})"
-                            )));
-                        }
-                    };
-                    if registry_signatures_have_matching_key(signatures, &npm_keys) {
-                        tracing::debug!(
-                            target: "lpm_cli::install",
-                            custom_registry = %target.base_url,
-                            error = %custom_error,
-                            "custom registry signing keys unavailable; using npm public keys for npm registry signatures"
-                        );
-                        Ok(npm_keys)
-                    } else {
-                        Err(custom_error)
-                    }
-                }
-            }
-        }
-        UpstreamRoute::LpmWorker | UpstreamRoute::NpmDirect => {
-            client
-                .get_registry_signing_keys(client.npm_registry_url(), None)
-                .await
-        }
-    }
-}
-
-fn registry_signatures_have_matching_key(
-    signatures: &[lpm_registry::RegistrySignature],
-    keys: &[lpm_registry::RegistrySigningKey],
-) -> bool {
-    signatures
-        .iter()
-        .filter_map(|signature| signature.keyid.as_deref())
-        .any(|keyid| keys.iter().any(|key| key.keyid == keyid))
 }
 
 /// Shared 404-handling: when a tarball URL 404s and the same-run
@@ -12188,14 +12360,6 @@ async fn fetch_and_store_legacy(
     let initial_url = initial_resolution.url.clone();
     let mut final_url = initial_url.clone();
 
-    verify_registry_signature_if_present(
-        client,
-        route_table,
-        p,
-        initial_resolution.metadata.as_ref(),
-    )
-    .await?;
-
     let download_start = std::time::Instant::now();
     let downloaded = match client
         .download_tarball_routed(route_table, &p.name, &initial_url)
@@ -12243,13 +12407,6 @@ async fn fetch_and_store_legacy(
                     project_dir,
                 ));
             }
-            verify_registry_signature_if_present(
-                client,
-                route_table,
-                p,
-                fresh_resolution.metadata.as_ref(),
-            )
-            .await?;
             match client
                 .download_tarball_routed(route_table, &p.name, &fresh_url)
                 .await
@@ -12515,14 +12672,6 @@ async fn fetch_and_store_streaming(
     let initial_url = initial_resolution.url.clone();
     let mut final_url = initial_url.clone();
 
-    verify_registry_signature_if_present(
-        client,
-        route_table,
-        p,
-        initial_resolution.metadata.as_ref(),
-    )
-    .await?;
-
     let response = match client
         .download_tarball_streaming_routed(route_table, &p.name, &initial_url)
         .await
@@ -12568,13 +12717,6 @@ async fn fetch_and_store_streaming(
                     project_dir,
                 ));
             }
-            verify_registry_signature_if_present(
-                client,
-                route_table,
-                p,
-                fresh_resolution.metadata.as_ref(),
-            )
-            .await?;
             match client
                 .download_tarball_streaming_routed(route_table, &p.name, &fresh_url)
                 .await
@@ -12984,6 +13126,119 @@ fn enforce_registry_integrity_policy(
         }
     }
     Ok(())
+}
+
+async fn enforce_registry_signature_policy(
+    client: Arc<RegistryClient>,
+    route_table: &RouteTable,
+    packages: &[InstallPackage],
+    json_output: bool,
+    allow_metadata_hydration: bool,
+) -> Result<(), LpmError> {
+    let inputs = registry_signature_inputs_from_install_packages(packages);
+    if inputs.is_empty() {
+        return Ok(());
+    }
+
+    let report = crate::registry_signatures::verify_packages(
+        client,
+        route_table.clone(),
+        inputs,
+        allow_metadata_hydration,
+    )
+    .await;
+
+    if report.has_failures() {
+        if !json_output {
+            install_ui::warn(&format!(
+                "Registry signatures · {} verified · {} not verified",
+                report.verified(),
+                report.not_verified()
+            ));
+            for package in report.not_verified_packages().take(10) {
+                let reason = package
+                    .reason
+                    .as_ref()
+                    .map_or_else(|| "not verified".to_string(), |reason| reason.human());
+                install_ui::detail(&format!("  {}  {}", package.package_id().yellow(), reason));
+            }
+        }
+        return Err(LpmError::Registry(registry_signature_failure_message(
+            &report,
+        )));
+    }
+
+    if !json_output {
+        install_ui::done(&format!(
+            "Registry signatures verified · {} verified",
+            report.verified()
+        ));
+    }
+    Ok(())
+}
+
+fn registry_signature_failure_message(
+    report: &crate::registry_signatures::RegistrySignatureReport,
+) -> String {
+    let sample = report
+        .not_verified_packages()
+        .take(5)
+        .map(|package| {
+            let reason = package
+                .reason
+                .as_ref()
+                .map_or_else(|| "not verified".to_string(), |reason| reason.human());
+            format!("{} ({reason})", package.package_id())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "registry signature verification failed for {} package(s): {}",
+        report.not_verified(),
+        sample
+    )
+}
+
+fn registry_signature_inputs_from_install_packages(
+    packages: &[InstallPackage],
+) -> Vec<crate::registry_signatures::RegistrySignatureInput> {
+    packages
+        .iter()
+        .map(
+            |package| crate::registry_signatures::RegistrySignatureInput {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                source: Some(package.source.clone()),
+                integrity: package.integrity.clone(),
+                signatures: package.registry_signatures.clone(),
+                published_at: package.registry_published_at.clone(),
+            },
+        )
+        .collect()
+}
+
+fn lockfile_registry_signatures(
+    signatures: &[lpm_registry::RegistrySignature],
+) -> Vec<lpm_lockfile::LockedRegistrySignature> {
+    signatures
+        .iter()
+        .map(|signature| lpm_lockfile::LockedRegistrySignature {
+            keyid: signature.keyid.clone(),
+            sig: signature.sig.clone(),
+        })
+        .collect()
+}
+
+fn install_registry_signatures(
+    signatures: &[lpm_lockfile::LockedRegistrySignature],
+) -> Vec<lpm_registry::RegistrySignature> {
+    signatures
+        .iter()
+        .map(|signature| lpm_registry::RegistrySignature {
+            keyid: signature.keyid.clone(),
+            sig: signature.sig.clone(),
+        })
+        .collect()
 }
 
 fn install_package_is_registry_source(package: &InstallPackage) -> bool {
@@ -13470,6 +13725,7 @@ pub async fn run_add_packages(
     verify_policy: crate::provenance_fetch::VerifyPolicy,
     // forwarded strict peer-dependency override — see [`run_with_options`].
     strict_peer_dependencies_override: Option<bool>,
+    omit_policy: InstallOmitPolicy,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -13617,6 +13873,7 @@ pub async fn run_add_packages(
             min_release_age_override,
             drift_ignore_policy,
             verify_policy,
+            omit_policy,
             strict_sandbox,
             no_sandbox,
             verbose,
@@ -13697,6 +13954,7 @@ pub async fn run_install_filtered_add(
     verify_policy: crate::provenance_fetch::VerifyPolicy,
     // forwarded strict peer-dependency override — see [`run_with_options`].
     strict_peer_dependencies_override: Option<bool>,
+    omit_policy: InstallOmitPolicy,
     // forwarded CLI sandbox-mode
     // overrides. Opaque pass-through — see [`run_with_options`].
     strict_sandbox: bool,
@@ -13985,6 +14243,7 @@ pub async fn run_install_filtered_add(
                 // `SkipPolicy` (HashSet of skip-listed names); cloning is
                 // bounded by the user-passed flag count.
                 verify_policy.clone(),
+                omit_policy,
                 strict_sandbox,
                 no_sandbox,
                 verbose,
@@ -15236,6 +15495,7 @@ mod tests {
                     lpm_config: None,
                     ecosystem: Some("swift".to_string()),
                     swift_meta: None,
+                    npm_user: None,
                     behavioral_tags: None,
                     lifecycle_scripts: None,
                     security_findings: None,
@@ -15254,6 +15514,7 @@ mod tests {
             dist_tags,
             versions: version_map,
             time: Default::default(),
+            modified: None,
             downloads: None,
             distribution_mode: None,
             package_type: None,
@@ -16384,6 +16645,10 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         }
@@ -16483,14 +16748,37 @@ mod tests {
             key: String::new(),
         }];
 
-        assert!(!registry_signatures_have_matching_key(
-            &signatures,
-            &custom_keys
-        ));
-        assert!(registry_signatures_have_matching_key(
-            &signatures,
-            &npm_keys
-        ));
+        assert!(
+            !crate::registry_signatures::registry_signatures_have_matching_key(
+                &signatures,
+                &custom_keys
+            )
+        );
+        assert!(
+            crate::registry_signatures::registry_signatures_have_matching_key(
+                &signatures,
+                &npm_keys
+            )
+        );
+    }
+
+    #[test]
+    fn parse_bool_env_value_accepts_common_flag_spellings() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(parse_bool_env_value(value, false), "{value:?}");
+        }
+        for value in ["0", "false", "FALSE", " no ", "off"] {
+            assert!(!parse_bool_env_value(value, true), "{value:?}");
+        }
+        assert!(parse_bool_env_value("maybe", true));
+        assert!(!parse_bool_env_value("maybe", false));
+    }
+
+    #[test]
+    fn parse_positive_usize_or_default_rejects_zero_and_invalid_values() {
+        assert_eq!(parse_positive_usize_or_default("8", 3), 8);
+        assert_eq!(parse_positive_usize_or_default("0", 3), 3);
+        assert_eq!(parse_positive_usize_or_default("not-a-number", 3), 3);
     }
 
     #[tokio::test]
@@ -16535,9 +16823,13 @@ mod tests {
             sig: Some("MEUCIQD".to_string()),
         }];
 
-        let keys = registry_signing_keys_for_route(&client, &route, &signatures)
-            .await
-            .expect("npm keyid match should allow npm key fallback");
+        let keys = crate::registry_signatures::registry_signing_keys_for_route(
+            client.as_ref(),
+            &route,
+            &signatures,
+        )
+        .await
+        .expect("npm keyid match should allow npm key fallback");
 
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].keyid, "SHA256:npm");
@@ -16585,9 +16877,13 @@ mod tests {
             sig: Some("MEUCIQD".to_string()),
         }];
 
-        let error = registry_signing_keys_for_route(&client, &route, &signatures)
-            .await
-            .expect_err("non-matching npm keys must not hide the custom registry error");
+        let error = crate::registry_signatures::registry_signing_keys_for_route(
+            client.as_ref(),
+            &route,
+            &signatures,
+        )
+        .await
+        .expect_err("non-matching npm keys must not hide the custom registry error");
 
         assert!(
             matches!(error, LpmError::Http { status: 400, .. }),
@@ -16748,7 +17044,8 @@ mod tests {
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
             crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
-            None,  // strict_peer_dependencies_override
+            None, // strict_peer_dependencies_override
+            InstallOmitPolicy::default(),
             false, // strict_sandbox
             false, // no_sandbox
             false, // verbose
@@ -16797,7 +17094,8 @@ mod tests {
             None,                                                  // min_release_age_override
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
             crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
-            None,  // strict_peer_dependencies_override
+            None, // strict_peer_dependencies_override
+            InstallOmitPolicy::default(),
             false, // strict_sandbox
             false, // no_sandbox
             false, // verbose
@@ -17595,6 +17893,8 @@ mod tests {
             peers: Vec::new(),
             tarball_url: None,
             integrity: None,
+            platform: None,
+            optional: false,
         }
     }
 
@@ -17617,6 +17917,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -17662,26 +17963,26 @@ mod tests {
     }
 
     #[test]
-    fn r25_repair_gate_v2_lockfile_with_auto_install_takes_fast_path() {
+    fn peer_state_repair_gate_v2_lockfile_with_auto_install_takes_fast_path() {
         // The current happy path: v2 lockfile, auto-install on,
         // schema is authoritative. Don't repair.
-        let lf = make_lockfile_with_version(lpm_lockfile::LOCKFILE_VERSION);
+        let lf = make_lockfile_with_version(MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE);
         assert!(
-            !lockfile_needs_r25_repair(&lf, true),
+            !lockfile_needs_peer_state_repair(&lf, true),
             "v2 lockfile with auto-install on must take fast path — \
              empty ambient-peer-installs is authoritative"
         );
     }
 
     #[test]
-    fn r25_repair_gate_v1_lockfile_with_auto_install_forces_repair() {
+    fn peer_state_repair_gate_v1_lockfile_with_auto_install_forces_repair() {
         // The load-bearing test. A v1 lockfile under
         // `auto_install_peers = true` is suspect: it may be missing
         // peer-tracking state. Discard fast path so a
         // fresh resolve repopulates the new fields.
         let lf = make_lockfile_with_version(1);
         assert!(
-            lockfile_needs_r25_repair(&lf, true),
+            lockfile_needs_peer_state_repair(&lf, true),
             "v1 lockfile under auto_install_peers=true must force \
              fresh resolve — the silent ambient-peer-installs hole \
              that cannot be repaired any other way"
@@ -17689,36 +17990,32 @@ mod tests {
     }
 
     #[test]
-    fn r25_repair_gate_v1_lockfile_with_auto_install_off_takes_fast_path() {
+    fn peer_state_repair_gate_v1_lockfile_with_auto_install_off_takes_fast_path() {
         // The opt-out path: with `auto_install_peers = false`, no
         // ambient installs were ever performed, so a v1 lockfile is
         // correct as-is. Honor it.
         let lf = make_lockfile_with_version(1);
         assert!(
-            !lockfile_needs_r25_repair(&lf, false),
+            !lockfile_needs_peer_state_repair(&lf, false),
             "v1 lockfile under auto_install_peers=false must take \
              fast path — opt-out installs never produced ambient peers"
         );
     }
 
     #[test]
-    fn r25_repair_gate_v2_lockfile_with_auto_install_off_takes_fast_path() {
+    fn peer_state_repair_gate_v2_lockfile_with_auto_install_off_takes_fast_path() {
         // Sanity baseline: v2 + opt-out → trust fast path. Symmetric
         // with the v2 + on case above; covered for completeness so
         // no future logic branch can silently invert it.
-        let lf = make_lockfile_with_version(lpm_lockfile::LOCKFILE_VERSION);
-        assert!(!lockfile_needs_r25_repair(&lf, false));
+        let lf = make_lockfile_with_version(MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE);
+        assert!(!lockfile_needs_peer_state_repair(&lf, false));
     }
 
     #[test]
-    fn r25_lockfile_version_is_2() {
-        // The schema-bump anchor.        // on every fresh lockfile via `Lockfile::new`. If a future
-        // refactor drops this back to 1 without thinking through the
-        // gate's truth table, this test fails first. Keep paired with
-        // the gate tests above.
-        assert_eq!(lpm_lockfile::LOCKFILE_VERSION, 2);
+    fn fresh_lockfiles_use_current_schema_version() {
+        assert_eq!(lpm_lockfile::LOCKFILE_VERSION, 4);
         let lf = lpm_lockfile::Lockfile::new();
-        assert_eq!(lf.metadata.lockfile_version, 2);
+        assert_eq!(lf.metadata.lockfile_version, lpm_lockfile::LOCKFILE_VERSION);
     }
 
     #[test]
@@ -17737,6 +18034,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -17764,6 +18062,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -17807,6 +18106,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -17826,6 +18126,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
         );
 
@@ -17833,6 +18134,60 @@ mod tests {
         assert_eq!(
             installed[0].source, "registry+https://registry.npmjs.org",
             "no .npmrc override → npmjs.org default"
+        );
+    }
+
+    #[test]
+    fn resolved_to_install_packages_carries_registry_signature_metadata() {
+        let signature = lpm_registry::RegistrySignature {
+            keyid: Some("SHA256:test-key".to_string()),
+            sig: Some("base64-signature".to_string()),
+        };
+        let mut dist = HashMap::new();
+        dist.insert(
+            "1.0.0".to_string(),
+            lpm_resolver::CachedDistInfo {
+                tarball_url: Some("https://registry.npmjs.org/signed/-/signed-1.0.0.tgz".into()),
+                integrity: Some("sha512-test".to_string()),
+                signatures: vec![signature.clone()],
+                published_at: Some("2026-01-02T03:04:05.000Z".to_string()),
+                trust_evidence: None,
+            },
+        );
+        let mut resolver_cache = HashMap::new();
+        resolver_cache.insert(
+            lpm_resolver::CanonicalKey::npm("signed"),
+            Arc::new(lpm_resolver::CachedPackageInfo {
+                modified: None,
+                trust_metadata_complete: false,
+                versions: vec![NpmVersion::parse("1.0.0").unwrap()],
+                deps: HashMap::new(),
+                peer_deps: HashMap::new(),
+                optional_dep_names: HashMap::new(),
+                optional_peer_names: HashMap::new(),
+                bundled_dep_names: HashMap::new(),
+                platform: HashMap::new(),
+                dist,
+                aliases: HashMap::new(),
+            }),
+        );
+
+        let resolved = vec![fake_resolved("signed", "1.0.0", None)];
+        let deps: HashMap<String, String> = [("signed".to_string(), "^1.0.0".to_string())].into();
+        let installed = resolved_to_install_packages(
+            &resolved,
+            &deps,
+            &HashMap::new(),
+            &[],
+            &resolver_cache,
+            &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        );
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].registry_signatures, vec![signature]);
+        assert_eq!(
+            installed[0].registry_published_at.as_deref(),
+            Some("2026-01-02T03:04:05.000Z")
         );
     }
 
@@ -17857,6 +18212,7 @@ mod tests {
             &deps,
             &HashMap::new(),
             &[], // tests don't exercise ambient peer installs
+            &HashMap::new(),
             &route_table,
         );
 
@@ -17936,6 +18292,12 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -17999,6 +18361,12 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18031,6 +18399,12 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18066,6 +18440,12 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18103,6 +18483,12 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18152,6 +18538,12 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-test".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18180,6 +18572,56 @@ mod tests {
         assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
     }
 
+    #[test]
+    fn try_lockfile_fast_path_restores_registry_signature_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+        let signature = lpm_lockfile::LockedRegistrySignature {
+            keyid: Some("SHA256:test-key".to_string()),
+            sig: Some("base64-signature".to_string()),
+        };
+
+        let mut lf = lpm_lockfile::Lockfile::new();
+        lf.add_package(lpm_lockfile::LockedPackage {
+            name: "signed-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-test".to_string()),
+            registry_signatures: vec![signature.clone()],
+            registry_published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+            dependencies: vec![],
+            alias_dependencies: vec![],
+            peers: vec![],
+            tarball: None,
+        });
+        lf.write_all(&lockfile_path).unwrap();
+
+        let deps: HashMap<String, String> =
+            [("signed-pkg".to_string(), "^1.0.0".to_string())].into();
+        let client = RegistryClient::new();
+        let gate_stats = GateStats::default();
+        let result =
+            try_lockfile_fast_path(&lockfile_path, &deps, &[], &client, &gate_stats, false)
+                .expect("fast path should succeed on signed lockfile");
+
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(
+            result.packages[0].registry_signatures,
+            vec![lpm_registry::RegistrySignature {
+                keyid: signature.keyid,
+                sig: signature.sig,
+            }]
+        );
+        assert_eq!(
+            result.packages[0].registry_published_at.as_deref(),
+            Some("2025-01-01T00:00:00.000Z")
+        );
+    }
+
     ///3-2 **failing-test-first retrofit** .
     ///
     /// Complement to the acceptance test: gate-REJECTED URLs must
@@ -18201,6 +18643,12 @@ mod tests {
                 version: "1.0.0".to_string(),
                 source: Some("registry+https://registry.npmjs.org".to_string()),
                 integrity: Some("sha512-test".to_string()),
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                os: Vec::new(),
+                cpu: Vec::new(),
+                libc: Vec::new(),
+                optional: false,
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
@@ -18265,6 +18713,12 @@ mod tests {
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-test".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
@@ -18721,6 +19175,10 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: integrity.map(|s| s.to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: Some(url.to_string()),
             metadata_checked_for_tarball: false,
         }
@@ -20029,6 +20487,10 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             };
@@ -20074,6 +20536,10 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         };
@@ -20088,6 +20554,10 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         };
@@ -20425,6 +20895,10 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         };
@@ -20458,6 +20932,10 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         };
@@ -21005,6 +21483,10 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         };
@@ -21366,6 +21848,10 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21380,6 +21866,10 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21394,6 +21884,10 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21460,6 +21954,10 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21474,6 +21972,10 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21488,6 +21990,10 @@ mod tests {
                 is_lpm: false,
                 peers: Vec::new(),
                 integrity: None,
+                registry_signatures: Vec::new(),
+                registry_published_at: None,
+                platform: None,
+                optional: false,
                 tarball_url: None,
                 metadata_checked_for_tarball: false,
             },
@@ -21531,6 +22037,10 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
         }];

@@ -1733,6 +1733,7 @@ pub async fn dlx(
             None,  // min_release_age_override: `lpm dlx` uses the chain
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dlx` enforces drift
             crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: dlx honors env + config posture chain
+            crate::commands::install::InstallOmitPolicy::default(),
             // dlx does not surface its own
             // sandbox-mode flags. The env / config / default chain
             // inside `rebuild::run` still applies.

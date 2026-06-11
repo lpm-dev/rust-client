@@ -8,6 +8,9 @@
 # Run these tests serially to avoid the race.
 keychain-serial = { max-threads = 1 }
 
+[profile.audit]
+default-filter = "test(install_realworld_nextjs_fixture_succeeds_through_verdaccio)"
+
 [[profile.default.overrides]]
 filter = "package(lpm-vault) & test(~tests::)"
 test-group = "keychain-serial"

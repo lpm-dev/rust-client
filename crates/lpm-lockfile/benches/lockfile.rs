@@ -9,6 +9,13 @@ fn make_lockfile(n: usize) -> Lockfile {
             version: format!("{i}.0.0"),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-abcdef1234567890".to_string()),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            optional: false,
+
             dependencies: if i > 0 {
                 vec![format!("pkg-{:05}@{}.0.0", i - 1, i - 1)]
             } else {

@@ -23,6 +23,9 @@
 #
 # Usage:
 #   ./bench/scripts/run-readme.sh <n_iters> [<tag>]
+#
+#   BENCH_ARMS=lpm,bun ./bench/scripts/run-readme.sh 5 quick
+#   BENCH_ARMS=all     ./bench/scripts/run-readme.sh 20 readme
 
 set -euo pipefail
 
@@ -38,7 +41,33 @@ EFFECTIVE_LPM_HOME="${LPM_HOME:-$HOME/.lpm}"
 TRASH_DIR="$BENCH_BASE/${TAG}-trash"
 BUN_CACHE_DIR="${BENCH_BUN_CACHE_DIR:-$HOME/.bun/install/cache}"
 NPM_CACHE_DIR="${BENCH_NPM_CACHE_DIR:-$HOME/.npm}"
-DEFAULT_PNPM_STORE_DIR="$(pnpm store path 2>/dev/null || true)"
+BENCH_ARMS_RAW="${BENCH_ARMS:-all}"
+BENCH_ARMS_CSV="$(printf '%s' "$BENCH_ARMS_RAW" | tr -d '[:space:]')"
+if [[ "$BENCH_ARMS_CSV" == "all" ]]; then
+    BENCH_ARMS_CSV="lpm,bun,npm,pnpm"
+fi
+if [[ -z "$BENCH_ARMS_CSV" ]]; then
+    echo "ERROR: BENCH_ARMS must include at least one arm: lpm,bun,npm,pnpm or all"
+    exit 1
+fi
+for configured_arm in ${BENCH_ARMS_CSV//,/ }; do
+    case "$configured_arm" in
+        lpm|bun|npm|pnpm) ;;
+        *) echo "ERROR: unknown BENCH_ARMS entry '$configured_arm'"; exit 1;;
+    esac
+done
+
+arm_enabled() {
+    case ",$BENCH_ARMS_CSV," in
+        *",$1,"*) return 0;;
+        *) return 1;;
+    esac
+}
+
+DEFAULT_PNPM_STORE_DIR=""
+if arm_enabled pnpm; then
+    DEFAULT_PNPM_STORE_DIR="$(pnpm store path 2>/dev/null || true)"
+fi
 PNPM_STORE_DIR="${BENCH_PNPM_STORE_DIR:-$DEFAULT_PNPM_STORE_DIR}"
 ROTATE_SEQ=0
 DEFERRED_DELETE=()
@@ -46,7 +75,9 @@ DEFERRED_DELETE=()
 mkdir -p "$RESULTS" "$TRASH_DIR"
 
 if [[ ! -x "$BIN" ]]; then echo "ERROR: missing $BIN — build with cargo build --release"; exit 1; fi
-if ! command -v bun &>/dev/null; then echo "ERROR: bun not on PATH"; exit 1; fi
+if arm_enabled bun && ! command -v bun &>/dev/null; then echo "ERROR: bun not on PATH"; exit 1; fi
+if arm_enabled npm && ! command -v npm &>/dev/null; then echo "ERROR: npm not on PATH"; exit 1; fi
+if arm_enabled pnpm && ! command -v pnpm &>/dev/null; then echo "ERROR: pnpm not on PATH"; exit 1; fi
 
 # Use a fresh work dir, not the in-tree fixture itself, so the `node_modules`
 # / lockfile churn doesn't pollute the committed fixture state.
@@ -84,7 +115,7 @@ prepare_full_lpm_reset() {
 }
 
 run_lpm_install() {
-    (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" "$BIN" install --allow-new --json) > /dev/null 2>&1
+    (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" "$BIN" install --json) > /dev/null 2>&1
 }
 
 run_bun_install() {
@@ -145,6 +176,7 @@ run_arm() {
 
 echo "[bench] readme round-robin — n=${N} per arm, fixture: $(basename "$FIXTURE")"
 echo "[bench] HEAD: $(cd "$(dirname "$0")/../.." && git rev-parse --short HEAD) ($(cd "$(dirname "$0")/../.." && git branch --show-current))"
+echo "[bench] arms: $BENCH_ARMS_CSV"
 echo "[bench] full/lpm reset: out-of-band rotate"
 date
 
@@ -172,26 +204,48 @@ echo "[clean] cold install, equal footing — wipes OUTSIDE timer"
 # lpm + bun round-robin (alternating order per iter) — the apples-to-
 # apples headline. Each arm visits position-1 and position-2 equally
 # often across n iters, so both see the same warm/cold network mix.
-for i in $(seq 1 "$N"); do
-    if (( i % 2 == 1 )); then arm_order=(lpm bun); else arm_order=(bun lpm); fi
-    for arm in "${arm_order[@]}"; do run_arm clean "$arm"; done
-done
+if arm_enabled lpm && arm_enabled bun; then
+    for i in $(seq 1 "$N"); do
+        if (( i % 2 == 1 )); then arm_order=(lpm bun); else arm_order=(bun lpm); fi
+        for arm in "${arm_order[@]}"; do run_arm clean "$arm"; done
+    done
+else
+    for arm in lpm bun; do
+        if arm_enabled "$arm"; then
+            for i in $(seq 1 "$N"); do run_arm clean "$arm"; done
+        fi
+    done
+fi
 
 # npm + pnpm sequential — context numbers. Their ~1.5-7s install times
 # dwarf any 200-300ms network-warmth bias, so methodology drift is N/A.
-for i in $(seq 1 "$N"); do run_arm clean npm; done
-for i in $(seq 1 "$N"); do run_arm clean pnpm; done
+for arm in npm pnpm; do
+    if arm_enabled "$arm"; then
+        for i in $(seq 1 "$N"); do run_arm clean "$arm"; done
+    fi
+done
 
 # ── Cold install, reset-each-iter (lpm rotates old state) ──────────
 echo "[full] cold install, reset-each-iter — lpm rotates old state outside timer"
 
-for i in $(seq 1 "$N"); do
-    if (( i % 2 == 1 )); then arm_order=(lpm bun); else arm_order=(bun lpm); fi
-    for arm in "${arm_order[@]}"; do run_arm full "$arm"; done
-done
+if arm_enabled lpm && arm_enabled bun; then
+    for i in $(seq 1 "$N"); do
+        if (( i % 2 == 1 )); then arm_order=(lpm bun); else arm_order=(bun lpm); fi
+        for arm in "${arm_order[@]}"; do run_arm full "$arm"; done
+    done
+else
+    for arm in lpm bun; do
+        if arm_enabled "$arm"; then
+            for i in $(seq 1 "$N"); do run_arm full "$arm"; done
+        fi
+    done
+fi
 
-for i in $(seq 1 "$N"); do run_arm full npm; done
-for i in $(seq 1 "$N"); do run_arm full pnpm; done
+for arm in npm pnpm; do
+    if arm_enabled "$arm"; then
+        for i in $(seq 1 "$N"); do run_arm full "$arm"; done
+    fi
+done
 
 # ── Summary ────────────────────────────────────────────────────────
 echo

@@ -11,16 +11,20 @@ use std::io::IsTerminal;
 /// Stores config in ~/.lpm/config.toml (user/machine config).
 /// Project config lives in package.json under "lpm" key.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, five focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, seven focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
 /// - `lpm config sigstore` owns `[sigstore] verify = deny | warn | off`
 ///   (operator persistent toggle for Sigstore provenance verification).
+/// - `lpm config signatures` owns `signatures = true | false`
+///   (operator persistent toggle for npm registry package signatures).
+/// - `lpm config trust-policy` owns `trust-policy = off | no-downgrade`
+///   (operator persistent toggle for npm publisher/provenance downgrade checks).
 /// - `lpm config release-age` owns `minimum-release-age-secs = <seconds>`
 ///   via human-friendly duration inputs.
 ///
-/// All five default to interactive in a TTY; `--set <value>` is the
+/// All seven default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: &str,
@@ -43,6 +47,12 @@ pub async fn run(
     if action == "sigstore" {
         return run_sigstore_wizard(&config_path, set, json_output).await;
     }
+    if action == "signatures" {
+        return run_signatures_wizard(&config_path, set, json_output).await;
+    }
+    if action == "trust-policy" {
+        return run_trust_policy_wizard(&config_path, set, json_output).await;
+    }
     if action == "release-age" {
         return run_release_age_wizard(&config_path, set, json_output).await;
     }
@@ -51,17 +61,20 @@ pub async fn run(
         "get" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
             let config = read_config(&config_path)?;
-            if let Some(val) = config.get(key).and_then(|v| v.as_str()) {
+            if let Some(val) = config.get(key) {
                 if json_output {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(
-                            &serde_json::json!({ "success": true, key: val })
-                        )
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "success": true,
+                            key: config_value_to_json(val),
+                        }))
                         .unwrap()
                     );
+                } else if let Some(raw) = val.as_str() {
+                    println!("{raw}");
                 } else {
-                    println!("{val}");
+                    println!("{}", config_value_for_display(val));
                 }
             } else if !json_output {
                 install_ui::warn(&format!("{key} is not set"));
@@ -95,13 +108,33 @@ pub async fn run(
                         &format!("lpm config set {key} {value}"),
                     )?;
                 }
+                SIGNATURES_KEY => {
+                    parse_config_bool(value).map_err(|message| {
+                        LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
+                    })?;
+                }
+                TRUST_POLICY_KEY => validate_trust_policy_value(value)?,
                 _ => {}
             }
             if let Some(table) = config.as_table_mut() {
-                table.insert(key.to_string(), toml::Value::String(value.to_string()));
+                let value = if key == SIGNATURES_KEY {
+                    toml::Value::Boolean(parse_config_bool(value).map_err(|message| {
+                        LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
+                    })?)
+                } else {
+                    toml::Value::String(value.to_string())
+                };
+                table.insert(key.to_string(), value);
             }
             write_config(&config_path, &config)?;
             if json_output {
+                let value = if key == SIGNATURES_KEY {
+                    serde_json::Value::Bool(parse_config_bool(value).map_err(|message| {
+                        LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
+                    })?)
+                } else {
+                    serde_json::Value::String(value.to_string())
+                };
                 println!(
                     "{}",
                     serde_json::json!({
@@ -180,7 +213,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore, release-age"
+                 scripts, triage, sandbox, sigstore, signatures, trust-policy, release-age"
             )));
         }
     }
@@ -204,6 +237,20 @@ fn write_config(path: &std::path::Path, config: &toml::Value) -> Result<(), LpmE
         .map_err(|e| LpmError::Registry(format!("config serialize error: {e}")))?;
     std::fs::write(path, content)?;
     Ok(())
+}
+
+fn config_value_to_json(value: &toml::Value) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+}
+
+fn config_value_for_display(value: &toml::Value) -> String {
+    match value {
+        toml::Value::Boolean(value) => value.to_string(),
+        toml::Value::Integer(value) => value.to_string(),
+        toml::Value::Float(value) => value.to_string(),
+        toml::Value::Datetime(value) => value.to_string(),
+        _ => value.to_string(),
+    }
 }
 
 fn global_config_view_from_value(config: &toml::Value) -> GlobalConfig {
@@ -323,8 +370,8 @@ impl GlobalConfig {
         match self.table.get(key)? {
             toml::Value::Boolean(b) => Some(*b),
             toml::Value::String(s) => match s.as_str() {
-                "true" | "1" | "yes" => Some(true),
-                "false" | "0" | "no" => Some(false),
+                "true" | "1" | "yes" | "on" | "enabled" => Some(true),
+                "false" | "0" | "no" | "off" | "disabled" => Some(false),
                 _ => None,
             },
             _ => None,
@@ -366,6 +413,14 @@ impl GlobalConfig {
             .map(String::from)?;
         match raw.as_str() {
             "deny" | "warn" | "off" => Some(raw),
+            _ => None,
+        }
+    }
+
+    pub fn get_trust_policy(&self) -> Option<String> {
+        let raw = self.get_str(TRUST_POLICY_KEY)?.to_string();
+        match raw.as_str() {
+            "off" | "no-downgrade" => Some(raw),
             _ => None,
         }
     }
@@ -655,14 +710,172 @@ fn announce_release_age_set(value: Option<u64>, json_output: bool) {
 
 const SCRIPT_POLICY_KEY: &str = "script-policy";
 const TRIAGE_ADVISOR_KEY: &str = "triage-advisor";
+const SIGNATURES_KEY: &str = "signatures";
+pub(crate) const TRUST_POLICY_KEY: &str = "trust-policy";
 
 const SCRIPT_POLICY_VALUES: &[&str] = &["deny", "triage", "allow"];
 const TRIAGE_ADVISOR_VALUES: &[&str] = &["none", "claude-cli", "codex", "ollama"];
+const TRUST_POLICY_VALUES: &[&str] = &["off", "no-downgrade"];
 
 /// Privacy one-liner shown when a cloud advisor is the chosen path.
 /// Locked wording: short, accurate, not a consent wall.
 const PRIVACY_LINE: &str = "Choosing a cloud advisor sends the package's lifecycle script text for review; \
      local advisors keep review on this machine.";
+
+async fn run_signatures_wizard(
+    config_path: &std::path::Path,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let enabled = if let Some(value) = set {
+        parse_config_bool(value)
+            .map_err(|message| LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}")))?
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err(LpmError::Registry(
+                "lpm config signatures requires a TTY; use `--set true|false` instead".to_string(),
+            ));
+        }
+
+        let current = read_bool_value(config_path, SIGNATURES_KEY)?.unwrap_or(false);
+        println!();
+        println!("  current: {}", format_bool_enabled(current).cyan());
+        let new_value: &str =
+            cliclack::select("Verify npm registry package signatures during install?")
+                .item(
+                    "true",
+                    "enabled",
+                    "fail install when registry signatures cannot verify",
+                )
+                .item(
+                    "false",
+                    "disabled",
+                    "default; use `lpm audit signatures` on demand",
+                )
+                .initial_value(if current { "true" } else { "false" })
+                .interact()
+                .map_err(prompt_err)?;
+        parse_config_bool(new_value)
+            .map_err(|message| LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}")))?
+    };
+
+    persist_bool(config_path, SIGNATURES_KEY, enabled)?;
+    announce_bool_set(SIGNATURES_KEY, enabled, json_output);
+    Ok(())
+}
+
+async fn run_trust_policy_wizard(
+    config_path: &std::path::Path,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let value = if let Some(value) = set {
+        validate_trust_policy_value(value)?;
+        value.to_string()
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err(LpmError::Registry(
+                "lpm config trust-policy requires a TTY; use `--set off|no-downgrade` instead"
+                    .to_string(),
+            ));
+        }
+
+        let current = read_string_value(config_path, TRUST_POLICY_KEY)?
+            .filter(|v| TRUST_POLICY_VALUES.contains(&v.as_str()))
+            .unwrap_or_else(|| "off".to_string());
+        println!();
+        println!("  current: {}", current.cyan());
+        cliclack::select("How should LPM handle npm trust downgrades?")
+            .item("off", "off", "default")
+            .item(
+                "no-downgrade",
+                "no-downgrade",
+                "block versions that drop publisher/provenance trust",
+            )
+            .initial_value(current.as_str())
+            .interact()
+            .map_err(prompt_err)?
+            .to_string()
+    };
+
+    persist_string(config_path, TRUST_POLICY_KEY, &value)?;
+    announce_trust_policy_set(&value, json_output);
+    Ok(())
+}
+
+fn validate_trust_policy_value(value: &str) -> Result<(), LpmError> {
+    if TRUST_POLICY_VALUES.contains(&value) {
+        Ok(())
+    } else {
+        Err(LpmError::Registry(format!(
+            "invalid trust-policy '{value}'; must be one of: {}",
+            TRUST_POLICY_VALUES.join(" | ")
+        )))
+    }
+}
+
+fn parse_config_bool(input: &str) -> Result<bool, &'static str> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" | "enabled" => Ok(true),
+        "false" | "0" | "no" | "off" | "disabled" => Ok(false),
+        _ => Err("must be true or false"),
+    }
+}
+
+fn read_bool_value(config_path: &std::path::Path, key: &str) -> Result<Option<bool>, LpmError> {
+    let cfg = read_config(config_path)?;
+    let table = match cfg {
+        toml::Value::Table(table) => table,
+        _ => return Ok(None),
+    };
+    Ok(GlobalConfig { table }.get_bool(key))
+}
+
+fn persist_bool(config_path: &std::path::Path, key: &str, value: bool) -> Result<(), LpmError> {
+    let mut cfg = read_config(config_path)?;
+    let table = cfg.as_table_mut().ok_or_else(|| {
+        LpmError::Registry("config.toml must be a TOML table at the top level".into())
+    })?;
+    table.insert(key.to_string(), toml::Value::Boolean(value));
+    write_config(config_path, &cfg)
+}
+
+fn format_bool_enabled(value: bool) -> &'static str {
+    if value { "enabled" } else { "disabled" }
+}
+
+fn announce_bool_set(key: &str, value: bool, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                key: value,
+            }))
+            .unwrap()
+        );
+    } else {
+        install_ui::done(&format!(
+            "Set {key} = {}",
+            format_bool_enabled(value).bold()
+        ));
+    }
+}
+
+fn announce_trust_policy_set(value: &str, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                TRUST_POLICY_KEY: value,
+            }))
+            .unwrap()
+        );
+    } else {
+        install_ui::done(&format!("Set trust-policy = {}", value.bold()));
+    }
+}
 
 async fn run_scripts_wizard(
     config_path: &std::path::Path,

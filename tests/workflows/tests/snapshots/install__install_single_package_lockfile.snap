@@ -4,7 +4,7 @@ assertion_line: 705
 expression: lockfile
 ---
 [metadata]
-lockfile-version = 2
+lockfile-version = 3
 resolved-with = "greedy-fusion"
 
 [[packages]]

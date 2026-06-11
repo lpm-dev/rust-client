@@ -106,9 +106,9 @@ jobs:
         run: npm --prefix npm/cli run pack:check
 
   test:
-    name: Test
+    name: Fast tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -132,19 +132,51 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
 
-      # The verdaccio workflow test harness spawns one Verdaccio instance
-      # per test via `npx --yes verdaccio@<VERSION>` (see
-      # `tests/workflows/tests/support/verdaccio.rs`). On a cold ~/.npm
-      # cache the install eats ~20+ seconds — longer than the harness's
-      # 20s readiness deadline — so the first batch of parallel install
-      # tests fails reliably under nextest. Caching ~/.npm + pre-warming
-      # the Verdaccio install once removes the race entirely and keeps
-      # the tight readiness deadline meaningful for genuinely-broken
-      # Verdaccio.
-      #
-      # Cache key includes a hash of verdaccio.rs so a version bump in
-      # the harness invalidates cleanly; the restore-keys fallback lets
-      # npm fetch only the diff against the last cached snapshot.
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Unit and integration tests (non-workflow, non-CLI)
+        run: cargo nextest run --workspace --exclude lpm-integration-tests --exclude lpm-workflows --exclude lpm-cli --no-fail-fast --status-level slow --final-status-level fail
+
+      - name: CLI unit tests (serial libtest)
+        run: cargo test -p lpm-cli --bin lpm-rs -- --test-threads=1
+
+      - name: CLI binary-surface tests
+        run: cargo nextest run -p lpm-cli -E 'not binary_id(/bin\/lpm-rs/)' --no-fail-fast --status-level slow --final-status-level fail
+
+  full-nextest:
+    name: Full isolated nextest
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-full-nextest-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-full-nextest-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install Linux keyring build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+
+      - name: Install nextest
+        uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
+
+      - name: Install Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
       - name: Cache npm (Verdaccio test harness)
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -163,8 +195,11 @@ jobs:
           echo "Pre-warming npm cache for verdaccio@$VERDACCIO_VERSION"
           npx --yes "verdaccio@$VERDACCIO_VERSION" --version
 
-      - name: Test (workspace, excluding lpm-integration-tests)
-        run: cargo nextest run --workspace --exclude lpm-integration-tests --no-fail-fast
+      - name: Full workspace nextest
+        run: cargo nextest run --workspace --exclude lpm-integration-tests --ignore-default-filter --no-fail-fast --status-level slow --final-status-level fail
+
+      - name: Audit-scale workflow fixtures
+        run: cargo nextest run -P audit -p lpm-workflows --test install_realworld --run-ignored only --no-fail-fast --status-level slow --final-status-level fail
 
   windows-platform-backends:
     name: Windows platform backend runtime checks
@@ -207,14 +242,14 @@ jobs:
 
   audit-fixtures:
     name: Hoisted-mode compat audit (${{ matrix.os }} / ${{ matrix.store_version }})
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    # Run the audit fixtures on every push to main + every PR. The
+    # Run the audit fixtures on main, scheduled, and manual CI. The
     # suite catches mode-asymmetric regressions: a fix that lands and
-    # accidentally breaks hoisted (or isolated) for a real-world
-    # package shape. Equal-outcome failures across modes (e.g. an
-    # ecosystem-side ESLint 9 incompat) don't gate the build — only
-    # asymmetric outcomes do.
+    # accidentally breaks hoisted (or isolated) for a real-world package
+    # shape. Equal-outcome failures across modes don't gate the build;
+    # only asymmetric outcomes do.
     #
     # Phase 66 Phase 4d: matrix runs the suite under both the new
     # default (v2 — virtual store) AND the explicit-downgrade v1
@@ -240,8 +275,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         store_version: ["v2", "v1"]
         # Windows row: only run the v2 default — the v1 downgrade path
-        # is tested implicitly on Linux. Saves ~30 minutes of CI per PR
-        # while still catching cross-platform v2 regressions.
+        # is tested explicitly on Linux while the Windows row catches
+        # cross-platform v2 regressions.
         exclude:
           - os: windows-latest
             store_version: "v1"

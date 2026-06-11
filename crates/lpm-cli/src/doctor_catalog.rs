@@ -569,10 +569,10 @@ pub static LOCKFILE_BINARY_MISSING: CheckEntry = CheckEntry {
     category: Category::ProjectState,
     tier: Tier::Fast,
     description: "`lpm.lockb` is missing while `lpm.lock` is present.",
-    when_fires: "Only the TOML lockfile is on disk.",
+    when_fires: "Only the TOML lockfile is on disk and the graph fits the binary lockfile format.",
     remediation: "Run `lpm doctor --fix` to regenerate, or run `lpm install`.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("regenerate lpm.lockb"),
+    auto_fix: Some("reconcile lpm.lockb"),
 };
 
 pub static LOCKFILE_BINARY_STALE: CheckEntry = CheckEntry {
@@ -581,10 +581,10 @@ pub static LOCKFILE_BINARY_STALE: CheckEntry = CheckEntry {
     category: Category::ProjectState,
     tier: Tier::Fast,
     description: "`lpm.lockb` does not match the contents of `lpm.lock`.",
-    when_fires: "TOML lockfile changed but the binary mirror was not regenerated.",
-    remediation: "Run `lpm doctor --fix` to regenerate, or run `lpm install`.",
+    when_fires: "TOML lockfile changed but the binary mirror was not regenerated, or stale binary bytes remain for a TOML-only graph.",
+    remediation: "Run `lpm doctor --fix` to reconcile, or run `lpm install`.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("regenerate lpm.lockb"),
+    auto_fix: Some("reconcile lpm.lockb"),
 };
 
 pub static LOCKFILE_BINARY_CORRUPT: CheckEntry = CheckEntry {
@@ -594,9 +594,9 @@ pub static LOCKFILE_BINARY_CORRUPT: CheckEntry = CheckEntry {
     tier: Tier::Fast,
     description: "`lpm.lockb` does not parse as a valid binary lockfile.",
     when_fires: "Binary lockfile bytes are truncated, mis-versioned, or otherwise unreadable.",
-    remediation: "Run `lpm doctor --fix` to regenerate from `lpm.lock`.",
+    remediation: "Run `lpm doctor --fix` to reconcile from `lpm.lock`.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("regenerate lpm.lockb"),
+    auto_fix: Some("reconcile lpm.lockb"),
 };
 
 pub static GITATTRIBUTES_LOCKB_MARKED: CheckEntry = CheckEntry {

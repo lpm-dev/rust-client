@@ -19,6 +19,58 @@ pub struct MockRegistry {
     server: MockServer,
 }
 
+pub struct RegistrySigningFixture {
+    keyid: String,
+    public_key: String,
+    signing_key: p256::ecdsa::SigningKey,
+}
+
+impl RegistrySigningFixture {
+    pub fn new() -> Self {
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+
+        let signing_key = p256::ecdsa::SigningKey::from_slice(&[7u8; 32])
+            .expect("deterministic test signing key must be valid");
+        let pem = signing_key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("test public key must encode as PEM");
+        let public_key = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>();
+
+        Self {
+            keyid: "SHA256:test".to_string(),
+            public_key,
+            signing_key,
+        }
+    }
+
+    pub fn signature_json(&self, name: &str, version: &str, integrity: &str) -> serde_json::Value {
+        use base64::Engine;
+        use p256::ecdsa::signature::Signer;
+
+        let message = format!("{name}@{version}:{integrity}");
+        let signature: p256::ecdsa::Signature = self.signing_key.sign(message.as_bytes());
+        let sig = base64::engine::general_purpose::STANDARD.encode(signature.to_der().as_bytes());
+        serde_json::json!({
+            "keyid": self.keyid,
+            "sig": sig,
+        })
+    }
+
+    fn key_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "expires": null,
+            "keyid": self.keyid,
+            "keytype": "ecdsa-sha2-nistp256",
+            "scheme": "ecdsa-sha2-nistp256",
+            "key": self.public_key,
+        })
+    }
+}
+
 impl MockRegistry {
     /// Start a new mock registry on a random port.
     pub async fn start() -> Self {
@@ -855,6 +907,103 @@ impl MockRegistry {
         format!("{}{}", self.server.uri(), Self::tarball_path(name, version))
     }
 
+    pub fn package_metadata(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_bytes: &[u8],
+    ) -> serde_json::Value {
+        let integrity = compute_integrity(tarball_bytes);
+        serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": {
+                version: {
+                    "name": name,
+                    "version": version,
+                    "dist": {
+                        "tarball": self.tarball_url(name, version),
+                        "integrity": integrity,
+                    },
+                    "dependencies": {}
+                }
+            },
+            "time": { version: "2025-01-01T00:00:00.000Z" }
+        })
+    }
+
+    pub fn signed_package_metadata(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_bytes: &[u8],
+        signer: &RegistrySigningFixture,
+    ) -> serde_json::Value {
+        let integrity = compute_integrity(tarball_bytes);
+        let signature = signer.signature_json(name, version, &integrity);
+        serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": version },
+            "versions": {
+                version: {
+                    "name": name,
+                    "version": version,
+                    "dist": {
+                        "tarball": self.tarball_url(name, version),
+                        "integrity": integrity,
+                        "signatures": [signature],
+                    },
+                    "dependencies": {}
+                }
+            },
+            "time": { version: "2025-01-01T00:00:00.000Z" }
+        })
+    }
+
+    pub async fn with_registry_signing_keys(&self, signer: &RegistrySigningFixture) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/-/npm/v1/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [signer.key_json()],
+            })))
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_package_metadata(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_bytes: &[u8],
+        metadata: serde_json::Value,
+    ) -> &Self {
+        let metadata_path = format!("/api/registry/{name}");
+        Mock::given(method("GET"))
+            .and(path(&metadata_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(&self.server)
+            .await;
+        let npm_direct_path = format!("/{name}");
+        Mock::given(method("GET"))
+            .and(path(&npm_direct_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+            .mount(&self.server)
+            .await;
+
+        let tarball_path = Self::tarball_path(name, version);
+        Mock::given(method("GET"))
+            .and(path(&tarball_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball_bytes.to_vec())
+                    .insert_header("content-type", "application/octet-stream"),
+            )
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a package metadata endpoint for a simple npm package (no deps).
     ///
     /// Mounts:
@@ -1201,6 +1350,47 @@ impl MockRegistry {
         // to the candidate selector's GET path.
         self.with_batch_metadata(vec![metadata]).await;
 
+        self
+    }
+
+    /// Mount caller-built package metadata plus tarballs for the listed versions.
+    ///
+    /// This is useful for registry-policy tests that need fields not modeled by
+    /// the higher-level helpers, such as per-version publish times or trust
+    /// evidence in full packuments.
+    pub async fn with_package_metadata_and_tarballs(
+        &self,
+        name: &str,
+        metadata: serde_json::Value,
+        tarballs: &[(&str, Vec<u8>)],
+    ) -> &Self {
+        let metadata_path = format!("/api/registry/{name}");
+        Mock::given(method("GET"))
+            .and(path(&metadata_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(&self.server)
+            .await;
+        let npm_direct_path = format!("/{name}");
+        Mock::given(method("GET"))
+            .and(path(&npm_direct_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+            .mount(&self.server)
+            .await;
+
+        for (version, tarball_bytes) in tarballs {
+            let tarball_path = Self::tarball_path(name, version);
+            Mock::given(method("GET"))
+                .and(path(&tarball_path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(tarball_bytes.clone())
+                        .insert_header("content-type", "application/octet-stream"),
+                )
+                .mount(&self.server)
+                .await;
+        }
+
+        self.with_batch_metadata(vec![metadata]).await;
         self
     }
 
