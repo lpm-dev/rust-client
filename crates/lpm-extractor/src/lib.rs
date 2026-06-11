@@ -6,16 +6,14 @@
 //! (equivalent to `tar x --strip-components=1`).
 //!
 //! Performance: libdeflate for whole-buffer gzip decompression (~2-3x faster than
-//! flate2/zlib-rs on the npm size distribution). flate2's `GzDecoder` is retained
-//! for the test-only streaming helper.
+//! flate2/zlib-rs on the npm size distribution). Oversized inputs fall back to
+//! flate2's streaming `GzDecoder` so peak allocation stays bounded.
 
+use flate2::read::GzDecoder;
 use lpm_common::{Integrity, LpmError};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tar::Archive;
-
-#[cfg(test)]
-use flate2::read::GzDecoder;
 
 /// Verify a tarball's integrity against an expected SRI hash.
 ///
@@ -52,21 +50,68 @@ fn decompress_gzip(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
 /// callers that want a tighter cap can apply their own.
 const MAX_BUFFERED_COMPRESSED_SIZE: u64 = 500 * 1024 * 1024;
 
+/// Maximum decompressed output held by the buffered libdeflate path.
+const MAX_BUFFERED_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct ExtractionLimits {
+    max_buffered_compressed_size: u64,
+    max_buffered_decompressed_size: usize,
+    max_extraction_size: u64,
+    max_file_size: u64,
+    max_file_count: usize,
+}
+
+impl ExtractionLimits {
+    fn max_decompressed_stream_size(self) -> u64 {
+        let tar_framing_budget = (self.max_file_count as u64)
+            .saturating_add(2)
+            .saturating_mul(1024);
+        self.max_extraction_size.saturating_add(tar_framing_budget)
+    }
+}
+
+const DEFAULT_EXTRACTION_LIMITS: ExtractionLimits = ExtractionLimits {
+    max_buffered_compressed_size: MAX_BUFFERED_COMPRESSED_SIZE,
+    max_buffered_decompressed_size: MAX_BUFFERED_DECOMPRESSED_SIZE,
+    max_extraction_size: MAX_EXTRACTION_SIZE,
+    max_file_size: MAX_FILE_SIZE,
+    max_file_count: MAX_FILE_COUNT,
+};
+
+enum BufferedGzipDecode {
+    Decoded(Vec<u8>),
+    NeedsStreaming,
+}
+
 /// Decompress a single-member gzip stream into a freshly-allocated `Vec<u8>`.
 ///
 /// Uses libdeflate (~2-3x faster than flate2/zlib-rs on the npm-tarball size
 /// distribution). The initial output buffer is sized from the gzip footer's
-/// `ISIZE` field (uncompressed size mod 2^32, RFC 1952 §2.3.1); if the actual
-/// size exceeds that hint (only happens for streams over 4 GiB decompressed —
-/// vanishingly rare for npm packages), the buffer doubles and retries up to
-/// `MAX_EXTRACTION_SIZE`.
+/// `ISIZE` field (uncompressed size mod 2^32, RFC 1952 §2.3.1). If the output
+/// would exceed the buffered memory ceiling, callers must switch to the
+/// streaming fallback instead of growing the `Vec`.
 ///
 /// Limitations vs `flate2::read::MultiGzDecoder`: only the first gzip member
 /// is decoded. npm packs always emit single-member gzip, so this is sound for
 /// the install hot path; the test-only `decompress_gzip` helper retains the
 /// flate2 streaming decoder for any multi-member edge cases callers want to
 /// exercise.
+#[cfg(test)]
 fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
+    match decompress_gzip_libdeflate_with_limits(compressed, DEFAULT_EXTRACTION_LIMITS)? {
+        BufferedGzipDecode::Decoded(decompressed) => Ok(decompressed),
+        BufferedGzipDecode::NeedsStreaming => Err(LpmError::Registry(format!(
+            "gzip decompressed output exceeds {}-byte buffered-decode limit",
+            DEFAULT_EXTRACTION_LIMITS.max_buffered_decompressed_size
+        ))),
+    }
+}
+
+fn decompress_gzip_libdeflate_with_limits(
+    compressed: &[u8],
+    limits: ExtractionLimits,
+) -> Result<BufferedGzipDecode, LpmError> {
     if compressed.len() < 18 {
         return Err(LpmError::Registry(
             "gzip stream too short (need ≥18 bytes for header + footer)".to_string(),
@@ -90,18 +135,16 @@ fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
         isize_bytes[2],
         isize_bytes[3],
     ]) as usize;
-    // Cap the *initial* allocation so a small compressed body claiming
-    // a 4 GiB ISIZE in its footer can't force a multi-GiB pre-allocation.
-    // The InsufficientSpace branch below doubles the buffer up to
-    // MAX_EXTRACTION_SIZE for legitimate large payloads; the initial
-    // allocation here is a starting hint, not a binding ceiling.
-    let initial_isize = isize_hint.min(INITIAL_ALLOCATION_CAP);
-    // Floor the capacity at the compressed size — a gzip stream cannot
-    // decompress to fewer bytes than its compressed length minus header/footer,
-    // and tiny ISIZE values would otherwise force an immediate grow round-trip.
-    let mut capacity = initial_isize
-        .max(compressed.len())
-        .min(MAX_EXTRACTION_SIZE as usize);
+    let max_buffered = limits.max_buffered_decompressed_size;
+    if max_buffered == 0 || isize_hint > max_buffered {
+        return Ok(BufferedGzipDecode::NeedsStreaming);
+    }
+
+    let mut capacity = if isize_hint == 0 {
+        compressed.len().clamp(1, max_buffered)
+    } else {
+        isize_hint
+    };
 
     // Hold a global budget reservation for the duration of the
     // decompress call. The guard releases on every return path
@@ -118,20 +161,18 @@ fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
         match decompressor.gzip_decompress(compressed, &mut output) {
             Ok(actual) => {
                 output.truncate(actual);
-                return Ok(output);
+                return Ok(BufferedGzipDecode::Decoded(output));
             }
             Err(libdeflater::DecompressionError::InsufficientSpace) => {
-                if capacity >= MAX_EXTRACTION_SIZE as usize {
-                    return Err(LpmError::Registry(format!(
-                        "gzip decompression exceeded {MAX_EXTRACTION_SIZE}-byte limit"
-                    )));
+                if capacity >= max_buffered {
+                    return Ok(BufferedGzipDecode::NeedsStreaming);
                 }
                 // Drop the old buffer FIRST so its bytes leave the
                 // process before we acquire the larger budget — keeps
                 // peak memory at `new_capacity` rather than
                 // `old + new`.
                 drop(output);
-                capacity = capacity.saturating_mul(2).min(MAX_EXTRACTION_SIZE as usize);
+                capacity = capacity.saturating_mul(2).min(max_buffered);
                 drop(budget);
                 budget = EXTRACT_BUDGET.acquire(capacity as u64);
             }
@@ -147,26 +188,15 @@ fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
 /// Maximum total extraction size (5 GB) — prevents zip-bomb / tar-bomb attacks.
 const MAX_EXTRACTION_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Upper bound on the *initial* output-buffer allocation in
-/// [`decompress_gzip_libdeflate`]. Real npm packages decompress to
-/// well under this (the biggest packuments are ~10-50 MB), so 256 MiB
-/// covers the legitimate one-shot case while preventing a small
-/// compressed body from forcing a multi-GiB pre-allocation via a
-/// tampered ISIZE footer field. The grow loop in
-/// `decompress_gzip_libdeflate` handles the rare case where a real
-/// payload exceeds this initial budget.
-const INITIAL_ALLOCATION_CAP: usize = 256 * 1024 * 1024;
-
 /// Global ceiling on the sum of in-flight gzip-decompress output
-/// allocations across all rayon workers. The single-tarball cap
-/// (`INITIAL_ALLOCATION_CAP`) bounds one decompress call at 256 MiB,
-/// but a registry-mirror attacker can publish N small packages each
-/// of which advertises a 256 MiB ISIZE; with 8 concurrent workers
-/// the peak virtual allocation reaches ~2 GiB and OOMs containers
-/// running `vm.overcommit_memory=2` or cgroup-bounded CI runners.
-/// This budget caps the sum across workers — concurrent decompress
-/// calls serialize at the budget boundary instead of competing for
-/// virtual memory.
+/// allocations across all rayon workers. The single-tarball buffered
+/// ceiling bounds one decode call at 256 MiB, but a registry-mirror
+/// attacker can publish N small packages each of which advertises a
+/// 256 MiB ISIZE; with 8 concurrent workers the peak virtual allocation
+/// reaches ~2 GiB and OOMs containers running `vm.overcommit_memory=2`
+/// or cgroup-bounded CI runners. This budget caps the sum across workers
+/// so concurrent buffered decodes serialize at the budget boundary instead
+/// of competing for virtual memory.
 ///
 /// 1 GiB lets 4 simultaneous worst-case (ISIZE=256 MiB) decompresses
 /// run in parallel and an arbitrary number of small ones; legitimate
@@ -305,12 +335,33 @@ pub struct EntryInfo<'a> {
 /// scanning, it's `files_under_2MB × max_concurrent_scanned_entries`,
 /// which in practice is one file at a time within a single tarball.
 pub fn extract_tarball_from_reader_with_inspector<P, I>(
-    mut reader: impl std::io::Read,
+    reader: impl std::io::Read,
     target_dir: &Path,
     buffer_predicate: P,
-    mut inspector: I,
+    inspector: I,
 ) -> Result<Vec<PathBuf>, LpmError>
 where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    extract_tarball_from_reader_with_inspector_with_limits(
+        reader,
+        target_dir,
+        DEFAULT_EXTRACTION_LIMITS,
+        buffer_predicate,
+        inspector,
+    )
+}
+
+fn extract_tarball_from_reader_with_inspector_with_limits<R, P, I>(
+    reader: R,
+    target_dir: &Path,
+    limits: ExtractionLimits,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    R: std::io::Read,
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
 {
@@ -325,23 +376,157 @@ where
     // For npm packages (typically <2 MB compressed / <10 MB decompressed)
     // this is a clear win on cold-install wall-clock.
     //
-    // The streaming pipeline still works because:
-    // 1. Callers (e.g. `stream_and_store_package`) wrap the network reader
-    //    with `HashingReader`. `read_to_end` here fully drains the reader,
-    //    so the hasher sees every byte exactly once.
-    // 2. The downstream `tar::Archive` consumes from an in-memory slice
-    //    rather than the original reader — same archive walk logic, just
-    //    fed by an already-decoded byte buffer.
-    let mut compressed = Vec::new();
-    reader.read_to_end(&mut compressed).map_err(LpmError::Io)?;
-    if compressed.len() as u64 > MAX_BUFFERED_COMPRESSED_SIZE {
-        return Err(LpmError::Registry(format!(
-            "compressed tarball exceeds {MAX_BUFFERED_COMPRESSED_SIZE}-byte buffered-decode limit"
-        )));
+    // The streaming pipeline still works because callers that need SRI
+    // verification wrap the network reader with `HashingReader`: bytes read
+    // into the prefix buffer are hashed once, and any remaining bytes are read
+    // from the original reader by the fallback decoder.
+    match read_compressed_input(reader, limits.max_buffered_compressed_size)? {
+        CompressedInput::Buffered(compressed) => {
+            match decompress_gzip_libdeflate_with_limits(&compressed, limits)? {
+                BufferedGzipDecode::Decoded(decompressed) => extract_tar_archive_with_inspector(
+                    std::io::Cursor::new(decompressed),
+                    target_dir,
+                    limits,
+                    buffer_predicate,
+                    inspector,
+                    |_| Ok(()),
+                ),
+                BufferedGzipDecode::NeedsStreaming => extract_streaming_gzip_tarball(
+                    std::io::Cursor::new(compressed),
+                    target_dir,
+                    limits,
+                    buffer_predicate,
+                    inspector,
+                ),
+            }
+        }
+        CompressedInput::Stream(reader) => {
+            extract_streaming_gzip_tarball(reader, target_dir, limits, buffer_predicate, inspector)
+        }
     }
-    let decompressed = decompress_gzip_libdeflate(&compressed)?;
-    drop(compressed);
-    let mut archive = Archive::new(decompressed.as_slice());
+}
+
+enum CompressedInput<R> {
+    Buffered(Vec<u8>),
+    Stream(std::io::Chain<std::io::Cursor<Vec<u8>>, R>),
+}
+
+fn read_compressed_input<R: std::io::Read>(
+    mut reader: R,
+    max_buffered_size: u64,
+) -> Result<CompressedInput<R>, LpmError> {
+    const READ_CHUNK_SIZE: usize = 64 * 1024;
+
+    let initial_capacity = max_buffered_size.min(READ_CHUNK_SIZE as u64) as usize;
+    let mut compressed = Vec::with_capacity(initial_capacity);
+    let mut chunk = [0u8; READ_CHUNK_SIZE];
+
+    loop {
+        let buffered_len = compressed.len() as u64;
+        if buffered_len >= max_buffered_size {
+            let read = reader.read(&mut chunk).map_err(LpmError::Io)?;
+            if read == 0 {
+                return Ok(CompressedInput::Buffered(compressed));
+            }
+            compressed.extend_from_slice(&chunk[..read]);
+            return Ok(CompressedInput::Stream(
+                std::io::Cursor::new(compressed).chain(reader),
+            ));
+        }
+
+        let remaining = (max_buffered_size - buffered_len).min(READ_CHUNK_SIZE as u64) as usize;
+        let read = reader.read(&mut chunk[..remaining]).map_err(LpmError::Io)?;
+        if read == 0 {
+            return Ok(CompressedInput::Buffered(compressed));
+        }
+        compressed.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn extract_streaming_gzip_tarball<R, P, I>(
+    reader: R,
+    target_dir: &Path,
+    limits: ExtractionLimits,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    R: std::io::Read,
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    let decoder = GzDecoder::new(reader);
+    let limited = DecompressedLimitReader::new(decoder, limits.max_decompressed_stream_size());
+    extract_tar_archive_with_inspector(
+        limited,
+        target_dir,
+        limits,
+        buffer_predicate,
+        inspector,
+        |mut reader| {
+            std::io::copy(&mut reader, &mut std::io::sink())
+                .map(|_| ())
+                .map_err(LpmError::Io)
+        },
+    )
+}
+
+struct DecompressedLimitReader<R> {
+    inner: R,
+    bytes_read: u64,
+    limit: u64,
+}
+
+impl<R> DecompressedLimitReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+            limit,
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for DecompressedLimitReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let remaining = self.limit.saturating_sub(self.bytes_read);
+        if remaining == 0 {
+            let mut scratch = [0u8; 1];
+            return match self.inner.read(&mut scratch)? {
+                0 => Ok(0),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("gzip decompression exceeded {}-byte limit", self.limit),
+                )),
+            };
+        }
+
+        let max_read = std::cmp::min(buf.len() as u64, remaining) as usize;
+        let read = self.inner.read(&mut buf[..max_read])?;
+        self.bytes_read += read as u64;
+        Ok(read)
+    }
+}
+
+fn extract_tar_archive_with_inspector<R, P, I, D>(
+    reader: R,
+    target_dir: &Path,
+    limits: ExtractionLimits,
+    buffer_predicate: P,
+    mut inspector: I,
+    drain_after_entries: D,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    R: std::io::Read,
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+    D: FnOnce(R) -> Result<(), LpmError>,
+{
+    let mut archive = Archive::new(reader);
     // npm tarballs ship arbitrary uid/gid/mode/mtime that mean nothing to a
     // downstream Node consumer. The tar crate's defaults call `fchmodat` +
     // `fchownat` + `filetime::set_file_handle_times` per regular file.
@@ -379,161 +564,12 @@ where
         std::collections::HashSet::with_capacity(64);
     verified_parents.insert(extraction_root.clone());
 
-    for entry_result in archive.entries()? {
-        let mut entry = match entry_result {
-            Ok(entry) => entry,
-            Err(error) => {
-                return rollback_extraction(
-                    &extraction_root,
-                    &extracted_files,
-                    &created_dirs,
-                    LpmError::Io(error),
-                );
-            }
-        };
-
-        // Enforce file count limit
-        file_count += 1;
-        if file_count > MAX_FILE_COUNT {
-            return rollback_extraction(
-                &extraction_root,
-                &extracted_files,
-                &created_dirs,
-                LpmError::Registry(format!(
-                    "tarball contains too many files (>{MAX_FILE_COUNT})"
-                )),
-            );
-        }
-
-        // Enforce per-file and total size limits
-        let size = match entry.header().size() {
-            Ok(size) => size,
-            Err(error) => {
-                return rollback_extraction(
-                    &extraction_root,
-                    &extracted_files,
-                    &created_dirs,
-                    LpmError::Registry(format!("invalid tar entry size: {error}")),
-                );
-            }
-        };
-        if size > MAX_FILE_SIZE {
-            return rollback_extraction(
-                &extraction_root,
-                &extracted_files,
-                &created_dirs,
-                LpmError::Registry(format!(
-                    "file too large in tarball: {} bytes (max {MAX_FILE_SIZE})",
-                    size
-                )),
-            );
-        }
-        total_size += size;
-        if total_size > MAX_EXTRACTION_SIZE {
-            return rollback_extraction(
-                &extraction_root,
-                &extracted_files,
-                &created_dirs,
-                LpmError::Registry("tarball extraction size limit exceeded (5 GB)".to_string()),
-            );
-        }
-
-        let original_path = match entry.path() {
-            Ok(path) => path.into_owned(),
-            Err(error) => {
-                return rollback_extraction(
-                    &extraction_root,
-                    &extracted_files,
-                    &created_dirs,
-                    LpmError::Io(error),
-                );
-            }
-        };
-
-        // Strip first component (e.g., "package/src/index.js" → "src/index.js")
-        let stripped = strip_first_component(&original_path);
-        let Some(relative_path) = stripped else {
-            continue;
-        };
-
-        if relative_path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        }) {
-            return rollback_extraction(
-                &extraction_root,
-                &extracted_files,
-                &created_dirs,
-                LpmError::Registry(format!(
-                    "path traversal detected in tarball: {}",
-                    original_path.display()
-                )),
-            );
-        }
-
-        let target_path = match prepare_output_path(
-            &extraction_root,
-            &relative_path,
-            &original_path,
-            &mut verified_parents,
-        ) {
-            Ok((path, mut entry_created_dirs)) => {
-                created_dirs.append(&mut entry_created_dirs);
-                path
-            }
-            Err(error) => {
-                return rollback_extraction(
-                    &extraction_root,
-                    &extracted_files,
-                    &created_dirs,
-                    error,
-                );
-            }
-        };
-
-        // Safety: prevent path traversal
-        if !target_path.starts_with(&extraction_root) {
-            return rollback_extraction(
-                &extraction_root,
-                &extracted_files,
-                &created_dirs,
-                LpmError::Registry(format!(
-                    "path traversal detected in tarball: {}",
-                    original_path.display()
-                )),
-            );
-        }
-
-        // Only extract regular files (skip symlinks for security)
-        if entry.header().entry_type().is_file() {
-            // Capture the tar entry's exec bits BEFORE any read; the
-            // header is parsed up-front by the tar crate. We honor
-            // whichever execute bits the tarball declares (user / group /
-            // other) and OR them onto the default 0644 mode after the
-            // write. SUID / SGID / sticky bits are deliberately dropped —
-            // same security posture as `set_preserve_permissions(false)`.
-            //
-            // Most npm package files are 0644 (no exec) and skip the
-            // post-write `set_permissions` call entirely. The only
-            // affected files are bin scripts (typically 0755) — usually
-            // 0–5 per package, so the syscall cost is negligible vs the
-            // install-side breakage when a `.bin` script lands as 0644
-            // (EACCES on `execve`).
-            let exec_bits = entry.header().mode().unwrap_or(0o644) & 0o111;
-
-            // P2 fused-scan hook: if the caller asked us to buffer this
-            // entry's bytes for inspection, read the entry into memory,
-            // write those bytes to disk, and hand them to the inspector.
-            // Otherwise stream directly via `entry.unpack()` as the pre-P2
-            // code did — same memory profile for non-buffered entries.
-            let buffer_this = buffer_predicate(&relative_path, size);
-            let buffered_bytes = if buffer_this {
-                let mut buf = Vec::with_capacity(size as usize);
-                if let Err(error) = entry.read_to_end(&mut buf) {
+    {
+        let entries = archive.entries()?;
+        for entry_result in entries {
+            let mut entry = match entry_result {
+                Ok(entry) => entry,
+                Err(error) => {
                     return rollback_extraction(
                         &extraction_root,
                         &extracted_files,
@@ -541,45 +577,61 @@ where
                         LpmError::Io(error),
                     );
                 }
-                if let Err(error) = write_buffered_entry(&target_path, &buf) {
-                    return rollback_extraction(
-                        &extraction_root,
-                        &extracted_files,
-                        &created_dirs,
-                        error,
-                    );
-                }
-                Some(buf)
-            } else {
-                // Stream directly to disk via `io::copy` instead of
-                // `entry.unpack()`. Even with the three `preserve_*`
-                // flags false, tar 0.4.45's unpack path unconditionally
-                // calls `_set_perms` (entry.rs:814) — the flag only
-                // controls SUID-bit retention. Bypassing it drops the
-                // residual `__fchmod` cost on every non-buffered entry.
-                //
-                // Same minimal write semantics as [`write_buffered_entry`]:
-                // create-or-truncate, default mode (umask-respecting), no
-                // post-write metadata calls.
-                if let Err(error) = stream_entry_to_disk(&mut entry, &target_path) {
-                    return rollback_extraction(
-                        &extraction_root,
-                        &extracted_files,
-                        &created_dirs,
-                        error,
-                    );
-                }
-                None
             };
 
-            // Restore the exec bits captured before the write. Skipped
-            // on Windows (NTFS doesn't have POSIX mode bits — bin
-            // scripts are dispatched by extension, not the X bit).
-            #[cfg(unix)]
-            if exec_bits != 0 {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o644 | exec_bits);
-                if let Err(error) = std::fs::set_permissions(&target_path, perms) {
+            // Enforce file count limit
+            file_count += 1;
+            if file_count > limits.max_file_count {
+                return rollback_extraction(
+                    &extraction_root,
+                    &extracted_files,
+                    &created_dirs,
+                    LpmError::Registry(format!(
+                        "tarball contains too many files (>{})",
+                        limits.max_file_count
+                    )),
+                );
+            }
+
+            // Enforce per-file and total size limits
+            let size = match entry.header().size() {
+                Ok(size) => size,
+                Err(error) => {
+                    return rollback_extraction(
+                        &extraction_root,
+                        &extracted_files,
+                        &created_dirs,
+                        LpmError::Registry(format!("invalid tar entry size: {error}")),
+                    );
+                }
+            };
+            if size > limits.max_file_size {
+                return rollback_extraction(
+                    &extraction_root,
+                    &extracted_files,
+                    &created_dirs,
+                    LpmError::Registry(format!(
+                        "file too large in tarball: {} bytes (max {})",
+                        size, limits.max_file_size
+                    )),
+                );
+            }
+            total_size = total_size.saturating_add(size);
+            if total_size > limits.max_extraction_size {
+                return rollback_extraction(
+                    &extraction_root,
+                    &extracted_files,
+                    &created_dirs,
+                    LpmError::Registry(format!(
+                        "tarball extraction size limit exceeded ({} bytes)",
+                        limits.max_extraction_size
+                    )),
+                );
+            }
+
+            let original_path = match entry.path() {
+                Ok(path) => path.into_owned(),
+                Err(error) => {
                     return rollback_extraction(
                         &extraction_root,
                         &extracted_files,
@@ -587,18 +639,163 @@ where
                         LpmError::Io(error),
                     );
                 }
+            };
+
+            // Strip first component (e.g., "package/src/index.js" → "src/index.js")
+            let stripped = strip_first_component(&original_path);
+            let Some(relative_path) = stripped else {
+                continue;
+            };
+
+            if relative_path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            }) {
+                return rollback_extraction(
+                    &extraction_root,
+                    &extracted_files,
+                    &created_dirs,
+                    LpmError::Registry(format!(
+                        "path traversal detected in tarball: {}",
+                        original_path.display()
+                    )),
+                );
             }
-            #[cfg(not(unix))]
-            let _ = exec_bits;
 
-            inspector(EntryInfo {
-                relative_path: &relative_path,
-                size,
-                bytes: buffered_bytes.as_deref(),
-            });
+            let target_path = match prepare_output_path(
+                &extraction_root,
+                &relative_path,
+                &original_path,
+                &mut verified_parents,
+            ) {
+                Ok((path, mut entry_created_dirs)) => {
+                    created_dirs.append(&mut entry_created_dirs);
+                    path
+                }
+                Err(error) => {
+                    return rollback_extraction(
+                        &extraction_root,
+                        &extracted_files,
+                        &created_dirs,
+                        error,
+                    );
+                }
+            };
 
-            extracted_files.push(relative_path);
+            // Safety: prevent path traversal
+            if !target_path.starts_with(&extraction_root) {
+                return rollback_extraction(
+                    &extraction_root,
+                    &extracted_files,
+                    &created_dirs,
+                    LpmError::Registry(format!(
+                        "path traversal detected in tarball: {}",
+                        original_path.display()
+                    )),
+                );
+            }
+
+            // Only extract regular files (skip symlinks for security)
+            if entry.header().entry_type().is_file() {
+                // Capture the tar entry's exec bits BEFORE any read; the
+                // header is parsed up-front by the tar crate. We honor
+                // whichever execute bits the tarball declares (user / group /
+                // other) and OR them onto the default 0644 mode after the
+                // write. SUID / SGID / sticky bits are deliberately dropped —
+                // same security posture as `set_preserve_permissions(false)`.
+                //
+                // Most npm package files are 0644 (no exec) and skip the
+                // post-write `set_permissions` call entirely. The only
+                // affected files are bin scripts (typically 0755) — usually
+                // 0–5 per package, so the syscall cost is negligible vs the
+                // install-side breakage when a `.bin` script lands as 0644
+                // (EACCES on `execve`).
+                let exec_bits = entry.header().mode().unwrap_or(0o644) & 0o111;
+
+                // P2 fused-scan hook: if the caller asked us to buffer this
+                // entry's bytes for inspection, read the entry into memory,
+                // write those bytes to disk, and hand them to the inspector.
+                // Otherwise stream directly via `entry.unpack()` as the pre-P2
+                // code did — same memory profile for non-buffered entries.
+                let buffer_this = buffer_predicate(&relative_path, size);
+                let buffered_bytes = if buffer_this {
+                    let mut buf = Vec::with_capacity(size as usize);
+                    if let Err(error) = entry.read_to_end(&mut buf) {
+                        return rollback_extraction(
+                            &extraction_root,
+                            &extracted_files,
+                            &created_dirs,
+                            LpmError::Io(error),
+                        );
+                    }
+                    if let Err(error) = write_buffered_entry(&target_path, &buf) {
+                        return rollback_extraction(
+                            &extraction_root,
+                            &extracted_files,
+                            &created_dirs,
+                            error,
+                        );
+                    }
+                    Some(buf)
+                } else {
+                    // Stream directly to disk via `io::copy` instead of
+                    // `entry.unpack()`. Even with the three `preserve_*`
+                    // flags false, tar 0.4.45's unpack path unconditionally
+                    // calls `_set_perms` (entry.rs:814) — the flag only
+                    // controls SUID-bit retention. Bypassing it drops the
+                    // residual `__fchmod` cost on every non-buffered entry.
+                    //
+                    // Same minimal write semantics as [`write_buffered_entry`]:
+                    // create-or-truncate, default mode (umask-respecting), no
+                    // post-write metadata calls.
+                    if let Err(error) = stream_entry_to_disk(&mut entry, &target_path) {
+                        return rollback_extraction(
+                            &extraction_root,
+                            &extracted_files,
+                            &created_dirs,
+                            error,
+                        );
+                    }
+                    None
+                };
+
+                // Restore the exec bits captured before the write. Skipped
+                // on Windows (NTFS doesn't have POSIX mode bits — bin
+                // scripts are dispatched by extension, not the X bit).
+                #[cfg(unix)]
+                if exec_bits != 0 {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o644 | exec_bits);
+                    if let Err(error) = std::fs::set_permissions(&target_path, perms) {
+                        return rollback_extraction(
+                            &extraction_root,
+                            &extracted_files,
+                            &created_dirs,
+                            LpmError::Io(error),
+                        );
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = exec_bits;
+
+                inspector(EntryInfo {
+                    relative_path: &relative_path,
+                    size,
+                    bytes: buffered_bytes.as_deref(),
+                });
+
+                extracted_files.push(relative_path);
+            }
         }
+    }
+
+    let inner = archive.into_inner();
+    if let Err(error) = drain_after_entries(inner) {
+        return rollback_extraction(&extraction_root, &extracted_files, &created_dirs, error);
     }
 
     Ok(extracted_files)
@@ -874,20 +1071,65 @@ pub fn verify_and_extract(
 ///
 /// Useful for `lpm info --files` or source browsing.
 pub fn list_tarball_contents(data: &[u8]) -> Result<Vec<PathBuf>, LpmError> {
-    let decompressed = decompress_gzip_libdeflate(data)?;
-    let mut archive = Archive::new(decompressed.as_slice());
+    list_tarball_contents_with_limits(data, DEFAULT_EXTRACTION_LIMITS)
+}
+
+fn list_tarball_contents_with_limits(
+    data: &[u8],
+    limits: ExtractionLimits,
+) -> Result<Vec<PathBuf>, LpmError> {
+    if data.len() as u64 > limits.max_buffered_compressed_size {
+        return list_tarball_contents_streaming(std::io::Cursor::new(data), limits);
+    }
+
+    match decompress_gzip_libdeflate_with_limits(data, limits)? {
+        BufferedGzipDecode::Decoded(decompressed) => {
+            list_tar_archive_contents(std::io::Cursor::new(decompressed), |_| Ok(()))
+        }
+        BufferedGzipDecode::NeedsStreaming => {
+            list_tarball_contents_streaming(std::io::Cursor::new(data), limits)
+        }
+    }
+}
+
+fn list_tarball_contents_streaming<R: std::io::Read>(
+    reader: R,
+    limits: ExtractionLimits,
+) -> Result<Vec<PathBuf>, LpmError> {
+    let decoder = GzDecoder::new(reader);
+    let limited = DecompressedLimitReader::new(decoder, limits.max_decompressed_stream_size());
+    list_tar_archive_contents(limited, |mut reader| {
+        std::io::copy(&mut reader, &mut std::io::sink())
+            .map(|_| ())
+            .map_err(LpmError::Io)
+    })
+}
+
+fn list_tar_archive_contents<R, D>(
+    reader: R,
+    drain_after_entries: D,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    R: std::io::Read,
+    D: FnOnce(R) -> Result<(), LpmError>,
+{
+    let mut archive = Archive::new(reader);
     let mut files = Vec::new();
 
-    for entry_result in archive.entries()? {
-        let entry = entry_result?;
-        if entry.header().entry_type().is_file() {
-            let path = entry.path()?.into_owned();
-            if let Some(stripped) = strip_first_component(&path) {
-                files.push(stripped);
+    {
+        let entries = archive.entries()?;
+        for entry_result in entries {
+            let entry = entry_result?;
+            if entry.header().entry_type().is_file() {
+                let path = entry.path()?.into_owned();
+                if let Some(stripped) = strip_first_component(&path) {
+                    files.push(stripped);
+                }
             }
         }
     }
 
+    drain_after_entries(archive.into_inner())?;
     Ok(files)
 }
 
@@ -934,6 +1176,137 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn streaming_test_limits() -> ExtractionLimits {
+        ExtractionLimits {
+            max_buffered_compressed_size: 64 * 1024,
+            max_buffered_decompressed_size: 1024,
+            max_extraction_size: 1024 * 1024,
+            max_file_size: 512 * 1024,
+            max_file_count: 1000,
+        }
+    }
+
+    #[test]
+    fn buffered_gzip_decode_yields_streaming_when_output_exceeds_memory_cap() {
+        let payload = vec![b'a'; 4096];
+        let tgz = create_test_tarball("payload.bin", &payload);
+
+        let decoded =
+            decompress_gzip_libdeflate_with_limits(&tgz, streaming_test_limits()).unwrap();
+
+        assert!(matches!(decoded, BufferedGzipDecode::NeedsStreaming));
+    }
+
+    #[test]
+    fn extract_tarball_streams_when_buffered_output_cap_is_exceeded() {
+        let payload = vec![b'a'; 4096];
+        let tgz = create_test_tarball("payload.bin", &payload);
+        let dir = tempfile::tempdir().unwrap();
+        let mut inspected = Vec::new();
+
+        let files = extract_tarball_from_reader_with_inspector_with_limits(
+            std::io::Cursor::new(&tgz),
+            dir.path(),
+            streaming_test_limits(),
+            |path, size| path == Path::new("payload.bin") && size == payload.len() as u64,
+            |entry| {
+                if let Some(bytes) = entry.bytes {
+                    inspected.extend_from_slice(bytes);
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(files, [PathBuf::from("payload.bin")]);
+        assert_eq!(
+            std::fs::read(dir.path().join("payload.bin")).unwrap(),
+            payload
+        );
+        assert_eq!(inspected, payload);
+    }
+
+    #[test]
+    fn extract_tarball_streams_when_compressed_input_exceeds_buffered_cap() {
+        let payload = b"small package content";
+        let tgz = create_test_tarball("index.js", payload);
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_buffered_compressed_size: 8,
+            max_buffered_decompressed_size: 64 * 1024,
+            ..streaming_test_limits()
+        };
+
+        let files = extract_tarball_from_reader_with_inspector_with_limits(
+            std::io::Cursor::new(&tgz),
+            dir.path(),
+            limits,
+            |_, _| false,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(files, [PathBuf::from("index.js")]);
+        assert_eq!(std::fs::read(dir.path().join("index.js")).unwrap(), payload);
+    }
+
+    #[test]
+    fn streaming_fallback_rolls_back_path_traversal() {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+
+            let valid = b"valid";
+            let mut valid_header = tar::Header::new_gnu();
+            valid_header.set_size(valid.len() as u64);
+            valid_header.set_mode(0o644);
+            valid_header.set_cksum();
+            builder
+                .append_data(&mut valid_header, "package/valid.txt", &valid[..])
+                .unwrap();
+
+            let escaped = b"escaped";
+            let mut escaped_header = tar::Header::new_gnu();
+            escaped_header.set_size(escaped.len() as u64);
+            escaped_header.set_mode(0o644);
+            escaped_header.set_entry_type(tar::EntryType::Regular);
+            escaped_header.set_path("package/ok.txt").unwrap();
+
+            let raw = escaped_header.as_mut_bytes();
+            raw[..100].fill(0);
+            raw[..22].copy_from_slice(b"package/../escaped.txt");
+            escaped_header.set_cksum();
+            builder.append(&escaped_header, &escaped[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        let tgz = encoder.finish().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_buffered_compressed_size: 8,
+            max_buffered_decompressed_size: 64 * 1024,
+            ..streaming_test_limits()
+        };
+
+        let error = extract_tarball_from_reader_with_inspector_with_limits(
+            std::io::Cursor::new(&tgz),
+            dir.path(),
+            limits,
+            |_, _| false,
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("path traversal"),
+            "expected traversal rejection, got: {error}"
+        );
+        assert!(!dir.path().join("valid.txt").exists());
+        assert!(!dir.path().join("escaped.txt").exists());
+    }
+
     #[test]
     fn extract_simple_tarball() {
         let tgz = create_test_tarball("index.js", b"console.log('hello')");
@@ -967,6 +1340,16 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0], PathBuf::from("package.json"));
+    }
+
+    #[test]
+    fn list_tarball_contents_streams_when_buffered_output_cap_is_exceeded() {
+        let payload = vec![b'a'; 4096];
+        let tgz = create_test_tarball("package.json", &payload);
+
+        let files = list_tarball_contents_with_limits(&tgz, streaming_test_limits()).unwrap();
+
+        assert_eq!(files, [PathBuf::from("package.json")]);
     }
 
     #[test]
@@ -1667,36 +2050,26 @@ mod tests {
         );
     }
 
-    /// M17: a small compressed stream with a maliciously inflated
-    /// ISIZE footer must not pre-allocate a multi-GiB buffer. We can't
-    /// directly observe the allocation size from inside the test, but
-    /// we CAN verify that decompression of a real payload still works
-    /// when the footer claims an inflated ISIZE — proves the grow
-    /// path handles the case where the initial cap clips the hint.
-    /// Pin the constant alongside so a future bump is loud.
+    /// The buffered libdeflate path must never allocate beyond the
+    /// single-tarball memory ceiling. Larger payloads use the streaming
+    /// fallback instead.
     #[test]
-    fn initial_allocation_cap_bounds_pre_allocation() {
-        // The bound itself: 256 MiB. If a future change relaxes this
-        // (or removes the cap), this assertion fires and forces a
-        // review of the M17 threat model.
+    fn buffered_decompression_cap_bounds_real_allocations() {
         assert_eq!(
-            INITIAL_ALLOCATION_CAP,
+            MAX_BUFFERED_DECOMPRESSED_SIZE,
             256 * 1024 * 1024,
-            "initial allocation cap must stay ≤ 256 MiB to defend against \
-             hostile-ISIZE pre-allocation attacks",
+            "buffered decompression cap must stay ≤ 256 MiB to defend \
+             against hostile gzip pre-allocation and grow-loop attacks",
         );
-        // And the relationship to MAX_EXTRACTION_SIZE must hold —
-        // the initial cap is a starting hint, not a ceiling.
         assert!(
-            (INITIAL_ALLOCATION_CAP as u64) < MAX_EXTRACTION_SIZE,
-            "initial cap must be strictly less than MAX_EXTRACTION_SIZE \
-             so legitimate large payloads still extract via the grow path",
+            (MAX_BUFFERED_DECOMPRESSED_SIZE as u64) < MAX_EXTRACTION_SIZE,
+            "buffered cap must stay below the extraction ceiling so \
+             legitimate large payloads route to streaming fallback",
         );
     }
 
-    /// Round-trip a real (small) gzip payload to prove the
-    /// initial-allocation cap doesn't break the common path. The
-    /// decompressed bytes must match the input.
+    /// Round-trip a real (small) gzip payload to prove the buffered
+    /// cap doesn't break the common path.
     #[test]
     fn decompress_gzip_libdeflate_round_trips_small_payload() {
         use std::io::Write;

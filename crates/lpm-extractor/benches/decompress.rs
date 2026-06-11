@@ -61,9 +61,11 @@ fn make_fixture(target_uncompressed_bytes: usize) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+const MAX_BUFFERED_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
+
 /// Mirror of `decompress_gzip_libdeflate` in lib.rs — copied here because
-/// the helper is private. The bench measures the same code shape (ISIZE
-/// hint + retry-on-grow loop) so the comparison is apples-to-apples.
+/// the helper is private. The bench measures the same buffered decode shape
+/// (ISIZE hint + bounded retry-on-grow loop) so the comparison is apples-to-apples.
 fn libdeflate_decompress(compressed: &[u8]) -> Vec<u8> {
     let isize_bytes = &compressed[compressed.len() - 4..];
     let isize_hint = u32::from_le_bytes([
@@ -72,7 +74,15 @@ fn libdeflate_decompress(compressed: &[u8]) -> Vec<u8> {
         isize_bytes[2],
         isize_bytes[3],
     ]) as usize;
-    let mut capacity = isize_hint.max(compressed.len());
+    assert!(
+        isize_hint <= MAX_BUFFERED_DECOMPRESSED_SIZE,
+        "benchmark fixture exceeds buffered decompression cap"
+    );
+    let mut capacity = if isize_hint == 0 {
+        compressed.len().clamp(1, MAX_BUFFERED_DECOMPRESSED_SIZE)
+    } else {
+        isize_hint
+    };
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
         let mut output = vec![0u8; capacity];
@@ -82,7 +92,13 @@ fn libdeflate_decompress(compressed: &[u8]) -> Vec<u8> {
                 return output;
             }
             Err(libdeflater::DecompressionError::InsufficientSpace) => {
-                capacity = capacity.saturating_mul(2);
+                assert!(
+                    capacity < MAX_BUFFERED_DECOMPRESSED_SIZE,
+                    "benchmark fixture exceeded buffered decompression cap"
+                );
+                capacity = capacity
+                    .saturating_mul(2)
+                    .min(MAX_BUFFERED_DECOMPRESSED_SIZE);
             }
             Err(e) => panic!("decompress failed: {e:?}"),
         }
