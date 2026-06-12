@@ -100,8 +100,13 @@ impl InspectorDb {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        let tmp =
-            std::env::temp_dir().join(format!("lpm-inspect-test-{}-{id}.db", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let tmp = std::env::temp_dir().join(format!(
+            "lpm-inspect-test-{}-{nanos}-{id}.db",
+            std::process::id()
+        ));
 
         let write_conn = Connection::open(&tmp)?;
         init_schema(&write_conn)?;
