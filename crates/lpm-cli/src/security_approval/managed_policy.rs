@@ -1,5 +1,6 @@
 use super::prelude::*;
 
+#[cfg(debug_assertions)]
 fn managed_policy_path_override() -> Option<PathBuf> {
     std::env::var(SECURITY_POLICY_PATH_ENV)
         .ok()
