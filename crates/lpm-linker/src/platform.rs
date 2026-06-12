@@ -1,5 +1,8 @@
 use lpm_common::LpmError;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[cfg(unix)]
+use std::path::PathBuf;
 
 #[cfg(unix)]
 pub(crate) fn relative_symlink_target_from_parent(target: &Path, link_parent: &Path) -> PathBuf {
