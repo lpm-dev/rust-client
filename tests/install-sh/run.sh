@@ -7,6 +7,7 @@
 #   - LPM_INSTALL_INSECURE=1 opt-out succeeds without integrity gate
 #   - LPM_INSTALL_TEST_API_URL / _DOWNLOAD_BASE loopback enforcement
 #   - happy path (manifest + binary match, no cosign on PATH)
+#   - explicit LPM_INSTALL_VERSION path (no latest-release API fetch)
 #   - manifest 404 (release predates signed-install gate)
 #   - bundle 404 (manifest present, bundle missing → fail-closed)
 #   - SHA mismatch (manifest declares one SHA, binary has another)
@@ -29,6 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"
 SERVE_PY="$SCRIPT_DIR/serve.py"
+FIXTURE_VERSION="v0.43.1-test"
 
 if [ ! -f "$INSTALL_SH" ]; then
   echo "FAIL: install.sh not found at $INSTALL_SH" >&2
@@ -107,7 +109,7 @@ stop_server() {
 make_happy_fixture() {
   FIXTURE_DIR="$(mktemp -d)"
   # API response — install.sh extracts `tag_name` via grep+sed.
-  echo '{"tag_name": "v0.0.1-test"}' > "$FIXTURE_DIR/api.json"
+  printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$FIXTURE_DIR/api.json"
   # Placeholder binary at the path install.sh expects after the
   # `$VERSION` is substituted. install.sh's $BASE_URL is the override,
   # so the path is `<base>/$PLATFORM` (NO $VERSION segment).
@@ -152,6 +154,7 @@ run_install_sh() {
     LPM_INSTALL_TEST_DOWNLOAD_BASE="http://127.0.0.1:$SERVER_PORT" \
     HOME="$install_root" \
     LPM_INSTALL_INSECURE="${LPM_INSTALL_INSECURE:-}" \
+    LPM_INSTALL_VERSION="${LPM_INSTALL_VERSION:-}" \
     sh "$INSTALL_SH" 2>&1
   )"
   RUN_RC=$?
@@ -216,9 +219,31 @@ fixture_sha="$($SHA_TOOL "$FIXTURE_DIR/$PLATFORM" | awk '{print $1}')"
 rm -rf "$FIXTURE_DIR"
 pass "happy path installs the verified binary"
 
-# ── Case 5: manifest 404 fails closed ─────────────────────────
+# ── Case 5: explicit version skips the latest-release API ──────
 fdir="$(mktemp -d)"
-echo '{"tag_name": "v0.0.1-test"}' > "$fdir/api.json"
+printf 'explicit-version-binary-bytes' > "$fdir/$PLATFORM"
+sha="$($SHA_TOOL "$fdir/$PLATFORM" | awk '{print $1}')"
+printf '%s  %s\n' "$sha" "$PLATFORM" > "$fdir/SHA256SUMS.txt"
+printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+# Deliberately omit api.json. If install.sh still fetches the latest
+# release API while LPM_INSTALL_VERSION is set, this case fails closed.
+trap 'stop_server' EXIT
+start_server "$fdir"
+LPM_INSTALL_VERSION="$FIXTURE_VERSION" run_install_sh
+unset LPM_INSTALL_VERSION
+stop_server
+trap - EXIT
+[ "$RUN_RC" -eq 0 ] || fail "explicit-version path failed with exit $RUN_RC; out: $RUN_OUT"
+echo "$RUN_OUT" | grep -q "Using requested version $FIXTURE_VERSION" \
+  || fail "explicit-version path did not acknowledge requested version: $RUN_OUT"
+[ -x "$RUN_INSTALL_DIR/lpm" ] \
+  || fail "explicit-version path did not produce executable at $RUN_INSTALL_DIR/lpm"
+rm -rf "$fdir"
+pass "explicit version installs without latest-release API"
+
+# ── Case 6: manifest 404 fails closed ─────────────────────────
+fdir="$(mktemp -d)"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'placeholder' > "$fdir/$PLATFORM"
 printf 'bundle' > "$fdir/SHA256SUMS.txt.sigstore"
 # Deliberately omit SHA256SUMS.txt — server returns 404.
@@ -234,9 +259,9 @@ echo "$RUN_OUT" | grep -q "does not ship a signed checksums manifest" \
 rm -rf "$fdir"
 pass "manifest 404 fails closed"
 
-# ── Case 6: bundle 404 fails closed ───────────────────────────
+# ── Case 7: bundle 404 fails closed ───────────────────────────
 fdir="$(mktemp -d)"
-echo '{"tag_name": "v0.0.1-test"}' > "$fdir/api.json"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'placeholder' > "$fdir/$PLATFORM"
 sha="$($SHA_TOOL "$fdir/$PLATFORM" | awk '{print $1}')"
 printf '%s  %s\n' "$sha" "$PLATFORM" > "$fdir/SHA256SUMS.txt"
@@ -258,9 +283,9 @@ echo "$RUN_OUT" | grep -q "Verified Sigstore" \
 rm -rf "$fdir"
 pass "bundle 404 falls back to SHA-only floor"
 
-# ── Case 7: SHA mismatch fails closed ─────────────────────────
+# ── Case 8: SHA mismatch fails closed ─────────────────────────
 fdir="$(mktemp -d)"
-echo '{"tag_name": "v0.0.1-test"}' > "$fdir/api.json"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'real-bytes' > "$fdir/$PLATFORM"
 # Manifest lists a wrong SHA (all zeros) for the platform.
 printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$PLATFORM" \
@@ -278,9 +303,9 @@ echo "$RUN_OUT" | grep -q "SHA-256 mismatch" \
 rm -rf "$fdir"
 pass "SHA mismatch fails closed"
 
-# ── Case 8: missing platform entry in manifest ───────────────
+# ── Case 9: missing platform entry in manifest ───────────────
 fdir="$(mktemp -d)"
-echo '{"tag_name": "v0.0.1-test"}' > "$fdir/api.json"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'real-bytes' > "$fdir/$PLATFORM"
 # Manifest enumerates SOME other platform but not the running one.
 printf '0000000000000000000000000000000000000000000000000000000000000000  lpm-some-other-platform\n' \
@@ -298,9 +323,9 @@ echo "$RUN_OUT" | grep -q "manifest does not enumerate" \
 rm -rf "$fdir"
 pass "missing platform entry fails closed"
 
-# ── Case 9: LPM_INSTALL_INSECURE=1 bypasses missing manifest ─
+# ── Case 10: LPM_INSTALL_INSECURE=1 bypasses missing manifest ─
 fdir="$(mktemp -d)"
-echo '{"tag_name": "v0.0.1-test"}' > "$fdir/api.json"
+printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
 printf 'unsigned-bytes' > "$fdir/$PLATFORM"
 # Deliberately no manifest.
 trap 'stop_server' EXIT

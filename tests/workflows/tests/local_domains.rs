@@ -695,18 +695,38 @@ fn wait_for_proxy_route_absent(project: &TempProject, host: &str) {
 #[cfg(unix)]
 fn assert_proxy_tls_routes_to_service(project: &TempProject, host: &str) {
     let tls_port = proxy_tls_port(project);
-    let response = reqwest::blocking::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(5))
         .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], tls_port)))
         .build()
-        .expect("build TLS client")
-        .get(format!("https://{host}:{tls_port}/"))
-        .send()
-        .expect("request through TLS proxy");
+        .expect("build TLS client");
 
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(response.text().expect("read TLS proxy response"), "ok");
+    let url = format!("https://{host}:{tls_port}/");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_status = None;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match client.get(&url).send() {
+            Ok(response) if response.status() == reqwest::StatusCode::OK => {
+                assert_eq!(response.text().expect("read TLS proxy response"), "ok");
+                return;
+            }
+            Ok(response) => {
+                last_status = Some(response.status());
+                last_error = None;
+            }
+            Err(err) => {
+                last_error = Some(err.to_string());
+                last_status = None;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!(
+        "TLS proxy route {host} did not return 200; last_status={last_status:?} last_error={last_error:?}"
+    );
 }
 
 #[cfg(unix)]

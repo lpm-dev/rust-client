@@ -17,10 +17,11 @@ on:
     # weekday push-traffic peak so it doesn't compete with PR CI.
     - cron: "0 9 * * 1"
 
-# Cancel in-progress CI for the same branch (don't waste minutes)
+# Cancel superseded PR CI, but never cancel `main` push runs. Each merge
+# commit needs its own completed signal before downstream work trusts it.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Pin to exact version so CI is deterministic. Bump after running
@@ -143,6 +144,61 @@ jobs:
 
       - name: CLI binary-surface tests
         run: cargo nextest run --locked -p lpm-cli -E 'not binary_id(/bin\/lpm-rs/)' --no-fail-fast --status-level slow --final-status-level fail
+
+  macos-workspace:
+    name: macOS workspace checks
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-macos-workspace-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-macos-workspace-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install nextest
+        uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
+
+      - name: Install Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Cache npm (Verdaccio test harness)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-verdaccio-${{ hashFiles('tests/workflows/tests/support/verdaccio.rs') }}
+          restore-keys: ${{ runner.os }}-npm-verdaccio-
+
+      - name: Pre-warm Verdaccio in npm cache
+        run: |
+          set -e
+          VERDACCIO_VERSION=$(grep -oE 'VERDACCIO_VERSION: &str = "[^"]+"' tests/workflows/tests/support/verdaccio.rs | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$VERDACCIO_VERSION" ]; then
+            echo "::error::Could not extract VERDACCIO_VERSION from verdaccio.rs"
+            exit 1
+          fi
+          echo "Pre-warming npm cache for verdaccio@$VERDACCIO_VERSION"
+          npx --yes "verdaccio@$VERDACCIO_VERSION" --version
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Workspace tests
+        run: cargo nextest run --locked --workspace --exclude lpm-integration-tests --no-fail-fast --status-level slow --final-status-level fail
 
   full-nextest:
     name: Full isolated nextest
@@ -532,13 +588,16 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-bench-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Run benchmarks
-        run: cargo bench --locked -p lpm-security 2>&1 | grep -E '^test |^Benchmarking' | tee bench-output.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench --locked -p lpm-security 2>&1 | grep -E '^test |^Benchmarking' | tee bench-output.txt
 
       - name: Verify benchmarks ran
         run: |
           if [ ! -s bench-output.txt ]; then
-            echo "::warning::No benchmark output captured — criterion may need configuration"
-            exit 0
+            echo "::error::No benchmark output captured — criterion may need configuration"
+            exit 1
           fi
           echo "Benchmarks completed:"
           cat bench-output.txt
