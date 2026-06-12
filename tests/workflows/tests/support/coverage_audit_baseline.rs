@@ -930,7 +930,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: true,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/approve_scripts.rs",
+            "crates/lpm-cli/src/commands/approve_scripts/mod.rs",
             "crates/lpm-cli/tests/approve_scripts_interactive_tty.rs",
         ],
     },
