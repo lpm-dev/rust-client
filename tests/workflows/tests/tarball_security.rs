@@ -436,6 +436,98 @@ async fn tarball_with_dot_dot_path_entry_is_rejected_by_install() {
     );
 }
 
+#[tokio::test]
+async fn tarball_with_windows_reserved_basename_is_rejected_by_install() {
+    let tgz = tarball_with_extra_entries("reserved-name-pkg", "1.0.0", |builder| {
+        let content = b"reserved device payload";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/lib/NUL.txt", &content[..])
+            .unwrap();
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("reserved-name-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("reserved-name-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "install of reserved-device-name tarball reported success:\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "extractor panicked on reserved-device-name entry:\nstderr:\n{stderr}"
+    );
+    let stderr_l = stderr.to_lowercase();
+    assert!(
+        stderr_l.contains("reserved") && stderr_l.contains("windows"),
+        "reserved-device rejection should name the portable path concern. stderr:\n{stderr}"
+    );
+    assert!(
+        !project
+            .path()
+            .join("node_modules/reserved-name-pkg/lib/NUL.txt")
+            .exists(),
+        "reserved-device-name entry must not be linked into node_modules"
+    );
+}
+
+#[tokio::test]
+async fn tarball_with_case_fold_path_collision_is_rejected_by_install() {
+    let tgz = tarball_with_extra_entries("case-fold-pkg", "1.0.0", |builder| {
+        for (path, content) in [
+            ("package/lib/Foo.js", b"module.exports = 'upper';" as &[u8]),
+            ("package/lib/foo.js", b"module.exports = 'lower';" as &[u8]),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append_data(&mut header, path, content).unwrap();
+        }
+    });
+
+    let mock = MockRegistry::start().await;
+    mock.with_package("case-fold-pkg", "1.0.0", &tgz).await;
+
+    let project = TempProject::empty(r#"{"name":"sec-test","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(install_args("case-fold-pkg@1.0.0"))
+        .output()
+        .expect("run install");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "install of case-fold-collision tarball reported success:\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
+        "extractor panicked on case-fold collision:\nstderr:\n{stderr}"
+    );
+    let stderr_l = stderr.to_lowercase();
+    assert!(
+        stderr_l.contains("case-fold") && stderr_l.contains("collision"),
+        "case-fold rejection should name the collision. stderr:\n{stderr}"
+    );
+    let pkg_dir = project.path().join("node_modules/case-fold-pkg");
+    assert!(
+        !pkg_dir.join("lib/Foo.js").exists() && !pkg_dir.join("lib/foo.js").exists(),
+        "case-fold collision must roll back any extracted package files under {pkg_dir:?}"
+    );
+}
+
 /// **Plan #3 — absolute-path entry is normalized to relative under the package dir.**
 ///
 /// **Plan-vs-actual:** the plan's name said "rejected"; the
