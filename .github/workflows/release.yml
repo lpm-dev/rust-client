@@ -416,19 +416,47 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Compute SHA256 checksums
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+
+      - name: Verify release manifest and export Homebrew checksums
         run: |
+          set -euo pipefail
+
           VERSION="${GITHUB_REF_NAME}"
           BASE="https://github.com/lpm-dev/rust-client/releases/download/${VERSION}"
 
-          for binary in lpm-darwin-arm64 lpm-darwin-x64 lpm-linux-arm64 lpm-linux-x64; do
-            curl -fsSL "${BASE}/${binary}" -o "${binary}"
-          done
+          curl -fsSL --retry 3 --max-time 60 "${BASE}/SHA256SUMS.txt" -o SHA256SUMS.txt
+          curl -fsSL --retry 3 --max-time 60 "${BASE}/SHA256SUMS.txt.sigstore" -o SHA256SUMS.txt.sigstore
 
-          echo "SHA_DARWIN_ARM64=$(sha256sum lpm-darwin-arm64 | cut -d' ' -f1)" >> $GITHUB_ENV
-          echo "SHA_DARWIN_X64=$(sha256sum lpm-darwin-x64 | cut -d' ' -f1)" >> $GITHUB_ENV
-          echo "SHA_LINUX_ARM64=$(sha256sum lpm-linux-arm64 | cut -d' ' -f1)" >> $GITHUB_ENV
-          echo "SHA_LINUX_X64=$(sha256sum lpm-linux-x64 | cut -d' ' -f1)" >> $GITHUB_ENV
+          cosign verify-blob \
+            --bundle SHA256SUMS.txt.sigstore \
+            --certificate-identity-regexp "^https://github\\.com/lpm-dev/rust-client/\\.github/workflows/release\\.yml@.+" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            SHA256SUMS.txt
+
+          export_manifest_hash() {
+            local binary="$1"
+            local env_name="$2"
+            local hash
+            hash=$(awk -v p="$binary" '$2 == p { print $1; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt) || {
+              echo "::error::SHA256SUMS.txt must contain exactly one entry for ${binary}"
+              exit 1
+            }
+            hash=$(printf '%s' "$hash" | tr '[:upper:]' '[:lower:]')
+            if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::SHA256SUMS.txt has an invalid SHA-256 for ${binary}: ${hash}"
+              exit 1
+            fi
+            echo "${env_name}=${hash}" >> "$GITHUB_ENV"
+          }
+
+          export_manifest_hash lpm-darwin-arm64 SHA_DARWIN_ARM64
+          export_manifest_hash lpm-darwin-x64 SHA_DARWIN_X64
+          export_manifest_hash lpm-linux-arm64 SHA_LINUX_ARM64
+          export_manifest_hash lpm-linux-x64 SHA_LINUX_X64
           echo "VERSION=${VERSION#v}" >> $GITHUB_ENV
 
       - name: Update Homebrew tap
