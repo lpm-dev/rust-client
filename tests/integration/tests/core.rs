@@ -6,13 +6,40 @@
 //! They do NOT make network calls — they test the local processing pipeline.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("fixtures")
         .join(name)
+}
+
+fn isolated_wrapper_dir(
+    project_dir: &Path,
+    name: &str,
+    version: &str,
+    wrapper_id: Option<&str>,
+) -> PathBuf {
+    let segment = lpm_linker::LayoutPaths::wrapper_segment(name, version, wrapper_id);
+    lpm_linker::LayoutPaths::for_project(project_dir).isolated_wrapper_dir(&segment)
+}
+
+fn isolated_wrapper_root(project_dir: &Path) -> PathBuf {
+    lpm_linker::LayoutPaths::for_project(project_dir).isolated_wrapper_root()
+}
+
+fn isolated_wrapper_segments(project_dir: &Path) -> Vec<String> {
+    let mut segments: Vec<_> = std::fs::read_dir(isolated_wrapper_root(project_dir))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (!name.starts_with('.')).then_some(name)
+        })
+        .collect();
+    segments.sort();
+    segments
 }
 
 // ─── Lockfile ────────────────────────────────────────────────────
@@ -580,7 +607,7 @@ fn linker_isolated_mode_creates_lpm_dir() {
     let result = lpm_linker::link_packages(&project_dir, &targets, false, None).unwrap();
 
     assert!(result.linked > 0);
-    assert!(project_dir.join("node_modules/.lpm/ms@2.1.3").exists());
+    assert!(isolated_wrapper_dir(&project_dir, "ms", "2.1.3", None).exists());
     assert!(project_dir.join("node_modules/ms").exists());
 }
 
@@ -1000,8 +1027,12 @@ fn linker_directory_dep_creates_plus_wrapper_with_live_symlinks() {
     let result = lpm_linker::link_packages(&project_dir, &[target], false, None).unwrap();
     assert!(result.linked > 0);
 
-    // Wrapper at `+` shape, NOT `@`.
-    let wrapper = project_dir.join("node_modules/.lpm/local-foo+f-deadbeef00000000");
+    let wrapper = isolated_wrapper_dir(
+        &project_dir,
+        "local-foo",
+        "0.1.0",
+        Some("f-deadbeef00000000"),
+    );
     assert!(wrapper.is_dir(), "missing wrapper: {wrapper:?}");
 
     // Pkg dir under wrapper has per-file symlinks (not real files).
@@ -1037,9 +1068,8 @@ fn linker_directory_dep_creates_plus_wrapper_with_live_symlinks() {
     let initial = std::fs::read_to_string(root_link.join("index.js")).unwrap();
     assert_eq!(initial, "module.exports = 'initial';");
 
-    // Edits to the SOURCE file are visible immediately through the
-    // wrapper — no relink required. This is the F7 dev-loop UX
-    // contract.
+    // Edits to the source file are visible immediately through the
+    // wrapper, with no relink required.
     std::fs::write(src.join("index.js"), b"module.exports = 'edited';").unwrap();
     let after_edit = std::fs::read_to_string(root_link.join("index.js")).unwrap();
     assert_eq!(
@@ -1052,10 +1082,7 @@ fn linker_directory_dep_creates_plus_wrapper_with_live_symlinks() {
 
 /// Full pipeline test for `Source::Link` deps. Structurally identical
 /// to `linker_directory_dep_creates_plus_wrapper_with_live_symlinks`
-/// but with a `link:` source kind and `l-` wrapper-id prefix. Same
-/// per-file symlink contract; same edits-visible UX. The semantic
-/// difference (link: ignores `--no-symlink`) doesn't show up in v1
-/// because day-4 doesn't ship `--no-symlink` for `file:` either.
+/// but with a `link:` source kind and `l-` wrapper-id prefix.
 #[test]
 fn linker_link_dep_creates_l_prefix_wrapper_with_live_symlinks() {
     use std::collections::HashMap;
@@ -1097,19 +1124,14 @@ fn linker_link_dep_creates_l_prefix_wrapper_with_live_symlinks() {
     let result = lpm_linker::link_packages(&project_dir, &[target], false, None).unwrap();
     assert!(result.linked > 0);
 
-    // Wrapper at `+l-` shape.
-    let wrapper = project_dir.join("node_modules/.lpm/linked-foo+l-cafebabe00000000");
+    let wrapper = isolated_wrapper_dir(
+        &project_dir,
+        "linked-foo",
+        "0.2.0",
+        Some("l-cafebabe00000000"),
+    );
     assert!(wrapper.is_dir(), "missing wrapper: {wrapper:?}");
-    // The `l-` shape lives ALONGSIDE potential `f-` and `@`
-    // wrappers in the same `.lpm/` dir; visual distinction matters
-    // for `lpm doctor` / `lpm why`. Verify the `l-` prefix didn't
-    // collide with `f-` / `@` shapes (other-shape paths absent).
-    let lpm_dir = project_dir.join("node_modules").join(".lpm");
-    let entries: Vec<_> = std::fs::read_dir(&lpm_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
+    let entries = isolated_wrapper_segments(&project_dir);
     assert_eq!(entries.len(), 1, "expected single wrapper, got {entries:?}",);
     assert!(
         entries[0].contains("+l-"),
@@ -1153,23 +1175,9 @@ fn linker_link_dep_creates_l_prefix_wrapper_with_live_symlinks() {
 
 // ── wrapper sibling layout ───────────
 
-/// Day-5 integration test: a directory dep with TRANSITIVE local-source
-/// deps. Verifies the linker materializes the wrapper's
-/// `node_modules/<dep>` symlink to the transitive dep's wrapper using
-/// the `+`-shape (NOT `@`). Without the day-5 dep-target branch, the
-/// symlink would point at a non-existent `<dep>@<source-id>` and the
-/// install would fail at runtime.
-///
-/// Setup (mimics what lpm-cli builds end-to-end):
-/// - Consumer's package.json declares `"a": "file:./packages/a"`.
-/// - A's package.json declares `"b": "file:../b"`.
-/// - lpm-cli pre_resolve produces 2 LinkTargets (A immediate, B
-///   transitive); A's `dependencies` is `[(b, l-...)]` populated by
-///   the post-resolve fix-up.
-/// - link_packages produces wrappers for both A and B.
-/// - A's wrapper has `node_modules/b → ../../b+f-{16hex}/node_modules/b`.
-/// - require('b') from inside A's source resolves through the
-///   wrapper to B's source.
+/// Verifies that a directory dependency with a transitive directory
+/// dependency links the nested dependency through the transitive
+/// package's source-specific wrapper.
 #[test]
 fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() {
     use std::collections::HashMap;
@@ -1195,9 +1203,8 @@ fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() 
     .unwrap();
     std::fs::write(pkg_b.join("index.js"), b"module.exports = 'b';").unwrap();
 
-    // Mimic lpm-cli: A is immediate (root_link_names = ["a"], is_direct = true),
-    // its dependency edge is populated post-resolve with B's source identity.
-    // B is transitive (root_link_names = vec![]).
+    // A is direct and B is transitive; the dependency edge carries B's
+    // source identity so A links to B's source-specific wrapper.
     let b_source_id = "f-deadbeef00000000".to_string();
     let a_source_id = "f-cafebabe00000000".to_string();
 
@@ -1235,14 +1242,11 @@ fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() 
 
     lpm_linker::link_packages(&project_dir, &[target_a, target_b], false, None).unwrap();
 
-    // Both wrappers exist at the `+` shape.
-    let wrapper_a = project_dir.join(format!("node_modules/.lpm/a+{a_source_id}"));
-    let wrapper_b = project_dir.join(format!("node_modules/.lpm/b+{b_source_id}"));
+    let wrapper_a = isolated_wrapper_dir(&project_dir, "a", "1.0.0", Some(&a_source_id));
+    let wrapper_b = isolated_wrapper_dir(&project_dir, "b", "2.0.0", Some(&b_source_id));
     assert!(wrapper_a.is_dir(), "missing A wrapper: {wrapper_a:?}");
     assert!(wrapper_b.is_dir(), "missing B wrapper: {wrapper_b:?}");
 
-    // A's wrapper has a symlink at `node_modules/b` pointing at B's wrapper
-    // — this is what the day-5 dep-target branch produces.
     let b_in_a = wrapper_a.join("node_modules/b");
     assert!(
         b_in_a.symlink_metadata().unwrap().file_type().is_symlink(),
@@ -1283,49 +1287,10 @@ fn linker_directory_dep_with_transitive_directory_dep_creates_sibling_symlink() 
 
 // ── cross-source identity coexistence ──
 
-/// Day-7 + audit-response integration test: a single install pipeline
-/// where FIVE `foo@1.0.0` packages from every supported source kind
-/// coexist without colliding at the linker layer. Per umbrella R1
-/// risk register: the highest-risk collision case
-/// is `react@19.1.0` from registry + a fork tarball + a git SHA in
-/// the same graph; this test exercises the analog (registry +
-/// remote tarball + local tarball + file-directory + link).
-///
-/// **Coverage scope** (post-audit):
-/// - Registry `foo@1.0.0` (wrapper_id=None, CasBacked) →
-///   `.lpm/foo@1.0.0/` — the legacy "no wrapper id" shape, still
-///   valid for the registry namespace which doesn't share keys
-///   with any other source kind.
-/// - Tarball-remote `foo@1.0.0` (wrapper_id=Some("t-...remote..."),
-///   CasBacked) → `.lpm/foo+t-{16hex(https-url)}/`.
-/// - Tarball-local `foo@1.0.0` (wrapper_id=Some("t-...local..."),
-///   CasBacked) → `.lpm/foo+t-{16hex(file-url)}/` — different
-///   hash than the remote tarball even at the same `(name, version)`
-///   because `Source::source_id()` hashes the URL string.
-/// - File-directory `foo@1.0.0` (wrapper_id=Some("f-..."),
-///   DirectorySource) → `.lpm/foo+f-{16hex}/`.
-/// - Link `foo@1.0.0` (wrapper_id=Some("l-..."), DirectorySource)
-///   → `.lpm/foo+l-{16hex}/`.
-///
-/// All five coexist with distinct wrapper segments. Registry +
-/// both Tarball variants share `Materialization::CasBacked`
-/// (hardlink / clonefile from the global store); Directory + Link
-/// use `Materialization::DirectorySource` (per-file absolute
-/// symlinks from the source realpath). PackageKey
-/// day-7 finish-line) keeps lockfile-level identity distinct.
-///
-/// **Pre-audit history.** Day-7 originally covered registry +
-/// file-directory + link only. This flagged a
-/// PRINCIPAL KNOWN GAP — registry and tarball (remote OR local)
-/// silently collided because `wrapper_id_for_source` returned
-/// `None` for `Source::Tarball` regardless of URL prefix, so all
-/// three landed in the same `foo@1.0.0` wrapper segment. The
-/// audit-response commit (a) extended `wrapper_id_for_source` to
-/// every non-Registry source, and (b) added an explicit
-/// `Materialization` field on `LinkTarget` to decouple wrapper-
-/// segment shape from materialization strategy (so tarball-source
-/// wrappers carry a `+`-shape segment while still hardlinking
-/// from CAS). This test now guards the full 5-way contract.
+/// Verifies same-name same-version packages from every supported
+/// source kind coexist without wrapper-segment collisions.
+/// Registry uses the `<name>@<version>` segment; tarball, file, and
+/// link sources carry source-specific `<name>+<wrapper_id>` segments.
 #[test]
 fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
     use std::collections::HashMap;
@@ -1334,9 +1299,6 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
     let project_dir = dir.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
 
-    // Helper: write a CAS-shape package directory with a marker
-    // payload in its package.json (used to verify materializations
-    // don't bleed across wrappers).
     let make_pkg = |path: &std::path::Path, marker: &str, msg: &str| {
         std::fs::create_dir_all(path).unwrap();
         std::fs::write(
@@ -1347,13 +1309,8 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
         std::fs::write(path.join("index.js"), msg).unwrap();
     };
 
-    // CAS-backed sources: each gets its own subtree under the global
-    // store. Registry uses the `v1/foo@1.0.0/` shape; remote and
-    // local tarballs use the `v1/tarball/` and `v1/tarball-local/`
-    // subtrees respectively (the day-1.5 routing fix). For the
-    // linker test, what matters is each LinkTarget points at a
-    // distinct directory containing a package.json — the global
-    // store's exact path is opaque to the linker.
+    // Each CAS-backed source points at a distinct store directory; the
+    // store's exact internal path is opaque to the linker.
     let store_dir = dir.path().join("store");
     let registry_store = store_dir.join("v1").join("foo@1.0.0");
     let tarball_remote_store = store_dir
@@ -1382,8 +1339,8 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
         "module.exports = 'tarball-local-foo';",
     );
 
-    // Directory-source sources: real source dirs OUTSIDE the global
-    // store. The linker per-file-symlinks these into the wrapper.
+    // Directory-source packages live outside the store and are
+    // per-file symlinked into their wrappers.
     let file_dir_pkg = dir.path().join("packages").join("file-foo");
     let link_pkg = dir.path().join("shared").join("linked-foo");
     make_pkg(&file_dir_pkg, "file-dir", "module.exports = 'file-foo';");
@@ -1399,12 +1356,9 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
     const FILE_WID: &str = "f-feedfacedeadbeef";
     const LINK_WID: &str = "l-cafebabe00000000";
 
-    // Five LinkTargets — same `(name, version)`, DIFFERENT
-    // wrapper_id + materialization. Root link names are kept
-    // distinct so the linker can disambiguate the 5 root symlinks
-    // (cross-source coexistence is about the `.lpm/` wrappers,
-    // not the root-symlink namespace which is single-tenant per
-    // node_modules entry).
+    // Five LinkTargets share `(name, version)` but differ by
+    // wrapper_id and materialization. Root link names stay distinct
+    // because the root `node_modules` namespace is single-tenant.
     let registry_target = lpm_linker::LinkTarget {
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
@@ -1486,13 +1440,8 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
     .unwrap();
     assert_eq!(result.linked, 5);
 
-    // All five wrappers exist with DISTINCT segment shapes.
-    let lpm_dir = project_dir.join("node_modules").join(".lpm");
-    let entries: Vec<String> = std::fs::read_dir(&lpm_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
+    let wrapper_root = isolated_wrapper_root(&project_dir);
+    let entries = isolated_wrapper_segments(&project_dir);
     assert_eq!(
         entries.len(),
         5,
@@ -1512,14 +1461,10 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
         );
     }
 
-    // Each wrapper's pkg dir contains the source-specific
-    // package.json — verifies the materializations didn't bleed
-    // across wrappers. Pre-audit, registry + tarball-remote +
-    // tarball-local would collapse and any `_source` assertion
-    // would fail (the last write would win, leaving 1-3 wrappers
-    // pointing at whichever materialization ran last).
     let read_marker = |segment: &str| -> String {
-        let path = lpm_dir.join(segment).join("node_modules/foo/package.json");
+        let path = wrapper_root
+            .join(segment)
+            .join("node_modules/foo/package.json");
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
                 .unwrap_or_else(|e| panic!("invalid json at {path:?}: {e}"));
@@ -1545,7 +1490,7 @@ fn linker_cross_source_coexistence_all_five_kinds_in_one_install() {
     // strongest assertion that the two materialization strategies
     // are correctly dispatched per source kind.
     let pkg_json_meta = |segment: &str| {
-        lpm_dir
+        wrapper_root
             .join(segment)
             .join("node_modules/foo/package.json")
             .symlink_metadata()
