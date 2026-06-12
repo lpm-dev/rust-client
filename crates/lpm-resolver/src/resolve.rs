@@ -239,8 +239,8 @@ pub struct StageTiming {
     /// escape_hatch_rpc_count` (modulo arm) is a sanity check on the
     /// instrumentation.
     pub dispatcher_rpc_count: u64,
-    /// Peak `metadata_jobs.len()` observed at any Phase A→C
-    /// transition of the fused dispatcher loop. Confirms the metadata
+    /// Peak `metadata_jobs.len()` observed between queue-drain and
+    /// bounded-await steps of the fused dispatcher loop. Confirms the metadata
     /// semaphore is the binding constraint when this approaches the
     /// configured fanout; if it sits well below, the binding
     /// constraint is something upstream (h2 single-connection flow
@@ -262,7 +262,7 @@ pub struct StageTiming {
     /// Count of speculative peer-manifest fetches the fused dispatcher
     /// dispatched concurrent with the regular dep walk. Each prefetch
     /// corresponds to one `peerDependencies` requirement that (at the
-    /// moment Phase A drained) was: non-optional, not yet satisfied
+    /// moment the queue-drain step completed) was: non-optional, not yet satisfied
     /// by the resolved tree, not yet in the shared cache, and not yet
     /// in flight from a sibling dispatch.
     ///
