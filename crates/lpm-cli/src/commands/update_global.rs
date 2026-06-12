@@ -23,6 +23,12 @@
 //! `--dry-run` runs every step up to `prepare_locked` but releases
 //! the lock without writing anything; the upgrade plan is printed.
 
+#[cfg(test)]
+use super::global_util::short_name;
+use super::global_util::{
+    InnerGlobalInstallOptions, SyntheticProjectJsonFormat, discover_bin_commands, mk_tx_id,
+    pick_version, run_inner_global_install,
+};
 use crate::output;
 use crate::save_spec::{
     SaveConfig, SaveFlags, UserSaveIntent, decide_saved_dependency_spec, parse_user_save_intent,
@@ -36,7 +42,7 @@ use lpm_global::{
     find_command_collisions, read_for, remove_shim, validate_install_root, write_for, write_marker,
 };
 use lpm_registry::RegistryClient;
-use lpm_semver::{Version, VersionReq};
+use lpm_semver::Version;
 use std::path::PathBuf;
 
 pub async fn run(
@@ -335,7 +341,7 @@ async fn plan_upgrade(
         registry.get_npm_package_metadata(&target.name).await?
     };
 
-    let new_version_str = pick_version(&metadata, &intent)?;
+    let new_version_str = pick_version(&metadata, &intent, "global update")?;
     let new_version = Version::parse(&new_version_str).map_err(|e| {
         LpmError::Script(format!(
             "registry returned unparseable version '{new_version_str}' for '{}': {e}",
@@ -457,62 +463,6 @@ fn infer_intent_from_saved_spec(saved_spec: &str) -> UserSaveIntent {
         return UserSaveIntent::Exact(saved_spec.to_string());
     }
     UserSaveIntent::Range(saved_spec.to_string())
-}
-
-fn pick_version(
-    metadata: &lpm_registry::PackageMetadata,
-    intent: &UserSaveIntent,
-) -> Result<String, LpmError> {
-    // Same as install_global::pick_version. Duplicated rather than
-    // shared to keep the install/update modules independent;
-    // we can extract a shared helper later.
-    let token = match intent {
-        UserSaveIntent::Bare => "latest".to_string(),
-        UserSaveIntent::Exact(s) => return Ok(s.clone()),
-        UserSaveIntent::Range(s) => s.clone(),
-        UserSaveIntent::DistTag(t) => t.clone(),
-        UserSaveIntent::Wildcard => "*".to_string(),
-        UserSaveIntent::Workspace(_) => {
-            return Err(LpmError::Script(
-                "global update does not support workspace: protocol".into(),
-            ));
-        }
-    };
-    if let Some(v) = metadata.dist_tags.get(&token) {
-        return Ok(v.clone());
-    }
-    let req = VersionReq::parse(&token)
-        .map_err(|e| LpmError::Script(format!("could not parse version token '{token}': {e}")))?;
-    let mut versions: Vec<Version> = metadata
-        .versions
-        .keys()
-        .filter_map(|s| Version::parse(s).ok())
-        .collect();
-    if versions.is_empty() {
-        return Err(LpmError::Script(format!(
-            "registry returned no parseable versions for '{}'",
-            metadata.name
-        )));
-    }
-    let refs: Vec<&Version> = versions.iter().collect();
-    match lpm_semver::max_satisfying(&refs, &req) {
-        Some(v) => Ok(v.to_string()),
-        None => {
-            versions.sort();
-            Err(LpmError::Script(format!(
-                "no version of '{}' satisfies '{}'. Available: {}",
-                metadata.name,
-                token,
-                versions
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )))
-        }
-    }
 }
 
 fn ensure_registry_serves_version(
@@ -727,63 +677,27 @@ async fn do_install_upgrade(
     staged: &StagedUpgrade,
     suppress_nested_output: bool,
 ) -> Result<(), LpmError> {
-    // Same shape as install_global::do_install. Could share via a
-    // helper crate later; duplicated for module independence right
-    // now.
-    // route Windows fs ops through the long-path
-    // helper. No-op on POSIX.
-    let install_root_ext = lpm_common::as_extended_path(&staged.install_root);
-    std::fs::create_dir_all(&install_root_ext)?;
-    let pkg_json = format!(
-        r#"{{"private":true,"name":"@lpm-global-upgrade/{}","dependencies":{{"{}":"{}"}}}}"#,
-        sanitize_inner_name(&prep.name),
-        prep.name,
-        prep.new_version
-    );
-    std::fs::write(install_root_ext.join("package.json"), &pkg_json)?;
-
-    // In outer --json mode, the aggregate bulk-update result owns
-    // stdout. Silence the nested upgrade install so it cannot prepend
-    // human install summaries ahead of the final JSON payload.
-    let _stdout_gag =
-        crate::output::suppress_stdout(suppress_nested_output).map_err(LpmError::Script)?;
-
-    crate::commands::install::run_with_options(
+    let new_version = prep.new_version.to_string();
+    run_inner_global_install(
         registry,
-        &staged.install_root,
-        suppress_nested_output, // preserve automation semantics; stdout is already suppressed above
-        false,                  // offline
-        false,                  // force
-        false,                  // allow_new
-        false,                  // strict_integrity
-        None,                   // strict_peer_dependencies_override
-        None,                   // linker_override
-        true,                   // no_skills
-        true,                   // no_editor_setup
-        true,                   // no_security_summary
-        false,                  // auto_build
-        None,
-        None,
-        None,
-        None, // script_policy_override: global update does not expose policy flags
-        None, // advisor_override: global update does not expose `--advisor`
-        None, // min_release_age_override: D13/D19 — global scope is out of, cooldown uses the chain
-        crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: D13/D19 — global scope is out of
-        crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: global update honors env + config posture chain
-        crate::commands::install::InstallOmitPolicy::default(),
-        // global update does not surface its own
-        // sandbox-mode flags. The env / config / default chain
-        // inside `rebuild::run` still applies.
-        false, // strict_sandbox
-        false, // no_sandbox
-        false, // verbose: internal pipeline, no user-facing Done footer
-        false, // audit_after_install: internal pipeline never runs audit
+        InnerGlobalInstallOptions {
+            install_root: &staged.install_root,
+            package_name: &prep.name,
+            package_version: &new_version,
+            synthetic_project_scope: "@lpm-global-upgrade",
+            trust_root: None,
+            json_format: SyntheticProjectJsonFormat::Compact,
+            suppress_nested_output,
+            allow_new: false,
+            strict_peer_dependencies_override: None,
+            auto_build: false,
+            script_policy_override: None,
+            min_release_age_override: None,
+            drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy::default(),
+            verify_policy: crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+        },
     )
     .await
-}
-
-fn sanitize_inner_name(name: &str) -> String {
-    name.replace(['@', '/', '.'], "-")
 }
 
 fn commit_upgrade_locked(
@@ -1476,67 +1390,6 @@ fn active_matches_planned_snapshot(
         ));
     }
     Ok(())
-}
-
-// Step 6 fix: removed `build_registry` — `run` now receives
-// the injected `&RegistryClient`.
-
-fn mk_tx_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("{nanos}-{}", std::process::id())
-}
-
-/// Read the installed package's `package.json` to discover bin entries.
-/// Same implementation as install_global::discover_bin_commands.
-fn discover_bin_commands(
-    install_root: &std::path::Path,
-    package_name: &str,
-) -> Result<Vec<String>, LpmError> {
-    let pkg_json_path = lpm_common::as_extended_path(
-        &install_root
-            .join("node_modules")
-            .join(package_name)
-            .join("package.json"),
-    );
-    let bytes = std::fs::read(&pkg_json_path).map_err(|e| {
-        LpmError::Script(format!(
-            "could not read installed package.json at {}: {e}",
-            pkg_json_path.display()
-        ))
-    })?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-        LpmError::Script(format!(
-            "installed package.json is not valid JSON at {}: {e}",
-            pkg_json_path.display()
-        ))
-    })?;
-    let Some(bin_field) = value.get("bin") else {
-        return Ok(Vec::new());
-    };
-    let mut commands = Vec::new();
-    match bin_field {
-        serde_json::Value::String(_) => {
-            commands.push(short_name(package_name).to_string());
-        }
-        serde_json::Value::Object(map) => {
-            for k in map.keys() {
-                commands.push(k.clone());
-            }
-        }
-        _ => {}
-    }
-    Ok(commands)
-}
-
-fn short_name(package_name: &str) -> &str {
-    if let Some(rest) = package_name.strip_prefix('@')
-        && let Some(slash) = rest.find('/')
-    {
-        return &rest[slash + 1..];
-    }
-    package_name
 }
 
 #[cfg(test)]

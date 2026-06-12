@@ -24,9 +24,13 @@
 //! Fresh-install, upgrade, collision resolution, and approve-scripts
 //! capture are all supported (WAL-backed, crash-safe).
 
+use super::global_util::{
+    InnerGlobalInstallOptions, SyntheticProjectJsonFormat, discover_materialized_bin_commands,
+    mk_tx_id, pick_version, run_inner_global_install, short_name,
+};
 use crate::output;
 use crate::save_spec::{
-    SaveConfig, SaveFlags, UserSaveIntent, decide_saved_dependency_spec, parse_user_save_intent,
+    SaveConfig, SaveFlags, decide_saved_dependency_spec, parse_user_save_intent,
 };
 use chrono::Utc;
 use lpm_common::color::Painted;
@@ -38,7 +42,7 @@ use lpm_global::{
     remove_shim, validate_install_root, write_for, write_marker,
 };
 use lpm_registry::RegistryClient;
-use lpm_semver::{Version, VersionReq};
+use lpm_semver::Version;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
@@ -339,7 +343,7 @@ async fn pre_resolve(registry: &RegistryClient, spec: &str) -> Result<ResolvedSp
     };
 
     // Pick a concrete version that satisfies `intent`.
-    let version_str = pick_version(&metadata, &intent)?;
+    let version_str = pick_version(&metadata, &intent, "global install")?;
     let version = Version::parse(&version_str).map_err(|e| {
         LpmError::Script(format!(
             "registry returned unparseable version '{version_str}' for '{name}': {e}"
@@ -384,62 +388,6 @@ async fn pre_resolve(registry: &RegistryClient, spec: &str) -> Result<ResolvedSp
         source,
         saved_spec: decision.spec_to_write,
     })
-}
-
-fn pick_version(
-    metadata: &lpm_registry::PackageMetadata,
-    intent: &UserSaveIntent,
-) -> Result<String, LpmError> {
-    let token = match intent {
-        UserSaveIntent::Bare => "latest".to_string(),
-        UserSaveIntent::Exact(s) => return Ok(s.clone()),
-        UserSaveIntent::Range(s) => s.clone(),
-        UserSaveIntent::DistTag(t) => t.clone(),
-        UserSaveIntent::Wildcard => "*".to_string(),
-        UserSaveIntent::Workspace(_) => {
-            return Err(LpmError::Script(
-                "global install does not support workspace: protocol".into(),
-            ));
-        }
-    };
-
-    // dist-tag fast path
-    if let Some(v) = metadata.dist_tags.get(&token) {
-        return Ok(v.clone());
-    }
-    // Range / wildcard via lpm-semver
-    let req = VersionReq::parse(&token)
-        .map_err(|e| LpmError::Script(format!("could not parse version token '{token}': {e}")))?;
-    let mut versions: Vec<Version> = metadata
-        .versions
-        .keys()
-        .filter_map(|s| Version::parse(s).ok())
-        .collect();
-    if versions.is_empty() {
-        return Err(LpmError::Script(format!(
-            "registry returned no parseable versions for '{}'",
-            metadata.name
-        )));
-    }
-    let refs: Vec<&Version> = versions.iter().collect();
-    match lpm_semver::max_satisfying(&refs, &req) {
-        Some(v) => Ok(v.to_string()),
-        None => {
-            versions.sort();
-            Err(LpmError::Script(format!(
-                "no version of '{}' satisfies '{}'. Available: {}",
-                metadata.name,
-                token,
-                versions
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )))
-        }
-    }
 }
 
 // ─── Step 1: prepare under .tx.lock ──────────────────────────────────
@@ -559,199 +507,27 @@ async fn do_install(
     suppress_nested_output: bool,
     overrides: &InstallGlobalOverrides,
 ) -> Result<(), LpmError> {
-    // Mirror dlx's pattern: write a synthetic package.json with the
-    // single dependency, then call the project install pipeline against
-    // the install root. This reuses every byte of resolution / store /
-    // linker logic — global install is a self-hosted install with a
-    // specific synthetic project.
-    //
-    // Inject the global trusted-dependencies
-    // into the synthesized `lpm.trustedDependencies` so the inner
-    // install pipeline's strict-gate check honours user approvals
-    // recorded via `lpm approve-scripts --global`. Without this, every
-    // scripts-carrying transitive dep would block on every global
-    // install even after the user approved it.
-    //
-    // also threads the user's `--allow-new`,
-    // `--min-release-age`, `--ignore-provenance-drift[-all]`,
-    // `--policy`/`--triage`/`--yolo`, and `--auto-build` overrides
-    // into the inner pipeline so all four security gates (cooldown,
-    // drift, script-policy, sandbox auto-build) fire end-to-end on `-g`.
-    //
-    // route the install-root creation + synthetic
-    // package.json write through `as_extended_path` so a deeply-nested
-    // `~/.lpm/global/installs/` path doesn't truncate at the legacy
-    // 260-char Windows ceiling. No-op on POSIX.
-    let install_root_ext = lpm_common::as_extended_path(&prep.install_root);
-    std::fs::create_dir_all(&install_root_ext)?;
-    let pkg_json_value = synthesize_pkg_json(root, &prep.name, &prep.version.to_string())?;
-    let pkg_json_body = serde_json::to_string_pretty(&pkg_json_value)
-        .map_err(|e| LpmError::Script(format!("serializing synthetic package.json: {e}")))?;
-    std::fs::write(install_root_ext.join("package.json"), pkg_json_body)?;
-
-    // In outer --json mode, the global install command owns stdout and
-    // must emit exactly one machine-readable document. Silence the
-    // inner self-hosted install pipeline so its human summary lines do
-    // not corrupt the parent command's JSON contract.
-    let _stdout_gag =
-        crate::output::suppress_stdout(suppress_nested_output).map_err(LpmError::Script)?;
-
-    crate::commands::install::run_with_options(
+    let version = prep.version.to_string();
+    run_inner_global_install(
         registry,
-        &prep.install_root,
-        suppress_nested_output, // preserve automation semantics; stdout is already suppressed above
-        false,                  // offline
-        false,                  // force
-        overrides.allow_new,
-        false, // strict_integrity — global installs use lockfile path
-        overrides.strict_peer_dependencies_override,
-        None, // linker_override
-        true, // no_skills (global installs skip skill auto-install)
-        true, // no_editor_setup (global installs are not project-specific)
-        // keep the inner project-shape security summary
-        // suppressed — the global wrapper banner at
-        // `emit_post_install_blocked_warning` is the right surface and
-        // routes users to `lpm approve-scripts --global`.
-        true, // no_security_summary
-        overrides.auto_build,
-        None,
-        None,
-        None,
-        overrides.script_policy_override,
-        // `lpm install -g` does not expose its own
-        // `--advisor` flag yet. The global install path stays portable-
-        // by-default; opt-in to an advisor uplift for the synthesized
-        // project install would belong with a future `-g`-specific
-        // override surface.
-        None,
-        overrides.min_release_age_override,
-        overrides.drift_ignore_policy.clone(),
-        overrides.verify_policy.clone(),
-        crate::commands::install::InstallOmitPolicy::default(),
-        // `lpm install -g` does not surface its
-        // own sandbox-mode flags. The env / config / default chain
-        // inside `rebuild::run` still applies — `LPM_STRICT_SANDBOX=1`
-        // still kicks in for CI globally-installed tooling.
-        false, // strict_sandbox
-        false, // no_sandbox
-        false, // verbose: internal pipeline, no user-facing Done footer
-        false, // audit_after_install: internal pipeline never runs audit
+        InnerGlobalInstallOptions {
+            install_root: &prep.install_root,
+            package_name: &prep.name,
+            package_version: &version,
+            synthetic_project_scope: "@lpm-global",
+            trust_root: Some(root),
+            json_format: SyntheticProjectJsonFormat::Pretty,
+            suppress_nested_output,
+            allow_new: overrides.allow_new,
+            strict_peer_dependencies_override: overrides.strict_peer_dependencies_override,
+            auto_build: overrides.auto_build,
+            script_policy_override: overrides.script_policy_override,
+            min_release_age_override: overrides.min_release_age_override,
+            drift_ignore_policy: overrides.drift_ignore_policy.clone(),
+            verify_policy: overrides.verify_policy.clone(),
+        },
     )
-    .await?;
-
-    let _ = registry; // silence unused if we ever stop passing it directly
-    Ok(())
-}
-
-/// Read the installed package's `package.json` to discover what bin
-/// entries it exposes. Returns the list of command names that should
-/// appear in `~/.lpm/bin/` and in the manifest's `commands` field.
-///
-/// Handles both `bin: "single-file"` (command name = package name's
-/// short form) and `bin: { "name": "path" }` (command name = key) per
-/// the npm spec.
-fn discover_bin_commands(
-    install_root: &std::path::Path,
-    package_name: &str,
-) -> Result<Vec<String>, LpmError> {
-    // The installed package lives at
-    // `<install_root>/node_modules/<package_name>/package.json`. For
-    // scoped names like `@lpm.dev/owner.tool` the path is literal —
-    // node_modules preserves the scope dir.
-    let pkg_json_path = lpm_common::as_extended_path(
-        &install_root
-            .join("node_modules")
-            .join(package_name)
-            .join("package.json"),
-    );
-    let bytes = std::fs::read(&pkg_json_path).map_err(|e| {
-        LpmError::Script(format!(
-            "could not read installed package.json at {}: {e}",
-            pkg_json_path.display()
-        ))
-    })?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-        LpmError::Script(format!(
-            "installed package.json is not valid JSON at {}: {e}",
-            pkg_json_path.display()
-        ))
-    })?;
-
-    let Some(bin_field) = value.get("bin") else {
-        return Ok(Vec::new());
-    };
-    let mut commands = Vec::new();
-    match bin_field {
-        serde_json::Value::String(_) => {
-            // Single-file form: command name is the package's short name
-            // (without the scope). For `@lpm.dev/owner.tool` → `tool`,
-            // for `eslint` → `eslint`.
-            commands.push(short_name(package_name).to_string());
-        }
-        serde_json::Value::Object(map) => {
-            for k in map.keys() {
-                commands.push(k.clone());
-            }
-        }
-        _ => {}
-    }
-    Ok(commands)
-}
-
-fn short_name(package_name: &str) -> &str {
-    // Strip scope: `@scope/name` → `name`. Otherwise return as-is.
-    if let Some(rest) = package_name.strip_prefix('@')
-        && let Some(slash) = rest.find('/')
-    {
-        return &rest[slash + 1..];
-    }
-    package_name
-}
-
-fn discover_materialized_bin_commands(
-    install_root: &std::path::Path,
-    package_name: &str,
-) -> Result<Vec<String>, LpmError> {
-    let declared = discover_bin_commands(install_root, package_name)?;
-    let bin_dir = install_root.join("node_modules").join(".bin");
-    let mut commands = Vec::with_capacity(declared.len());
-    for command in declared {
-        if let Err(reason) = lpm_linker::validate_bin_name(&command, package_name) {
-            tracing::warn!("global install: skipping invalid bin \"{command}\": {reason}");
-            continue;
-        }
-        let bin_path = bin_dir.join(&command);
-        if !is_materialized_bin_command(&bin_path)? {
-            tracing::warn!(
-                "global install: skipping bin \"{command}\" because {} was not materialized",
-                bin_path.display()
-            );
-            continue;
-        }
-        commands.push(command);
-    }
-    Ok(commands)
-}
-
-fn is_materialized_bin_command(bin_path: &std::path::Path) -> Result<bool, LpmError> {
-    let meta = match std::fs::symlink_metadata(bin_path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(LpmError::Io(e)),
-    };
-    if meta.is_symlink() && !bin_path.exists() {
-        return Ok(false);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let target_meta = std::fs::metadata(bin_path).map_err(LpmError::Io)?;
-        Ok(target_meta.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(true)
-    }
+    .await
 }
 
 // ─── Step 3: commit under .tx.lock ───────────────────────────────────
@@ -1875,98 +1651,6 @@ fn print_success(
     // refactors don't accidentally double-print.
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────
-
-// Step 6 fix: removed `build_registry` — `run` now receives
-// the injected `&RegistryClient` so `--registry` and `SessionManager`
-// are honored.
-
-/// Generate a stable transaction id: `<unix-nanos>-<pid>`. Adequate
-/// uniqueness within a single host (per the WAL Intent doc).
-fn mk_tx_id() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("{nanos}-{}", std::process::id())
-}
-
-/// Sanitize a package name for use as the synthetic project's `name`
-/// field. The synthetic `package.json` `name` is purely cosmetic
-/// (avoids npm warnings about missing name) — the real install target
-/// is in `dependencies`. Must be a valid npm package name.
-fn sanitize_inner_name(name: &str) -> String {
-    name.replace(['@', '/', '.'], "-")
-}
-
-/// build the synthetic `package.json` body for the
-/// install root. Extends the prior minimal shape with an
-/// `lpm.trustedDependencies` Rich-form map populated from
-/// `~/.lpm/global/trusted-dependencies.json`, so the inner project
-/// install pipeline's strict-gate check sees the user's global
-/// approvals and doesn't re-block every script-running transitive dep
-/// on every global install.
-///
-/// Shape:
-///
-/// ```json
-/// {
-///   "private": true,
-///   "name": "@lpm-global/<sanitized>",
-///   "dependencies": { "<pkg>": "<version>" },
-///   "lpm": {
-///     "trustedDependencies": {
-///       "esbuild@0.25.1": {
-///         "integrity": "sha512-…",
-///         "scriptHash": "sha256-…"
-///       }
-///     }
-///   }
-/// }
-/// ```
-///
-/// Omits the `lpm` block when the global trust file is empty so the
-/// on-disk file remains minimal (matches the no-trust shape byte-for-byte
-/// when no packages have been approved). This keeps the "fresh machine"
-/// path identical to the baseline — the `lpm` block only
-/// appears once the user has approved something.
-fn synthesize_pkg_json(
-    root: &LpmRoot,
-    pkg_name: &str,
-    pkg_version: &str,
-) -> Result<serde_json::Value, LpmError> {
-    let trust = lpm_global::trusted_deps::read_for(root)?;
-    let mut obj = serde_json::Map::new();
-    obj.insert("private".into(), serde_json::Value::Bool(true));
-    obj.insert(
-        "name".into(),
-        serde_json::Value::String(format!("@lpm-global/{}", sanitize_inner_name(pkg_name))),
-    );
-    let mut deps = serde_json::Map::new();
-    deps.insert(
-        pkg_name.to_string(),
-        serde_json::Value::String(pkg_version.to_string()),
-    );
-    obj.insert("dependencies".into(), serde_json::Value::Object(deps));
-
-    if !trust.trusted.is_empty() {
-        let mut rich = serde_json::Map::new();
-        for (key, binding) in &trust.trusted {
-            rich.insert(
-                key.clone(),
-                serde_json::to_value(binding).unwrap_or(serde_json::Value::Null),
-            );
-        }
-        let mut lpm_block = serde_json::Map::new();
-        lpm_block.insert(
-            "trustedDependencies".into(),
-            serde_json::Value::Object(rich),
-        );
-        obj.insert("lpm".into(), serde_json::Value::Object(lpm_block));
-    }
-
-    Ok(serde_json::Value::Object(obj))
-}
-
 /// emit a post-install banner if the new install root's
 /// per-install `build-state.json` surfaces packages not covered by the
 /// global trust list. Mirrors the project-level
@@ -2083,17 +1767,6 @@ mod tests {
                 ]),
             }
         }
-    }
-
-    fn tmp_pkg_json(install_root: &Path, package_name: &str, bin: serde_json::Value) {
-        let pkg_dir = install_root.join("node_modules").join(package_name);
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-        let body = serde_json::json!({
-            "name": package_name,
-            "version": "1.0.0",
-            "bin": bin,
-        });
-        std::fs::write(pkg_dir.join("package.json"), body.to_string()).unwrap();
     }
 
     fn tarball_route(name: &str, version: &str) -> String {
@@ -2434,191 +2107,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discover_bin_string_form_uses_short_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        tmp_pkg_json(tmp.path(), "eslint", serde_json::json!("./bin/eslint.js"));
-        let cmds = discover_bin_commands(tmp.path(), "eslint").unwrap();
-        assert_eq!(cmds, vec!["eslint"]);
-    }
-
-    #[test]
-    fn discover_bin_string_form_strips_scope() {
-        let tmp = tempfile::tempdir().unwrap();
-        tmp_pkg_json(
-            tmp.path(),
-            "@lpm.dev/owner.tool",
-            serde_json::json!("./bin/run.js"),
-        );
-        let cmds = discover_bin_commands(tmp.path(), "@lpm.dev/owner.tool").unwrap();
-        assert_eq!(cmds, vec!["owner.tool"]);
-    }
-
-    #[test]
-    fn discover_bin_object_form_returns_keys() {
-        let tmp = tempfile::tempdir().unwrap();
-        tmp_pkg_json(
-            tmp.path(),
-            "typescript",
-            serde_json::json!({"tsc": "./bin/tsc", "tsserver": "./bin/tsserver"}),
-        );
-        let mut cmds = discover_bin_commands(tmp.path(), "typescript").unwrap();
-        cmds.sort();
-        assert_eq!(cmds, vec!["tsc", "tsserver"]);
-    }
-
-    #[test]
-    fn discover_materialized_bin_commands_uses_actual_bin_artifacts() {
-        let tmp = tempfile::tempdir().unwrap();
-        tmp_pkg_json(
-            tmp.path(),
-            "tool",
-            serde_json::json!({
-                "good": "./bin/good.js",
-                "../escape": "./bin/escape.js",
-                "missing": "./bin/missing.js",
-            }),
-        );
-        let bin_dir = tmp.path().join("node_modules").join(".bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        let good = bin_dir.join("good");
-        std::fs::write(&good, b"#!/bin/sh\necho ok\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let commands = discover_materialized_bin_commands(tmp.path(), "tool").unwrap();
-
-        assert_eq!(commands, vec!["good"]);
-    }
-
-    #[test]
-    fn discover_bin_returns_empty_when_no_bin_field() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pkg_dir = tmp.path().join("node_modules").join("just-a-lib");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-        std::fs::write(
-            pkg_dir.join("package.json"),
-            r#"{"name":"just-a-lib","version":"1.0.0"}"#,
-        )
-        .unwrap();
-        let cmds = discover_bin_commands(tmp.path(), "just-a-lib").unwrap();
-        assert!(cmds.is_empty());
-    }
-
-    #[test]
-    fn discover_bin_errors_when_package_json_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let err = discover_bin_commands(tmp.path(), "ghost").unwrap_err();
-        assert!(format!("{err}").contains("could not read installed package.json"));
-    }
-
-    #[test]
-    fn short_name_strips_scope() {
-        assert_eq!(short_name("@lpm.dev/owner.tool"), "owner.tool");
-        assert_eq!(short_name("@scope/name"), "name");
-        assert_eq!(short_name("eslint"), "eslint");
-    }
-
-    #[test]
-    fn pick_version_returns_exact_verbatim() {
-        let mut versions = BTreeMap::new();
-        versions.insert(
-            "1.0.0".to_string(),
-            lpm_registry::VersionMetadata::default(),
-        );
-        let metadata = lpm_registry::PackageMetadata {
-            name: "x".into(),
-            description: None,
-            dist_tags: BTreeMap::new().into_iter().collect(),
-            versions: versions.into_iter().collect(),
-            time: Default::default(),
-            modified: None,
-            downloads: None,
-            distribution_mode: None,
-            package_type: None,
-            latest_version: None,
-            ecosystem: None,
-        };
-        let version = pick_version(&metadata, &UserSaveIntent::Exact("1.0.0".into())).unwrap();
-        assert_eq!(version, "1.0.0");
-    }
-
-    #[test]
-    fn pick_version_dist_tag_resolves() {
-        let mut dist_tags = std::collections::HashMap::new();
-        dist_tags.insert("latest".to_string(), "9.24.0".to_string());
-        let metadata = lpm_registry::PackageMetadata {
-            name: "x".into(),
-            description: None,
-            dist_tags,
-            versions: Default::default(),
-            time: Default::default(),
-            modified: None,
-            downloads: None,
-            distribution_mode: None,
-            package_type: None,
-            latest_version: None,
-            ecosystem: None,
-        };
-        let version = pick_version(&metadata, &UserSaveIntent::DistTag("latest".into())).unwrap();
-        assert_eq!(version, "9.24.0");
-    }
-
-    #[test]
-    fn pick_version_range_picks_max_satisfying() {
-        let mut versions = std::collections::HashMap::new();
-        for v in ["9.10.0", "9.24.0", "10.0.0"] {
-            versions.insert(v.to_string(), lpm_registry::VersionMetadata::default());
-        }
-        let metadata = lpm_registry::PackageMetadata {
-            name: "x".into(),
-            description: None,
-            dist_tags: Default::default(),
-            versions,
-            time: Default::default(),
-            modified: None,
-            downloads: None,
-            distribution_mode: None,
-            package_type: None,
-            latest_version: None,
-            ecosystem: None,
-        };
-        let version = pick_version(&metadata, &UserSaveIntent::Range("^9".into())).unwrap();
-        assert_eq!(version, "9.24.0");
-    }
-
-    #[test]
-    fn pick_version_workspace_intent_errors() {
-        let metadata = lpm_registry::PackageMetadata {
-            name: "x".into(),
-            description: None,
-            dist_tags: Default::default(),
-            versions: Default::default(),
-            time: Default::default(),
-            modified: None,
-            downloads: None,
-            distribution_mode: None,
-            package_type: None,
-            latest_version: None,
-            ecosystem: None,
-        };
-        let err =
-            pick_version(&metadata, &UserSaveIntent::Workspace("workspace:*".into())).unwrap_err();
-        assert!(format!("{err}").contains("workspace: protocol"));
-    }
-
-    #[test]
-    fn sanitize_inner_name_strips_at_slash_dot() {
-        assert_eq!(
-            sanitize_inner_name("@lpm.dev/owner.tool"),
-            "-lpm-dev-owner-tool"
-        );
-        assert_eq!(sanitize_inner_name("eslint"), "eslint");
-    }
-
     /// Audit Medium + audit High: the
     /// detection helper itself moved to `lpm_global::find_command_collisions`
     /// (and is exercised by the lpm-global test suite). Here we verify
@@ -2808,104 +2296,6 @@ mod tests {
             "emitted alias shim must be removed by rollback"
         );
         assert!(!install_root.exists());
-    }
-
-    #[test]
-    fn mk_tx_id_includes_pid_and_is_unique_within_process() {
-        let a = mk_tx_id();
-        // A small sleep would make the second id deterministically
-        // newer; in practice the nanos resolution is sub-microsecond
-        // so two calls in series yield different ids on every platform
-        // we ship to.
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let b = mk_tx_id();
-        assert_ne!(a, b);
-        let pid = std::process::id().to_string();
-        assert!(a.ends_with(&pid));
-    }
-
-    // ─── synthesize_pkg_json ───────────────────────────────────
-
-    /// Empty global trust file: the synthesized package.json has NO
-    /// `lpm` block so the on-disk shape matches the no-trust baseline
-    /// (prevents a no-op diff across every global install).
-    #[test]
-    fn synthesize_pkg_json_omits_lpm_block_when_global_trust_is_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = lpm_common::LpmRoot::from_dir(tmp.path());
-        let value = synthesize_pkg_json(&root, "eslint", "9.24.0").unwrap();
-        assert!(value.get("lpm").is_none());
-        assert_eq!(
-            value.get("name").and_then(|v| v.as_str()),
-            Some("@lpm-global/eslint")
-        );
-        assert_eq!(
-            value
-                .get("dependencies")
-                .and_then(|d| d.get("eslint"))
-                .and_then(|v| v.as_str()),
-            Some("9.24.0")
-        );
-    }
-
-    /// Global trust file with entries: the synthesized package.json
-    /// gains an `lpm.trustedDependencies` map that round-trips to the
-    /// project-level `TrustedDependencyBinding` shape. The inner
-    /// install pipeline reads this via `lpm_workspace::read_package_json`
-    /// and applies the same strict-gate logic as a normal project.
-    #[test]
-    fn synthesize_pkg_json_embeds_global_trust_under_lpm_namespace() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = lpm_common::LpmRoot::from_dir(tmp.path());
-        let mut trust = lpm_global::GlobalTrustedDependencies::default();
-        trust.insert_strict(
-            "esbuild",
-            "0.25.1",
-            Some("sha512-x".into()),
-            Some("sha256-y".into()),
-        );
-        lpm_global::trusted_deps::write_for(&root, &trust).unwrap();
-
-        let value = synthesize_pkg_json(&root, "eslint", "9.24.0").unwrap();
-        let lpm_block = value.get("lpm").expect("lpm block must be present");
-        let trusted = lpm_block
-            .get("trustedDependencies")
-            .expect("trustedDependencies must be present");
-        let entry = trusted
-            .get("esbuild@0.25.1")
-            .expect("entry keyed name@version");
-        assert_eq!(
-            entry.get("integrity").and_then(|v| v.as_str()),
-            Some("sha512-x")
-        );
-        // MUST use the renamed JSON key `scriptHash`, not `script_hash`,
-        // so the inner pipeline's deserializer recognises it.
-        assert_eq!(
-            entry.get("scriptHash").and_then(|v| v.as_str()),
-            Some("sha256-y")
-        );
-    }
-
-    /// Scoped package names produce a valid synthesized `name` field
-    /// (no `@`/`/` characters in the middle — sanitized by
-    /// `sanitize_inner_name`).
-    #[test]
-    fn synthesize_pkg_json_name_for_scoped_package_is_sanitized() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = lpm_common::LpmRoot::from_dir(tmp.path());
-        let value = synthesize_pkg_json(&root, "@lpm.dev/owner.tool", "1.0.0").unwrap();
-        let name = value.get("name").and_then(|v| v.as_str()).unwrap();
-        // Sanitizer replaces @, /, . with `-`.
-        assert_eq!(name, "@lpm-global/-lpm-dev-owner-tool");
-        // Dependency key MUST keep the original scoped name so the
-        // inner install resolves the right package.
-        assert_eq!(
-            value
-                .get("dependencies")
-                .and_then(|d| d.get("@lpm.dev/owner.tool"))
-                .and_then(|v| v.as_str()),
-            Some("1.0.0")
-        );
     }
 
     // ─── CollisionResolution flag parsing ──────────────────────
