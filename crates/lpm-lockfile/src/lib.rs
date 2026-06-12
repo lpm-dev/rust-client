@@ -2814,10 +2814,9 @@ version = "1.0.0"
         // alphabetical order.
         let mut lf = Lockfile::new();
         lf.ambient_peer_installs = vec!["react".to_string(), "@types/react".to_string()];
-        // Sort here mirrors the resolver's drain-tail dedup+sort
-        // (`greedy.rs::830-840`); the ordering invariant is part of
-        // the contract so tests pin both serialize and deserialize
-        // sides agree.
+        // Sort here mirrors the resolver's drain-tail dedup+sort; the
+        // ordering invariant is part of the contract so tests pin both
+        // serialize and deserialize sides agree.
         lf.ambient_peer_installs.sort();
 
         let toml = lf.to_toml().expect("serialize must succeed");
