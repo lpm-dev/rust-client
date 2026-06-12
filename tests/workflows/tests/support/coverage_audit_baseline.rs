@@ -426,7 +426,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: true,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/publish.rs",
+            "crates/lpm-cli/src/commands/publish/mod.rs",
             "tests/workflows/tests/publish.rs",
             "crates/lpm-cli/tests/oidc_publish_auto_exchange_contract.rs",
         ],
@@ -1069,7 +1069,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: false,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/run.rs",
+            "crates/lpm-cli/src/commands/run/mod.rs",
             "tests/workflows/tests/run.rs",
             "tests/workflows/tests/json_output.rs",
         ],
@@ -1763,7 +1763,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: true,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/proxy.rs",
+            "crates/lpm-cli/src/commands/proxy/mod.rs",
             "crates/lpm-cli/tests/proxy_status_contract.rs",
             "crates/lpm-proxy/src/lib.rs",
             "tests/workflows/tests/local_domains.rs",
