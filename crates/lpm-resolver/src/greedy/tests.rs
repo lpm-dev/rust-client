@@ -436,8 +436,7 @@ fn process_edge_applies_name_selector_override() {
     // `lpm.overrides: { "lodash": "3.10.1" }` — every lodash
     // resolution is forced to 3.10.1, even when the consumer's
     // range nominally satisfies 4.17.21. Mirrors
-    // `LpmDependencyProvider::choose_version`'s pubgrub-arm
-    // semantics (provider.rs:1185-1207).
+    // `LpmDependencyProvider::choose_version` semantics.
     let info = mk_info(&["4.17.21", "4.0.0", "3.10.1", "3.0.0"], &[]);
     let mut deps = HashMap::new();
     deps.insert("lodash".to_string(), "^3.0.0 || ^4.0.0".to_string());

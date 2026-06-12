@@ -4,7 +4,7 @@ use super::state::ResolveState;
 use super::types::Edge;
 
 /// Fast cache hit, then short-lived per-canonical wait, then escape-hatch
-/// direct fetch. Mirrors `provider.rs::ensure_cached` shape but yields an
+/// direct fetch. Mirrors `LpmDependencyProvider::ensure_cached` but yields an
 /// owned `Arc<CachedPackageInfo>` instead of a `RefCell` borrow.
 #[allow(clippy::too_many_arguments)] // mirrors provider::ensure_cached's plumbing surface
 pub(super) async fn ensure_manifest(
@@ -61,7 +61,7 @@ pub(super) async fn ensure_manifest(
             .await;
         }
         // Walker may have flipped done — if so, fetch directly without
-        // burning the timeout. Matches `provider.rs::ensure_cached`'s
+        // burning the timeout. Matches `LpmDependencyProvider::ensure_cached`'s
         // walker_done short-circuit path.
         if !walker_done.load(Ordering::Acquire) {
             match tokio::time::timeout(fetch_wait_timeout, notified).await {
