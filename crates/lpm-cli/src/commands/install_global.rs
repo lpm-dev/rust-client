@@ -1177,7 +1177,7 @@ fn maybe_prompt_for_collisions(
     // Checking only stdin would let `lpm install -g foo | cat` enter
     // the cliclack prompt with no visible UI (output goes to the
     // pipe), stranding the user with an unresponsive terminal.
-    // Matches the pattern used by `approve_scripts.rs` and
+    // Matches the pattern used by `approve_scripts/display.rs` and
     // `upgrade.rs` for every other interactive command.
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {

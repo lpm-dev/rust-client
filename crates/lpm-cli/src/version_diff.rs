@@ -405,7 +405,7 @@ pub fn compute_version_diff(
 // ═══════════════════════════════════════════════════════════════════
 //
 // Pure text rendering — no I/O, no stdout writes. Callers (install.rs,
-// approve_scripts.rs) pass already-collected script-body snapshots and
+// approve_scripts/display.rs) pass already-collected script-body snapshots and
 // get back an `Option<String>` to emit however they route output
 // (stderr vs stdout, `output::warn` vs `println!`, JSON vs human).
 //
