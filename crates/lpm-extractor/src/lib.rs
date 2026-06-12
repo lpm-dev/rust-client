@@ -11,8 +11,10 @@
 
 use flate2::read::GzDecoder;
 use lpm_common::{Integrity, LpmError};
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tar::Archive;
 
 /// Verify a tarball's integrity against an expected SRI hash.
@@ -560,9 +562,9 @@ where
     //
     // Capacity heuristic: most npm tarballs have ≤ 10 distinct
     // intermediate dirs; 64 covers the long tail without over-allocating.
-    let mut verified_parents: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::with_capacity(64);
+    let mut verified_parents: HashSet<PathBuf> = HashSet::with_capacity(64);
     verified_parents.insert(extraction_root.clone());
+    let mut seen_archive_paths = HashMap::with_capacity(64);
 
     {
         let entries = archive.entries()?;
@@ -689,6 +691,17 @@ where
 
             // Only extract regular files (skip symlinks for security)
             if entry.header().entry_type().is_file() {
+                if let Err(error) =
+                    record_case_fold_archive_path(&mut seen_archive_paths, &relative_path)
+                {
+                    return rollback_extraction(
+                        &extraction_root,
+                        &extracted_files,
+                        &created_dirs,
+                        error,
+                    );
+                }
+
                 // Capture the tar entry's exec bits BEFORE any read; the
                 // header is parsed up-front by the tar crate. We honor
                 // whichever execute bits the tarball declares (user / group /
@@ -1103,6 +1116,7 @@ where
 {
     let mut archive = Archive::new(reader);
     let mut files = Vec::new();
+    let mut seen_archive_paths = HashMap::with_capacity(64);
 
     {
         let entries = archive.entries()?;
@@ -1111,6 +1125,7 @@ where
             if entry.header().entry_type().is_file() {
                 let path = entry.path()?.into_owned();
                 if let Some(stripped) = sanitize_entry_path(&path)? {
+                    record_case_fold_archive_path(&mut seen_archive_paths, &stripped)?;
                     files.push(stripped);
                 }
             }
@@ -1144,21 +1159,87 @@ pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
         return Ok(None);
     };
 
-    if relative_path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        )
-    }) {
-        return Err(LpmError::Registry(format!(
-            "path traversal detected in tarball: {}",
-            path.display()
-        )));
+    for component in relative_path.components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(LpmError::Registry(format!(
+                    "path traversal detected in tarball: {}",
+                    path.display()
+                )));
+            }
+            Component::Normal(name) if is_windows_reserved_device_name(name) => {
+                return Err(LpmError::Registry(format!(
+                    "reserved Windows device name in tarball entry: {}",
+                    path.display()
+                )));
+            }
+            Component::Normal(_) | Component::CurDir => {}
+        }
     }
 
     Ok(Some(relative_path))
+}
+
+fn record_case_fold_archive_path(
+    seen_paths: &mut HashMap<String, PathBuf>,
+    relative_path: &Path,
+) -> Result<(), LpmError> {
+    let key = case_fold_path_key(relative_path);
+    if let Some(existing_path) = seen_paths.get(&key) {
+        if existing_path == relative_path {
+            return Ok(());
+        }
+
+        return Err(LpmError::Registry(format!(
+            "case-fold path collision in tarball: {} conflicts with {}",
+            relative_path.display(),
+            existing_path.display()
+        )));
+    }
+
+    seen_paths.insert(key, relative_path.to_path_buf());
+    Ok(())
+}
+
+fn case_fold_path_key(path: &Path) -> String {
+    let mut key = String::new();
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        if !key.is_empty() {
+            key.push('/');
+        }
+        append_case_fold_component_key(&mut key, name);
+    }
+    key
+}
+
+fn append_case_fold_component_key(key: &mut String, component: &OsStr) {
+    let component = component.to_string_lossy();
+    let trimmed = component.trim_end_matches([' ', '.']);
+    for ch in trimmed.chars() {
+        key.extend(ch.to_lowercase());
+    }
+}
+
+fn is_windows_reserved_device_name(component: &OsStr) -> bool {
+    let component = component.to_string_lossy();
+    let trimmed = component.trim_end_matches([' ', '.']);
+    let stem = trimmed.split('.').next().unwrap_or(trimmed);
+    let upper = stem.to_ascii_uppercase();
+
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        || is_reserved_windows_port_name(&upper, "COM")
+        || is_reserved_windows_port_name(&upper, "LPT")
+}
+
+fn is_reserved_windows_port_name(upper: &str, prefix: &str) -> bool {
+    let Some(number) = upper.strip_prefix(prefix) else {
+        return false;
+    };
+
+    matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
 }
 
 #[cfg(test)]
@@ -1171,18 +1252,26 @@ mod tests {
 
     /// Create a test .tgz with a single file inside `package/`.
     fn create_test_tarball(filename: &str, content: &[u8]) -> Vec<u8> {
+        create_test_tarball_with_entries(&[(filename, content)])
+    }
+
+    /// Create a test .tgz with multiple files inside `package/`.
+    fn create_test_tarball_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut tar_data = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_data);
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
+            for (filename, content) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_cksum();
 
-            let tar_path = format!("package/{filename}");
-            builder
-                .append_data(&mut header, &tar_path, content)
-                .unwrap();
+                let tar_path = format!("package/{filename}");
+                builder
+                    .append_data(&mut header, &tar_path, *content)
+                    .unwrap();
+            }
             builder.finish().unwrap();
         }
 
@@ -1585,6 +1674,81 @@ mod tests {
         assert!(
             error.contains("path traversal detected"),
             "expected traversal diagnostic, got: {error}"
+        );
+    }
+
+    #[test]
+    fn sanitize_entry_path_rejects_windows_reserved_device_names() {
+        for path in [
+            "package/CON",
+            "package/lib/nul.txt",
+            "package/AUX.",
+            "package/COM1/readme.md",
+        ] {
+            let error = sanitize_entry_path(Path::new(path))
+                .expect_err("reserved path must be rejected")
+                .to_string();
+
+            assert!(
+                error.contains("reserved Windows device name"),
+                "expected reserved-device diagnostic for {path}, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_tarball_contents_rejects_case_fold_path_collision() {
+        let tgz = create_test_tarball_with_entries(&[
+            ("lib/Foo.js", b"first"),
+            ("lib/foo.js", b"second"),
+        ]);
+
+        let error = list_tarball_contents(&tgz).unwrap_err().to_string();
+
+        assert!(
+            error.contains("case-fold path collision"),
+            "expected case-fold collision diagnostic, got: {error}"
+        );
+    }
+
+    #[test]
+    fn extract_rejects_case_fold_path_collision_and_rolls_back_written_files() {
+        let tgz = create_test_tarball_with_entries(&[
+            ("lib/Foo.js", b"first"),
+            ("lib/foo.js", b"second"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = extract_tarball(&tgz, dir.path()).unwrap_err().to_string();
+
+        assert!(
+            error.contains("case-fold path collision"),
+            "expected case-fold collision diagnostic, got: {error}"
+        );
+        assert!(!dir.path().join("lib/Foo.js").exists());
+        assert!(!dir.path().join("lib/foo.js").exists());
+    }
+
+    #[test]
+    fn extract_allows_exact_duplicate_member_path_with_last_write_winning() {
+        let tgz = create_test_tarball_with_entries(&[
+            ("duplicate.txt", b"first"),
+            ("duplicate.txt", b"second"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let files = extract_tarball(&tgz, dir.path()).unwrap();
+
+        assert_eq!(
+            files,
+            [
+                PathBuf::from("duplicate.txt"),
+                PathBuf::from("duplicate.txt")
+            ]
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("duplicate.txt")).unwrap(),
+            b"second"
         );
     }
 
