@@ -25,8 +25,8 @@ pub enum ResolverPackage {
         /// Format: the parent's full Display identity (e.g. `"ajv"` for a
         /// flat parent or `"ajv[eslint]"` for an already-split parent).
         /// Using the full identity propagates splits downward so
-        /// grandchildren of sibling splits stay distinct. See the
-        /// multi-version split-retry logic in `provider.rs` for rationale.
+        /// grandchildren of sibling splits stay distinct. See the provider
+        /// split-retry logic for rationale.
         context: Option<String>,
     },
 
@@ -38,8 +38,8 @@ pub enum ResolverPackage {
         /// Format: the parent's full Display identity (e.g. `"ajv"` for a
         /// flat parent or `"ajv[eslint]"` for an already-split parent).
         /// Using the full identity propagates splits downward so
-        /// grandchildren of sibling splits stay distinct. See the
-        /// multi-version split-retry logic in `provider.rs` for rationale.
+        /// grandchildren of sibling splits stay distinct. See the provider
+        /// split-retry logic for rationale.
         context: Option<String>,
     },
 }
@@ -163,7 +163,7 @@ impl ResolverPackage {
 /// Provider code **MUST** canonicalize (`CanonicalKey::from(&pkg)`) before
 /// any cache read, notify lookup, or insert. Do not revert this type to
 /// include a context field without re-benching and extending the split-
-/// subtree regression test in `provider.rs`.
+/// subtree regression tests.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum CanonicalKey {
     /// The root project being resolved.
