@@ -1,27 +1,25 @@
 //! Composed workflow tests for `lpm add`.
 //!
-//! The unit tests in `crates/lpm-cli/src/commands/add.rs` cover the
+//! The unit tests in `crates/lpm-cli/src/commands/add/` cover the
 //! helper-level contracts (collector dedup, save-spec decision logic,
 //! preflight gate, canonical-pinning). These workflow tests exercise the
-//! real `lpm-rs` binary end-to-end against a mock registry — the gap
-//! GPT's audits flagged across the #9 / #9.1 / #9.2 / #9.3 / #9.4
-//! retrospective.
+//! real `lpm-rs` binary end-to-end against a mock registry.
 //!
 //! Three properties get composed coverage:
 //!
-//! 1. **Happy path** (#9 + #9.1): a config-driven source package
+//! 1. **Happy path**: a config-driven source package
 //!    declaring a mix of bare names and `name@^range` specs ends with
 //!    each entry written to `package.json` per the save
 //!    policy — bare → `^resolvedLatest`, explicit range preserved
 //!    verbatim — and the source files copied into the project.
 //!
-//! 2. **Preflight** (#9.4): a deps-declaring source package against a
+//! 2. **Preflight**: a deps-declaring source package against a
 //!    project with no `package.json` exits non-zero with a remediation
 //!    hint pointing at `lpm init` / `npm init -y`, and crucially does
 //!    NOT copy any source files (no source-file copy side effects on the
 //!    failure path).
 //!
-//! 3. **Rollback** (#9.2 + #9.3): a deps-declaring source package
+//! 3. **Rollback**: a deps-declaring source package
 //!    where the trailing install fails leaves `package.json` byte-
 //!    identical to its pre-`lpm add` state and the source-file dest
 //!    paths absent (or restored, for overwrites).
@@ -393,7 +391,7 @@ async fn lpm_add_json_envelope_with_simple_source_pkg_matches_snapshot() {
     });
 }
 
-// ─── Test 2: #9.4 preflight ─────────────────────────────────────────
+// ─── Preflight ───────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn lpm_add_preflight_blocks_deps_source_with_no_consumer_manifest() {
@@ -464,25 +462,25 @@ async fn lpm_add_preflight_blocks_deps_source_with_no_consumer_manifest() {
         "preflight must run BEFORE source-file copy; the failure path \
          must not copy anything"
     );
-    // No package.json materialized either (we don't auto-init, per the
-    // option-(a) call-out in the #9.4 narrative).
+    // No package.json materialized either; the command does not auto-init
+    // a project from this failure path.
     assert!(
         !project.file_exists("package.json"),
         "preflight failure must not auto-create a manifest"
     );
 }
 
-// ─── Test 3: #9.2 + #9.3 rollback ───────────────────────────────────
+// ─── Rollback ────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn lpm_add_rollback_restores_manifest_and_source_files_on_install_failure() {
     // Setup: source pkg declares an Exact-pinned dep whose tarball
     // path is NOT mounted on the mock. The Exact intent skips
-    // `lpm add`'s pre-resolve at #9.1 (verbatim preservation), so
-    // resolution succeeds at the metadata layer; the trailing install
-    // then 404s on the tarball download, fails, and the
-    // ManifestTransaction Drops uncommitted — rolling back the
-    // package.json mutation AND the source-file copies.
+    // `lpm add` preserves the exact dep spec here, so resolution succeeds
+    // at the metadata layer; the trailing install then 404s on the
+    // tarball download, fails, and the ManifestTransaction drops
+    // uncommitted, rolling back the package.json mutation and source-file
+    // copies.
     let mock = MockRegistry::start().await;
 
     let lpm_config = json!({
@@ -565,13 +563,11 @@ async fn lpm_add_rollback_restores_manifest_and_source_files_on_install_failure(
     );
 
     // **Source files rolled back.** Baz.tsx was a NEW file (didn't
-    // exist before); the rollback should have deleted it. This is the
-    // #9.3 property — ManifestTransaction extends to source-file
-    // copies, not just manifests + lockfiles.
+    // exist before); the rollback should have deleted it. The transaction
+    // covers source-file copies, not just manifests + lockfiles.
     assert!(
         !project.file_exists("components/Baz.tsx"),
-        "source file copied during the failed run must be deleted on \
-         rollback (#9.3 contract)"
+        "source file copied during the failed run must be deleted on rollback"
     );
 }
 

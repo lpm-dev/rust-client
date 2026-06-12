@@ -1,4 +1,4 @@
-//! **Tier placement: cli-binary** (per CLAUDE.md `# Testing Tier
+//! **Tier placement: cli-binary** (per AGENTS.md `# Testing Tier
 //! Discipline`). Justification class: **parser/schema corpus**. This
 //! file iterates JSON fixtures under `tests/fixtures/lpm_config_corpus/`
 //! and validates each against the hand-authored schema using the
@@ -13,7 +13,7 @@
 //! Validates the hand-authored `lpm.config.json` schema against a
 //! curated corpus of fixtures.
 //!
-//! The schema sits next to the consumer code in `commands/add.rs` and
+//! The schema sits next to the consumer code in `commands/add/` and
 //! must agree with what the runtime actually accepts. Without a corpus
 //! it would silently drift the moment someone added a new field.
 //!
@@ -25,12 +25,12 @@
 //!
 //! The numeric prefix orders fixtures so test failures point at a
 //! stable filename. Add new ones whenever the consumer surface in
-//! `add.rs` grows or shifts.
+//! `commands/add/` grows or shifts.
 //!
 //! When this test fails the cause is one of:
 //!  - The schema is wrong → fix `crates/lpm-cli/schemas/lpm.config.schema.json`.
 //!  - The fixture is wrong → adjust the fixture to match the new contract.
-//!  - The consumer code in `add.rs` shifted → update both the schema
+//!  - The consumer code in `commands/add/` shifted → update both the schema
 //!    and the fixture together.
 
 use jsonschema::Validator;
@@ -133,7 +133,7 @@ fn every_negative_fixture_is_rejected() {
 #[test]
 fn corpus_covers_the_documented_field_surface() {
     // Pin the de-facto Rust-consumer field surface so adding a new
-    // top-level key to add.rs without a fixture trips this test.
+    // top-level key to commands/add/ without a fixture trips this test.
     // Update this list AND add a fixture whenever the consumer
     // surface grows.
     const REQUIRED_KEYS: &[&str] = &[
