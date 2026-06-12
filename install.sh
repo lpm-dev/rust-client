@@ -2,11 +2,12 @@
 # LPM CLI installer
 # Usage: curl -fsSL https://raw.githubusercontent.com/lpm-dev/rust-client/main/install.sh | sh
 #
-# Installs the latest LPM CLI binary to ~/.lpm/bin and adds it to PATH.
+# Installs the latest (or requested) LPM CLI binary to ~/.lpm/bin and adds it to PATH.
 # Every downloaded byte is verified against a signed SHA256SUMS.txt
 # manifest before chmod +x; cosign verify-blob runs opportunistically
 # when a cosign binary is on PATH. Set LPM_INSTALL_INSECURE=1 to skip
 # all integrity checks (NOT recommended; emergency-recovery only).
+# Set LPM_INSTALL_VERSION=vX.Y.Z to install a specific release tag.
 
 set -e
 
@@ -115,10 +116,20 @@ if [ -n "${LPM_INSTALL_TEST_DOWNLOAD_BASE:-}" ] && ! is_loopback_http "$LPM_INST
   exit 1
 fi
 
-API_URL="${LPM_INSTALL_TEST_API_URL:-https://api.github.com/repos/$REPO/releases/latest}"
+REQUESTED_VERSION="${LPM_INSTALL_VERSION:-}"
+if [ -n "$REQUESTED_VERSION" ]; then
+  VERSION="$REQUESTED_VERSION"
+  echo "Using requested version $VERSION..."
+else
+  API_URL="${LPM_INSTALL_TEST_API_URL:-https://api.github.com/repos/$REPO/releases/latest}"
 
-echo "Detecting latest version..."
-VERSION=$(curl -fsSL "$API_URL" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+  echo "Detecting latest version..."
+  API_RESPONSE="$(curl -fsSL --max-time 30 "$API_URL")" || {
+    echo "Failed to detect latest version. Check https://github.com/$REPO/releases"
+    exit 1
+  }
+  VERSION=$(printf '%s\n' "$API_RESPONSE" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+fi
 
 if [ -z "$VERSION" ]; then
   echo "Failed to detect latest version. Check https://github.com/$REPO/releases"

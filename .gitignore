@@ -1,6 +1,7 @@
 /target
 .npmrc
-.lpm/certs/
+/.lpm/
+/node_modules/
 
 AGENTS.md
 
@@ -20,6 +21,7 @@ AGENTS
 /bench/.audit-local
 /bench/.audit-remote
 /bench/.audit-local-home
+/bench/.last-bench.log
 /bench/.work
 /bench/.pgo-work
 /bench/fixture-large
