@@ -67,8 +67,8 @@ use std::path::{Path, PathBuf};
 /// here AND ensure they live at the top level of the package directory
 /// (the filter only matches the file basename at the top level).
 ///
-/// See `crates/lpm-store/src/lib.rs` line 131 (`.integrity`) and
-/// line 141 (`.lpm-security.json`).
+/// See `lpm-store`'s extraction paths for the `.integrity` and
+/// `.lpm-security.json` write sites.
 pub const STORE_INTERNAL_FILES: &[&str] = &[".integrity", ".lpm-security.json"];
 
 /// The breadcrumb file `lpm patch` writes at the staging-dir root so
