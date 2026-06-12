@@ -206,7 +206,7 @@ fn prompt_pair_confirmation() -> Result<(), LpmError> {
 }
 
 pub(super) async fn env_pair(args: &[&str], json_output: bool) -> Result<(), LpmError> {
-    let parsed = parse_pair_args(&args[1..])?;
+    let parsed = parse_pair_args(args)?;
 
     let registry_url = lpm_common::resolve_lpm_registry_url();
     // Vault pairing requires a refresh-backed session. The

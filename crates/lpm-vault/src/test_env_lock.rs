@@ -1,5 +1,5 @@
 //! Crate-wide env-mutation lock for tests across `crypto.rs`,
-//! `lib.rs`, `keychain.rs`, and `sync.rs`.
+//! `lib.rs`, `keychain.rs`, and the `sync/` modules.
 //!
 //! Several test helpers mutate process-wide env vars (`HOME`,
 //! `LPM_FORCE_FILE_VAULT`, `LPM_TEST_FAST_SCRYPT`) inside
