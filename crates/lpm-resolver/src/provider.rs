@@ -730,7 +730,7 @@ impl LpmDependencyProvider {
     // clippy's type_complexity threshold (was `CachedPackageInfo` alone).
     // CLAUDE.md explicitly permits `#[allow(clippy::type_complexity)]`
     // for design-level lints where the fix would be a refactor; the
-    // single caller in `resolve.rs` already destructures with readable
+    // single caller in `resolve::format_solution` already destructures with readable
     // names, so a named-fields struct here is cleanup-of-clean-code.
     #[allow(clippy::type_complexity)]
     pub fn into_parts(
@@ -1176,7 +1176,7 @@ pub(crate) fn version_allowed_by_policy(
 /// Validate a dependency name from registry metadata.
 /// Rejects path traversal, null bytes, excessive length, and invalid formats.
 ///
-/// `pub(crate)` so the peer-rules selector parser in `resolve.rs` can
+/// `pub(crate)` so the peer-rules selector parser in `resolve::peers` can
 /// reuse the same npm-name validity gate without duplicating the
 /// scope / unscoped logic.
 pub(crate) fn is_valid_dep_name(name: &str) -> bool {
@@ -1844,7 +1844,7 @@ impl DependencyProvider for LpmDependencyProvider {
         // peers react@^16 but styled-components@6 peers react@^18 — union would
         // force react@^18, breaking projects using v5).
         //
-        // See resolve.rs: check_unmet_peers() for the post-resolution check.
+        // See check_unmet_peers() for the post-resolution check.
 
         Ok(Dependencies::Available(constraints))
     }

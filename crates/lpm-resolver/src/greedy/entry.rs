@@ -6,7 +6,7 @@ use super::state::ResolveState;
 
 /// Entry point — same signature shape as
 /// [`crate::resolve::resolve_with_shared_cache`] so the dispatch in
-/// `resolve.rs` can swap implementations behind a feature flag.
+/// [`crate::resolve`] can swap implementations behind a feature flag.
 ///
 /// **`auto_install_peers`** — `true` to enable bun-parity eager peer
 /// auto-install: any non-optional `peerDependency` not already satisfied
@@ -193,7 +193,7 @@ pub async fn resolve_greedy_with_options_and_policy(
     // Build the public result. Cache the in-memory CachedPackageInfo from
     // shared_cache for the downstream `check_unmet_peers` pass and the
     // install pipeline's tarball-url lookup (matching the format_solution
-    // contract in resolve.rs).
+    // contract in `format_solution`).
     // Surface `Arc<CachedPackageInfo>` directly — materializing
     // `HashMap<_, CachedPackageInfo>` by deep-cloning each entry causes
     // significant allocator churn (seven nested HashMaps per package).
