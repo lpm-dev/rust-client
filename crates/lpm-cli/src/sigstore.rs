@@ -32,7 +32,7 @@ const SIGSTORE_HTTP_TIMEOUT_SECS: u64 = 30;
 /// Maximum response body bytes we will buffer from Fulcio or Rekor.
 /// Real responses are kilobyte-sized; the cap exists to prevent a
 /// compromised endpoint from streaming GiB of data into our heap. Matches
-/// the cap in [`crate::provenance_fetch`] for consistency.
+/// the cap in [`crate::provenance_bundle`] for consistency.
 const SIGSTORE_RESPONSE_CAP_BYTES: usize = 1024 * 1024;
 
 /// Sigstore service endpoints.

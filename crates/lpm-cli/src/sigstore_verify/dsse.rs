@@ -54,7 +54,7 @@ pub(crate) fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
 ///   sigstore-rs versions) emit.
 ///
 /// The fallback decoding tries raw first; DER second.
-#[allow(dead_code)] // wired into provenance_fetch
+#[allow(dead_code)] // wired into provenance_bundle
 pub fn verify_dsse(envelope: &DsseEnvelope, cert: &X509Certificate<'_>) -> Result<(), VerifyError> {
     if envelope.signatures.is_empty() {
         return Err(VerifyError::DsseSignature(

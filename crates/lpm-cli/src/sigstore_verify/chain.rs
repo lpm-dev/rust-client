@@ -49,7 +49,7 @@ const MAX_CHAIN_LENGTH: usize = 3;
 /// forged child leaf with attacker-controlled SAN, bypassing
 /// Sigstore's identity binding entirely. The extension enforcement
 /// is load-bearing for the verifier's core guarantee.
-#[allow(dead_code)] // wired into provenance_fetch
+#[allow(dead_code)] // wired into provenance_bundle
 pub fn verify_cert_chain(
     bundle_chain_der: &[&[u8]],
     fulcio_roots: &[&FulcioRoot],

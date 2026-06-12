@@ -47,7 +47,7 @@ struct RekorHashRef {
 /// Both shapes carry the same load-bearing information; the
 /// extraction handles the field-name differences and the verifier
 /// runs identical hard-fail checks against the unified view.
-#[allow(dead_code)] // wired into provenance_fetch
+#[allow(dead_code)] // wired into provenance_bundle
 pub fn verify_rekor_body(
     tlog_entry: &crate::sigstore::TlogEntry,
     envelope: &DsseEnvelope,
