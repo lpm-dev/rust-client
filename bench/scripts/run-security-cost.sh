@@ -1,16 +1,15 @@
 #!/bin/bash
-# measurement-sprint A — security-analyzer wall-cost on the
-# fusion install hot path. Two cells, n=20 round-robin per outer iter.
+# Security-analyzer wall-cost on the fused install hot path. Two cells,
+# n=20 round-robin per outer iter.
 #
 #   fusion-baseline    — current default (security analyzer fused into extract)
-#   fusion-no-security — LPM_SKIP_SECURITY=1 (predicate disabled, inspector
-#                        no-op, finalize skipped — see lpm-store/src/lib.rs)
+#   fusion-no-security — LPM_SKIP_SECURITY=1 (predicate disabled,
+#                        inspector no-op, finalize skipped in
+#                        lpm-store's extraction module)
 #
 # Wall delta = empirical cost of behavioral analysis on bench/fixture-large.
-# Compares against Gemini's "~300 ms wall-clock win from deferring the
-# analyzer" claim, which assumed a serial post-extract pass. P2
-# already folded analysis INTO the extract pass, so the empirical answer
-# may differ substantially from the model.
+# The analyzer is already folded into the extract pass, so compare
+# measured wall time rather than assuming a separate post-extract pass.
 #
 # Usage: $0 <n_iters> [<tag>]
 set -euo pipefail
