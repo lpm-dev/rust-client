@@ -32,6 +32,7 @@ pub mod path_onboarding;
 pub mod precedence;
 mod prompt;
 mod provenance;
+mod provenance_bundle;
 mod provenance_fetch;
 mod quality;
 mod registry_signatures;

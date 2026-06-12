@@ -345,7 +345,7 @@ static TRUST_ROOT_CELL: OnceLock<Result<Arc<TrustRoot>, String>> = OnceLock::new
 /// returns an error for the process lifetime, it always will. That's
 /// load-bearing: a verifier path that succeeded the first call must
 /// not silently start failing mid-install because something flapped.
-#[allow(dead_code)] // wired into provenance_fetch
+#[allow(dead_code)] // wired into provenance_bundle
 pub fn trust_root() -> Result<Arc<TrustRoot>, VerifyError> {
     let cached = TRUST_ROOT_CELL.get_or_init(|| {
         let parsed =

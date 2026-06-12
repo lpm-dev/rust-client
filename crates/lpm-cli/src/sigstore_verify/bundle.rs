@@ -107,7 +107,7 @@ pub struct VerifiedProvenance {
 /// failure short-circuits with the most-specific `VerifyError`
 /// variant so the caller can surface diagnostics without a generic
 /// "verification failed" rollup.
-#[allow(dead_code)] // wired into provenance_fetch
+#[allow(dead_code)] // wired into provenance_bundle
 #[tracing::instrument(skip_all, name = "provenance.verify", level = "debug")]
 pub fn verify_sigstore_bundle(
     body: &[u8],
@@ -248,8 +248,8 @@ pub(super) struct BundleComponents {
 
 /// Parse a Sigstore bundle body into [`BundleComponents`]. Handles
 /// the three wire shapes the production fetch path already deals
-/// with (mirrors [`crate::provenance_fetch::find_leaf_cert_rawbytes`]
-/// for cert extraction):
+/// with (mirrors the legacy identity-only parser in
+/// `crate::provenance_bundle` for cert extraction):
 ///
 /// 1. **Sigstore Bundle v0.2** — chain at
 ///    `verificationMaterial.x509CertificateChain.certificates[]`.
@@ -598,7 +598,7 @@ fn extract_leaf_san_uri(leaf: &X509Certificate<'_>) -> Option<String> {
 
 /// Build the `ProvenanceSnapshot` consumed by the drift gate
 /// (`lpm_security::provenance::check_provenance_drift`). Reuses
-/// the leaf-cert SAN parsing already in `provenance_fetch`; this
+/// the same leaf-cert SAN parsing contract as `provenance_bundle`; this
 /// helper exists so the snapshot construction has the same shape
 /// regardless of which code path produced the leaf cert.
 fn build_provenance_snapshot(
@@ -617,7 +617,7 @@ fn build_provenance_snapshot(
 }
 
 /// Parse a GitHub Actions SAN URI into `(publisher, workflow_path,
-/// workflow_ref)`. Mirrors `provenance_fetch::parse_github_actions_uri`
+/// workflow_ref)`. Mirrors `provenance_bundle`'s GitHub Actions parser
 /// — kept inline in the verifier so the orchestrator doesn't reach
 /// out into the install-path module; the duplication is small (10
 /// lines) and the two stay in sync via the workflow tests that
