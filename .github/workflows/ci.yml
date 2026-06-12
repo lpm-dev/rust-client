@@ -176,6 +176,24 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Cache npm (Verdaccio test harness)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-verdaccio-${{ hashFiles('tests/workflows/tests/support/verdaccio.rs') }}
+          restore-keys: ${{ runner.os }}-npm-verdaccio-
+
+      - name: Pre-warm Verdaccio in npm cache
+        run: |
+          set -e
+          VERDACCIO_VERSION=$(grep -oE 'VERDACCIO_VERSION: &str = "[^"]+"' tests/workflows/tests/support/verdaccio.rs | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$VERDACCIO_VERSION" ]; then
+            echo "::error::Could not extract VERDACCIO_VERSION from verdaccio.rs"
+            exit 1
+          fi
+          echo "Pre-warming npm cache for verdaccio@$VERDACCIO_VERSION"
+          npx --yes "verdaccio@$VERDACCIO_VERSION" --version
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
