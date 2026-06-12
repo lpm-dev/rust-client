@@ -5,10 +5,9 @@
 //! schema additions are forward-compatible with old on-disk state (see
 //! the schema comment in `build_state.rs`).
 //!
-//! `ProvenanceSnapshot` was moved to `lpm-workspace` so that
-//! `TrustedDependencyBinding.provenance_at_approval` can reference it
-//! without inducing a `lpm-workspace → lpm-security` dependency cycle.
-//! See the struct's doc comment in `lpm-workspace/src/lib.rs`.
+//! `ProvenanceSnapshot` is owned by `lpm-common` and re-exported by
+//! `lpm-workspace` so `TrustedDependencyBinding.provenance_at_approval`
+//! can share the schema without inducing a workspace/security dependency cycle.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -259,10 +258,8 @@ mod tests {
         assert_eq!(empty.into_iter().reduce(StaticTier::worse_of), None);
     }
 
-    // ProvenanceSnapshot tests live in `lpm-workspace/src/lib.rs`
-    // because `TrustedDependencyBinding.provenance_at_approval` needs
-    // to reference it, and `lpm-security` already depends on
-    // `lpm-workspace` (reverse edge would cycle).
+    // ProvenanceSnapshot serde coverage lives with the shared schema in
+    // `lpm-common`; this module keeps the behavioral-tag tests local.
 
     // ── hash_behavioral_tag_set ───────────────────────────────────
 
