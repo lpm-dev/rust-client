@@ -185,7 +185,7 @@ fn supplemental_references(surface_id: u16) -> &'static [&'static str] {
         60 => &["crates/lpm-cli/src/commands/trust.rs"],
         64 => &["crates/lpm-cli/src/commands/audit/mod.rs"],
         66 => &["crates/lpm-cli/src/commands/query.rs"],
-        84 => &["crates/lpm-cli/src/commands/run.rs"],
+        84 => &["crates/lpm-cli/src/commands/run/mod.rs"],
         88 | 89 => &["crates/lpm-cli/src/commands/tools.rs"],
         97 => &[
             "crates/lpm-cli/src/commands/env/inventory.rs",
