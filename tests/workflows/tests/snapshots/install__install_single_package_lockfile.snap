@@ -1,11 +1,16 @@
 ---
 source: tests/workflows/tests/install.rs
-assertion_line: 1545
 expression: lockfile
 ---
 [metadata]
-lockfile-version = 4
+lockfile-version = 5
 resolved-with = "greedy-fusion"
+
+[importers."."]
+auto-install-peers = true
+
+[importers.".".dependencies]
+ms = "^2.1.3"
 
 [[packages]]
 name = "ms"

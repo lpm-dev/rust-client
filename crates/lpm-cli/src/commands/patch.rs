@@ -23,8 +23,9 @@ use crate::patch_engine::{
     GeneratedPatch, PatchSelector, STAGING_BREADCRUMB_FILE, copy_store_to_staging, generate_patch,
     parse_patch_selector, resolve_patch_selector,
 };
+use crate::patch_state;
 use lpm_common::LpmError;
-use lpm_lockfile::Lockfile;
+use lpm_lockfile::{Lockfile, LockfilePatch};
 use lpm_store::find_installed_package_baseline;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -306,6 +307,8 @@ async fn run_patch_commit_inner(
         let _ = std::fs::remove_file(&patch_file_abs);
         return Err(e);
     }
+    let lockfile_updated =
+        upsert_lockfile_patch_record(project_dir, key, &patch_file_rel, &integrity)?;
 
     // 7. Clean up the staging dir on success. Best-effort — we don't
     //    fail the command if cleanup hiccups.
@@ -322,6 +325,7 @@ async fn run_patch_commit_inner(
             "insertions": generated.insertions,
             "deletions": generated.deletions,
             "original_integrity": integrity,
+            "lockfile_updated": lockfile_updated,
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
     } else {
@@ -330,6 +334,9 @@ async fn run_patch_commit_inner(
             "Updated {}",
             install_ui::cyan("package.json › lpm.patchedDependencies")
         ));
+        if lockfile_updated {
+            install_ui::done(&format!("Updated {}", install_ui::dim("lpm.lock")));
+        }
         install_ui::detail("");
         install_ui::done("Done · patch registered for future installs");
     }
@@ -356,6 +363,12 @@ pub async fn run_patch_remove(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let outcome = remove_package_json_patches(project_dir, selectors, dry_run, keep_file)?;
+    let removed_keys: BTreeSet<String> = outcome.removed.iter().map(|r| r.key.clone()).collect();
+    let lockfile_updated = if dry_run {
+        false
+    } else {
+        remove_lockfile_patch_records(project_dir, &removed_keys)?
+    };
 
     if json_output {
         let removed: Vec<_> = outcome
@@ -376,6 +389,7 @@ pub async fn run_patch_remove(
                 "success": true,
                 "dry_run": dry_run,
                 "keep_file": keep_file,
+                "lockfile_updated": lockfile_updated,
                 "removed": removed,
             }))
             .unwrap()
@@ -416,6 +430,9 @@ pub async fn run_patch_remove(
                     install_ui::dim(&format!("({reason})"))
                 ));
             }
+        }
+        if lockfile_updated {
+            install_ui::done(&format!("Updated {}", install_ui::dim("lpm.lock")));
         }
         if dry_run {
             install_ui::done("Dry run · package.json unchanged");
@@ -699,6 +716,84 @@ fn update_package_json_patches(
     );
 
     write_package_json_value(project_dir, &value)
+}
+
+fn upsert_lockfile_patch_record(
+    project_dir: &Path,
+    key: &str,
+    patch_file_rel: &str,
+    integrity: &str,
+) -> Result<bool, LpmError> {
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    if !lockfile_path.exists() {
+        return Ok(false);
+    }
+
+    let mut lockfile = Lockfile::read_from_file(&lockfile_path).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to read {} while recording patch checksum: {e}",
+            lockfile_path.display()
+        ))
+    })?;
+    lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
+    lockfile.patches.insert(
+        key.to_string(),
+        LockfilePatch {
+            path: patch_file_rel.to_string(),
+            sha256: patch_state::patch_file_sha256(project_dir, patch_file_rel)?,
+            original_integrity: integrity.to_string(),
+        },
+    );
+    lockfile.write_all(&lockfile_path).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to write {} after recording patch checksum: {e}",
+            lockfile_path.display()
+        ))
+    })?;
+    lpm_lockfile::ensure_gitattributes(project_dir).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to ensure .gitattributes after recording patch checksum: {e}"
+        ))
+    })?;
+    Ok(true)
+}
+
+fn remove_lockfile_patch_records(
+    project_dir: &Path,
+    removed_keys: &BTreeSet<String>,
+) -> Result<bool, LpmError> {
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    if removed_keys.is_empty() || !lockfile_path.exists() {
+        return Ok(false);
+    }
+
+    let mut lockfile = Lockfile::read_from_file(&lockfile_path).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to read {} while removing patch checksum records: {e}",
+            lockfile_path.display()
+        ))
+    })?;
+    let before = lockfile.patches.len();
+    for key in removed_keys {
+        lockfile.patches.remove(key);
+    }
+    if lockfile.patches.len() == before {
+        return Ok(false);
+    }
+
+    lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
+    lockfile.write_all(&lockfile_path).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to write {} after removing patch checksum records: {e}",
+            lockfile_path.display()
+        ))
+    })?;
+    lpm_lockfile::ensure_gitattributes(project_dir).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to ensure .gitattributes after removing patch checksum records: {e}"
+        ))
+    })?;
+    Ok(true)
 }
 
 fn write_package_json_value(project_dir: &Path, value: &serde_json::Value) -> Result<(), LpmError> {

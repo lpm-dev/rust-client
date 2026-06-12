@@ -56,8 +56,8 @@ impl ManifestMetadata {
 #[derive(Debug, Clone)]
 struct PatchMetadata {
     path: String,
-    original_integrity: Option<String>,
-    patch_sha256: Option<String>,
+    original_integrity: String,
+    patch_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -220,7 +220,7 @@ async fn build_document(
         .unwrap_or("0.0.0")
         .to_string();
     let root_metadata = extract_manifest_metadata(&root_json);
-    let patch_metadata = read_patch_metadata(project_dir, &root_json)?;
+    let patch_metadata = read_patch_metadata(&lockfile);
     let direct_scopes = root_dependency_scopes(&root_json);
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
@@ -469,59 +469,19 @@ fn read_local_metadata(
     })
 }
 
-fn read_patch_metadata(
-    project_dir: &Path,
-    root_json: &Value,
-) -> Result<BTreeMap<String, PatchMetadata>, LpmError> {
+fn read_patch_metadata(lockfile: &Lockfile) -> BTreeMap<String, PatchMetadata> {
     let mut out = BTreeMap::new();
-    let Some(patches) = root_json
-        .get("lpm")
-        .and_then(|lpm| lpm.get("patchedDependencies"))
-        .and_then(Value::as_object)
-    else {
-        return Ok(out);
-    };
-
-    for (selector, value) in patches {
-        let (path, original_integrity) = match value {
-            Value::String(path) => (path.clone(), None),
-            Value::Object(obj) => {
-                let Some(path) = obj.get("path").and_then(Value::as_str) else {
-                    continue;
-                };
-                (
-                    path.to_string(),
-                    obj.get("originalIntegrity")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                )
-            }
-            _ => continue,
-        };
-        let patch_sha256 = hash_project_file(project_dir, &path)?;
+    for (selector, patch) in &lockfile.patches {
         out.insert(
             selector.clone(),
             PatchMetadata {
-                path,
-                original_integrity,
-                patch_sha256,
+                path: patch.path.clone(),
+                original_integrity: patch.original_integrity.clone(),
+                patch_sha256: patch.sha256.clone(),
             },
         );
     }
-    Ok(out)
-}
-
-fn hash_project_file(project_dir: &Path, rel_path: &str) -> Result<Option<String>, LpmError> {
-    let path = project_dir.join(rel_path);
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            let mut hasher = Sha256::new();
-            hasher.update(&bytes);
-            Ok(Some(format!("sha256-{}", hex::encode(hasher.finalize()))))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(LpmError::Io(e)),
-    }
+    out
 }
 
 fn render_cyclonedx(document: &SbomDocument) -> Value {
@@ -598,13 +558,13 @@ fn cyclonedx_component(component: &SbomComponent) -> Value {
         add_external_reference(&mut value, "distribution", tarball);
     }
     if let Some(patch) = &component.patch {
+        add_cyclonedx_patch_pedigree(&mut value, patch);
         properties.push(property("lpm:patch:path", &patch.path));
-        if let Some(integrity) = &patch.original_integrity {
-            properties.push(property("lpm:patch:originalIntegrity", integrity));
-        }
-        if let Some(sha256) = &patch.patch_sha256 {
-            properties.push(property("lpm:patch:sha256", sha256));
-        }
+        properties.push(property(
+            "lpm:patch:originalIntegrity",
+            &patch.original_integrity,
+        ));
+        properties.push(property("lpm:patch:sha256", &patch.patch_sha256));
         properties.push(property("lpm:patched", "true"));
     }
     if let Some(provenance) = &component.provenance {
@@ -633,6 +593,22 @@ fn cyclonedx_component(component: &SbomComponent) -> Value {
         object.insert("properties".to_string(), Value::Array(properties));
     }
     value
+}
+
+fn add_cyclonedx_patch_pedigree(value: &mut Value, patch: &PatchMetadata) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "pedigree".to_string(),
+            json!({
+                "patches": [{
+                    "type": "unofficial",
+                    "diff": {
+                        "url": &patch.path,
+                    },
+                }],
+            }),
+        );
+    }
 }
 
 fn merge_cyclonedx_metadata(value: &mut Value, metadata: &ManifestMetadata) {
@@ -815,12 +791,11 @@ fn spdx_attribution(component: &SbomComponent) -> Vec<String> {
     }
     if let Some(patch) = &component.patch {
         out.push(format!("lpm:patch:path={}", patch.path));
-        if let Some(integrity) = &patch.original_integrity {
-            out.push(format!("lpm:patch:originalIntegrity={integrity}"));
-        }
-        if let Some(sha256) = &patch.patch_sha256 {
-            out.push(format!("lpm:patch:sha256={sha256}"));
-        }
+        out.push(format!(
+            "lpm:patch:originalIntegrity={}",
+            patch.original_integrity
+        ));
+        out.push(format!("lpm:patch:sha256={}", patch.patch_sha256));
     }
     if let Some(provenance) = &component.provenance {
         out.push(format!("lpm:provenance:status={}", provenance.status));

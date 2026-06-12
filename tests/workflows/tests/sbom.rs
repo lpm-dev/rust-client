@@ -4,6 +4,12 @@ mod support;
 
 use support::{TempProject, lpm};
 
+fn patch_sha256(project: &TempProject, rel_path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(project.path().join(rel_path)).unwrap();
+    format!("sha256-{}", hex::encode(Sha256::digest(bytes)))
+}
+
 fn seed_lockfile(project: &TempProject) {
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.add_package(lpm_lockfile::LockedPackage {
@@ -23,6 +29,14 @@ fn seed_lockfile(project: &TempProject) {
         tarball: Some("https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz".to_string()),
         ..Default::default()
     });
+    lockfile.patches.insert(
+        "left-pad@1.3.0".to_string(),
+        lpm_lockfile::LockfilePatch {
+            path: "patches/left-pad@1.3.0.patch".to_string(),
+            sha256: patch_sha256(project, "patches/left-pad@1.3.0.patch"),
+            original_integrity: "sha512-leftpad-original".to_string(),
+        },
+    );
     lockfile
         .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
         .expect("failed to write lpm.lock");
@@ -47,6 +61,10 @@ fn seed_project() -> TempProject {
         }
     }"#,
     );
+    project.write_file(
+        "patches/left-pad@1.3.0.patch",
+        "diff --git a/index.js b/index.js\n",
+    );
     seed_lockfile(&project);
     project.write_file(
         "node_modules/left-pad/package.json",
@@ -67,10 +85,6 @@ fn seed_project() -> TempProject {
             "version": "5.0.1",
             "license": "MIT"
         }"#,
-    );
-    project.write_file(
-        "patches/left-pad@1.3.0.patch",
-        "diff --git a/index.js b/index.js\n",
     );
     project
 }
@@ -105,6 +119,14 @@ fn sbom_cyclonedx_includes_lockfile_graph_patch_and_local_metadata() {
         .find(|component| component["name"] == "left-pad")
         .expect("left-pad component must be present");
     assert_eq!(left_pad["description"], "left pad test fixture");
+    assert_eq!(
+        left_pad["pedigree"]["patches"][0]["type"],
+        serde_json::json!("unofficial")
+    );
+    assert_eq!(
+        left_pad["pedigree"]["patches"][0]["diff"]["url"],
+        serde_json::json!("patches/left-pad@1.3.0.patch")
+    );
     assert!(
         left_pad["properties"]
             .as_array()
@@ -115,6 +137,17 @@ fn sbom_cyclonedx_includes_lockfile_graph_patch_and_local_metadata() {
                     && property["value"] == "patches/left-pad@1.3.0.patch"
             }),
         "left-pad component must include patch metadata: {left_pad:#?}"
+    );
+    let expected_sha = patch_sha256(&project, "patches/left-pad@1.3.0.patch");
+    assert!(
+        left_pad["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|property| {
+                property["name"] == "lpm:patch:sha256" && property["value"] == expected_sha
+            }),
+        "left-pad component must include lockfile patch checksum: {left_pad:#?}"
     );
 
     insta::assert_json_snapshot!("sbom_cyclonedx_lockfile_graph", envelope, {

@@ -79,6 +79,7 @@ pub(super) fn vars_print(args: &[&str], project_dir: &std::path::Path) -> Result
     let mut format_str = "dotenv";
     let mut env_mode: Option<&str> = None;
     let mut schema_only = false;
+    let mut ci = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -98,8 +99,18 @@ pub(super) fn vars_print(args: &[&str], project_dir: &std::path::Path) -> Result
             }
         } else if args[i] == "--schema-only" {
             schema_only = true;
+        } else if args[i] == "--ci" {
+            ci = true;
         }
         i += 1;
+    }
+
+    if ci {
+        return super::ci::emit_project_env_for_ci(
+            project_dir,
+            env_mode,
+            super::ci::CiEnvDestination::Stdout,
+        );
     }
 
     let format = lpm_env::PrintFormat::parse(format_str).ok_or_else(|| {

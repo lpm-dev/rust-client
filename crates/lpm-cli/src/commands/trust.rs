@@ -844,6 +844,8 @@ mod tests {
                 resolved_with: Some("test".into()),
                 auto_isolated_peer_conflicts: false,
             },
+            importers: Default::default(),
+            patches: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
@@ -976,6 +978,8 @@ mod tests {
                 resolved_with: Some("test".into()),
                 auto_isolated_peer_conflicts: false,
             },
+            importers: Default::default(),
+            patches: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
@@ -1016,6 +1020,8 @@ mod tests {
                 resolved_with: Some("test".into()),
                 auto_isolated_peer_conflicts: false,
             },
+            importers: Default::default(),
+            patches: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
@@ -1053,6 +1059,8 @@ mod tests {
                 resolved_with: Some("test".into()),
                 auto_isolated_peer_conflicts: false,
             },
+            importers: Default::default(),
+            patches: Default::default(),
             packages: vec![],
             catalogs: Default::default(),
             root_aliases: Default::default(),

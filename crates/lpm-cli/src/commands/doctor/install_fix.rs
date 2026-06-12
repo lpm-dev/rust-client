@@ -11,8 +11,9 @@ pub(super) async fn run_doctor_install(
     crate::commands::install::run_with_options(
         client,
         project_dir,
-        false,                                                   // json_output
-        false,                                                   // offline
+        false, // json_output
+        false, // offline
+        crate::commands::install::FrozenLockfileMode::Never,
         false,                                                   // force
         false,                                                   // allow_new
         false,                                                   // strict_integrity

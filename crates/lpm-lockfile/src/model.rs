@@ -72,6 +72,12 @@ impl PackageKey {
 ///   (`registry-signatures`, `registry-published-at`). Warm installs
 ///   can verify package signatures from the lockfile without
 ///   rehydrating package metadata.
+/// - **v5**: importer snapshots and patch evidence. Frozen installs
+///   compare the current manifest's graph-affecting dependency
+///   declarations against importer snapshots before any resolve/write
+///   path can run. Patch records bind `lpm.patchedDependencies` to
+///   patch file SHA-256 digests so replayed installs can verify the
+///   bytes they apply.
 ///
 /// **Why this matters:** install.rs's lockfile fast path uses the
 /// version to decide whether the absence of `ambient-peer-installs`
@@ -79,13 +85,97 @@ impl PackageKey {
 /// could be a buggy-writer artifact, so the fast path is invalidated
 /// and a fresh resolve runs (which writes a v2 lockfile, restoring
 /// fast-path eligibility on subsequent installs).
-pub const LOCKFILE_VERSION: u32 = 4;
+pub const LOCKFILE_VERSION: u32 = 5;
 
 /// Default lockfile filename.
 pub const LOCKFILE_NAME: &str = "lpm.lock";
 
 /// Catalog resolutions used by this install, grouped by catalog name and package name.
 pub type CatalogSnapshots = BTreeMap<String, BTreeMap<String, CatalogSnapshotEntry>>;
+
+/// Importer snapshots keyed by importer path relative to the lockfile root.
+pub type ImporterSnapshots = BTreeMap<String, ImporterSnapshot>;
+
+/// Lockfile-recorded patch evidence keyed by `<package-name>@<version>`.
+pub type LockfilePatches = BTreeMap<String, LockfilePatch>;
+
+/// One patch file bound to the package bytes it is allowed to modify.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LockfilePatch {
+    /// Patch file path relative to the project root.
+    pub path: String,
+    /// SHA-256 digest of the patch file contents, formatted as `sha256-<hex>`.
+    pub sha256: String,
+    /// Original package SRI integrity recorded when the patch was authored.
+    #[serde(rename = "original-integrity")]
+    pub original_integrity: String,
+}
+
+/// The manifest state a frozen install compares against.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ImporterSnapshot {
+    /// `package.json > dependencies`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dependencies: BTreeMap<String, String>,
+    /// `package.json > devDependencies`.
+    #[serde(
+        default,
+        rename = "dev-dependencies",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub dev_dependencies: BTreeMap<String, String>,
+    /// `package.json > optionalDependencies`.
+    #[serde(
+        default,
+        rename = "optional-dependencies",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub optional_dependencies: BTreeMap<String, String>,
+    /// `package.json > peerDependencies`.
+    #[serde(
+        default,
+        rename = "peer-dependencies",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub peer_dependencies: BTreeMap<String, String>,
+    /// `package.json > lpm.overrides`, after any catalog protocol references are resolved.
+    #[serde(
+        default,
+        rename = "lpm-overrides",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub lpm_overrides: BTreeMap<String, String>,
+    /// Top-level npm-compatible `overrides`, after catalog protocol resolution.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overrides: BTreeMap<String, String>,
+    /// Yarn-compatible `resolutions`, after catalog protocol resolution.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resolutions: BTreeMap<String, String>,
+    /// Centralized catalog declarations visible to this importer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub catalogs: BTreeMap<String, BTreeMap<String, String>>,
+    /// Fingerprint for `package.json > lpm.patchedDependencies`.
+    #[serde(
+        default,
+        rename = "patches-fingerprint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub patches_fingerprint: Option<String>,
+    /// Fingerprint for `package.json > lpm.peerDependencyRules`.
+    #[serde(
+        default,
+        rename = "peer-dependency-rules-fingerprint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub peer_dependency_rules_fingerprint: Option<String>,
+    /// Resolved `lpm.autoInstallPeers` value used for this graph.
+    #[serde(
+        default,
+        rename = "auto-install-peers",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auto_install_peers: Option<bool>,
+}
 
 /// One lockfile-recorded catalog resolution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -115,6 +205,12 @@ pub struct LockedRegistrySignature {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Lockfile {
     pub metadata: LockfileMetadata,
+    /// Manifest/importer snapshots used by frozen installs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub importers: ImporterSnapshots,
+    /// Patch files that change installed package bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub patches: LockfilePatches,
     /// Catalog protocol resolutions used by direct dependencies in this lockfile.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalogs: CatalogSnapshots,
@@ -428,6 +524,8 @@ impl Lockfile {
                 resolved_with: Some(resolver.to_string()),
                 auto_isolated_peer_conflicts: false,
             },
+            importers: ImporterSnapshots::new(),
+            patches: LockfilePatches::new(),
             catalogs: CatalogSnapshots::new(),
             packages: Vec::new(),
             root_aliases: BTreeMap::new(),

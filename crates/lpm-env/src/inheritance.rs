@@ -127,9 +127,9 @@ fn collect_chain(
 /// caller resolves the remaining (project-relative) path via
 /// `project_dir.join(...)`.
 ///
-/// M51: a hostile `lpm.json` like
+/// A hostile `lpm.json` like
 /// `{"environments":{"prod":{"file":"../.env"}}}` would otherwise let
-/// `lpm run --env`, `lpm env print`, `lpm ci env`, or `lpm dev` load
+/// `lpm run --env`, `lpm env print --ci`, or `lpm dev` load
 /// dotenv contents from outside the repo and emit / inject them
 /// into the child process or generated env files. Containment lives
 /// at the manifest boundary so every downstream consumer

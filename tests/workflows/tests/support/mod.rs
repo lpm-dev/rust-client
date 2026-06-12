@@ -228,13 +228,12 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("GITLAB_TOKEN");
     cmd.remove_env("CI_JOB_TOKEN");
 
-    // Clear CI-environment OIDC vars that GitHub Actions / GitLab inject
-    // into every job. Without this, OIDC tests running ON GitHub Actions
-    // pick the runner's CI provider (because `GITHUB_ACTIONS=true` is
-    // always set) and exchange against the real provider instead of the
-    // mock the test set up — failure looks like "ACTIONS_ID_TOKEN_REQUEST_TOKEN
-    // not set" because we strip the inner token vars but not the
-    // *gating* `GITHUB_ACTIONS` flag.
+    // Clear CI-environment vars that GitHub Actions / GitLab inject into
+    // every job. Without this, OIDC tests running ON GitHub Actions pick the
+    // runner's CI provider (because `GITHUB_ACTIONS=true` is always set) and
+    // exchange against the real provider instead of the mock the test set up.
+    // Generic `CI=true` also carries install semantics: tests opt into it
+    // explicitly when they want auto-frozen installs.
     //
     // The full list mirrors every env var read by `get_ci_oidc_token`
     // and `oidc::detect_ci_environment` so the tests exercise only the
@@ -242,6 +241,7 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     // intentionally exercise a CI provider re-set the relevant vars
     // themselves on their command builder (later `cmd.env(...)` calls
     // override these `env_remove`s).
+    cmd.remove_env("CI");
     cmd.remove_env("GITHUB_ACTIONS");
     cmd.remove_env("ACTIONS_ID_TOKEN_REQUEST_URL");
     cmd.remove_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN");

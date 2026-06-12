@@ -35,6 +35,8 @@ pub struct DiscoveredPackage {
     pub path: String,
     /// SRI integrity hash from the lockfile (e.g., "sha512-...").
     pub integrity: Option<String>,
+    /// Patch-file digest from `lpm.lock`, when this package's installed bytes are patched.
+    pub patch_sha256: Option<String>,
     /// Tarball resolved URL. Used for private registry detection.
     pub resolved_url: Option<String>,
     /// How this package can be scanned.
@@ -164,11 +166,18 @@ fn discover_from_lpm_lock(project_root: &Path) -> Result<DiscoveryResult, LpmErr
                 })
                 .collect();
 
+            let selector = format!("{}@{}", p.name, p.version);
+            let patch_sha256 = lockfile
+                .patches
+                .get(&selector)
+                .map(|patch| patch.sha256.clone());
+
             DiscoveredPackage {
                 name: p.name.clone(),
                 version: p.version.clone(),
                 path: format!("node_modules/{}", p.name),
                 integrity: p.integrity.clone(),
+                patch_sha256,
                 resolved_url: None,
                 scan_mode: ScanMode::RegistryAndStore,
                 is_dev: false,
@@ -276,6 +285,7 @@ fn discover_from_yarn_lockfile(project_root: &Path) -> Result<DiscoveryResult, L
                 version: p.version.clone(),
                 path: format!("node_modules/{}", p.name),
                 integrity: p.integrity.clone(),
+                patch_sha256: None,
                 resolved_url: p.resolved.clone(),
                 scan_mode: ScanMode::OsvOnly,
                 is_dev: p.is_dev,
@@ -439,6 +449,7 @@ fn read_package_from_node_modules(
             version,
             path,
             integrity: None,
+            patch_sha256: None,
             resolved_url: None,
             scan_mode: ScanMode::FullLocal,
             is_dev: false,            // Can't determine without lockfile
@@ -504,6 +515,7 @@ fn migrated_to_discovered(
             version: mp.version.clone(),
             path,
             integrity: mp.integrity.clone(),
+            patch_sha256: None,
             resolved_url: mp.resolved.clone(),
             scan_mode,
             is_dev: mp.is_dev,

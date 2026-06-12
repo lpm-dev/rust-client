@@ -500,7 +500,8 @@ pub async fn run(
         client,
         project_dir,
         json_output,
-        false,                                                 // offline
+        false, // offline
+        crate::commands::install::FrozenLockfileMode::Never,
         false,                                                 // force
         false,                                                 // allow_new
         false,                                                 // strict_integrity

@@ -23,8 +23,9 @@ pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
 pub use error::LockfileError;
 pub use io::ensure_gitattributes;
 pub use model::{
-    CatalogSnapshotEntry, CatalogSnapshots, DEFAULT_RESOLVED_WITH, LOCKFILE_NAME, LOCKFILE_VERSION,
-    LockedPackage, LockedRegistrySignature, Lockfile, LockfileMetadata, PackageKey, is_safe_source,
+    CatalogSnapshotEntry, CatalogSnapshots, DEFAULT_RESOLVED_WITH, ImporterSnapshot,
+    ImporterSnapshots, LOCKFILE_NAME, LOCKFILE_VERSION, LockedPackage, LockedRegistrySignature,
+    Lockfile, LockfileMetadata, LockfilePatch, LockfilePatches, PackageKey, is_safe_source,
 };
 pub use source::{Source, SourceParseError};
 

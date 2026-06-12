@@ -11,9 +11,10 @@
 //! 8. Print summary
 
 use crate::install_ui;
+use crate::patch_state;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
-use lpm_lockfile::LOCKFILE_NAME;
+use lpm_lockfile::{LOCKFILE_NAME, LockfilePatch};
 use lpm_migrate::backup::{self, MigrationBackup};
 use lpm_registry::RegistryClient;
 use std::path::Path;
@@ -58,7 +59,7 @@ pub async fn run(
         install_ui::phase("Detecting current package manager");
     }
 
-    let result = lpm_migrate::migrate(cwd)?;
+    let mut result = lpm_migrate::migrate(cwd)?;
 
     if !json {
         render_detected_source(&result, dry_run);
@@ -306,6 +307,17 @@ pub async fn run(
             render_migration_failure_with_rollback(&e, &migration_backup);
             return Err(e);
         }
+        if let Err(e) =
+            record_migrated_patch_records(cwd, &mut result.lockfile, &patches_plan.to_apply)
+                .and_then(|_| {
+                    result.lockfile.write_all(&lockfile_path).map_err(|e| {
+                        LpmError::Script(format!("failed to write lockfile patch records: {e}"))
+                    })
+                })
+        {
+            render_migration_failure_with_rollback(&e, &migration_backup);
+            return Err(e);
+        }
         if !json {
             let n = patches_plan.to_apply.len();
             let copied = patches_plan
@@ -358,9 +370,10 @@ pub async fn run(
             cwd,
             json,
             false, // not offline — need to download tarballs
-            false, // force
-            false, // allow_new
-            false, // strict_integrity
+            super::install::FrozenLockfileMode::Never,
+            false,                                                   // force
+            false,                                                   // allow_new
+            false,                                                   // strict_integrity
             None,  // strict_peer_dependencies_override
             None,  // linker_override
             true,  // no_skills — skip skill setup during migration
@@ -1390,6 +1403,29 @@ fn apply_patches(
     if let Err(e) = std::fs::rename(&tmp, pkg_path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(LpmError::Io(e));
+    }
+    Ok(())
+}
+
+fn record_migrated_patch_records(
+    project_dir: &Path,
+    lockfile: &mut lpm_lockfile::Lockfile,
+    to_apply: &[super::migrate_patches::PatchTranslation],
+) -> Result<(), LpmError> {
+    if to_apply.is_empty() {
+        return Ok(());
+    }
+
+    lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
+    for t in to_apply {
+        lockfile.patches.insert(
+            t.lpm_key.clone(),
+            LockfilePatch {
+                path: t.dest_relative.clone(),
+                sha256: patch_state::patch_file_sha256(project_dir, &t.dest_relative)?,
+                original_integrity: t.integrity.clone(),
+            },
+        );
     }
     Ok(())
 }

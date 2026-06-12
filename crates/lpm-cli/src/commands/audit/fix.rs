@@ -191,6 +191,7 @@ pub async fn run_fix(
         project_dir,
         false, // keep audit-fix JSON stdout single-document
         false, // offline
+        crate::commands::install::FrozenLockfileMode::Never,
         false, // force
         false, // allow_new
         false, // strict_integrity

@@ -41,6 +41,14 @@ pub(crate) fn find_project_baseline(
         .flatten()
 }
 
+pub(crate) fn audit_cache_integrity(pkg: &DiscoveredPackage) -> Option<&str> {
+    pkg.patch_sha256.as_deref().or(pkg.integrity.as_deref())
+}
+
+pub(crate) fn can_reuse_lpm_store_analysis(pkg: &DiscoveredPackage) -> bool {
+    pkg.patch_sha256.is_none()
+}
+
 /// A fully loaded package inventory ready for audit or query consumption.
 ///
 /// Contains discovered packages with their behavioral analysis loaded
@@ -133,28 +141,35 @@ impl PackageInventory {
         let loaded: Vec<LoadedAnalysis> = scannable
             .par_iter()
             .filter_map(|pkg| {
+                let cache_integrity = audit_cache_integrity(pkg);
                 let cached_analysis = if pkg.scan_mode == ScanMode::RegistryAndStore {
-                    lpm_root
-                        .as_ref()
-                        .and_then(|root| {
-                            find_project_baseline(
-                                baseline_index.as_ref(),
-                                root,
-                                &pkg.name,
-                                &pkg.version,
-                            )
-                        })
-                        .and_then(|baseline| {
-                            lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
-                        })
-                        .or_else(|| {
-                            project_cache_ref
-                                .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
-                                .cloned()
-                        })
+                    let store_analysis = if can_reuse_lpm_store_analysis(pkg) {
+                        lpm_root
+                            .as_ref()
+                            .and_then(|root| {
+                                find_project_baseline(
+                                    baseline_index.as_ref(),
+                                    root,
+                                    &pkg.name,
+                                    &pkg.version,
+                                )
+                            })
+                            .and_then(|baseline| {
+                                lpm_security::behavioral::read_cached_analysis(
+                                    &baseline.package_dir,
+                                )
+                            })
+                    } else {
+                        None
+                    };
+                    store_analysis.or_else(|| {
+                        project_cache_ref
+                            .and_then(|c| c.get(&pkg.path, cache_integrity))
+                            .cloned()
+                    })
                 } else {
                     project_cache_ref
-                        .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
+                        .and_then(|c| c.get(&pkg.path, cache_integrity))
                         .cloned()
                 };
 
@@ -167,7 +182,7 @@ impl PackageInventory {
                         path: pkg.path.clone(),
                         name: pkg.name.clone(),
                         version: pkg.version.clone(),
-                        integrity: pkg.integrity.clone(),
+                        integrity: pkg.patch_sha256.clone().or_else(|| pkg.integrity.clone()),
                         analysis: analysis.clone(),
                         dependencies: pkg.dependencies.clone(),
                     };
@@ -229,5 +244,45 @@ impl PackageInventory {
             .filter(|p| !p.name.starts_with("@lpm.dev/"))
             .map(|p| (p.name.clone(), p.version.clone()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::discovery::ScanMode;
+    use super::*;
+
+    fn discovered_package(
+        integrity: Option<&str>,
+        patch_sha256: Option<&str>,
+    ) -> DiscoveredPackage {
+        DiscoveredPackage {
+            name: "left-pad".to_string(),
+            version: "1.3.0".to_string(),
+            path: "node_modules/left-pad".to_string(),
+            integrity: integrity.map(str::to_string),
+            patch_sha256: patch_sha256.map(str::to_string),
+            resolved_url: None,
+            scan_mode: ScanMode::RegistryAndStore,
+            is_dev: false,
+            is_optional: false,
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn audit_cache_integrity_prefers_patch_checksum_over_package_integrity() {
+        let pkg = discovered_package(Some("sha512-package"), Some("sha256-patch"));
+
+        assert_eq!(audit_cache_integrity(&pkg), Some("sha256-patch"));
+    }
+
+    #[test]
+    fn patched_lpm_package_does_not_reuse_pristine_store_analysis() {
+        let patched = discovered_package(Some("sha512-package"), Some("sha256-patch"));
+        let unpatched = discovered_package(Some("sha512-package"), None);
+
+        assert!(!can_reuse_lpm_store_analysis(&patched));
+        assert!(can_reuse_lpm_store_analysis(&unpatched));
     }
 }

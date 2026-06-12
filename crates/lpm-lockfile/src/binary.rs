@@ -98,7 +98,7 @@ fn read_u16_le(bytes: &[u8], off: usize) -> u16 {
 /// Binary format capability check — does this lockfile fit the wire format?
 ///
 /// Does this lockfile fit the binary wire format? The binary format
-/// has no section for TOML-only metadata such as alias, peer,
+/// has no section for TOML-only metadata such as patch, alias, peer,
 /// platform, catalog, or registry-signature state. Writing those
 /// lockfiles as binary would silently drop data and make the generated
 /// companion disagree with the reviewer-visible TOML lockfile. The
@@ -108,6 +108,12 @@ fn read_u16_le(bytes: &[u8], off: usize) -> u16 {
 /// Returns `true` for lockfiles whose metadata fits the current binary
 /// slots; `false` the moment any TOML-only field is populated.
 pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
+    if !lockfile.importers.is_empty() {
+        return false;
+    }
+    if !lockfile.patches.is_empty() {
+        return false;
+    }
     if !lockfile.root_aliases.is_empty() {
         return false;
     }
@@ -631,6 +637,8 @@ impl BinaryLockfileReader {
                 resolved_with: Some(crate::DEFAULT_RESOLVED_WITH.to_string()),
                 auto_isolated_peer_conflicts: false,
             },
+            importers: crate::ImporterSnapshots::new(),
+            patches: crate::LockfilePatches::new(),
             catalogs: crate::CatalogSnapshots::new(),
             packages,
             // The binary format cannot represent alias metadata; any

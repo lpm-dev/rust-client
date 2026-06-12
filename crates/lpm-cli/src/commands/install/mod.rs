@@ -15,7 +15,7 @@ use lpm_resolver::{
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -71,6 +71,325 @@ use workspace::*;
 pub(crate) struct InstallOmitPolicy {
     pub dev: bool,
     pub optional: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum FrozenLockfileMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl FrozenLockfileMode {
+    fn is_active(self, lockfile_path: &Path) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => lockfile_path.exists() && install_running_in_ci(),
+        }
+    }
+}
+
+pub(crate) fn install_running_in_ci() -> bool {
+    crate::install_state::ci_env_is_truthy()
+}
+
+fn btree_from_hash_map(map: &HashMap<String, String>) -> BTreeMap<String, String> {
+    map.iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn nested_btree_from_hash_map(
+    map: &HashMap<String, HashMap<String, String>>,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    map.iter()
+        .map(|(key, value)| (key.clone(), btree_from_hash_map(value)))
+        .collect()
+}
+
+fn peer_rules_fingerprint(pkg: &lpm_workspace::PackageJson) -> Option<String> {
+    let rules = pkg.lpm.as_ref().map(|lpm| &lpm.peer_dependency_rules)?;
+    if rules == &lpm_workspace::PeerDependencyRules::default() {
+        return None;
+    }
+    let bytes = serde_json::to_vec(rules).ok()?;
+    use sha2::{Digest, Sha256};
+    Some(format!("sha256-{}", hex::encode(Sha256::digest(bytes))))
+}
+
+fn importer_snapshot_for_current_manifest(
+    pkg: &lpm_workspace::PackageJson,
+    lpm_overrides: &HashMap<String, String>,
+    overrides: &HashMap<String, String>,
+    resolutions: &HashMap<String, String>,
+    catalogs: &HashMap<String, HashMap<String, String>>,
+    patches_fingerprint: Option<&str>,
+    auto_install_peers: bool,
+) -> lpm_lockfile::ImporterSnapshot {
+    lpm_lockfile::ImporterSnapshot {
+        dependencies: btree_from_hash_map(&pkg.dependencies),
+        dev_dependencies: btree_from_hash_map(&pkg.dev_dependencies),
+        optional_dependencies: btree_from_hash_map(&pkg.optional_dependencies),
+        peer_dependencies: btree_from_hash_map(&pkg.peer_dependencies),
+        lpm_overrides: btree_from_hash_map(lpm_overrides),
+        overrides: btree_from_hash_map(overrides),
+        resolutions: btree_from_hash_map(resolutions),
+        catalogs: nested_btree_from_hash_map(catalogs),
+        patches_fingerprint: patches_fingerprint.map(str::to_string),
+        peer_dependency_rules_fingerprint: peer_rules_fingerprint(pkg),
+        auto_install_peers: Some(auto_install_peers),
+    }
+}
+
+fn validate_frozen_importer_snapshot(
+    lockfile_path: &Path,
+    lockfile: &lpm_lockfile::Lockfile,
+    current: &lpm_lockfile::ImporterSnapshot,
+) -> Result<(), LpmError> {
+    if lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION {
+        return Err(LpmError::Registry(format!(
+            "Frozen lockfile mismatch\n  lockfile    {}\n  found       v{}\n  required    v{}\n  hint        run `lpm install` locally and commit lpm.lock before running a frozen install",
+            lockfile_path.display(),
+            lockfile.metadata.lockfile_version,
+            lpm_lockfile::LOCKFILE_VERSION,
+        )));
+    }
+    let locked = lockfile.importers.get(".").ok_or_else(|| {
+        LpmError::Registry(format!(
+            "Frozen lockfile mismatch\n  lockfile    {}\n  importer    .\n  hint        run `lpm install` locally and commit the v5 lpm.lock",
+            lockfile_path.display()
+        ))
+    })?;
+
+    if let Some(diff) = first_importer_snapshot_diff(current, locked) {
+        return Err(LpmError::Registry(format!(
+            "Frozen lockfile mismatch\n  {}  {}\n  manifest    {}\n  lockfile    {}\n  hint        run `lpm install` locally and commit lpm.lock, or pass --no-frozen-lockfile",
+            diff.kind, diff.name, diff.manifest, diff.lockfile,
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_lockfile_patch_records(
+    lockfile_path: &Path,
+    lockfile: &lpm_lockfile::Lockfile,
+    current: &lpm_lockfile::LockfilePatches,
+) -> Result<(), LpmError> {
+    if lockfile.patches == *current {
+        return Ok(());
+    }
+
+    let diff = first_lockfile_patch_diff(current, &lockfile.patches).unwrap_or_else(|| {
+        LockfilePatchDiff {
+            selector: "<unknown>".to_string(),
+            field: "patches",
+            current: "<unknown>".to_string(),
+            lockfile: "<unknown>".to_string(),
+        }
+    });
+    Err(LpmError::Registry(format!(
+        "Patch lockfile mismatch\n  patch       {}\n  field       {}\n  current     {}\n  lockfile    {}\n  file        {}\n  hint        restore the patch file recorded in lpm.lock, or re-run `lpm patch` and `lpm patch-commit`",
+        diff.selector,
+        diff.field,
+        diff.current,
+        diff.lockfile,
+        lockfile_path.display(),
+    )))
+}
+
+struct LockfilePatchDiff {
+    selector: String,
+    field: &'static str,
+    current: String,
+    lockfile: String,
+}
+
+fn first_lockfile_patch_diff(
+    current: &lpm_lockfile::LockfilePatches,
+    locked: &lpm_lockfile::LockfilePatches,
+) -> Option<LockfilePatchDiff> {
+    let selectors: BTreeSet<&String> = current.keys().chain(locked.keys()).collect();
+    for selector in selectors {
+        match (current.get(selector), locked.get(selector)) {
+            (Some(current), Some(locked)) => {
+                if current.path != locked.path {
+                    return Some(LockfilePatchDiff {
+                        selector: selector.clone(),
+                        field: "path",
+                        current: current.path.clone(),
+                        lockfile: locked.path.clone(),
+                    });
+                }
+                if current.sha256 != locked.sha256 {
+                    return Some(LockfilePatchDiff {
+                        selector: selector.clone(),
+                        field: "sha256",
+                        current: current.sha256.clone(),
+                        lockfile: locked.sha256.clone(),
+                    });
+                }
+                if current.original_integrity != locked.original_integrity {
+                    return Some(LockfilePatchDiff {
+                        selector: selector.clone(),
+                        field: "original-integrity",
+                        current: current.original_integrity.clone(),
+                        lockfile: locked.original_integrity.clone(),
+                    });
+                }
+            }
+            (Some(current), None) => {
+                return Some(LockfilePatchDiff {
+                    selector: selector.clone(),
+                    field: "record",
+                    current: format!(
+                        "{} {} {}",
+                        current.path, current.sha256, current.original_integrity
+                    ),
+                    lockfile: "<absent>".to_string(),
+                });
+            }
+            (None, Some(locked)) => {
+                return Some(LockfilePatchDiff {
+                    selector: selector.clone(),
+                    field: "record",
+                    current: "<absent>".to_string(),
+                    lockfile: format!(
+                        "{} {} {}",
+                        locked.path, locked.sha256, locked.original_integrity
+                    ),
+                });
+            }
+            (None, None) => {}
+        }
+    }
+    None
+}
+
+struct ImporterSnapshotDiff {
+    kind: &'static str,
+    name: String,
+    manifest: String,
+    lockfile: String,
+}
+
+fn first_importer_snapshot_diff(
+    current: &lpm_lockfile::ImporterSnapshot,
+    locked: &lpm_lockfile::ImporterSnapshot,
+) -> Option<ImporterSnapshotDiff> {
+    compare_string_maps("dependency", &current.dependencies, &locked.dependencies)
+        .or_else(|| {
+            compare_string_maps(
+                "dev dependency",
+                &current.dev_dependencies,
+                &locked.dev_dependencies,
+            )
+        })
+        .or_else(|| {
+            compare_string_maps(
+                "optional dependency",
+                &current.optional_dependencies,
+                &locked.optional_dependencies,
+            )
+        })
+        .or_else(|| {
+            compare_string_maps(
+                "peer dependency",
+                &current.peer_dependencies,
+                &locked.peer_dependencies,
+            )
+        })
+        .or_else(|| {
+            compare_string_maps(
+                "lpm override",
+                &current.lpm_overrides,
+                &locked.lpm_overrides,
+            )
+        })
+        .or_else(|| compare_string_maps("override", &current.overrides, &locked.overrides))
+        .or_else(|| compare_string_maps("resolution", &current.resolutions, &locked.resolutions))
+        .or_else(|| compare_nested_string_maps("catalog", &current.catalogs, &locked.catalogs))
+        .or_else(|| {
+            compare_option(
+                "patches",
+                &current.patches_fingerprint,
+                &locked.patches_fingerprint,
+            )
+        })
+        .or_else(|| {
+            compare_option(
+                "peer dependency rules",
+                &current.peer_dependency_rules_fingerprint,
+                &locked.peer_dependency_rules_fingerprint,
+            )
+        })
+        .or_else(|| {
+            let manifest = current.auto_install_peers.map(|value| value.to_string());
+            let lockfile = locked.auto_install_peers.map(|value| value.to_string());
+            compare_option("auto install peers", &manifest, &lockfile)
+        })
+}
+
+fn compare_string_maps(
+    kind: &'static str,
+    current: &BTreeMap<String, String>,
+    locked: &BTreeMap<String, String>,
+) -> Option<ImporterSnapshotDiff> {
+    let keys: BTreeSet<&String> = current.keys().chain(locked.keys()).collect();
+    for key in keys {
+        if current.get(key) != locked.get(key) {
+            return Some(ImporterSnapshotDiff {
+                kind,
+                name: key.clone(),
+                manifest: current
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| "<absent>".to_string()),
+                lockfile: locked
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| "<absent>".to_string()),
+            });
+        }
+    }
+    None
+}
+
+fn compare_nested_string_maps(
+    kind: &'static str,
+    current: &BTreeMap<String, BTreeMap<String, String>>,
+    locked: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Option<ImporterSnapshotDiff> {
+    let outer_keys: BTreeSet<&String> = current.keys().chain(locked.keys()).collect();
+    for outer in outer_keys {
+        let empty = BTreeMap::new();
+        if let Some(diff) = compare_string_maps(
+            kind,
+            current.get(outer).unwrap_or(&empty),
+            locked.get(outer).unwrap_or(&empty),
+        ) {
+            return Some(ImporterSnapshotDiff {
+                name: format!("{outer}.{}", diff.name),
+                ..diff
+            });
+        }
+    }
+    None
+}
+
+fn compare_option(
+    name: &'static str,
+    current: &Option<String>,
+    locked: &Option<String>,
+) -> Option<ImporterSnapshotDiff> {
+    (current != locked).then(|| ImporterSnapshotDiff {
+        kind: "setting",
+        name: name.to_string(),
+        manifest: current.clone().unwrap_or_else(|| "<absent>".to_string()),
+        lockfile: locked.clone().unwrap_or_else(|| "<absent>".to_string()),
+    })
 }
 
 /// Test-only deterministic-panic injection hook.
@@ -155,6 +474,7 @@ pub async fn run_with_options(
     project_dir: &Path,
     json_output: bool,
     offline: bool,
+    frozen_lockfile: FrozenLockfileMode,
     force: bool,
     allow_new: bool,
     // () — strict_integrity: when true, tarball-URL
@@ -276,6 +596,7 @@ pub async fn run_with_options(
         project_dir,
         json_output,
         offline,
+        frozen_lockfile,
         force,
         allow_new,
         strict_integrity,
@@ -309,6 +630,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     project_dir: &Path,
     json_output: bool,
     offline: bool,
+    frozen_lockfile: FrozenLockfileMode,
     force: bool,
     allow_new: bool,
     strict_integrity: bool,
@@ -351,6 +673,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             project_dir,
             json_output,
             offline,
+            frozen_lockfile,
             force,
             allow_new,
             strict_integrity,
@@ -388,6 +711,7 @@ async fn run_with_options_under_store_lock(
     project_dir: &Path,
     json_output: bool,
     offline: bool,
+    frozen_lockfile: FrozenLockfileMode,
     force: bool,
     allow_new: bool,
     strict_integrity: bool,
@@ -430,6 +754,7 @@ async fn run_with_options_under_store_lock(
     // Step 1: Read package.json
     let pkg_json_path = project_dir.join("package.json");
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let frozen_lockfile_active = frozen_lockfile.is_active(&lockfile_path);
     if !pkg_json_path.exists() {
         return Err(LpmError::NotFound(
             "no package.json found in current directory or any parent. \
@@ -581,7 +906,12 @@ async fn run_with_options_under_store_lock(
         linker_mode,
     );
     let cleanup_catalogs_in_pipeline = requested_add_count.is_none();
-    if !force && !offline && !strict_peer_dependencies && install_state.up_to_date {
+    if !frozen_lockfile_active
+        && !force
+        && !offline
+        && !strict_peer_dependencies
+        && install_state.up_to_date
+    {
         let catalogs_cleaned = if cleanup_catalogs_in_pipeline {
             cleanup_unused_catalogs_after_install(project_dir)?
         } else {
@@ -1046,6 +1376,63 @@ async fn run_with_options_under_store_lock(
     // freshness (post-install env/config flips invalidate the cache).
     // No re-resolution here.
 
+    let current_patches: HashMap<String, PatchedDependencyEntry> = pkg
+        .lpm
+        .as_ref()
+        .map(|l| l.patched_dependencies.clone())
+        .unwrap_or_default();
+    let current_patch_fingerprint = patch_state::compute_fingerprint(&current_patches);
+    let current_importer_patch_fingerprint =
+        (!current_patches.is_empty()).then_some(current_patch_fingerprint.as_str());
+    let current_lockfile_patches =
+        patch_state::lockfile_patches_from_manifest(project_dir, &current_patches)?;
+    let current_importer_snapshot = importer_snapshot_for_current_manifest(
+        &pkg,
+        lpm_overrides_map.as_ref(),
+        overrides_map.as_ref(),
+        resolutions_map.as_ref(),
+        override_catalogs,
+        current_importer_patch_fingerprint,
+        auto_install_peers,
+    );
+    let lockfile_for_validation = if lockfile_path.exists() || frozen_lockfile_active {
+        match lpm_lockfile::Lockfile::read_fast(&lockfile_path) {
+            Ok(lockfile) => Some(lockfile),
+            Err(e) if frozen_lockfile_active => {
+                return Err(LpmError::Registry(format!(
+                    "Frozen lockfile mismatch\n  lockfile    {}\n  error       {}\n  hint        run `lpm install` locally and commit lpm.lock before running a frozen install",
+                    lockfile_path.display(),
+                    e,
+                )));
+            }
+            Err(e) if !current_lockfile_patches.is_empty() => {
+                return Err(LpmError::Registry(format!(
+                    "Patch lockfile mismatch\n  lockfile    {}\n  error       {}\n  hint        run `lpm install` after restoring a readable lpm.lock",
+                    lockfile_path.display(),
+                    e,
+                )));
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if let Some(lockfile) = lockfile_for_validation.as_ref() {
+        validate_lockfile_patch_records(&lockfile_path, lockfile, &current_lockfile_patches)?;
+    }
+    if frozen_lockfile_active {
+        if force {
+            return Err(LpmError::Registry(
+                "Frozen lockfile mismatch\n  flag        --force\n  hint        frozen installs cannot force fresh resolution; pass --no-frozen-lockfile for a mutable install"
+                    .into(),
+            ));
+        }
+        let lockfile = lockfile_for_validation
+            .as_ref()
+            .expect("frozen lockfile validation loaded lockfile or returned");
+        validate_frozen_importer_snapshot(&lockfile_path, lockfile, &current_importer_snapshot)?;
+    }
+
     if deps.is_empty() && workspace_member_deps.is_empty() {
         if cleanup_catalogs_in_pipeline {
             cleanup_unused_catalogs_after_install(project_dir)?;
@@ -1144,12 +1531,6 @@ async fn run_with_options_under_store_lock(
     // re-link).
     // 2. Offline mode can hard-error on drift since it can't
     // re-resolve to bring the lockfile in sync.
-    let current_patches: HashMap<String, PatchedDependencyEntry> = pkg
-        .lpm
-        .as_ref()
-        .map(|l| l.patched_dependencies.clone())
-        .unwrap_or_default();
-    let current_patch_fingerprint = patch_state::compute_fingerprint(&current_patches);
     let prior_patch_state = patch_state::read_state(project_dir);
     let patches_changed = prior_patch_state
         .as_ref()
@@ -1481,7 +1862,30 @@ async fn run_with_options_under_store_lock(
     // staged with new top-level entries, a stale lockfile can contain
     // the same package name only transitively, which is insufficient to
     // answer what concrete direct version the add path should pick.
-    let lockfile_result = if force || overrides_changed || patches_changed || is_add_invocation {
+    let lockfile_result = if frozen_lockfile_active {
+        let candidate = try_lockfile_fast_path(
+            &lockfile_path,
+            &deps,
+            &catalog_resolutions,
+            client,
+            &gate_stats,
+            false,
+        )
+        .ok_or_else(|| {
+            LpmError::Registry(
+                "Frozen lockfile mismatch\n  lockfile    lpm.lock\n  hint        lockfile cannot satisfy the current manifest; run `lpm install` locally and commit lpm.lock, or pass --no-frozen-lockfile"
+                    .into(),
+            )
+        })?;
+        if lockfile_needs_peer_state_repair(&candidate.lockfile, auto_install_peers) {
+            return Err(LpmError::Registry(format!(
+                "Frozen lockfile mismatch\n  lockfile    v{}\n  required    v{}\n  hint        run `lpm install` locally and commit the upgraded lpm.lock",
+                candidate.lockfile.metadata.lockfile_version,
+                lpm_lockfile::LOCKFILE_VERSION,
+            )));
+        }
+        Some(candidate)
+    } else if force || overrides_changed || patches_changed || is_add_invocation {
         None
     } else {
         // Online installs keep the safety gate strict
@@ -4339,6 +4743,10 @@ async fn run_with_options_under_store_lock(
             &lockfile_catalog_resolutions,
             &persisted_packages,
         )?;
+        lockfile.patches = current_lockfile_patches.clone();
+        lockfile
+            .importers
+            .insert(".".to_string(), current_importer_snapshot.clone());
 
         lockfile
             .write_all(&lockfile_path)
@@ -4350,26 +4758,43 @@ async fn run_with_options_under_store_lock(
     // The lockfile-size line moved into the `--verbose` footer at
     // the end of the install, alongside the per-phase timing
     // breakdown.
-    } else if let Some(mut lockfile) = fast_path_lockfile.take() {
-        // generalized writeback ( Change 3). When the
-        // fast path ran, we skip the fresh-resolve writer above. But
-        // two signals can still require a rewrite:
+    } else if !frozen_lockfile_active && let Some(mut lockfile) = fast_path_lockfile.take() {
+        // When the fast path ran, we skip the fresh-resolve writer
+        // above. A few lockfile-maintenance signals can still require
+        // a rewrite:
         //
         // 1. `fresh_urls` is non-empty — at least one URL diverged
         // from the stored value (stale-URL recovery and/or
         // origin-mismatch rebase). Without the rewrite, the
         // divergence recurs on every subsequent install.
-        // 2. `needs_binary_upgrade` — the v2 `lpm.lockb` was
+        // 2. `needs_binary_upgrade` — the `lpm.lockb` was
         // missing or out-of-version. Fast-path-only runs would
-        // otherwise defer the v1→v2 binary migration
-        // indefinitely; force it here so read-only commands
-        // (`lpm outdated`, `lpm upgrade`) immediately benefit.
+        // otherwise defer the binary migration indefinitely.
+        // 3. Importer snapshots are missing/stale, or the TOML schema
+        // version predates the current frozen-install contract.
         //
-        // On the true happy path (URLs all match, binary current),
-        // both signals are clean and no write fires — lockfiles stay
-        // byte-identical, CI diffs stay empty.
+        // On the true happy path, all signals are clean and no write
+        // fires, so lockfiles stay byte-identical.
         let url_churn = !fresh_urls.is_empty();
-        if url_churn || needs_binary_upgrade {
+        let importer_snapshot_changed =
+            lockfile.importers.get(".") != Some(&current_importer_snapshot);
+        let patch_records_changed = lockfile.patches != current_lockfile_patches;
+        let schema_version_changed =
+            lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION;
+        if importer_snapshot_changed || patch_records_changed || schema_version_changed {
+            lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
+            lockfile.patches = current_lockfile_patches.clone();
+            lockfile
+                .importers
+                .insert(".".to_string(), current_importer_snapshot.clone());
+        }
+
+        if url_churn
+            || needs_binary_upgrade
+            || importer_snapshot_changed
+            || patch_records_changed
+            || schema_version_changed
+        {
             // Patch `lp.tarball` in place for every package whose
             // final URL diverged. Linear scan over `fresh_urls` is
             // fine — even large workspaces have <1k packages and

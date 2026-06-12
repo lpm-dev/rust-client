@@ -1,6 +1,7 @@
 //! `lpm env` command dispatcher and domain modules.
 
 mod auth;
+mod ci;
 mod inventory;
 mod local;
 mod oidc;

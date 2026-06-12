@@ -299,8 +299,9 @@ pub async fn dlx(
         crate::commands::install::run_with_options(
             client,
             install.root(),
-            false,                                                   // json_output
-            false,                                                   // offline
+            false, // json_output
+            false, // offline
+            crate::commands::install::FrozenLockfileMode::Never,
             false,                                                   // force
             false,                                                   // allow_new
             false,                                                   // strict_integrity

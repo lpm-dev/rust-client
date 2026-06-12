@@ -991,7 +991,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/token_rotate.rs", 1)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 41: lpm setup ci (.npmrc CI gen) ──
+    // ── id 41: lpm setup ci npmrc (.npmrc CI gen) ──
     SurfaceV2 {
         id: 41,
         scenarios: 3,
@@ -2025,37 +2025,30 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/tools.rs", 3)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 93: lpm ci env ──
+    // ── id 93: lpm ci ──
     //
-    // KEEP_NONE rationale: `lpm ci env` is a shell-format surface by
-    // design. The happy path emits `export FOO=bar` (or
-    // `::add-mask::secret\necho 'FOO=bar' >> "$GITHUB_ENV"`) on stdout
-    // so the CI runner can `eval` or pipe it into the env file. A JSON
-    // envelope on the same surface would defeat the contract — there's
-    // no shell shape for `{"success": true, "vars": {...}}` that lets
-    // the runner pick up the values. Error paths upstream (unknown ci
-    // sub-action) DO route through the LpmError → envelope handler
-    // (see `lpm --json ci nonsense` and the ci-setup unknown-platform
-    // test under id 94/95), but the `ci env` surface itself stays
-    // shell-format-only. Not a gap.
     SurfaceV2 {
         id: 93,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
-            "github-actions masks secret values + emits github-env commands",
-            "output writes dotenv file for selected env-mode",
+            "missing lockfile fails as a frozen install",
+            "matching frozen lockfile replays without rewriting lockfiles",
+            "JSON success envelope remains parseable without rewriting lpm.lock",
         ],
         failure_modes_known: &[
-            "malformed env schema",
-            "concurrent env write",
-            "missing required var (helpful exit code)",
-            "github-actions runner without GITHUB_ENV set (degraded path)",
+            "strict peer failure under frozen replay",
+            "offline frozen replay with missing store entries",
+            "root lifecycle failure before dependency replay",
+            "workspace importer snapshots",
         ],
-        json_contract_depth: JsonContractDepth::None,
-        scenarios_by_file: &[("tests/workflows/tests/ci.rs", 2)],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[
+            ("tests/workflows/tests/ci.rs", 1),
+            ("tests/workflows/tests/frozen_lockfile.rs", 2),
+        ],
         last_audited_at: "2026-05-14",
     },
-    // ── id 94: lpm ci setup github-actions ──
+    // ── id 94: lpm setup ci github-actions ──
     SurfaceV2 {
         id: 94,
         scenarios: 2,
@@ -2073,7 +2066,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/ci.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 95: lpm ci setup gitlab ──
+    // ── id 95: lpm setup ci gitlab ──
     SurfaceV2 {
         id: 95,
         scenarios: 4,
