@@ -12,7 +12,8 @@
 //!    (RustCrypto, no openssl). Passphrase resolution order:
 //!    1. `LPM_KEY_PASSPHRASE` env var (CI / non-interactive).
 //!    2. TTY prompt via [`rpassword`], gated on **both** stdin AND
-//!       stdout being terminals (matches `install_global.rs` precedent).
+//!       stdout being terminals (matches the global install prompt
+//!       precedent).
 //!    3. Hard error citing the keyfile line.
 //! 3. Detects PKCS#12 (`.p12`/`.pfx`) input and emits a cited error
 //!    with the `openssl` conversion recipe — rustls cannot ingest

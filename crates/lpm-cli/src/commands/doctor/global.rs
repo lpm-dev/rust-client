@@ -289,8 +289,8 @@ fn check_orphaned_bin_shims(
 /// Read `~/.lpm/global/trusted-dependencies.json` and report presence,
 /// approval count, and parse health. A malformed or future-schema trust
 /// file breaks `lpm install -g` via the synthetic
-/// `lpm.trustedDependencies` projection in `install_global::synthesize_pkg_json`,
-/// and can also break `lpm approve-scripts --global`.
+/// `lpm.trustedDependencies` projection used by global installs, and
+/// can also break `lpm approve-scripts --global`.
 ///
 /// The check itself is small — the trust store is a few hundred
 /// bytes typically — but it covers the same diagnostic gap that the
