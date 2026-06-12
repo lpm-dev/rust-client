@@ -358,14 +358,9 @@ jobs:
     # Pre-Phase-4d this matrix was inverted (v1 default + v2 opt-in)
     # while v2 was a dev-only flag.
     #
-    # Phase 66 confidence-followup §3b: cross-platform expansion. The
-    # ubuntu-latest rows gate the build (every fixture must PASS/PASS
-    # symmetric or PASS/PASS). The windows-latest row uses Git Bash to
-    # run the same harness — `continue-on-error: true` is set so first-
-    # time Windows-specific failures (mostly native fixtures lacking
-    # node-gyp / vcredist) surface as signal without blocking the
-    # build. Once the Windows row stabilizes, drop continue-on-error
-    # to make it a hard gate.
+    # Cross-platform audit: Linux covers both store backends; Windows
+    # covers the v2 default through Git Bash. All matrix rows hard-gate
+    # asymmetric fixture regressions.
     strategy:
       fail-fast: false
       matrix:
@@ -377,8 +372,6 @@ jobs:
         exclude:
           - os: windows-latest
             store_version: "v1"
-    # §3b: tolerate Windows-specific incompat for now (see job comment).
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
