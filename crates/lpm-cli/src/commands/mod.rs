@@ -17,6 +17,7 @@ pub mod download;
 pub mod env;
 pub mod filter;
 pub mod global;
+mod global_util;
 pub mod graph;
 pub mod health;
 pub mod hosts;
