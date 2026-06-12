@@ -220,7 +220,7 @@ impl ResolveState {
     }
 
     /// Convert the in-flight builders into the public
-    /// `Vec<ResolvedPackage>`. Mirrors `resolve.rs::format_solution`.
+    /// `Vec<ResolvedPackage>`. Mirrors `format_solution`.
     pub(super) fn into_resolved_packages(
         self,
         cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
