@@ -1,0 +1,784 @@
+use super::npm_artifact::prepare_npm_target_artifact;
+use super::output::{
+    DryRunSummary, format_publish_retry_detail, format_upload_message, lpm_visibility,
+    print_dry_run_summary, print_upload_details, publish_check_json, publish_detail,
+    publish_result_json, visibility_from_access,
+};
+use super::prepare::prepare_publish_project;
+use super::provenance::resolve_provenance_context;
+use super::quality_gate::run_publish_quality_gate;
+use super::secret_scan::run_publish_secret_scan;
+use super::skills::{
+    compute_published_skills_digest, compute_skills_digest, ensure_lpm_in_files,
+    validate_skills_for_publish,
+};
+use super::target::resolve_targets;
+use super::types::{
+    NpmTargetArtifactInput, PublishProject, PublishQualityGateInput, PublishResult, PublishTarget,
+};
+use super::upload_lpm::publish_to_lpm;
+use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
+use crate::commands::{npm_auth, publish_common, publish_npm};
+use crate::{auth, install_ui, oidc, provenance, sigstore};
+use lpm_common::LpmError;
+use lpm_registry::RegistryClient;
+use std::collections::HashMap;
+use std::path::Path;
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+    client: &RegistryClient,
+    project_dir: &Path,
+    dry_run: bool,
+    check_only: bool,
+    yes: bool,
+    json_output: bool,
+    min_score: Option<u32>,
+    allow_secrets: bool,
+    cli_npm: bool,
+    cli_lpm: bool,
+    cli_github: bool,
+    cli_gitlab: bool,
+    cli_registry: Option<&str>,
+    provenance_flag: bool,
+) -> Result<(), LpmError> {
+    let publish_started = std::time::Instant::now();
+
+    let PublishProject {
+        package_json_path: pkg_json_path,
+        pkg_json,
+        name,
+        version,
+        publish_config,
+        readme,
+        tarball_data,
+        tarball_files,
+        tarball_size,
+        detected_ecosystem,
+        swift_manifest,
+    } = prepare_publish_project(project_dir)?;
+    let publish_config = publish_config.as_ref();
+
+    // Resolve target registries
+    let targets = resolve_targets(
+        cli_npm,
+        cli_lpm,
+        cli_github,
+        cli_gitlab,
+        cli_registry,
+        publish_config,
+    )?;
+
+    // Cap registry fan-out so one publish command cannot spray tokens too broadly.
+    const MAX_REGISTRIES: usize = 5;
+    if targets.len() > MAX_REGISTRIES {
+        return Err(LpmError::Registry(format!(
+            "too many target registries ({}, max {MAX_REGISTRIES})",
+            targets.len()
+        )));
+    }
+
+    let targets_lpm = targets.contains(&PublishTarget::Lpm);
+    let targets_gitlab = targets.iter().any(|t| matches!(t, PublishTarget::GitLab));
+
+    // GitLab Packages requires projectId in lpm.json
+    if targets_gitlab {
+        let gl_config = publish_config.and_then(|p| p.gitlab.as_ref());
+        if gl_config.and_then(|c| c.project_id.as_deref()).is_none() {
+            return Err(LpmError::Registry(
+                "GitLab Packages requires publish.gitlab.projectId in lpm.json".into(),
+            ));
+        }
+    }
+
+    // Resolve per-target names early (before expensive tarball work).
+    // Each registry can have its own name override in lpm.json.
+    // package.json `name` is the fallback when no config override exists.
+    let lpm_config = publish_config.and_then(|p| p.lpm.as_ref());
+    let npm_config = publish_config.and_then(|p| p.npm.as_ref());
+    let github_config = publish_config.and_then(|p| p.github.as_ref());
+    let gitlab_config = publish_config.and_then(|p| p.gitlab.as_ref());
+
+    let mut target_names: HashMap<String, String> = HashMap::new();
+    for target in &targets {
+        let resolved = match target {
+            PublishTarget::Lpm => {
+                // LPM: config override → package.json name. Must be @lpm.dev/.
+                let lpm_name = lpm_config
+                    .and_then(|c| c.name.clone())
+                    .unwrap_or_else(|| name.to_string());
+                if !lpm_name.starts_with("@lpm.dev/") {
+                    return Err(LpmError::Registry(format!(
+                        "LPM registry requires @lpm.dev/ prefix (got \"{lpm_name}\"). \
+						 Set publish.lpm.name in lpm.json."
+                    )));
+                }
+                lpm_name
+            }
+            PublishTarget::Npm => {
+                // npm: config override → package.json name. Reject @lpm.dev/.
+                npm_config
+                    .and_then(|c| c.name.clone())
+                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?
+            }
+            PublishTarget::GitHub => {
+                // GitHub: config override → npm config → package.json. Must be scoped.
+                let gh_name = github_config
+                    .and_then(|c| c.name.clone())
+                    .or_else(|| npm_config.and_then(|c| c.name.clone()))
+                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?;
+                if !gh_name.starts_with('@') {
+                    return Err(LpmError::Registry(
+                        "GitHub Packages requires scoped package names (@owner/package). \
+						 Set publish.github.name in lpm.json."
+                            .into(),
+                    ));
+                }
+                gh_name
+            }
+            PublishTarget::GitLab => {
+                // GitLab: config override → npm config → package.json.
+                gitlab_config
+                    .and_then(|c| c.name.clone())
+                    .or_else(|| npm_config.and_then(|c| c.name.clone()))
+                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?
+            }
+            PublishTarget::Custom(_) => {
+                // Custom: npm config → package.json.
+                npm_config
+                    .and_then(|c| c.name.clone())
+                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?
+            }
+        };
+        target_names.insert(target.key(), resolved);
+    }
+
+    run_publish_secret_scan(project_dir, json_output, allow_secrets)?;
+
+    // Quality checks are required only for the LPM target.
+    let quality_result = if targets_lpm {
+        Some(run_publish_quality_gate(PublishQualityGateInput {
+            pkg_json: &pkg_json,
+            readme: readme.as_deref(),
+            project_dir,
+            tarball_files: &tarball_files,
+            detected_ecosystem: &detected_ecosystem,
+            swift_manifest: swift_manifest.as_ref(),
+            min_score,
+            json_output,
+        })?)
+    } else {
+        None
+    };
+
+    // Skills validation applies only to LPM publishes.
+    let skills_dir = project_dir.join(".lpm").join("skills");
+    let has_skills = skills_dir.exists() && skills_dir.is_dir();
+
+    if has_skills && targets_lpm {
+        if !json_output {
+            install_ui::phase("Validating skills");
+        }
+
+        let (valid, skill_errors, security_issues) = validate_skills_for_publish(&skills_dir);
+
+        if !security_issues.is_empty() {
+            for issue in &security_issues {
+                install_ui::warn(&format!(
+                    "Skill security: {} — {} at line {} ({})",
+                    issue.matched_text, issue.category, issue.line_number, issue.pattern
+                ));
+            }
+            return Err(LpmError::Registry(
+                "skills contain blocked security patterns".into(),
+            ));
+        }
+
+        if !skill_errors.is_empty() {
+            for err in &skill_errors {
+                install_ui::warn(err);
+            }
+            return Err(LpmError::Registry(
+                "skills validation failed — fix errors above".into(),
+            ));
+        }
+
+        if !json_output {
+            install_ui::done(&format!("{valid} skill(s) validated"));
+        }
+
+        ensure_lpm_in_files(&pkg_json_path, &pkg_json)?;
+    }
+
+    // OIDC auto-exchange is limited to LPM publishes, real publish, and dry-run.
+    //
+    // Gated on `targets_lpm && !check_only`:
+    //
+    // - **`targets_lpm`** — `--npm` / `--github` / `--gitlab`-only publishes
+    //   never touch the LPM target client, so leaking the package name to the
+    //   LPM exchange endpoint would be a privacy violation with no upside.
+    // - **`!check_only`** — `--check` is a local-validation surface; running
+    //   a real CI OIDC exchange there mints a session token the user never
+    //   asked for and contradicts the documented contract. `--dry-run` IS
+    //   honored — it forms part of the LPM-side preflight (alongside the
+    //   skills-staleness lookup below) so OIDC trust misconfiguration
+    //   surfaces before a real publish. Note: dry-run does NOT cover the
+    //   later per-target auth checks (whoami/permissions) — those run only
+    //   on a real publish.
+    //
+    // This runs before the skill-staleness check so the first LPM network
+    // call uses the exchanged client too.
+    //
+    // The origin requires `package` for `scope=publish` (see a-package-manager
+    // `app/api/registry/-/token/oidc/route.js`), and the package name only
+    // becomes known after `package.json` is parsed — that's why this can't
+    // live in main.rs.
+    //
+    // Failure is non-fatal: the original `client` is reused so a missing
+    // OIDC policy or a misconfigured token can still publish via the stored
+    // session token. The failure is debug-logged for diagnostics.
+    let oidc_swapped_client;
+    let client: &RegistryClient =
+        if targets_lpm && !check_only && oidc::registry_exchange_jwt_available() {
+            match oidc::exchange_oidc_token(client.base_url(), Some(&name), "publish").await {
+                Ok(oidc_token) => {
+                    oidc_swapped_client = client.clone_with_config().with_token(oidc_token.token);
+                    if !json_output {
+                        install_ui::phase("Using OIDC-exchanged session token for LPM publish");
+                    }
+                    &oidc_swapped_client
+                }
+                Err(e) => {
+                    tracing::debug!("OIDC publish auto-exchange failed, using stored token: {e}");
+                    client
+                }
+            }
+        } else {
+            client
+        };
+
+    // Skills staleness check is an LPM network read, so skip it in --check.
+    //
+    // Gated to skip in `--check` mode: this is a network read against the
+    // LPM registry, and `--check` is the local-validation surface. Kept on
+    // for `--dry-run` because the staleness diagnostic ("your skills are
+    // identical to the previously published version") is part of the
+    // LPM-side preflight a dry-run is meant to surface.
+    if has_skills && targets_lpm && !check_only {
+        let name_short = name.strip_prefix("@lpm.dev/").unwrap_or(&name);
+        match client.get_skills(name_short, None).await {
+            Ok(prev) if !prev.skills.is_empty() => {
+                let local_digest = compute_skills_digest(&skills_dir);
+                let published_digest = compute_published_skills_digest(&prev.skills);
+                if local_digest == published_digest && !json_output {
+                    install_ui::warn(
+                        "Skills are identical to the previously published version — consider updating them",
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Check-only and dry-run modes stop before publishing.
+    if check_only {
+        if json_output {
+            let json = publish_check_json(quality_result.as_ref(), &targets, &target_names);
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        }
+        return Ok(());
+    }
+
+    if dry_run {
+        if json_output {
+            let json = serde_json::json!({
+                "success": true,
+                "dry_run": true,
+                "name": name,
+                "version": version,
+                "files": tarball_files.len(),
+                "tarball_size": tarball_size,
+                "quality": quality_result,
+                "targets": targets.iter().map(|t| {
+                    let key = t.key();
+                    let name = target_names.get(&key);
+                    serde_json::json!({"registry": key, "name": name})
+                }).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        } else {
+            let mut eco = "js".to_string();
+            let lpm_cfg = project_dir.join("lpm.config.json");
+            if lpm_cfg.exists()
+                && let Ok(s) = std::fs::read_to_string(&lpm_cfg)
+                && let Ok(c) = serde_json::from_str::<serde_json::Value>(&s)
+                && let Some(e) = c.get("ecosystem").and_then(|v| v.as_str())
+            {
+                eco = e.to_string();
+            }
+            if project_dir.join("Package.swift").exists() && eco == "js" {
+                eco = "swift".to_string();
+            }
+
+            let summary = DryRunSummary {
+                name: &name,
+                version: &version,
+                target_names: &target_names,
+                file_count: tarball_files.len(),
+                tarball_size,
+                quality_result: quality_result.as_ref(),
+                has_skills,
+                ecosystem: &eco,
+                targets: &targets,
+            };
+            print_dry_run_summary(&summary);
+        }
+        return Ok(());
+    }
+
+    // Prompt before a real human-facing publish unless explicitly confirmed.
+    if !json_output && !yes {
+        println!();
+        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        if is_tty {
+            let prompt_msg = if targets.len() > 1 {
+                format!(
+                    "Publish {name}@{version} to {}?",
+                    targets
+                        .iter()
+                        .map(|t| t.display_name())
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                )
+            } else {
+                format!("Publish {name}@{version}?")
+            };
+            let confirm = cliclack::confirm(prompt_msg)
+                .initial_value(true)
+                .interact()
+                .map_err(|e| LpmError::Registry(e.to_string()))?;
+
+            if !confirm {
+                install_ui::skipped("Publish cancelled");
+                return Ok(());
+            }
+        }
+    }
+
+    let version_data =
+        build_publish_version_data(&pkg_json, &name, &version, readme.as_deref(), &tarball_data);
+    let provenance_context = resolve_provenance_context(provenance_flag).await?;
+
+    // Publish sequentially so per-target auth prompts and summaries stay deterministic.
+    // All per-target errors are caught and collected — the loop NEVER aborts early.
+    let mut results: Vec<PublishResult> = Vec::with_capacity(targets.len());
+
+    for target in &targets {
+        let start = std::time::Instant::now();
+
+        match target {
+            PublishTarget::Lpm => {
+                // Wrap the entire LPM publish path so any error becomes a PublishResult
+                let lpm_result: Result<serde_json::Value, LpmError> = async {
+                    let lpm_name = target_names.get("lpm").map_or(name.as_str(), |s| s.as_str());
+
+                    // Rewrite tarball if LPM name differs from package.json name
+                    let lpm_tarball = if lpm_name != name.as_str() {
+                        publish_common::rewrite_tarball_name(&tarball_data, &name, lpm_name)?
+                    } else {
+                        tarball_data.clone()
+                    };
+
+                    // Recompute dist hashes from the final rewritten tarball so metadata
+                    // matches the actual uploaded artifact (not the pre-rewrite original).
+                    let mut lpm_version_data = version_data.clone();
+                    if lpm_name != name.as_str() {
+                        let lpm_hashes = publish_common::compute_hashes(&lpm_tarball);
+                        lpm_version_data["dist"] = serde_json::json!({
+                            "shasum": lpm_hashes.shasum,
+                            "integrity": lpm_hashes.integrity,
+                        });
+                    }
+
+                    // Generate per-target provenance from the final rewritten tarball
+                    if let Some(ref context) = provenance_context {
+                        let final_hashes = publish_common::compute_hashes(&lpm_tarball);
+                        let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
+                        let slsa = provenance::build_slsa_statement(
+                            &context.ci,
+                            lpm_name,
+                            &version,
+                            &sha512_hex,
+                        );
+                        let slsa_json = serde_json::to_vec(&slsa)
+                            .map_err(|e| LpmError::Registry(format!("failed to serialize SLSA statement: {e}")))?;
+
+                        // --provenance is strict: fail if Sigstore fails
+                        let bundle = sigstore::sign_and_record(&context.jwt, &slsa_json).await
+                            .map_err(|e| LpmError::Registry(format!(
+                                "Sigstore provenance failed: {e}. \
+                                 Publish aborted because --provenance requires successful provenance generation."
+                            )))?;
+
+                        if !json_output {
+                            install_ui::done("Sigstore provenance generated and recorded in Rekor");
+                        }
+                        let bundle_json = serde_json::to_value(&bundle).unwrap_or_default();
+                        lpm_version_data["_provenance"] = bundle_json.clone();
+                        lpm_version_data["_npmProvenanceAttestations"] = bundle_json;
+                    }
+
+                    let upload_spinner = if json_output {
+                        None
+                    } else {
+                        Some(install_ui::spin(&format_upload_message("lpm.dev")))
+                    };
+                    let response = publish_to_lpm(
+                        client,
+                        project_dir,
+                        lpm_name,
+                        &version,
+                        &readme,
+                        &lpm_tarball,
+                        &tarball_files,
+                        &lpm_version_data,
+                        &quality_result,
+                        json_output,
+                        &detected_ecosystem,
+                        &swift_manifest,
+                    )
+                    .await?;
+                    drop(upload_spinner);
+                    if !json_output {
+                        print_upload_details(lpm_name, &version, lpm_visibility(&pkg_json), "latest");
+                    }
+                    Ok(response)
+                }
+                .await;
+
+                let duration = start.elapsed();
+                let lpm_name = target_names
+                    .get("lpm")
+                    .map_or(name.as_str(), |s| s.as_str());
+                match lpm_result {
+                    Ok(resp) => {
+                        if !json_output {
+                            let owner_pkg = lpm_name.strip_prefix("@lpm.dev/").unwrap_or(lpm_name);
+                            if let Some((owner, pkg)) = owner_pkg.split_once('.') {
+                                publish_detail(
+                                    "url",
+                                    &install_ui::url(&format!("https://lpm.dev/{owner}/{pkg}")),
+                                );
+                            }
+                            if let Some(warnings) = resp.get("warnings").and_then(|w| w.as_array())
+                            {
+                                for w in warnings {
+                                    if let Some(msg) = w.as_str() {
+                                        install_ui::warn(msg);
+                                    }
+                                }
+                            }
+                        }
+                        results.push(PublishResult {
+                            target: "lpm".into(),
+                            success: true,
+                            error: None,
+                            auth: None,
+                            duration,
+                        });
+                    }
+                    Err(e) => {
+                        if !json_output {
+                            install_ui::warn(&format!("LPM publish failed: {e}"));
+                        }
+                        results.push(PublishResult {
+                            target: "lpm".into(),
+                            success: false,
+                            error: Some(e.to_string()),
+                            auth: None,
+                            duration,
+                        });
+                    }
+                }
+            }
+            PublishTarget::Npm
+            | PublishTarget::GitHub
+            | PublishTarget::GitLab
+            | PublishTarget::Custom(_) => {
+                // Wrap the entire npm-like target path so any error becomes a PublishResult.
+                // This ensures the loop always continues to the next target.
+                let npm_target_result: Result<PublishResult, LpmError> = async {
+                    let npm_name_str = target_names.get(&target.key()).ok_or_else(|| {
+                        LpmError::Registry(format!(
+                            "no name resolved for {}",
+                            target.display_name()
+                        ))
+                    })?;
+
+                    // Resolve registry URL, token, display name per target
+                    let (registry_url, token, display, auth_source) = match target {
+                        PublishTarget::Npm => {
+                            let registry_url = publish_npm::resolve_npm_registry(npm_config);
+                            let npm_auth =
+                                npm_auth::resolve_publish_auth(npm_name_str, &registry_url)
+                                    .await?;
+                            (
+                                registry_url,
+                                npm_auth.token().to_string(),
+                                "npm",
+                                Some(npm_auth.source().as_str()),
+                            )
+                        }
+                        PublishTarget::GitHub => (
+                            "https://npm.pkg.github.com".to_string(),
+                            auth::get_github_token().ok_or_else(|| {
+                                LpmError::Registry(
+                                    "no GitHub Packages token found. Run `gh auth login --hostname github.com`, run `lpm login --github --token <pat>`, or set GITHUB_TOKEN.".into(),
+                                )
+                            })?,
+                            "GitHub Packages",
+                            None,
+                        ),
+                        PublishTarget::GitLab => {
+                            let gl_cfg = publish_config.and_then(|p| p.gitlab.as_ref());
+                            let project_id = gl_cfg
+                                .and_then(|c| c.project_id.as_deref())
+                                .ok_or_else(|| {
+                                    LpmError::Registry(
+                                        "GitLab publish requires publish.gitlab.projectId in lpm.json"
+                                            .into(),
+                                    )
+                                })?;
+                            let gitlab_host = gl_cfg
+                                .and_then(|c| c.registry.as_deref())
+                                .unwrap_or("https://gitlab.com");
+                            // A project lpm.json can override the GitLab host while still
+                            // naming `gitlab` as a publish target. Warn before the
+                            // GitLab token is sent to a non-default host.
+                            if gitlab_host.trim_end_matches('/') != "https://gitlab.com" {
+                                tracing::warn!(
+                                    target_url = %gitlab_host,
+                                    "publish.gitlab.registry overridden — GitLab token will be sent to a non-default host; \
+                                     confirm this is intentional",
+                                );
+                            }
+                            let url = format!(
+                                "{}/api/v4/projects/{}/packages/npm",
+                                gitlab_host.trim_end_matches('/'),
+                                urlencoding::encode(project_id)
+                            );
+                            (
+                                url,
+                                auth::get_gitlab_token_for_host(gitlab_host).ok_or_else(|| {
+                                    LpmError::Registry(
+                                        "no GitLab Packages token found. For gitlab.com, run `glab auth login`; otherwise run `lpm login --gitlab --token <token>` or set GITLAB_TOKEN/CI_JOB_TOKEN.".into(),
+                                    )
+                                })?,
+                                "GitLab Packages",
+                                None,
+                            )
+                        }
+                        PublishTarget::Custom(url) => (
+                            url.clone(),
+                            auth::get_custom_registry_token(url).ok_or_else(|| {
+                                LpmError::Registry(format!(
+                                    "no token found for {url}. Run `lpm login --login-registry {url} --token <token>`."
+                                ))
+                            })?,
+                            "custom",
+                            None,
+                        ),
+                        _ => unreachable!(),
+                    };
+
+                    if auth_source == Some("oidc") && !json_output {
+                        install_ui::phase("Using npm Trusted Publishing (OIDC)");
+                    }
+
+                    // Per-target access
+                    let npm_access = match target {
+                        PublishTarget::GitHub => github_config
+                            .and_then(|c| c.access.clone())
+                            .unwrap_or_else(|| {
+                                publish_npm::resolve_npm_access(npm_name_str, npm_config)
+                            }),
+                        PublishTarget::GitLab => gitlab_config
+                            .and_then(|c| c.access.clone())
+                            .unwrap_or_else(|| {
+                                publish_npm::resolve_npm_access(npm_name_str, npm_config)
+                            }),
+                        _ => publish_npm::resolve_npm_access(npm_name_str, npm_config),
+                    };
+                    let npm_tag = publish_npm::resolve_npm_tag(npm_config);
+
+                    // OTP preemption
+                    let registry_key_for_otp = match target {
+                        PublishTarget::Npm => "npmjs.org",
+                        PublishTarget::GitHub => "github.com",
+                        PublishTarget::GitLab => "gitlab.com",
+                        _ => "",
+                    };
+                    let otp_preempt = npm_config
+                        .and_then(|c| c.otp_required)
+                        .unwrap_or(false)
+                        || auth::is_otp_required(registry_key_for_otp);
+
+                    let target_artifact = prepare_npm_target_artifact(NpmTargetArtifactInput {
+                        package_json_name: &name,
+                        npm_name: npm_name_str,
+                        version: &version,
+                        base_version_data: &version_data,
+                        base_tarball_data: &tarball_data,
+                        provenance_context: provenance_context.as_ref(),
+                        target_label: display,
+                        json_output,
+                    })
+                    .await?;
+
+                    let upload_spinner = if json_output {
+                        None
+                    } else {
+                        Some(install_ui::spin(&format_upload_message(display)))
+                    };
+                    let npm_result = publish_npm::publish_to_npm(
+                        &token,
+                        npm_name_str,
+                        &version,
+                        &target_artifact.version_data,
+                        &target_artifact.tarball_data,
+                        &npm_access,
+                        &npm_tag,
+                        &registry_url,
+                        otp_preempt,
+                        json_output,
+                        yes,
+                    )
+                    .await?;
+                    drop(upload_spinner);
+                    if !json_output {
+                        print_upload_details(
+                            npm_name_str,
+                            &version,
+                            visibility_from_access(&npm_access),
+                            &npm_tag,
+                        );
+                    }
+
+                    if npm_result.success {
+                        if !json_output {
+                            let package_url = match target {
+                                PublishTarget::Npm => {
+                                    Some(format!(
+                                        "https://www.npmjs.com/package/{}",
+                                        npm_name_str
+                                    ))
+                                }
+                                PublishTarget::GitHub => npm_name_str
+                                    .strip_prefix('@')
+                                    .and_then(|s| s.split_once('/'))
+                                    .map(|(scope, pkg)| {
+                                        format!("https://github.com/users/{scope}/packages/npm/package/{pkg}")
+                                    }),
+                                PublishTarget::GitLab => {
+                                    let gl_cfg = publish_config.and_then(|p| p.gitlab.as_ref());
+                                    let host = gl_cfg
+                                        .and_then(|c| c.registry.as_deref())
+                                        .unwrap_or("https://gitlab.com");
+                                    gl_cfg
+                                        .and_then(|c| c.project_id.as_deref())
+                                        .map(|pid| format!("{host}/projects/{pid}/packages"))
+                                }
+                                _ => None,
+                            };
+                            if let Some(url) = package_url {
+                                publish_detail("url", &install_ui::url(&url));
+                            }
+                        }
+                    } else if !json_output {
+                        let err_msg = npm_result.error.as_deref().unwrap_or("unknown error");
+                        install_ui::warn(&format!("{display} publish failed: {err_msg}"));
+                    }
+
+                    Ok(PublishResult {
+                        target: target.key(),
+                        success: npm_result.success,
+                        error: npm_result.error,
+                        auth: auth_source,
+                        duration: npm_result.duration,
+                    })
+                }
+                .await;
+
+                // Catch any error from the npm-like target and convert to a failed PublishResult.
+                // This ensures the loop always continues to the next target.
+                match npm_target_result {
+                    Ok(result) => results.push(result),
+                    Err(e) => {
+                        let duration = start.elapsed();
+                        if !json_output {
+                            install_ui::warn(&format!(
+                                "{} publish failed: {e}",
+                                target.display_name()
+                            ));
+                        }
+                        results.push(PublishResult {
+                            target: target.key(),
+                            success: false,
+                            error: Some(e.to_string()),
+                            auth: None,
+                            duration,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Final summary after every target has had a chance to publish.
+    let any_failed = results.iter().any(|r| !r.success);
+    let succeeded = results.iter().filter(|r| r.success).count();
+
+    if json_output {
+        let json = serde_json::json!({
+            "success": !any_failed,
+            "results": results.iter().map(publish_result_json).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    } else if targets.len() > 1 {
+        if any_failed {
+            install_ui::warn(&format!(
+                "Published to {succeeded} of {} registries.",
+                targets.len()
+            ));
+            for (target, result) in targets.iter().zip(results.iter()) {
+                if !result.success {
+                    install_ui::detail(&format_publish_retry_detail(target));
+                }
+            }
+        } else {
+            let elapsed =
+                install_ui::green(&install_ui::format_duration(publish_started.elapsed()));
+            install_ui::done(&format!(
+                "Done · published to {} registries in {elapsed}",
+                targets.len()
+            ));
+        }
+    } else if !any_failed {
+        let target = &targets[0];
+        let key = target.key();
+        let published_name = target_names.get(&key).map_or(name.as_str(), |s| s.as_str());
+        let elapsed = install_ui::green(&install_ui::format_duration(publish_started.elapsed()));
+        install_ui::done(&format!(
+            "Done · published {} in {elapsed}",
+            install_ui::yellow(&format!("{published_name}@{version}"))
+        ));
+    }
+
+    if any_failed {
+        Err(LpmError::Registry(
+            "one or more publish targets failed".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
