@@ -213,7 +213,7 @@ fn seed_root_edges_rewrites_npm_alias_root_dep() {
     // `node_modules/<alias>/` slot to build; (d) record `local → target`
     // in `root_aliases` for
     // ResolveResult downstream consumption. Mirrors
-    // `resolve.rs::resolve_with_prefetch_handles_root_npm_alias`'s
+    // `resolve_with_prefetch_handles_root_npm_alias`'s
     // contract on the legacy-pubgrub arm.
     let mut deps = HashMap::new();
     deps.insert("lodash-cjs".to_string(), "npm:lodash@^4.17.21".to_string());
@@ -1234,7 +1234,7 @@ fn peer_collection_no_peer_deps_is_empty_worklist() {
 // These tests drive the helper directly with a hand-built
 // closure that returns pre-canned manifests. End-to-end
 // integration through the dispatcher is exercised by the
-// resolve-tier tests in `resolve.rs`.
+// resolve-tier tests in `resolve::tests`.
 
 /// Stand-in for an `Arc<CachedPackageInfo>` returned by the
 /// fetch closure. Tests pre-populate a name → info map and the

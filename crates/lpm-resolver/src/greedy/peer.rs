@@ -31,7 +31,7 @@ use super::types::{DepBehavior, Edge, PeerConflictReport, PeerRequirement};
 // `ResolvedPackage.dependencies` and `ResolvedPackage.peers` are
 // distinct fields; the v2 store's graph-key derivation depends on
 // the separation
-// (`install.rs::4620-4686` / `lpm-resolver::resolve.rs::36+61`).
+// (`ResolvedPackage.dependencies` / `ResolvedPackage.peers`).
 // Smuggling peers in as children would break peer-divergent link-
 // entry isolation under v2 (default). Hence: ambient install at
 // ROOT scope, satisfying the peer's canonical from the side without
