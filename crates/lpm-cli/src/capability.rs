@@ -204,11 +204,10 @@ impl RlimitKey {
 /// Wired through [`evaluate_trust`].
 /// Only the [`sandbox_limits`] field is user-configurable right now
 /// — `pass_env` and `read_project` have fixed floors (empty /
-/// `Narrow`) that aren't user-extensible in. A future sub-slice
-/// could extend `UserBound` with `pass_env_allowlist` to match the
-/// phase48 Gap-5 env-allowlist model if user-level passthrough
-/// becomes desirable; the enforcement code already handles "empty
-/// allowlist = no widening allowed without approval" correctly.
+/// `Narrow`) that aren't user-extensible in. If user-level env
+/// passthrough becomes desirable, `UserBound` can grow a
+/// `pass_env_allowlist`; the enforcement code already handles
+/// "empty allowlist = no widening allowed without approval" correctly.
 ///
 /// # Reading from `~/.lpm/config.toml`
 ///
@@ -1043,11 +1042,11 @@ mod tests {
 
     // ── is_approved_by match semantics ──
     //
-    // Reviewer's acceptance list for this sub-slice:
+    // Capability-hash match semantics:
     //
     // 1. Old record without capability_hash loads successfully.
     //    → `binding_without_capability_hash_loads_as_legacy_approval`
-    //      in lpm-workspace/src/lib.rs.
+    //      in lpm-workspace/src/trust.rs.
     //
     // 2. Old record matches the no-extra-capability case only.
     //    → `legacy_binding_approves_baseline_request` below.
