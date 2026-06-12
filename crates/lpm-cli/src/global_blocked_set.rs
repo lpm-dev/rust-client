@@ -1,8 +1,8 @@
 //! Aggregate blocked-set across globally-installed packages.
 //!
 //! Each globally-installed package is its own synthetic project (per
-//! the install pipeline routing). When `install_global::do_install`
-//! calls `install::run_with_options`, the inner project install writes
+//! the install pipeline routing). When the global install path calls
+//! `install::run_with_options`, the inner project install writes
 //! `<install_root>/.lpm/build-state.json` the same way any other
 //! project install would — just scoped to the global install root.
 //!

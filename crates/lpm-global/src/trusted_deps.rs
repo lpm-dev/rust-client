@@ -58,7 +58,7 @@ use std::path::Path;
 /// enforced on the global install path: `integrity`, `script_hash`,
 /// and `provenance_at_approval` (which drives the install-time drift
 /// gate via the synthetic `package.json > lpm > trustedDependencies`
-/// projection in `install_global::synthesize_pkg_json`). The
+/// projection used by global installs. The
 /// project-only fields — `behavioral_tags_hash`, `behavioral_tags`,
 /// `capability_hash` — are NOT yet captured here; revisit when the
 /// matching gates extend to globals.

@@ -345,12 +345,9 @@ pub struct CommandCollision {
 /// at the install entry point. the upgrade path will also use this
 /// helper without false-positive on its own pre-existing rows.
 ///
-/// Used by both `commands::install_global::commit_locked` (commit
-/// path) and the recovery `reconcile_one` (replay path) so the
-/// invariant is enforced at every commit point — not just the
-/// happy-path one. Audit High: pre-fix the recovery side could
-/// silently commit a previously-rejected install on the next `lpm`
-/// invocation.
+/// Used by both the global-install commit path and the recovery
+/// `reconcile_one` replay path so the invariant is enforced at every
+/// commit point.
 pub fn find_command_collisions(
     manifest: &GlobalManifest,
     candidate_package: &str,

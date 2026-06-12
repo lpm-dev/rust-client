@@ -295,7 +295,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: true,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/install_global.rs",
+            "crates/lpm-cli/src/commands/install_global/mod.rs",
             "crates/lpm-cli/tests/global_install_state_mutation.rs",
             "tests/workflows/tests/global.rs",
             "tests/workflows/tests/install_global_security.rs",
