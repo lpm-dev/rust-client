@@ -442,8 +442,7 @@ async fn install_with_shared_store_lock_blocks_concurrent_store_clean() {
 ///
 /// Unlike project installs (no project-lock, finding #77), global
 /// installs wrap their **commit** sections with `global_tx_lock` held
-/// exclusively ([update_global.rs:534](../../../crates/lpm-cli/src/commands/update_global.rs),
-/// [update_global.rs:562](../../../crates/lpm-cli/src/commands/update_global.rs)).
+/// exclusively (see the global install and update command facades).
 /// The fetch+extract+link phases run in parallel; only the WAL-commit
 /// regions serialize. The user-facing contract is therefore not "total
 /// wall-clock doubles" but rather: **both packages end up in

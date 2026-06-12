@@ -6,7 +6,7 @@
 //! pins binary-level stdout shape, so the workflow tier's
 //! per-project `TempProject` model can't isolate cleanly.
 //!
-//! ## Contract under test (finding C from the #72/#73/#76 review)
+//! ## Contract under test
 //!
 //! `global update` ships its own rich JSON envelope:
 //!
@@ -27,9 +27,9 @@
 //!
 //! ## Why an explicit binary test
 //!
-//! `update_global.rs` already has a unit test that asserts the
+//! `update_global/mod.rs` already has a unit test that asserts the
 //! function returns `Err(LpmError::ExitCode(1))` on json-mode failure
-//! (`emit_results_json_mode_failure_path_surfaces_exit_code_1`). That
+//! (`run_json_failure_returns_exit_code_not_script_error`). That
 //! test pins the Rust-level contract but cannot observe the
 //! load-bearing routing predicate in `main.rs::async_main` (lines
 //! ~4230) — the `matches!(e, ExitCode(_))` check that decides whether
@@ -121,7 +121,7 @@ async fn json_update_global_failure_emits_rich_envelope_only() {
     assert!(
         envelope["results"].is_array(),
         "rich envelope must carry a `results` array (rich shape — \
-         pre-fix this was emitted before the generic envelope, which \
+         the command-specific envelope was once emitted before the generic envelope, which \
          would have replaced it). Full envelope={envelope}",
     );
     assert!(
