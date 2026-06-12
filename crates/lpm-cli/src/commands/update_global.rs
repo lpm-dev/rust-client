@@ -854,9 +854,9 @@ fn commit_upgrade_locked(
         emitted_shims.push(alias_name.clone());
     }
 
-    // Audit follow-up: three-artifact invariant — confirm
-    // every command's shim triple is fully present after emission.
-    // Same rationale as install_global::commit_locked: a partial triple
+    // Confirm every command's shim triple is fully present after
+    // emission. Same rationale as the global-install commit path:
+    // a partial triple
     // observable to other shells would diverge from the manifest commit
     // we're about to write. Recovery's roll-forward repaves shims from
     // WAL data on the next invocation if we abort here.

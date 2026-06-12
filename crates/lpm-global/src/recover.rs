@@ -1160,11 +1160,10 @@ fn post_resolution_view(manifest: &GlobalManifest, intent: &IntentPayload) -> Gl
 /// Replay one OwnershipChange against the manifest
 /// during recovery roll-forward.
 ///
-/// Mirrors `install_global::apply_ownership_change_to_manifest` (kept
-/// in lpm-cli because that's where the planner lives) — duplicated
-/// here because lpm-global is lower-layer and can't depend on lpm-cli.
-/// The two copies are semantically identical; if one changes, update
-/// both together.
+/// Mirrors the global-install commit-side ownership delta applicator.
+/// Duplicated here because lpm-global is lower-layer and can't depend
+/// on lpm-cli. The two copies are semantically identical; if one
+/// changes, update both together.
 ///
 /// Idempotent for every variant: replaying a delta already applied is
 /// a no-op (retain() filters nothing; remove() returns None; insert
@@ -1973,15 +1972,11 @@ mod tests {
         );
     }
 
-    /// Audit High — defense in depth: recovery must
-    /// NOT silently roll forward a pending install whose marker
-    /// commands would collide with an existing package's commands.
-    /// The commit-side fix in `install_global::commit_locked` should
-    /// prevent this state from ever existing, but if it ever does
-    /// (older binary, manual tampering), recovery refuses to commit
-    /// it and rolls back instead. Without this check, a user could be
-    /// told "this install was refused" and then have it silently
-    /// committed by the next `lpm` invocation that triggers recovery.
+    /// Recovery must not silently roll forward a pending install whose
+    /// marker commands would collide with an existing package's
+    /// commands. The commit path should prevent this state from ever
+    /// existing, but if it ever does (older binary, manual tampering),
+    /// recovery refuses to commit it and rolls back instead.
     #[test]
     fn recovery_rolls_back_when_pending_install_would_collide_with_existing_package() {
         let tmp = TempDir::new().unwrap();
