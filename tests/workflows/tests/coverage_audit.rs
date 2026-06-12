@@ -187,7 +187,26 @@ fn supplemental_references(surface_id: u16) -> &'static [&'static str] {
         66 => &["crates/lpm-cli/src/commands/query.rs"],
         84 => &["crates/lpm-cli/src/commands/run.rs"],
         88 | 89 => &["crates/lpm-cli/src/commands/tools.rs"],
-        97 | 98 | 99 | 100 | 102 | 105 => &["crates/lpm-cli/src/commands/env.rs"],
+        97 => &[
+            "crates/lpm-cli/src/commands/env/inventory.rs",
+            "crates/lpm-cli/src/commands/env/local.rs",
+        ],
+        98 => &["crates/lpm-cli/src/commands/env/local.rs"],
+        99 => &[
+            "crates/lpm-cli/src/commands/env/inventory.rs",
+            "crates/lpm-cli/src/commands/env/local.rs",
+            "crates/lpm-cli/src/commands/env/schema.rs",
+        ],
+        100 => &[
+            "crates/lpm-cli/src/commands/env/remote.rs",
+            "crates/lpm-cli/src/commands/env/schema.rs",
+        ],
+        102 => &["crates/lpm-cli/src/commands/env/remote.rs"],
+        105 => &[
+            "crates/lpm-cli/src/commands/env/platform.rs",
+            "crates/lpm-cli/src/commands/env/remote.rs",
+            "crates/lpm-cli/src/commands/env/rotation.rs",
+        ],
         110 => &["crates/lpm-cli/src/commands/dev.rs"],
         117 => &["tests/workflows/tests/ports.rs"],
         119 | 120 => &["crates/lpm-cli/src/commands/tunnel.rs"],
