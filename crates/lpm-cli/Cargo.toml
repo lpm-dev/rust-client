@@ -66,7 +66,7 @@ dirs = { workspace = true }
 
 # Interactive prompts & terminal UI
 cliclack = { workspace = true }
-crossterm = "0.28"
+crossterm = "0.29"
 # `console` is cliclack's styling primitive — `cliclack::Theme` returns
 # `console::Style` from its color hooks, so the no-color theme override
 # needs a direct dep to construct an unstyled `Style::new()`. Pinned to the

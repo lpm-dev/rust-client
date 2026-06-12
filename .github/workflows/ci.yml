@@ -77,6 +77,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Cargo dependency policy
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          rust-version: ${{ env.RUST_TOOLCHAIN }}
+          command: check
+          arguments: --all-features
+          command-arguments: --hide-inclusion-graph advisories bans licenses
+
       # Security: fancy-regex uses backtracking which is vulnerable to ReDoS.
       # All regex in lpm-security scans untrusted input (npm package source code).
       # The `regex` crate guarantees linear-time matching (Thompson NFA).
