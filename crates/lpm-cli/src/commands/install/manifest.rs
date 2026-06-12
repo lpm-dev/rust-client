@@ -1021,6 +1021,7 @@ pub async fn run_add_packages(
             project_dir,
             json_output,
             false, // offline
+            FrozenLockfileMode::Never,
             force,
             allow_new,
             false, // strict_integrity — internal call, no flag
@@ -1376,6 +1377,7 @@ pub async fn run_install_filtered_add(
                 install_root,
                 json_output,
                 false, // offline
+                FrozenLockfileMode::Never,
                 force,
                 allow_new,
                 false, // strict_integrity — workspace-add path, no flag

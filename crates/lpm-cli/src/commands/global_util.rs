@@ -56,6 +56,7 @@ pub(super) async fn run_inner_global_install(
         options.install_root,
         options.suppress_nested_output,
         false,
+        crate::commands::install::FrozenLockfileMode::Never,
         false,
         options.allow_new,
         false,

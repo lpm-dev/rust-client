@@ -99,9 +99,10 @@ lpm login                      # Authenticate (aliases: l)
 lpm logout                     # Clear token (aliases: lo)
 lpm whoami                     # Current user
 lpm token-rotate               # Rotate your auth token
-lpm setup ci                   # Generate .npmrc for CI/CD
+lpm setup ci npmrc             # Generate .npmrc for CI/CD
+lpm setup ci github-actions    # Print a GitHub Actions OIDC snippet
 lpm setup local                # Read-only `.npmrc` token for local development
-lpm ci                         # CI/CD helpers (env, OIDC, workflow YAML)
+lpm ci                         # Frozen lockfile install for CI
 lpm init                       # Create a new package
 lpm config                     # CLI configuration
 lpm pool                       # Pool revenue stats

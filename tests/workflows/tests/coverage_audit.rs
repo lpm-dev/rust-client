@@ -86,7 +86,7 @@ fn json_contract_statuses_are_fully_accounted_for() {
 
     assert_eq!(
         not_applicable.len(),
-        5,
+        4,
         "the intentionally non-JSON surface set changed; update v2 KEEP_NONE rationale rows:\n{}",
         not_applicable.join("\n")
     );

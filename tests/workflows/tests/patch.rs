@@ -395,6 +395,60 @@ fn patch_commit_writes_patch_file_and_updates_manifest() {
 }
 
 #[test]
+fn patch_commit_updates_lockfile_patch_checksum_record() {
+    let project = TempProject::empty(r#"{"name":"patch-commit-lockfile","version":"0.0.0"}"#);
+    let integrity = seed_store_package(
+        &project,
+        "lodash",
+        "4.17.21",
+        &[("index.js", "module.exports = 'orig'\n")],
+    );
+    write_lockfile(&project, &[("lodash", "4.17.21")]);
+
+    let extract = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch", "lodash@4.17.21"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(
+        extract.status.success(),
+        "extract failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&extract.stdout),
+        String::from_utf8_lossy(&extract.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&extract.stdout))).unwrap();
+    let staging = PathBuf::from(parsed["staging_dir"].as_str().unwrap());
+    std::fs::write(
+        staging.join("node_modules/lodash/index.js"),
+        "module.exports = 'PATCHED'\n",
+    )
+    .unwrap();
+
+    let commit = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn lpm patch-commit");
+    assert!(
+        commit.status.success(),
+        "patch-commit failed: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&commit.stdout),
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let commit_json: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&commit.stdout))).unwrap();
+    assert_eq!(commit_json["lockfile_updated"], serde_json::json!(true));
+
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")).unwrap();
+    let record = lockfile.patches.get("lodash@4.17.21").unwrap();
+    assert_eq!(record.path, "patches/lodash@4.17.21.patch");
+    assert_eq!(record.original_integrity, integrity);
+    assert_eq!(
+        record.sha256,
+        patch_sha256(&project, "patches/lodash@4.17.21.patch")
+    );
+}
+
+#[test]
 fn patch_commit_human_output_uses_slim_status_lines() {
     let project = TempProject::empty(r#"{"name":"patch-commit-human","version":"0.0.0"}"#);
     seed_store_package(
@@ -516,6 +570,52 @@ fn patch_remove_exact_pin_removes_manifest_entry_and_patch_file() {
     assert!(
         pkg.get("lpm").is_none(),
         "empty lpm section should be removed after the last patch entry"
+    );
+}
+
+#[test]
+fn patch_remove_removes_lockfile_patch_checksum_record() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "patch-remove-lockfile",
+  "version": "0.0.0",
+  "lpm": {
+    "patchedDependencies": {
+      "lodash@4.17.21": {
+        "path": "patches/lodash@4.17.21.patch",
+        "originalIntegrity": "sha512-fixture"
+      }
+    }
+  }
+}"#,
+    );
+    project.write_file("patches/lodash@4.17.21.patch", "diff --git a/a b/a\n");
+    write_lockfile(&project, &[("lodash", "4.17.21")]);
+    append_lockfile_patch_record(
+        &project,
+        "lodash@4.17.21",
+        "patches/lodash@4.17.21.patch",
+        "sha512-fixture",
+    );
+
+    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch-remove", "lodash@4.17.21"])
+        .output()
+        .expect("spawn lpm patch-remove");
+    assert!(
+        out.status.success(),
+        "patch-remove failed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out.stdout))).unwrap();
+    assert_eq!(parsed["lockfile_updated"], serde_json::json!(true));
+
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock")).unwrap();
+    assert!(
+        !lockfile.patches.contains_key("lodash@4.17.21"),
+        "patch-remove must delete the matching lpm.lock patch record"
     );
 }
 
@@ -859,13 +959,36 @@ fn patch_commit_fails_on_binary_change() {
 /// Write a synthetic `lpm.lock` listing `(name, version)` pairs. Used
 /// to set up selector-resolution fixtures. `source` defaults to npm.
 fn write_lockfile(project: &TempProject, entries: &[(&str, &str)]) {
-    let mut toml = String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"test\"\n\n");
+    let mut toml = format!(
+        "[metadata]\nlockfile-version = {}\nresolved-with = \"test\"\n\n",
+        lpm_lockfile::LOCKFILE_VERSION
+    );
     for (name, version) in entries {
         toml.push_str(&format!(
             "[[packages]]\nname = \"{name}\"\nversion = \"{version}\"\n\
              source = \"registry+https://registry.npmjs.org\"\n\n",
         ));
     }
+    project.write_file("lpm.lock", &toml);
+}
+
+fn patch_sha256(project: &TempProject, rel_path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(project.path().join(rel_path)).unwrap();
+    format!("sha256-{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn append_lockfile_patch_record(
+    project: &TempProject,
+    selector: &str,
+    path: &str,
+    integrity: &str,
+) {
+    let mut toml = project.read_file("lpm.lock");
+    toml.push_str(&format!(
+        "\n[patches.\"{selector}\"]\npath = \"{path}\"\nsha256 = \"{}\"\noriginal-integrity = \"{integrity}\"\n",
+        patch_sha256(project, path),
+    ));
     project.write_file("lpm.lock", &toml);
 }
 

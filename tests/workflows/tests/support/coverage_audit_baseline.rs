@@ -582,7 +582,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
     },
     SurfaceBaseline {
         id: 41,
-        name: "`lpm setup ci` (.npmrc CI gen)",
+        name: "`lpm setup ci npmrc` (.npmrc CI gen)",
         unit: false,
         integration: false,
         workflow: true,
@@ -1172,17 +1172,20 @@ pub const SURFACES: &[SurfaceBaseline] = &[
     },
     SurfaceBaseline {
         id: 93,
-        name: "`lpm ci env`",
+        name: "`lpm ci`",
         unit: false,
         integration: false,
         workflow: true,
         cli_binary: false,
-        json_contract: JsonContractStatus::NotApplicable,
-        references: &["tests/workflows/tests/ci.rs"],
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "tests/workflows/tests/ci.rs",
+            "tests/workflows/tests/frozen_lockfile.rs",
+        ],
     },
     SurfaceBaseline {
         id: 94,
-        name: "`lpm ci setup github-actions`",
+        name: "`lpm setup ci github-actions`",
         unit: false,
         integration: false,
         workflow: true,
@@ -1192,7 +1195,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
     },
     SurfaceBaseline {
         id: 95,
-        name: "`lpm ci setup gitlab`",
+        name: "`lpm setup ci gitlab`",
         unit: false,
         integration: false,
         workflow: true,

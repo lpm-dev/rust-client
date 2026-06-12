@@ -881,6 +881,10 @@ pub fn write_install_hash(
 /// results — false negatives (falling through) are safe, false positives
 /// (exiting early when we shouldn't) are not.
 pub fn argv_qualifies_for_fast_lane() -> Option<bool> {
+    if ci_env_is_truthy() {
+        return None;
+    }
+
     // Use args_os() to avoid panicking on non-UTF-8 arguments.
     // Any argument that isn't valid UTF-8 causes a conservative bail
     // (fall through to the full pipeline where clap handles it).
@@ -914,6 +918,8 @@ pub fn argv_qualifies_for_fast_lane() -> Option<bool> {
             // ANY of these means semantics differ from a bare `lpm install`.
             "--force"
             | "--offline"
+            | "--frozen-lockfile"
+            | "--no-frozen-lockfile"
             | "--filter"
             | "-w"
             | "--workspace-root"
@@ -951,6 +957,17 @@ pub fn argv_qualifies_for_fast_lane() -> Option<bool> {
     }
 
     if found_install { Some(json_mode) } else { None }
+}
+
+pub(crate) fn ci_env_is_truthy() -> bool {
+    ["CI", "GITHUB_ACTIONS", "GITLAB_CI", "BUILDKITE", "CIRCLECI"]
+        .iter()
+        .any(|key| {
+            std::env::var(key).is_ok_and(|value| {
+                let trimmed = value.trim();
+                !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+            })
+        })
 }
 
 /// Conservative check for whether a package.json defines workspaces.

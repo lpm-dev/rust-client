@@ -1,4 +1,4 @@
-//! Workflow tests for `lpm setup ci` (CI `.npmrc` generation).
+//! Workflow tests for `lpm setup ci npmrc` (CI `.npmrc` generation).
 //!
 //! The OIDC contract paths are pinned by the cli-binary survivor
 //! [`crates/lpm-cli/tests/oidc_setup_snippet_contract.rs`]. This file
@@ -22,13 +22,19 @@ fn setup_ci_default_writes_scoped_registry_line_to_dot_npmrc() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["--registry", "https://lpm.example.test", "setup", "ci"])
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
         .output()
-        .expect("failed to run lpm setup ci");
+        .expect("failed to run lpm setup ci npmrc");
 
     assert!(
         output.status.success(),
-        "lpm setup ci failed:\nstdout: {}\nstderr: {}",
+        "lpm setup ci npmrc failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -81,11 +87,12 @@ fn setup_ci_color_output_uses_plain_file_and_cyan_env_var() {
             "https://lpm.example.test",
             "setup",
             "ci",
+            "npmrc",
         ])
         .output()
-        .expect("failed to run lpm setup ci --color=always");
+        .expect("failed to run lpm setup ci npmrc --color=always");
 
-    assert!(output.status.success(), "lpm setup ci failed");
+    assert!(output.status.success(), "lpm setup ci npmrc failed");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -108,12 +115,13 @@ fn setup_ci_proxy_flag_writes_non_scoped_registry_line() {
             "https://lpm.example.test",
             "setup",
             "ci",
+            "npmrc",
             "--proxy",
         ])
         .output()
-        .expect("failed to run lpm setup ci --proxy");
+        .expect("failed to run lpm setup ci npmrc --proxy");
 
-    assert!(output.status.success(), "lpm setup ci --proxy failed");
+    assert!(output.status.success(), "lpm setup ci npmrc --proxy failed");
 
     let npmrc =
         std::fs::read_to_string(project.path().join(".npmrc")).expect("setup ci must write .npmrc");
@@ -161,12 +169,13 @@ fn setup_ci_json_envelope_carries_path_content_and_flag_state() {
             "--json",
             "setup",
             "ci",
+            "npmrc",
             "--proxy",
         ])
         .output()
-        .expect("failed to run lpm setup ci --json");
+        .expect("failed to run lpm setup ci npmrc --json");
 
-    assert!(output.status.success(), "lpm setup ci --json failed");
+    assert!(output.status.success(), "lpm setup ci npmrc --json failed");
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
@@ -209,13 +218,13 @@ fn setup_ci_json_reports_file_backed_storage_backend_for_stored_token() {
     );
 
     let output = lpm(&project)
-        .args(["--registry", registry_url, "--json", "setup", "ci"])
+        .args(["--registry", registry_url, "--json", "setup", "ci", "npmrc"])
         .output()
-        .expect("failed to run lpm setup ci --json");
+        .expect("failed to run lpm setup ci npmrc --json");
 
     assert!(
         output.status.success(),
-        "lpm setup ci --json with stored token failed:\nstdout: {}\nstderr: {}",
+        "lpm setup ci npmrc --json with stored token failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );

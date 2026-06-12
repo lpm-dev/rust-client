@@ -386,6 +386,8 @@ async fn async_main() -> Result<()> {
             omit,
             prod,
             offline,
+            frozen_lockfile,
+            no_frozen_lockfile,
             force,
             allow_new,
             strict_integrity,
@@ -478,6 +480,12 @@ async fn async_main() -> Result<()> {
                     catalog.is_some(),
                     omit_policy != commands::install::InstallOmitPolicy::default(),
                 )?;
+                if frozen_lockfile || no_frozen_lockfile {
+                    return Err(lpm_common::LpmError::Script(
+                        "`--frozen-lockfile` and `--no-frozen-lockfile` only apply to project installs."
+                            .into(),
+                    ));
+                }
                 // parse collision-resolution flags. Syntactic
                 // validation only (no lookup against marker commands —
                 // that happens at commit time with authoritative data).
@@ -556,6 +564,24 @@ async fn async_main() -> Result<()> {
             // intentionally keeps the missing-manifest error — it has
             // nothing to install against.
             let cwd = resolve_install_project_dir(&cwd, !packages.is_empty(), cli.json)?;
+            let frozen_lockfile_mode = if frozen_lockfile {
+                commands::install::FrozenLockfileMode::Always
+            } else if no_frozen_lockfile {
+                commands::install::FrozenLockfileMode::Never
+            } else {
+                commands::install::FrozenLockfileMode::Auto
+            };
+            if !packages.is_empty()
+                && frozen_lockfile_mode != commands::install::FrozenLockfileMode::Never
+                && (frozen_lockfile
+                    || (cwd.join(lpm_lockfile::LOCKFILE_NAME).exists()
+                        && commands::install::install_running_in_ci()))
+            {
+                return Err(lpm_common::LpmError::Script(
+                    "frozen installs do not accept package specs. Run `lpm install` locally to update package.json and lpm.lock, or pass --no-frozen-lockfile for a mutable install."
+                        .into(),
+                ));
+            }
             let cfg = commands::config::GlobalConfig::load();
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
 
@@ -778,6 +804,7 @@ async fn async_main() -> Result<()> {
                         &cwd,
                         cli.json,
                         offline,
+                        frozen_lockfile_mode,
                         force,
                         eff_allow_new,
                         strict_integrity,
@@ -1259,16 +1286,40 @@ async fn async_main() -> Result<()> {
         }
         Commands::Setup { action } => match action {
             SetupAction::Ci {
+                target,
+                env,
                 registry: setup_registry,
                 oidc,
                 proxy,
                 scoped: _,
             } => {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
-                let cfg = commands::config::GlobalConfig::load();
-                let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
-                commands::setup::run(effective_registry, &cwd, cli.json, oidc, eff_proxy).await
+                let target = target.as_deref().ok_or_else(|| {
+                    lpm_common::LpmError::Script(
+                        "usage: lpm setup ci <target>. Available: npmrc, github-actions, gitlab"
+                            .into(),
+                    )
+                })?;
+                match target {
+                    "npmrc" => {
+                        let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
+                        let cfg = commands::config::GlobalConfig::load();
+                        let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
+                        commands::setup::run(effective_registry, &cwd, cli.json, oidc, eff_proxy)
+                            .await
+                    }
+                    "github-actions" | "github" | "gha" => {
+                        commands::setup::run_ci_platform(target, &cwd, &env)?;
+                        Ok(())
+                    }
+                    "gitlab" | "gitlab-ci" => {
+                        commands::setup::run_ci_platform(target, &cwd, &env)?;
+                        Ok(())
+                    }
+                    other => Err(lpm_common::LpmError::Script(format!(
+                        "unknown CI setup target: '{other}'. Available: npmrc, github-actions, gitlab"
+                    ))),
+                }
             }
             SetupAction::Local {
                 days,
@@ -2050,10 +2101,188 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Ci { action, args } => {
+        Commands::Ci {
+            omit,
+            prod,
+            offline,
+            allow_new,
+            strict_integrity,
+            strict_peer_dependencies,
+            no_strict_peer_dependencies,
+            min_release_age,
+            ignore_provenance_drift,
+            ignore_provenance_drift_all,
+            unverified_provenance,
+            unverified_provenance_all,
+            linker,
+            no_skills,
+            no_editor_setup,
+            no_security_summary,
+            auto_build,
+            no_engine_strict,
+            audit_after_install,
+            no_audit_after_install,
+            policy,
+            yolo,
+            triage_alias,
+            advisor,
+            strict_sandbox,
+            paranoid,
+            no_sandbox,
+        } => {
+            let cli_strict_peer_dependencies =
+                match (strict_peer_dependencies, no_strict_peer_dependencies) {
+                    (true, false) => Some(true),
+                    (false, true) => Some(false),
+                    _ => None,
+                };
+            let omit_policy = install_omit_policy_from_cli(&omit, prod);
+
+            if !cli.json {
+                for warning in auth::check_token_expiry_warnings() {
+                    output::warn(&warning);
+                }
+            }
+
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            commands::ci::run(&action, &args_refs, &cwd, cli.json).await
+            let cwd = resolve_install_project_dir(&cwd, false, cli.json)?;
+            let cfg = commands::config::GlobalConfig::load();
+            let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
+            let eff_no_skills = no_skills || cfg.get_bool("noSkills").unwrap_or(false);
+            let eff_no_editor =
+                no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
+            let eff_no_sec =
+                no_security_summary || cfg.get_bool("noSecuritySummary").unwrap_or(false);
+            let eff_auto_build = auto_build || cfg.get_bool("autoBuild").unwrap_or(false);
+            let eff_audit_after_install: bool = if audit_after_install {
+                true
+            } else if no_audit_after_install {
+                false
+            } else if let Ok(env_val) = std::env::var("LPM_AUDIT_AFTER_INSTALL") {
+                match env_val.trim().to_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => true,
+                    "0" | "false" | "no" | "off" => false,
+                    _ => cfg.get_bool("audit-after-install").unwrap_or(false),
+                }
+            } else {
+                cfg.get_bool("audit-after-install").unwrap_or(false)
+            };
+
+            engine_check::enforce(&cwd, no_engine_strict, cli.json)?;
+
+            let min_release_age_override: Option<u64> = match min_release_age.as_deref() {
+                Some(s) => Some(release_age_config::parse_duration(s)?),
+                None => None,
+            };
+            let drift_ignore_policy = provenance_fetch::DriftIgnorePolicy::from_cli(
+                ignore_provenance_drift,
+                ignore_provenance_drift_all,
+            );
+            let (verify_policy, verify_source) = provenance_fetch::VerifyPolicy::resolve_from_chain(
+                unverified_provenance,
+                unverified_provenance_all,
+                std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref(),
+                || cfg.get_sigstore_verify(),
+            );
+            if !matches!(verify_policy.enforce, provenance_fetch::EnforceMode::Deny) {
+                let mode_label = match verify_policy.enforce {
+                    provenance_fetch::EnforceMode::Warn => "warn",
+                    provenance_fetch::EnforceMode::Off => "off",
+                    provenance_fetch::EnforceMode::Deny => unreachable!("guarded above"),
+                };
+                tracing::warn!(
+                    target = "lpm::provenance",
+                    enforce_mode = mode_label,
+                    source = ?verify_source,
+                    "sigstore verification posture is degraded for this install run",
+                );
+                if !cli.json {
+                    output::warn(&format!(
+                        "Sigstore provenance verification posture: {} (source: {}). \
+                         Provenance attestations will {} be cryptographically verified \
+                         for this install. To re-enable fail-closed: {}.",
+                        mode_label,
+                        match verify_source {
+                            provenance_fetch::EnforceModeSource::Env =>
+                                "LPM_PROVENANCE_ENFORCE env",
+                            provenance_fetch::EnforceModeSource::Config =>
+                                "[sigstore] verify in ~/.lpm/config.toml",
+                            provenance_fetch::EnforceModeSource::Default => "default",
+                        },
+                        if matches!(verify_policy.enforce, provenance_fetch::EnforceMode::Off) {
+                            "NOT"
+                        } else {
+                            "be checked but rejections will only log, not block —"
+                        },
+                        verify_source.re_enable_hint(),
+                    ));
+                }
+            }
+
+            let script_policy_cfg =
+                script_policy_config::ScriptPolicyConfig::from_package_json(&cwd);
+            let cli_script_policy_override =
+                script_policy_config::collapse_policy_flags(policy.as_deref(), yolo, triage_alias)
+                    .map_err(lpm_common::LpmError::Script)?;
+            let effective_script_policy =
+                script_policy_config::resolve_script_policy_with_security(
+                    &cwd,
+                    cli_script_policy_override,
+                    &script_policy_cfg,
+                    cli.json,
+                )?;
+            tracing::debug!(
+                "lpm ci: effective script-policy = {}",
+                effective_script_policy.as_str()
+            );
+            if let Some(invalid) = &script_policy_cfg.policy_parse_error
+                && !cli.json
+            {
+                output::warn(&format!(
+                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
+                     (expected one of: deny, allow, triage); this key was \
+                     ignored — effective policy: {}",
+                    effective_script_policy.as_str(),
+                ));
+            }
+
+            let cli_linker = linker.map(LinkerCli::into_linker_mode);
+            let root_lifecycle = commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?;
+            root_lifecycle.run_dev_preinstall(&cwd, cli.json)?;
+
+            commands::install::run_with_options(
+                &client,
+                &cwd,
+                cli.json,
+                offline,
+                commands::install::FrozenLockfileMode::Always,
+                false,
+                eff_allow_new,
+                strict_integrity,
+                cli_strict_peer_dependencies,
+                cli_linker,
+                eff_no_skills,
+                eff_no_editor,
+                eff_no_sec,
+                eff_auto_build,
+                None,
+                None,
+                None,
+                cli_script_policy_override,
+                advisor.clone(),
+                min_release_age_override,
+                drift_ignore_policy,
+                verify_policy,
+                omit_policy,
+                strict_sandbox || paranoid,
+                no_sandbox,
+                cli.verbose,
+                eff_audit_after_install,
+            )
+            .await?;
+
+            commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?
+                .run_after_successful_install(&cwd, cli.json)
         }
         Commands::Dev {
             https,

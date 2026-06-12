@@ -333,6 +333,14 @@ pub(crate) enum Commands {
         #[arg(long)]
         offline: bool,
 
+        /// Refuse to update lpm.lock; fail if package.json and lpm.lock differ.
+        #[arg(long, conflicts_with = "no_frozen_lockfile")]
+        frozen_lockfile: bool,
+
+        /// Disable the CI default frozen-lockfile behavior for this install.
+        #[arg(long, conflicts_with = "frozen_lockfile")]
+        no_frozen_lockfile: bool,
+
         /// Force full re-install: bypass the fast-exit hash check, skip the
         /// lockfile (force fresh resolution from registry), re-download all
         /// packages (even if already in the global store), and re-link
@@ -2169,13 +2177,152 @@ pub(crate) enum Commands {
         args: Vec<String>,
     },
 
-    /// CI/CD helpers: load env vars, setup OIDC, generate workflow YAML.
+    /// Frozen install for CI.
     Ci {
-        /// Action: env, setup.
-        action: String,
-        /// Extra arguments.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Omit dependency types from node_modules.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        omit: Vec<InstallOmitCli>,
+
+        /// Install production dependencies only.
+        #[arg(long, alias = "production")]
+        prod: bool,
+
+        /// Install without network (use lockfile + global store only).
+        #[arg(long)]
+        offline: bool,
+
+        /// Allow recently published packages (skip minimumReleaseAge check).
+        #[arg(long)]
+        allow_new: bool,
+
+        /// Fail on tarball-URL deps that have no declared SRI integrity.
+        #[arg(long)]
+        strict_integrity: bool,
+
+        /// Fail install when peer-dependency warnings or conflicts are detected.
+        #[arg(
+            long,
+            id = "ci_strict_peer_dependencies",
+            conflicts_with = "ci_no_strict_peer_dependencies"
+        )]
+        strict_peer_dependencies: bool,
+
+        /// Disable strict peer-dependency failures for this install.
+        #[arg(
+            long,
+            id = "ci_no_strict_peer_dependencies",
+            conflicts_with = "ci_strict_peer_dependencies"
+        )]
+        no_strict_peer_dependencies: bool,
+
+        /// Override the minimumReleaseAge cooldown for this install only.
+        #[arg(long, value_name = "DUR")]
+        min_release_age: Option<String>,
+
+        /// Skip the provenance-drift check for this package name.
+        #[arg(long, value_name = "PKG")]
+        ignore_provenance_drift: Vec<String>,
+
+        /// Skip the provenance-drift check for every resolved package.
+        #[arg(long)]
+        ignore_provenance_drift_all: bool,
+
+        /// Skip cryptographic Sigstore verification for this package name.
+        #[arg(long, value_name = "PKG")]
+        unverified_provenance: Vec<String>,
+
+        /// Skip cryptographic Sigstore verification for every package.
+        #[arg(long)]
+        unverified_provenance_all: bool,
+
+        /// Linking mode: `hoisted` or `isolated`.
+        #[arg(long, value_enum)]
+        linker: Option<LinkerCli>,
+
+        /// Skip skills auto-install.
+        #[arg(long)]
+        no_skills: bool,
+
+        /// Skip editor auto-integration.
+        #[arg(long)]
+        no_editor_setup: bool,
+
+        /// Disable post-install security summary.
+        #[arg(long)]
+        no_security_summary: bool,
+
+        /// Automatically run `lpm rebuild` for trusted packages after install.
+        #[arg(long)]
+        auto_build: bool,
+
+        /// Skip `engines.lpm` / `engines.node` enforcement for this invocation.
+        #[arg(long)]
+        no_engine_strict: bool,
+
+        /// Run `lpm audit` once after a successful install.
+        #[arg(
+            long,
+            id = "ci_audit_after_install",
+            conflicts_with = "ci_no_audit_after_install"
+        )]
+        audit_after_install: bool,
+
+        /// Suppress audit-after-install for this invocation.
+        #[arg(
+            long,
+            id = "ci_no_audit_after_install",
+            conflicts_with = "ci_audit_after_install"
+        )]
+        no_audit_after_install: bool,
+
+        /// Lifecycle-script policy override for this invocation.
+        #[arg(
+            long,
+            id = "ci_policy",
+            value_name = "deny|allow|triage",
+            conflicts_with_all = ["ci_yolo", "ci_triage_alias"],
+        )]
+        policy: Option<String>,
+
+        /// Alias for `--policy=allow`.
+        #[arg(long, id = "ci_yolo", conflicts_with_all = ["ci_policy", "ci_triage_alias"])]
+        yolo: bool,
+
+        /// Alias for `--policy=triage`.
+        #[arg(long = "triage", id = "ci_triage_alias", conflicts_with_all = ["ci_policy", "ci_yolo"])]
+        triage_alias: bool,
+
+        /// Override the triage advisor for this run.
+        #[arg(
+            long,
+            value_name = "none|claude-cli|codex|ollama",
+            value_parser = parse_advisor_slug,
+        )]
+        advisor: Option<String>,
+
+        /// Engage strict sandbox for lifecycle scripts.
+        #[arg(
+            long = "strict-sandbox",
+            id = "ci_strict_sandbox",
+            conflicts_with_all = ["ci_no_sandbox", "ci_paranoid"],
+        )]
+        strict_sandbox: bool,
+
+        /// Alias for `--strict-sandbox`.
+        #[arg(
+            long = "paranoid",
+            id = "ci_paranoid",
+            conflicts_with_all = ["ci_no_sandbox", "ci_strict_sandbox"],
+        )]
+        paranoid: bool,
+
+        /// Drop all containment for lifecycle scripts.
+        #[arg(
+            long = "no-sandbox",
+            id = "ci_no_sandbox",
+            conflicts_with_all = ["ci_strict_sandbox", "ci_paranoid"],
+        )]
+        no_sandbox: bool,
     },
 
     /// Start the dev server with optional HTTPS, tunnel, and network features.
@@ -2596,6 +2743,13 @@ pub(crate) enum Commands {
 pub(crate) enum SetupAction {
     /// Generate `.npmrc` for CI/CD.
     Ci {
+        /// Setup target: npmrc, github-actions, gitlab.
+        target: Option<String>,
+
+        /// Environment name for workflow snippets.
+        #[arg(long, default_value = "production")]
+        env: String,
+
         /// Override the registry URL for `.npmrc` (default: current `--registry` or `LPM_REGISTRY_URL`).
         #[arg(short = 'r', long)]
         registry: Option<String>,

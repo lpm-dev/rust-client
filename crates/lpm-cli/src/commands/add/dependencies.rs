@@ -421,6 +421,7 @@ pub(super) async fn handle_dependencies(
                 project_dir,
                 json_output,
                 false,                                                 // offline
+                crate::commands::install::FrozenLockfileMode::Never,
                 false,                                                 // force
                 false,                                                 // allow_new
                 false, // strict_integrity

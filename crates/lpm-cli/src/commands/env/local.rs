@@ -185,10 +185,19 @@ pub(super) fn env_export(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let (env_input, remaining) = parse_env_flag(args)?;
+    let ci = args.contains(&"--ci");
+    let filtered_args: Vec<&str> = args.iter().copied().filter(|arg| *arg != "--ci").collect();
+    let (env_input, remaining) = parse_env_flag(&filtered_args)?;
     let file = remaining
         .first()
         .ok_or_else(|| LpmError::Script("usage: lpm env export [--env=<name>] <file>".into()))?;
+    if ci {
+        return super::ci::emit_project_env_for_ci(
+            project_dir,
+            env_input,
+            super::ci::CiEnvDestination::DotenvFile(file),
+        );
+    }
     let path = project_dir.join(file);
 
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;

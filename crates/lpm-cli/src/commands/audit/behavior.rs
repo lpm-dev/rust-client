@@ -93,28 +93,33 @@ pub(super) fn run_behavioral_analysis(
             } else {
                 "local"
             };
+            let cache_integrity = inventory::audit_cache_integrity(pkg);
             let cached_analysis = if pkg.scan_mode == ScanMode::RegistryAndStore {
-                lpm_root
-                    .as_ref()
-                    .and_then(|root| {
-                        inventory::find_project_baseline(
-                            baseline_index.as_ref(),
-                            root,
-                            &pkg.name,
-                            &pkg.version,
-                        )
-                    })
-                    .and_then(|baseline| {
-                        lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
-                    })
-                    .or_else(|| {
-                        project_cache_ref
-                            .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
-                            .cloned()
-                    })
+                let store_analysis = if inventory::can_reuse_lpm_store_analysis(pkg) {
+                    lpm_root
+                        .as_ref()
+                        .and_then(|root| {
+                            inventory::find_project_baseline(
+                                baseline_index.as_ref(),
+                                root,
+                                &pkg.name,
+                                &pkg.version,
+                            )
+                        })
+                        .and_then(|baseline| {
+                            lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
+                        })
+                } else {
+                    None
+                };
+                store_analysis.or_else(|| {
+                    project_cache_ref
+                        .and_then(|c| c.get(&pkg.path, cache_integrity))
+                        .cloned()
+                })
             } else {
                 project_cache_ref
-                    .and_then(|c| c.get(&pkg.path, pkg.integrity.as_deref()))
+                    .and_then(|c| c.get(&pkg.path, cache_integrity))
                     .cloned()
             };
 
@@ -127,7 +132,7 @@ pub(super) fn run_behavioral_analysis(
                     path: pkg.path.clone(),
                     name: pkg.name.clone(),
                     version: pkg.version.clone(),
-                    integrity: pkg.integrity.clone(),
+                    integrity: pkg.patch_sha256.clone().or_else(|| pkg.integrity.clone()),
                     analysis: analysis.clone(),
                     dependencies: pkg.dependencies.clone(),
                 };

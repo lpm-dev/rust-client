@@ -108,9 +108,27 @@ fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
         })
         .collect();
     let toml = format!(
-        "[metadata]\nlockfile-version = 2\nresolved-with = \"pubgrub\"\n\n{}\n",
+        "[metadata]\nlockfile-version = {}\nresolved-with = \"pubgrub\"\n\n{}\n",
+        lpm_lockfile::LOCKFILE_VERSION,
         pkgs.join("\n")
     );
+    project.write_file("lpm.lock", &toml);
+}
+
+fn patch_sha256(project: &TempProject, rel_path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(project.path().join(rel_path)).unwrap();
+    format!("sha256-{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn append_lockfile_patch_records(project: &TempProject, records: &[(&str, &str, &str)]) {
+    let mut toml = project.read_file("lpm.lock");
+    for (selector, path, integrity) in records {
+        toml.push_str(&format!(
+            "\n[patches.\"{selector}\"]\npath = \"{path}\"\nsha256 = \"{}\"\noriginal-integrity = \"{integrity}\"\n",
+            patch_sha256(project, path),
+        ));
+    }
     project.write_file("lpm.lock", &toml);
 }
 
@@ -233,6 +251,7 @@ fn build_patch_install_fixture(
     write_lockfile(project, &[(pkg_name, pkg_version, &[])]);
 
     let key = format!("{pkg_name}@{pkg_version}");
+    append_lockfile_patch_records(project, &[(&key, &patch_rel, &integrity)]);
     let fp = phase6_fingerprint(&[(&key, &patch_rel, &integrity)]);
     write_patch_state(
         project,
@@ -479,6 +498,51 @@ fn install_patches_hard_errors_on_missing_patch_file() {
     );
 }
 
+/// Patch path and manifest fingerprint are unchanged, but the patch
+/// file bytes no longer match the checksum recorded in `lpm.lock`.
+/// Install must stop before applying the edited patch.
+#[test]
+fn install_patches_hard_errors_when_patch_file_hash_differs_from_lockfile() {
+    let project = TempProject::empty("");
+    let patch_text = "--- a/index.js\n+++ b/index.js\n@@ -1 +1 @@\n-x\n+X\n";
+    build_patch_install_fixture(
+        &project,
+        "install-patch-hash-mismatch",
+        "lodash",
+        "4.17.21",
+        &[("index.js", "x\n")],
+        patch_text,
+    );
+    project.write_file(
+        "patches/lodash@4.17.21.patch",
+        "--- a/index.js\n+++ b/index.js\n@@ -1 +1 @@\n-x\n+Y\n",
+    );
+
+    let out = lpm_isolated(&project, "http://127.0.0.1:1")
+        .args(["install", "--offline"])
+        .output()
+        .expect("spawn lpm install");
+    assert!(
+        !out.status.success(),
+        "edited patch file must hard-error; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ));
+    assert!(
+        combined.contains("Patch lockfile mismatch") && combined.contains("sha256"),
+        "error must report the lockfile patch checksum mismatch; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("restore the patch file") && combined.contains("patch-commit"),
+        "error must point at restoring or re-authoring the patch; got:\n{combined}"
+    );
+}
+
 /// Patch was authored against different content than the store
 /// baseline; strict apply must reject ("hunk failed" / regenerate
 /// guidance).
@@ -552,6 +616,10 @@ fn install_patches_offline_hard_errors_when_patches_change_between_runs() {
     );
     project.write_file("package.json", &manifest_v1);
     write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    append_lockfile_patch_records(
+        &project,
+        &[("lodash@4.17.21", "patches/v1.patch", &integrity)],
+    );
     let fp_v1 = phase6_fingerprint(&[("lodash@4.17.21", "patches/v1.patch", &integrity)]);
     write_patch_state(
         &project,
@@ -586,12 +654,12 @@ fn install_patches_offline_hard_errors_when_patches_change_between_runs() {
         String::from_utf8_lossy(&out.stderr)
     ));
     assert!(
-        combined.contains("patch") || combined.contains("fingerprint"),
-        "error must mention patches/fingerprint; got:\n{combined}"
+        combined.contains("Patch lockfile mismatch"),
+        "error must mention patch lockfile mismatch; got:\n{combined}"
     );
     assert!(
-        combined.contains("online") || combined.contains("re-resolve"),
-        "error must point at online recovery; got:\n{combined}"
+        combined.contains("patches/v2.patch") && combined.contains("patches/v1.patch"),
+        "error must show current and lockfile patch paths; got:\n{combined}"
     );
 }
 
@@ -624,6 +692,10 @@ fn install_patches_offline_hard_errors_on_patch_fingerprint_mismatch() {
         ),
     );
     write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    append_lockfile_patch_records(
+        &project,
+        &[("lodash@4.17.21", "patches/lodash@4.17.21.patch", &integrity)],
+    );
     write_patch_state(
         &project,
         "sha256-completely-different-from-current",
@@ -690,6 +762,10 @@ fn install_patches_offline_hard_errors_when_patches_exist_but_no_state_file() {
         ),
     );
     write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
+    append_lockfile_patch_records(
+        &project,
+        &[("lodash@4.17.21", "patches/lodash@4.17.21.patch", &integrity)],
+    );
     // Intentionally no patch-state.json.
 
     let out = lpm_isolated(&project, "http://127.0.0.1:1")

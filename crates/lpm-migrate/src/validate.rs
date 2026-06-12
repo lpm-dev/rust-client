@@ -264,6 +264,8 @@ mod tests {
                 resolved_with: Some("migrate".to_string()),
                 auto_isolated_peer_conflicts: false,
             },
+            importers: lpm_lockfile::ImporterSnapshots::new(),
+            patches: lpm_lockfile::LockfilePatches::new(),
             catalogs: lpm_lockfile::CatalogSnapshots::new(),
             packages,
             root_aliases: std::collections::BTreeMap::new(),

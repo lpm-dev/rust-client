@@ -34,10 +34,11 @@
 //! leaves the previous state file intact.
 
 use lpm_common::LpmError;
+use lpm_lockfile::{LockfilePatch, LockfilePatches};
 use lpm_workspace::PatchedDependencyEntry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Schema version for the on-disk state file. Bump on breaking changes.
@@ -213,6 +214,48 @@ pub fn compute_fingerprint(patches: &HashMap<String, PatchedDependencyEntry>) ->
         hasher.update(b"\x01");
     }
     format!("sha256-{:x}", hasher.finalize())
+}
+
+/// Full SHA-256 digest for a project-relative patch file.
+pub fn patch_file_sha256(project_dir: &Path, rel_path: &str) -> Result<String, LpmError> {
+    let path = project_dir.join(rel_path);
+    let bytes = std::fs::read(&path).map_err(|e| {
+        LpmError::Script(format!(
+            "patch file {rel_path} declared in lpm.patchedDependencies cannot be read: {e}"
+        ))
+    })?;
+    Ok(format!("sha256-{}", hex::encode(Sha256::digest(&bytes))))
+}
+
+/// Build lockfile patch records from the current manifest declarations.
+///
+/// The map key is the manifest's exact `name@version` selector. The
+/// patch engine parser is intentionally reused here so `lpm.lock`
+/// never records a patch selector the installer could not replay.
+pub fn lockfile_patches_from_manifest(
+    project_dir: &Path,
+    patches: &HashMap<String, PatchedDependencyEntry>,
+) -> Result<LockfilePatches, LpmError> {
+    if patches.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut out = LockfilePatches::new();
+    let mut keys: Vec<&String> = patches.keys().collect();
+    keys.sort();
+    for key in keys {
+        crate::patch_engine::parse_patch_key(key)?;
+        let entry = &patches[key];
+        out.insert(
+            key.clone(),
+            LockfilePatch {
+                path: entry.path.clone(),
+                sha256: patch_file_sha256(project_dir, &entry.path)?,
+                original_integrity: entry.original_integrity.clone(),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// Return the path to the state file inside `<project_dir>/.lpm/`.

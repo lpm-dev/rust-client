@@ -62,6 +62,129 @@ fn toml_output_is_readable() {
     assert!(toml_str.contains("react"));
 }
 
+#[test]
+fn importer_snapshots_round_trip_dependency_sections() {
+    let mut lf = Lockfile::new();
+    let importer = ImporterSnapshot {
+        dependencies: BTreeMap::from([("react".to_string(), "^19.0.0".to_string())]),
+        dev_dependencies: BTreeMap::from([("vitest".to_string(), "^4.0.0".to_string())]),
+        optional_dependencies: BTreeMap::from([("fsevents".to_string(), "^2.3.3".to_string())]),
+        peer_dependencies: BTreeMap::from([("typescript".to_string(), ">=5".to_string())]),
+        ..ImporterSnapshot::default()
+    };
+    lf.importers.insert(".".to_string(), importer.clone());
+
+    let toml = lf.to_toml().expect("serialize importer snapshot");
+    assert!(
+        toml.contains("[importers.\".\".dependencies]")
+            && toml.contains("[importers.\".\".dev-dependencies]")
+            && toml.contains("[importers.\".\".optional-dependencies]")
+            && toml.contains("[importers.\".\".peer-dependencies]"),
+        "v5 lockfile must serialize importer dependency sections, got:\n{toml}"
+    );
+
+    let parsed = Lockfile::from_toml(&toml).expect("parse importer snapshot");
+    assert_eq!(parsed.importers.get(".").unwrap(), &importer);
+}
+
+#[test]
+fn patch_records_round_trip_and_skip_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml_path = dir.path().join("lpm.lock");
+    let binary_path = toml_path.with_extension("lockb");
+
+    let mut lf = Lockfile::new();
+    lf.add_package(LockedPackage {
+        name: "lodash".to_string(),
+        version: "4.17.21".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        integrity: Some("sha512-original".to_string()),
+        registry_signatures: Vec::new(),
+        registry_published_at: None,
+        os: Vec::new(),
+        cpu: Vec::new(),
+        libc: Vec::new(),
+        optional: false,
+        dependencies: vec![],
+        alias_dependencies: vec![],
+        peers: vec![],
+        tarball: None,
+    });
+    lf.write_all(&toml_path).unwrap();
+    assert!(
+        binary_path.exists(),
+        "binary-compatible lockfile must write lpm.lockb before patch metadata is present"
+    );
+
+    lf.patches.insert(
+        "lodash@4.17.21".to_string(),
+        LockfilePatch {
+            path: "patches/lodash@4.17.21.patch".to_string(),
+            sha256: "sha256-0123456789abcdef".to_string(),
+            original_integrity: "sha512-original".to_string(),
+        },
+    );
+    let toml = lf.to_toml().expect("serialize patch records");
+    assert!(
+        toml.contains("[patches.\"lodash@4.17.21\"]")
+            && toml.contains("path = \"patches/lodash@4.17.21.patch\"")
+            && toml.contains("sha256 = \"sha256-0123456789abcdef\"")
+            && toml.contains("original-integrity = \"sha512-original\""),
+        "v5 lockfile must serialize patch evidence, got:\n{toml}"
+    );
+    let parsed = Lockfile::from_toml(&toml).expect("parse patch records");
+    assert_eq!(parsed.patches, lf.patches);
+
+    lf.write_all(&toml_path).unwrap();
+    assert!(
+        !binary_path.exists(),
+        "patch-bearing v5 lockfile must remove stale lpm.lockb"
+    );
+}
+
+#[test]
+fn write_all_skips_binary_when_importer_snapshots_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml_path = dir.path().join("lpm.lock");
+    let binary_path = toml_path.with_extension("lockb");
+
+    let mut lf = Lockfile::new();
+    lf.add_package(LockedPackage {
+        name: "foo".to_string(),
+        version: "1.0.0".to_string(),
+        source: None,
+        integrity: None,
+        registry_signatures: Vec::new(),
+        registry_published_at: None,
+        os: Vec::new(),
+        cpu: Vec::new(),
+        libc: Vec::new(),
+        optional: false,
+        dependencies: vec![],
+        alias_dependencies: vec![],
+        peers: vec![],
+        tarball: None,
+    });
+    lf.write_all(&toml_path).unwrap();
+    assert!(
+        binary_path.exists(),
+        "binary-compatible lockfile must write lpm.lockb"
+    );
+
+    lf.importers.insert(
+        ".".to_string(),
+        ImporterSnapshot {
+            dependencies: BTreeMap::from([("foo".to_string(), "^1.0.0".to_string())]),
+            ..ImporterSnapshot::default()
+        },
+    );
+    lf.write_all(&toml_path).unwrap();
+    assert!(
+        !binary_path.exists(),
+        "importer-bearing v5 lockfile must remove stale lpm.lockb"
+    );
+}
+
 /// Every default `lpm install` writes a lockfile produced by
 /// greedy-fusion — the field was previously hardcoded to "pubgrub".
 /// The constructor must round-trip the resolver name

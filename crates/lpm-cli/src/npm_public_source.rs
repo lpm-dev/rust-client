@@ -65,6 +65,8 @@ mod tests {
                 resolved_with: Some("greedy-fusion".into()),
                 auto_isolated_peer_conflicts: false,
             },
+            importers: Default::default(),
+            patches: Default::default(),
             catalogs: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
                 name: "ms".into(),

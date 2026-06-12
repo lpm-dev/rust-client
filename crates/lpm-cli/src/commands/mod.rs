@@ -6,7 +6,6 @@ pub mod cache;
 pub mod cache_prune;
 pub mod catalog;
 pub mod cert;
-pub mod ci;
 pub mod completions;
 pub mod config;
 pub mod deploy;

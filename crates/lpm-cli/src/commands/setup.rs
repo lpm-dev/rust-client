@@ -1,5 +1,6 @@
 use crate::{auth_storage_notice, install_ui, oidc};
 use lpm_common::LpmError;
+use lpm_common::color::Painted;
 use std::path::Path;
 
 fn hint_line(message: &str) {
@@ -174,4 +175,98 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+pub fn run_ci_platform(platform: &str, project_dir: &Path, env_mode: &str) -> Result<(), LpmError> {
+    match platform {
+        "github-actions" | "github" | "gha" => {
+            setup_github_actions(project_dir, env_mode);
+            Ok(())
+        }
+        "gitlab" | "gitlab-ci" => {
+            setup_gitlab_ci(env_mode);
+            Ok(())
+        }
+        _ => Err(LpmError::Script(format!(
+            "unknown CI setup target: '{platform}'. Available: npmrc, github-actions, gitlab"
+        ))),
+    }
+}
+
+fn setup_github_actions(project_dir: &Path, env_mode: &str) {
+    let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
+        .unwrap_or_else(|| "<your-vault-id>".to_string());
+
+    println!();
+    println!("  {} GitHub Actions OIDC Setup", "▸".bold());
+    println!();
+    println!(
+        "  {} Add this to your workflow (.github/workflows/deploy.yml):",
+        "1.".bold()
+    );
+    println!();
+    println!(
+        "  {}",
+        "jobs:
+    deploy:
+      permissions:
+        id-token: write
+        contents: read
+      steps:
+        - uses: actions/checkout@v4
+        - name: Install LPM
+          run: npm install -g @lpm-registry/cli
+        - name: Load secrets from env
+          run: lpm env pull --oidc --env={ENV} --output=.env
+          env:
+            LPM_VAULT_ID: {VAULT_ID}
+        - name: Deploy
+          run: lpm exec -- ./deploy.sh"
+            .replace("{ENV}", env_mode)
+            .replace("{VAULT_ID}", &vault_id)
+            .dimmed()
+    );
+    println!();
+    println!("  {} Authorize this repo:", "2.".bold());
+    println!();
+    println!(
+        "  {}",
+        format!(
+            "lpm env oidc allow --provider=github --repo=<owner/repo> --branch=main --env={env_mode}"
+        )
+        .bold()
+    );
+    println!();
+}
+
+fn setup_gitlab_ci(env_mode: &str) {
+    println!();
+    println!("  {} GitLab CI OIDC Setup", "▸".bold());
+    println!();
+    println!("  {} Add this to .gitlab-ci.yml:", "1.".bold());
+    println!();
+    println!(
+        "  {}",
+        "deploy:
+  id_tokens:
+    LPM_OIDC_TOKEN:
+      aud: https://lpm.dev
+  script:
+    - npm install -g @lpm-registry/cli
+    - lpm env pull --oidc --env={ENV} --output=.env
+    - lpm exec -- ./deploy.sh"
+            .replace("{ENV}", env_mode)
+            .dimmed()
+    );
+    println!();
+    println!("  {} Authorize this project:", "2.".bold());
+    println!();
+    println!(
+        "  {}",
+        format!(
+            "lpm env oidc allow --provider=gitlab --repo=<project-path> --branch=main --env={env_mode}"
+        )
+        .bold()
+    );
+    println!();
 }

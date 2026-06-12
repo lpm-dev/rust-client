@@ -23,13 +23,13 @@ fn ci_env_github_actions_masks_secret_values_and_emits_github_env_commands() {
 
     let output = lpm(&project)
         .env("GITHUB_ACTIONS", "1")
-        .args(["ci", "env"])
+        .args(["env", "print", "--ci"])
         .output()
-        .expect("failed to run lpm ci env");
+        .expect("failed to run lpm env print --ci");
 
     assert!(
         output.status.success(),
-        "lpm ci env failed:\nstdout: {}\nstderr: {}",
+        "lpm env print --ci failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -48,7 +48,7 @@ fn ci_env_github_actions_masks_secret_values_and_emits_github_env_commands() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("✓ Emitted 2 environment variables for GitHub Actions"),
-        "ci env must report a slim terminus on stderr, got:\n{stderr}"
+        "env print --ci must report a slim terminus on stderr, got:\n{stderr}"
     );
 }
 
@@ -63,13 +63,13 @@ fn ci_env_shell_output_reports_generic_ci_terminus_on_stderr() {
     let output = lpm(&project)
         .env_remove("GITHUB_ACTIONS")
         .env_remove("VERCEL")
-        .args(["ci", "env"])
+        .args(["env", "print", "--ci"])
         .output()
-        .expect("failed to run lpm ci env");
+        .expect("failed to run lpm env print --ci");
 
     assert!(
         output.status.success(),
-        "lpm ci env failed:\nstdout: {}\nstderr: {}",
+        "lpm env print --ci failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -84,7 +84,7 @@ fn ci_env_shell_output_reports_generic_ci_terminus_on_stderr() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("✓ Emitted 2 environment variables for generic CI"),
-        "ci env shell path must report the generic CI terminus, got:\n{stderr}"
+        "env print --ci shell path must report the generic CI terminus, got:\n{stderr}"
     );
 }
 
@@ -98,13 +98,13 @@ fn ci_env_output_writes_dotenv_file_for_selected_env_mode() {
     );
 
     let output = lpm(&project)
-        .args(["ci", "env", "--env=production", "--output=ci.env"])
+        .args(["env", "export", "--ci", "--env=production", "ci.env"])
         .output()
-        .expect("failed to run lpm ci env --output");
+        .expect("failed to run lpm env export --ci");
 
     assert!(
         output.status.success(),
-        "lpm ci env --output failed:\nstdout: {}\nstderr: {}",
+        "lpm env export --ci failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -121,7 +121,7 @@ fn ci_env_output_writes_dotenv_file_for_selected_env_mode() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("✓ Wrote 3 vars to ci.env"),
-        "ci env --output must report the file write, got:\n{stderr}"
+        "env export --ci must report the file write, got:\n{stderr}"
     );
 }
 
@@ -131,13 +131,13 @@ fn ci_setup_github_actions_uses_project_vault_id_and_requested_env_name() {
     project.write_file("lpm.json", r#"{ "vault": "vault-123" }"#);
 
     let output = lpm(&project)
-        .args(["ci", "setup", "github-actions", "--env=preview"])
+        .args(["setup", "ci", "github-actions", "--env=preview"])
         .output()
-        .expect("failed to run lpm ci setup github-actions");
+        .expect("failed to run lpm setup ci github-actions");
 
     assert!(
         output.status.success(),
-        "lpm ci setup github-actions failed:\nstdout: {}\nstderr: {}",
+        "lpm setup ci github-actions failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -163,20 +163,20 @@ fn ci_setup_github_actions_uses_project_vault_id_and_requested_env_name() {
     );
 }
 
-// ─── ci setup gitlab ──────────────────────────────────────────────────
+// ─── setup ci gitlab ──────────────────────────────────────────────────
 
 #[test]
 fn ci_setup_gitlab_emits_id_tokens_block_and_authorization_command() {
     let project = TempProject::empty(r#"{"name":"ci-gitlab","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["ci", "setup", "gitlab"])
+        .args(["setup", "ci", "gitlab"])
         .output()
-        .expect("failed to run lpm ci setup gitlab");
+        .expect("failed to run lpm setup ci gitlab");
 
     assert!(
         output.status.success(),
-        "lpm ci setup gitlab failed:\nstdout: {}\nstderr: {}",
+        "lpm setup ci gitlab failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -201,11 +201,11 @@ fn ci_setup_gitlab_with_env_flag_threads_the_env_name() {
     let project = TempProject::empty(r#"{"name":"ci-gitlab","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["ci", "setup", "gitlab", "--env=staging"])
+        .args(["setup", "ci", "gitlab", "--env=staging"])
         .output()
-        .expect("failed to run lpm ci setup gitlab --env=staging");
+        .expect("failed to run lpm setup ci gitlab --env=staging");
 
-    assert!(output.status.success(), "ci setup gitlab --env failed");
+    assert!(output.status.success(), "setup ci gitlab --env failed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -219,9 +219,9 @@ fn ci_setup_unknown_platform_fails_with_helpful_message() {
     let project = TempProject::empty(r#"{"name":"ci","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["ci", "setup", "bitbucket"])
+        .args(["setup", "ci", "bitbucket"])
         .output()
-        .expect("failed to run lpm ci setup bitbucket");
+        .expect("failed to run lpm setup ci bitbucket");
 
     assert!(
         !output.status.success(),
@@ -235,9 +235,9 @@ fn ci_setup_unknown_platform_fails_with_helpful_message() {
     );
 }
 
-/// `lpm --json ci setup <unknown-platform>` surfaces the same
+/// `lpm --json setup ci <unknown-platform>` surfaces the same
 /// validation error as a structured envelope. Pins the JSON contract
-/// shared by `ci setup github-actions` and `ci setup gitlab` (the
+/// shared by `setup ci github-actions` and `setup ci gitlab` (the
 /// happy paths emit shell-format on stdout, not envelopes — see the
 /// existing tests above — but the dispatcher's unknown-platform
 /// rejection is the cheapest envelope contract for both surfaces).
@@ -246,13 +246,13 @@ fn ci_setup_unknown_platform_under_json_emits_error_envelope_on_stdout() {
     let project = TempProject::empty(r#"{"name":"ci","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["--json", "ci", "setup", "bitbucket"])
+        .args(["--json", "setup", "ci", "bitbucket"])
         .output()
-        .expect("failed to run lpm --json ci setup bitbucket");
+        .expect("failed to run lpm --json setup ci bitbucket");
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("--json ci setup unknown error path must emit JSON: {e}\n---\n{stdout}")
+        panic!("--json setup ci unknown error path must emit JSON: {e}\n---\n{stdout}")
     });
     assert_eq!(envelope["success"], serde_json::json!(false));
     assert!(
@@ -268,18 +268,44 @@ fn ci_setup_without_platform_arg_fails_with_usage_message() {
     let project = TempProject::empty(r#"{"name":"ci","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["ci", "setup"])
+        .args(["setup", "ci"])
         .output()
-        .expect("failed to run lpm ci setup (no platform)");
+        .expect("failed to run lpm setup ci (no platform)");
 
     assert!(
         !output.status.success(),
-        "ci setup without platform must exit non-zero"
+        "setup ci without platform must exit non-zero"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("usage:") || stderr.contains("Available"),
         "stderr must show usage, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn ci_without_lockfile_fails_as_frozen_install() {
+    let project = TempProject::empty(r#"{"name":"ci-frozen","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "ci",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run lpm ci");
+
+    assert!(
+        !output.status.success(),
+        "lpm ci must fail when the frozen lockfile is missing"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Frozen lockfile") && stderr.contains("lpm.lock"),
+        "stderr must explain that lpm ci is a frozen install requiring lpm.lock, got:\n{stderr}"
     );
 }
