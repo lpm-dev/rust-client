@@ -532,13 +532,16 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-bench-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Run benchmarks
-        run: cargo bench --locked -p lpm-security 2>&1 | grep -E '^test |^Benchmarking' | tee bench-output.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench --locked -p lpm-security 2>&1 | grep -E '^test |^Benchmarking' | tee bench-output.txt
 
       - name: Verify benchmarks ran
         run: |
           if [ ! -s bench-output.txt ]; then
-            echo "::warning::No benchmark output captured — criterion may need configuration"
-            exit 0
+            echo "::error::No benchmark output captured — criterion may need configuration"
+            exit 1
           fi
           echo "Benchmarks completed:"
           cat bench-output.txt

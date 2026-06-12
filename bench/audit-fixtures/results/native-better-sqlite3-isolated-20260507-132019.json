@@ -1,7 +1,0 @@
-{
-  "fixture": "native/better-sqlite3",
-  "mode": "isolated",
-  "timestamp": "20260507-132019",
-  "verdict": "SKIP",
-  "skip_reason": "node-gyp not on PATH (better-sqlite3 falls back to compile-on-install)\n  \u2192 install with: npm install -g node-gyp\n  \u2192 tracking as roadmap A3 (lpm lifecycle runner doesn't expose npm-bundled node-gyp)"
-}
