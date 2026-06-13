@@ -56,6 +56,7 @@ mod tool_pin_validation;
 pub mod triage_advisor_session;
 mod trust_snapshot;
 mod tsc_status;
+mod typosquat_guard;
 mod update_check;
 pub mod upgrade_engine;
 pub mod version_diff;

@@ -924,6 +924,7 @@ async fn async_main() -> Result<()> {
                         &packages,
                         save_dev,
                         cli.json,
+                        yes,
                         eff_allow_new,
                         force,
                         save_flags,

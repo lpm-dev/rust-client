@@ -25,7 +25,6 @@ use paths::{prepare_safe_dest_parent, resolve_safe_dest_validate, validate_extra
 use project::{
     detect_buyer_alias, detect_default_install_dir, detect_package_manager, resolve_target_dir,
 };
-use security::should_warn_typosquatting;
 use source::{
     collect_source_with_fallback, filter_config_files, is_runtime_source_text_file,
     json_value_to_config_string, read_lpm_config,
@@ -58,23 +57,22 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let add_started = std::time::Instant::now();
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let reviewed = crate::typosquat_guard::guard_explicit_package_specs(
+        project_dir,
+        &[package_spec.to_string()],
+        &[project_dir.to_path_buf()],
+        yes,
+        json_output,
+    )?;
+    let package_spec =
+        reviewed.specs.first().map(String::as_str).ok_or_else(|| {
+            LpmError::Registry("internal typosquat guard returned no package".into())
+        })?;
 
     // Resolve package reference into AddTarget.
     // `@lpm.dev/owner.name` → AddTarget::Lpm(PackageName); everything else
     // → AddTarget::Npm { spec } verbatim. No dotted-name auto-prepend.
     let (target, version_spec, mut inline_config) = resolve_add_target(package_spec)?;
-
-    // Typosquatting check: warn if the name looks like a popular package misspelling.
-    // Skip if the exact package is already in the lockfile — the user has already accepted it.
-    let display_for_typosquat = target.display();
-    if !json_output
-        && let Some(warning) = should_warn_typosquatting(&display_for_typosquat, project_dir)
-    {
-        output::warn(&format!(
-            "'{}' is similar to popular package '{}'. Did you mean '{}'?",
-            warning.input, warning.similar, warning.similar
-        ));
-    }
 
     // `.npmrc` setup before any network call.
     //

@@ -153,9 +153,8 @@ impl StoreV2Paths {
     }
 
     /// `~/.lpm/store/v2/links/<graph-key>/node_modules/<pkg>/` —
-    /// where the canonical bytes for THIS link entry live (clonefile
-    /// of an [`Self::object_dir`]). Sibling deps live alongside as
-    /// symlinks.
+    /// where the canonical bytes for THIS link entry live. Sibling deps
+    /// live alongside as symlinks.
     ///
     /// Pre-sized single-allocation build (see
     /// [`Self::link_node_modules_dir`]). The chained `.join()` shape
@@ -219,7 +218,7 @@ pub struct LinkEntryRequest {
     /// exists (typically via [`Store::extract_object`]).
     pub object_dir: PathBuf,
     /// Sibling-dep targets to materialize as symlinks alongside the
-    /// package's clonefile. Each tuple is
+    /// package. Each tuple is
     /// `(local_name, target_graph_key, target_name, target_version)`.
     /// Order is irrelevant; symlinks are created independently.
     pub deps: Vec<DepLink>,
@@ -514,8 +513,9 @@ impl Store {
 
     /// Populate `links/<graph-key>/` with the package bytes, sibling
     /// symlinks, and sidecar metadata. Idempotent: if the entry is
-    /// already complete, refreshes [`LinkMeta::last_referenced_at`]
-    /// and short-circuits.
+    /// already complete and its package tree still matches the source
+    /// object digest, refreshes [`LinkMeta::last_referenced_at`] and
+    /// short-circuits.
     ///
     /// Atomicity contract:
     /// - Final visible state is created via
@@ -545,7 +545,7 @@ impl Store {
         // package dir got truncated) or causes the subsequent rename
         // to hard-fail with ENOTEMPTY against a non-empty leftover.
         if final_dir.exists() {
-            if is_complete_link_entry(&final_dir, &graph_key) {
+            if link_entry_is_reusable(&final_dir, &graph_key, &object_dir)? {
                 // Refresh the sidecar's "last referenced" via a single
                 // set_modified() call instead of read+touch+write+rename.
                 // On a 256-package warm install that's 256 fewer JSON
@@ -568,11 +568,11 @@ impl Store {
 
             tracing::warn!(
                 target = %final_dir.display(),
-                "v2 store: incomplete link entry; removing before re-populate"
+                "v2 store: incomplete or stale link entry; removing before re-populate"
             );
             std::fs::remove_dir_all(&final_dir).map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to remove incomplete v2 link entry at {}: {e}",
+                    "failed to remove incomplete or stale v2 link entry at {}: {e}",
                     final_dir.display()
                 ))
             })?;
@@ -618,9 +618,9 @@ impl Store {
                 freshly_populated: true,
                 sidecar: Some(sidecar),
             }),
-            Err(_) if is_complete_link_entry(&final_dir, &graph_key) => {
+            Err(_) if link_entry_is_reusable(&final_dir, &graph_key, &object_dir)? => {
                 // Concurrent install beat us — discard our stage and
-                // refresh the existing sidecar's mtime (followup #3).
+                // refresh the existing sidecar's mtime.
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 let sidecar_path = final_dir.join(LINK_META_FILENAME);
                 if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
@@ -633,21 +633,17 @@ impl Store {
                 })
             }
             Err(_) if final_dir.exists() => {
-                // Final dir exists but is incomplete — a different
-                // process crashed mid-populate AFTER our existence
-                // check above. Remove the leftover and retry the
-                // rename once. Beyond a single retry we surface the
-                // error rather than spinning, since the underlying
-                // cause is filesystem-level (permission, EXDEV) and
-                // a third attempt won't change that.
+                // Final dir exists but is incomplete or stale. Remove the
+                // leftover and retry the rename once; a third attempt won't
+                // change filesystem-level failures such as permission errors.
                 tracing::warn!(
                     target = %final_dir.display(),
-                    "v2 store: rename hit incomplete leftover; removing and retrying once"
+                    "v2 store: rename hit incomplete or stale leftover; removing and retrying once"
                 );
                 if let Err(e) = std::fs::remove_dir_all(&final_dir) {
                     let _ = std::fs::remove_dir_all(&tmp_dir);
                     return Err(LpmError::Store(format!(
-                        "failed to remove incomplete v2 link entry during retry at {}: {e}",
+                        "failed to remove incomplete or stale v2 link entry during retry at {}: {e}",
                         final_dir.display()
                     )));
                 }
@@ -1053,10 +1049,9 @@ fn populate_into(
         ))
     })?;
 
-    // Materialize the package itself by clonefile/hardlink/copy from
-    // the object directory. This produces independent inodes on
-    // CoW-capable filesystems (clonefile / reflink) and shared inodes
-    // on Linux ext4 fallback.
+    // Materialize the package itself from the verified object directory.
+    // Link entries must not share hardlink inodes with objects: writes
+    // through executable package bytes must never mutate the object store.
     ensure_object_tree_integrity(object_dir)?;
     let pkg_dir = node_modules.join(graph_key.name());
     if let Some(parent) = pkg_dir.parent() {
@@ -1196,6 +1191,25 @@ fn is_complete_link_entry(dir: &Path, key: &GraphKey) -> bool {
     path.is_file()
 }
 
+fn link_entry_is_reusable(dir: &Path, key: &GraphKey, object_dir: &Path) -> Result<bool, LpmError> {
+    if !is_complete_link_entry(dir, key) {
+        return Ok(false);
+    }
+    let expected = verified_object_tree_integrity(object_dir)?;
+    let package_dir = link_entry_package_dir(dir, key);
+    let actual = compute_object_tree_integrity(&package_dir)?;
+    Ok(actual == expected)
+}
+
+fn link_entry_package_dir(dir: &Path, key: &GraphKey) -> PathBuf {
+    let capacity = dir.as_os_str().len() + LINK_NODE_MODULES.len() + key.name().len() + 2;
+    let mut path = PathBuf::with_capacity(capacity);
+    path.push(dir);
+    path.push(LINK_NODE_MODULES);
+    path.push(key.name());
+    path
+}
+
 /// Object dir is complete iff the package root and both object
 /// integrity sidecars are present. This is a cheap crash-recovery
 /// predicate; callers that will reuse the object must also verify the
@@ -1295,10 +1309,14 @@ fn object_tree_integrity_matches(dir: &Path) -> Result<bool, LpmError> {
 }
 
 fn ensure_object_tree_integrity(dir: &Path) -> Result<(), LpmError> {
+    verified_object_tree_integrity(dir).map(|_| ())
+}
+
+fn verified_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
     let expected = read_object_tree_integrity(dir)?;
     let actual = compute_object_tree_integrity(dir)?;
     if expected == actual {
-        return Ok(());
+        return Ok(expected);
     }
     Err(LpmError::Store(format!(
         "v2 object integrity mismatch at {}: expected {expected}, actual {actual}",
@@ -1838,48 +1856,12 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 use lpm_common::symlink::create_dir_symlink_or_junction as create_dir_symlink;
 use lpm_common::symlink::create_symlink as create_fs_symlink;
 
-/// Materialize `src/` into `dst/` using the fastest available primitive.
+/// Materialize `src/` into `dst/` using independent bytes.
 ///
-/// Order: macOS clonefile → hardlink fallback (file-by-file) → copy
-/// fallback. Mirrors `lpm-linker::link_dir_recursive`'s policy so the
-/// v2 store inherits the same CoW-on-APFS performance characteristics
-/// today's v1 wrappers already have.
-///
-/// # Accepted-posture trade-off (H22)
-///
-/// On Linux the function falls straight to [`std::fs::hard_link`],
-/// which makes the project's `node_modules/<pkg>/<file>` and the
-/// store object at `objects/<sri>/<file>` share an inode. On a CoW-
-/// capable filesystem (Btrfs, XFS with `reflink=1`, F2FS) this is
-/// safe in practice because most editor / build-tool writes
-/// `unlink`+`create` the destination, breaking the link before the
-/// kernel writes attacker-controlled bytes. On ext4 — the default
-/// Linux root FS — `unlink`+`create` still breaks the link, but a
-/// truncate-in-place write (`fs.writeFileSync` in Node, `open(O_TRUNC)`
-/// in C, `open(..., 'w')` in Python) modifies the underlying inode
-/// in place and so mutates the CAS object that every project on the
-/// machine resolving the same SRI shares.
-///
-/// The primary defense is the script-policy gate: any postinstall
-/// that could trigger the mutation must be either bundled with a
-/// `trustedDependencies` entry or explicitly approved via the
-/// triage-advisor (see `crates/lpm-cli/src/script_policy_config.rs`
-/// and the H4/L29 fixes for the surrounding gate). H22 only triggers
-/// when an approved script intentionally mutates its package files;
-/// the next install resolves the mutated SRI as a new entry, so
-/// long-term divergence is bounded by SRI rotation.
-///
-/// The long-term mitigation handle is `FICLONE` (ioctl
-/// `FS_IOC_CLONE` / `0x40049409`) attempted first on Linux, with
-/// fallback to hard_link only when the kernel returns `EOPNOTSUPP`
-/// (ext4). Reflink gives an independent inode under CoW semantics,
-/// so a project-side write doesn't touch the store object even
-/// under truncate-in-place. Implementation is deferred because the
-/// fallback path still leaves the ext4 case exposed and the right
-/// answer is to migrate the default install-pipeline write shape
-/// instead (covered by tracking-issue work outside this audit). See
-/// `private/security-findings.md` H22 for the full trade-off
-/// discussion.
+/// macOS gets `clonefile()` for whole-directory copy-on-write. Other
+/// platforms use file copies, which lets Linux choose copy_file_range or
+/// filesystem reflinks without sharing hardlink inodes between the object
+/// store and executable link entries.
 fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
     let allow_source_symlinks = src.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file();
     materialize_into_inner(src, src, dst, allow_source_symlinks)
@@ -1958,13 +1940,7 @@ fn materialize_into_inner(
                     target.display()
                 ))
             })?;
-        } else if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
-            tracing::trace!(
-                src = %src_path.display(),
-                dst = %dst_path.display(),
-                error = %e,
-                "v2 materialize: hardlink failed, falling back to copy"
-            );
+        } else {
             std::fs::copy(&src_path, &dst_path).map_err(|copy_err| {
                 LpmError::Store(format!(
                     "failed to copy v2 source file {} → {}: {copy_err}",
@@ -2395,10 +2371,83 @@ mod tests {
             read_back.created_at, first_sidecar.created_at,
             "created_at is immutable across cache hits"
         );
-        // The JSON `last_referenced_at` is frozen at creation under
-        // followup #3; the effective time tracks file mtime.
+        // The JSON `last_referenced_at` is frozen at creation; the
+        // effective time tracks file mtime.
         let effective = read_back.effective_last_referenced_at(&sidecar_path);
         assert!(effective > first_sidecar.last_referenced_at);
+    }
+
+    #[test]
+    fn populate_link_entry_copies_bytes_without_sharing_object_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let sri = synthetic_sri(b"populate_link_entry_copies_bytes_without_sharing_object_inode");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"copy-safe\"}"),
+                ("index.js", b"module.exports = {};"),
+            ],
+        );
+        let key = arc_key("copy-safe", "1.0.0");
+
+        let entry = store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: key,
+                source_sri: sri,
+                object_dir: object_dir.clone(),
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+        let link_index = entry.link_dir.join("node_modules/copy-safe/index.js");
+
+        std::fs::write(object_dir.join("index.js"), b"module.exports = 'tampered';").unwrap();
+
+        assert_eq!(
+            std::fs::read(link_index).unwrap(),
+            b"module.exports = {};",
+            "link entry bytes must not alias the object-store inode"
+        );
+    }
+
+    #[test]
+    fn populate_link_entry_rebuilds_stale_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let sri = synthetic_sri(b"populate_link_entry_rebuilds_stale_existing_entry");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"stale-link\"}"),
+                ("index.js", b"module.exports = {};"),
+            ],
+        );
+        let key = arc_key("stale-link", "1.0.0");
+        let request = || LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri.clone(),
+            object_dir: object_dir.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        };
+
+        let first = store.populate_link_entry(request()).unwrap();
+        let link_index = first.link_dir.join("node_modules/stale-link/index.js");
+        std::fs::write(&link_index, b"module.exports = 'stale';").unwrap();
+
+        let second = store.populate_link_entry(request()).unwrap();
+
+        assert!(second.freshly_populated);
+        assert_eq!(
+            std::fs::read(link_index).unwrap(),
+            b"module.exports = {};",
+            "stale link entry must be rebuilt from the verified object"
+        );
     }
 
     #[test]

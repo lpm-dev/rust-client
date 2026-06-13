@@ -1,8 +1,7 @@
 //! Typosquatting detection for LPM.
 //!
 //! Compares package names against a curated list of popular npm packages
-//! using Levenshtein distance. Warns (but does not block) when a name
-//! is suspiciously similar to a well-known package.
+//! using low-noise typo techniques plus Levenshtein distance.
 //!
 //! Operates entirely offline — no network required.
 
@@ -57,6 +56,7 @@ const POPULAR_PACKAGES: &[&str] = &[
     "morgan",
     "compression",
     "cookie-parser",
+    "cross-env",
     "http-errors",
     "serve-static",
     "path-to-regexp",
@@ -127,23 +127,41 @@ const POPULAR_PACKAGES: &[&str] = &[
     "cypress",
 ];
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TyposquatTechnique {
+    DelimiterVariant,
+    AdjacentTransposition,
+    EditDistance,
+}
+
+impl TyposquatTechnique {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DelimiterVariant => "delimiter_variant",
+            Self::AdjacentTransposition => "adjacent_transposition",
+            Self::EditDistance => "edit_distance",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TyposquatFinding {
+    pub similar: &'static str,
+    pub technique: TyposquatTechnique,
+}
+
 /// Extract the bare package name from a potentially scoped package name.
 ///
 /// - `@lpm.dev/owner.loadash` → `loadash` (strips scope + owner prefix)
 /// - `@scope/lodash` → `lodash` (strips npm scope)
 /// - `lodash` → `lodash` (unchanged)
 pub fn extract_package_name(name: &str) -> &str {
-    // Strip @lpm.dev/ scope
-    let name = name.strip_prefix("@lpm.dev/").unwrap_or(name);
-    // Strip @scope/ for npm scoped packages
-    let name = if name.starts_with('@') {
+    if let Some(rest) = name.strip_prefix("@lpm.dev/") {
+        return rest.find('.').map_or(rest, |dot_pos| &rest[dot_pos + 1..]);
+    }
+
+    if name.starts_with('@') {
         name.split('/').nth(1).unwrap_or(name)
-    } else {
-        name
-    };
-    // Strip owner. prefix for LPM packages (first dot separates owner from package name)
-    if let Some(dot_pos) = name.find('.') {
-        &name[dot_pos + 1..]
     } else {
         name
     }
@@ -162,6 +180,14 @@ pub fn extract_package_name(name: &str) -> &str {
 ///
 /// Exact matches return `None` (user wants the real package).
 pub fn check_typosquatting(name: &str) -> Option<&'static str> {
+    analyze_typosquatting(name).map(|finding| finding.similar)
+}
+
+pub fn analyze_typosquatting(name: &str) -> Option<TyposquatFinding> {
+    if name.starts_with('@') && !name.starts_with("@lpm.dev/") {
+        return None;
+    }
+
     let bare_name = extract_package_name(name);
 
     // Exact match = user wants the real thing
@@ -170,14 +196,96 @@ pub fn check_typosquatting(name: &str) -> Option<&'static str> {
     }
 
     for &popular in POPULAR_PACKAGES {
+        if is_delimiter_variant(bare_name, popular) {
+            return Some(TyposquatFinding {
+                similar: popular,
+                technique: TyposquatTechnique::DelimiterVariant,
+            });
+        }
+    }
+
+    for &popular in POPULAR_PACKAGES {
+        if popular.len() >= 5 && is_adjacent_transposition(bare_name, popular) {
+            return Some(TyposquatFinding {
+                similar: popular,
+                technique: TyposquatTechnique::AdjacentTransposition,
+            });
+        }
+    }
+
+    for &popular in POPULAR_PACKAGES {
+        if bare_name.len() < 4 || popular.len() < 4 {
+            continue;
+        }
         let distance = levenshtein(bare_name, popular);
         let threshold = if popular.len() <= 5 { 1 } else { 2 };
         if distance > 0 && distance <= threshold {
-            return Some(popular);
+            return Some(TyposquatFinding {
+                similar: popular,
+                technique: TyposquatTechnique::EditDistance,
+            });
         }
     }
 
     None
+}
+
+fn is_delimiter_variant(candidate: &str, popular: &str) -> bool {
+    if candidate == popular {
+        return false;
+    }
+    let candidate_has_delimiter = has_name_delimiter(candidate);
+    let popular_has_delimiter = has_name_delimiter(popular);
+    if !candidate_has_delimiter && !popular_has_delimiter {
+        return false;
+    }
+
+    normalized_without_delimiters(candidate) == normalized_without_delimiters(popular)
+}
+
+fn has_name_delimiter(name: &str) -> bool {
+    name.bytes().any(|b| matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn normalized_without_delimiters(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if !matches!(b, b'-' | b'_' | b'.') {
+            normalized.push(char::from(b));
+        }
+    }
+    normalized
+}
+
+fn is_adjacent_transposition(candidate: &str, popular: &str) -> bool {
+    if candidate.len() != popular.len() || candidate == popular {
+        return false;
+    }
+
+    let candidate = candidate.as_bytes();
+    let popular = popular.as_bytes();
+    let mut first_mismatch = None;
+
+    for idx in 0..candidate.len() {
+        if candidate[idx] == popular[idx] {
+            continue;
+        }
+
+        if let Some(first) = first_mismatch {
+            return idx == first + 1
+                && candidate[first] == popular[idx]
+                && candidate[idx] == popular[first]
+                && candidate
+                    .iter()
+                    .zip(popular.iter())
+                    .enumerate()
+                    .all(|(pos, (left, right))| pos == first || pos == idx || left == right);
+        }
+
+        first_mismatch = Some(idx);
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -205,9 +313,10 @@ mod tests {
     }
 
     #[test]
-    fn no_detect_axois_transposition() {
-        // "axois" is distance 2 from "axios" (5 chars, threshold 1) — no match
-        assert_eq!(check_typosquatting("axois"), None);
+    fn detects_axois_adjacent_transposition() {
+        let finding = analyze_typosquatting("axois").unwrap();
+        assert_eq!(finding.similar, "axios");
+        assert_eq!(finding.technique, TyposquatTechnique::AdjacentTransposition);
     }
 
     #[test]
@@ -234,6 +343,29 @@ mod tests {
     #[test]
     fn no_warn_scoped() {
         assert_eq!(check_typosquatting("@scope/lodash"), None);
+    }
+
+    #[test]
+    fn no_warn_npm_scoped_typosquat_like_name() {
+        assert_eq!(check_typosquatting("@scope/loadash"), None);
+    }
+
+    #[test]
+    fn no_warn_workspace_scoped_internal_names() {
+        assert_eq!(check_typosquatting("@test/utils"), None);
+        assert_eq!(check_typosquatting("@smoke/core"), None);
+    }
+
+    #[test]
+    fn no_warn_dotted_exact_name() {
+        assert_eq!(check_typosquatting("socket.io"), None);
+    }
+
+    #[test]
+    fn detects_delimiter_variant() {
+        let finding = analyze_typosquatting("crossenv").unwrap();
+        assert_eq!(finding.similar, "cross-env");
+        assert_eq!(finding.technique, TyposquatTechnique::DelimiterVariant);
     }
 
     #[test]
@@ -270,6 +402,11 @@ mod tests {
     fn no_false_positive_on_short_unrelated() {
         // "glob" is 4 chars. "blog" is distance 2, which exceeds threshold 1 for short names.
         assert_eq!(check_typosquatting("blog"), None);
+    }
+
+    #[test]
+    fn no_warn_legitimate_tiny_package_name() {
+        assert_eq!(check_typosquatting("ms"), None);
     }
 
     #[test]

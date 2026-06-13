@@ -104,6 +104,53 @@ impl fmt::Display for ResolutionErrorContext {
     }
 }
 
+/// One suspicious package name detected before it enters a project.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct TyposquatErrorFinding {
+    /// Package name requested by the user or declared directly in package.json.
+    pub package: String,
+    /// Popular package name the requested name resembles.
+    pub similar_to: String,
+    /// Stable machine-readable typo technique.
+    pub technique: String,
+    /// Where the direct dependency came from.
+    pub source: String,
+}
+
+/// Structured context for a typosquatting policy refusal.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct TyposquatErrorContext {
+    /// Suspicious direct dependencies that were not allow-listed.
+    pub findings: Vec<TyposquatErrorFinding>,
+    /// Project policy file the user can commit for an intentional exception.
+    pub config_path: String,
+    /// TOML snippet showing the committed allow-list shape.
+    pub allow_example: String,
+    /// Safer command when a single CLI package arg has an obvious intended target.
+    pub suggested_command: Option<String>,
+}
+
+impl TyposquatErrorContext {
+    /// First finding, used by compact human summaries.
+    pub fn primary(&self) -> Option<&TyposquatErrorFinding> {
+        self.findings.first()
+    }
+}
+
+impl fmt::Display for TyposquatErrorContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.findings.as_slice() {
+            [] => f.write_str("suspicious package name"),
+            [finding] => write!(
+                f,
+                "suspicious package name '{}' looks like '{}'",
+                finding.package, finding.similar_to
+            ),
+            findings => write!(f, "{} suspicious package names", findings.len()),
+        }
+    }
+}
+
 /// Top-level error type for all LPM operations.
 ///
 /// Integrates with `miette` for rich, user-friendly error display.
@@ -156,6 +203,15 @@ pub enum LpmError {
         )
     )]
     Resolution(Box<ResolutionErrorContext>),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(lpm::typosquat_suspected),
+        help(
+            "Install the intended package name, or commit a policy.typosquat allow-list entry with a reason if this name is intentional."
+        )
+    )]
+    TyposquatSuspected(Box<TyposquatErrorContext>),
 
     #[error("peer dependency check failed: {0}")]
     #[diagnostic(
@@ -462,6 +518,7 @@ impl LpmError {
             LpmError::InvalidVersionRange(_) => "invalid_version_range",
             LpmError::Registry(_) => "registry",
             LpmError::Resolution(_) => "resolution_failed",
+            LpmError::TyposquatSuspected(_) => "typosquat_suspected",
             LpmError::PeerDependency(_) => "peer_dependency",
             LpmError::Network(_) => "network",
             LpmError::Http { .. } => "http",

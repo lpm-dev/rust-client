@@ -163,6 +163,18 @@ fn print_json_error(error: &lpm_common::LpmError) {
                 "error": serde_json::Value::Object(detail),
             })
         }
+        lpm_common::LpmError::TyposquatSuspected(context) => serde_json::json!({
+            "success": false,
+            "error_code": "typosquat_suspected",
+            "error": {
+                "code": "TYPOSQUAT_SUSPECTED",
+                "message": context.to_string(),
+                "findings": context.findings,
+                "config_path": context.config_path,
+                "allow_example": context.allow_example,
+                "suggested_command": context.suggested_command,
+            }
+        }),
         lpm_common::LpmError::SecurityApprovalRequired {
             message,
             requested_scopes,
@@ -310,6 +322,44 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             diagnostic_lines("Registry error", Some(reason), error)
         }
         lpm_common::LpmError::Resolution(context) => resolution_error_lines(context, error),
+        lpm_common::LpmError::TyposquatSuspected(context) => {
+            let mut lines = vec![SlimErrorLine::Failed("Suspicious package name".to_owned())];
+            for finding in &context.findings {
+                lines.push(SlimErrorLine::Detail(format!(
+                    "  {} {} {} {} {}",
+                    install_ui::dim("package"),
+                    install_ui::yellow(&finding.package),
+                    install_ui::dim("looks like"),
+                    install_ui::yellow(&finding.similar_to),
+                    install_ui::dim(&format!("({})", finding.technique))
+                )));
+                lines.push(SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("source"),
+                    install_ui::cyan(&finding.source)
+                )));
+            }
+            if let Some(command) = &context.suggested_command {
+                lines.push(SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("try"),
+                    install_ui::yellow(command)
+                )));
+            }
+            lines.push(SlimErrorLine::Detail(format!(
+                "  {} {}",
+                install_ui::dim("allow"),
+                install_ui::cyan(&context.config_path)
+            )));
+            for line in context.allow_example.lines() {
+                lines.push(SlimErrorLine::Detail(format!(
+                    "  {} {}",
+                    install_ui::dim("toml"),
+                    install_ui::cyan(line)
+                )));
+            }
+            lines
+        }
         lpm_common::LpmError::PeerDependency(reason) => {
             diagnostic_lines("Peer dependency check failed", Some(reason), error)
         }

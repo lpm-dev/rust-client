@@ -867,6 +867,7 @@ pub async fn run_add_packages(
     packages: &[String],
     save_dev: bool,
     json_output: bool,
+    yes: bool,
     allow_new: bool,
     force: bool,
     save_flags: crate::save_spec::SaveFlags,
@@ -900,11 +901,20 @@ pub async fn run_add_packages(
     // forwarded resolved audit-after-install boolean — see [`run_with_options`].
     audit_after_install: bool,
 ) -> Result<(), LpmError> {
+    let reviewed = crate::typosquat_guard::guard_explicit_package_specs(
+        project_dir,
+        packages,
+        &[project_dir.to_path_buf()],
+        yes,
+        json_output,
+    )?;
+    let packages = reviewed.specs;
+
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
     let mut js_packages = Vec::new();
 
-    for spec in packages {
+    for spec in &packages {
         let (name, intent) = crate::save_spec::parse_user_save_intent(spec)?;
         let range = intent_to_range_string(&intent);
 
@@ -1171,6 +1181,24 @@ pub async fn run_install_filtered_add(
         return Ok(());
     }
 
+    let member_install_roots: Vec<PathBuf> = targets
+        .member_manifests
+        .iter()
+        .map(|m| crate::commands::install_targets::install_root_for(m).to_path_buf())
+        .collect();
+    let workspace_root_for_config: PathBuf = lpm_workspace::discover_workspace(cwd)
+        .ok()
+        .flatten()
+        .map_or_else(|| cwd.to_path_buf(), |ws| ws.root);
+    let reviewed = crate::typosquat_guard::guard_explicit_package_specs(
+        &workspace_root_for_config,
+        packages,
+        &member_install_roots,
+        yes,
+        json_output,
+    )?;
+    let packages = reviewed.specs;
+
     // 3. Multi-member confirmation prompt.
     //
     // ** ** — the original plan included an
@@ -1228,11 +1256,6 @@ pub async fn run_install_filtered_add(
     // converges. ──────────────────────────────────────────────────────
 
     // Compute per-member install roots and the four state paths.
-    let member_install_roots: Vec<PathBuf> = targets
-        .member_manifests
-        .iter()
-        .map(|m| crate::commands::install_targets::install_root_for(m).to_path_buf())
-        .collect();
     let lockfile_paths: Vec<PathBuf> = member_install_roots
         .iter()
         .map(|r| r.join(lpm_lockfile::LOCKFILE_NAME))
@@ -1249,10 +1272,6 @@ pub async fn run_install_filtered_add(
     // Workspace-aware config resolution reads from the workspace root, and
     // catalog cleanup can mutate the root package even when only a member was
     // targeted.
-    let workspace_root_for_config: PathBuf = lpm_workspace::discover_workspace(cwd)
-        .ok()
-        .flatten()
-        .map_or_else(|| cwd.to_path_buf(), |ws| ws.root);
     let root_package_json_path = workspace_root_for_config.join("package.json");
     let pnpm_workspace_path = workspace_root_for_config.join("pnpm-workspace.yaml");
 
@@ -1328,7 +1347,7 @@ pub async fn run_install_filtered_add(
             // (a) Stage the target manifest. Explicit specs land verbatim;
             // bare/dist-tag entries get a `*` placeholder.
             let staged =
-                match stage_packages_to_manifest(manifest_path, packages, save_dev, save_flags) {
+                match stage_packages_to_manifest(manifest_path, &packages, save_dev, save_flags) {
                     Ok(s) => s,
                     Err(e) => {
                         last_err = Some(e);

@@ -380,10 +380,8 @@ pub(super) fn spawn_speculation_dispatcher(
                     (store_v2_spec.as_deref(), integrity.as_deref())
                 {
                     store_v2
-                        .paths()
-                        .object_dir(sri)
-                        .ok()
-                        .is_some_and(|dir| dir.exists())
+                        .reusable_object_dir(sri)
+                        .is_ok_and(|object_dir| object_dir.is_some())
                 } else {
                     store_spec.has_package(&name, &version)
                 };
@@ -609,10 +607,8 @@ pub(super) async fn speculative_download_and_store(
     let already_present = if let Some(v2) = store_v2 {
         match integrity {
             Some(sri) => v2
-                .paths()
-                .object_dir(sri)
-                .ok()
-                .is_some_and(|dir| dir.exists()),
+                .reusable_object_dir(sri)
+                .is_ok_and(|object_dir| object_dir.is_some()),
             None => store.has_package(name, version),
         }
     } else {
