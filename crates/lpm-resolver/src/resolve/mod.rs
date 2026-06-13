@@ -42,7 +42,7 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use super::error::{
         ResolveError, extract_conflicting_packages, extract_conflicts_fallback,
-        extract_conflicts_primary, map_pubgrub_error,
+        extract_conflicts_primary, map_pubgrub_error, no_solution_error,
     };
     #[allow(unused_imports)]
     pub(super) use super::format::{

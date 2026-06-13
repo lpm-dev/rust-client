@@ -93,6 +93,7 @@ mod prelude {
         ResolveError, ResolveResult, ResolvedPackage, StageTiming, resolve_peer_binding_version,
     };
     pub(super) use ahash::{AHashMap, AHashSet};
+    pub(super) use lpm_common::{ResolutionErrorContext, ResolutionFailureKind};
     #[cfg(test)]
     pub(super) use lpm_registry::RouteMode;
     pub(super) use lpm_registry::{RegistryClient, RouteTable, UpstreamRoute};

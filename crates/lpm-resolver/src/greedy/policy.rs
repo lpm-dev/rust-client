@@ -88,7 +88,11 @@ pub(super) enum PolicyBlock {
     },
 }
 
-pub(super) fn handle_policy_blocked(edge: &Edge, block: PolicyBlock) -> Result<(), ResolveError> {
+pub(super) fn handle_policy_blocked(
+    edge: &Edge,
+    block: PolicyBlock,
+    state: &ResolveState,
+) -> Result<(), ResolveError> {
     if edge.behavior.optional {
         tracing::debug!(
             "optional dep {} skipped by resolver policy (range={})",
@@ -109,11 +113,15 @@ pub(super) fn handle_policy_blocked(edge: &Edge, block: PolicyBlock) -> Result<(
             format!("{version} blocked by trust-policy no-downgrade: {reason}")
         }
     };
-    Err(ResolveError::DependencyFetch {
-        package: edge.canonical.to_string(),
-        version: edge.range.to_string(),
-        detail,
-    })
+    Err(ResolveError::Resolution(Box::new(
+        state.edge_resolution_context(
+            edge,
+            ResolutionFailureKind::PolicyBlocked,
+            detail,
+            None,
+            None,
+        ),
+    )))
 }
 
 pub(super) fn handle_no_version(
@@ -149,21 +157,23 @@ pub(super) fn handle_no_version(
         );
         return Ok(());
     }
-    let detail = if platform_filtered {
-        format!(
-            "every version satisfying the range is incompatible with this OS/CPU \
-             (versions in manifest: {})",
-            info.versions.len()
+    let available_versions = Some(info.versions.len());
+    let newest_version = info.versions.first().map(ToString::to_string);
+    let (kind, detail) = if platform_filtered {
+        (
+            ResolutionFailureKind::PlatformIncompatible,
+            format!(
+                "published versions matching {} are incompatible with this OS/CPU",
+                edge.range
+            ),
         )
     } else {
-        format!(
-            "no version satisfies range (versions available: {})",
-            info.versions.len()
+        (
+            ResolutionFailureKind::NoMatchingVersion,
+            format!("no published version satisfies {}", edge.range),
         )
     };
-    Err(ResolveError::DependencyFetch {
-        package: edge.canonical.to_string(),
-        version: edge.range.to_string(),
-        detail,
-    })
+    Err(ResolveError::Resolution(Box::new(
+        state.edge_resolution_context(edge, kind, detail, available_versions, newest_version),
+    )))
 }

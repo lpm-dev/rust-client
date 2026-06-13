@@ -94,7 +94,7 @@ pub async fn run(
 
             Ok(())
         }
-        Err(e) => Err(LpmError::Registry(format!("resolution failed: {e}"))),
+        Err(e) => Err(crate::resolver_error::resolver_error_to_lpm(e)),
     }
 }
 

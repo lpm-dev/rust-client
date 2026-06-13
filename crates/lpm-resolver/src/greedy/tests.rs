@@ -2422,10 +2422,17 @@ fn handle_no_version_required_errors() {
         },
     };
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
-    assert!(matches!(
-        handle_no_version(&edge, &info, false, &mut state),
-        Err(ResolveError::DependencyFetch { .. })
-    ));
+    match handle_no_version(&edge, &info, false, &mut state) {
+        Err(ResolveError::Resolution(context)) => {
+            assert_eq!(context.package, "x");
+            assert_eq!(context.requested, "^99.0.0");
+            assert_eq!(context.required_by.as_deref(), None);
+            assert_eq!(context.kind, ResolutionFailureKind::NoMatchingVersion);
+            assert_eq!(context.available_versions, Some(1));
+            assert_eq!(context.newest_version.as_deref(), Some("1.0.0"));
+        }
+        other => panic!("expected structured resolution failure, got {other:?}"),
+    }
 }
 
 // ── Fusion termination invariants ───────────────────────────────
@@ -2691,7 +2698,11 @@ async fn fusion_propagates_required_fetch_failure() {
     // loop. The critical invariant is "no hang" — the test would
     // hit tokio's default test timeout if termination broke.
     match result {
-        Err(ResolveError::DependencyFetch { .. } | ResolveError::NoSolution(_)) => {}
+        Err(
+            ResolveError::Resolution(_)
+            | ResolveError::DependencyFetch { .. }
+            | ResolveError::NoSolution(_),
+        ) => {}
         Err(other) => panic!("unexpected error variant: {other:?}"),
         Ok(_) => panic!("required dep with broken client must fail, not succeed"),
     }
