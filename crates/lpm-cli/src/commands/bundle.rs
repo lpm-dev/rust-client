@@ -203,15 +203,21 @@ pub async fn bundle(
     options: &BundleOptions,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let pinned_rolldown = read_rolldown_pin(project_dir)?;
+    let rolldown_version = lpm_plugin::resolve_engine_version_for_current_platform(
+        "rolldown",
+        pinned_rolldown.as_deref(),
+    )?;
     if !json_output {
         install_ui::phase(&format!(
             "Bundling with {} {}",
             install_ui::yellow("Rolldown"),
-            rolldown_version()
+            rolldown_version
         ));
     }
 
-    let engine_entry = lpm_plugin::ensure_engine("rolldown", None, false).await?;
+    let engine_entry =
+        lpm_plugin::ensure_engine("rolldown", pinned_rolldown.as_deref(), false).await?;
     let start = std::time::Instant::now();
     let outcome = run_bundle_process(project_dir, &engine_entry, options, StdioMode::Inherit)?;
     if !json_output {
@@ -228,8 +234,13 @@ pub async fn bundle(
     outcome.into_result()
 }
 
-fn rolldown_version() -> &'static str {
-    lpm_plugin::get_engine("rolldown").map_or("latest", |engine| engine.latest_version)
+fn read_rolldown_pin(project_dir: &Path) -> Result<Option<String>, LpmError> {
+    let Some(config) = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .map_err(|e| LpmError::Script(format!("failed to read lpm.json: {e}")))?
+    else {
+        return Ok(None);
+    };
+    Ok(config.tools.get("rolldown").cloned())
 }
 
 fn run_bundle_process(
@@ -378,36 +389,38 @@ async fn bundle_workspace(
         return Ok(());
     }
 
-    let engine_entry = match lpm_plugin::ensure_engine("rolldown", None, false).await {
-        Ok(entry) => entry,
-        Err(prewarm_err) => {
-            let failed_members = synthesize_prewarm_failure_members(
-                &ws_graph,
-                &target_set,
-                &prewarm_err.to_string(),
-            );
-            if json_output {
-                emit_envelope(
-                    &failed_members,
-                    failed_members.len(),
-                    0,
-                    failed_members.len(),
-                    std::time::Duration::from_millis(0),
+    let pinned_rolldown = read_rolldown_pin(project_dir)?;
+    let engine_entry =
+        match lpm_plugin::ensure_engine("rolldown", pinned_rolldown.as_deref(), false).await {
+            Ok(entry) => entry,
+            Err(prewarm_err) => {
+                let failed_members = synthesize_prewarm_failure_members(
+                    &ws_graph,
+                    &target_set,
+                    &prewarm_err.to_string(),
                 );
-            } else {
-                install_ui::failed(&format!("bundle: {prewarm_err}"));
-                emit_human_summary(
-                    "bundle",
-                    failed_members.len(),
-                    0,
-                    failed_members.len(),
-                    target_set.len(),
-                    std::time::Duration::from_millis(0),
-                );
+                if json_output {
+                    emit_envelope(
+                        &failed_members,
+                        failed_members.len(),
+                        0,
+                        failed_members.len(),
+                        std::time::Duration::from_millis(0),
+                    );
+                } else {
+                    install_ui::failed(&format!("bundle: {prewarm_err}"));
+                    emit_human_summary(
+                        "bundle",
+                        failed_members.len(),
+                        0,
+                        failed_members.len(),
+                        target_set.len(),
+                        std::time::Duration::from_millis(0),
+                    );
+                }
+                return Err(LpmError::ExitCode(1));
             }
-            return Err(LpmError::ExitCode(1));
-        }
-    };
+        };
 
     let stdio = if json_output {
         StdioMode::Capture
@@ -480,7 +493,7 @@ fn synthesize_prewarm_failure_members(
             exit_code: None,
             duration_ms: 0,
             captured: Captured::default(),
-            error: Some(format!("engine prewarm failed: {error_msg}")),
+            error: Some(format!("managed tool prewarm failed: {error_msg}")),
         })
         .collect()
 }

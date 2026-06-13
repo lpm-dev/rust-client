@@ -11,7 +11,7 @@ use super::check::Check;
 /// - Known top-level fields (runtime, env, tasks, tools, services, tunnel, publish, https)
 /// - runtime.node is a valid version spec
 /// - tasks have valid structure (command, dependsOn, cache, outputs, inputs, env)
-/// - tools reference known plugins
+/// - tools reference known managed tools
 /// - services have required command field
 /// - Falls back to serde deserialization for type-level validation
 pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
@@ -124,14 +124,16 @@ pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     // 5. Validate tools section
     if let Some(tools) = obj.get("tools") {
         if let Some(tools_obj) = tools.as_object() {
-            let known_tools: Vec<&str> = lpm_plugin::registry::list_plugins()
+            let mut known_tools: Vec<&str> = lpm_plugin::registry::list_plugins()
                 .iter()
                 .map(|p| p.name)
                 .collect();
+            known_tools.extend(lpm_plugin::user_facing_engine_tool_names());
+            known_tools.sort_unstable();
             for (tool_name, tool_value) in tools_obj {
                 if !known_tools.contains(&tool_name.as_str()) {
                     warnings.push(format!(
-                        "tools.{tool_name}: unknown plugin (available: {})",
+                        "tools.{tool_name}: unknown managed tool (available: {})",
                         known_tools.join(", ")
                     ));
                 }
@@ -402,6 +404,22 @@ mod tests {
         let result = validate_lpm_json(dir.path()).unwrap();
         assert!(matches!(result.severity, Severity::Warn));
         assert!(result.detail.contains("must be an object"));
+    }
+
+    #[test]
+    fn validate_lpm_json_accepts_rolldown_tool_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{ "tools": { "rolldown": "1.0.2" } }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(
+            matches!(result.severity, Severity::Pass),
+            "rolldown should be a known managed tool: {}",
+            result.detail
+        );
     }
 
     #[test]

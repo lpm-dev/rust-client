@@ -1988,6 +1988,7 @@ async fn async_main() -> Result<()> {
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
             let options = commands::bundle::BundleOptions {
                 entry,
                 out_dir,

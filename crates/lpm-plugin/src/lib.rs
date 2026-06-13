@@ -48,7 +48,13 @@ pub mod versions;
 use lpm_common::LpmError;
 use std::path::{Path, PathBuf};
 
-pub use engine::{ensure_engine, get_engine};
+pub use engine::{
+    EngineInstallEvent, ensure_engine, get_engine, get_latest_engine_version,
+    list_installed_versions as list_installed_engine_versions, peek_latest_engine_version,
+    remove_all as remove_all_engine_versions, remove_version as remove_engine_version,
+    resolve_engine_version_for_current_platform, update_engine, update_engine_with_observer,
+    user_facing_engine_tool_names,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginInstallEvent {

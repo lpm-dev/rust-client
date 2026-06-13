@@ -54,7 +54,14 @@ fn normalize_test_path(path: &str) -> String {
 }
 
 #[cfg(unix)]
-fn seeded_rolldown_sidecar_packages(platform: &str) -> Vec<serde_json::Value> {
+fn seeded_rolldown_sidecar_packages_for_version(
+    version: &str,
+    platform: &str,
+) -> Vec<serde_json::Value> {
+    if version != ROLLDOWN_VERSION {
+        return fake_rolldown_sidecar_packages_for_version(version, platform);
+    }
+
     let (binding_subdir, binding_url, binding_integrity) = match platform {
         "darwin-arm64" => (
             "node_modules/@rolldown/binding-darwin-arm64",
@@ -102,6 +109,47 @@ fn seeded_rolldown_sidecar_packages(platform: &str) -> Vec<serde_json::Value> {
             "install_subdir": binding_subdir,
             "tarball_url": binding_url,
             "tarball_integrity": binding_integrity,
+            "tarball_sha256": "test-sha256-binding",
+        }),
+    ]
+}
+
+#[cfg(unix)]
+fn fake_rolldown_sidecar_packages_for_version(
+    version: &str,
+    platform: &str,
+) -> Vec<serde_json::Value> {
+    let binding_subdir = match platform {
+        "darwin-arm64" => "node_modules/@rolldown/binding-darwin-arm64",
+        "darwin-x64" => "node_modules/@rolldown/binding-darwin-x64",
+        "linux-x64" => "node_modules/@rolldown/binding-linux-x64-gnu",
+        "linux-arm64" => "node_modules/@rolldown/binding-linux-arm64-gnu",
+        other => panic!("unsupported seeded rolldown platform: {other}"),
+    };
+
+    vec![
+        serde_json::json!({
+            "install_subdir": "",
+            "tarball_url": format!("https://example.test/rolldown-{version}.tgz"),
+            "tarball_integrity": format!("sha512-root-{version}"),
+            "tarball_sha256": "test-sha256-root",
+        }),
+        serde_json::json!({
+            "install_subdir": "node_modules/@rolldown/pluginutils",
+            "tarball_url": format!("https://example.test/pluginutils-{version}.tgz"),
+            "tarball_integrity": format!("sha512-pluginutils-{version}"),
+            "tarball_sha256": "test-sha256-pluginutils",
+        }),
+        serde_json::json!({
+            "install_subdir": "node_modules/@oxc-project/types",
+            "tarball_url": format!("https://example.test/types-{version}.tgz"),
+            "tarball_integrity": format!("sha512-types-{version}"),
+            "tarball_sha256": "test-sha256-oxc-types",
+        }),
+        serde_json::json!({
+            "install_subdir": binding_subdir,
+            "tarball_url": format!("https://example.test/binding-{platform}-{version}.tgz"),
+            "tarball_integrity": format!("sha512-binding-{platform}-{version}"),
             "tarball_sha256": "test-sha256-binding",
         }),
     ]
@@ -171,13 +219,23 @@ fn write_unix_executable(path: &std::path::Path, content: &str) {
 
 #[cfg(unix)]
 fn seed_fake_rolldown_engine(project: &TempProject, marker_file: &std::path::Path) {
+    seed_fake_rolldown_engine_version(project, marker_file, ROLLDOWN_VERSION, false);
+}
+
+#[cfg(unix)]
+fn seed_fake_rolldown_engine_version(
+    project: &TempProject,
+    marker_file: &std::path::Path,
+    version: &str,
+    approve: bool,
+) {
     let platform = current_bundle_platform();
     let engine_dir = project
         .home()
         .join(".lpm")
         .join("engines")
         .join("rolldown")
-        .join(ROLLDOWN_VERSION)
+        .join(version)
         .join(platform);
     let entry_path = engine_dir.join("bin/cli.mjs");
     let marker_literal = serde_json::to_string(&marker_file.to_string_lossy().into_owned())
@@ -192,7 +250,7 @@ fn seed_fake_rolldown_engine(project: &TempProject, marker_file: &std::path::Pat
         format!(
             r#"{{
   "name": "rolldown",
-  "version": "{ROLLDOWN_VERSION}",
+  "version": "{version}",
   "bin": {{ "rolldown": "./bin/cli.mjs" }}
 }}"#
         ),
@@ -203,10 +261,10 @@ fn seed_fake_rolldown_engine(project: &TempProject, marker_file: &std::path::Pat
     let sidecar = serde_json::json!({
         "schema_version": 2,
         "engine_name": "rolldown",
-        "version": ROLLDOWN_VERSION,
+        "version": version,
         "platform": platform,
         "entry_rel_path": "bin/cli.mjs",
-        "packages": seeded_rolldown_sidecar_packages(platform),
+        "packages": seeded_rolldown_sidecar_packages_for_version(version, platform),
         "layout_sha256": layout_sha256,
         "verified_at_unix": 0,
     });
@@ -215,6 +273,56 @@ fn seed_fake_rolldown_engine(project: &TempProject, marker_file: &std::path::Pat
         serde_json::to_vec_pretty(&sidecar).expect("failed to serialize rolldown sidecar"),
     )
     .expect("failed to write rolldown sidecar");
+
+    if approve {
+        let packages: Vec<serde_json::Value> =
+            seeded_rolldown_sidecar_packages_for_version(version, platform)
+                .into_iter()
+                .map(|mut package| {
+                    package
+                        .as_object_mut()
+                        .expect("package metadata must be object")
+                        .remove("tarball_sha256");
+                    package
+                })
+                .collect();
+        let mut cache = serde_json::json!({
+            "engines": {
+                "rolldown": {
+                    "selected": {},
+                    "assets": {},
+                },
+            },
+        });
+        cache["engines"]["rolldown"]["selected"]
+            .as_object_mut()
+            .expect("selected cache must be object")
+            .insert(platform.to_string(), serde_json::json!(version));
+        let mut platform_assets = serde_json::Map::new();
+        platform_assets.insert(
+            platform.to_string(),
+            serde_json::json!({
+                "entry_rel_path": "bin/cli.mjs",
+                "packages": packages,
+            }),
+        );
+        cache["engines"]["rolldown"]["assets"]
+            .as_object_mut()
+            .expect("assets cache must be object")
+            .insert(
+                version.to_string(),
+                serde_json::Value::Object(platform_assets),
+            );
+        std::fs::write(
+            project
+                .home()
+                .join(".lpm")
+                .join("engines")
+                .join(".version-cache.json"),
+            serde_json::to_vec_pretty(&cache).expect("failed to serialize engine cache"),
+        )
+        .expect("failed to write engine version cache");
+    }
 }
 
 #[cfg(unix)]
@@ -299,6 +407,87 @@ fn bundle_uses_seeded_managed_rolldown_engine_with_lpm_flags() {
             "--minify",
             "--sourcemap"
         ])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_uses_approved_rolldown_pin_from_lpm_json() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "bundle-test-project",
+  "version": "1.0.0"
+}"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+  "tools": {
+    "rolldown": "1.1.1"
+  }
+}"#,
+    );
+    project.write_file("src/index.js", "export const answer = 42\n");
+
+    let marker_file = project.home().join("bundle-pinned.log");
+    seed_fake_rolldown_engine_version(&project, &marker_file, "1.1.1", true);
+
+    let output = lpm(&project)
+        .args(["bundle", "--entry", "src/index.js", "--out-dir", "dist"])
+        .output()
+        .expect("failed to run pinned lpm bundle");
+
+    assert!(
+        output.status.success(),
+        "pinned bundle must succeed, got: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("› Bundling with Rolldown 1.1.1"),
+        "bundle must announce the pinned approved rolldown version, got:\n{stderr}"
+    );
+
+    let invocations = read_marker_lines(&marker_file);
+    assert_eq!(invocations.len(), 1, "expected one rolldown invocation");
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_rejects_unapproved_rolldown_pin_before_running_node() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "bundle-test-project",
+  "version": "1.0.0"
+}"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+  "tools": {
+    "rolldown": "9.9.9"
+  }
+}"#,
+    );
+    project.write_file("src/index.js", "export const answer = 42\n");
+
+    let output = lpm(&project)
+        .args(["bundle", "--entry", "src/index.js", "--out-dir", "dist"])
+        .output()
+        .expect("failed to run unapproved pinned lpm bundle");
+
+    assert!(
+        !output.status.success(),
+        "unapproved rolldown pin must fail, got success\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("tools.rolldown")
+            && stderr.contains("not approved")
+            && stderr.contains("lpm plugin update rolldown"),
+        "bundle must clearly explain how to approve a pinned rolldown version, got:\n{stderr}"
     );
 }
 

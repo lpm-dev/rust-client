@@ -1,13 +1,18 @@
 use lpm_common::{LpmError, LpmRoot};
 use lpm_extractor::verify_and_extract;
 use lpm_runtime::platform::Platform;
+use lpm_semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const ENGINE_SCHEMA_VERSION: u32 = 2;
 const ENGINE_SIDECAR_FILE_NAME: &str = ".lpm-engine.json";
+const ENGINE_VERSION_CACHE_FILE_NAME: &str = ".version-cache.json";
 const MAX_ENGINE_DOWNLOAD_SIZE: usize = 150 * 1024 * 1024;
+const MANAGED_ENGINE_TOOL_NAMES: &[&str] = &["rolldown"];
+const MANAGED_TOOL_NPM_REGISTRY_ENV: &str = "LPM_MANAGED_TOOL_NPM_REGISTRY";
 const ROLLDOWN_VERSION: &str = "1.0.2";
 const ROLLDOWN_ROOT_TARBALL_URL: &str = "https://registry.npmjs.org/rolldown/-/rolldown-1.0.2.tgz";
 const ROLLDOWN_ROOT_TARBALL_INTEGRITY: &str = "sha512-oZx5zVDtVB44AW3eaifgDml1gWRDZGvjcfdxonE4swNPG98PrrXjaO/KrnUjzlMnztCCRVlUueA1kCXhARGk6g==";
@@ -33,14 +38,14 @@ struct EnginePlatformAsset {
     packages: &'static [EngineInstallAsset],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ResolvedEngineInstallAsset {
     install_subdir: String,
     tarball_url: String,
     tarball_integrity: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ResolvedEngineAsset {
     entry_rel_path: String,
     packages: Vec<ResolvedEngineInstallAsset>,
@@ -51,6 +56,27 @@ pub struct EngineDef {
     pub name: &'static str,
     pub latest_version: &'static str,
     assets: &'static [EnginePlatformAsset],
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct EngineVersionCache {
+    #[serde(default)]
+    engines: HashMap<String, CachedEngine>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct CachedEngine {
+    #[serde(default)]
+    selected: HashMap<String, String>,
+    #[serde(default)]
+    assets: HashMap<String, HashMap<String, ResolvedEngineAsset>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineInstallEvent {
+    ResolvingLatest { engine: String },
+    Downloading { engine: String, version: String },
+    VerifiedIntegrity { engine: String, version: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +98,27 @@ struct EngineSidecar {
     packages: Vec<EngineSidecarPackage>,
     layout_sha256: String,
     verified_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NpmVersionMetadata {
+    version: String,
+    dist: NpmDist,
+    #[serde(default)]
+    dependencies: HashMap<String, String>,
+    #[serde(default, rename = "optionalDependencies")]
+    optional_dependencies: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NpmDist {
+    tarball: String,
+    integrity: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NpmPackument {
+    versions: HashMap<String, NpmVersionMetadata>,
 }
 
 impl EngineSidecar {
@@ -358,10 +405,10 @@ pub async fn ensure_engine(
 ) -> Result<PathBuf, LpmError> {
     let def = get_engine(engine_name)
         .ok_or_else(|| LpmError::Engine(format!("unknown engine: '{engine_name}'")))?;
-    let version = resolve_engine_version(def, pinned_version)?;
     let platform = Platform::current()?;
     let platform_str = platform.to_string();
-    let asset = resolve_engine_asset(def, &platform_str)?;
+    let version = resolve_engine_version(def, pinned_version, &platform_str)?;
+    let asset = resolve_engine_asset(def, &version, &platform_str)?;
     let entry_path = engine_entry_path(def.name, &version, &platform_str, &asset.entry_rel_path)?;
     let sidecar_path = engine_sidecar_path(def.name, &version, &platform_str)?;
     let platform_dir = engine_platform_dir(def.name, &version, &platform_str)?;
@@ -402,21 +449,101 @@ pub fn get_engine(name: &str) -> Option<&'static EngineDef> {
     ENGINES.iter().find(|engine| engine.name == name)
 }
 
+pub fn user_facing_engine_tool_names() -> &'static [&'static str] {
+    MANAGED_ENGINE_TOOL_NAMES
+}
+
+pub fn resolve_engine_version_for_current_platform(
+    engine_name: &str,
+    pinned_version: Option<&str>,
+) -> Result<String, LpmError> {
+    let def = get_engine(engine_name)
+        .ok_or_else(|| LpmError::Engine(format!("unknown engine: '{engine_name}'")))?;
+    let platform = Platform::current()?.to_string();
+    resolve_engine_version(def, pinned_version, &platform)
+}
+
+pub fn get_latest_engine_version(engine_name: &str) -> Result<String, LpmError> {
+    let def = get_engine(engine_name)
+        .ok_or_else(|| LpmError::Engine(format!("unknown engine: '{engine_name}'")))?;
+    let platform = Platform::current()?.to_string();
+    Ok(read_cached_engine_selected(def.name, &platform)
+        .filter(|cached| crate::versions::is_newer_semver(cached, def.latest_version))
+        .unwrap_or_else(|| def.latest_version.to_string()))
+}
+
+pub fn list_installed_versions(engine_name: &str) -> Result<Vec<String>, LpmError> {
+    let dir = engines_dir()?.join(engine_name);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut versions = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            versions.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    versions.sort_by(|a, b| compare_semver_like(a, b));
+    Ok(versions)
+}
+
+pub fn remove_version(engine_name: &str, version: &str) -> Result<bool, LpmError> {
+    let dir = engine_version_dir(engine_name, version)?;
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+pub fn remove_all(engine_name: &str) -> Result<usize, LpmError> {
+    let dir = engines_dir()?.join(engine_name);
+    if !dir.exists() {
+        return Ok(0);
+    }
+
+    let versions = list_installed_versions(engine_name)?;
+    let count = versions.len();
+    std::fs::remove_dir_all(&dir)?;
+    Ok(count)
+}
+
 fn resolve_engine_version(
     def: &EngineDef,
     pinned_version: Option<&str>,
+    platform: &str,
 ) -> Result<String, LpmError> {
     match pinned_version {
-        None => Ok(def.latest_version.to_string()),
+        None => Ok(get_latest_engine_version_for_platform(def, platform)),
         Some(version) if version == def.latest_version => Ok(version.to_string()),
+        Some(version) if cached_engine_asset(def.name, version, platform).is_some() => {
+            Ok(version.to_string())
+        }
         Some(version) => Err(LpmError::Engine(format!(
-            "managed engine '{}' only supports the bundled version {} today; requested {}",
-            def.name, def.latest_version, version,
+            "tools.{} is pinned to {}, but that version is not approved for {}. \
+             Run `lpm plugin update {}` to approve a verified version, or remove the pin to use {}.",
+            def.name, version, platform, def.name, def.latest_version,
         ))),
     }
 }
 
-fn resolve_engine_asset(def: &EngineDef, platform: &str) -> Result<ResolvedEngineAsset, LpmError> {
+fn resolve_engine_asset(
+    def: &EngineDef,
+    version: &str,
+    platform: &str,
+) -> Result<ResolvedEngineAsset, LpmError> {
+    if version != def.latest_version {
+        return cached_engine_asset(def.name, version, platform).ok_or_else(|| {
+            LpmError::Engine(format!(
+                "engine '{}' version {} is approved without an install graph for {}; run `lpm plugin update {}` again",
+                def.name, version, platform, def.name,
+            ))
+        });
+    }
+
     let asset = def
         .assets
         .iter()
@@ -439,6 +566,91 @@ fn resolve_engine_asset(def: &EngineDef, platform: &str) -> Result<ResolvedEngin
             })
             .collect(),
     })
+}
+
+fn compare_semver_like(a: &str, b: &str) -> std::cmp::Ordering {
+    match (Version::parse(a), Version::parse(b)) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        _ => a.cmp(b),
+    }
+}
+
+fn get_latest_engine_version_for_platform(def: &EngineDef, platform: &str) -> String {
+    read_cached_engine_selected(def.name, platform)
+        .filter(|cached| crate::versions::is_newer_semver(cached, def.latest_version))
+        .unwrap_or_else(|| def.latest_version.to_string())
+}
+
+fn read_cached_engine_selected(engine_name: &str, platform: &str) -> Option<String> {
+    let cache = read_engine_version_cache().ok()?;
+    cache
+        .engines
+        .get(engine_name)?
+        .selected
+        .get(platform)
+        .cloned()
+}
+
+fn cached_engine_asset(
+    engine_name: &str,
+    version: &str,
+    platform: &str,
+) -> Option<ResolvedEngineAsset> {
+    let cache = read_engine_version_cache().ok()?;
+    cache
+        .engines
+        .get(engine_name)?
+        .assets
+        .get(version)?
+        .get(platform)
+        .cloned()
+}
+
+fn approve_engine_version(
+    engine_name: &str,
+    version: &str,
+    platform: &str,
+    asset: &ResolvedEngineAsset,
+) -> Result<(), LpmError> {
+    let cache_path = engine_version_cache_path()?;
+    let mut cache = read_engine_version_cache_at(&cache_path).unwrap_or_default();
+    let entry = cache.engines.entry(engine_name.to_string()).or_default();
+    entry
+        .selected
+        .insert(platform.to_string(), version.to_string());
+    entry
+        .assets
+        .entry(version.to_string())
+        .or_default()
+        .insert(platform.to_string(), asset.clone());
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&cache)
+        .map_err(|e| LpmError::Engine(format!("failed to serialize engine version cache: {e}")))?;
+    let tmp = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, json.as_bytes())
+        .map_err(|e| LpmError::Engine(format!("failed to write engine version cache: {e}")))?;
+    std::fs::rename(&tmp, &cache_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        LpmError::Engine(format!("failed to finalize engine version cache: {e}"))
+    })?;
+    Ok(())
+}
+
+fn read_engine_version_cache() -> Result<EngineVersionCache, LpmError> {
+    read_engine_version_cache_at(&engine_version_cache_path()?)
+}
+
+fn read_engine_version_cache_at(path: &Path) -> Result<EngineVersionCache, LpmError> {
+    let content = std::fs::read_to_string(path)?;
+    serde_json::from_str(&content)
+        .map_err(|e| LpmError::Engine(format!("failed to parse engine version cache: {e}")))
+}
+
+fn engine_version_cache_path() -> Result<PathBuf, LpmError> {
+    Ok(engines_dir()?.join(ENGINE_VERSION_CACHE_FILE_NAME))
 }
 
 async fn install_under_lock(
@@ -487,7 +699,7 @@ async fn install_under_lock_at(
 
     if !quiet {
         eprintln!(
-            "  Engine '{}' not installed. Downloading {} v{} ({})...",
+            "  Managed tool '{}' not installed. Downloading {} v{} ({})...",
             engine_name, engine_name, version, platform,
         );
     }
@@ -572,6 +784,8 @@ async fn install_under_lock_at(
 }
 
 async fn download_tarball(url: &str) -> Result<Vec<u8>, LpmError> {
+    validate_fetch_url(url, "engine tarball")?;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -614,6 +828,328 @@ async fn download_tarball(url: &str) -> Result<Vec<u8>, LpmError> {
     }
 
     Ok(bytes.to_vec())
+}
+
+pub async fn peek_latest_engine_version(engine_name: &str) -> Result<String, String> {
+    match engine_name {
+        "rolldown" => {
+            let client = npm_client().map_err(|e| e.to_string())?;
+            let base = managed_tool_npm_registry_base().map_err(|e| e.to_string())?;
+            let metadata = fetch_npm_version_metadata(&client, &base, "rolldown", "latest")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(metadata.version)
+        }
+        _ => Err(format!(
+            "managed engine '{engine_name}' is not exposed through `lpm plugin update`"
+        )),
+    }
+}
+
+pub async fn update_engine_with_observer(
+    engine_name: &str,
+    observer: &mut (dyn FnMut(EngineInstallEvent) + Send),
+) -> Result<String, LpmError> {
+    update_engine_with_optional_observer(engine_name, Some(observer)).await
+}
+
+pub async fn update_engine(engine_name: &str) -> Result<String, LpmError> {
+    update_engine_with_optional_observer(engine_name, None).await
+}
+
+async fn update_engine_with_optional_observer(
+    engine_name: &str,
+    observer: Option<&mut (dyn FnMut(EngineInstallEvent) + Send)>,
+) -> Result<String, LpmError> {
+    let def = get_engine(engine_name)
+        .ok_or_else(|| LpmError::Engine(format!("unknown engine: '{engine_name}'")))?;
+    if !MANAGED_ENGINE_TOOL_NAMES.contains(&def.name) {
+        return Err(LpmError::Engine(format!(
+            "managed engine '{}' is internal and is not updated through `lpm plugin update`",
+            def.name
+        )));
+    }
+
+    let lock_path = engine_update_lock_path(def.name)?;
+    lpm_common::with_exclusive_lock_async(lock_path, run_engine_update_under_lock(def, observer))
+        .await
+}
+
+async fn run_engine_update_under_lock(
+    def: &'static EngineDef,
+    mut observer: Option<&mut (dyn FnMut(EngineInstallEvent) + Send)>,
+) -> Result<String, LpmError> {
+    emit_engine_install_event(
+        &mut observer,
+        EngineInstallEvent::ResolvingLatest {
+            engine: def.name.to_string(),
+        },
+    );
+
+    let platform = Platform::current()?;
+    let platform_str = platform.to_string();
+    let (latest_version, fetched_asset) = match def.name {
+        "rolldown" => fetch_latest_rolldown_asset_for_platform(&platform_str).await?,
+        _ => {
+            return Err(LpmError::Engine(format!(
+                "managed engine '{}' is not user-updatable",
+                def.name
+            )));
+        }
+    };
+
+    let (target_version, asset) =
+        if crate::versions::is_newer_semver(&latest_version, def.latest_version) {
+            (latest_version, fetched_asset)
+        } else {
+            (
+                def.latest_version.to_string(),
+                resolve_engine_asset(def, def.latest_version, &platform_str)?,
+            )
+        };
+
+    emit_engine_install_event(
+        &mut observer,
+        EngineInstallEvent::Downloading {
+            engine: def.name.to_string(),
+            version: target_version.clone(),
+        },
+    );
+    install_under_lock(
+        def.name,
+        &target_version,
+        &platform_str,
+        asset.clone(),
+        true,
+    )
+    .await?;
+    emit_engine_install_event(
+        &mut observer,
+        EngineInstallEvent::VerifiedIntegrity {
+            engine: def.name.to_string(),
+            version: target_version.clone(),
+        },
+    );
+    approve_engine_version(def.name, &target_version, &platform_str, &asset)?;
+    Ok(target_version)
+}
+
+fn emit_engine_install_event(
+    observer: &mut Option<&mut (dyn FnMut(EngineInstallEvent) + Send)>,
+    event: EngineInstallEvent,
+) {
+    if let Some(observer) = observer.as_deref_mut() {
+        observer(event);
+    }
+}
+
+async fn fetch_latest_rolldown_asset_for_platform(
+    platform: &str,
+) -> Result<(String, ResolvedEngineAsset), LpmError> {
+    let client = npm_client()?;
+    let base = managed_tool_npm_registry_base()?;
+    let root = fetch_npm_version_metadata(&client, &base, "rolldown", "latest").await?;
+
+    let pluginutils_req = root
+        .dependencies
+        .get("@rolldown/pluginutils")
+        .ok_or_else(|| {
+            LpmError::Engine("rolldown metadata is missing @rolldown/pluginutils".into())
+        })?;
+    let oxc_types_req = root.dependencies.get("@oxc-project/types").ok_or_else(|| {
+        LpmError::Engine("rolldown metadata is missing @oxc-project/types".into())
+    })?;
+    let binding_package = rolldown_binding_package_for_platform(platform)?;
+    let binding_req = root
+        .optional_dependencies
+        .get(binding_package)
+        .ok_or_else(|| {
+            LpmError::Engine(format!(
+                "rolldown metadata is missing {binding_package} for {platform}"
+            ))
+        })?;
+
+    let pluginutils =
+        resolve_npm_dependency_metadata(&client, &base, "@rolldown/pluginutils", pluginutils_req)
+            .await?;
+    let oxc_types =
+        resolve_npm_dependency_metadata(&client, &base, "@oxc-project/types", oxc_types_req)
+            .await?;
+    let binding =
+        resolve_npm_dependency_metadata(&client, &base, binding_package, binding_req).await?;
+
+    let packages = vec![
+        npm_package_asset("", &root)?,
+        npm_package_asset("node_modules/@rolldown/pluginutils", &pluginutils)?,
+        npm_package_asset("node_modules/@oxc-project/types", &oxc_types)?,
+        npm_package_asset(&format!("node_modules/{binding_package}"), &binding)?,
+    ];
+
+    Ok((
+        root.version.clone(),
+        ResolvedEngineAsset {
+            entry_rel_path: "bin/cli.mjs".into(),
+            packages,
+        },
+    ))
+}
+
+fn npm_package_asset(
+    install_subdir: &str,
+    metadata: &NpmVersionMetadata,
+) -> Result<ResolvedEngineInstallAsset, LpmError> {
+    if metadata.dist.integrity.is_empty() {
+        return Err(LpmError::Engine(format!(
+            "npm metadata for version {} is missing dist.integrity",
+            metadata.version
+        )));
+    }
+    validate_fetch_url(&metadata.dist.tarball, "npm tarball")?;
+    Ok(ResolvedEngineInstallAsset {
+        install_subdir: install_subdir.to_string(),
+        tarball_url: metadata.dist.tarball.clone(),
+        tarball_integrity: metadata.dist.integrity.clone(),
+    })
+}
+
+fn npm_client() -> Result<reqwest::Client, LpmError> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| LpmError::Network(format!("failed to create npm HTTP client: {e}")))
+}
+
+fn managed_tool_npm_registry_base() -> Result<String, LpmError> {
+    let raw = std::env::var(MANAGED_TOOL_NPM_REGISTRY_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| lpm_common::NPM_REGISTRY_URL.to_string());
+    validate_fetch_url(&raw, "npm registry")?;
+    Ok(raw.trim_end_matches('/').to_string())
+}
+
+async fn fetch_npm_version_metadata(
+    client: &reqwest::Client,
+    base: &str,
+    package: &str,
+    version: &str,
+) -> Result<NpmVersionMetadata, LpmError> {
+    let url = format!("{}/{}/{}", base, encode_npm_package_path(package), version);
+    fetch_json(client, &url, "npm version metadata").await
+}
+
+async fn fetch_npm_packument(
+    client: &reqwest::Client,
+    base: &str,
+    package: &str,
+) -> Result<NpmPackument, LpmError> {
+    let url = format!("{}/{}", base, encode_npm_package_path(package));
+    fetch_json(client, &url, "npm package metadata").await
+}
+
+async fn resolve_npm_dependency_metadata(
+    client: &reqwest::Client,
+    base: &str,
+    package: &str,
+    requirement: &str,
+) -> Result<NpmVersionMetadata, LpmError> {
+    let trimmed = requirement.trim();
+    let exact = trimmed.strip_prefix('=').unwrap_or(trimmed);
+    if Version::parse(exact).is_ok() {
+        return fetch_npm_version_metadata(client, base, package, exact).await;
+    }
+
+    let req = VersionReq::parse(trimmed).map_err(|e| {
+        LpmError::Engine(format!(
+            "failed to parse npm dependency range {package}@{trimmed}: {e}"
+        ))
+    })?;
+    let packument = fetch_npm_packument(client, base, package).await?;
+    let mut best: Option<(Version, String)> = None;
+    for version in packument.versions.keys() {
+        let Ok(parsed) = Version::parse(version) else {
+            continue;
+        };
+        if !req.matches(&parsed) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_version, _)| parsed > *best_version)
+        {
+            best = Some((parsed, version.clone()));
+        }
+    }
+
+    let (_, version_key) = best.ok_or_else(|| {
+        LpmError::Engine(format!(
+            "no npm version of {package} satisfies required range {trimmed}"
+        ))
+    })?;
+    packument
+        .versions
+        .get(&version_key)
+        .cloned()
+        .ok_or_else(|| {
+            LpmError::Engine(format!(
+                "resolved npm version {package}@{version_key} disappeared from metadata"
+            ))
+        })
+}
+
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    context: &str,
+) -> Result<T, LpmError> {
+    validate_fetch_url(url, context)?;
+    let resp = client
+        .get(url)
+        .header("User-Agent", "lpm-cli")
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| LpmError::Network(format!("failed to fetch {context}: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(LpmError::Http {
+            status: resp.status().as_u16(),
+            message: format!("failed to fetch {context} from {url}"),
+        });
+    }
+    resp.json()
+        .await
+        .map_err(|e| LpmError::Network(format!("failed to parse {context}: {e}")))
+}
+
+fn encode_npm_package_path(name: &str) -> String {
+    name.replace('@', "%40").replace('/', "%2f")
+}
+
+fn rolldown_binding_package_for_platform(platform: &str) -> Result<&'static str, LpmError> {
+    match platform {
+        "darwin-arm64" => Ok("@rolldown/binding-darwin-arm64"),
+        "darwin-x64" => Ok("@rolldown/binding-darwin-x64"),
+        "linux-arm" => Ok("@rolldown/binding-linux-arm-gnueabihf"),
+        "linux-arm64" => Ok("@rolldown/binding-linux-arm64-gnu"),
+        "linux-x64" => Ok("@rolldown/binding-linux-x64-gnu"),
+        "win-arm64" => Ok("@rolldown/binding-win32-arm64-msvc"),
+        "win-x64" => Ok("@rolldown/binding-win32-x64-msvc"),
+        _ => Err(LpmError::Engine(format!(
+            "rolldown has no npm binding package for platform {platform}"
+        ))),
+    }
+}
+
+fn validate_fetch_url(url: &str, context: &str) -> Result<(), LpmError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| LpmError::Engine(format!("invalid {context} URL {url}: {e}")))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if parsed.host_str().is_some_and(lpm_common::is_loopback_host) => Ok(()),
+        scheme => Err(LpmError::Engine(format!(
+            "refusing {context} URL {url}: scheme {scheme:?} is not allowed"
+        ))),
+    }
 }
 
 fn validate_for_reuse(
@@ -850,6 +1386,11 @@ fn engine_version_dir_at(
     Ok(engines_root.join(engine_name).join(version))
 }
 
+fn engine_version_dir(engine_name: &str, version: &str) -> Result<PathBuf, LpmError> {
+    let engines_root = engines_dir()?;
+    engine_version_dir_at(&engines_root, engine_name, version)
+}
+
 fn engine_platform_dir(
     engine_name: &str,
     version: &str,
@@ -920,6 +1461,10 @@ fn engine_entry_path_at(
 fn engine_install_lock_path(engine_name: &str, version: &str) -> Result<PathBuf, LpmError> {
     let engines_root = engines_dir()?;
     Ok(engine_version_dir_at(&engines_root, engine_name, version)?.join(".install.lock"))
+}
+
+fn engine_update_lock_path(engine_name: &str) -> Result<PathBuf, LpmError> {
+    Ok(engines_dir()?.join(engine_name).join(".update.lock"))
 }
 
 fn now_unix() -> u64 {
@@ -1172,11 +1717,9 @@ mod tests {
 
     #[test]
     fn resolve_engine_version_rejects_unbundled_pin() {
-        let error = resolve_engine_version(get_engine("tsgo").unwrap(), Some("1.0.0")).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("only supports the bundled version")
-        );
+        let error =
+            resolve_engine_version(get_engine("tsgo").unwrap(), Some("1.0.0"), "darwin-arm64")
+                .unwrap_err();
+        assert!(error.to_string().contains("not approved"));
     }
 }
