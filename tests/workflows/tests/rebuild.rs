@@ -53,6 +53,13 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+fn assert_no_terminal_controls(context: &str, text: &str) {
+    assert!(
+        !text.bytes().any(|b| matches!(b, 0x07 | 0x1b | 0x7f)),
+        "{context} must not contain terminal control bytes, got:\n{text}"
+    );
+}
+
 /// Seed `<store>/v1/<safe>@<v>/` with package.json, the requested
 /// `postinstall` script body, and the `.integrity` sentinel. Adds
 /// `build.js` for green-tier shapes. Returns the store directory path
@@ -565,6 +572,53 @@ fn rebuild_human_output_collapses_lifecycle_scripts_to_slim_rows() {
     assert!(
         !stderr.contains("→ postinstall:") && !stderr.contains("postinstall completed"),
         "must drop per-step command chatter; stderr:\n{stderr}",
+    );
+}
+
+#[test]
+fn rebuild_lifecycle_output_sanitizes_terminal_controls() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-controls", None, &[]);
+    let name = "control-script-pkg";
+    let version = "1.0.0";
+    let script = "printf 'safe\\033[2J\\n'; printf 'err\\007\\n' >&2";
+    let store_pkg = project
+        .store_dir()
+        .join("v1")
+        .join(format!("{name}@{version}"));
+    std::fs::create_dir_all(&store_pkg).unwrap();
+    std::fs::write(
+        store_pkg.join("package.json"),
+        serde_json::to_string(&serde_json::json!({
+            "name": name,
+            "version": version,
+            "scripts": { "postinstall": script }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(store_pkg.join(".integrity"), "sha512-fixture-skip-verify").unwrap();
+    seed_wrapper(&project, &store_pkg, name, version);
+    write_lockfile_for_packages(&project, &[(name, version)]);
+
+    let out = lpm(&project)
+        .args(["rebuild", "--all"])
+        .output()
+        .expect("spawn lpm rebuild --all");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "rebuild --all should succeed; output:\n{combined}",
+    );
+    assert_no_terminal_controls("rebuild lifecycle output", &combined);
+    assert!(
+        combined.contains("safe") && combined.contains("err"),
+        "sanitized lifecycle output should preserve readable text, got:\n{combined}",
     );
 }
 

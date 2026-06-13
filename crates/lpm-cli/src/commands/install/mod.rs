@@ -2965,8 +2965,7 @@ async fn run_with_options_under_store_lock(
             && !is_local_source
             && let Some(v2_store) = store_v2_handle.as_deref()
             && let Some(sri) = p.integrity.as_deref()
-            && let Ok(object_dir) = v2_store.paths().object_dir(sri)
-            && object_dir.exists()
+            && v2_store.reusable_object_dir(sri)?.is_some()
         {
             cached += 1;
             // followup #6b — dispatch link_v2_one immediately.

@@ -535,13 +535,28 @@ mod tests {
     }
 
     fn write_object(store: &V2Store, sri: &str, files: &[(&str, &[u8])]) -> PathBuf {
-        let dir = store.paths().object_dir(sri).unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
-        for (name, bytes) in files {
-            std::fs::write(dir.join(name), bytes).unwrap();
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            for (path, content) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, format!("package/{path}"), &content[..])
+                    .unwrap();
+            }
+            builder.finish().unwrap();
         }
-        std::fs::write(dir.join(".integrity"), sri).unwrap();
-        dir
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        let tarball = encoder.finish().unwrap();
+        store.extract_object(sri, &tarball).unwrap()
     }
 
     fn sample_key(name: &str, version: &str) -> crate::v2::GraphKey {

@@ -2,8 +2,8 @@ use crate::commands::registry_reads::{
     fetch_routed_package_metadata, normalize_package_version_input, prepare_routed_read_context,
 };
 use crate::install_ui;
-use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use lpm_common::{LpmError, sanitize_for_terminal};
 use lpm_registry::RegistryClient;
 use std::path::Path;
 
@@ -28,7 +28,7 @@ pub async fn run(
         return Ok(());
     }
 
-    println!("{}", metadata.name.bold());
+    println!("{}", sanitize_for_terminal(&metadata.name).bold());
 
     // Determine which version to show
     let version_key = version
@@ -86,10 +86,15 @@ pub async fn run(
         );
         let latest = metadata.latest_version_tag().unwrap_or("");
         for v in &versions {
+            let safe_version = sanitize_for_terminal(v);
             if *v == latest {
-                println!("  {:<12} {}", v, install_ui::status_ok("(latest)"));
+                println!(
+                    "  {:<12} {}",
+                    safe_version,
+                    install_ui::status_ok("(latest)")
+                );
             } else {
-                println!("  {}", v.dimmed());
+                println!("  {}", safe_version.dimmed());
             }
         }
     }
@@ -107,11 +112,15 @@ pub async fn run(
 }
 
 fn print_field(label: &str, value: &str) {
-    println!("  {} {value}", format!("{label:<12}").dimmed());
+    let safe_value = sanitize_for_terminal(value);
+    println!("  {} {safe_value}", format!("{label:<12}").dimmed());
 }
 
 fn print_name_value_rows(values: &std::collections::HashMap<String, String>) {
-    let mut rows: Vec<_> = values.iter().collect();
+    let mut rows: Vec<_> = values
+        .iter()
+        .map(|(name, value)| (sanitize_for_terminal(name), sanitize_for_terminal(value)))
+        .collect();
     rows.sort_by(|(left, _), (right, _)| left.cmp(right));
     let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
     for (name, value) in rows {

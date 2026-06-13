@@ -1,6 +1,6 @@
 use crate::commands::registry_reads::{prepare_routed_read_context, search_route_for_query};
 use crate::install_ui;
-use lpm_common::LpmError;
+use lpm_common::{LpmError, sanitize_for_terminal};
 use lpm_registry::RegistryClient;
 use std::path::Path;
 
@@ -16,9 +16,10 @@ pub async fn run(
     let route = search_route_for_query(&context.route_table, query);
     if !json_output {
         let registry_label = search_registry_label(&context.client, &route);
+        let query_safe = sanitize_for_terminal(query);
         install_ui::phase(&format!(
             "Searching {registry_label} for \"{}\"",
-            install_ui::cyan(query)
+            install_ui::cyan(&query_safe)
         ));
     }
     let results = context
@@ -40,7 +41,8 @@ pub async fn run(
     }
 
     if results.packages.is_empty() {
-        install_ui::warn(&format!("No packages found for \"{query}\""));
+        let query_safe = sanitize_for_terminal(query);
+        install_ui::warn(&format!("No packages found for \"{query_safe}\""));
         return Ok(());
     }
 
@@ -53,12 +55,14 @@ pub async fn run(
             None => pkg.name.clone(),
         };
 
-        println!("  {}", install_ui::cyan(&package_name));
+        let package_name_safe = sanitize_for_terminal(&package_name);
+        println!("  {}", install_ui::cyan(&package_name_safe));
 
         if let Some(desc) = &pkg.description
             && !desc.is_empty()
         {
-            let short = truncate_description(desc, 80);
+            let safe_desc = sanitize_for_terminal(desc);
+            let short = truncate_description(&safe_desc, 80);
             println!("    {}", install_ui::dim(&short));
         }
 
@@ -108,7 +112,8 @@ fn format_search_metadata(
     ecosystem: Option<&str>,
 ) -> String {
     let mut parts = Vec::with_capacity(3);
-    parts.push(format!("latest {}", install_ui::yellow(version)));
+    let safe_version = sanitize_for_terminal(version);
+    parts.push(format!("latest {}", install_ui::yellow(&safe_version)));
     if let Some(score) = quality_score {
         let score_text = score.to_string();
         let colored = if score >= 80 {
@@ -121,7 +126,8 @@ fn format_search_metadata(
     if let Some(ecosystem) = ecosystem
         && !ecosystem.is_empty()
     {
-        parts.push(format!("ecosystem {ecosystem}"));
+        let safe_ecosystem = sanitize_for_terminal(ecosystem);
+        parts.push(format!("ecosystem {safe_ecosystem}"));
     }
 
     if parts.len() == 1 {

@@ -544,9 +544,15 @@ fn extract_binary_from_zip(
             )));
         }
 
-        let file_name = entry
-            .enclosed_name()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        let enclosed = entry.enclosed_name().ok_or_else(|| {
+            LpmError::Plugin(format!(
+                "path traversal detected in plugin ZIP entry: {}",
+                entry.name()
+            ))
+        })?;
+        let file_name = enclosed
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
         found_files.push(file_name.clone());
@@ -587,6 +593,56 @@ mod tests {
         assert!(is_zip_magic(&[0x50, 0x4b, 0x03, 0x04, 0x00]));
         assert!(!is_zip_magic(&[0x1f, 0x8b, 0x08, 0x00])); // gzip
         assert!(!is_zip_magic(&[0x00, 0x00])); // too short
+    }
+
+    fn forged_zip_with_declared_file(path: &str, declared_size: u32) -> Vec<u8> {
+        let name = path.as_bytes();
+        let name_len = name.len() as u16;
+        let mut zip = Vec::new();
+
+        zip.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+        zip.extend_from_slice(&20_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(&declared_size.to_le_bytes());
+        zip.extend_from_slice(&name_len.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(name);
+
+        let central_offset = zip.len() as u32;
+        zip.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+        zip.extend_from_slice(&20_u16.to_le_bytes());
+        zip.extend_from_slice(&20_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(&declared_size.to_le_bytes());
+        zip.extend_from_slice(&name_len.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(name);
+
+        let central_size = zip.len() as u32 - central_offset;
+        zip.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&1_u16.to_le_bytes());
+        zip.extend_from_slice(&1_u16.to_le_bytes());
+        zip.extend_from_slice(&central_size.to_le_bytes());
+        zip.extend_from_slice(&central_offset.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip
     }
 
     #[test]
@@ -665,11 +721,8 @@ mod tests {
         assert!(msg.contains("exceeds maximum"), "error: {msg}");
     }
 
-    /// M46: a tarball whose entry header declares a per-entry size
-    /// above the cap is refused before any bytes are unpacked. Pre-fix
-    /// the extractor `std::io::copy`-ed the named entry verbatim, so a
-    /// malicious release could pack a small compressed archive whose
-    /// internal entry expanded to multi-GB.
+    /// A tarball whose entry header declares a per-entry size above
+    /// the cap is refused before any bytes are unpacked.
     #[test]
     fn tarball_extraction_rejects_per_entry_over_cap() {
         let mut builder = tar::Builder::new(Vec::new());
@@ -697,9 +750,8 @@ mod tests {
         assert!(!dest.exists(), "no partial extract on refusal");
     }
 
-    /// M46: a tarball with too many entries is refused before any
-    /// entry is unpacked. Real plugins ship ~3 entries; 1024 is the
-    /// cap. A hostile archive trying to exhaust inodes is rejected.
+    /// A tarball with too many entries is refused before any entry is
+    /// unpacked.
     #[test]
     fn tarball_extraction_rejects_excessive_entry_count() {
         let mut builder = tar::Builder::new(Vec::new());
@@ -726,27 +778,68 @@ mod tests {
         );
     }
 
-    /// M46: ZIP entry declaring oversized payload is rejected on the
-    /// same cap as the tar path.
     #[test]
-    fn zip_extraction_rejects_per_entry_over_cap() {
+    fn zip_extraction_rejects_path_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("oxlint");
         let buf = std::io::Cursor::new(Vec::new());
         let mut writer = zip::ZipWriter::new(buf);
-        // We can't easily craft a malicious ZIP with a forged size
-        // header via the zip crate's writer; the cap test for the
-        // tarball path is the load-bearing one. Validate the legitimate
-        // case still extracts cleanly: a small payload below the caps.
+        writer
+            .start_file("../oxlint", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"pwned").unwrap();
+        let zip_data = writer.finish().unwrap().into_inner();
+
+        let err = extract_binary_from_zip(&zip_data, &dest, "oxlint").unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("path traversal"),
+            "zip traversal rejection should be explicit: {msg}"
+        );
+        assert!(!dest.exists(), "no binary should be extracted on refusal");
+        assert!(
+            !root.path().join("oxlint").exists(),
+            "zip traversal must not write outside the destination"
+        );
+    }
+
+    #[test]
+    fn zip_extraction_rejects_excessive_entry_count() {
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(buf);
         let options = zip::write::SimpleFileOptions::default();
-        writer.start_file("oxlint", options).unwrap();
-        std::io::Write::write_all(&mut writer, b"binary contents").unwrap();
-        let buf = writer.finish().unwrap();
-        let zip_data = buf.into_inner();
+        for i in 0..(MAX_PLUGIN_ARCHIVE_ENTRIES + 1) {
+            writer.start_file(format!("f-{i}"), options).unwrap();
+        }
+        let zip_data = writer.finish().unwrap().into_inner();
 
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("oxlint");
-        extract_binary_from_zip(&zip_data, &dest, "oxlint").unwrap();
-        let extracted = std::fs::read(&dest).unwrap();
-        assert_eq!(&extracted, b"binary contents");
+        let err = extract_binary_from_zip(&zip_data, &dest, "oxlint").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds") && msg.contains("entries"),
+            "must label ZIP entry-count overflow: {msg}"
+        );
+    }
+
+    /// ZIP entry declaring oversized payload is rejected on the same
+    /// cap as the tar path.
+    #[test]
+    fn zip_extraction_rejects_per_entry_over_cap() {
+        let zip_data =
+            forged_zip_with_declared_file("oxlint", (MAX_PLUGIN_EXTRACTED_BYTES + 1) as u32);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("oxlint");
+        let err = extract_binary_from_zip(&zip_data, &dest, "oxlint").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("per-entry cap"),
+            "must refuse with per-entry cap: {msg}"
+        );
+        assert!(!dest.exists(), "no partial extract on refusal");
     }
 
     // --- Unique temp file names ---

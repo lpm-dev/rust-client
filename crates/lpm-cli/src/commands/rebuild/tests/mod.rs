@@ -207,14 +207,27 @@ fn live_package_dir_resolves_v2_transitive_via_store_walk() {
     // Materialize one link entry for a "transitive-only" package
     // (no project-side symlink).
     let sri = lpm_store::compute_sri_hash(b"live_package_dir_v2_transitive");
-    let object_dir = v2_store.paths().object_dir(&sri).unwrap();
-    std::fs::create_dir_all(&object_dir).unwrap();
-    std::fs::write(
-        object_dir.join("package.json"),
-        b"{\"name\":\"deeply-nested\",\"version\":\"1.0.0\"}",
-    )
-    .unwrap();
-    std::fs::write(object_dir.join(".integrity"), &sri).unwrap();
+    let object_dir = {
+        use std::io::Write;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let content = b"{\"name\":\"deeply-nested\",\"version\":\"1.0.0\"}";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", &content[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&tar_data).unwrap();
+        let tarball = encoder.finish().unwrap();
+        v2_store.extract_object(&sri, &tarball).unwrap()
+    };
 
     let inputs = lpm_store::v2::GraphKeyInputs::new(
         "deeply-nested",

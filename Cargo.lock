@@ -3266,12 +3266,14 @@ dependencies = [
 name = "lpm-linker"
 version = "0.60.0"
 dependencies = [
+ "flate2",
  "lpm-common",
  "lpm-store",
  "lpm-workspace",
  "pathdiff",
  "rayon",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
@@ -3659,6 +3661,7 @@ dependencies = [
  "lpm-runner",
  "lpm-runtime",
  "lpm-security",
+ "lpm-store",
  "lpm-vault",
  "p256",
  "predicates",
