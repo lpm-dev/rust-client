@@ -14,6 +14,7 @@ pub mod dev_ui;
 pub mod doctor;
 pub mod download;
 pub mod env;
+pub mod fetch;
 pub mod filter;
 pub mod global;
 mod global_util;
