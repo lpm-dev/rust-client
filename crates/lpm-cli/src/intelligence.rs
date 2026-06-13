@@ -787,6 +787,10 @@ fn node_builtins() -> HashSet<&'static str> {
     .collect()
 }
 
+pub(crate) fn node_builtin_package_names() -> HashSet<&'static str> {
+    node_builtins()
+}
+
 // ─── Quality & Security Warnings ───────────────────────────────────
 
 /// Warning about a package's quality or security during install.

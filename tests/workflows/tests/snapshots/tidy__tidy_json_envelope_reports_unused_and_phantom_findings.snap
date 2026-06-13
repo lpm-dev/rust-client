@@ -1,0 +1,39 @@
+---
+source: tests/workflows/tests/tidy.rs
+assertion_line: 111
+expression: envelope
+---
+{
+  "success": false,
+  "fixed": false,
+  "manifest": "package.json",
+  "counts": {
+    "declared": 3,
+    "imported": 2,
+    "unused": 1,
+    "phantoms": 1,
+    "ignored": 0,
+    "removed": 0,
+    "remaining": 2
+  },
+  "unused": [
+    {
+      "name": "lodash",
+      "section": "dependencies",
+      "spec": "^4.17.21",
+      "fixable": true,
+      "reason": "not imported, referenced by scripts, or found in known config files"
+    }
+  ],
+  "phantoms": [
+    {
+      "name": "left-pad",
+      "file": "src/index.js",
+      "line": 2,
+      "import_count": 1
+    }
+  ],
+  "removed": [],
+  "ignored": [],
+  "elapsed_ms": "[ELAPSED]"
+}

@@ -3332,6 +3332,27 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/fetch.rs", 6)],
         last_audited_at: "2026-06-13",
     },
+    SurfaceV2 {
+        id: 154,
+        scenarios: 5,
+        failure_modes_tested: &[
+            "report-only tidy exits 1 on unused dependency and phantom import findings",
+            "report-only tidy leaves package.json unchanged",
+            "script-used dev dependency is not reported unused",
+            "JSON envelope reports unused and phantom findings",
+            "tidy --fix removes unused dependencies and reconciles lpm.lock/node_modules",
+            "tidy --fix reports peerDependencies without removing them",
+            "lpm.toml [tidy] ignore-unused and ignore-phantom suppress configured findings",
+        ],
+        failure_modes_known: &[
+            "workspace-recursive tidy target selection",
+            "invalid [tidy] ignore glob diagnostics",
+            "rollback after install failure restores lpm.lock/lpm.lockb snapshots",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/tidy.rs", 5)],
+        last_audited_at: "2026-06-13",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

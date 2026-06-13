@@ -66,6 +66,7 @@ pub mod stage;
 pub mod store;
 pub mod swift_registry;
 pub mod third_party_login;
+pub mod tidy;
 pub mod token;
 pub mod tools;
 pub mod tools_ui;
