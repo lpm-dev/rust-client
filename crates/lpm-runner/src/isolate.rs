@@ -15,7 +15,7 @@
 //!
 //! Today this primitive serves one job: encapsulate the per-spec
 //! install-root lifecycle for `lpm dlx` (cache freshness, completeness
-//! markers, TTL sweep, mtime touch, restricted-perms create).
+//! markers, TTL sweep, restricted-perms create).
 //! `commands::run::dlx` is the only call site; future audit-driven
 //! changes to that flow happen here.
 
@@ -31,9 +31,8 @@ use std::time::{Duration, SystemTime};
 pub struct IsolatedInstall {
     spec: String,
     root: PathBuf,
-    /// How long the install can sit unused before [`should_sweep`]
-    /// classifies it as stale. Refreshed by [`touch`] on every
-    /// successful invocation (install or hit).
+    /// How long the install marker can age before [`should_sweep`]
+    /// classifies it as stale.
     ttl: Duration,
 }
 
@@ -106,9 +105,9 @@ impl IsolatedInstall {
         dlx::create_cache_dir(&self.root)
     }
 
-    /// Refresh the install's "last used" mtime. Called on every
-    /// successful invocation, hit or install — see
-    /// [`crate::dlx::touch_cache`] for the use-time semantics rationale.
+    /// Refresh the install marker mtime. Normal `lpm dlx` cache hits do not
+    /// call this; keeping TTL tied to install time forces periodic
+    /// revalidation.
     pub fn touch(&self) {
         dlx::touch_cache(&self.root);
     }

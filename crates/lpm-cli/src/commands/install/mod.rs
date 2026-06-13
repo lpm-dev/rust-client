@@ -50,6 +50,9 @@ pub use gitignore::{
 use lifecycle::*;
 use linking::*;
 use lockfile::*;
+pub(crate) use lockfile::{
+    requested_range_for_locked_lookup, select_locked_package_for_requested_spec,
+};
 #[cfg(test)]
 pub(crate) use manifest::finalize_packages_in_manifest;
 use manifest::*;

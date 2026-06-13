@@ -1716,10 +1716,25 @@ async fn async_main() -> Result<()> {
         Commands::Dlx {
             package,
             refresh,
+            allow_new,
+            min_release_age,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::run::dlx(&client, &cwd, &package, &args, refresh).await
+            let min_release_age_override = match min_release_age.as_deref() {
+                Some(s) => Some(release_age_config::parse_duration(s)?),
+                None => None,
+            };
+            commands::run::dlx(
+                &client,
+                &cwd,
+                &package,
+                &args,
+                refresh,
+                allow_new,
+                min_release_age_override,
+            )
+            .await
         }
         Commands::Filter {
             exprs,

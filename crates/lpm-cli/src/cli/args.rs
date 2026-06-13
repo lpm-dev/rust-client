@@ -1609,6 +1609,12 @@ pub(crate) enum Commands {
         /// Force reinstall (ignore cache).
         #[arg(long)]
         refresh: bool,
+        /// Allow recently published packages for this dlx run.
+        #[arg(long)]
+        allow_new: bool,
+        /// Override the minimumReleaseAge cooldown for this dlx run only.
+        #[arg(long, value_name = "DUR")]
+        min_release_age: Option<String>,
         /// Extra arguments passed to the binary.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

@@ -2,7 +2,8 @@ mod support;
 
 use lpm_common::LpmRoot;
 use std::time::{Duration, SystemTime};
-use support::{TempProject, lpm};
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
+use support::{TempProject, lpm, lpm_with_registry};
 
 fn seed_dlx_cache(
     project: &TempProject,
@@ -20,7 +21,26 @@ fn seed_dlx_cache(
         .expect("failed to seed dlx package.json");
     std::fs::write(package_dir.join("package.json"), installed_package_json)
         .expect("failed to seed installed package.json");
+    seed_lockfile_identity(&cache_dir, package_name, "1.0.0", "sha512-cache");
     cache_dir
+}
+
+fn seed_lockfile_identity(
+    root: &std::path::Path,
+    package_name: &str,
+    version: &str,
+    integrity: &str,
+) {
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: package_name.to_string(),
+        version: version.to_string(),
+        integrity: Some(integrity.to_string()),
+        ..Default::default()
+    });
+    lockfile
+        .write_to_file(&root.join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("failed to seed dlx cache lockfile");
 }
 
 #[cfg(unix)]
@@ -32,6 +52,72 @@ fn make_executable(path: &std::path::Path) {
         .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms).expect("failed to mark script executable");
+}
+
+fn make_dlx_tool_tarball(name: &str, version: &str) -> Vec<u8> {
+    let body = format!("#!/usr/bin/env node\nconsole.log('version:{version}');\n").into_bytes();
+    make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": name,
+            "version": version,
+            "bin": {
+                name: "bin/tool.js"
+            }
+        }),
+        &[("bin/tool.js", body.as_slice())],
+    )
+}
+
+fn iso8601_n_secs_ago(n_secs: i64) -> String {
+    use chrono::SecondsFormat;
+
+    let dt = chrono::Utc::now() - chrono::Duration::seconds(n_secs);
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+async fn mount_dlx_tool_versions(mock: &MockRegistry, name: &str) {
+    let v1 = make_dlx_tool_tarball(name, "1.0.0");
+    let v2 = make_dlx_tool_tarball(name, "2.0.0");
+
+    mock.with_full_package_metadata(
+        name,
+        "2.0.0",
+        &[
+            ("1.0.0", serde_json::json!({}), Some(v1)),
+            ("2.0.0", serde_json::json!({}), Some(v2)),
+        ],
+    )
+    .await;
+}
+
+async fn mount_published_dlx_tool(
+    mock: &MockRegistry,
+    name: &str,
+    version: &str,
+    published_at: &str,
+) {
+    let tarball = make_dlx_tool_tarball(name, version);
+    let integrity = compute_integrity(&tarball);
+
+    mock.with_package_published_at(name, version, &tarball, published_at)
+        .await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": version },
+        "versions": {
+            version: {
+                "name": name,
+                "version": version,
+                "dist": {
+                    "tarball": mock.tarball_url(name, version),
+                    "integrity": integrity,
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { version: published_at }
+    })])
+    .await;
 }
 
 /// `lpm --json dlx <malformed-spec>` surfaces the resolver error as a
@@ -62,7 +148,7 @@ fn dlx_malformed_spec_under_json_emits_error_envelope_on_stdout() {
 }
 
 #[test]
-fn dlx_cache_hit_executes_cached_binary_and_refreshes_ttl() {
+fn dlx_cache_hit_executes_cached_binary_without_extending_ttl() {
     let project = TempProject::empty(r#"{"name":"dlx-test","version":"1.0.0"}"#);
     let spec = "npm-check-updates@1.0.0";
     let cache_dir = seed_dlx_cache(
@@ -124,13 +210,123 @@ fn dlx_cache_hit_executes_cached_binary_and_refreshes_ttl() {
         stderr.contains("› Reusing dlx cache entry (fresh)"),
         "dlx should mark the fresh cache-hit path; stderr:\n{stderr}"
     );
+    assert!(
+        stderr.contains("Resolved npm-check-updates@1.0.0"),
+        "dlx should print the cached package identity; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("sha512-cache"),
+        "dlx should print the cached package integrity; stderr:\n{stderr}"
+    );
 
     let after = std::fs::metadata(&package_json)
         .expect("package.json must still exist")
         .modified()
         .expect("package.json mtime must be readable");
+    assert_eq!(
+        after, before,
+        "cache hits must not extend the 24h dlx TTL without revalidation"
+    );
+}
+
+#[tokio::test]
+async fn dlx_bare_package_uses_project_lockfile_version_before_registry_latest() {
+    let project = TempProject::empty(
+        r#"{"name":"dlx-lockfile-project","version":"1.0.0","dependencies":{"dlx-lock-tool":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    mount_dlx_tool_versions(&mock, "dlx-lock-tool").await;
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args(["install"])
+        .output()
+        .expect("failed to install locked dlx fixture");
     assert!(
-        after > before,
-        "successful dlx invocations must refresh the cache mtime"
+        install.status.success(),
+        "fixture install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let dlx = lpm_with_registry(&project, &mock.url())
+        .args(["dlx", "dlx-lock-tool"])
+        .output()
+        .expect("failed to run lpm dlx dlx-lock-tool");
+    assert!(
+        dlx.status.success(),
+        "dlx failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&dlx.stdout),
+        String::from_utf8_lossy(&dlx.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&dlx.stdout);
+    assert!(
+        stdout.contains("version:1.0.0"),
+        "dlx should execute the version already selected by the project lockfile, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("version:2.0.0"),
+        "dlx must not jump to registry latest when the project lockfile has the package, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&dlx.stderr);
+    assert!(
+        stderr.contains("Resolved dlx-lock-tool@1.0.0"),
+        "dlx should print the lockfile-selected package identity; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("sha512-"),
+        "dlx should print the lockfile-selected package integrity; stderr:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn dlx_applies_project_release_age_policy_and_guards_min_release_age_override() {
+    let project = TempProject::empty(
+        r#"{"name":"dlx-release-age","version":"1.0.0","lpm":{"minimumReleaseAge":259200}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let published_at = iso8601_n_secs_ago(48 * 3600);
+    mount_published_dlx_tool(&mock, "dlx-fresh-tool", "1.0.0", &published_at).await;
+
+    let blocked = lpm_with_registry(&project, &mock.url())
+        .args(["dlx", "dlx-fresh-tool"])
+        .output()
+        .expect("failed to run lpm dlx against cooldown fixture");
+    assert!(
+        !blocked.status.success(),
+        "dlx should apply the caller project's minimumReleaseAge; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&blocked.stdout),
+        String::from_utf8_lossy(&blocked.stderr),
+    );
+    let blocked_stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        blocked_stderr.contains("minimumReleaseAge")
+            || blocked_stderr.contains("published too recently"),
+        "cooldown failure should be visible in stderr, got:\n{blocked_stderr}"
+    );
+
+    let override_blocked = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "dlx", "--min-release-age=0", "dlx-fresh-tool"])
+        .output()
+        .expect("failed to run lpm dlx with release-age override");
+    let envelope = support::assertions::assert_security_approval_required(&override_blocked);
+    assert!(
+        envelope["error"]["requested_scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "cooldown-bypass")),
+        "dlx override must use the same guarded cooldown-bypass scope as install; got {envelope}",
+    );
+
+    let allow_new_blocked = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "dlx", "--allow-new", "dlx-fresh-tool"])
+        .output()
+        .expect("failed to run lpm dlx with --allow-new");
+    let envelope = support::assertions::assert_security_approval_required(&allow_new_blocked);
+    assert!(
+        envelope["error"]["requested_scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "cooldown-bypass")),
+        "dlx --allow-new must use the same guarded cooldown-bypass scope as install; got {envelope}",
     );
 }
