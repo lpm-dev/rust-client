@@ -256,17 +256,17 @@ struct DlxResolvedIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DlxIdentitySource {
-    ProjectLockfile,
-    CacheLockfile,
-    InstallLockfile,
+    Project,
+    Cache,
+    Install,
 }
 
 impl DlxIdentitySource {
     fn label(self) -> &'static str {
         match self {
-            Self::ProjectLockfile => "project lockfile",
-            Self::CacheLockfile => "dlx cache lockfile",
-            Self::InstallLockfile => "dlx install lockfile",
+            Self::Project => "project lockfile",
+            Self::Cache => "dlx cache lockfile",
+            Self::Install => "dlx install lockfile",
         }
     }
 }
@@ -353,7 +353,7 @@ fn resolve_dlx_target(project_dir: &Path, package_spec: &str) -> Result<DlxTarge
         return Ok(target);
     };
 
-    let identity = identity_from_locked_package(locked, DlxIdentitySource::ProjectLockfile);
+    let identity = identity_from_locked_package(locked, DlxIdentitySource::Project);
     target.install_spec = package_version_spec(&identity.package_name, &identity.version);
     target.cache_key = cache_key_for_identity(&identity);
     target.expected_identity = Some(identity);
@@ -431,7 +431,7 @@ fn identity_for_display(
     let recorded = read_dlx_identity(root, &target.package_name, &target.requested_spec, source);
     match (target.expected_identity.as_ref(), recorded) {
         (Some(expected), Some(mut recorded)) if identity_matches_expected(&recorded, expected) => {
-            recorded.source = DlxIdentitySource::ProjectLockfile;
+            recorded.source = DlxIdentitySource::Project;
             recorded
         }
         (Some(expected), _) => expected.clone(),
@@ -485,7 +485,7 @@ pub async fn dlx(
             install.root(),
             &target.package_name,
             &target.requested_spec,
-            DlxIdentitySource::CacheLockfile,
+            DlxIdentitySource::Cache,
         )
     } else {
         None
@@ -575,7 +575,7 @@ pub async fn dlx(
             _ => identity,
         }
     } else {
-        identity_for_display(&target, install.root(), DlxIdentitySource::InstallLockfile)
+        identity_for_display(&target, install.root(), DlxIdentitySource::Install)
     };
     print_dlx_identity(&display_identity);
 
