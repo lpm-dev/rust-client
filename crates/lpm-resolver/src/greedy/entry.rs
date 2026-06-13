@@ -1,5 +1,5 @@
 use super::edge::process_edge;
-use super::manifest::ensure_manifest;
+use super::manifest::{ensure_manifest, propagate_fetch_error};
 use super::peer::drain_peer_requirements_one_pass;
 use super::prelude::*;
 use super::state::ResolveState;
@@ -121,7 +121,7 @@ pub async fn resolve_greedy_with_options_and_policy(
     loop {
         // Inner: drain task_queue exactly as before.
         while let Some(edge) = state.task_queue.pop_front() {
-            let info = ensure_manifest(
+            let info = match ensure_manifest(
                 &edge.canonical,
                 client.clone(),
                 &route_table,
@@ -132,7 +132,14 @@ pub async fn resolve_greedy_with_options_and_policy(
                 &metrics,
                 &policy,
             )
-            .await?;
+            .await
+            {
+                Ok(info) => info,
+                Err(err) => {
+                    propagate_fetch_error(&edge, &err, &mut state)?;
+                    continue;
+                }
+            };
             process_edge(&edge, &info, &mut state)?;
         }
 

@@ -70,9 +70,10 @@ pub(super) fn process_edge(
                     remaining_secs,
                     minimum_secs,
                 },
+                state,
             ),
             VersionPick::BlockedByTrustPolicy { version, reason } => {
-                handle_policy_blocked(edge, PolicyBlock::TrustPolicy { version, reason })
+                handle_policy_blocked(edge, PolicyBlock::TrustPolicy { version, reason }, state)
             }
             VersionPick::Picked(_) => unreachable!(),
         };
@@ -212,12 +213,14 @@ fn process_edge_inner(
                             remaining_secs,
                             minimum_secs,
                         },
+                        state,
                     );
                 }
                 VersionPick::BlockedByTrustPolicy { version, reason } => {
                     return handle_policy_blocked(
                         edge,
                         PolicyBlock::TrustPolicy { version, reason },
+                        state,
                     );
                 }
             };
@@ -235,6 +238,7 @@ fn process_edge_inner(
                     remaining_secs: state.policy.minimum_release_age_secs(),
                     minimum_secs: state.policy.minimum_release_age_secs(),
                 },
+                state,
             );
         }
         ReleaseTimeStatus::TooNew { remaining_secs } => {
@@ -245,6 +249,7 @@ fn process_edge_inner(
                     remaining_secs,
                     minimum_secs: state.policy.minimum_release_age_secs(),
                 },
+                state,
             );
         }
     }
@@ -257,6 +262,7 @@ fn process_edge_inner(
                 version: target_version,
                 reason,
             },
+            state,
         );
     }
 

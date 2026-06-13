@@ -2269,7 +2269,7 @@ async fn run_with_options_under_store_lock(
                         resolver_policy.clone(),
                     )
                     .await
-                    .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
+                    .map_err(crate::resolver_error::resolver_error_to_lpm);
 
                     // initial_batch_ms is meaningless under fusion (no
                     // walker → no roots-ready boundary); 0 reads as
@@ -2412,7 +2412,7 @@ async fn run_with_options_under_store_lock(
                             resolver_policy.clone(),
                         )
                         .await
-                        .map_err(|e| LpmError::Registry(format!("resolution failed: {e}")));
+                        .map_err(crate::resolver_error::resolver_error_to_lpm);
                         tracing::debug!(
                             "perf.w2_resolve_after_roots ms={}",
                             w2_resolve_start.elapsed().as_millis()

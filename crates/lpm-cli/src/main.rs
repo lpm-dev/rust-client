@@ -38,6 +38,7 @@ mod quality;
 mod registry_signatures;
 mod release_age_config;
 mod release_lookup;
+mod resolver_error;
 mod sandbox_config;
 mod save_config;
 mod save_spec;

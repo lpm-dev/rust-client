@@ -1,10 +1,11 @@
 use super::prelude::*;
+use lpm_common::{ResolutionErrorContext, ResolutionFailureKind};
 
 pub(super) fn map_pubgrub_error(e: pubgrub::PubGrubError<LpmDependencyProvider>) -> ResolveError {
     match e {
         pubgrub::PubGrubError::NoSolution(mut dt) => {
             dt.collapse_no_versions();
-            ResolveError::NoSolution(DefaultStringReporter::report(&dt))
+            no_solution_error(DefaultStringReporter::report(&dt))
         }
         pubgrub::PubGrubError::ErrorRetrievingDependencies {
             package,
@@ -23,6 +24,20 @@ pub(super) fn map_pubgrub_error(e: pubgrub::PubGrubError<LpmDependencyProvider>)
         }
         pubgrub::PubGrubError::ErrorInShouldCancel(e) => ResolveError::Cancelled(e.to_string()),
     }
+}
+
+pub(super) fn no_solution_error(report: String) -> ResolveError {
+    ResolveError::Resolution(Box::new(ResolutionErrorContext {
+        package: "dependency graph".to_string(),
+        requested: "*".to_string(),
+        dependency: "dependency graph".to_string(),
+        required_by: None,
+        kind: ResolutionFailureKind::NoSolution,
+        reason: "no compatible set of package versions exists".to_string(),
+        available_versions: None,
+        newest_version: None,
+        derivation: Some(report),
+    }))
 }
 
 /// Extract package names that appear in conflicts from PubGrub's error report.
@@ -113,6 +128,9 @@ pub(super) fn extract_conflicts_fallback(report: &str) -> HashSet<String> {
 /// Errors from the resolution process.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
+    #[error("{0}")]
+    Resolution(Box<ResolutionErrorContext>),
+
     #[error("no solution found:\n{0}")]
     NoSolution(String),
 

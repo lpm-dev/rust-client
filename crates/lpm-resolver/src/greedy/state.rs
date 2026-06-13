@@ -354,6 +354,35 @@ impl ResolveState {
         out.sort_by_cached_key(|pkg| (pkg.package.to_string(), pkg.version.clone()));
         out
     }
+
+    pub(super) fn edge_resolution_context(
+        &self,
+        edge: &Edge,
+        kind: ResolutionFailureKind,
+        reason: String,
+        available_versions: Option<usize>,
+        newest_version: Option<String>,
+    ) -> ResolutionErrorContext {
+        ResolutionErrorContext {
+            package: edge.canonical.to_string(),
+            requested: edge.range.to_string(),
+            dependency: edge.local_name.clone(),
+            required_by: self.edge_required_by(edge),
+            kind,
+            reason,
+            available_versions,
+            newest_version,
+            derivation: None,
+        }
+    }
+
+    fn edge_required_by(&self, edge: &Edge) -> Option<String> {
+        let parent = self.nodes.get(edge.parent as usize)?;
+        match &parent.canonical {
+            CanonicalKey::Root => Some("project root".to_string()),
+            _ => Some(format!("{}@{}", parent.canonical, parent.version)),
+        }
+    }
 }
 
 /// Convert a `CanonicalKey` back to a `ResolverPackage` for the

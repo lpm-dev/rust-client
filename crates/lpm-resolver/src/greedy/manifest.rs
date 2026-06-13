@@ -284,21 +284,20 @@ async fn fetch_full_metadata_raw(
 }
 
 /// Apply optional/peer/required behavior to an edge whose manifest fetch
-/// failed. Mirrors [`handle_no_version`]'s contract for fetch-side errors
-/// so the fused dispatcher's failure semantics are indistinguishable from
-/// the walker arm's:
+/// failed. Required fetch failures keep the failed dependency edge attached
+/// so CLI diagnostics can name the requester.
 ///
 /// - Optional → skip silently. The platform_skipped counter is
 ///   irrelevant here (we never reached platform filtering — the
 ///   manifest itself never landed), so it stays unchanged.
 /// - Peer → skip with debug log; the post-resolve `check_unmet_peers`
 ///   pass surfaces unmet peers separately.
-/// - Required → propagate as `ResolveError::DependencyFetch` with the
-///   underlying detail, matching `direct_fetch`'s error shape exactly.
+/// - Required → propagate as a structured resolver failure with the
+///   underlying fetch detail.
 pub(super) fn propagate_fetch_error(
     edge: &Edge,
     err: &ResolveError,
-    _state: &mut ResolveState,
+    state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
     if edge.behavior.optional {
         tracing::debug!(
@@ -314,9 +313,12 @@ pub(super) fn propagate_fetch_error(
         );
         return Ok(());
     }
-    Err(ResolveError::DependencyFetch {
-        package: edge.canonical.to_string(),
-        version: edge.range.to_string(),
-        detail: err.to_string(),
-    })
+    let detail = match err {
+        ResolveError::DependencyFetch { detail, .. } => detail.clone(),
+        ResolveError::Resolution(context) => context.reason.clone(),
+        other => other.to_string(),
+    };
+    Err(ResolveError::Resolution(Box::new(
+        state.edge_resolution_context(edge, ResolutionFailureKind::FetchFailed, detail, None, None),
+    )))
 }

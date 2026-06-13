@@ -338,7 +338,7 @@ pub async fn resolve_with_shared_cache_options_and_policy(
 
                 let conflicting = extract_conflicting_packages(&report);
                 if conflicting.is_empty() {
-                    break Err(ResolveError::NoSolution(report));
+                    break Err(no_solution_error(report));
                 }
 
                 let mut new_splits: Vec<String> = conflicting
@@ -346,7 +346,7 @@ pub async fn resolve_with_shared_cache_options_and_policy(
                     .filter(|pkg| !split_packages.contains(pkg))
                     .collect();
                 if new_splits.is_empty() {
-                    break Err(ResolveError::NoSolution(report));
+                    break Err(no_solution_error(report));
                 }
 
                 new_splits.sort();

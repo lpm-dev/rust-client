@@ -1,5 +1,108 @@
 use miette::Diagnostic;
+use serde::Serialize;
+use std::fmt;
 use thiserror::Error;
+
+/// Machine-readable category for a dependency resolution failure.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionFailureKind {
+    /// No published version satisfied the declared semver range.
+    NoMatchingVersion,
+    /// Matching versions exist but are incompatible with the current platform.
+    PlatformIncompatible,
+    /// A resolver policy such as minimum release age or trust policy rejected the candidate.
+    PolicyBlocked,
+    /// The registry metadata for a required package could not be fetched.
+    FetchFailed,
+    /// The resolver proved that no compatible dependency graph exists.
+    NoSolution,
+    /// Required peer ranges could not be reconciled.
+    PeerConflict,
+}
+
+impl ResolutionFailureKind {
+    /// Stable string used in JSON error envelopes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResolutionFailureKind::NoMatchingVersion => "no_matching_version",
+            ResolutionFailureKind::PlatformIncompatible => "platform_incompatible",
+            ResolutionFailureKind::PolicyBlocked => "policy_blocked",
+            ResolutionFailureKind::FetchFailed => "fetch_failed",
+            ResolutionFailureKind::NoSolution => "no_solution",
+            ResolutionFailureKind::PeerConflict => "peer_conflict",
+        }
+    }
+}
+
+impl fmt::Display for ResolutionFailureKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Structured context for an install-time dependency resolution failure.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct ResolutionErrorContext {
+    /// Canonical package name that could not be resolved.
+    pub package: String,
+    /// Declared range or version request.
+    pub requested: String,
+    /// Local dependency key from the requiring manifest. Differs from `package` for aliases.
+    pub dependency: String,
+    /// Package or project root that declared the request.
+    pub required_by: Option<String>,
+    /// Stable machine-readable failure category.
+    pub kind: ResolutionFailureKind,
+    /// Human-readable cause, already specific to the failed edge.
+    pub reason: String,
+    /// Number of versions present in metadata when known.
+    pub available_versions: Option<usize>,
+    /// Newest version present in metadata when known.
+    pub newest_version: Option<String>,
+    /// Solver derivation for no-solution cases when available.
+    pub derivation: Option<String>,
+}
+
+impl ResolutionErrorContext {
+    /// Render the canonical `package@range` request.
+    pub fn package_request(&self) -> String {
+        if self.requested.is_empty() || self.requested == "*" {
+            self.package.clone()
+        } else {
+            format!("{}@{}", self.package, self.requested)
+        }
+    }
+
+    /// Compact summary of known published versions for human output.
+    pub fn available_summary(&self) -> Option<String> {
+        let count = self.available_versions?;
+        let noun = if count == 1 { "version" } else { "versions" };
+        match self.newest_version.as_deref() {
+            Some(newest) => Some(format!("{count} {noun}, newest {newest}")),
+            None => Some(format!("{count} {noun}")),
+        }
+    }
+}
+
+impl fmt::Display for ResolutionErrorContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.required_by.as_deref() {
+            Some(required_by) => write!(
+                f,
+                "failed to resolve {} required by {required_by}: {}",
+                self.package_request(),
+                self.reason
+            ),
+            None => write!(
+                f,
+                "failed to resolve {}: {}",
+                self.package_request(),
+                self.reason
+            ),
+        }
+    }
+}
 
 /// Top-level error type for all LPM operations.
 ///
@@ -44,6 +147,15 @@ pub enum LpmError {
     #[error("registry error: {0}")]
     #[diagnostic(code(lpm::registry))]
     Registry(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(lpm::resolution_failed),
+        help(
+            "Update the requested version range, change the package that requires it, or add an override if you intentionally want to force a compatible version."
+        )
+    )]
+    Resolution(Box<ResolutionErrorContext>),
 
     #[error("peer dependency check failed: {0}")]
     #[diagnostic(
@@ -349,6 +461,7 @@ impl LpmError {
             LpmError::InvalidVersion(_) => "invalid_version",
             LpmError::InvalidVersionRange(_) => "invalid_version_range",
             LpmError::Registry(_) => "registry",
+            LpmError::Resolution(_) => "resolution_failed",
             LpmError::PeerDependency(_) => "peer_dependency",
             LpmError::Network(_) => "network",
             LpmError::Http { .. } => "http",
@@ -496,6 +609,7 @@ mod tests {
             LpmError::InvalidVersion("x".into()),
             LpmError::InvalidVersionRange("x".into()),
             LpmError::Registry("x".into()),
+            LpmError::Resolution(Box::new(resolution_error_context())),
             LpmError::PeerDependency("x".into()),
             LpmError::Network("x".into()),
             LpmError::Http {
@@ -660,6 +774,10 @@ mod tests {
         );
         assert_eq!(LpmError::Store("x".into()).error_code(), "store");
         assert_eq!(
+            LpmError::Resolution(Box::new(resolution_error_context())).error_code(),
+            "resolution_failed"
+        );
+        assert_eq!(
             LpmError::PeerDependency("x".into()).error_code(),
             "peer_dependency"
         );
@@ -694,5 +812,19 @@ mod tests {
             LpmError::SecurityFloor("x".into()).error_code(),
             "security_floor"
         );
+    }
+
+    fn resolution_error_context() -> ResolutionErrorContext {
+        ResolutionErrorContext {
+            package: "missing-leaf".into(),
+            requested: "^2.0.0".into(),
+            dependency: "missing-leaf".into(),
+            required_by: Some("parent@1.0.0".into()),
+            kind: ResolutionFailureKind::NoMatchingVersion,
+            reason: "no published version satisfies ^2.0.0".into(),
+            available_versions: Some(1),
+            newest_version: Some("1.0.0".into()),
+            derivation: None,
+        }
     }
 }

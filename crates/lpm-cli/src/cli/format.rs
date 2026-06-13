@@ -118,6 +118,51 @@ fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>) {
 
 fn print_json_error(error: &lpm_common::LpmError) {
     let json = match error {
+        lpm_common::LpmError::Resolution(context) => {
+            let mut detail = serde_json::Map::with_capacity(12);
+            detail.insert("code".to_owned(), serde_json::json!("RESOLUTION_FAILED"));
+            detail.insert("message".to_owned(), serde_json::json!(context.to_string()));
+            detail.insert(
+                "package".to_owned(),
+                serde_json::json!(context.package.as_str()),
+            );
+            detail.insert(
+                "requested".to_owned(),
+                serde_json::json!(context.requested.as_str()),
+            );
+            detail.insert(
+                "dependency".to_owned(),
+                serde_json::json!(context.dependency.as_str()),
+            );
+            detail.insert("kind".to_owned(), serde_json::json!(context.kind.as_str()));
+            detail.insert(
+                "reason".to_owned(),
+                serde_json::json!(context.reason.as_str()),
+            );
+            if let Some(required_by) = &context.required_by {
+                detail.insert("required_by".to_owned(), serde_json::json!(required_by));
+            }
+            if let Some(available_versions) = context.available_versions {
+                detail.insert(
+                    "available_versions".to_owned(),
+                    serde_json::json!(available_versions),
+                );
+            }
+            if let Some(newest_version) = &context.newest_version {
+                detail.insert(
+                    "newest_version".to_owned(),
+                    serde_json::json!(newest_version),
+                );
+            }
+            if let Some(derivation) = &context.derivation {
+                detail.insert("derivation".to_owned(), serde_json::json!(derivation));
+            }
+            serde_json::json!({
+                "success": false,
+                "error_code": error.error_code(),
+                "error": serde_json::Value::Object(detail),
+            })
+        }
         lpm_common::LpmError::SecurityApprovalRequired {
             message,
             requested_scopes,
@@ -264,6 +309,7 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::Registry(reason) => {
             diagnostic_lines("Registry error", Some(reason), error)
         }
+        lpm_common::LpmError::Resolution(context) => resolution_error_lines(context, error),
         lpm_common::LpmError::PeerDependency(reason) => {
             diagnostic_lines("Peer dependency check failed", Some(reason), error)
         }
@@ -495,6 +541,52 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             push_diagnostic_help(&mut lines, error);
             lines
         }
+    }
+}
+
+fn resolution_error_lines(
+    context: &lpm_common::ResolutionErrorContext,
+    error: &lpm_common::LpmError,
+) -> Vec<SlimErrorLine> {
+    let mut lines = vec![SlimErrorLine::Failed(
+        "Could not resolve dependencies".to_owned(),
+    )];
+    push_detail(
+        &mut lines,
+        "package",
+        &install_ui::yellow(&context.package_request()),
+    );
+    if context.dependency != context.package {
+        push_detail(
+            &mut lines,
+            "dependency",
+            &install_ui::cyan(&context.dependency),
+        );
+    }
+    if let Some(required_by) = &context.required_by {
+        push_detail(&mut lines, "required by", &install_ui::yellow(required_by));
+    }
+    push_detail(&mut lines, "reason", &context.reason);
+    if let Some(available) = resolution_available_detail(context) {
+        push_detail(&mut lines, "available", &available);
+    }
+    if let Some(derivation) = &context.derivation {
+        push_dimmed_multiline_detail(&mut lines, "because", derivation);
+    }
+    push_diagnostic_help(&mut lines, error);
+    lines
+}
+
+fn resolution_available_detail(context: &lpm_common::ResolutionErrorContext) -> Option<String> {
+    let count = context.available_versions?;
+    let noun = if count == 1 { "version" } else { "versions" };
+    let count = install_ui::status_ok(&count.to_string());
+    match context.newest_version.as_deref() {
+        Some(newest) => Some(format!(
+            "{count} {noun}, newest {}",
+            install_ui::yellow(newest)
+        )),
+        None => Some(format!("{count} {noun}")),
     }
 }
 
