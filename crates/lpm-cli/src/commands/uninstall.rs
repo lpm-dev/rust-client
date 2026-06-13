@@ -14,14 +14,14 @@ struct UninstallResult {
 }
 
 #[derive(Debug, Default)]
-struct CleanupReport {
+pub(crate) struct CleanupReport {
     orphaned: Vec<PackageVersion>,
     cleaned_empty_dirs: usize,
     freed_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct PackageVersion {
+pub(crate) struct PackageVersion {
     name: String,
     version: String,
 }
@@ -52,7 +52,7 @@ fn remove_from_manifest(doc: &mut Value, packages: &[String]) -> UninstallResult
     UninstallResult { removed, not_found }
 }
 
-fn cleanup_removed_packages(
+pub(crate) fn cleanup_removed_packages(
     project_dir: &Path,
     removed: &[String],
     direct_versions: &HashMap<String, String>,
@@ -293,7 +293,7 @@ fn npm_scope_name(name: &str) -> Option<&str> {
 fn collect_manifest_dependency_specs(doc: &Value) -> HashMap<String, String> {
     let mut specs = HashMap::new();
 
-    for section in ["dependencies", "devDependencies"] {
+    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
         let Some(obj) = doc.get(section).and_then(Value::as_object) else {
             continue;
         };

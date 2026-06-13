@@ -286,6 +286,13 @@ pub(crate) enum Commands {
         platform: Option<String>,
     },
 
+    /// Report unused dependencies and undeclared imports.
+    Tidy {
+        /// Remove unused dependency entries and reconcile lpm.lock/node_modules.
+        #[arg(long)]
+        fix: bool,
+    },
+
     /// Resolve dependency tree for packages.
     Resolve {
         /// Packages to resolve (e.g., @lpm.dev/owner.package@^1.0.0)

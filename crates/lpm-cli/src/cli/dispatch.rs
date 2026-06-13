@@ -380,6 +380,10 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::fetch::run(&client, &cwd, platform.as_deref(), cli.json).await
         }
+        Commands::Tidy { fix } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::tidy::run(&client, &cwd, fix, cli.json).await
+        }
         Commands::Resolve { packages } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::resolve::run(&client, &cwd, &packages, cli.json).await

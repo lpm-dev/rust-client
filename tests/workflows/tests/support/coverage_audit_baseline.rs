@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 153;
+pub const EXPECTED_SURFACE_COUNT: usize = 154;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -52,6 +52,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Health",
     "Download",
     "Fetch",
+    "Tidy",
     "Resolve",
     "Install",
     "Uninstall",
@@ -1887,6 +1888,19 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/fetch.rs",
             "tests/workflows/tests/fetch.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 154,
+        name: "`lpm tidy`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/tidy.rs",
+            "tests/workflows/tests/tidy.rs",
         ],
     },
 ];
