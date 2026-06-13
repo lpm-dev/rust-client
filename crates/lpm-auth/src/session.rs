@@ -1163,15 +1163,41 @@ mod tests {
     /// LPM_FORCE_FILE_AUTH=1 causes `get_token` / `get_refresh_token`
     /// to skip the keychain, and an isolated HOME keeps file-auth
     /// writes off the host.
-    fn token_classify_isolate() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
+    #[derive(Clone, Copy)]
+    enum CiTokenTestEnv {
+        Cleared,
+        GitHubOidc,
+    }
+
+    fn token_classify_isolate_with_lpm_token(
+        lpm_token: Option<&str>,
+        ci_env: CiTokenTestEnv,
+    ) -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
         let tempdir = tempfile::tempdir().expect("create test home tempdir");
+        let (ci, github_oidc, gitlab_oidc, bitbucket_oidc) = match ci_env {
+            CiTokenTestEnv::Cleared => (None, None, None, None),
+            CiTokenTestEnv::GitHubOidc => (
+                Some("true".into()),
+                Some("github-oidc-token".into()),
+                None,
+                None,
+            ),
+        };
         let scoped = crate::test_env::ScopedEnv::update([
             ("HOME", Some(tempdir.path().as_os_str().to_owned())),
             ("LPM_FORCE_FILE_AUTH", Some("1".into())),
             ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
-            ("LPM_TOKEN", None),
+            ("LPM_TOKEN", lpm_token.map(std::ffi::OsString::from)),
+            ("CI", ci),
+            ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", github_oidc),
+            ("CI_JOB_JWT_V2", gitlab_oidc),
+            ("BITBUCKET_STEP_OIDC_TOKEN", bitbucket_oidc),
         ]);
         (tempdir, scoped)
+    }
+
+    fn token_classify_isolate() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
+        token_classify_isolate_with_lpm_token(None, CiTokenTestEnv::Cleared)
     }
 
     #[test]
@@ -1342,18 +1368,28 @@ mod tests {
         // When LPM_TOKEN is set, eager classification should succeed
         // and `classified` should start as `true` — the keychain never
         // needs to be consulted.
-        let tempdir = tempfile::tempdir().unwrap();
-        let _scoped = crate::test_env::ScopedEnv::set([
-            ("HOME", tempdir.path().as_os_str().to_owned()),
-            ("LPM_FORCE_FILE_AUTH", "1".into()),
-            ("LPM_TOKEN", "env-token-value".into()),
-        ]);
+        let _env =
+            token_classify_isolate_with_lpm_token(Some("env-token-value"), CiTokenTestEnv::Cleared);
         let mgr = SessionManager::new("https://example.invalid", None);
         assert!(
             mgr.classified.load(Ordering::Acquire),
             "LPM_TOKEN in env must produce eager-classified state"
         );
         assert_eq!(mgr.current_source_peek(), Some(TokenSource::EnvVar));
+    }
+
+    #[test]
+    fn eager_ci_env_token_classifies_immediately() {
+        let _env = token_classify_isolate_with_lpm_token(
+            Some("ci-token-value"),
+            CiTokenTestEnv::GitHubOidc,
+        );
+        let mgr = SessionManager::new("https://example.invalid", None);
+        assert!(
+            mgr.classified.load(Ordering::Acquire),
+            "CI-issued LPM_TOKEN must produce eager-classified state"
+        );
+        assert_eq!(mgr.current_source_peek(), Some(TokenSource::CiToken));
     }
 
     #[test]
