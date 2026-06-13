@@ -1,7 +1,7 @@
 //! Validate `lpm.json > tools` keys against the plugin-backed set.
 //!
 //! `lpm.json` accepts an arbitrary `tools` map by serde shape, but
-//! only `oxlint` and `biome` are plugin-backed and respect the pin.
+//! only `oxlint`, `biome`, and `rolldown` are plugin-backed and respect the pin.
 //! A user-pinned `typescript` (or any other tool) is silently dropped
 //! today — this helper surfaces the gap once per process invocation
 //! so the warning fires once even when workspace mode runs the same
@@ -15,7 +15,7 @@ use crate::install_ui;
 use std::path::Path;
 use std::sync::OnceLock;
 
-const PLUGIN_BACKED_TOOLS: &[&str] = &["oxlint", "biome"];
+const PLUGIN_BACKED_TOOLS: &[&str] = &["oxlint", "biome", "rolldown"];
 
 static WARNED: OnceLock<()> = OnceLock::new();
 
@@ -65,12 +65,26 @@ fn format_warning(unsupported: &[String]) -> String {
     let supported = PLUGIN_BACKED_TOOLS
         .iter()
         .map(|tool| install_ui::yellow(tool))
-        .collect::<Vec<_>>()
-        .join(" and ");
+        .collect::<Vec<_>>();
     format!(
         "{}: {names} ignored — only {supported} are plugin-backed today",
-        install_ui::cyan("lpm.json")
+        install_ui::cyan("lpm.json"),
+        supported = join_natural(&supported),
     )
+}
+
+fn join_natural(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [one, two] => format!("{one} and {two}"),
+        _ => {
+            let mut out = items[..items.len() - 1].join(", ");
+            out.push_str(", and ");
+            out.push_str(&items[items.len() - 1]);
+            out
+        }
+    }
 }
 
 #[cfg(test)]
@@ -83,6 +97,7 @@ mod tests {
         let mut tools = HashMap::new();
         tools.insert("oxlint".to_string(), "1.58.0".to_string());
         tools.insert("biome".to_string(), "2.4.10".to_string());
+        tools.insert("rolldown".to_string(), "1.0.2".to_string());
         tools.insert("typescript".to_string(), "5.4.0".to_string());
         tools.insert("eslint".to_string(), "9.0.0".to_string());
 
@@ -95,6 +110,7 @@ mod tests {
         let mut tools = HashMap::new();
         tools.insert("oxlint".to_string(), "1.58.0".to_string());
         tools.insert("biome".to_string(), "2.4.10".to_string());
+        tools.insert("rolldown".to_string(), "1.0.2".to_string());
 
         assert!(collect_unsupported(&tools).is_empty());
     }
@@ -125,7 +141,7 @@ mod tests {
 
         assert_eq!(
             warning,
-            "lpm.json: tools.typescript, tools.eslint ignored — only oxlint and biome are plugin-backed today"
+            "lpm.json: tools.typescript, tools.eslint ignored — only oxlint, biome, and rolldown are plugin-backed today"
         );
     }
 }

@@ -10,6 +10,7 @@ description = "Plugin management for LPM — lazy-download external tool binarie
 lpm-common = { workspace = true }
 lpm-extractor = { path = "../lpm-extractor" }
 lpm-runtime = { path = "../lpm-runtime" }
+lpm-semver = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

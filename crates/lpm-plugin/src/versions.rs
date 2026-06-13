@@ -21,6 +21,8 @@ use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+const GITHUB_API_BASE_ENV: &str = "LPM_PLUGIN_GITHUB_API_BASE";
+
 /// Cached install-selection state. Each entry is the highest version
 /// we have ever **successfully verified-and-installed** via
 /// `lpm plugin update`.
@@ -181,6 +183,16 @@ fn build_github_request(client: &reqwest::Client, url: &str) -> reqwest::Request
     req
 }
 
+fn github_api_base() -> String {
+    std::env::var(GITHUB_API_BASE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(
+            || "https://api.github.com".to_string(),
+            |value| value.trim_end_matches('/').to_string(),
+        )
+}
+
 /// Check GitHub API response for rate limiting and return a specific error.
 fn check_rate_limit(resp: &reqwest::Response) -> Option<String> {
     if resp.status().as_u16() == 403
@@ -216,7 +228,10 @@ pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> 
         .map_err(|e| format!("http client error: {e}"))?;
 
     let tag = if let Some(prefix) = tag_prefix {
-        let api_url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=20");
+        let api_url = format!(
+            "{}/repos/{owner}/{repo}/releases?per_page=20",
+            github_api_base()
+        );
 
         let resp = build_github_request(&client, &api_url)
             .send()
@@ -244,7 +259,7 @@ pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> 
             })?
             .to_string()
     } else {
-        let api_url = format!("https://api.github.com/repos/{owner}/{repo}/releases/latest");
+        let api_url = format!("{}/repos/{owner}/{repo}/releases/latest", github_api_base());
 
         let resp = build_github_request(&client, &api_url)
             .send()

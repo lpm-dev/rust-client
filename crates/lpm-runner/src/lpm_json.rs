@@ -34,8 +34,8 @@ pub struct LpmJsonConfig {
     #[serde(default, rename = "remoteCache")]
     pub remote_cache: Option<RemoteCacheConfig>,
 
-    /// Pinned tool plugin versions.
-    /// e.g., `{"oxlint": "1.57.0", "biome": "2.4.8"}`
+    /// Pinned managed tool versions.
+    /// e.g., `{"oxlint": "1.57.0", "biome": "2.4.8", "rolldown": "1.0.2"}`
     #[serde(default)]
     pub tools: HashMap<String, String>,
 

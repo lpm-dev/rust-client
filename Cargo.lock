@@ -3332,6 +3332,7 @@ dependencies = [
  "lpm-common",
  "lpm-extractor",
  "lpm-runtime",
+ "lpm-semver",
  "reqwest",
  "serde",
  "serde_json",

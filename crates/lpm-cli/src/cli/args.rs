@@ -1866,9 +1866,9 @@ pub(crate) enum Commands {
         fail_if_no_match: bool,
     },
 
-    /// Manage tool plugins (list, update, remove).
+    /// Manage tool plugins (list, outdated, update, remove).
     Plugin {
-        /// Action: `list` (alias `ls`), `update` (alias `upgrade`), `remove` (aliases `rm`, `uninstall`).
+        /// Action: `list` (alias `ls`), `outdated`, `update` (alias `upgrade`), `remove` (aliases `rm`, `uninstall`).
         action: String,
         /// Plugin name. Optional for `update` (omit to update all); required for `remove`.
         name: Option<String>,
