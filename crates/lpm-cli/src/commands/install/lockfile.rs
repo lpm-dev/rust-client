@@ -284,7 +284,7 @@ pub(super) fn lockfile_catalog_snapshots_match_current(
     true
 }
 
-pub(super) fn requested_range_for_locked_lookup(requested_spec: &str) -> Option<String> {
+pub(crate) fn requested_range_for_locked_lookup(requested_spec: &str) -> Option<String> {
     match lpm_resolver::Specifier::parse(requested_spec).ok()? {
         lpm_resolver::Specifier::SemverRange(range) => Some(range),
         lpm_resolver::Specifier::NpmAlias { range, .. } => Some(range),
@@ -292,7 +292,7 @@ pub(super) fn requested_range_for_locked_lookup(requested_spec: &str) -> Option<
     }
 }
 
-pub(super) fn select_locked_package_for_requested_spec<'a>(
+pub(crate) fn select_locked_package_for_requested_spec<'a>(
     lockfile: &'a lpm_lockfile::Lockfile,
     target: &str,
     requested_spec: &str,

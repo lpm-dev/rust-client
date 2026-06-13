@@ -246,29 +246,254 @@ pub async fn exec(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct DlxResolvedIdentity {
+    package_name: String,
+    version: String,
+    integrity: Option<String>,
+    source: DlxIdentitySource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DlxIdentitySource {
+    Project,
+    Cache,
+    Install,
+}
+
+impl DlxIdentitySource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Project => "project lockfile",
+            Self::Cache => "dlx cache lockfile",
+            Self::Install => "dlx install lockfile",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DlxTarget {
+    package_name: String,
+    requested_spec: String,
+    install_spec: String,
+    cache_key: String,
+    expected_identity: Option<DlxResolvedIdentity>,
+}
+
+fn package_version_spec(name: &str, version: &str) -> String {
+    format!("{name}@{version}")
+}
+
+fn identity_from_locked_package(
+    package: &lpm_lockfile::LockedPackage,
+    source: DlxIdentitySource,
+) -> DlxResolvedIdentity {
+    DlxResolvedIdentity {
+        package_name: package.name.clone(),
+        version: package.version.clone(),
+        integrity: package.integrity.clone(),
+        source,
+    }
+}
+
+fn cache_key_for_identity(identity: &DlxResolvedIdentity) -> String {
+    let mut key = package_version_spec(&identity.package_name, &identity.version);
+    if let Some(integrity) = identity.integrity.as_deref() {
+        key.push('#');
+        key.push_str(integrity);
+    }
+    key
+}
+
+fn lockfile_package_for_dlx<'a>(
+    lockfile: &'a lpm_lockfile::Lockfile,
+    package_name: &str,
+    requested_spec: &str,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
+    let candidate = crate::commands::install::select_locked_package_for_requested_spec(
+        lockfile,
+        package_name,
+        requested_spec,
+    )?;
+
+    let Some(range_text) =
+        crate::commands::install::requested_range_for_locked_lookup(requested_spec)
+    else {
+        return Some(candidate);
+    };
+    let range = lpm_resolver::NpmRange::parse(&range_text).ok()?;
+    let version = lpm_resolver::NpmVersion::parse(&candidate.version).ok()?;
+    range.satisfies(&version).then_some(candidate)
+}
+
+fn resolve_dlx_target(project_dir: &Path, package_spec: &str) -> Result<DlxTarget, LpmError> {
+    let (package_name, requested_spec) = lpm_runner::dlx::parse_package_spec(package_spec);
+    let mut target = DlxTarget {
+        package_name,
+        requested_spec,
+        install_spec: package_spec.to_string(),
+        cache_key: package_spec.to_string(),
+        expected_identity: None,
+    };
+
+    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    if !lockfile_path.exists() {
+        return Ok(target);
+    }
+
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to read {} for dlx resolution: {e}",
+            lockfile_path.display()
+        ))
+    })?;
+    let Some(locked) =
+        lockfile_package_for_dlx(&lockfile, &target.package_name, &target.requested_spec)
+    else {
+        return Ok(target);
+    };
+
+    let identity = identity_from_locked_package(locked, DlxIdentitySource::Project);
+    target.install_spec = package_version_spec(&identity.package_name, &identity.version);
+    target.cache_key = cache_key_for_identity(&identity);
+    target.expected_identity = Some(identity);
+    Ok(target)
+}
+
+fn read_project_lpm_config(project_dir: &Path) -> Result<Option<serde_json::Value>, LpmError> {
+    let path = project_dir.join("package.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(LpmError::Script(format!(
+                "failed to read caller package.json for dlx policy: {e}"
+            )));
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to parse caller package.json for dlx policy: {e}"
+        ))
+    })?;
+    Ok(value.get("lpm").cloned())
+}
+
+fn dlx_manifest_text(project_dir: &Path, install_spec: &str) -> Result<String, LpmError> {
+    let (pkg_name, version_spec) = lpm_runner::dlx::parse_package_spec(install_spec);
+    let mut deps = serde_json::Map::new();
+    deps.insert(pkg_name, serde_json::Value::String(version_spec));
+
+    let mut manifest = serde_json::Map::new();
+    manifest.insert("private".to_string(), serde_json::Value::Bool(true));
+    manifest.insert("dependencies".to_string(), serde_json::Value::Object(deps));
+    if let Some(lpm_config) = read_project_lpm_config(project_dir)? {
+        manifest.insert("lpm".to_string(), lpm_config);
+    }
+
+    serde_json::to_string(&serde_json::Value::Object(manifest))
+        .map_err(|e| LpmError::Script(format!("failed to render dlx package.json: {e}")))
+}
+
+fn read_dlx_identity(
+    root: &Path,
+    package_name: &str,
+    requested_spec: &str,
+    source: DlxIdentitySource,
+) -> Option<DlxResolvedIdentity> {
+    let lockfile =
+        lpm_lockfile::Lockfile::read_fast(&root.join(lpm_lockfile::LOCKFILE_NAME)).ok()?;
+    let package = lockfile_package_for_dlx(&lockfile, package_name, requested_spec)?;
+    Some(identity_from_locked_package(package, source))
+}
+
+fn identity_matches_expected(actual: &DlxResolvedIdentity, expected: &DlxResolvedIdentity) -> bool {
+    actual.package_name == expected.package_name
+        && actual.version == expected.version
+        && expected
+            .integrity
+            .as_ref()
+            .is_none_or(|integrity| actual.integrity.as_ref() == Some(integrity))
+}
+
+fn cache_identity_matches_target(identity: &DlxResolvedIdentity, target: &DlxTarget) -> bool {
+    target
+        .expected_identity
+        .as_ref()
+        .is_none_or(|expected| identity_matches_expected(identity, expected))
+}
+
+fn identity_for_display(
+    target: &DlxTarget,
+    root: &Path,
+    source: DlxIdentitySource,
+) -> DlxResolvedIdentity {
+    let recorded = read_dlx_identity(root, &target.package_name, &target.requested_spec, source);
+    match (target.expected_identity.as_ref(), recorded) {
+        (Some(expected), Some(mut recorded)) if identity_matches_expected(&recorded, expected) => {
+            recorded.source = DlxIdentitySource::Project;
+            recorded
+        }
+        (Some(expected), _) => expected.clone(),
+        (None, Some(recorded)) => recorded,
+        (None, None) => DlxResolvedIdentity {
+            package_name: target.package_name.clone(),
+            version: target.requested_spec.clone(),
+            integrity: None,
+            source,
+        },
+    }
+}
+
+fn print_dlx_identity(identity: &DlxResolvedIdentity) {
+    let package = package_version_spec(&identity.package_name, &identity.version);
+    let integrity = identity.integrity.as_deref().unwrap_or("unavailable");
+    install_ui::done(&format!(
+        "Resolved {} · {} {} · {} {}",
+        install_ui::yellow(&package),
+        install_ui::dim("integrity"),
+        install_ui::cyan(integrity),
+        install_ui::dim("source"),
+        install_ui::cyan(identity.source.label()),
+    ));
+}
+
 /// Run a package binary without installing it into the project.
 ///
 /// Uses LPM's own install pipeline (self-hosted, no npm dependency).
-/// Caches installations for 24 hours. Use `--refresh` to force reinstall.
+/// Caches installations for 24 hours from install time. Use `--refresh` to force reinstall.
 pub async fn dlx(
     client: &lpm_registry::RegistryClient,
     project_dir: &Path,
     package_spec: &str,
     extra_args: &[String],
     refresh: bool,
+    allow_new: bool,
+    min_release_age_override: Option<u64>,
 ) -> Result<(), LpmError> {
-    // route through the IsolatedInstall primitive.
-    // Behavior is byte-for-byte identical to the prior dlx path —
-    // primitive owns the policy decisions (freshness, manifest text,
-    // restricted perms, touch semantics).
-    let cache_dir = lpm_runner::dlx::dlx_cache_dir(package_spec)?;
+    let target = resolve_dlx_target(project_dir, package_spec)?;
+    let cache_dir = lpm_runner::dlx::dlx_cache_dir(&target.cache_key)?;
     let install = lpm_runner::isolate::IsolatedInstall::ephemeral(
-        package_spec,
+        &target.install_spec,
         cache_dir,
         std::time::Duration::from_secs(lpm_runner::dlx::CACHE_TTL_SECS),
     );
 
-    let was_ready = install.is_ready();
+    let markers_ready = install.is_ready();
+    let cached_identity = if markers_ready {
+        read_dlx_identity(
+            install.root(),
+            &target.package_name,
+            &target.requested_spec,
+            DlxIdentitySource::Cache,
+        )
+    } else {
+        None
+    };
+    let was_ready = markers_ready
+        && cached_identity
+            .as_ref()
+            .is_some_and(|identity| cache_identity_matches_target(identity, &target));
     let needs_install = refresh || !was_ready;
     install_ui::phase(&format!("Resolving {}", install_ui::yellow(package_spec)));
     if !refresh && was_ready {
@@ -278,6 +503,11 @@ pub async fn dlx(
         ));
     } else if !refresh && !install.root().join("node_modules/.bin").is_dir() {
         // First install or evicted entry — silent install (matches prior dlx behavior).
+    } else if !refresh && cached_identity.is_none() {
+        install_ui::phase(&format!(
+            "Refreshing unaudited dlx cache entry for {}",
+            install_ui::yellow(package_spec),
+        ));
     } else if !refresh {
         // Markers present but TTL expired — be loud about the reinstall.
         install_ui::phase(&format!(
@@ -289,10 +519,16 @@ pub async fn dlx(
     if needs_install {
         install.prepare()?;
 
-        std::fs::write(install.root().join("package.json"), install.manifest_text())
-            .map_err(|e| LpmError::Script(format!("failed to write dlx package.json: {e}")))?;
+        std::fs::write(
+            install.root().join("package.json"),
+            dlx_manifest_text(project_dir, &target.install_spec)?,
+        )
+        .map_err(|e| LpmError::Script(format!("failed to write dlx package.json: {e}")))?;
 
-        install_ui::phase(&format!("Installing {}", install_ui::yellow(package_spec)));
+        install_ui::phase(&format!(
+            "Installing {}",
+            install_ui::yellow(&target.install_spec)
+        ));
 
         // Use the injected client so authenticated registry scopes keep their
         // configured credentials during the internal install.
@@ -302,9 +538,9 @@ pub async fn dlx(
             false, // json_output
             false, // offline
             crate::commands::install::FrozenLockfileMode::Never,
-            false,                                                   // force
-            false,                                                   // allow_new
-            false,                                                   // strict_integrity
+            false, // force
+            allow_new,
+            false, // strict_integrity
             None,  // strict_peer_dependencies_override
             None,  // linker_override
             false, // no_skills
@@ -316,7 +552,7 @@ pub async fn dlx(
             None,  // requested_add_count: dlx is not an add-path install
             None,  // script_policy_override: `lpm dlx` does not expose policy flags
             None,  // advisor_override: `lpm dlx` does not expose `--advisor`
-            None,  // min_release_age_override: `lpm dlx` uses the chain
+            min_release_age_override,
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dlx` enforces drift
             crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: dlx honors env + config posture chain
             crate::commands::install::InstallOmitPolicy::default(),
@@ -331,23 +567,34 @@ pub async fn dlx(
         .await?;
     }
 
-    // Refresh the use-time mtime on every successful invocation so the
-    // dlx sweep TTL tracks time since last use.
-    install.touch();
+    let display_identity = if let Some(identity) = cached_identity
+        && was_ready
+    {
+        match target.expected_identity.as_ref() {
+            Some(expected) if identity_matches_expected(&identity, expected) => expected.clone(),
+            _ => identity,
+        }
+    } else {
+        identity_for_display(&target, install.root(), DlxIdentitySource::Install)
+    };
+    print_dlx_identity(&display_identity);
 
-    // dlx is the only install/run surface with no sandbox, no
-    // triage-advisor consent gate, and no `trustedDependencies` check.
-    // Surface the trust posture on every invocation so support bundles
-    // capture which package was invoked under this posture.
     tracing::warn!(
         target: "lpm_cli::dlx",
-        package = package_spec,
-        "lpm dlx runs `{}` with no sandbox and no consent gate. Only invoke `lpm dlx` against packages you trust.",
+        package = display_identity.package_name,
+        version = display_identity.version,
+        integrity = display_identity.integrity.as_deref().unwrap_or("unavailable"),
+        "lpm dlx executed `{}` after install-policy gates; the package command inherits the caller cwd and process privileges.",
         package_spec,
     );
     install_ui::warn(&format!(
-        "running `{package_spec}` with no sandbox — credential env vars are stripped, but cwd and ambient privileges are inherited"
+        "running `{package_spec}` inherits cwd privileges; credential env vars are stripped"
     ));
 
-    lpm_runner::dlx::exec_dlx_binary(project_dir, install.root(), package_spec, extra_args)
+    lpm_runner::dlx::exec_dlx_binary(
+        project_dir,
+        install.root(),
+        &target.install_spec,
+        extra_args,
+    )
 }

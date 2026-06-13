@@ -53,12 +53,9 @@ pub fn dlx_cache_dir(package_spec: &str) -> Result<PathBuf, LpmError> {
 /// Remove every direct child of `~/.lpm/cache/dlx/` whose `package.json`
 /// mtime is older than `ttl_secs`.
 ///
-/// **mtime semantics: time since last successful use.** Every successful
-/// `lpm dlx` call (install *or* cache hit) refreshes the mtime via
-/// [`touch_cache`] — see `commands::run::dlx` in lpm-cli. A frequently
-/// used entry therefore keeps renewing itself and the sweep never touches
-/// it; a truly unused entry ages out and gets pruned on the next
-/// invocation against any spec.
+/// **mtime semantics: time since install or refresh.** Cache hits do not
+/// renew the marker; a frequently used entry is still revalidated after
+/// the TTL instead of becoming a permanent unaudited install.
 ///
 /// Entries without a `package.json` (partial installs, stray files) are
 /// left alone — they're either in-flight work or not ours to touch.
@@ -287,11 +284,9 @@ pub fn is_cache_fresh(cache_dir: &Path, ttl_secs: u64) -> bool {
     }
 }
 
-/// Touch the cache to reset the TTL. Called on every successful `lpm dlx`
-/// invocation — both install and cache-hit paths — so the TTL tracks
-/// "time since last successful use," not "time since original install."
-/// This is what [`sweep_stale_dlx_entries`] prunes against, and what
-/// users actually mean when they think about dlx cache lifetime.
+/// Touch the cache marker to reset the TTL. The shipped `lpm dlx` path does
+/// not call this on cache hits; it is kept as a low-level utility for tests
+/// and explicit refresh-style callers.
 ///
 /// Uses `File::set_modified()` to update mtime without reading or
 /// rewriting file contents.
