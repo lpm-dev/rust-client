@@ -141,9 +141,8 @@ impl InstallPackage {
                 _ => {
                     return self.integrity.as_deref().is_some_and(|sri| {
                         v2_store
-                            .paths()
-                            .object_dir(sri)
-                            .is_ok_and(|object_dir| object_dir.exists())
+                            .reusable_object_dir(sri)
+                            .is_ok_and(|object_dir| object_dir.is_some())
                     });
                 }
             }

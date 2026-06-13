@@ -214,6 +214,7 @@ pub struct SaveSpecDecision {
 /// silent corruption worse than the original confusing failure.
 pub fn parse_user_save_intent(spec: &str) -> Result<(String, UserSaveIntent), LpmError> {
     let (name, version_token) = split_name_and_version_token(spec);
+    crate::typosquat_guard::validate_package_name(&name)?;
     let intent = match version_token {
         None => UserSaveIntent::Bare,
         Some(token) => classify_version_token(token)?,
@@ -571,6 +572,16 @@ mod tests {
         assert!(
             msg.contains("file:"),
             "error must hint at the `file:` prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_flag_shaped_package_name() {
+        let err = super::parse_user_save_intent("--legacy-peer-deps").unwrap_err();
+        assert_eq!(err.error_code(), "invalid_package_name");
+        assert!(
+            err.to_string().contains("command-line flag"),
+            "error must explain flag-shaped package names, got: {err}"
         );
     }
 

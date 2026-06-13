@@ -87,6 +87,7 @@ chrono = { workspace = true }
 
 # Config
 toml = { workspace = true }
+toml_edit = { workspace = true }
 
 # Tarball creation
 tar = { workspace = true }

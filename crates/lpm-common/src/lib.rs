@@ -17,7 +17,10 @@ pub mod provenance;
 pub mod symlink;
 
 pub use atomic_write::write_file_atomic;
-pub use error::{LpmError, ResolutionErrorContext, ResolutionFailureKind};
+pub use error::{
+    LpmError, ResolutionErrorContext, ResolutionFailureKind, TyposquatErrorContext,
+    TyposquatErrorFinding,
+};
 pub use integrity::Integrity;
 pub use package_name::PackageName;
 pub use paths::{

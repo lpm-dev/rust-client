@@ -319,9 +319,8 @@ fn is_cached(
 ) -> bool {
     if let Some(store_v2) = store_v2 {
         return store_v2
-            .paths()
-            .object_dir(&target.integrity)
-            .is_ok_and(|dir| dir.exists());
+            .reusable_object_dir(&target.integrity)
+            .is_ok_and(|object_dir| object_dir.is_some());
     }
 
     match target.source {

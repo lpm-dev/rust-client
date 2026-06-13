@@ -128,6 +128,7 @@ version-ranges = "0.1"
 
 # Lockfile
 toml = "0.8"
+toml_edit = "0.22"
 memmap2 = "0.9"
 
 # Auth / secure storage

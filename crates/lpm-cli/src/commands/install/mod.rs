@@ -771,6 +771,12 @@ async fn run_with_options_under_store_lock(
         json_output,
         crate::security_approval::ApprovalSource::ProjectConfig,
     )?;
+    crate::typosquat_guard::guard_manifest_direct_dependencies(
+        project_dir,
+        &pkg_json_path,
+        &pkg,
+        json_output,
+    )?;
 
     let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
         project_dir,
