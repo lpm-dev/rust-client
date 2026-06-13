@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 152;
+pub const EXPECTED_SURFACE_COUNT: usize = 153;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -51,6 +51,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Whoami",
     "Health",
     "Download",
+    "Fetch",
     "Resolve",
     "Install",
     "Uninstall",
@@ -1873,6 +1874,19 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/npm_stage.rs",
             "tests/workflows/tests/stage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 153,
+        name: "`lpm fetch`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/fetch.rs",
+            "tests/workflows/tests/fetch.rs",
         ],
     },
 ];

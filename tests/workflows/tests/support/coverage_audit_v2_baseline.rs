@@ -3309,6 +3309,29 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/stage.rs", 1)],
         last_audited_at: "2026-06-04",
     },
+    SurfaceV2 {
+        id: 153,
+        scenarios: 6,
+        failure_modes_tested: &[
+            "lockfile-only fetch works without package.json",
+            "fetch does not link node_modules or rewrite lpm.lock",
+            "fetch-warmed store enables offline frozen install",
+            "store cache hit avoids repeated tarball download",
+            "missing integrity hard-errors before store write",
+            "integrity mismatch hard-errors before store write",
+            "platform option skips incompatible lockfile entries",
+            "JSON envelope reports lockfile fetch counts",
+        ],
+        failure_modes_known: &[
+            "remote tarball source fetch path",
+            "git source surfaced as unsupported lockfile fetch input",
+            "v2 object cache hit verified under default store layout",
+            "parallel fetch cancellation after one package fails",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/fetch.rs", 6)],
+        last_audited_at: "2026-06-13",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

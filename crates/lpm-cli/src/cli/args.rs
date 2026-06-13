@@ -279,6 +279,13 @@ pub(crate) enum Commands {
         allow_unverified: bool,
     },
 
+    /// Download packages from lpm.lock into the store without installing.
+    Fetch {
+        /// Target platform for OS/CPU/libc package filters, e.g. linux/x64/glibc.
+        #[arg(long, value_name = "OS/ARCH[/LIBC]")]
+        platform: Option<String>,
+    },
+
     /// Resolve dependency tree for packages.
     Resolve {
         /// Packages to resolve (e.g., @lpm.dev/owner.package@^1.0.0)

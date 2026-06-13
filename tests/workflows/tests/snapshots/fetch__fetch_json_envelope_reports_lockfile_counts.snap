@@ -1,0 +1,29 @@
+---
+source: tests/workflows/tests/fetch.rs
+assertion_line: 306
+expression: envelope
+---
+{
+  "success": true,
+  "lockfile": "lpm.lock",
+  "platform": {
+    "os": "linux",
+    "cpu": "x64",
+    "libc": "glibc"
+  },
+  "counts": {
+    "total": 1,
+    "fetched": 1,
+    "cached": 0,
+    "skipped": 0
+  },
+  "packages": [
+    {
+      "name": "ms",
+      "version": "2.1.3",
+      "source": "registry",
+      "status": "fetched"
+    }
+  ],
+  "elapsed_ms": "[ELAPSED]"
+}
