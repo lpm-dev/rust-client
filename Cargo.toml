@@ -39,7 +39,7 @@ members = [
 default-members = ["crates/lpm-cli"]
 
 [workspace.package]
-version = "0.59.1"
+version = "0.60.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lpm-dev/rust-client"
