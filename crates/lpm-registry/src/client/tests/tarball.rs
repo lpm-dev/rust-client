@@ -910,6 +910,55 @@ async fn download_tarball_with_auth_attaches_bearer() {
 }
 
 #[tokio::test]
+async fn download_tarball_with_auth_strips_authorization_on_cross_origin_redirect() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let redirector = MockServer::start().await;
+    let target = MockServer::start().await;
+    let saw_authorization = Arc::new(AtomicBool::new(false));
+    let body = b"redirected-tarball-body".to_vec();
+    let target_url = format!("{}/target.tgz", target.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/target.tgz"))
+        .respond_with(AuthorizationRecorder {
+            saw_authorization: Arc::clone(&saw_authorization),
+            body: body.clone(),
+        })
+        .expect(1)
+        .mount(&target)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/foo/-/foo-1.0.0.tgz"))
+        .and(header("Authorization", "Bearer SECRET-TOKEN"))
+        .respond_with(ResponseTemplate::new(302).append_header("Location", target_url.as_str()))
+        .expect(1)
+        .mount(&redirector)
+        .await;
+
+    let (client, _tmp) = client_with_mock_server(&redirector.uri());
+    let auth = bearer_for(&redirector.uri(), "SECRET-TOKEN");
+    let url = format!("{}/foo/-/foo-1.0.0.tgz", redirector.uri());
+
+    let downloaded = client
+        .download_tarball_to_file_with_auth(&url, Some(&auth))
+        .await
+        .expect("redirected tarball download must succeed");
+
+    assert_eq!(downloaded.compressed_size, body.len() as u64);
+    assert!(
+        !saw_authorization.load(Ordering::SeqCst),
+        "Authorization must not follow a cross-origin tarball redirect"
+    );
+}
+
+#[tokio::test]
 async fn download_tarball_with_auth_anon_when_none() {
     // No npmrc auth for this URL → request goes anonymous (no
     // Authorization header). Importantly, the LPM session bearer

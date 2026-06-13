@@ -1966,6 +1966,79 @@ async fn install_offline_with_v2_store_relinks_from_object_store() {
 }
 
 #[tokio::test]
+async fn install_v2_cache_hit_repairs_tampered_object_before_linking() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("is-number", "7.0.0");
+    mock.with_package("is-number", "7.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "v2-cache-integrity",
+        "version": "1.0.0",
+        "dependencies": {
+            "is-number": "7.0.0"
+        }
+    }"#,
+    );
+
+    let first = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run first v2 install");
+    assert!(
+        first.status.success(),
+        "first v2 install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let sri = compute_integrity(&tarball);
+    let v2_store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v2"));
+    let object_dir = v2_store.paths().object_dir(&sri).unwrap();
+    let index_js = object_dir.join("index.js");
+    assert!(
+        index_js.is_file(),
+        "warm v2 object should contain package index.js at {}",
+        index_js.display()
+    );
+    std::fs::write(&index_js, b"module.exports = 'tampered';").unwrap();
+
+    let nm = project.path().join("node_modules");
+    if nm.exists() {
+        std::fs::remove_dir_all(&nm).unwrap();
+    }
+
+    let second = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run second v2 install");
+    assert!(
+        second.status.success(),
+        "second v2 install must refetch and repair a tampered object\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    assert_eq!(std::fs::read(&index_js).unwrap(), b"module.exports = {};");
+    assert_eq!(
+        std::fs::read(project.path().join("node_modules/is-number/index.js")).unwrap(),
+        b"module.exports = {};"
+    );
+}
+
+#[tokio::test]
 async fn install_without_harness_overrides_uses_shipped_v2_layout() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("is-number", "7.0.0");
@@ -6043,6 +6116,35 @@ async fn mount_signed_signature_pkg(mock: &MockRegistry) {
     mock.with_batch_metadata(vec![metadata]).await;
 }
 
+async fn mount_malformed_signature_pkg(mock: &MockRegistry) {
+    let signer = RegistrySigningFixture::new();
+    mock.with_registry_signing_keys(&signer).await;
+    let name = "malformed-signature-pkg";
+    let version = "1.0.0";
+    let tarball = make_tarball(name, version);
+    let mut metadata = mock.package_metadata(name, version, &tarball);
+    metadata["versions"][version]["dist"]["signatures"] =
+        serde_json::json!([{ "keyid": "SHA256:test" }]);
+    mock.with_package_metadata(name, version, &tarball, metadata.clone())
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+}
+
+async fn mount_mismatched_signature_pkg(mock: &MockRegistry) {
+    let signer = RegistrySigningFixture::new();
+    mock.with_registry_signing_keys(&signer).await;
+    let name = "mismatched-signature-pkg";
+    let version = "1.0.0";
+    let tarball = make_tarball(name, version);
+    let integrity = compute_integrity(&tarball);
+    let mut metadata = mock.package_metadata(name, version, &tarball);
+    metadata["versions"][version]["dist"]["signatures"] =
+        serde_json::json!([signer.signature_json("other-pkg", version, &integrity)]);
+    mock.with_package_metadata(name, version, &tarball, metadata.clone())
+        .await;
+    mock.with_batch_metadata(vec![metadata]).await;
+}
+
 #[tokio::test]
 async fn install_does_not_verify_registry_signatures_by_default() {
     let project = TempProject::empty(
@@ -6104,6 +6206,81 @@ async fn install_config_signatures_true_blocks_unsigned_registry_package() {
     assert!(
         combined.contains("unsigned-pkg@1.0.0") && combined.contains("missing dist.signatures"),
         "install failure must identify the unsigned package and reason; got:\n{combined}",
+    );
+}
+
+#[tokio::test]
+async fn install_config_signatures_true_blocks_malformed_registry_signature() {
+    let project = TempProject::empty(
+        r#"{"name":"signatures-malformed","version":"1.0.0","dependencies":{"malformed-signature-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    write_signatures_global_config(&project, true);
+    mount_malformed_signature_pkg(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        !out.status.success(),
+        "signatures=true must block malformed registry signatures; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("malformed-signature-pkg@1.0.0") && combined.contains("without sig"),
+        "install failure must identify the malformed signature payload; got:\n{combined}",
+    );
+}
+
+#[tokio::test]
+async fn install_config_signatures_true_blocks_mismatched_registry_signature() {
+    let project = TempProject::empty(
+        r#"{"name":"signatures-mismatched","version":"1.0.0","dependencies":{"mismatched-signature-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    write_signatures_global_config(&project, true);
+    mount_mismatched_signature_pkg(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        !out.status.success(),
+        "signatures=true must block mismatched registry signatures; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("mismatched-signature-pkg@1.0.0")
+            && combined.contains("invalid registry signature"),
+        "install failure must identify the mismatched signature; got:\n{combined}",
     );
 }
 

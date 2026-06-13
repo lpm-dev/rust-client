@@ -1,7 +1,11 @@
 use super::process_tree::wait_with_timeout;
+use lpm_common::sanitize_for_terminal;
 use lpm_sandbox::SandboxMode;
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 #[allow(clippy::too_many_arguments)]
@@ -59,7 +63,7 @@ pub(super) fn execute_script(
 
     let start = std::time::Instant::now();
 
-    let child = spawn_lifecycle_child(
+    let mut child = spawn_lifecycle_child(
         cmd,
         pkg_name,
         pkg_version,
@@ -74,8 +78,10 @@ pub(super) fn execute_script(
         home_dir,
         tmpdir,
     )?;
+    let output_readers = spawn_sanitized_output_readers(&mut child);
 
     let output = wait_with_timeout(child, timeout);
+    output_readers.join();
 
     match output {
         Ok(status) => {
@@ -166,13 +172,64 @@ pub(super) fn spawn_lifecycle_child(
     sbcmd = sbcmd
         .current_dir(package_dir)
         .envs_cleared(envs.iter().map(|(k, v)| (k.clone(), v.clone())));
-    sbcmd.stdout = SandboxStdio::Inherit;
-    sbcmd.stderr = SandboxStdio::Inherit;
+    sbcmd.stdout = SandboxStdio::Piped;
+    sbcmd.stderr = SandboxStdio::Piped;
     sbcmd.stdin = SandboxStdio::Inherit;
 
     sandbox
         .spawn(sbcmd)
         .map_err(|e| format!("failed to spawn: {e}"))
+}
+
+struct OutputReaders {
+    stdout: Option<JoinHandle<()>>,
+    stderr: Option<JoinHandle<()>>,
+}
+
+impl OutputReaders {
+    fn join(self) {
+        if let Some(handle) = self.stdout {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stderr {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn spawn_sanitized_output_readers(child: &mut Child) -> OutputReaders {
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stdout| std::thread::spawn(move || copy_sanitized_output(stdout, std::io::stdout())));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stderr| std::thread::spawn(move || copy_sanitized_output(stderr, std::io::stderr())));
+    OutputReaders { stdout, stderr }
+}
+
+fn copy_sanitized_output<R, W>(mut reader: R, mut writer: W)
+where
+    R: Read,
+    W: Write,
+{
+    let mut buf = [0_u8; 8192];
+    loop {
+        let read = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        let lossy = String::from_utf8_lossy(&buf[..read]);
+        let safe = sanitize_for_terminal(&lossy);
+        if writer.write_all(safe.as_bytes()).is_err() {
+            break;
+        }
+        if writer.flush().is_err() {
+            break;
+        }
+    }
 }
 
 /// Case-insensitive env-var lookup against the sanitized env map.

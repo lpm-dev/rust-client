@@ -23,11 +23,46 @@ fn v1_entry_dir(project: &TempProject, name: &str, version: &str) -> std::path::
     store_v1(project).join(format!("{safe_name}@{version}"))
 }
 
-fn v2_sri_and_segment(seed: &[u8]) -> (String, String) {
-    let digest: [u8; 64] = Sha512::digest(seed).into();
+fn v2_sri_and_segment(bytes: &[u8]) -> (String, String) {
+    let digest: [u8; 64] = Sha512::digest(bytes).into();
     let sri = format!("sha512-{}", general_purpose::STANDARD.encode(digest));
     let segment = format!("sha512-{}", hex::encode(digest));
     (sri, segment)
+}
+
+fn npm_tarball(name: &str, version: &str) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let files = [
+        (
+            "package.json",
+            format!(r#"{{"name":"{name}","version":"{version}"}}"#).into_bytes(),
+        ),
+        ("index.js", b"module.exports = {}\n".to_vec()),
+    ];
+
+    let mut tar_data = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_data);
+        for (path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("package/{path}"), &content[..])
+                .expect("failed to append test tarball entry");
+        }
+        builder.finish().expect("failed to finish test tarball");
+    }
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&tar_data)
+        .expect("failed to gzip test tarball");
+    encoder.finish().expect("failed to finish gzip tarball")
 }
 
 /// Seed a single v1 store entry with a minimal package.json + one stub file.
@@ -52,18 +87,15 @@ fn seed_v1_entry(project: &TempProject, name: &str, version: &str, valid: bool) 
 }
 
 fn seed_v2_entry(project: &TempProject, name: &str, version: &str) {
-    let (sri, segment) = v2_sri_and_segment(format!("{name}@{version}").as_bytes());
     let v2 = store_root(project).join("v2");
+    let store = lpm_store::v2::Store::at(&v2);
+    let tarball = npm_tarball(name, version);
+    let (sri, segment) = v2_sri_and_segment(&tarball);
     let object_path = format!("objects/{segment}");
-    let object_dir = v2.join(&object_path);
-    std::fs::create_dir_all(&object_dir).expect("failed to create v2 object dir");
-    std::fs::write(
-        object_dir.join("package.json"),
-        format!(r#"{{"name":"{name}","version":"{version}"}}"#),
-    )
-    .expect("failed to write v2 object package.json");
-    std::fs::write(object_dir.join(".integrity"), &sri)
-        .expect("failed to write v2 object integrity");
+    let object_dir = store
+        .extract_object(&sri, &tarball)
+        .expect("failed to seed v2 object through extractor");
+    assert_eq!(object_dir, v2.join(&object_path));
 
     let link_key = format!("{name}@{version}+0123456789abcdef");
     let link_dir = v2.join("links").join(&link_key);

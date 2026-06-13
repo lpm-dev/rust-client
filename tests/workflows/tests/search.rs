@@ -3,6 +3,13 @@ mod support;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 
+fn assert_no_terminal_controls(context: &str, text: &str) {
+    assert!(
+        !text.bytes().any(|b| matches!(b, 0x07 | 0x1b | 0x7f)),
+        "{context} must not contain terminal control bytes, got:\n{text}"
+    );
+}
+
 fn sample_search_package(description: &str, download_count: u64) -> serde_json::Value {
     serde_json::json!({
         "name": "react",
@@ -14,6 +21,43 @@ fn sample_search_package(description: &str, download_count: u64) -> serde_json::
         "qualityScore": 91,
         "ecosystem": "js"
     })
+}
+
+#[tokio::test]
+async fn search_human_output_sanitizes_registry_control_sequences() {
+    let project = TempProject::empty(r#"{"name":"search-controls","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let mut package =
+        sample_search_package("safe description\u{1b}]8;;file:///etc/passwd\u{7}", 12_345);
+    package["name"] = serde_json::json!("react\u{1b}[2J");
+    package["owner"] = serde_json::json!("neo\u{7}");
+    package["latestVersion"] = serde_json::json!("1.2.3\u{1b}[31m");
+    package["ecosystem"] = serde_json::json!("js\u{1b}[0m");
+    mock.with_search_results("@lpm.dev/react", 20, vec![package])
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["search", "@lpm.dev/react"])
+        .output()
+        .expect("failed to run lpm search");
+
+    assert!(
+        output.status.success(),
+        "lpm search failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_no_terminal_controls("search output", &combined);
+    assert!(
+        combined.contains("safe description") && combined.contains("latest 1.2.3"),
+        "sanitized search output should preserve readable registry text, got:\n{combined}",
+    );
 }
 
 #[tokio::test]

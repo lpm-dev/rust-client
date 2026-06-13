@@ -36,6 +36,7 @@ reqwest = { workspace = true }
 lpm-runtime = { path = "../../crates/lpm-runtime" }
 lpm-common = { path = "../../crates/lpm-common" }
 lpm-linker = { path = "../../crates/lpm-linker" }
+lpm-store = { path = "../../crates/lpm-store" }
 lpm-runner = { path = "../../crates/lpm-runner" }
 lpm-vault = { path = "../../crates/lpm-vault" }
 lpm-lockfile = { path = "../../crates/lpm-lockfile" }

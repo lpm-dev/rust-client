@@ -905,6 +905,27 @@ mod tests {
         }
     }
 
+    fn test_tarball(name: &str, version: &str) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let content = format!(r#"{{"name":"{name}","version":"{version}"}}"#);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", content.as_bytes())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
     fn seed_v2_verify_entry(
         lpm_root: &LpmRoot,
         name: &str,
@@ -918,14 +939,9 @@ mod tests {
         let object_path = store_v2.paths().relative_object_path(&sri).unwrap();
 
         if create_object {
-            let object_dir = store_v2.paths().object_dir(&sri).unwrap();
-            std::fs::create_dir_all(&object_dir).unwrap();
-            std::fs::write(
-                object_dir.join("package.json"),
-                format!(r#"{{"name":"{name}","version":"{version}"}}"#),
-            )
-            .unwrap();
-            std::fs::write(object_dir.join(".integrity"), &sri).unwrap();
+            store_v2
+                .extract_object(&sri, &test_tarball(name, version))
+                .unwrap();
         }
 
         let link_key = format!("{name}@{version}+0123456789abcdef");

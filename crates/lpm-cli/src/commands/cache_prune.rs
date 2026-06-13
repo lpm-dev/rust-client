@@ -811,15 +811,30 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn test_tarball() -> Vec<u8> {
+        use std::io::Write;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let content = br#"{"name":"x","version":"1.0.0"}"#;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", &content[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[cfg(unix)]
     fn write_object(store: &V2Store, sri: &str) {
-        let dir = store.paths().object_dir(sri).unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("package.json"),
-            br#"{"name":"x","version":"1.0.0"}"#,
-        )
-        .unwrap();
-        std::fs::write(dir.join(".integrity"), sri).unwrap();
+        store.extract_object(sri, &test_tarball()).unwrap();
     }
 
     #[cfg(unix)]

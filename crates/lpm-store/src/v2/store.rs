@@ -8,11 +8,13 @@
 //!
 //! v2 writes are gated behind `LPM_STORE_VERSION=v2`.
 
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lpm_common::integrity::{HashAlgorithm, Integrity};
 use lpm_common::{LpmError, LpmRoot};
+use sha2::{Digest, Sha256};
 
 use crate::StageTimings;
 use crate::v2::graph_key::GraphKey;
@@ -42,6 +44,11 @@ const LINK_NODE_MODULES: &str = "node_modules";
 
 /// Marker file written into synthetic local-source objects.
 const LOCAL_SOURCE_OBJECT_SENTINEL: &str = ".lpm-local-source";
+
+/// Deterministic digest over the extracted package tree. `.integrity`
+/// records the source tarball SRI; this records the bytes lpm links
+/// from cache on later installs.
+const OBJECT_TREE_INTEGRITY_FILENAME: &str = ".lpm-object-integrity";
 
 /// Pure path helper for the v2 store layout.
 ///
@@ -294,6 +301,21 @@ impl Store {
         &self.paths
     }
 
+    /// Return the object directory when `sri` is already present and
+    /// its extracted-tree digest still matches. Incomplete or stale
+    /// objects are removed so callers can safely refetch before
+    /// linking.
+    pub fn reusable_object_dir(&self, sri: &str) -> Result<Option<PathBuf>, LpmError> {
+        let object_dir = self.paths.object_dir(sri)?;
+        if !object_dir.exists() {
+            return Ok(None);
+        }
+        if object_dir_is_reusable_or_remove(&object_dir, "before cache reuse")? {
+            return Ok(Some(object_dir));
+        }
+        Ok(None)
+    }
+
     /// Extract the supplied tarball bytes into
     /// `objects/<algo>-<hex>/`, run behavioral security analysis, write
     /// the cache file, and atomically rename into place. Idempotent:
@@ -339,25 +361,14 @@ impl Store {
         // crash leaves the install pipeline returning success on a
         // half-populated object dir and downstream link entries inherit
         // the corruption.
-        if object_dir.exists() {
-            if is_complete_object_dir(&object_dir) {
-                tracing::debug!(
-                    target = %object_dir.display(),
-                    "v2 store: object hit"
-                );
-                return Ok((object_dir, timings));
-            }
-
-            tracing::warn!(
+        if object_dir.exists()
+            && object_dir_is_reusable_or_remove(&object_dir, "before re-extract")?
+        {
+            tracing::debug!(
                 target = %object_dir.display(),
-                "v2 store: incomplete object dir; removing before re-extract"
+                "v2 store: object hit"
             );
-            std::fs::remove_dir_all(&object_dir).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to remove incomplete v2 object at {}: {e}",
-                    object_dir.display()
-                ))
-            })?;
+            return Ok((object_dir, timings));
         }
 
         if let Some(parent) = object_dir.parent() {
@@ -420,6 +431,10 @@ impl Store {
         // mixed-v1/v2 environments. Also load-bearing for
         // [`is_complete_object_dir`]'s incompleteness probe.
         let finalize_start = std::time::Instant::now();
+        if let Err(e) = write_object_tree_integrity(&tmp_dir) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e);
+        }
         if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(LpmError::Store(format!(
@@ -427,21 +442,11 @@ impl Store {
             )));
         }
 
-        let result = match std::fs::rename(&tmp_dir, &object_dir) {
-            Ok(()) => Ok(object_dir),
-            Err(_) if is_complete_object_dir(&object_dir) => {
-                // Concurrent install populated the same object first —
-                // discard our stage and use theirs.
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                Ok(object_dir)
-            }
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                Err(LpmError::Store(format!(
-                    "failed to atomically install v2 object: {e}"
-                )))
-            }
-        };
+        let result = std::fs::rename(&tmp_dir, &object_dir)
+            .map(|()| object_dir.clone())
+            .or_else(|e| {
+                finish_object_rename_after_collision(&tmp_dir, &object_dir, "v2 extract", e)
+            });
         timings.finalize_ms = finalize_start.elapsed().as_millis();
 
         result.map(|dir| (dir, timings))
@@ -854,7 +859,9 @@ impl Store {
         sri: &str,
     ) -> Result<PathBuf, LpmError> {
         let object_dir = self.paths.object_dir(sri)?;
-        if object_dir.exists() && is_complete_object_dir(&object_dir) {
+        if object_dir.exists()
+            && object_dir_is_reusable_or_remove(&object_dir, "before v1 to v2 translation")?
+        {
             return Ok(object_dir);
         }
         if !v1_pkg_dir.is_dir() {
@@ -883,17 +890,6 @@ impl Store {
             ))
         })?;
 
-        // Re-write `.integrity` from the caller-supplied SRI rather
-        // than trusting whatever v1 happened to record — keeps the
-        // v2 object's integrity field byte-equivalent to what
-        // `extract_object` would write for the same SRI.
-        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(LpmError::Store(format!(
-                "failed to write v2 .integrity during v1 translation: {e}"
-            )));
-        }
-
         // If v1 didn't ship a security cache (rare, but possible on
         // a stale or partial v1 entry), re-run analysis so the v2
         // post-write contract holds.
@@ -904,20 +900,27 @@ impl Store {
             }
         }
 
-        match std::fs::rename(&tmp_dir, &object_dir) {
-            Ok(()) => Ok(object_dir),
-            Err(_) if is_complete_object_dir(&object_dir) => {
-                // Concurrent install completed first — discard ours.
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                Ok(object_dir)
-            }
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                Err(LpmError::Store(format!(
-                    "v1 → v2 translation: failed to atomically install v2 object: {e}"
-                )))
-            }
+        if let Err(e) = write_object_tree_integrity(&tmp_dir) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e);
         }
+        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(LpmError::Store(format!(
+                "failed to write v2 .integrity during v1 translation: {e}"
+            )));
+        }
+
+        std::fs::rename(&tmp_dir, &object_dir)
+            .map(|()| object_dir.clone())
+            .or_else(|e| {
+                finish_object_rename_after_collision(
+                    &tmp_dir,
+                    &object_dir,
+                    "v1 to v2 translation",
+                    e,
+                )
+            })
     }
 
     /// Populate `objects/<sri>/` from a live local source directory.
@@ -1001,7 +1004,7 @@ impl Store {
             if !file_type.is_dir() {
                 return None;
             }
-            if !object_dir.join(".integrity").is_file() {
+            if !is_complete_object_dir(&object_dir) {
                 return None;
             }
             let segment = object_dir.file_name()?.to_string_lossy().to_string();
@@ -1054,6 +1057,7 @@ fn populate_into(
     // the object directory. This produces independent inodes on
     // CoW-capable filesystems (clonefile / reflink) and shared inodes
     // on Linux ext4 fallback.
+    ensure_object_tree_integrity(object_dir)?;
     let pkg_dir = node_modules.join(graph_key.name());
     if let Some(parent) = pkg_dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -1192,14 +1196,317 @@ fn is_complete_link_entry(dir: &Path, key: &GraphKey) -> bool {
     path.is_file()
 }
 
-/// Object dir is complete iff `package.json` AND `.integrity` are
-/// both present — symmetric to v1's `is_complete_package_dir`. The
-/// tarball extractor writes `package.json` first (it's at the root of
-/// every npm tarball) and `extract_object` writes `.integrity` last;
-/// observing both means staging closed cleanly even on a crash
-/// mid-extract.
+/// Object dir is complete iff the package root and both object
+/// integrity sidecars are present. This is a cheap crash-recovery
+/// predicate; callers that will reuse the object must also verify the
+/// tree digest.
 fn is_complete_object_dir(dir: &Path) -> bool {
-    dir.is_dir() && dir.join("package.json").exists() && dir.join(".integrity").exists()
+    dir.is_dir()
+        && is_regular_file_no_symlink(&dir.join("package.json"))
+        && is_regular_file_no_symlink(&dir.join(".integrity"))
+        && is_regular_file_no_symlink(&dir.join(OBJECT_TREE_INTEGRITY_FILENAME))
+}
+
+fn is_regular_file_no_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
+fn object_dir_is_reusable_or_remove(dir: &Path, context: &str) -> Result<bool, LpmError> {
+    match is_verified_object_dir(dir) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            remove_unusable_object_dir(dir, context)?;
+            Ok(false)
+        }
+        Err(err) => {
+            tracing::warn!(
+                target = %dir.display(),
+                "v2 store: treating object as unusable {context}: {err}"
+            );
+            remove_unusable_object_dir(dir, context)?;
+            Ok(false)
+        }
+    }
+}
+
+fn remove_unusable_object_dir(dir: &Path, context: &str) -> Result<(), LpmError> {
+    tracing::warn!(
+        target = %dir.display(),
+        "v2 store: removing incomplete or unverifiable object {context}"
+    );
+    std::fs::remove_dir_all(dir).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to remove incomplete or unverifiable v2 object at {} {context}: {e}",
+            dir.display()
+        ))
+    })
+}
+
+fn finish_object_rename_after_collision(
+    tmp_dir: &Path,
+    object_dir: &Path,
+    context: &str,
+    original_error: std::io::Error,
+) -> Result<PathBuf, LpmError> {
+    if object_dir.exists() {
+        match is_verified_object_dir(object_dir) {
+            Ok(true) => {
+                let _ = std::fs::remove_dir_all(tmp_dir);
+                return Ok(object_dir.to_path_buf());
+            }
+            Ok(false) => remove_unusable_object_dir(object_dir, "after rename collision")?,
+            Err(err) => {
+                tracing::warn!(
+                    target = %object_dir.display(),
+                    "v2 store: treating collided object as unusable during {context}: {err}"
+                );
+                remove_unusable_object_dir(object_dir, "after rename collision")?;
+            }
+        }
+        return std::fs::rename(tmp_dir, object_dir)
+            .map(|()| object_dir.to_path_buf())
+            .map_err(|retry_error| {
+                let _ = std::fs::remove_dir_all(tmp_dir);
+                LpmError::Store(format!(
+                    "{context}: failed to replace unusable v2 object after rename collision: {retry_error}; original rename error: {original_error}"
+                ))
+            });
+    }
+
+    let _ = std::fs::remove_dir_all(tmp_dir);
+    Err(LpmError::Store(format!(
+        "{context}: failed to atomically install v2 object: {original_error}"
+    )))
+}
+
+fn is_verified_object_dir(dir: &Path) -> Result<bool, LpmError> {
+    if !is_complete_object_dir(dir) {
+        return Ok(false);
+    }
+    object_tree_integrity_matches(dir)
+}
+
+fn object_tree_integrity_matches(dir: &Path) -> Result<bool, LpmError> {
+    let expected = read_object_tree_integrity(dir)?;
+    let actual = compute_object_tree_integrity(dir)?;
+    Ok(expected == actual)
+}
+
+fn ensure_object_tree_integrity(dir: &Path) -> Result<(), LpmError> {
+    let expected = read_object_tree_integrity(dir)?;
+    let actual = compute_object_tree_integrity(dir)?;
+    if expected == actual {
+        return Ok(());
+    }
+    Err(LpmError::Store(format!(
+        "v2 object integrity mismatch at {}: expected {expected}, actual {actual}",
+        dir.display()
+    )))
+}
+
+fn read_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
+    let path = dir.join(OBJECT_TREE_INTEGRITY_FILENAME);
+    if !is_regular_file_no_symlink(&path) {
+        return Err(LpmError::Store(format!(
+            "v2 object integrity sidecar is missing or not a regular file at {}",
+            path.display()
+        )));
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to read v2 object integrity sidecar at {}: {e}",
+            path.display()
+        ))
+    })?;
+    let digest = raw.trim();
+    let hex_part = digest.strip_prefix("sha256-").ok_or_else(|| {
+        LpmError::Store(format!(
+            "invalid v2 object integrity sidecar at {}: expected sha256-<hex>",
+            path.display()
+        ))
+    })?;
+    if hex_part.len() != 64 || !hex_part.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(LpmError::Store(format!(
+            "invalid v2 object integrity sidecar at {}: expected sha256-<64 hex chars>",
+            path.display()
+        )));
+    }
+    Ok(digest.to_string())
+}
+
+fn write_object_tree_integrity(dir: &Path) -> Result<(), LpmError> {
+    let digest = compute_object_tree_integrity(dir)?;
+    std::fs::write(
+        dir.join(OBJECT_TREE_INTEGRITY_FILENAME),
+        format!("{digest}\n"),
+    )
+    .map_err(|e| LpmError::Store(format!("failed to write v2 object integrity sidecar: {e}")))
+}
+
+fn compute_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
+    let mut hasher = Sha256::new();
+    hash_object_tree_dir(dir, dir, &mut hasher)?;
+    let digest = hasher.finalize();
+    Ok(format!("sha256-{}", hex::encode(digest)))
+}
+
+fn hash_object_tree_dir(root: &Path, dir: &Path, hasher: &mut Sha256) -> Result<(), LpmError> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to read v2 object tree at {}: {e}",
+            dir.display()
+        ))
+    })? {
+        entries.push(entry.map_err(|e| {
+            LpmError::Store(format!("failed to enumerate v2 object tree entry: {e}"))
+        })?);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        if is_object_metadata_sidecar(root, &path) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to stat v2 object tree entry {}: {e}",
+                path.display()
+            ))
+        })?;
+        let relative = object_tree_relative_path(root, &path)?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            let mode = object_entry_mode(&metadata).to_le_bytes();
+            hash_object_tree_record(hasher, b"dir", &relative, &mode);
+            hash_object_tree_dir(root, &path, hasher)?;
+        } else if file_type.is_file() {
+            hash_object_file(hasher, &relative, &path, &metadata)?;
+        } else if file_type.is_symlink() {
+            let target = std::fs::read_link(&path).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to read v2 object symlink {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let mut target_bytes = Vec::new();
+            push_os_str_bytes(&mut target_bytes, target.as_os_str());
+            hash_object_tree_record(hasher, b"symlink", &relative, &target_bytes);
+        } else {
+            return Err(LpmError::Store(format!(
+                "unsupported v2 object entry type at {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn hash_object_file(
+    hasher: &mut Sha256,
+    relative: &[u8],
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), LpmError> {
+    hasher.update(b"file\0");
+    hasher.update(relative);
+    hasher.update(b"\0");
+    hasher.update(object_entry_mode(metadata).to_le_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    let file = std::fs::File::open(path).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to open v2 object file {} for integrity hashing: {e}",
+            path.display()
+        ))
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buf).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to read v2 object file {} for integrity hashing: {e}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(())
+}
+
+fn hash_object_tree_record(hasher: &mut Sha256, kind: &[u8], relative: &[u8], payload: &[u8]) {
+    hasher.update(kind);
+    hasher.update(b"\0");
+    hasher.update(relative);
+    hasher.update(b"\0");
+    hasher.update((payload.len() as u64).to_le_bytes());
+    hasher.update(payload);
+}
+
+fn object_tree_relative_path(root: &Path, path: &Path) -> Result<Vec<u8>, LpmError> {
+    let relative = path.strip_prefix(root).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to relativize v2 object path {} under {}: {e}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    let mut out = Vec::new();
+    for component in relative.components() {
+        if !out.is_empty() {
+            out.push(b'/');
+        }
+        push_os_str_bytes(&mut out, component.as_os_str());
+    }
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn push_os_str_bytes(out: &mut Vec<u8>, value: &std::ffi::OsStr) {
+    use std::os::unix::ffi::OsStrExt;
+    out.extend_from_slice(value.as_bytes());
+}
+
+#[cfg(windows)]
+fn push_os_str_bytes(out: &mut Vec<u8>, value: &std::ffi::OsStr) {
+    use std::os::windows::ffi::OsStrExt;
+    for unit in value.encode_wide() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn push_os_str_bytes(out: &mut Vec<u8>, value: &std::ffi::OsStr) {
+    out.extend_from_slice(value.to_string_lossy().as_bytes());
+}
+
+#[cfg(unix)]
+fn object_entry_mode(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(not(unix))]
+fn object_entry_mode(metadata: &std::fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
+}
+
+fn is_object_metadata_sidecar(root: &Path, path: &Path) -> bool {
+    if path.parent() != Some(root) {
+        return false;
+    }
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".integrity")
+            | Some(".lpm-security.json")
+            | Some(OBJECT_TREE_INTEGRITY_FILENAME)
+            | Some(LOCAL_SOURCE_OBJECT_SENTINEL)
+    )
 }
 
 fn is_complete_local_source_object_dir(dir: &Path) -> bool {
@@ -1320,6 +1627,12 @@ fn populate_local_source_object_into(
     sri: &str,
 ) -> Result<(), LpmError> {
     walk_local_source_object(source_root, source_root, tmp_dir, 0)?;
+    let analysis = lpm_security::behavioral::analyze_package(tmp_dir);
+    if let Err(e) = lpm_security::behavioral::write_cached_analysis(tmp_dir, &analysis) {
+        tracing::warn!("v2 local-source object: failed to write .lpm-security.json: {e}");
+    }
+
+    write_object_tree_integrity(tmp_dir)?;
     std::fs::write(tmp_dir.join(".integrity"), sri).map_err(|e| {
         LpmError::Store(format!(
             "failed to write v2 local-source .integrity at {}: {e}",
@@ -1336,11 +1649,6 @@ fn populate_local_source_object_into(
             tmp_dir.display()
         ))
     })?;
-
-    let analysis = lpm_security::behavioral::analyze_package(tmp_dir);
-    if let Err(e) = lpm_security::behavioral::write_cached_analysis(tmp_dir, &analysis) {
-        tracing::warn!("v2 local-source object: failed to write .lpm-security.json: {e}");
-    }
 
     Ok(())
 }
@@ -1574,10 +1882,11 @@ use lpm_common::symlink::create_symlink as create_fs_symlink;
 /// discussion.
 fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
     let allow_source_symlinks = src.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file();
-    materialize_into_inner(src, dst, allow_source_symlinks)
+    materialize_into_inner(src, src, dst, allow_source_symlinks)
 }
 
 fn materialize_into_inner(
+    root: &Path,
     src: &Path,
     dst: &Path,
     allow_source_symlinks: bool,
@@ -1585,6 +1894,7 @@ fn materialize_into_inner(
     #[cfg(target_os = "macos")]
     {
         if try_clonefile(src, dst) {
+            remove_materialized_object_sidecars(dst)?;
             return Ok(());
         }
     }
@@ -1608,6 +1918,9 @@ fn materialize_into_inner(
             continue;
         }
         let src_path = entry.path();
+        if is_object_metadata_sidecar(root, &src_path) {
+            continue;
+        }
         let dst_path = dst.join(entry.file_name());
 
         let file_type = entry.file_type().map_err(|e| {
@@ -1618,7 +1931,7 @@ fn materialize_into_inner(
         })?;
 
         if file_type.is_dir() {
-            materialize_into_inner(&src_path, &dst_path, allow_source_symlinks)?;
+            materialize_into_inner(root, &src_path, &dst_path, allow_source_symlinks)?;
         } else if file_type.is_symlink() {
             if !allow_source_symlinks {
                 // Refuse symlink entries — the extractor's `is_file()`
@@ -1662,6 +1975,27 @@ fn materialize_into_inner(
         }
     }
 
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_materialized_object_sidecars(dst: &Path) -> Result<(), LpmError> {
+    for name in [
+        ".integrity",
+        ".lpm-security.json",
+        OBJECT_TREE_INTEGRITY_FILENAME,
+        LOCAL_SOURCE_OBJECT_SENTINEL,
+    ] {
+        let path = dst.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to remove v2 metadata sidecar from materialized package at {}: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -1754,6 +2088,7 @@ mod tests {
             }
             std::fs::write(path, contents).unwrap();
         }
+        write_object_tree_integrity(&dir).unwrap();
         std::fs::write(dir.join(".integrity"), sri).unwrap();
         dir
     }
@@ -1834,6 +2169,85 @@ mod tests {
         assert_eq!(read_back.source_sri, sri);
         assert!(read_back.object_path.starts_with("objects/sha512-"));
         assert_eq!(read_back.deps, vec![]);
+    }
+
+    #[test]
+    fn reusable_object_dir_removes_tampered_object_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"reusable_object_dir_removes_tampered_object_tree");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
+        );
+        std::fs::write(object_dir.join("index.js"), b"//tampered").unwrap();
+
+        let reusable = store.reusable_object_dir(&sri).unwrap();
+
+        assert!(reusable.is_none());
+        assert!(
+            !object_dir.exists(),
+            "tampered v2 objects must be removed before cache reuse"
+        );
+    }
+
+    #[test]
+    fn reusable_object_dir_removes_malformed_object_tree_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"reusable_object_dir_removes_malformed_object_tree_sidecar");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
+        );
+        std::fs::write(
+            object_dir.join(OBJECT_TREE_INTEGRITY_FILENAME),
+            b"sha256-not-hex\n",
+        )
+        .unwrap();
+
+        let reusable = store.reusable_object_dir(&sri).unwrap();
+
+        assert!(reusable.is_none());
+        assert!(
+            !object_dir.exists(),
+            "malformed object integrity sidecars must force a fresh cache write"
+        );
+    }
+
+    #[test]
+    fn populate_link_entry_rejects_object_tree_integrity_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"populate_link_entry_rejects_object_tree_integrity_mismatch");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
+        );
+        std::fs::write(object_dir.join("index.js"), b"//tampered").unwrap();
+
+        let key = arc_key("a", "1.0.0");
+        let err = store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: Arc::clone(&key),
+                source_sri: sri,
+                object_dir,
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("v2 object integrity mismatch"),
+            "link population must fail before reading tampered object bytes, got: {err}"
+        );
+        assert!(
+            !store.paths().link_dir(&key).exists(),
+            "failed link population must clean up its staging dir"
+        );
     }
 
     #[cfg(unix)]
@@ -2416,10 +2830,60 @@ mod tests {
         assert!(obj_dir.is_dir());
         assert!(obj_dir.join("package.json").is_file());
         assert!(obj_dir.join(".integrity").is_file());
+        assert!(obj_dir.join(OBJECT_TREE_INTEGRITY_FILENAME).is_file());
         // Security cache lives next to the object.
         assert!(
             obj_dir.join(".lpm-security.json").is_file(),
             "v2 security analysis must run inside extract_object"
+        );
+    }
+
+    #[test]
+    fn extract_object_from_bytes_repairs_tampered_hot_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[
+            ("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}"),
+            ("index.js", b"module.exports = 1;\n"),
+        ]);
+
+        let (obj_dir, _sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+        std::fs::write(obj_dir.join("index.js"), b"module.exports = 99;\n").unwrap();
+
+        let (repaired_dir, _sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+
+        assert_eq!(repaired_dir, obj_dir);
+        assert_eq!(
+            std::fs::read(repaired_dir.join("index.js")).unwrap(),
+            b"module.exports = 1;\n"
+        );
+    }
+
+    #[test]
+    fn extract_object_from_bytes_repairs_malformed_object_tree_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[
+            ("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}"),
+            ("index.js", b"module.exports = 1;\n"),
+        ]);
+
+        let (obj_dir, _sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+        std::fs::write(
+            obj_dir.join(OBJECT_TREE_INTEGRITY_FILENAME),
+            b"sha256-not-hex\n",
+        )
+        .unwrap();
+
+        let (repaired_dir, _sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+
+        assert_eq!(repaired_dir, obj_dir);
+        assert_eq!(
+            std::fs::read_to_string(repaired_dir.join(OBJECT_TREE_INTEGRITY_FILENAME))
+                .unwrap()
+                .trim()
+                .len(),
+            "sha256-".len() + 64
         );
     }
 

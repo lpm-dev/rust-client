@@ -20,6 +20,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+flate2 = "1"
+tar = "0.4"
 tempfile = "3"
 
 [lints]

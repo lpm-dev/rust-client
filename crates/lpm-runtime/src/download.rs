@@ -811,6 +811,56 @@ mod tests {
         entry
     }
 
+    fn forged_zip_with_declared_file(path: &str, declared_size: u32) -> Vec<u8> {
+        let name = path.as_bytes();
+        let name_len = name.len() as u16;
+        let mut zip = Vec::new();
+
+        zip.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+        zip.extend_from_slice(&20_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(&declared_size.to_le_bytes());
+        zip.extend_from_slice(&name_len.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(name);
+
+        let central_offset = zip.len() as u32;
+        zip.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+        zip.extend_from_slice(&20_u16.to_le_bytes());
+        zip.extend_from_slice(&20_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(&declared_size.to_le_bytes());
+        zip.extend_from_slice(&name_len.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(&0_u32.to_le_bytes());
+        zip.extend_from_slice(name);
+
+        let central_size = zip.len() as u32 - central_offset;
+        zip.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip.extend_from_slice(&1_u16.to_le_bytes());
+        zip.extend_from_slice(&1_u16.to_le_bytes());
+        zip.extend_from_slice(&central_size.to_le_bytes());
+        zip.extend_from_slice(&central_offset.to_le_bytes());
+        zip.extend_from_slice(&0_u16.to_le_bytes());
+        zip
+    }
+
     #[test]
     fn extract_tarball_rejects_path_traversal() {
         let malicious_tar = build_tar_gz(&[("../escape.txt", b"pwned")]);
@@ -839,6 +889,52 @@ mod tests {
     }
 
     #[test]
+    fn extract_zip_rejects_path_traversal() {
+        let root = TempDir::new().unwrap();
+        let dest = root.path().join("extract");
+        std::fs::create_dir_all(&dest).unwrap();
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(buf);
+        writer
+            .start_file("../escape.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"pwned").unwrap();
+        let zip_data = writer.finish().unwrap().into_inner();
+
+        let result = extract_zip(&zip_data, &dest);
+
+        assert!(result.is_err(), "zip traversal must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("path traversal"),
+            "error should mention path traversal, got: {err_msg}"
+        );
+        assert!(
+            !root.path().join("escape.txt").exists(),
+            "zip traversal must not write outside the destination"
+        );
+    }
+
+    #[test]
+    fn extract_zip_rejects_oversized_entry_declaration() {
+        let zip_data =
+            forged_zip_with_declared_file("node-v22.5.0/bin/node", (MAX_ENTRY_BYTES + 1) as u32);
+        let dest = TempDir::new().unwrap();
+
+        let err = extract_zip(&zip_data, dest.path()).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("per-entry cap"),
+            "zip entry cap rejection should be explicit: {msg}"
+        );
+        assert!(
+            !dest.path().join("node-v22.5.0/bin/node").exists(),
+            "no partial zip extract on cap failure"
+        );
+    }
+
+    #[test]
     fn extract_tarball_allows_normal_entries() {
         let normal_tar = build_tar_gz(&[
             ("mydir/file.txt", b"hello"),
@@ -854,9 +950,8 @@ mod tests {
         assert!(dest.path().join("mydir/sub/deep.txt").exists());
     }
 
-    /// M46: a tar entry whose declared size exceeds the per-entry cap
-    /// is rejected before unpack. Without this guard, a small
-    /// compressed archive could expand into a multi-GiB on-disk file.
+    /// A tar entry whose declared size exceeds the per-entry cap is
+    /// rejected before unpack.
     #[test]
     fn extract_tarball_rejects_oversized_entry_declaration() {
         // Build a raw tar entry that declares size > MAX_ENTRY_BYTES
