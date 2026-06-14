@@ -44,6 +44,7 @@
 pub mod assertions;
 pub mod auth_state;
 pub mod build_state;
+pub mod fault_registry;
 pub mod mock_registry;
 pub mod verdaccio;
 pub mod verdaccio_proxy;

@@ -2628,7 +2628,7 @@ async fn run_with_options_under_store_lock(
         );
     }
 
-    let packages_for_lockfile = packages.clone();
+    let mut packages_for_lockfile = packages.clone();
     if omit_policy.dev {
         filter_dev_packages(&mut packages, &production_dependency_names);
     }
@@ -4073,21 +4073,19 @@ async fn run_with_options_under_store_lock(
             }
         }
 
-        // Update packages with computed integrity hashes (for lockfile persistence)
-        for p in &mut packages {
-            let key = install_pkg_key(p);
-            if let Some(sri) = integrity_map.get(&key) {
-                p.integrity = Some(sri.clone());
+        let apply_fetch_writebacks = |packages: &mut [InstallPackage]| {
+            for p in packages {
+                let key = install_pkg_key(p);
+                if let Some(sri) = integrity_map.get(&key) {
+                    p.integrity = Some(sri.clone());
+                }
+                if let Some(url) = fresh_urls.get(&key) {
+                    p.tarball_url = Some(url.clone());
+                }
             }
-            // — update `InstallPackage.tarball_url` to the
-            // URL that actually served bytes so the fresh-resolve
-            // writer (at install-end) persists it. For the fast-path
-            // case, this flows into the generalized writeback (see
-            // `compute_fresh_tarball_urls` at install-end).
-            if let Some(url) = fresh_urls.get(&key) {
-                p.tarball_url = Some(url.clone());
-            }
-        }
+        };
+        apply_fetch_writebacks(&mut packages);
+        apply_fetch_writebacks(&mut packages_for_lockfile);
 
         overall.finish_and_clear();
     }
