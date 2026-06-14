@@ -1054,6 +1054,7 @@ pub async fn run_add_packages(
             no_sandbox,
             verbose,
             audit_after_install,
+            &[],
         )
         .await?;
         maybe_test_panic("after-install");
@@ -1432,6 +1433,7 @@ pub async fn run_install_filtered_add(
                 no_sandbox,
                 verbose,
                 audit_after_install,
+                &[],
             )
             .await;
 

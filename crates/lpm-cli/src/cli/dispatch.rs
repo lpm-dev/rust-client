@@ -840,6 +840,7 @@ async fn async_main() -> Result<()> {
                         no_sandbox,
                         cli.verbose,
                         eff_audit_after_install,
+                        &[],
                     )
                     .await?;
 
@@ -2303,6 +2304,7 @@ async fn async_main() -> Result<()> {
                 no_sandbox,
                 cli.verbose,
                 eff_audit_after_install,
+                &[],
             )
             .await?;
 

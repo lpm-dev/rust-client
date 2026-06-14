@@ -72,13 +72,13 @@ fn parse_metadata_to_cache_info_inner(
 
             for (dep_name, dep_range) in &ver_meta.dependencies {
                 if !is_valid_dep_name(dep_name) {
-                    tracing::warn!("skipping invalid dep name: {dep_name:?}");
+                    tracing::debug!("skipping invalid dep name: {dep_name:?}");
                     continue;
                 }
                 let (inner_range, target) = split_alias(dep_range);
                 if let Some(target) = target {
                     if !is_valid_dep_name(&target) {
-                        tracing::warn!(
+                        tracing::debug!(
                             "skipping alias dep {dep_name:?}: invalid target name {target:?}"
                         );
                         continue;
@@ -91,13 +91,13 @@ fn parse_metadata_to_cache_info_inner(
             let mut opt_names = HashSet::new();
             for (dep_name, dep_range) in &ver_meta.optional_dependencies {
                 if !is_valid_dep_name(dep_name) {
-                    tracing::warn!("skipping invalid optional dep name: {dep_name:?}");
+                    tracing::debug!("skipping invalid optional dep name: {dep_name:?}");
                     continue;
                 }
                 let (inner_range, target) = split_alias(dep_range);
                 if let Some(target) = target {
                     if !is_valid_dep_name(&target) {
-                        tracing::warn!(
+                        tracing::debug!(
                             "skipping optional alias dep {dep_name:?}: invalid target name {target:?}"
                         );
                         continue;
@@ -120,7 +120,7 @@ fn parse_metadata_to_cache_info_inner(
                 let mut ver_peers = HashMap::new();
                 for (dep_name, dep_range) in &ver_meta.peer_dependencies {
                     if !is_valid_dep_name(dep_name) {
-                        tracing::warn!("skipping invalid peer dep name: {dep_name:?}");
+                        tracing::debug!("skipping invalid peer dep name: {dep_name:?}");
                         continue;
                     }
                     ver_peers.insert(dep_name.clone(), dep_range.clone());
@@ -137,7 +137,7 @@ fn parse_metadata_to_cache_info_inner(
                 let mut bundled = HashSet::new();
                 for name in &ver_meta.bundle_dependencies {
                     if !is_valid_dep_name(name) {
-                        tracing::warn!("skipping invalid bundleDependency name: {name:?}");
+                        tracing::debug!("skipping invalid bundleDependency name: {name:?}");
                         continue;
                     }
                     bundled.insert(name.clone());
@@ -160,7 +160,7 @@ fn parse_metadata_to_cache_info_inner(
                         continue;
                     }
                     if !is_valid_dep_name(peer_name) {
-                        tracing::warn!("skipping invalid optional-peer name: {peer_name:?}");
+                        tracing::debug!("skipping invalid optional-peer name: {peer_name:?}");
                         continue;
                     }
                     opt_peers.insert(peer_name.clone());

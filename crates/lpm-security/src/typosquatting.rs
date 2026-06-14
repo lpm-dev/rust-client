@@ -7,7 +7,7 @@
 
 use strsim::levenshtein;
 
-/// Top ~100 most popular npm packages by weekly downloads.
+/// Popular npm packages plus well-known framework package names.
 /// Hardcoded for offline operation — no network needed.
 const POPULAR_PACKAGES: &[&str] = &[
     "lodash",
@@ -89,8 +89,10 @@ const POPULAR_PACKAGES: &[&str] = &[
     "path-browserify",
     "vm-browserify",
     "next",
+    "nuxt",
     "vue",
     "angular",
+    "astro",
     "svelte",
     "solid-js",
     "preact",
@@ -104,6 +106,7 @@ const POPULAR_PACKAGES: &[&str] = &[
     "rollup",
     "vite",
     "esbuild",
+    "storybook",
     "swc",
     "turbo",
     "prisma",
@@ -333,6 +336,11 @@ mod tests {
     #[test]
     fn no_warn_exact_react() {
         assert_eq!(check_typosquatting("react"), None);
+    }
+
+    #[test]
+    fn no_warn_nuxt_framework_package() {
+        assert_eq!(check_typosquatting("nuxt"), None);
     }
 
     #[test]

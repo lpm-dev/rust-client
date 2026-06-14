@@ -682,6 +682,11 @@ fn resolve_and_load_env(
     })
 }
 
+/// Resolve only a script command from package.json or lpm.json tasks.
+pub fn script_command(project_dir: &Path, script_name: &str) -> Result<String, LpmError> {
+    resolve_script_command(project_dir, script_name).map(|(command, _)| command)
+}
+
 /// Resolve a script command from package.json or lpm.json tasks.
 ///
 /// Lookup order:

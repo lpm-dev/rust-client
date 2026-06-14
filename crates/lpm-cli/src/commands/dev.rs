@@ -112,7 +112,15 @@ pub async fn run(
     yes: bool,
     allow_ca_bootstrap: bool,
 ) -> Result<(), LpmError> {
-    let port = port.unwrap_or(3000);
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+
+    let lpm_config = if let Some(cfg) = pre_parsed_config {
+        Some(cfg)
+    } else {
+        lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?
+    };
+    let has_services = lpm_config.as_ref().is_some_and(|c| !c.services.is_empty());
+    let port = resolve_dev_port(port, has_services);
 
     // Warn about privileged ports that may require elevated permissions
     if is_privileged_port(port) {
@@ -122,13 +130,6 @@ pub async fn run(
         ));
     }
 
-    let mut extra_env: Vec<(String, String)> = Vec::new();
-
-    let lpm_config = if let Some(cfg) = pre_parsed_config {
-        Some(cfg)
-    } else {
-        lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?
-    };
     let local_domain_hostnames = lpm_config
         .as_ref()
         .map(lpm_runner::local_domains::configured_hostnames)
@@ -203,11 +204,13 @@ pub async fn run(
             })
             .map(|v| v.trim().to_string())
     });
+    let dev_entrypoint_compatibility_bins = dev_entrypoint_compatibility_bins(project_dir);
 
     let (install_result, env_result, https_result, runtime_hint, node_version_result) = tokio::join!(
         async {
             if !no_install {
-                auto_install_if_stale(client, &install_dir).await
+                auto_install_if_stale(client, &install_dir, &dev_entrypoint_compatibility_bins)
+                    .await
             } else {
                 Ok("skipped (--no-install)".to_string())
             }
@@ -642,8 +645,6 @@ pub async fn run(
     print_startup_banner(&startup, project_dir);
 
     // ── Check for multi-service orchestration ──────────────────────────
-    let has_services = lpm_config.as_ref().is_some_and(|c| !c.services.is_empty());
-
     if has_services {
         let services = &lpm_config.as_ref().unwrap().services;
 
@@ -883,12 +884,14 @@ pub async fn run(
 
     // Run the "dev" script with extra env vars injected safely (no unsafe set_var).
     // `runtime_hint` was resolved during the parallel-startup join above.
+    let mut script_env = extra_env.clone();
+    upsert_extra_env(&mut script_env, "PORT", port.to_string());
     let script_result = lpm_runner::script::run_script_with_envs(
         project_dir,
         "dev",
         extra_args,
         env_mode,
-        &extra_env,
+        &script_env,
         &runtime_hint,
     );
     let result = release_proxy_lease_after(script_result, &proxy_lease).await;
@@ -1500,6 +1503,7 @@ fn needs_install(project_dir: &std::path::Path) -> (bool, Option<String>) {
 async fn auto_install_if_stale(
     client: &lpm_registry::RegistryClient,
     project_dir: &std::path::Path,
+    compatibility_bin_names: &[String],
 ) -> Result<String, LpmError> {
     let pkg_json = project_dir.join("package.json");
     if !pkg_json.exists() {
@@ -1509,12 +1513,18 @@ async fn auto_install_if_stale(
     let start = std::time::Instant::now();
 
     let (stale, _) = needs_install(project_dir);
-    if !stale {
+    let compatibility_missing =
+        dev_entrypoint_compatibility_missing(project_dir, compatibility_bin_names);
+    if !stale && !compatibility_missing {
         let elapsed = start.elapsed();
         return Ok(format!("up to date ({})", format_duration(elapsed)));
     }
 
-    dev_ui::phase("Dependencies out of date, installing...");
+    if stale {
+        dev_ui::phase("Dependencies out of date, installing...");
+    } else {
+        dev_ui::phase("Preparing dev tool compatibility...");
+    }
 
     // Single-writer ownership: `run_with_options` is the only writer
     // of `.lpm/install-hash`. Pre-fix this branch wrote a stale,
@@ -1564,6 +1574,7 @@ async fn auto_install_if_stale(
             false, // no_sandbox
             false, // verbose: internal pipeline, no user-facing Done footer
             false, // audit_after_install: internal pipeline never runs audit
+            compatibility_bin_names,
         )
         .await
     };
@@ -1577,6 +1588,92 @@ async fn auto_install_if_stale(
             "auto-install failed: {e}\n    Use --no-install to skip dependency installation."
         ))),
     }
+}
+
+fn dev_entrypoint_compatibility_bins(project_dir: &Path) -> Vec<String> {
+    let Ok(script_cmd) = lpm_runner::script::script_command(project_dir, "dev") else {
+        return Vec::new();
+    };
+    first_script_binary_name(&script_cmd)
+        .map(|bin| vec![bin])
+        .unwrap_or_default()
+}
+
+fn dev_entrypoint_compatibility_missing(project_dir: &Path, bin_names: &[String]) -> bool {
+    !bin_names.is_empty()
+        && lpm_store::StoreVersion::from_env().is_v2()
+        && !lpm_linker::v2::project_compatibility_bins_ready(project_dir, bin_names)
+}
+
+fn first_script_binary_name(script_cmd: &str) -> Option<String> {
+    let words = shlex::split(script_cmd)?;
+    let mut index = 0usize;
+    while index < words.len() {
+        let word = words[index].as_str();
+        if is_shell_assignment(word) {
+            index += 1;
+            continue;
+        }
+        match word {
+            "env" | "command" => {
+                index += 1;
+                continue;
+            }
+            "cross-env" | "cross-env-shell" => {
+                index += 1;
+                while index < words.len() && is_shell_assignment(&words[index]) {
+                    index += 1;
+                }
+                continue;
+            }
+            _ => return normalize_script_binary_name(word),
+        }
+    }
+    None
+}
+
+fn is_shell_assignment(word: &str) -> bool {
+    let Some((key, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn normalize_script_binary_name(word: &str) -> Option<String> {
+    if word.is_empty()
+        || word.starts_with('-')
+        || word.contains('/')
+        || word.contains('\\')
+        || word.contains('\0')
+        || matches!(
+            word,
+            "node"
+                | "npm"
+                | "npx"
+                | "pnpm"
+                | "yarn"
+                | "bun"
+                | "lpm"
+                | "cd"
+                | "echo"
+                | "export"
+                | "set"
+                | "source"
+                | "."
+                | "&&"
+                | "||"
+                | ";"
+                | "|"
+        )
+    {
+        return None;
+    }
+    Some(word.to_string())
 }
 
 /// Auto-copy .env.example → .env if .env doesn't exist.
@@ -1696,6 +1793,24 @@ fn is_privileged_port(port: u16) -> bool {
     port < 1024
 }
 
+fn resolve_dev_port(requested: Option<u16>, has_services: bool) -> u16 {
+    if let Some(port) = requested {
+        return port;
+    }
+    if has_services {
+        return 3000;
+    }
+    lpm_runner::ports::find_available_port(3000).unwrap_or(3000)
+}
+
+fn upsert_extra_env(extra_env: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some((_, existing)) = extra_env.iter_mut().find(|(env_key, _)| env_key == key) {
+        *existing = value;
+    } else {
+        extra_env.push((key.to_string(), value));
+    }
+}
+
 /// Convert orchestrator's `ServiceStatus` to dashboard's `ServiceStatus`.
 ///
 /// The two enums are structurally similar but live in different crates.
@@ -1805,6 +1920,36 @@ mod tests {
     fn is_ci_detects_ci_env() {
         // Verify the function exists and returns bool — value depends on environment
         let _result: bool = is_ci();
+    }
+
+    #[test]
+    fn first_script_binary_name_detects_plain_framework_entrypoint() {
+        assert_eq!(
+            first_script_binary_name("next dev --turbo").as_deref(),
+            Some("next"),
+        );
+    }
+
+    #[test]
+    fn first_script_binary_name_skips_assignments_and_env_wrappers() {
+        assert_eq!(
+            first_script_binary_name("NODE_OPTIONS=--trace-warnings cross-env FOO=bar vite --host")
+                .as_deref(),
+            Some("vite"),
+        );
+    }
+
+    #[test]
+    fn first_script_binary_name_returns_none_for_runtime_commands() {
+        assert_eq!(first_script_binary_name("node server.js"), None);
+    }
+
+    #[test]
+    fn first_script_binary_name_returns_none_for_path_commands() {
+        assert_eq!(
+            first_script_binary_name("./node_modules/.bin/next dev"),
+            None
+        );
     }
 
     #[test]
@@ -2351,7 +2496,7 @@ mod tests {
         );
 
         // Exercise the real dev seam.
-        let result = auto_install_if_stale(&client, p).await;
+        let result = auto_install_if_stale(&client, p, &[]).await;
         assert!(
             result.is_ok(),
             "auto_install_if_stale must succeed on empty-deps project, got: {result:?}"

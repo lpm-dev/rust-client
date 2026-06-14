@@ -89,21 +89,46 @@ pub(super) fn select_peer_candidate<'a>(
     candidates: &[&'a (Option<String>, String)],
     peer_range: Option<&NpmRange>,
 ) -> Option<(&'a String, bool)> {
-    match candidates {
-        [] => None,
-        [(_, version)] => Some((version, peer_version_satisfies(version, peer_range))),
-        _ => {
-            let mut satisfying = candidates.iter().filter_map(|(_, version)| {
-                peer_version_satisfies(version, peer_range).then_some(version)
-            });
-            let first = satisfying.next()?;
-            if satisfying.next().is_none() {
-                Some((first, true))
-            } else {
-                None
+    let mut first_candidate: Option<&'a String> = None;
+    let mut first_satisfying: Option<&'a String> = None;
+    let mut newest_candidate: Option<(&'a String, NpmVersion)> = None;
+    let mut newest_satisfying: Option<(&'a String, NpmVersion)> = None;
+
+    for candidate in candidates.iter().copied() {
+        let version = &candidate.1;
+        first_candidate.get_or_insert(version);
+
+        let parsed = NpmVersion::parse(version).ok();
+        if let Some(parsed) = parsed.as_ref()
+            && newest_candidate
+                .as_ref()
+                .is_none_or(|(_, newest)| parsed > newest)
+        {
+            newest_candidate = Some((version, parsed.clone()));
+        }
+
+        if peer_version_satisfies(version, peer_range) {
+            first_satisfying.get_or_insert(version);
+            if let Some(parsed) = parsed
+                && newest_satisfying
+                    .as_ref()
+                    .is_none_or(|(_, newest)| &parsed > newest)
+            {
+                newest_satisfying = Some((version, parsed));
             }
         }
     }
+
+    if let Some((version, _)) = newest_satisfying {
+        return Some((version, true));
+    }
+    if let Some(version) = first_satisfying {
+        return Some((version, true));
+    }
+    if let Some((version, _)) = newest_candidate {
+        return Some((version, false));
+    }
+    first_candidate.map(|version| (version, false))
 }
 
 pub(super) fn peer_version_satisfies(version: &str, peer_range: Option<&NpmRange>) -> bool {

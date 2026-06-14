@@ -1316,6 +1316,69 @@ fn peer_check_wrong_version_produces_warning() {
     assert_eq!(warnings[0].resolved_version.as_deref(), Some("17.0.2"));
 }
 
+#[test]
+fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
+    let plugin_pkg = ResolverPackage::npm("esbuild-plugins-node-modules-polyfill");
+    let esbuild_nested_a = ResolverPackage::npm("esbuild").with_context("vite");
+    let esbuild_nested_b = ResolverPackage::npm("esbuild").with_context("@remix-run/dev");
+
+    let resolved = vec![
+        ResolvedPackage {
+            package: plugin_pkg.clone(),
+            version: NpmVersion::parse("1.8.1").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            optional: false,
+        },
+        ResolvedPackage {
+            package: esbuild_nested_a.clone(),
+            version: NpmVersion::parse("0.25.12").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            optional: false,
+        },
+        ResolvedPackage {
+            package: esbuild_nested_b.clone(),
+            version: NpmVersion::parse("0.17.6").unwrap(),
+            dependencies: vec![],
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            optional: false,
+        },
+    ];
+
+    let mut cache = HashMap::new();
+    cache.insert(
+        CanonicalKey::from(&plugin_pkg),
+        make_cached_info(
+            &["1.8.1"],
+            vec![],
+            vec![("1.8.1", vec![("esbuild", ">=0.14.0 <=0.27.x")])],
+        ),
+    );
+    cache.insert(
+        CanonicalKey::from(&esbuild_nested_a),
+        make_cached_info(&["0.25.12", "0.17.6"], vec![], vec![]),
+    );
+
+    let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+    assert!(
+        warnings.is_empty(),
+        "any satisfying esbuild instance should satisfy the peer instead of reporting it missing: {warnings:?}"
+    );
+}
+
 /// `peerDependenciesMeta.optional` suppresses the missing-peer
 /// warning. Real-world example: `react-redux@9` declares optional
 /// peer for older React; users who don't install those see noisy
