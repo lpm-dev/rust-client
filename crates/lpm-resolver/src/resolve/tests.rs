@@ -1346,7 +1346,7 @@ fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
             optional: false,
         },
         ResolvedPackage {
-            package: esbuild_nested_b.clone(),
+            package: esbuild_nested_b,
             version: NpmVersion::parse("0.17.6").unwrap(),
             dependencies: vec![],
             aliases: HashMap::new(),

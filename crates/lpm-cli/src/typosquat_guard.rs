@@ -353,8 +353,7 @@ fn error_context(
 ) -> LpmError {
     let allow_example = findings
         .first()
-        .map(allow_example_for_finding)
-        .unwrap_or_else(default_allow_example);
+        .map_or_else(default_allow_example, allow_example_for_finding);
 
     LpmError::TyposquatSuspected(Box::new(TyposquatErrorContext {
         findings: findings
