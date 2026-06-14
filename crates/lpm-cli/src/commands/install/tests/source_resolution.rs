@@ -931,9 +931,9 @@ fn classify_source_dep_accepts_supported_transitive_specs() {
         ("latest", DepKind::Registry),
         // npm: alias.
         ("npm:@scope/other@^2.0", DepKind::Registry),
-        // workspace: protocol (resolved later in lpm-workspace).
-        ("workspace:*", DepKind::Registry),
-        ("workspace:^1.0.0", DepKind::Registry),
+        // workspace: protocol (resolved by the local-source walker).
+        ("workspace:*", DepKind::Workspace),
+        ("workspace:^1.0.0", DepKind::Workspace),
         // file: directory and link: directory.
         ("file:./packages/local-foo", DepKind::FileDir),
         ("link:./packages/local-foo", DepKind::Link),
@@ -1061,6 +1061,76 @@ async fn workspace_transitive_with_matching_member_does_not_pollute_resolver_dep
         "expected 1 InstallPackage for foo"
     );
     assert_eq!(result.install_pkgs[0].name, "foo");
+}
+
+#[test]
+fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let packages = project_dir.path().join("packages");
+    std::fs::create_dir_all(&packages).unwrap();
+
+    let foo_dir = make_local_pkg(&packages, "foo", "1.0.0", r#"{"bar":"workspace:*"}"#);
+    let bar_dir = make_local_pkg(&packages, "bar", "1.0.0", "");
+
+    let foo = WorkspaceMemberLink {
+        name: "foo".to_string(),
+        version: "1.0.0".to_string(),
+        source_dir: foo_dir,
+    };
+    let bar = WorkspaceMemberLink {
+        name: "bar".to_string(),
+        version: "1.0.0".to_string(),
+        source_dir: bar_dir,
+    };
+    let mut deps = HashMap::new();
+
+    let mut result = pre_resolve_v2_direct_workspace_member_deps(
+        project_dir.path(),
+        &mut deps,
+        std::slice::from_ref(&foo),
+        &[foo.clone(), bar.clone()],
+        true,
+    )
+    .expect("v2 direct workspace pre-resolve should promote workspace child");
+
+    let names: Vec<&str> = result
+        .install_pkgs
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["foo", "bar"]);
+
+    let foo_source = result
+        .install_pkgs
+        .iter()
+        .find(|p| p.name == "foo")
+        .map(|p| p.source.clone())
+        .unwrap();
+    let bar_source = workspace_member_source(project_dir.path(), &bar.source_dir);
+    let foo_specs = result
+        .source_deps
+        .get(&foo_source)
+        .expect("foo source deps should be stashed");
+    assert_eq!(foo_specs.len(), 1);
+    assert_eq!(foo_specs[0].kind, DepKind::Workspace);
+    assert_eq!(
+        foo_specs[0].target_source.as_deref(),
+        Some(bar_source.as_str())
+    );
+
+    apply_post_resolve_directory_link_fixup(&mut result.install_pkgs, &result.source_deps);
+    let bar_source_id = lpm_lockfile::Source::parse(&bar_source)
+        .unwrap()
+        .source_id();
+    let foo_pkg = result
+        .install_pkgs
+        .iter()
+        .find(|p| p.name == "foo")
+        .unwrap();
+    assert_eq!(
+        foo_pkg.dependencies,
+        vec![("bar".to_string(), bar_source_id)]
+    );
 }
 
 /// when a local source's

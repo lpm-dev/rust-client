@@ -657,3 +657,37 @@ fn install_pkg_key_distinguishes_registry_from_tarball_with_same_name_version() 
         "tarball key must embed the tarball URL"
     );
 }
+
+#[test]
+fn dedupe_install_packages_by_identity_merges_workspace_reentry_source_graph() {
+    let mut resolver_pkg = install_package_for_tarball("ignored", None);
+    resolver_pkg.name = "@smoke/cycle-b".to_string();
+    resolver_pkg.version = "1.0.0".to_string();
+    resolver_pkg.source = "directory+../../packages/cycle-b".to_string();
+    resolver_pkg.root_link_names = None;
+    resolver_pkg.is_direct = false;
+    resolver_pkg.tarball_url = None;
+
+    let mut source_graph_pkg = resolver_pkg.clone();
+    source_graph_pkg.dependencies = vec![("@smoke/cycle-a".to_string(), "f-cycle-a".to_string())];
+    source_graph_pkg.root_link_names = Some(Vec::new());
+
+    let mut packages = vec![resolver_pkg, source_graph_pkg];
+    dedupe_install_packages_by_identity(&mut packages);
+
+    assert_eq!(
+        packages.len(),
+        1,
+        "same name/version/source package reached through resolver re-entry and source graph must collapse before linking"
+    );
+    assert_eq!(
+        packages[0].dependencies,
+        vec![("@smoke/cycle-a".to_string(), "f-cycle-a".to_string())],
+        "merged package must retain source-graph dependencies"
+    );
+    assert_eq!(
+        packages[0].root_link_names.as_deref(),
+        Some(&[][..]),
+        "merged transitive workspace package must stay off root links"
+    );
+}

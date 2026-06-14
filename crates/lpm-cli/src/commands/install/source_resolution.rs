@@ -23,8 +23,12 @@ pub(super) enum FileKindClassification {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DepKind {
     /// Registry-style spec — `^1.2.3`, `npm:foo@^1`, `latest`,
-    /// `workspace:*`, etc. Pubgrub/fusion handles it.
+    /// etc. Pubgrub/fusion handles it.
     Registry,
+    /// `workspace:` protocol. v1/local-source installs resolve this
+    /// through a project-root workspace symlink; v2 direct workspace
+    /// installs promote it to a source-backed graph edge.
+    Workspace,
     /// `file:` directory dep (the path is a directory). For -
     /// transitive purposes, file: tarballs are NOT included — they
     /// don't contribute to the wrapper-target resolution and
@@ -54,6 +58,12 @@ pub(super) struct SourceDep {
     /// directory/link target. Registry-style dependencies leave this
     /// empty and resolve through the registry package index.
     pub(super) target_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkspaceTransitiveMode {
+    RootSymlinkOnly,
+    SourceGraph,
 }
 
 /// return shape for
@@ -129,6 +139,7 @@ pub(super) fn expand_local_source_install_packages(
     install_pkgs: &mut Vec<InstallPackage>,
     workspace_members: &[WorkspaceMemberLink],
     json_output: bool,
+    workspace_transitives: WorkspaceTransitiveMode,
 ) -> Result<LocalSourceExpansionResult, LpmError> {
     let mut source_deps_out: HashMap<String, Vec<SourceDep>> = HashMap::new();
     let mut visited_realpaths: HashMap<PathBuf, String> =
@@ -171,6 +182,7 @@ pub(super) fn expand_local_source_install_packages(
             continue;
         };
         recurse_local_source_deps(
+            project_dir,
             &realpath,
             &parent_source_string,
             deps,
@@ -183,6 +195,7 @@ pub(super) fn expand_local_source_install_packages(
             json_output,
             &mut node_modules_warned,
             &mut additional_workspace_links,
+            workspace_transitives,
         )?;
     }
 
@@ -234,6 +247,7 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
         &mut install_pkgs,
         all_workspace_members,
         json_output,
+        WorkspaceTransitiveMode::SourceGraph,
     )?;
 
     Ok(V2WorkspaceRootPreResolveResult {
@@ -1017,6 +1031,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
         &mut install_pkgs,
         workspace_members,
         json_output,
+        WorkspaceTransitiveMode::RootSymlinkOnly,
     )?;
 
     Ok(NonRegistryPreResolveResult {
@@ -1154,9 +1169,10 @@ pub(super) fn read_pkg_json_name_version(
 /// which rejects URL and git specs as invalid semver ranges. Unsupported
 /// transitive shapes must fail here before they reach the resolver.
 ///
-/// Allowed shapes (one of three [`DepKind`] variants returned):
-/// - `DepKind::Registry` for SemverRange / NpmAlias / Workspace —
+/// Allowed shapes:
+/// - `DepKind::Registry` for SemverRange / NpmAlias —
 ///   the resolver handles these cleanly.
+/// - `DepKind::Workspace` for `workspace:` protocol.
 /// - `DepKind::FileDir` for `file:` specs whose target is a
 ///   directory.
 /// - `DepKind::Link` for `link:` specs (always a directory).
@@ -1232,9 +1248,11 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
 /// behavior bit-identical between immediate and transitive arms.
 ///
 /// **Allowed shapes (route through -transitive):**
-/// - SemverRange / NpmAlias / Workspace → [`DepKind::Registry`]; the
+/// - SemverRange / NpmAlias → [`DepKind::Registry`]; the
 ///   spec is appended to the consumer's `deps` map and the root
 ///   resolver (PubGrub or fusion) picks it up.
+/// - Workspace → [`DepKind::Workspace`]; the local-source walker
+///   resolves it against the workspace member set.
 /// - `link:<path>` → [`DepKind::Link`]; recursed into and produces
 ///   a transitive InstallPackage.
 /// - `file:<path>` whose target is a directory → [`DepKind::FileDir`];
@@ -1262,6 +1280,10 @@ pub(super) fn classify_source_dep(
     raw: &str,
     dep_name: &str,
 ) -> Result<DepKind, LpmError> {
+    if raw.starts_with("workspace:") {
+        return Ok(DepKind::Workspace);
+    }
+
     let unsupported_transitive = |kind: &str| -> LpmError {
         LpmError::Registry(format!(
             "transitive non-registry dep `{dep_name}` (\"{raw}\", a {kind}) declared in \
@@ -1276,8 +1298,8 @@ pub(super) fn classify_source_dep(
 
     match lpm_resolver::Specifier::parse(raw) {
         Ok(lpm_resolver::Specifier::SemverRange(_))
-        | Ok(lpm_resolver::Specifier::NpmAlias { .. })
-        | Ok(lpm_resolver::Specifier::Workspace(_)) => Ok(DepKind::Registry),
+        | Ok(lpm_resolver::Specifier::NpmAlias { .. }) => Ok(DepKind::Registry),
+        Ok(lpm_resolver::Specifier::Workspace(_)) => Ok(DepKind::Workspace),
         Ok(lpm_resolver::Specifier::Link { .. }) => Ok(DepKind::Link),
         Ok(lpm_resolver::Specifier::File { path }) => {
             // file: must be stat'd to disambiguate directory (FileDir,
@@ -1459,6 +1481,70 @@ pub(super) fn maybe_warn_pkg_node_modules(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
+fn promote_workspace_member_source_graph(
+    project_dir: &Path,
+    spec: &mut SourceDep,
+    matched_member: &WorkspaceMemberLink,
+    consumer_deps_map: &mut HashMap<String, String>,
+    install_pkgs_out: &mut Vec<InstallPackage>,
+    source_deps_out: &mut HashMap<String, Vec<SourceDep>>,
+    visited: &mut HashMap<PathBuf, String>,
+    current_depth: u32,
+    max_depth: u32,
+    workspace_members: &[WorkspaceMemberLink],
+    json_output: bool,
+    node_modules_warned: &mut std::collections::HashSet<PathBuf>,
+    additional_workspace_links: &mut Vec<WorkspaceMemberLink>,
+    workspace_transitives: WorkspaceTransitiveMode,
+) -> Result<(), LpmError> {
+    let realpath = match matched_member.source_dir.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(()),
+    };
+    let source_string = workspace_member_source(project_dir, &matched_member.source_dir);
+    if let Some(existing_source) = visited.get(&realpath) {
+        spec.target_source = Some(existing_source.clone());
+        return Ok(());
+    }
+    visited.insert(realpath.clone(), source_string.clone());
+    spec.target_source = Some(source_string.clone());
+    install_pkgs_out.push(InstallPackage {
+        name: matched_member.name.clone(),
+        version: matched_member.version.clone(),
+        source: source_string.clone(),
+        dependencies: Vec::new(),
+        aliases: HashMap::new(),
+        root_link_names: Some(Vec::new()),
+        is_direct: false,
+        is_lpm: false,
+        peers: Vec::new(),
+        integrity: None,
+        registry_signatures: Vec::new(),
+        registry_published_at: None,
+        platform: None,
+        optional: false,
+        tarball_url: None,
+        metadata_checked_for_tarball: false,
+    });
+    recurse_local_source_deps(
+        project_dir,
+        &realpath,
+        &source_string,
+        consumer_deps_map,
+        install_pkgs_out,
+        source_deps_out,
+        visited,
+        current_depth + 1,
+        max_depth,
+        workspace_members,
+        json_output,
+        node_modules_warned,
+        additional_workspace_links,
+        workspace_transitives,
+    )
+}
+
 /// recursively pre-resolve a
 /// directory/link source's transitive deps.
 ///
@@ -1486,6 +1572,7 @@ pub(super) fn maybe_warn_pkg_node_modules(
 /// >= max_depth, the function early-returns without processing.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn recurse_local_source_deps(
+    project_dir: &Path,
     source_dir: &Path,
     parent_source_string: &str,
     consumer_deps_map: &mut HashMap<String, String>,
@@ -1506,6 +1593,7 @@ pub(super) fn recurse_local_source_deps(
     // that drives `link_workspace_members`. Pre-the invariant these branches
     // silently dropped the member from the root-symlink set.
     additional_workspace_links: &mut Vec<WorkspaceMemberLink>,
+    workspace_transitives: WorkspaceTransitiveMode,
 ) -> Result<(), LpmError> {
     if current_depth > max_depth {
         return Ok(());
@@ -1515,74 +1603,6 @@ pub(super) fn recurse_local_source_deps(
     for spec in specs.iter_mut() {
         match spec.kind {
             DepKind::Registry => {
-                // **invariant (round 3) — workspace
-                // transitives.** A `workspace:` spec inside a local
-                // source's manifest must NOT be appended to
-                // `consumer_deps_map`: the top-level
-                // `extract_workspace_protocol_deps` pass has already
-                // run by the time this walker fires, so any
-                // `workspace:` spec we append here would land in the
-                // resolver's deps map verbatim and crash
-                // `NpmRange::parse` ("invalid range 'workspace:'").
-                //
-                // Resolution strategy (the invariant): the workspace member
-                // gets a root symlink at `node_modules/<local>` via
-                // `link_workspace_members`. Node module resolution
-                // from inside the wrapper walks ancestors up to the
-                // project root, so `require(<member>)` from inside a
-                // wrapped local source resolves via that root
-                // symlink. Pre-the invariant the comment here claimed the
-                // member was "already symlinked at the project root"
-                // — that was true ONLY when the consumer's top-level
-                // manifest had explicitly written `"<member>":
-                // "workspace:*"` (extracted by
-                // `extract_workspace_protocol_deps`). For transitive
-                // `workspace:` deps the regression showed the root
-                // symlink was missing. Invariant fix: push the matched
-                // member into `additional_workspace_links` so the
-                // install-pipeline caller adds it to
-                // `link_workspace_members`'s input.
-                if spec.raw_spec.starts_with("workspace:") {
-                    let matched_member =
-                        workspace_members.iter().find(|m| m.name == spec.local_name);
-                    let Some(matched_member) = matched_member else {
-                        let mut available: Vec<&str> =
-                            workspace_members.iter().map(|m| m.name.as_str()).collect();
-                        available.sort();
-                        let available_str = if available.is_empty() {
-                            "(this project is not a workspace)".to_string()
-                        } else {
-                            available.join(", ")
-                        };
-                        return Err(LpmError::Workspace(format!(
-                            "transitive `workspace:` dep `{}` (\"{}\") declared in {} \
-                             references package `{}` which is not a workspace member. \
-                             Available members: {}. Workspace transitives only resolve \
-                             when the consumer's project is a workspace AND the named \
-                             package is a member.",
-                            spec.local_name,
-                            spec.raw_spec,
-                            source_dir.display(),
-                            spec.local_name,
-                            available_str,
-                        )));
-                    };
-                    additional_workspace_links.push(WorkspaceMemberLink {
-                        name: spec.local_name.clone(),
-                        version: matched_member.version.clone(),
-                        source_dir: matched_member.source_dir.clone(),
-                    });
-                    // Skip the append. The post-resolve fix-up at
-                    // `apply_post_resolve_directory_link_fixup` also
-                    // handles the missing-from-`packages` case
-                    // gracefully (it logs and skips), so the
-                    // wrapper's `target.dependencies` won't get a
-                    // bogus entry for the workspace sibling. Node's
-                    // ancestor walk reaches the root symlink we
-                    // just queued.
-                    continue;
-                }
-
                 // First-come-first-serve: consumer's own decl wins,
                 // and the FIRST transitive dep encountered for a
                 // given local_name wins over later ones. Acceptable
@@ -1590,6 +1610,59 @@ pub(super) fn recurse_local_source_deps(
                 consumer_deps_map
                     .entry(spec.local_name.clone())
                     .or_insert_with(|| spec.raw_spec.clone());
+            }
+            DepKind::Workspace => {
+                let matched_member = workspace_members.iter().find(|m| m.name == spec.local_name);
+                let Some(matched_member) = matched_member else {
+                    let mut available: Vec<&str> =
+                        workspace_members.iter().map(|m| m.name.as_str()).collect();
+                    available.sort();
+                    let available_str = if available.is_empty() {
+                        "(this project is not a workspace)".to_string()
+                    } else {
+                        available.join(", ")
+                    };
+                    return Err(LpmError::Workspace(format!(
+                        "transitive `workspace:` dep `{}` (\"{}\") declared in {} \
+                         references package `{}` which is not a workspace member. \
+                         Available members: {}. Workspace transitives only resolve \
+                         when the consumer's project is a workspace AND the named \
+                         package is a member.",
+                        spec.local_name,
+                        spec.raw_spec,
+                        source_dir.display(),
+                        spec.local_name,
+                        available_str,
+                    )));
+                };
+                additional_workspace_links.push(WorkspaceMemberLink {
+                    name: spec.local_name.clone(),
+                    version: matched_member.version.clone(),
+                    source_dir: matched_member.source_dir.clone(),
+                });
+                if matches!(
+                    workspace_transitives,
+                    WorkspaceTransitiveMode::RootSymlinkOnly
+                ) {
+                    continue;
+                }
+
+                promote_workspace_member_source_graph(
+                    project_dir,
+                    spec,
+                    matched_member,
+                    consumer_deps_map,
+                    install_pkgs_out,
+                    source_deps_out,
+                    visited,
+                    current_depth,
+                    max_depth,
+                    workspace_members,
+                    json_output,
+                    node_modules_warned,
+                    additional_workspace_links,
+                    workspace_transitives,
+                )?;
             }
             DepKind::FileDir | DepKind::Link => {
                 let path_str = if let Some(p) = spec.raw_spec.strip_prefix("file:") {
@@ -1643,6 +1716,24 @@ pub(super) fn recurse_local_source_deps(
                             version: member.version.clone(),
                             source_dir: member.source_dir.clone(),
                         });
+                        if matches!(workspace_transitives, WorkspaceTransitiveMode::SourceGraph) {
+                            promote_workspace_member_source_graph(
+                                project_dir,
+                                spec,
+                                member,
+                                consumer_deps_map,
+                                install_pkgs_out,
+                                source_deps_out,
+                                visited,
+                                current_depth,
+                                max_depth,
+                                workspace_members,
+                                json_output,
+                                node_modules_warned,
+                                additional_workspace_links,
+                                workspace_transitives,
+                            )?;
+                        }
                         continue;
                     }
                     WorkspaceOverlap::NoOverlap => {}
@@ -1659,7 +1750,7 @@ pub(super) fn recurse_local_source_deps(
                 let source_string = match spec.kind {
                     DepKind::FileDir => format!("directory+{path_str}"),
                     DepKind::Link => format!("link+{path_str}"),
-                    DepKind::Registry => unreachable!(),
+                    DepKind::Registry | DepKind::Workspace => unreachable!(),
                 };
                 spec.target_source = Some(source_string.clone());
                 visited.insert(realpath.clone(), source_string.clone());
@@ -1690,6 +1781,7 @@ pub(super) fn recurse_local_source_deps(
                 });
                 // Recurse into THIS dep's source at depth + 1.
                 recurse_local_source_deps(
+                    project_dir,
                     &realpath,
                     &source_string,
                     consumer_deps_map,
@@ -1702,6 +1794,7 @@ pub(super) fn recurse_local_source_deps(
                     json_output,
                     node_modules_warned,
                     additional_workspace_links,
+                    workspace_transitives,
                 )?;
             }
         }
@@ -1795,7 +1888,7 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
                     // create a symlink without a corresponding
                     // wrapper.
                 }
-                DepKind::FileDir | DepKind::Link => {
+                DepKind::FileDir | DepKind::Link | DepKind::Workspace => {
                     if let Some(target_source) = &spec.target_source
                         && let Some(sid) = source_to_source_id.get(target_source)
                     {

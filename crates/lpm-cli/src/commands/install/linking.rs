@@ -156,6 +156,7 @@ pub(super) async fn run_link_and_finish(
         packages.extend(ephemeral_packages.iter().cloned());
         apply_post_resolve_directory_link_fixup(&mut packages, ephemeral_source_deps);
     }
+    dedupe_install_packages_by_identity(&mut packages);
     let store = PackageStore::from_root(lpm_root);
 
     // Mirror of the online-arm

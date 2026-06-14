@@ -4073,6 +4073,205 @@ async fn install_direct_workspace_dep_installs_member_registry_deps_under_v2_sto
     );
 }
 
+#[tokio::test]
+async fn install_direct_workspace_dep_resolves_workspace_child_under_v2_store() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-direct-workspace-child-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "foo": "workspace:*"
+  }
+}"#,
+    );
+
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "bar": "workspace:*"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/index.js",
+        r#"module.exports = require("bar")
+"#,
+    );
+    project.write_file(
+        "packages/bar/package.json",
+        r#"{
+  "name": "bar",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("packages/bar/index.js", "module.exports = 'from-bar'\n");
+
+    let mut cmd = lpm(&project);
+    cmd.env("LPM_STORE_VERSION", "v2");
+    let output = cmd
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run direct workspace install under v2 store");
+
+    assert!(
+        output.status.success(),
+        "v2 install should succeed for a direct workspace dep with a workspace child\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('foo'))")
+        .output()
+        .expect("spawn node runtime check");
+
+    assert!(
+        runtime.status.success(),
+        "direct workspace member should resolve its workspace child from the v2 link store\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "from-bar",
+        "runtime should resolve foo through its workspace dependency",
+    );
+}
+
+#[tokio::test]
+async fn install_registry_reentry_to_workspace_cycle_dedupes_v2_link_target() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-registry-reentry-cycle-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}"#,
+    );
+    project.write_file(
+        "apps/app/package.json",
+        r#"{
+  "name": "workspace-reentry-app",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@smoke/cycle-a": "workspace:*",
+    "external-reentry": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "apps/app/index.js",
+        r#"const cycleA = require("@smoke/cycle-a")
+const external = require("external-reentry")
+process.stdout.write(`${cycleA.name}:${cycleA.peer}:${external}`)
+"#,
+    );
+    project.write_file(
+        "packages/cycle-a/package.json",
+        r#"{
+  "name": "@smoke/cycle-a",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@smoke/cycle-b": "workspace:*"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/cycle-a/index.js",
+        r#"exports.name = "cycle-a"
+exports.peer = require("@smoke/cycle-b").name
+"#,
+    );
+    project.write_file(
+        "packages/cycle-b/package.json",
+        r#"{
+  "name": "@smoke/cycle-b",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@smoke/cycle-a": "workspace:*"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/cycle-b/index.js",
+        r#"exports.name = "cycle-b"
+exports.peer = require("@smoke/cycle-a").name
+"#,
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "external-reentry",
+            "version": "1.0.0",
+            "dependencies": {
+                "@smoke/cycle-b": "1.0.0"
+            }
+        }),
+        &[(
+            "index.js",
+            b"module.exports = require('@smoke/cycle-b').name\n",
+        )],
+    )
+    .await;
+
+    let app_dir = project.path().join("apps").join("app");
+    let mut cmd = lpm_with_registry(&project, &mock.url());
+    cmd.current_dir(&app_dir);
+    cmd.env("LPM_STORE_VERSION", "v2");
+    let output = cmd
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run v2 install with registry re-entry cycle");
+
+    assert!(
+        output.status.success(),
+        "v2 install should dedupe a workspace package reached through both direct workspace and registry re-entry paths\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let runtime = std::process::Command::new("node")
+        .current_dir(&app_dir)
+        .arg("index.js")
+        .output()
+        .expect("spawn node runtime check");
+
+    assert!(
+        runtime.status.success(),
+        "workspace cycle should remain resolvable after registry re-entry\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&runtime.stdout),
+        String::from_utf8_lossy(&runtime.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&runtime.stdout),
+        "cycle-a:cycle-b:cycle-b",
+        "runtime should resolve both the direct workspace cycle and registry re-entry",
+    );
+}
+
 /// In hoisted mode (`--linker hoisted`), a transitive dep must land at
 /// `node_modules/<C>` directly — flat npm-v3 layout — not nested under
 /// the package that pulled it in. Default isolated mode is exercised by

@@ -17,6 +17,86 @@ pub(super) fn install_pkg_key(p: &InstallPackage) -> String {
     k
 }
 
+fn append_unique_strings(dst: &mut Vec<String>, src: impl IntoIterator<Item = String>) {
+    let mut seen: HashSet<String> = dst.iter().cloned().collect();
+    for value in src {
+        if seen.insert(value.clone()) {
+            dst.push(value);
+        }
+    }
+}
+
+fn append_unique_pairs_by_left(dst: &mut Vec<(String, String)>, src: Vec<(String, String)>) {
+    let mut seen: HashSet<String> = dst.iter().map(|(left, _)| left.clone()).collect();
+    for (left, right) in src {
+        if seen.insert(left.clone()) {
+            dst.push((left, right));
+        }
+    }
+}
+
+fn normalize_implicit_root_links(pkg: &mut InstallPackage) {
+    if pkg.root_link_names.is_none() && pkg.is_direct {
+        pkg.root_link_names = Some(vec![pkg.name.clone()]);
+    }
+}
+
+fn merge_install_package(dst: &mut InstallPackage, mut src: InstallPackage) {
+    normalize_implicit_root_links(dst);
+    normalize_implicit_root_links(&mut src);
+
+    match (&mut dst.root_link_names, src.root_link_names) {
+        (Some(dst_names), Some(src_names)) => append_unique_strings(dst_names, src_names),
+        (None, Some(src_names)) => dst.root_link_names = Some(src_names),
+        (Some(_), None) | (None, None) => {}
+    }
+
+    append_unique_pairs_by_left(&mut dst.dependencies, src.dependencies);
+    for (alias, target) in src.aliases {
+        dst.aliases.entry(alias).or_insert(target);
+    }
+    append_unique_pairs_by_left(&mut dst.peers, src.peers);
+
+    dst.is_direct |= src.is_direct;
+    dst.is_lpm |= src.is_lpm;
+    dst.optional &= src.optional;
+    if dst.integrity.is_none() {
+        dst.integrity = src.integrity;
+    }
+    if dst.registry_signatures.is_empty() {
+        dst.registry_signatures = src.registry_signatures;
+    }
+    if dst.registry_published_at.is_none() {
+        dst.registry_published_at = src.registry_published_at;
+    }
+    if dst.platform.is_none() {
+        dst.platform = src.platform;
+    }
+    if dst.tarball_url.is_none() {
+        dst.tarball_url = src.tarball_url;
+    }
+    dst.metadata_checked_for_tarball |= src.metadata_checked_for_tarball;
+}
+
+pub(super) fn dedupe_install_packages_by_identity(packages: &mut Vec<InstallPackage>) {
+    if packages.len() < 2 {
+        return;
+    }
+
+    let mut index_by_key: HashMap<String, usize> = HashMap::with_capacity(packages.len());
+    let mut deduped = Vec::with_capacity(packages.len());
+    for package in packages.drain(..) {
+        let key = install_pkg_key(&package);
+        if let Some(existing_index) = index_by_key.get(&key).copied() {
+            merge_install_package(&mut deduped[existing_index], package);
+        } else {
+            index_by_key.insert(key, deduped.len());
+            deduped.push(package);
+        }
+    }
+    *packages = deduped;
+}
+
 /// Lightweight representation of a resolved package for the install pipeline.
 /// Used both for fresh resolution results and lockfile-restored packages.
 #[derive(Debug, Clone)]
