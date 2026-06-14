@@ -2627,6 +2627,7 @@ async fn run_with_options_under_store_lock(
             &v2_workspace_root_pre_resolve.source_deps,
         );
     }
+    dedupe_install_packages_by_identity(&mut packages);
 
     let mut packages_for_lockfile = packages.clone();
     if omit_policy.dev {
