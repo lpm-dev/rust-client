@@ -7,7 +7,7 @@ use support::{TempProject, lpm};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const ROLLDOWN_UPDATE_VERSION: &str = "1.1.1";
+const ROLLDOWN_UPDATE_VERSION: &str = "1.1.2";
 
 fn plugin_root(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("plugins")
@@ -132,7 +132,7 @@ async fn mount_github_latest(server: &MockServer) {
         .and(path("/repos/oxc-project/oxc/releases"))
         .and(query_param("per_page", "20"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            { "tag_name": "apps_v1.59.0" }
+            { "tag_name": "apps_v1.71.0" }
         ])))
         .mount(server)
         .await;
@@ -141,7 +141,7 @@ async fn mount_github_latest(server: &MockServer) {
         .and(path("/repos/biomejs/biome/releases"))
         .and(query_param("per_page", "20"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            { "tag_name": "@biomejs/biome@2.4.11" }
+            { "tag_name": "@biomejs/biome@2.5.1" }
         ])))
         .mount(server)
         .await;
@@ -152,7 +152,7 @@ async fn mount_rolldown_update_graph(server: &MockServer) {
         ("bin/cli.mjs", b"#!/usr/bin/env node\n"),
         (
             "package.json",
-            br#"{"name":"rolldown","version":"1.1.1","bin":{"rolldown":"./bin/cli.mjs"}}"#,
+            br#"{"name":"rolldown","version":"1.1.2","bin":{"rolldown":"./bin/cli.mjs"}}"#,
         ),
     ]);
     let pluginutils_tarball = create_test_tarball(&[(
@@ -164,17 +164,18 @@ async fn mount_rolldown_update_graph(server: &MockServer) {
         br#"{"name":"@oxc-project/types","version":"0.135.0"}"#,
     )]);
     let binding_package = rolldown_binding_package_for_current_platform();
-    let binding_package_json = format!(r#"{{"name":"{binding_package}","version":"1.1.1"}}"#);
+    let binding_package_json =
+        format!(r#"{{"name":"{binding_package}","version":"{ROLLDOWN_UPDATE_VERSION}"}}"#);
     let binding_tarball = create_test_tarball(&[
         ("package.json", binding_package_json.as_bytes()),
         ("binding.node", b"binding-bytes"),
     ]);
 
-    let root_path = "/rolldown/-/rolldown-1.1.1.tgz";
+    let root_path = "/rolldown/-/rolldown-1.1.2.tgz";
     let pluginutils_path = "/@rolldown/pluginutils/-/pluginutils-1.1.0.tgz";
     let oxc_types_path = "/@oxc-project/types/-/types-0.135.0.tgz";
     let binding_path = format!(
-        "/{binding_package}/-/{}-1.1.1.tgz",
+        "/{binding_package}/-/{}-{ROLLDOWN_UPDATE_VERSION}.tgz",
         binding_package.rsplit('/').next().unwrap()
     );
 
@@ -295,17 +296,17 @@ fn plugin_list_json_reports_installed_versions_and_known_latest_versions() {
     let oxlint = plugin_entry(plugins, "oxlint");
     assert_eq!(oxlint["installed"], serde_json::json!(["1.57.0"]));
     assert_eq!(oxlint["current"], serde_json::json!("1.57.0"));
-    assert_eq!(oxlint["latest"], serde_json::json!("1.58.0"));
+    assert_eq!(oxlint["latest"], serde_json::json!("1.70.0"));
 
     let biome = plugin_entry(plugins, "biome");
     assert_eq!(biome["installed"], serde_json::json!([]));
     assert_eq!(biome["current"], serde_json::json!("not installed"));
-    assert_eq!(biome["latest"], serde_json::json!("2.4.10"));
+    assert_eq!(biome["latest"], serde_json::json!("2.5.0"));
 
     let rolldown = plugin_entry(plugins, "rolldown");
     assert_eq!(rolldown["installed"], serde_json::json!([]));
     assert_eq!(rolldown["current"], serde_json::json!("not installed"));
-    assert_eq!(rolldown["latest"], serde_json::json!("1.0.2"));
+    assert_eq!(rolldown["latest"], serde_json::json!("1.1.1"));
 
     insta::assert_json_snapshot!("plugin_list_json_one_installed_plugin", envelope);
 }
@@ -314,7 +315,7 @@ fn plugin_list_json_reports_installed_versions_and_known_latest_versions() {
 fn plugin_list_human_renders_table_and_slim_completion() {
     let project = TempProject::empty(r#"{"name":"plugin-test","version":"1.0.0"}"#);
     seed_installed_plugin(&project, "oxlint", "1.57.0");
-    seed_installed_plugin(&project, "biome", "2.4.10");
+    seed_installed_plugin(&project, "biome", "2.5.0");
 
     let output = lpm(&project)
         .args(["--color=always", "plugin", "list"])
@@ -353,7 +354,7 @@ fn plugin_list_human_renders_table_and_slim_completion() {
     assert!(
         stdout_raw.contains("\u{1b}[2mPlugin")
             && stdout_raw.contains("\u{1b}[2m1.57.0")
-            && stdout_raw.contains("\u{1b}[33m1.58.0")
+            && stdout_raw.contains("\u{1b}[33m1.70.0")
             && stdout_raw.contains("\u{1b}[33mupdate available")
             && stdout_raw.contains("\u{1b}[32mcurrent"),
         "plugin list must apply slim color roles, got:\n{stdout_raw:?}"
@@ -402,8 +403,8 @@ async fn plugin_outdated_json_reports_managed_tools_and_project_owned_tsdown() {
 
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["outdated_count"], serde_json::json!(3));
-    assert_eq!(plugin_entry(plugins, "oxlint")["latest"], "1.59.0");
-    assert_eq!(plugin_entry(plugins, "biome")["latest"], "2.4.11");
+    assert_eq!(plugin_entry(plugins, "oxlint")["latest"], "1.71.0");
+    assert_eq!(plugin_entry(plugins, "biome")["latest"], "2.5.1");
     assert_eq!(
         plugin_entry(plugins, "rolldown")["latest"],
         ROLLDOWN_UPDATE_VERSION
