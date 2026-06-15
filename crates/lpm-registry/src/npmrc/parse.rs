@@ -566,6 +566,17 @@ mod tests {
         }
     }
 
+    fn encoded_npmrc_password(password: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(password.as_bytes())
+    }
+
+    fn encoded_basic_credential(username: &str, password: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("{username}:{password}").as_bytes())
+    }
+
     #[test]
     fn empty_file_yields_default_config() {
         let cfg = NpmrcConfig::parse("", "test", &no_env);
@@ -660,13 +671,13 @@ mod tests {
 
     #[test]
     fn basic_auth_via_combined_field() {
-        // base64("user:pass") = "dXNlcjpwYXNz"
-        let content = "//npm.internal/:_auth=dXNlcjpwYXNz\n";
-        let cfg = NpmrcConfig::parse(content, "test", &no_env);
+        let credential = encoded_basic_credential("user", "pass");
+        let content = format!("//npm.internal/:_auth={credential}\n");
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
         let auth = cfg.auth_for_url("https://npm.internal/").unwrap();
         match auth {
             RegistryAuth::Basic { credential: s, .. } => {
-                assert_eq!(s.expose_secret(), "dXNlcjpwYXNz")
+                assert_eq!(s.expose_secret(), credential.as_str())
             }
             other => panic!("expected Basic, got {other:?}"),
         }
@@ -674,17 +685,16 @@ mod tests {
 
     #[test]
     fn basic_auth_via_split_username_password() {
-        // username=user, password is base64("pass")="cGFzcw=="
-        // Joined+re-encoded: base64("user:pass")="dXNlcjpwYXNz"
-        let content = concat!(
-            "//npm.internal/:_username=user\n",
-            "//npm.internal/:_password=cGFzcw==\n"
+        let password = encoded_npmrc_password("pass");
+        let content = format!(
+            "//npm.internal/:_username=user\n\
+             //npm.internal/:_password={password}\n"
         );
-        let cfg = NpmrcConfig::parse(content, "test", &no_env);
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
         let auth = cfg.auth_for_url("https://npm.internal/").unwrap();
         match auth {
             RegistryAuth::Basic { credential: s, .. } => {
-                assert_eq!(s.expose_secret(), "dXNlcjpwYXNz")
+                assert_eq!(s.expose_secret(), encoded_basic_credential("user", "pass"))
             }
             other => panic!("expected Basic, got {other:?}"),
         }
@@ -1421,8 +1431,9 @@ mod tests {
         // partial-credential warnings.
         let system =
             NpmrcConfig::parse_layer("//npm.internal/:_username=alice\n", "/etc/npmrc", &no_env);
+        let password = encoded_npmrc_password("pass");
         let user = NpmrcConfig::parse_layer(
-            "//npm.internal/:_password=cGFzcw==\n", // base64("pass")
+            &format!("//npm.internal/:_password={password}\n"),
             "~/.npmrc",
             &no_env,
         );
@@ -1437,10 +1448,9 @@ mod tests {
         let auth = acc
             .auth_for_url("https://npm.internal/foo")
             .expect("composed Basic credential should resolve");
-        // base64("alice:pass") == "YWxpY2U6cGFzcw=="
         match auth {
             RegistryAuth::Basic { credential: s, .. } => {
-                assert_eq!(s.expose_secret(), "YWxpY2U6cGFzcw==")
+                assert_eq!(s.expose_secret(), encoded_basic_credential("alice", "pass"))
             }
             other => panic!("expected Basic, got {other:?}"),
         }
@@ -1451,13 +1461,15 @@ mod tests {
         // Per-subkey last-wins: lower layer's _password is replaced by
         // higher layer's, but lower layer's _username survives because
         // higher doesn't set one.
+        let old_password = encoded_npmrc_password("old-pw");
         let lower = NpmrcConfig::parse_layer(
-            "//npm.internal/:_username=alice\n//npm.internal/:_password=b2xkLXB3\n", // "old-pw"
+            &format!("//npm.internal/:_username=alice\n//npm.internal/:_password={old_password}\n"),
             "/etc/npmrc",
             &no_env,
         );
+        let new_password = encoded_npmrc_password("new-pw");
         let higher = NpmrcConfig::parse_layer(
-            "//npm.internal/:_password=bmV3LXB3\n", // "new-pw"
+            &format!("//npm.internal/:_password={new_password}\n"),
             "~/.npmrc",
             &no_env,
         );
@@ -1465,10 +1477,12 @@ mod tests {
         acc.merge_over(higher);
         acc.finalize();
         let auth = acc.auth_for_url("https://npm.internal/").unwrap();
-        // base64("alice:new-pw") == "YWxpY2U6bmV3LXB3"
         match auth {
             RegistryAuth::Basic { credential: s, .. } => {
-                assert_eq!(s.expose_secret(), "YWxpY2U6bmV3LXB3")
+                assert_eq!(
+                    s.expose_secret(),
+                    encoded_basic_credential("alice", "new-pw")
+                )
             }
             _ => panic!("expected Basic"),
         }
@@ -1723,11 +1737,12 @@ mod tests {
     #[test]
     fn _authtoken_beats_auth_within_same_origin() {
         // Precedence: _authToken > _auth > _username/_password.
-        let content = concat!(
-            "//npm.internal/:_authToken=BEARER\n",
-            "//npm.internal/:_auth=dXNlcjpwYXNz\n",
+        let credential = encoded_basic_credential("user", "pass");
+        let content = format!(
+            "//npm.internal/:_authToken=BEARER\n\
+             //npm.internal/:_auth={credential}\n"
         );
-        let cfg = NpmrcConfig::parse(content, "test", &no_env);
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
         let auth = cfg.auth_for_url("https://npm.internal/").unwrap();
         match auth {
             RegistryAuth::Bearer { token: s, .. } => assert_eq!(s.expose_secret(), "BEARER"),

@@ -316,6 +316,17 @@ mod tests {
         }
     }
 
+    fn encoded_npmrc_password(password: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(password.as_bytes())
+    }
+
+    fn encoded_basic_credential(username: &str, password: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("{username}:{password}").as_bytes())
+    }
+
     // ---- Walker tests ----
 
     use std::fs;
@@ -423,7 +434,13 @@ mod tests {
         let system_dir = TempDir::new().unwrap();
         let proj_dir = TempDir::new().unwrap();
         write_npmrc(system_dir.path(), "//npm.internal/:_username=alice\n");
-        write_npmrc(proj_dir.path(), "//npm.internal/:_password=cGFzcw==\n");
+        write_npmrc(
+            proj_dir.path(),
+            &format!(
+                "//npm.internal/:_password={}\n",
+                encoded_npmrc_password("pass")
+            ),
+        );
         let cfg = NpmrcConfig::load_from_paths(
             &[
                 system_dir.path().join(".npmrc"),
@@ -440,9 +457,8 @@ mod tests {
             .auth_for_url("https://npm.internal/foo")
             .expect("composed Basic credential should resolve");
         match auth {
-            // base64("alice:pass") == "YWxpY2U6cGFzcw=="
             RegistryAuth::Basic { credential: s, .. } => {
-                assert_eq!(s.expose_secret(), "YWxpY2U6cGFzcw==")
+                assert_eq!(s.expose_secret(), encoded_basic_credential("alice", "pass"))
             }
             other => panic!("expected Basic, got {other:?}"),
         }
