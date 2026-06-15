@@ -104,6 +104,7 @@ jobs:
     needs: verify
     if: github.event_name == 'push' || inputs.mode == 'full'
     runs-on: ${{ matrix.os }}
+    environment: windows-signing
     timeout-minutes: 30
     strategy:
       matrix:
@@ -144,19 +145,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-cli
 
-      # Phase 46.3 PR-2: the Windows runtime ships an additional
-      # binary, `lpm-sandbox-helper.exe`, that delivers AppContainer
-      # strict-mode (filesystem + outbound-network containment) by
-      # doing the `STARTUPINFOEXW` dance the stable Rust
-      # `std::process::Command` API doesn't expose. The release
-      # job builds it alongside `lpm-rs.exe` so they ship together
-      # in `npm/cli-win32-x64`. macOS / Linux builds skip this step:
-      # the helper is a Windows-only sandbox backend.
+      # The Windows runtime ships an additional helper binary for
+      # AppContainer strict-mode. Build it with the CLI so the release
+      # artifact and npm platform package consume the same signed bytes.
       - name: Build sandbox helper (Windows)
         if: runner.os == 'Windows'
         run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-sandbox --bin lpm-sandbox-helper
@@ -261,6 +257,85 @@ jobs:
           cp target/${{ matrix.target }}/release/lpm-rs.exe ${{ matrix.binary }}
           cp target/${{ matrix.target }}/release/lpm-sandbox-helper.exe lpm-sandbox-helper-win32-x64.exe
 
+      - name: Report Windows signing disabled
+        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING_ENABLED != 'true'
+        shell: pwsh
+        run: |
+          Write-Warning "Windows signing is disabled because WINDOWS_SIGNING_ENABLED is not true. This release will publish unsigned Windows binaries. Enable it only after the Windows signing smoke workflow passes."
+
+      - name: Validate Windows signing configuration
+        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING_ENABLED == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_AZURE_CLIENT_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_CLIENT_ID }}
+          WINDOWS_SIGNING_AZURE_TENANT_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_TENANT_ID }}
+          WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID }}
+          WINDOWS_SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+          WINDOWS_SIGNING_ACCOUNT_NAME: ${{ vars.WINDOWS_SIGNING_ACCOUNT_NAME }}
+          WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME }}
+        run: |
+          $missing = @()
+          foreach ($name in @(
+            "WINDOWS_SIGNING_AZURE_CLIENT_ID",
+            "WINDOWS_SIGNING_AZURE_TENANT_ID",
+            "WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID",
+            "WINDOWS_SIGNING_ENDPOINT",
+            "WINDOWS_SIGNING_ACCOUNT_NAME",
+            "WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME"
+          )) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              $missing += $name
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            Write-Error ("Set Windows signing repository secrets/variables before publishing Windows release artifacts. Missing: " + ($missing -join ", "))
+            exit 1
+          }
+
+      - name: Azure login (Windows signing)
+        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING_ENABLED == 'true'
+        uses: azure/login@2dd0bbf4064d5a1812889dc200bb8eed2597f82a # v3
+        with:
+          client-id: ${{ secrets.WINDOWS_SIGNING_AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.WINDOWS_SIGNING_AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign binaries (Windows)
+        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING_ENABLED == 'true'
+        uses: azure/artifact-signing-action@c0ae2c1d0c1847ab81ac0ab8521bee597cfedd30 # v2
+        with:
+          endpoint: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.WINDOWS_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: |
+            ${{ github.workspace }}\${{ matrix.binary }}
+            ${{ github.workspace }}\lpm-sandbox-helper-win32-x64.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: LPM CLI
+          description-url: https://github.com/lpm-dev/rust-client
+
+      - name: Verify signatures (Windows)
+        if: runner.os == 'Windows' && vars.WINDOWS_SIGNING_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          foreach ($file in @(".\${{ matrix.binary }}", ".\lpm-sandbox-helper-win32-x64.exe")) {
+            $signature = Get-AuthenticodeSignature -FilePath $file
+            $signature | Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
+
+            if ($signature.Status -ne "Valid") {
+              Write-Error "Authenticode signature for $file is $($signature.Status): $($signature.StatusMessage)"
+              exit 1
+            }
+
+            if ($null -eq $signature.TimeStamperCertificate) {
+              Write-Error "Authenticode signature for $file does not include a timestamp."
+              exit 1
+            }
+          }
+
       - name: Upload artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
@@ -315,7 +390,7 @@ jobs:
       - name: Verify every published binary is enumerated in SHA256SUMS.txt
         working-directory: binaries
         run: |
-          ls --format=single-column | grep -vE '^SHA256SUMS\.txt(\.sigstore)?$' | sort > /tmp/published.txt
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' ! -name 'SHA256SUMS.txt.sigstore' -printf '%f\n' | sort > /tmp/published.txt
           awk '{print $2}' SHA256SUMS.txt | sort > /tmp/manifest.txt
           if ! diff -u /tmp/published.txt /tmp/manifest.txt; then
             echo "::error::SHA256SUMS.txt enumeration drifted from binaries/ contents. Update the sha256sum step above to add or remove entries."
@@ -377,11 +452,11 @@ jobs:
           publish_pkg() {
             npx npm@11.12.1 publish --provenance --access public 2>&1 | tee /tmp/npm-publish.log
             local exit_code=${PIPESTATUS[0]}
-            if [ $exit_code -ne 0 ]; then
+            if [ "$exit_code" -ne 0 ]; then
               if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then
                 echo "Already published — skipping"
               else
-                return $exit_code
+                return "$exit_code"
               fi
             fi
           }
@@ -489,11 +564,11 @@ jobs:
           echo "Publishing @lpm-registry/cli@${VERSION}..."
           npx npm@11.12.1 publish --provenance --access public 2>&1 | tee /tmp/npm-publish.log
           exit_code=${PIPESTATUS[0]}
-          if [ $exit_code -ne 0 ]; then
+          if [ "$exit_code" -ne 0 ]; then
             if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then
               echo "Already published — skipping"
             else
-              exit $exit_code
+              exit "$exit_code"
             fi
           fi
 
@@ -574,7 +649,7 @@ jobs:
           export_manifest_hash lpm-darwin-x64 SHA_DARWIN_X64
           export_manifest_hash lpm-linux-arm64 SHA_LINUX_ARM64
           export_manifest_hash lpm-linux-x64 SHA_LINUX_X64
-          echo "VERSION=${VERSION#v}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
 
       - name: Update Homebrew tap
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
