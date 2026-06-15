@@ -32,16 +32,17 @@ fn request_platform_approval(_prompt: &str) -> Result<bool, LpmError> {
 }
 
 #[cfg(target_os = "windows")]
-fn request_platform_approval(_prompt: &str) -> Result<bool, LpmError> {
-    run_native_auth_command({
-        let mut command = std::process::Command::new("powershell");
-        command.args([
-            "-NoProfile",
-            "-Command",
-            "Start-Process -FilePath powershell -ArgumentList '-NoProfile -Command exit 0' -Verb RunAs -Wait",
-        ]);
-        command
-    })
+fn request_platform_approval(prompt: &str) -> Result<bool, LpmError> {
+    match request_windows_hello_approval(prompt)? {
+        WindowsHelloVerificationAction::Approved => Ok(true),
+        WindowsHelloVerificationAction::Denied => Ok(false),
+        WindowsHelloVerificationAction::TerminalFallback(reason) => {
+            request_windows_terminal_fallback(prompt, reason)
+        }
+        WindowsHelloVerificationAction::FailClosed(reason) => {
+            Err(windows_hello_unavailable_error(reason))
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -51,7 +52,7 @@ fn request_platform_approval(prompt: &str) -> Result<bool, LpmError> {
     )))
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 fn run_native_auth_command(mut command: std::process::Command) -> Result<bool, LpmError> {
     match command.status() {
         Ok(status) => Ok(status.success()),
@@ -62,6 +63,197 @@ fn run_native_auth_command(mut command: std::process::Command) -> Result<bool, L
             "native security approval failed to launch: {err}"
         ))),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn request_windows_hello_approval(
+    prompt: &str,
+) -> Result<WindowsHelloVerificationAction, LpmError> {
+    use windows::Security::Credentials::UI::{UserConsentVerificationResult, UserConsentVerifier};
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+    use windows::Win32::System::Console::GetConsoleWindow;
+    use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
+    use windows::core::{HSTRING, factory};
+    use windows_future::IAsyncOperation;
+
+    let _apartment = WindowsRuntimeApartment::initialize(RPC_E_CHANGED_MODE)?;
+    let availability = UserConsentVerifier::CheckAvailabilityAsync()
+        .and_then(|operation| operation.join())
+        .map_err(|err| {
+            LpmError::Registry(format!(
+                "native Windows security approval could not check Windows Hello availability: {err}"
+            ))
+        })?;
+    match windows_hello_availability_action(availability.0) {
+        WindowsHelloAvailabilityAction::UseWindowsHello => {}
+        WindowsHelloAvailabilityAction::TerminalFallback(reason) => {
+            return Ok(WindowsHelloVerificationAction::TerminalFallback(reason));
+        }
+        WindowsHelloAvailabilityAction::FailClosed(reason) => {
+            return Ok(WindowsHelloVerificationAction::FailClosed(reason));
+        }
+    }
+
+    let message = HSTRING::from(prompt);
+    let hwnd = unsafe {
+        // SAFETY: `GetConsoleWindow` only returns the HWND associated with this process's
+        // console, or a null HWND when there is no console window.
+        GetConsoleWindow()
+    };
+    let operation: IAsyncOperation<UserConsentVerificationResult> = if hwnd.0.is_null() {
+        UserConsentVerifier::RequestVerificationAsync(&message)
+    } else {
+        let interop =
+            factory::<UserConsentVerifier, IUserConsentVerifierInterop>().map_err(|err| {
+                LpmError::Registry(format!(
+                    "native Windows security approval could not load Windows Hello interop: {err}"
+                ))
+            })?;
+        unsafe {
+            // SAFETY: `interop` is the activation factory for UserConsentVerifier, `hwnd`
+            // belongs to this process's console window, and `message` is a live HSTRING.
+            interop.RequestVerificationForWindowAsync(hwnd, &message)
+        }
+    }
+    .map_err(|err| {
+        LpmError::Registry(format!(
+            "native Windows security approval could not open Windows Hello: {err}"
+        ))
+    })?;
+
+    let result = operation.join().map_err(|err| {
+        LpmError::Registry(format!(
+            "native Windows security approval did not return a result: {err}"
+        ))
+    })?;
+    Ok(windows_hello_verification_action(result.0))
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsRuntimeApartment {
+    should_uninitialize: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsRuntimeApartment {
+    fn initialize(changed_mode: windows::core::HRESULT) -> Result<Self, LpmError> {
+        match unsafe {
+            // SAFETY: Initializes WinRT for the current thread before using WinRT APIs.
+            windows::Win32::System::WinRT::RoInitialize(
+                windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
+            )
+        } {
+            Ok(()) => Ok(Self {
+                should_uninitialize: true,
+            }),
+            Err(err) if err.code() == changed_mode => Ok(Self {
+                should_uninitialize: false,
+            }),
+            Err(err) => Err(LpmError::Registry(format!(
+                "native Windows security approval could not initialize Windows Runtime: {err}"
+            ))),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsRuntimeApartment {
+    fn drop(&mut self) {
+        if self.should_uninitialize {
+            unsafe {
+                // SAFETY: Paired with a successful `RoInitialize` on this thread.
+                windows::Win32::System::WinRT::RoUninitialize();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn request_windows_terminal_fallback(prompt: &str, reason: &str) -> Result<bool, LpmError> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(LpmError::Registry(format!(
+            "native Windows security approval is unavailable: {reason}; run this command in an interactive terminal or configure Windows Hello or PIN"
+        )));
+    }
+
+    crate::output::warn(&format!(
+        "Windows Hello security approval is unavailable: {reason}. Falling back to terminal confirmation."
+    ));
+    cliclack::confirm(prompt)
+        .interact()
+        .map_err(crate::prompt::prompt_err)
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WindowsHelloAvailabilityAction {
+    UseWindowsHello,
+    TerminalFallback(&'static str),
+    FailClosed(&'static str),
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(super) fn windows_hello_availability_action(code: i32) -> WindowsHelloAvailabilityAction {
+    match code {
+        0 => WindowsHelloAvailabilityAction::UseWindowsHello,
+        1 => WindowsHelloAvailabilityAction::TerminalFallback(
+            "Windows Hello or PIN is not available on this device",
+        ),
+        2 => WindowsHelloAvailabilityAction::TerminalFallback(
+            "Windows Hello or PIN is not configured for this user",
+        ),
+        3 => WindowsHelloAvailabilityAction::FailClosed(
+            "Windows Hello or PIN verification is disabled by policy",
+        ),
+        4 => WindowsHelloAvailabilityAction::FailClosed(
+            "Windows Hello or PIN verification device is busy; try again",
+        ),
+        _ => WindowsHelloAvailabilityAction::FailClosed(
+            "Windows Hello or PIN availability returned an unknown status",
+        ),
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WindowsHelloVerificationAction {
+    Approved,
+    Denied,
+    TerminalFallback(&'static str),
+    FailClosed(&'static str),
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(super) fn windows_hello_verification_action(code: i32) -> WindowsHelloVerificationAction {
+    match code {
+        0 => WindowsHelloVerificationAction::Approved,
+        1 => WindowsHelloVerificationAction::TerminalFallback(
+            "Windows Hello or PIN is not available on this device",
+        ),
+        2 => WindowsHelloVerificationAction::TerminalFallback(
+            "Windows Hello or PIN is not configured for this user",
+        ),
+        3 => WindowsHelloVerificationAction::FailClosed(
+            "Windows Hello or PIN verification is disabled by policy",
+        ),
+        4 => WindowsHelloVerificationAction::FailClosed(
+            "Windows Hello or PIN verification device is busy; try again",
+        ),
+        5 => WindowsHelloVerificationAction::Denied,
+        6 => WindowsHelloVerificationAction::Denied,
+        _ => WindowsHelloVerificationAction::FailClosed(
+            "Windows Hello or PIN verification returned an unknown status",
+        ),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_hello_unavailable_error(reason: &str) -> LpmError {
+    LpmError::Registry(format!(
+        "native Windows security approval is unavailable: {reason}"
+    ))
 }
 
 #[cfg(target_os = "macos")]

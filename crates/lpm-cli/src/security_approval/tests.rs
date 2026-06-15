@@ -488,6 +488,50 @@ fn macos_local_auth_reason_uses_default_when_prompt_is_empty() {
 }
 
 #[test]
+fn windows_hello_availability_uses_native_prompt_when_available() {
+    assert_eq!(
+        super::native_auth::windows_hello_availability_action(0),
+        super::native_auth::WindowsHelloAvailabilityAction::UseWindowsHello
+    );
+}
+
+#[test]
+fn windows_hello_availability_falls_back_when_pin_is_not_configured() {
+    assert_eq!(
+        super::native_auth::windows_hello_availability_action(2),
+        super::native_auth::WindowsHelloAvailabilityAction::TerminalFallback(
+            "Windows Hello or PIN is not configured for this user"
+        )
+    );
+}
+
+#[test]
+fn windows_hello_availability_fails_closed_when_policy_disables_verification() {
+    assert_eq!(
+        super::native_auth::windows_hello_availability_action(3),
+        super::native_auth::WindowsHelloAvailabilityAction::FailClosed(
+            "Windows Hello or PIN verification is disabled by policy"
+        )
+    );
+}
+
+#[test]
+fn windows_hello_verification_approves_when_user_is_verified() {
+    assert_eq!(
+        super::native_auth::windows_hello_verification_action(0),
+        super::native_auth::WindowsHelloVerificationAction::Approved
+    );
+}
+
+#[test]
+fn windows_hello_verification_denies_when_user_cancels() {
+    assert_eq!(
+        super::native_auth::windows_hello_verification_action(6),
+        super::native_auth::WindowsHelloVerificationAction::Denied
+    );
+}
+
+#[test]
 fn project_trust_widening_requires_approval_at_runtime() {
     let temp = tempdir().unwrap();
     let project = temp.path().join("project");
