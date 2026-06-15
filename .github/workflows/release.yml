@@ -27,6 +27,7 @@ env:
   RUST_TOOLCHAIN: "1.94.0"
   APPLE_TEAM_ID: "823S8YKMRW"
   APPLE_CODESIGN_IDENTITY: "Developer ID Application: Tolga Ergin (823S8YKMRW)"
+  APPLE_CODESIGN_IDENTIFIER: "dev.lpm.cli"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
@@ -202,6 +203,7 @@ jobs:
 
           codesign --force --timestamp --options runtime \
             --keychain "$APPLE_SIGNING_KEYCHAIN" \
+            --identifier "$APPLE_CODESIGN_IDENTIFIER" \
             --sign "$APPLE_CODESIGN_IDENTITY" \
             "${{ matrix.binary }}"
 
