@@ -111,10 +111,10 @@ impl AuthStorageAccessKind {
     pub fn macos_notice_message(self) -> &'static str {
         match self {
             AuthStorageAccessKind::AccessToken => {
-                "Checking stored LPM token; macOS may ask for permission. Choose Allow or Always Allow to continue."
+                "Checking stored LPM token; macOS may show an LPM Keychain permission sheet. Choose Allow or Always Allow to continue."
             }
             AuthStorageAccessKind::RefreshToken => {
-                "Checking stored LPM refresh token; macOS may ask for permission. Choose Allow or Always Allow to continue."
+                "Checking stored LPM refresh token; macOS may show an LPM Keychain permission sheet. Choose Allow or Always Allow to continue."
             }
         }
     }
@@ -261,16 +261,15 @@ impl SessionManager {
     /// Resolve the keychain portion of the classification if it hasn't run
     /// yet. Idempotent; all but the first call are atomic-load-only. Safe to
     /// call from either blocking or async contexts: the keychain IPC itself is
-    /// synchronous blocking on macOS (subprocess to `/usr/bin/security` in
-    /// the fallback path) which is the cost we're amortizing away from
+    /// synchronous blocking, which is the cost we're amortizing away from
     /// startup — running it here instead of at `new()` ensures it fires at
     /// most once, and only when a read actually depends on the answer.
     fn ensure_classified(&self) {
         if self.classified.load(Ordering::Acquire) {
             return;
         }
-        // Serialize the actual keychain call so parallel readers don't
-        // both spawn the `security` subprocess. Short-held.
+        // Serialize the actual keychain call so parallel readers don't both
+        // hit secure storage. Short-held.
         let _guard = self.classify_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.classified.load(Ordering::Acquire) {
             return; // peer finished while we waited.

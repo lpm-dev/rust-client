@@ -39,6 +39,11 @@ use security_framework::passwords::{
     get_generic_password as macos_get_generic_password,
     set_generic_password as macos_set_generic_password,
 };
+#[cfg(target_os = "macos")]
+use security_framework::{
+    base::Error as MacosSecurityError,
+    os::macos::passwords::find_generic_password as macos_find_generic_password,
+};
 
 mod session;
 pub use session::{
@@ -56,6 +61,13 @@ const DISABLE_HOST_CLI_AUTH_ENV: &str = "LPM_DISABLE_HOST_CLI_AUTH";
 
 #[cfg(target_os = "macos")]
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+#[cfg(target_os = "macos")]
+enum MacosKeychainLookup {
+    Found(String),
+    NotFound,
+    Failed(MacosSecurityError),
+}
 
 #[cfg(test)]
 const KEYCHAIN_SERVICE_TEST_ENV: &str = "LPM_AUTH_TEST_KEYCHAIN_SERVICE";
@@ -1232,13 +1244,26 @@ fn get_password_from_keychain_account(account: &str) -> Option<String> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Some(token) = get_password_from_macos_keychain_native(service.as_ref(), account) {
-            tracing::debug!("keychain hit via Security.framework");
-            return Some(token);
+        match get_password_from_macos_keychain_native(service.as_ref(), account) {
+            MacosKeychainLookup::Found(token) => {
+                tracing::debug!("keychain hit via Security.framework");
+                return Some(token);
+            }
+            MacosKeychainLookup::NotFound => {}
+            MacosKeychainLookup::Failed(error) => {
+                tracing::debug!("Security.framework keychain lookup failed for {account}: {error}");
+                return None;
+            }
         }
 
-        if let Some(token) = get_token_from_macos_keychain(service.as_ref(), account) {
-            tracing::debug!("keychain hit via security command fallback");
+        if let Some(token) = get_token_from_macos_keychain_legacy(service.as_ref(), account) {
+            tracing::debug!("keychain hit via legacy Security.framework API");
+            // Older JS/keytar items can be visible only through the legacy
+            // Keychain API; rewrite after a successful read so future reads
+            // stay on the modern native prompt path.
+            if let Err(error) = set_password_in_macos_keychain(service.as_ref(), account, &token) {
+                tracing::debug!("legacy keychain item migration failed for {account}: {error}");
+            }
             return Some(token);
         }
     }
@@ -1278,15 +1303,32 @@ fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), St
 }
 
 #[cfg(target_os = "macos")]
-fn get_password_from_macos_keychain_native(service: &str, account: &str) -> Option<String> {
+fn get_password_from_macos_keychain_native(service: &str, account: &str) -> MacosKeychainLookup {
     match macos_get_generic_password(service, account) {
-        Ok(password) => String::from_utf8(password)
-            .ok()
-            .map(|token| token.trim().to_string())
-            .filter(|token| !token.is_empty()),
+        Ok(password) => token_from_keychain_password(password)
+            .map_or(MacosKeychainLookup::NotFound, MacosKeychainLookup::Found),
+        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => MacosKeychainLookup::NotFound,
+        Err(error) => MacosKeychainLookup::Failed(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn token_from_keychain_password(password: Vec<u8>) -> Option<String> {
+    String::from_utf8(password)
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn get_token_from_macos_keychain_legacy(service: &str, account: &str) -> Option<String> {
+    match macos_find_generic_password(None, service, account) {
+        Ok((password, _item)) => token_from_keychain_password(password.as_ref().to_vec()),
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => None,
         Err(error) => {
-            tracing::debug!("Security.framework keychain lookup failed for {account}: {error}");
+            tracing::debug!(
+                "legacy Security.framework keychain lookup failed for {account}: {error}"
+            );
             None
         }
     }
@@ -1334,28 +1376,6 @@ fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
 fn get_token_from_keychain(registry_url: &str) -> Option<String> {
     let account = scoped_account(registry_url);
     get_password_from_keychain_account(&account)
-}
-
-/// Legacy macOS CLI fallback.
-///
-/// `security find-generic-password` can still read older entries that
-/// the direct API path may miss, notably auth items written by the JS
-/// client via Node's keytar integration.
-#[cfg(target_os = "macos")]
-fn get_token_from_macos_keychain(service: &str, account: &str) -> Option<String> {
-    let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", service, "-a", account, "-w"])
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let token = String::from_utf8(output.stdout).ok()?;
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            return Some(token);
-        }
-    }
-    None
 }
 
 fn set_token_in_keychain(registry_url: &str, token: &str) -> Result<(), String> {
@@ -1921,6 +1941,22 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn keychain_password_bytes_trim_surrounding_whitespace() {
+        assert_eq!(
+            token_from_keychain_password(b"  lpm_access_token\n".to_vec()).as_deref(),
+            Some("lpm_access_token")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_password_bytes_ignore_empty_or_invalid_values() {
+        assert_eq!(token_from_keychain_password(b" \n\t".to_vec()), None);
+        assert_eq!(token_from_keychain_password(vec![0xff, 0xfe]), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     #[ignore = "macOS keychain integration; opt-in only and serial execution required"]
     fn macos_auth_h4_write_round_trip() {
         require_keychain_opt_in();
@@ -1937,11 +1973,11 @@ mod tests {
             set_password_in_keychain_account(&refresh_account, "lpm_refresh_token").unwrap();
 
             assert_eq!(
-                get_token_from_macos_keychain(service, &access_account).as_deref(),
+                get_token_from_macos_keychain_legacy(service, &access_account).as_deref(),
                 Some("lpm_access_token")
             );
             assert_eq!(
-                get_token_from_macos_keychain(service, &refresh_account).as_deref(),
+                get_token_from_macos_keychain_legacy(service, &refresh_account).as_deref(),
                 Some("lpm_refresh_token")
             );
 
