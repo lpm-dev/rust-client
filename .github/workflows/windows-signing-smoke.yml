@@ -1,0 +1,119 @@
+name: Windows Signing Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  RUST_TOOLCHAIN: "1.94.0"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  sign:
+    name: Build and sign Windows artifacts
+    runs-on: windows-latest
+    environment: windows-signing
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build CLI and sandbox helper
+        run: |
+          cargo build --locked --release --target x86_64-pc-windows-msvc -p lpm-cli
+          cargo build --locked --release --target x86_64-pc-windows-msvc -p lpm-sandbox --bin lpm-sandbox-helper
+
+      - name: Stage binaries
+        shell: pwsh
+        run: |
+          Copy-Item target\x86_64-pc-windows-msvc\release\lpm-rs.exe .\lpm-win32-x64.exe
+          Copy-Item target\x86_64-pc-windows-msvc\release\lpm-sandbox-helper.exe .\lpm-sandbox-helper-win32-x64.exe
+
+      - name: Validate Windows signing configuration
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_AZURE_CLIENT_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_CLIENT_ID }}
+          WINDOWS_SIGNING_AZURE_TENANT_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_TENANT_ID }}
+          WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID }}
+          WINDOWS_SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+          WINDOWS_SIGNING_ACCOUNT_NAME: ${{ vars.WINDOWS_SIGNING_ACCOUNT_NAME }}
+          WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME }}
+        run: |
+          $missing = @()
+          foreach ($name in @(
+            "WINDOWS_SIGNING_AZURE_CLIENT_ID",
+            "WINDOWS_SIGNING_AZURE_TENANT_ID",
+            "WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID",
+            "WINDOWS_SIGNING_ENDPOINT",
+            "WINDOWS_SIGNING_ACCOUNT_NAME",
+            "WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME"
+          )) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              $missing += $name
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            Write-Error ("Set Windows signing repository secrets/variables before running the signing smoke workflow. Missing: " + ($missing -join ", "))
+            exit 1
+          }
+
+      - name: Azure login
+        uses: azure/login@2dd0bbf4064d5a1812889dc200bb8eed2597f82a # v3
+        with:
+          client-id: ${{ secrets.WINDOWS_SIGNING_AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.WINDOWS_SIGNING_AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign binaries
+        uses: azure/artifact-signing-action@c0ae2c1d0c1847ab81ac0ab8521bee597cfedd30 # v2
+        with:
+          endpoint: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.WINDOWS_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: |
+            ${{ github.workspace }}\lpm-win32-x64.exe
+            ${{ github.workspace }}\lpm-sandbox-helper-win32-x64.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: LPM CLI
+          description-url: https://github.com/lpm-dev/rust-client
+
+      - name: Verify signatures
+        shell: pwsh
+        run: |
+          foreach ($file in @(".\lpm-win32-x64.exe", ".\lpm-sandbox-helper-win32-x64.exe")) {
+            $signature = Get-AuthenticodeSignature -FilePath $file
+            $signature | Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
+
+            if ($signature.Status -ne "Valid") {
+              Write-Error "Authenticode signature for $file is $($signature.Status): $($signature.StatusMessage)"
+              exit 1
+            }
+
+            if ($null -eq $signature.TimeStamperCertificate) {
+              Write-Error "Authenticode signature for $file does not include a timestamp."
+              exit 1
+            }
+          }
+
+      - name: Upload signed smoke artifacts
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: windows-signed-smoke-artifacts
+          path: |
+            lpm-win32-x64.exe
+            lpm-sandbox-helper-win32-x64.exe
+          retention-days: 7
