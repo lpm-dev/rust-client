@@ -10,6 +10,7 @@ mod approval;
 mod audit;
 mod helpers;
 mod managed_policy;
+mod native_auth;
 mod paths;
 mod posture;
 mod project_state;
@@ -164,6 +165,7 @@ mod prelude {
         scope_names, suggested_unlock_command,
     };
     pub(super) use super::managed_policy::{load_managed_policy, managed_policy_error};
+    pub(super) use super::native_auth::request_native_approval;
     pub(super) use super::paths::{
         approved_global_trust_path, approved_posture_path, approved_projects_dir, audit_head_path,
         audit_log_path, security_dir, signing_secret_path, unlocks_dir,
@@ -194,7 +196,7 @@ mod prelude {
         create_unlock_grant_for_scopes, ensure_global_unlock, ensure_project_unlock,
         find_active_project_unlock, has_active_project_unlock, list_active_global_unlocks,
         list_active_project_unlocks, list_active_unlocks, persist_unlock_grant, prompt_for_unlock,
-        read_active_unlocks, request_native_approval,
+        read_active_unlocks,
     };
 
     pub(super) use crate::precedence::PurePolicyKnob;

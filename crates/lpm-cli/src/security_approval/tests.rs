@@ -467,6 +467,26 @@ fn automation_mode_includes_json() {
     assert!(automation);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_local_auth_reason_formats_prompt_as_action_phrase() {
+    assert_eq!(
+        super::native_auth::macos_local_auth_reason(
+            "Approve cooldown-bypass for this project for 10m?"
+        ),
+        "approve cooldown-bypass for this project for 10m"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_local_auth_reason_uses_default_when_prompt_is_empty() {
+    assert_eq!(
+        super::native_auth::macos_local_auth_reason(" ? "),
+        "approve this LPM security action"
+    );
+}
+
 #[test]
 fn project_trust_widening_requires_approval_at_runtime() {
     let temp = tempdir().unwrap();
