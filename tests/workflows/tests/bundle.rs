@@ -10,21 +10,21 @@ use support::assertions::parse_json_output;
 use support::{TempProject, lpm};
 
 #[cfg(unix)]
-const ROLLDOWN_VERSION: &str = "1.0.2";
+const ROLLDOWN_VERSION: &str = "1.1.1";
 #[cfg(unix)]
-const ROLLDOWN_ROOT_TARBALL_URL: &str = "https://registry.npmjs.org/rolldown/-/rolldown-1.0.2.tgz";
+const ROLLDOWN_ROOT_TARBALL_URL: &str = "https://registry.npmjs.org/rolldown/-/rolldown-1.1.1.tgz";
 #[cfg(unix)]
-const ROLLDOWN_ROOT_TARBALL_INTEGRITY: &str = "sha512-oZx5zVDtVB44AW3eaifgDml1gWRDZGvjcfdxonE4swNPG98PrrXjaO/KrnUjzlMnztCCRVlUueA1kCXhARGk6g==";
+const ROLLDOWN_ROOT_TARBALL_INTEGRITY: &str = "sha512-IN750c0p+s3jqJIsFLRZrQazmbAB1kkQDTtQjSt/gbS2ywLhlv4R5Shazer0FZKmuo/BsO3/w2UoYnUjuOZqHg==";
 #[cfg(unix)]
 const ROLLDOWN_PLUGINUTILS_TARBALL_URL: &str =
-    "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.0.tgz";
+    "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.1.tgz";
 #[cfg(unix)]
-const ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY: &str = "sha512-aKs/3GSWyV0mrhNmt/96/Z3yczC3yvrzYATCiCXQebBsGyYzjNdUphRVLeJQ67ySKVXRfMxt2lm12pmXvbPFQQ==";
+const ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY: &str = "sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==";
 #[cfg(unix)]
 const OXC_TYPES_TARBALL_URL: &str =
-    "https://registry.npmjs.org/@oxc-project/types/-/types-0.132.0.tgz";
+    "https://registry.npmjs.org/@oxc-project/types/-/types-0.135.0.tgz";
 #[cfg(unix)]
-const OXC_TYPES_TARBALL_INTEGRITY: &str = "sha512-FESMOxil5Se014ui/Eq8fT5uHJo6nIRwH0PfJrZJXs6Gek3ZVFOrpUv3YIZT20m+extU98Hg1Ym72U58rlsxUQ==";
+const OXC_TYPES_TARBALL_INTEGRITY: &str = "sha512-wR+xRdFkUBMvcAjBJ2q2kcZM6d+DKu2NgoOyxZgYwZdLhmiv6+rnO8PZ/P68kMiZtIKm+pW7zyEJ4kSOs0vo+Q==";
 
 #[cfg(unix)]
 fn current_bundle_platform() -> &'static str {
@@ -65,23 +65,23 @@ fn seeded_rolldown_sidecar_packages_for_version(
     let (binding_subdir, binding_url, binding_integrity) = match platform {
         "darwin-arm64" => (
             "node_modules/@rolldown/binding-darwin-arm64",
-            "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.0.2.tgz",
-            "sha512-vdFA9+C/rekyGce7WqHs/xoT0ioZEWaOFyZLIV1mEeNFaFDUQrPIo8Vs2GvJ6eetb3rzDUtUBgzto3ExpXJB3w==",
+            "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.1.1.tgz",
+            "sha512-rRZRPy/Ynb+Mxu0O6tfPldHeDgAn0sRij+IOUy6sFdUlv3hArGW/DloE3GfAxtqpOJuRNgF74Nr5gM4xBeU2jQ==",
         ),
         "darwin-x64" => (
             "node_modules/@rolldown/binding-darwin-x64",
-            "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.0.2.tgz",
-            "sha512-BewSOwTHazv77DTYiAZXSqqKZ4KP/KonFisDMVU7PImxoWfB2aepnPhd2E4SWz3zDzYgDNbs6jBmTdgNnF02GA==",
+            "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.1.1.tgz",
+            "sha512-/MtefPxhKPyWWFM8L45OWiEqRf+eSU2Qv9ZAyTaoZOoGcoPKxbbhjTJO2/U2IThv0uDZ4NWHc3/oTsR6IEOtww==",
         ),
         "linux-x64" => (
             "node_modules/@rolldown/binding-linux-x64-gnu",
-            "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.0.2.tgz",
-            "sha512-0+bOkiQ779+r1WpoHOWHqncvyySci0vKph+myNDYb+im6meJAzHQXay6oEgnkHuUGouM1LKTZwqKpBow6Kj7CQ==",
+            "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.1.1.tgz",
+            "sha512-NwX/wspnq4vYyMFsqbYvzums3ki/Tk8FZbMzMAovPDp3OfLeYKby/D+9osokadXuYEV3OvpeHlwnr/bG8QMixA==",
         ),
         "linux-arm64" => (
             "node_modules/@rolldown/binding-linux-arm64-gnu",
-            "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.0.2.tgz",
-            "sha512-1jn6qDU5iiOgFgygDzKUuKP0maTi0/f1+sBLgvij/76C77Nm3ts6ufz9Bjg5q5dduxiUIxtq86JIoBvo1xQ4Ig==",
+            "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.1.1.tgz",
+            "sha512-at2EO4o7D/PJLC4Xik16bU4CcjQE2tSv1LfqMA0TRYQYQihRm3gZeDB8xaX28A9SFedibcAk5DeMCKt4REKG0A==",
         ),
         other => panic!("unsupported seeded rolldown platform: {other}"),
     };
@@ -372,7 +372,7 @@ fn bundle_uses_seeded_managed_rolldown_engine_with_lpm_flags() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("› Bundling with Rolldown 1.0.2"),
+        stderr.contains("› Bundling with Rolldown 1.1.1"),
         "bundle must use a slim phase line, got:\n{stderr}"
     );
     assert!(
@@ -423,14 +423,14 @@ fn bundle_uses_approved_rolldown_pin_from_lpm_json() {
         "lpm.json",
         r#"{
   "tools": {
-    "rolldown": "1.1.1"
+    "rolldown": "1.1.2"
   }
 }"#,
     );
     project.write_file("src/index.js", "export const answer = 42\n");
 
     let marker_file = project.home().join("bundle-pinned.log");
-    seed_fake_rolldown_engine_version(&project, &marker_file, "1.1.1", true);
+    seed_fake_rolldown_engine_version(&project, &marker_file, "1.1.2", true);
 
     let output = lpm(&project)
         .args(["bundle", "--entry", "src/index.js", "--out-dir", "dist"])
@@ -445,7 +445,7 @@ fn bundle_uses_approved_rolldown_pin_from_lpm_json() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("› Bundling with Rolldown 1.1.1"),
+        stderr.contains("› Bundling with Rolldown 1.1.2"),
         "bundle must announce the pinned approved rolldown version, got:\n{stderr}"
     );
 
