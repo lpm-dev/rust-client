@@ -56,7 +56,7 @@
 //! distinct GraphKeys via `with_root_link_names` + the dep-edge
 //! disambiguation that flows from each target's own `wrapper_id`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -66,6 +66,7 @@ use lpm_store::v2::{
     DepLink, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple, Store,
 };
 
+use crate::materialize::link_dir_recursive;
 #[cfg(unix)]
 use crate::platform::make_bin_target_executable;
 use crate::validation::{
@@ -121,6 +122,7 @@ pub struct LinkPlanV2 {
     /// re-derive a key after prepare (none today, but the plan is
     /// authoritative).
     pub linker_mode: LinkerMode,
+    compatibility_bin_names: Vec<String>,
 }
 
 impl LinkPlanV2 {
@@ -184,6 +186,26 @@ pub fn link_packages_v2(
     linker_mode: LinkerMode,
     self_package_name: Option<&str>,
 ) -> Result<LinkResult, LpmError> {
+    link_packages_v2_with_compatibility_bin_names(
+        project_dir,
+        targets,
+        store,
+        linker_mode,
+        self_package_name,
+        &[],
+    )
+}
+
+/// Materialize the v2 install set and project-local compatibility islands
+/// for the direct packages that own the requested binary names.
+pub fn link_packages_v2_with_compatibility_bin_names(
+    project_dir: &Path,
+    targets: Vec<V2Target>,
+    store: &Store,
+    linker_mode: LinkerMode,
+    self_package_name: Option<&str>,
+    compatibility_bin_names: &[String],
+) -> Result<LinkResult, LpmError> {
     if targets.is_empty() {
         return Ok(LinkResult {
             linked: 0,
@@ -195,7 +217,13 @@ pub fn link_packages_v2(
         });
     }
 
-    let plan = link_v2_prepare(project_dir, targets, store, linker_mode)?;
+    let plan = link_v2_prepare_with_compatibility_bin_names(
+        project_dir,
+        targets,
+        store,
+        linker_mode,
+        compatibility_bin_names,
+    )?;
     let augmented_slice = &plan.augmented_targets[..];
 
     // Materialize link entries in parallel for installs above the
@@ -283,12 +311,25 @@ pub fn link_v2_prepare(
     store: &Store,
     linker_mode: LinkerMode,
 ) -> Result<LinkPlanV2, LpmError> {
+    link_v2_prepare_with_compatibility_bin_names(project_dir, targets, store, linker_mode, &[])
+}
+
+/// Step 1 of the event-driven v2 link API with requested compatibility
+/// roots derived from project script binary names.
+pub fn link_v2_prepare_with_compatibility_bin_names(
+    project_dir: &Path,
+    targets: Vec<V2Target>,
+    store: &Store,
+    linker_mode: LinkerMode,
+    compatibility_bin_names: &[String],
+) -> Result<LinkPlanV2, LpmError> {
     link_v2_prepare_inner(
         project_dir,
         targets,
         store,
         linker_mode,
         PeerContextMode::DeriveMissing,
+        compatibility_bin_names,
     )
 }
 
@@ -307,12 +348,31 @@ pub fn link_v2_prepare_with_authoritative_peer_context(
     store: &Store,
     linker_mode: LinkerMode,
 ) -> Result<LinkPlanV2, LpmError> {
+    link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_names(
+        project_dir,
+        targets,
+        store,
+        linker_mode,
+        &[],
+    )
+}
+
+/// Step 1 of the event-driven v2 link API with authoritative peer context
+/// and requested compatibility roots derived from project script binary names.
+pub fn link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_names(
+    project_dir: &Path,
+    targets: Vec<V2Target>,
+    store: &Store,
+    linker_mode: LinkerMode,
+    compatibility_bin_names: &[String],
+) -> Result<LinkPlanV2, LpmError> {
     link_v2_prepare_inner(
         project_dir,
         targets,
         store,
         linker_mode,
         PeerContextMode::TrustTargets,
+        compatibility_bin_names,
     )
 }
 
@@ -327,6 +387,7 @@ fn link_v2_prepare_inner(
     store: &Store,
     linker_mode: LinkerMode,
     peer_context: PeerContextMode,
+    compatibility_bin_names: &[String],
 ) -> Result<LinkPlanV2, LpmError> {
     // Top-level linker-stage span. Visible in Tracy with
     // `--features tracy`; filtered at INFO level so it's essentially
@@ -354,6 +415,7 @@ fn link_v2_prepare_inner(
         platform,
         meta_platform,
         linker_mode,
+        compatibility_bin_names: normalize_compatibility_bin_names(compatibility_bin_names),
     })
 }
 
@@ -435,15 +497,36 @@ pub fn link_v2_finalize(
     )
     .entered();
     let augmented_slice = &plan.augmented_targets[..];
-    reconcile_project_node_modules(project_dir, augmented_slice, self_package_name)?;
+    reconcile_project_node_modules(
+        project_dir,
+        augmented_slice,
+        self_package_name,
+        !plan.compatibility_bin_names.is_empty(),
+    )?;
     let symlinked = {
         let _s = tracing::info_span!("linker.finalize.root_symlinks").entered();
         create_root_symlinks(project_dir, augmented_slice, store, &plan.key_map)?
     };
+    let compatibility_links = {
+        let _s = tracing::info_span!("linker.finalize.compatibility").entered();
+        create_project_compatibility_links(
+            project_dir,
+            augmented_slice,
+            store,
+            &plan.key_map,
+            &plan.compatibility_bin_names,
+        )?
+    };
     let bin_count = {
         let _s = tracing::info_span!("linker.finalize.bin_shims").entered();
         clear_bin_dir(project_dir)?;
-        create_bin_links_v2(project_dir, augmented_slice, store, &plan.key_map)?
+        create_bin_links_v2(
+            project_dir,
+            augmented_slice,
+            store,
+            &plan.key_map,
+            &compatibility_links,
+        )?
     };
     let self_referenced = if let Some(self_name) = self_package_name {
         create_self_ref(project_dir, self_name)?
@@ -894,6 +977,7 @@ fn reconcile_project_node_modules(
     project_dir: &Path,
     targets: &[V2Target],
     self_package_name: Option<&str>,
+    preserve_internal_lpm_dir: bool,
 ) -> Result<(), LpmError> {
     let nm = project_dir.join("node_modules");
     if !nm.exists() {
@@ -928,6 +1012,9 @@ fn reconcile_project_node_modules(
             .symlink_metadata()
             .map(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
             .unwrap_or(false);
+        if preserve_internal_lpm_dir && name == ".lpm" && is_real_dir {
+            continue;
+        }
         if name.starts_with('@') && is_real_dir {
             reconcile_scoped_root_dir(&path, &name, &desired)?;
             if std::fs::read_dir(&path)
@@ -1072,6 +1159,720 @@ fn create_root_symlinks(
     Ok(count)
 }
 
+const PROJECT_COMPAT_DIR: &str = "compat";
+const COMPAT_META_FILENAME: &str = ".lpm-compat-meta";
+const COMPAT_META_FORMAT: &str = "lpm-compat-v1";
+
+#[derive(Default)]
+struct CompatibilityLinks {
+    package_dirs_by_key: HashMap<String, PathBuf>,
+}
+
+impl CompatibilityLinks {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            package_dirs_by_key: HashMap::with_capacity(capacity),
+        }
+    }
+
+    fn insert(&mut self, key: &GraphKey, package_dir: PathBuf) {
+        self.package_dirs_by_key
+            .insert(key.dir_name().to_string(), package_dir);
+    }
+
+    fn package_dir_for_key(&self, key: &GraphKey) -> Option<&Path> {
+        self.package_dirs_by_key
+            .get(key.dir_name())
+            .map(PathBuf::as_path)
+    }
+}
+
+struct CompatibilityEntry<'a> {
+    target: &'a V2Target,
+    key: Arc<GraphKey>,
+}
+
+#[derive(Clone)]
+struct CompatibilitySibling {
+    local: String,
+    key: Arc<GraphKey>,
+}
+
+fn project_compatibility_root(project_dir: &Path) -> PathBuf {
+    project_dir
+        .join("node_modules")
+        .join(".lpm")
+        .join(PROJECT_COMPAT_DIR)
+}
+
+fn legacy_project_compatibility_root(project_dir: &Path) -> PathBuf {
+    project_dir.join(".lpm").join(PROJECT_COMPAT_DIR)
+}
+
+/// Return true when every requested project `.bin/<name>` resolves into
+/// LPM's project-local compatibility area.
+pub fn project_compatibility_bins_ready(project_dir: &Path, bin_names: &[String]) -> bool {
+    let bin_names = normalize_compatibility_bin_names(bin_names);
+    if bin_names.is_empty() {
+        return true;
+    }
+
+    let Ok(compatibility_root) = project_compatibility_root(project_dir).canonicalize() else {
+        return false;
+    };
+    let bin_dir = project_dir.join("node_modules").join(".bin");
+    bin_names.iter().all(|bin_name| {
+        bin_dir
+            .join(bin_name)
+            .canonicalize()
+            .is_ok_and(|real| real.starts_with(&compatibility_root))
+    })
+}
+
+fn create_project_compatibility_links(
+    project_dir: &Path,
+    targets: &[V2Target],
+    store: &Store,
+    key_map: &KeyMap,
+    compatibility_bin_names: &[String],
+) -> Result<CompatibilityLinks, LpmError> {
+    let requested_bins = normalize_compatibility_bin_names(compatibility_bin_names);
+    let roots = collect_compatibility_roots_for_bins(targets, store, key_map, &requested_bins);
+
+    if roots.is_empty() {
+        remove_project_compatibility_root(project_dir)?;
+        return Ok(CompatibilityLinks::default());
+    }
+
+    let project_context = collect_project_direct_compatibility_siblings(targets, key_map);
+    let compatibility_root = ensure_project_compatibility_root(project_dir)?;
+    let entries = collect_compatibility_entries(roots, targets, key_map, &project_context)?;
+    let desired: HashSet<String> = entries
+        .iter()
+        .map(|entry| entry.key.dir_name().to_string())
+        .collect();
+    reconcile_compatibility_root(&compatibility_root, &desired)?;
+
+    let mut compatibility_links = CompatibilityLinks::with_capacity(entries.len());
+    for entry in &entries {
+        let package_dir = ensure_compatibility_package_copy(&compatibility_root, entry, store)?;
+        compatibility_links.insert(&entry.key, package_dir);
+    }
+
+    for entry in &entries {
+        sync_compatibility_entry_links(
+            &compatibility_root,
+            entry,
+            key_map,
+            &compatibility_links,
+            &project_context,
+        )?;
+    }
+
+    for entry in &entries {
+        write_compatibility_marker(&compatibility_root, entry)?;
+    }
+
+    rewire_project_roots_to_compat(project_dir, targets, key_map, &compatibility_links)?;
+    Ok(compatibility_links)
+}
+
+fn normalize_compatibility_bin_names(bin_names: &[String]) -> Vec<String> {
+    let mut seen = HashSet::with_capacity(bin_names.len());
+    let mut normalized = Vec::with_capacity(bin_names.len());
+    for name in bin_names {
+        if !is_safe_root_link_name(name) {
+            tracing::warn!("v2 linker: ignoring unsafe compatibility bin name {name:?}");
+            continue;
+        }
+        if seen.insert(name.clone()) {
+            normalized.push(name.clone());
+        }
+    }
+    normalized
+}
+
+fn collect_compatibility_roots_for_bins<'a>(
+    targets: &'a [V2Target],
+    store: &Store,
+    key_map: &KeyMap,
+    requested_bins: &[String],
+) -> Vec<&'a V2Target> {
+    if requested_bins.is_empty() {
+        return Vec::new();
+    }
+    let requested: HashSet<&str> = requested_bins.iter().map(String::as_str).collect();
+    let mut roots = Vec::new();
+    for v2t in targets {
+        if !is_direct(&v2t.target) {
+            continue;
+        }
+        let Some(key) = key_map.get_for(&v2t.target) else {
+            continue;
+        };
+        let pkg_json_path = store.paths().link_package_dir(key).join("package.json");
+        let content = match std::fs::read(&pkg_json_path) {
+            Ok(content) => content,
+            Err(error) => {
+                tracing::debug!(
+                    "v2 linker: skipping compatibility bin scan for {}: failed to read {}: {error}",
+                    v2t.target.name,
+                    pkg_json_path.display()
+                );
+                continue;
+            }
+        };
+        const BIN_KEY: &[u8] = b"\"bin\"";
+        if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
+            continue;
+        }
+        let bin_config = match lpm_workspace::parse_bin_field(&content) {
+            Ok(Some(bin_config)) => bin_config,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::debug!(
+                    "v2 linker: skipping compatibility bin scan for {}: failed to parse package.json: {error}",
+                    v2t.target.name
+                );
+                continue;
+            }
+        };
+        if bin_config
+            .entries(&v2t.target.name)
+            .into_iter()
+            .any(|(cmd_name, _)| requested.contains(cmd_name.as_str()))
+        {
+            roots.push(v2t);
+        }
+    }
+    roots
+}
+
+fn collect_compatibility_entries<'a>(
+    roots: Vec<&'a V2Target>,
+    targets: &'a [V2Target],
+    key_map: &KeyMap,
+    project_context: &[CompatibilitySibling],
+) -> Result<Vec<CompatibilityEntry<'a>>, LpmError> {
+    let mut targets_by_key_dir: HashMap<String, &V2Target> = HashMap::with_capacity(targets.len());
+    for v2t in targets {
+        if let Some(key) = key_map.get_for(&v2t.target) {
+            targets_by_key_dir.insert(key.dir_name().to_string(), v2t);
+        }
+    }
+
+    let mut queue: VecDeque<&V2Target> = roots.into();
+    for sibling in project_context {
+        let Some(target) = targets_by_key_dir.get(sibling.key.dir_name()) else {
+            return Err(LpmError::Store(format!(
+                "v2 linker: project compatibility dependency {} for root context is missing from install set",
+                sibling.key.dir_name()
+            )));
+        };
+        queue.push_back(*target);
+    }
+    let mut seen: HashSet<String> = HashSet::with_capacity(targets.len());
+    let mut entries = Vec::new();
+    while let Some(v2t) = queue.pop_front() {
+        let key = key_map.get_for(&v2t.target).cloned().ok_or_else(|| {
+            LpmError::Store(format!(
+                "v2 linker: missing graph key for compatibility package {}@{}",
+                v2t.target.name, v2t.target.version
+            ))
+        })?;
+        if !seen.insert(key.dir_name().to_string()) {
+            continue;
+        }
+
+        for (_local, dep_key) in compatibility_dependency_links(&v2t.target, key_map)? {
+            let dep_target = targets_by_key_dir.get(dep_key.dir_name()).ok_or_else(|| {
+                LpmError::Store(format!(
+                    "v2 linker: compatibility dependency {} for {}@{} is missing from install set",
+                    dep_key.dir_name(),
+                    v2t.target.name,
+                    v2t.target.version
+                ))
+            })?;
+            queue.push_back(*dep_target);
+        }
+        entries.push(CompatibilityEntry { target: v2t, key });
+    }
+    Ok(entries)
+}
+
+fn collect_project_direct_compatibility_siblings(
+    targets: &[V2Target],
+    key_map: &KeyMap,
+) -> Vec<CompatibilitySibling> {
+    let mut siblings = Vec::new();
+    let mut seen_local = HashSet::new();
+    for v2t in targets {
+        if !v2t.target.is_direct {
+            continue;
+        }
+        let Some(key) = key_map.get_for(&v2t.target) else {
+            continue;
+        };
+        for local in direct_root_link_names(&v2t.target) {
+            if seen_local.insert(local.clone()) {
+                siblings.push(CompatibilitySibling {
+                    local,
+                    key: key.clone(),
+                });
+            }
+        }
+    }
+    siblings
+}
+
+fn compatibility_dependency_links(
+    target: &LinkTarget,
+    key_map: &KeyMap,
+) -> Result<Vec<(String, Arc<GraphKey>)>, LpmError> {
+    let mut links = Vec::with_capacity(target.dependencies.len() + target.peers.len());
+    let mut seen_local: HashSet<String> =
+        HashSet::with_capacity(target.dependencies.len() + target.peers.len());
+
+    for dep in &target.dependencies {
+        if !is_safe_root_link_name(&dep.local) {
+            tracing::warn!(
+                "v2 linker: skipping unsafe compatibility dependency local name {:?} for {}@{}",
+                dep.local,
+                target.name,
+                target.version
+            );
+            continue;
+        }
+        let dep_key = key_map
+            .get_for_dependency(dep)
+            .ok_or_else(|| {
+                LpmError::Store(format!(
+                    "v2 linker: compatibility dep {}=>{}@{} of {}@{} has no resolved graph key",
+                    dep.local,
+                    dep.target_name,
+                    dep.graph_key_value(),
+                    target.name,
+                    target.version
+                ))
+            })?
+            .clone();
+        if seen_local.insert(dep.local.clone()) {
+            links.push((dep.local.clone(), dep_key));
+        }
+    }
+
+    for (peer_name, peer_version) in &target.peers {
+        if !is_safe_root_link_name(peer_name) {
+            tracing::warn!(
+                "v2 linker: skipping unsafe compatibility peer local name {:?} for {}@{}",
+                peer_name,
+                target.name,
+                target.version
+            );
+            continue;
+        }
+        if !seen_local.insert(peer_name.clone()) {
+            continue;
+        }
+        if let Some(peer_key) = key_map.get_peer(peer_name, peer_version) {
+            links.push((peer_name.clone(), peer_key.clone()));
+        }
+    }
+
+    Ok(links)
+}
+
+fn ensure_project_compatibility_root(project_dir: &Path) -> Result<PathBuf, LpmError> {
+    remove_legacy_project_compatibility_root(project_dir)?;
+    let node_modules = ensure_node_modules_dir(project_dir)?;
+    let lpm_dir = node_modules.join(".lpm");
+    ensure_real_dir_or_create(&lpm_dir, "project node_modules/.lpm directory")?;
+    let compatibility_root = project_compatibility_root(project_dir);
+    ensure_real_dir_or_create(&compatibility_root, "project compatibility directory")?;
+    Ok(compatibility_root)
+}
+
+fn ensure_real_dir_or_create(path: &Path, label: &str) -> Result<(), LpmError> {
+    match path.symlink_metadata() {
+        Ok(_) => ensure_real_dir(path, label),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(path).map_err(|e| {
+                LpmError::Store(format!(
+                    "v2 linker: failed to create {label} at {}: {e}",
+                    path.display()
+                ))
+            })?;
+            ensure_real_dir(path, label)
+        }
+        Err(error) => Err(LpmError::Store(format!(
+            "v2 linker: failed to inspect {label} at {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn remove_project_compatibility_root(project_dir: &Path) -> Result<(), LpmError> {
+    let lpm_dir = project_dir.join("node_modules").join(".lpm");
+    let metadata = match lpm_dir.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_legacy_project_compatibility_root(project_dir)?;
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(LpmError::Store(format!(
+                "v2 linker: failed to inspect project node_modules/.lpm directory at {}: {error}",
+                lpm_dir.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(LpmError::Store(format!(
+            "v2 linker: refusing to clean compatibility directory through symlinked node_modules/.lpm at {}",
+            lpm_dir.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+
+    let compatibility_root = project_compatibility_root(project_dir);
+    if compatibility_root.symlink_metadata().is_ok() {
+        remove_node_modules_entry(&compatibility_root, "stale compatibility directory")?;
+    }
+    if std::fs::read_dir(&lpm_dir)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir(&lpm_dir);
+    }
+    remove_legacy_project_compatibility_root(project_dir)?;
+    Ok(())
+}
+
+fn remove_legacy_project_compatibility_root(project_dir: &Path) -> Result<(), LpmError> {
+    let lpm_dir = project_dir.join(".lpm");
+    let metadata = match lpm_dir.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(LpmError::Store(format!(
+                "v2 linker: failed to inspect legacy project .lpm directory at {}: {error}",
+                lpm_dir.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(LpmError::Store(format!(
+            "v2 linker: refusing to clean legacy compatibility directory through symlinked .lpm at {}",
+            lpm_dir.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let compatibility_root = legacy_project_compatibility_root(project_dir);
+    if compatibility_root.symlink_metadata().is_ok() {
+        remove_node_modules_entry(&compatibility_root, "legacy compatibility directory")?;
+    }
+    Ok(())
+}
+
+fn reconcile_compatibility_root(
+    compatibility_root: &Path,
+    desired: &HashSet<String>,
+) -> Result<(), LpmError> {
+    let entries = std::fs::read_dir(compatibility_root).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to read compatibility directory at {}: {e}",
+            compatibility_root.display()
+        ))
+    })?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains(".tmp.") || desired.contains(&name) {
+            continue;
+        }
+        remove_node_modules_entry(&entry.path(), "stale compatibility entry")?;
+    }
+    Ok(())
+}
+
+fn ensure_compatibility_package_copy(
+    compatibility_root: &Path,
+    entry: &CompatibilityEntry<'_>,
+    store: &Store,
+) -> Result<PathBuf, LpmError> {
+    let final_dir = compatibility_entry_dir(compatibility_root, &entry.key);
+    let package_dir = compatibility_package_dir(compatibility_root, &entry.key);
+    if compatibility_entry_reusable(&final_dir, entry) {
+        return Ok(package_dir);
+    }
+    if final_dir.symlink_metadata().is_ok() {
+        remove_node_modules_entry(&final_dir, "stale compatibility entry")?;
+    }
+
+    let tmp_dir = create_compatibility_tmp_dir(&final_dir)?;
+    let tmp_package_dir = tmp_dir.join("node_modules").join(entry.key.name());
+    let source_package_dir = store.paths().link_package_dir(&entry.key);
+    if !source_package_dir.join("package.json").is_file() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(LpmError::Store(format!(
+            "v2 linker: compatibility source package is missing at {}",
+            source_package_dir.display()
+        )));
+    }
+
+    if let Err(error) = link_dir_recursive(&source_package_dir, &tmp_package_dir) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(error);
+    }
+
+    match std::fs::rename(&tmp_dir, &final_dir) {
+        Ok(()) => Ok(package_dir),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            Err(LpmError::Store(format!(
+                "v2 linker: failed to publish compatibility entry {} -> {}: {error}",
+                tmp_dir.display(),
+                final_dir.display()
+            )))
+        }
+    }
+}
+
+fn create_compatibility_tmp_dir(final_dir: &Path) -> Result<PathBuf, LpmError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COMPAT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = final_dir.parent().ok_or_else(|| {
+        LpmError::Store(format!(
+            "v2 linker: compatibility path has no parent: {}",
+            final_dir.display()
+        ))
+    })?;
+    let base_name = final_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            LpmError::Store(format!(
+                "v2 linker: compatibility path has invalid final component: {}",
+                final_dir.display()
+            ))
+        })?;
+    for _ in 0..16 {
+        let suffix = COMPAT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(
+            "{}.tmp.{}.{suffix:x}",
+            base_name,
+            std::process::id()
+        ));
+        match std::fs::create_dir(&tmp) {
+            Ok(()) => return Ok(tmp),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(LpmError::Store(format!(
+                    "v2 linker: failed to create compatibility tmp dir at {}: {error}",
+                    tmp.display()
+                )));
+            }
+        }
+    }
+    Err(LpmError::Store(format!(
+        "v2 linker: failed to allocate compatibility tmp dir for {}",
+        final_dir.display()
+    )))
+}
+
+fn compatibility_entry_reusable(final_dir: &Path, entry: &CompatibilityEntry<'_>) -> bool {
+    let marker = final_dir.join(COMPAT_META_FILENAME);
+    let Ok(content) = std::fs::read_to_string(marker) else {
+        return false;
+    };
+    content == compatibility_marker(entry)
+        && final_dir
+            .join("node_modules")
+            .join(entry.key.name())
+            .join("package.json")
+            .is_file()
+}
+
+fn sync_compatibility_entry_links(
+    compatibility_root: &Path,
+    entry: &CompatibilityEntry<'_>,
+    key_map: &KeyMap,
+    compatibility_links: &CompatibilityLinks,
+    project_context: &[CompatibilitySibling],
+) -> Result<(), LpmError> {
+    let node_modules = compatibility_node_modules_dir(compatibility_root, &entry.key);
+    let mut links = compatibility_dependency_links(&entry.target.target, key_map)?;
+    let own_local = entry.key.name();
+    links.retain(|(local, _)| local != own_local);
+    let mut seen_local: HashSet<String> = HashSet::with_capacity(links.len() + 1);
+    seen_local.insert(own_local.to_string());
+    seen_local.extend(links.iter().map(|(local, _)| local.clone()));
+    for sibling in project_context {
+        if seen_local.insert(sibling.local.clone()) {
+            links.push((sibling.local.clone(), sibling.key.clone()));
+        }
+    }
+    let mut desired: HashSet<String> = HashSet::with_capacity(links.len() + 1);
+    desired.insert(entry.key.name().to_string());
+    desired.extend(links.iter().map(|(local, _)| local.clone()));
+    reconcile_compatibility_node_modules(&node_modules, &desired)?;
+
+    let own_package_dir = compatibility_package_dir(compatibility_root, &entry.key);
+    for (local, dep_key) in links {
+        let Some(target_package_dir) = compatibility_links.package_dir_for_key(&dep_key) else {
+            return Err(LpmError::Store(format!(
+                "v2 linker: compatibility link target {} for {}@{} was not materialized",
+                dep_key.dir_name(),
+                entry.target.target.name,
+                entry.target.target.version
+            )));
+        };
+        if target_package_dir == own_package_dir {
+            continue;
+        }
+        create_compatibility_sibling_link(&node_modules, &local, target_package_dir)?;
+    }
+    Ok(())
+}
+
+fn reconcile_compatibility_node_modules(
+    node_modules: &Path,
+    desired: &HashSet<String>,
+) -> Result<(), LpmError> {
+    let entries = std::fs::read_dir(node_modules).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to read compatibility node_modules at {}: {e}",
+            node_modules.display()
+        ))
+    })?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_real_dir = path
+            .symlink_metadata()
+            .map(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if name.starts_with('@') && is_real_dir {
+            reconcile_scoped_root_dir(&path, &name, desired)?;
+            if std::fs::read_dir(&path)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_dir(&path);
+            }
+            continue;
+        }
+        if !desired.contains(&name) {
+            remove_node_modules_entry(&path, "stale compatibility sibling")?;
+        }
+    }
+    Ok(())
+}
+
+fn create_compatibility_sibling_link(
+    node_modules: &Path,
+    local: &str,
+    target_package_dir: &Path,
+) -> Result<(), LpmError> {
+    if !is_safe_root_link_name(local) {
+        return Err(LpmError::Store(format!(
+            "v2 linker: unsafe compatibility sibling name {local:?}"
+        )));
+    }
+    let link_path = node_modules.join(local);
+    ensure_link_parent_dir(node_modules, &link_path, "compatibility sibling")?;
+    if symlink_points_to(&link_path, target_package_dir) {
+        return Ok(());
+    }
+    if link_path.symlink_metadata().is_ok() {
+        remove_node_modules_entry(&link_path, "stale compatibility sibling")?;
+    }
+    create_dir_symlink_or_junction(target_package_dir, &link_path).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to create compatibility sibling {} -> {}: {e}",
+            link_path.display(),
+            target_package_dir.display()
+        ))
+    })
+}
+
+fn write_compatibility_marker(
+    compatibility_root: &Path,
+    entry: &CompatibilityEntry<'_>,
+) -> Result<(), LpmError> {
+    let marker_path =
+        compatibility_entry_dir(compatibility_root, &entry.key).join(COMPAT_META_FILENAME);
+    std::fs::write(&marker_path, compatibility_marker(entry)).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to write compatibility marker at {}: {e}",
+            marker_path.display()
+        ))
+    })
+}
+
+fn compatibility_marker(entry: &CompatibilityEntry<'_>) -> String {
+    format!(
+        "{COMPAT_META_FORMAT}\nkey={}\nsri={}\n",
+        entry.key.dir_name(),
+        entry.target.source_sri
+    )
+}
+
+fn rewire_project_roots_to_compat(
+    project_dir: &Path,
+    targets: &[V2Target],
+    key_map: &KeyMap,
+    compatibility_links: &CompatibilityLinks,
+) -> Result<(), LpmError> {
+    let nm = ensure_node_modules_dir(project_dir)?;
+    for v2t in targets {
+        let Some(key) = key_map.get_for(&v2t.target) else {
+            continue;
+        };
+        let Some(package_dir) = compatibility_links.package_dir_for_key(key) else {
+            continue;
+        };
+        for root_name in root_link_names(&v2t.target) {
+            if root_name != v2t.target.name {
+                continue;
+            }
+            let link_path = nm.join(&root_name);
+            ensure_link_parent_dir(&nm, &link_path, "compatibility root symlink")?;
+            if symlink_points_to(&link_path, package_dir) {
+                continue;
+            }
+            if link_path.symlink_metadata().is_ok() {
+                remove_node_modules_entry(&link_path, "store root symlink")?;
+            }
+            create_dir_symlink_or_junction(package_dir, &link_path).map_err(|e| {
+                LpmError::Store(format!(
+                    "v2 linker: failed to rewire project root {} -> {}: {e}",
+                    link_path.display(),
+                    package_dir.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn compatibility_entry_dir(compatibility_root: &Path, key: &GraphKey) -> PathBuf {
+    compatibility_root.join(key.dir_name())
+}
+
+fn compatibility_node_modules_dir(compatibility_root: &Path, key: &GraphKey) -> PathBuf {
+    compatibility_entry_dir(compatibility_root, key).join("node_modules")
+}
+
+fn compatibility_package_dir(compatibility_root: &Path, key: &GraphKey) -> PathBuf {
+    compatibility_node_modules_dir(compatibility_root, key).join(key.name())
+}
+
 fn symlink_points_to(link_path: &Path, target_path: &Path) -> bool {
     let Ok(existing_target) = std::fs::read_link(link_path) else {
         return false;
@@ -1129,6 +1930,30 @@ fn root_link_names(target: &LinkTarget) -> Vec<String> {
         .collect()
 }
 
+fn direct_root_link_names(target: &LinkTarget) -> Vec<String> {
+    if !target.is_direct {
+        return Vec::new();
+    }
+    let raw: Vec<String> = target
+        .root_link_names
+        .clone()
+        .unwrap_or_else(|| vec![target.name.clone()]);
+    raw.into_iter()
+        .filter(|name| {
+            if is_safe_root_link_name(name) {
+                true
+            } else {
+                tracing::warn!(
+                    "v2 linker: rejecting unsafe direct root_link_name {name:?} for {}@{}",
+                    target.name,
+                    target.version
+                );
+                false
+            }
+        })
+        .collect()
+}
+
 /// `.bin/` shim creation for the v2 layout. Walks each direct dep's
 /// `package.json` from inside the link entry's package dir
 /// (`<store>/links/<graph-key>/node_modules/<name>/package.json`)
@@ -1144,6 +1969,7 @@ fn create_bin_links_v2(
     targets: &[V2Target],
     store: &Store,
     key_map: &KeyMap,
+    compatibility_links: &CompatibilityLinks,
 ) -> Result<usize, LpmError> {
     let bin_dir = project_dir.join("node_modules").join(".bin");
 
@@ -1164,7 +1990,9 @@ fn create_bin_links_v2(
             Some(k) => k,
             None => continue,
         };
-        let pkg_dir = store.paths().link_package_dir(key);
+        let pkg_dir = compatibility_links
+            .package_dir_for_key(key)
+            .map_or_else(|| store.paths().link_package_dir(key), Path::to_path_buf);
         pkg_json_path.clear();
         pkg_json_path.push(&pkg_dir);
         pkg_json_path.push("package.json");
@@ -1556,6 +2384,277 @@ mod tests {
         // And the symlink target resolves to the lib link entry's
         // package.json.
         assert!(lib_sibling.join("package.json").is_file());
+    }
+
+    #[test]
+    fn link_packages_v2_materializes_next_compatibility_island_under_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let next_sri = synthetic_sri(b"v2/next-compat/next");
+        write_object(
+            &store,
+            &next_sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"next","version":"16.2.4","bin":{"next":"dist/bin/next"},"dependencies":{"@swc/helpers":"0.5.0"},"peerDependencies":{"react":"^19.0.0","react-dom":"^19.0.0"}}"#,
+                ),
+                ("dist/bin/next", b"#!/usr/bin/env node\n"),
+            ],
+        );
+        let react_sri = synthetic_sri(b"v2/next-compat/react");
+        write_object(
+            &store,
+            &react_sri,
+            &[("package.json", br#"{"name":"react","version":"19.2.5"}"#)],
+        );
+        let react_dom_sri = synthetic_sri(b"v2/next-compat/react-dom");
+        write_object(
+            &store,
+            &react_dom_sri,
+            &[(
+                "package.json",
+                br#"{"name":"react-dom","version":"19.2.5"}"#,
+            )],
+        );
+        let helpers_sri = synthetic_sri(b"v2/next-compat/swc-helpers");
+        write_object(
+            &store,
+            &helpers_sri,
+            &[(
+                "package.json",
+                br#"{"name":"@swc/helpers","version":"0.5.0"}"#,
+            )],
+        );
+
+        let mut next = target("next", "16.2.4", &next_sri, true);
+        next.target.dependencies = vec![LinkDependency::registry("@swc/helpers", "0.5.0")];
+        next.target.peers = vec![
+            ("react".to_string(), "19.2.5".to_string()),
+            ("react-dom".to_string(), "19.2.5".to_string()),
+        ];
+        let react = target("react", "19.2.5", &react_sri, true);
+        let react_dom = target("react-dom", "19.2.5", &react_dom_sri, true);
+        let helpers = target("@swc/helpers", "0.5.0", &helpers_sri, false);
+
+        let result = link_packages_v2_with_compatibility_bin_names(
+            &project,
+            vec![next, react, react_dom, helpers],
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &["next".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(result.bin_linked, 1, "next's bin shim must still be linked");
+        let compat_root = project
+            .join("node_modules")
+            .join(".lpm")
+            .join("compat")
+            .canonicalize()
+            .expect("compatibility root should exist");
+        assert!(
+            !project.join(".lpm").join("compat").exists(),
+            "compatibility layout must not sit at project root where framework watchers recurse",
+        );
+        let store_root = store
+            .paths()
+            .root()
+            .canonicalize()
+            .expect("store root should exist");
+        let next_root = project.join("node_modules").join("next");
+        let next_real = next_root
+            .canonicalize()
+            .expect("project next root should resolve");
+        assert!(
+            next_real.starts_with(&compat_root),
+            "Next's root realpath must stay under the project compatibility island, got {}",
+            next_real.display(),
+        );
+        assert!(
+            !next_real.starts_with(&store_root),
+            "Next's root realpath must not point straight into the global v2 store",
+        );
+
+        let compat_node_modules = next_real
+            .parent()
+            .expect("next package dir should live under node_modules");
+        for package in ["react", "react-dom", "@swc/helpers"] {
+            let package_dir = compat_node_modules.join(package);
+            assert!(
+                package_dir.join("package.json").is_file(),
+                "{package} must be available inside Next's project-local compatibility island",
+            );
+            let package_real = package_dir
+                .canonicalize()
+                .unwrap_or_else(|e| panic!("{package} should resolve: {e}"));
+            assert!(
+                package_real.starts_with(&compat_root),
+                "{package} must resolve inside the project compatibility island, got {}",
+                package_real.display(),
+            );
+            assert!(
+                !package_real.starts_with(&store_root),
+                "{package} must not resolve straight into the global v2 store",
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let shim = project.join("node_modules").join(".bin").join("next");
+            let shim_target = std::fs::read_link(&shim).expect("next shim should be a symlink");
+            let shim_real = shim
+                .parent()
+                .unwrap()
+                .join(shim_target)
+                .canonicalize()
+                .expect("next shim target should resolve");
+            assert!(
+                shim_real.starts_with(&compat_root),
+                "next bin shim should execute the project-local compatibility copy, got {}",
+                shim_real.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn link_packages_v2_compatibility_island_exposes_project_direct_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let server_sri = synthetic_sri(b"v2/compat-context/dev-server");
+        write_object(
+            &store,
+            &server_sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"dev-server","version":"1.0.0","bin":{"dev-server":"bin/dev-server.js"},"dependencies":{"shared":"1.0.0"}}"#,
+                ),
+                ("bin/dev-server.js", b"#!/usr/bin/env node\n"),
+            ],
+        );
+        let cli_sri = synthetic_sri(b"v2/compat-context/delegated-cli");
+        write_object(
+            &store,
+            &cli_sri,
+            &[(
+                "package.json",
+                br#"{"name":"delegated-cli","version":"1.0.0"}"#,
+            )],
+        );
+        let shared_dep_sri = synthetic_sri(b"v2/compat-context/shared-1");
+        write_object(
+            &store,
+            &shared_dep_sri,
+            &[("package.json", br#"{"name":"shared","version":"1.0.0"}"#)],
+        );
+        let shared_root_sri = synthetic_sri(b"v2/compat-context/shared-2");
+        write_object(
+            &store,
+            &shared_root_sri,
+            &[("package.json", br#"{"name":"shared","version":"2.0.0"}"#)],
+        );
+
+        let mut server = target("dev-server", "1.0.0", &server_sri, true);
+        server.target.dependencies = vec![LinkDependency::registry("shared", "1.0.0")];
+        let delegated_cli = target("delegated-cli", "1.0.0", &cli_sri, true);
+        let shared_dep = target("shared", "1.0.0", &shared_dep_sri, false);
+        let shared_root = target("shared", "2.0.0", &shared_root_sri, true);
+
+        link_packages_v2_with_compatibility_bin_names(
+            &project,
+            vec![server, delegated_cli, shared_dep, shared_root],
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &["dev-server".to_string()],
+        )
+        .unwrap();
+
+        let compat_root = project
+            .join("node_modules")
+            .join(".lpm")
+            .join("compat")
+            .canonicalize()
+            .expect("compatibility root should exist");
+        let server_real = project
+            .join("node_modules")
+            .join("dev-server")
+            .canonicalize()
+            .expect("dev-server root should resolve");
+        let compat_node_modules = server_real
+            .parent()
+            .expect("dev-server package dir should live under node_modules");
+
+        let delegated_real = compat_node_modules
+            .join("delegated-cli")
+            .canonicalize()
+            .expect("project direct delegated CLI should resolve inside compat");
+        assert!(
+            delegated_real.starts_with(&compat_root),
+            "delegated CLI should resolve inside compat, got {}",
+            delegated_real.display(),
+        );
+
+        let shared_package_json = compat_node_modules.join("shared").join("package.json");
+        let shared_manifest =
+            std::fs::read_to_string(&shared_package_json).expect("shared package.json");
+        assert!(
+            shared_manifest.contains("\"version\":\"1.0.0\""),
+            "package-owned dependency should beat project direct context at {}, got {shared_manifest}",
+            shared_package_json.display(),
+        );
+    }
+
+    #[test]
+    fn link_packages_v2_leaves_unrequested_bins_in_store_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/unrequested-bin/tool");
+        write_object(
+            &store,
+            &sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"tool","version":"1.0.0","bin":{"tool":"bin/tool.js"}}"#,
+                ),
+                ("bin/tool.js", b"#!/usr/bin/env node\n"),
+            ],
+        );
+
+        let result = link_packages_v2(
+            &project,
+            vec![target("tool", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.bin_linked, 1, "tool's bin shim must be linked");
+        assert!(
+            !project.join(".lpm").join("compat").exists(),
+            "legacy compatibility layout should not be created without a requested dev entrypoint bin",
+        );
+        assert!(
+            !project
+                .join("node_modules")
+                .join(".lpm")
+                .join("compat")
+                .exists(),
+            "compatibility layout should not be created without a requested dev entrypoint bin",
+        );
     }
 
     #[test]

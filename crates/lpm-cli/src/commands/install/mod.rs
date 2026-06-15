@@ -592,6 +592,7 @@ pub async fn run_with_options(
     // block and emits a one-line advisory (or attaches `audit_summary`
     // to the JSON envelope). Audit results NEVER fail the install.
     audit_after_install: bool,
+    compatibility_bin_names: &[String],
 ) -> Result<(), LpmError> {
     let lpm_root = lpm_common::LpmRoot::from_env()?;
     run_with_options_with_lpm_root(
@@ -622,6 +623,7 @@ pub async fn run_with_options(
         no_sandbox,
         verbose,
         audit_after_install,
+        compatibility_bin_names,
         lpm_root,
     )
     .await
@@ -656,6 +658,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     no_sandbox: bool,
     verbose: bool,
     audit_after_install: bool,
+    compatibility_bin_names: &[String],
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     // Round 2: hold a shared lock on the store for the
@@ -699,6 +702,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             no_sandbox,
             verbose,
             audit_after_install,
+            compatibility_bin_names,
             &lpm_root,
         ),
     )
@@ -744,6 +748,7 @@ async fn run_with_options_under_store_lock(
     verbose: bool,
     // Resolved audit-after-install boolean — see [`run_with_options`].
     audit_after_install: bool,
+    compatibility_bin_names: &[String],
     lpm_root: &lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
@@ -894,6 +899,7 @@ async fn run_with_options_under_store_lock(
     } else {
         configured_linker_mode
     };
+    let requested_v2_mode = lpm_store::StoreVersion::from_env().is_v2();
 
     // Fast-exit: if package.json + lockfile haven't changed AND the
     // resolved linker matches the one used for the prior install, skip
@@ -914,12 +920,16 @@ async fn run_with_options_under_store_lock(
         &pkg_content_for_state,
         linker_mode,
     );
+    let compatibility_bins_ready = compatibility_bin_names.is_empty()
+        || !requested_v2_mode
+        || lpm_linker::v2::project_compatibility_bins_ready(project_dir, compatibility_bin_names);
     let cleanup_catalogs_in_pipeline = requested_add_count.is_none();
     if !frozen_lockfile_active
         && !force
         && !offline
         && !strict_peer_dependencies
         && install_state.up_to_date
+        && compatibility_bins_ready
     {
         let catalogs_cleaned = if cleanup_catalogs_in_pipeline {
             cleanup_unused_catalogs_after_install(project_dir)?
@@ -1132,7 +1142,6 @@ async fn run_with_options_under_store_lock(
         }
         (Vec::new(), catalog_resolutions)
     };
-    let requested_v2_mode = lpm_store::StoreVersion::from_env().is_v2();
     let direct_workspace_member_deps = if requested_v2_mode {
         workspace_member_deps.clone()
     } else {
@@ -2845,14 +2854,21 @@ async fn run_with_options_under_store_lock(
             .as_deref()
             .expect("v2_event_driven implies v2 store");
         let plan = if used_lockfile && lockfile_peer_context_authoritative {
-            lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context(
+            lpm_linker::v2::link_v2_prepare_with_authoritative_peer_context_and_compatibility_bin_names(
                 project_dir,
                 v2_targets_pre,
                 store_v2,
                 linker_mode,
+                compatibility_bin_names,
             )?
         } else {
-            lpm_linker::v2::link_v2_prepare(project_dir, v2_targets_pre, store_v2, linker_mode)?
+            lpm_linker::v2::link_v2_prepare_with_compatibility_bin_names(
+                project_dir,
+                v2_targets_pre,
+                store_v2,
+                linker_mode,
+                compatibility_bin_names,
+            )?
         };
         Some(std::sync::Arc::new(plan))
     } else {
@@ -4207,12 +4223,13 @@ async fn run_with_options_under_store_lock(
                 materialized: materialized_all,
             }
         } else {
-            lpm_linker::v2::link_packages_v2(
+            lpm_linker::v2::link_packages_v2_with_compatibility_bin_names(
                 project_dir,
                 v2_targets,
                 store_v2,
                 linker_mode,
                 pkg.name.as_deref(),
+                compatibility_bin_names,
             )?
         }
     } else {

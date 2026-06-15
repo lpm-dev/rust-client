@@ -186,6 +186,87 @@ fn resolved_to_install_packages_keeps_distinct_versions() {
 }
 
 #[test]
+fn resolved_to_install_packages_keeps_direct_root_link_when_ambient_peer_has_same_name() {
+    let resolved = vec![
+        fake_resolved("vite", "6.3.5", None),
+        fake_resolved("@vitejs/plugin-react", "1.0.0", None),
+        fake_resolved("vite", "8.0.16", Some("@vitejs/plugin-react")),
+    ];
+    let deps: HashMap<String, String> = [
+        ("vite".to_string(), "6.3.5".to_string()),
+        ("@vitejs/plugin-react".to_string(), "1.0.0".to_string()),
+    ]
+    .into();
+    let ambient_peer_installs = vec!["vite".to_string()];
+
+    let installed = resolved_to_install_packages(
+        &resolved,
+        &deps,
+        &HashMap::new(),
+        &ambient_peer_installs,
+        &HashMap::new(),
+        &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+    );
+
+    let direct = installed
+        .iter()
+        .find(|package| package.name == "vite" && package.version == "6.3.5")
+        .expect("direct vite version should be installed");
+    assert_eq!(
+        direct.root_link_names.as_deref(),
+        Some(&["vite".to_string()][..])
+    );
+    assert!(direct.is_direct);
+
+    let ambient = installed
+        .iter()
+        .find(|package| package.name == "vite" && package.version == "8.0.16")
+        .expect("ambient peer vite version should be installed");
+    assert_eq!(ambient.root_link_names.as_deref(), None);
+    assert!(!ambient.is_direct);
+}
+
+#[test]
+fn resolved_to_install_packages_prefers_unscoped_root_candidate_for_non_semver_direct_spec() {
+    let resolved = vec![
+        fake_resolved("vite", "6.3.5", None),
+        fake_resolved("@vitejs/plugin-react", "1.0.0", None),
+        fake_resolved("vite", "8.0.16", Some("@vitejs/plugin-react")),
+    ];
+    let deps: HashMap<String, String> = [
+        ("vite".to_string(), "file:../local-vite".to_string()),
+        ("@vitejs/plugin-react".to_string(), "1.0.0".to_string()),
+    ]
+    .into();
+
+    let installed = resolved_to_install_packages(
+        &resolved,
+        &deps,
+        &HashMap::new(),
+        &[],
+        &HashMap::new(),
+        &lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+    );
+
+    let direct = installed
+        .iter()
+        .find(|package| package.name == "vite" && package.version == "6.3.5")
+        .expect("unscoped vite candidate should be installed");
+    assert_eq!(
+        direct.root_link_names.as_deref(),
+        Some(&["vite".to_string()][..])
+    );
+    assert!(direct.is_direct);
+
+    let transitive = installed
+        .iter()
+        .find(|package| package.name == "vite" && package.version == "8.0.16")
+        .expect("scoped transitive vite candidate should be installed");
+    assert_eq!(transitive.root_link_names.as_deref(), None);
+    assert!(!transitive.is_direct);
+}
+
+#[test]
 fn resolved_to_install_packages_dedups_preserves_first_order() {
     // When the resolver emits the un-scoped entry first, that's the
     // one whose fields we keep. Later scoped copies are discarded.

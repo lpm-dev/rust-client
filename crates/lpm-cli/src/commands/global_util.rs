@@ -79,6 +79,7 @@ pub(super) async fn run_inner_global_install(
         false,
         false,
         false,
+        &[],
     )
     .await
 }

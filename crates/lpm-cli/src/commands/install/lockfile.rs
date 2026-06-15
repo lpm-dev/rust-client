@@ -341,6 +341,73 @@ pub(crate) fn select_locked_package_for_requested_spec<'a>(
         .or(first_match)
 }
 
+fn select_resolved_package_for_requested_spec<'a>(
+    resolved: &'a [ResolvedPackage],
+    target: &str,
+    requested_spec: &str,
+) -> Option<&'a ResolvedPackage> {
+    let requested_range = requested_range_for_locked_lookup(requested_spec)
+        .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
+    let mut first_match: Option<&ResolvedPackage> = None;
+    let mut first_unscoped: Option<&ResolvedPackage> = None;
+    let mut best_satisfying_unscoped: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
+    let mut best_satisfying: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
+    let mut best_any_unscoped: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
+    let mut best_any: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
+
+    for candidate in resolved {
+        if candidate.package.canonical_name() != target {
+            continue;
+        }
+        if first_match.is_none() {
+            first_match = Some(candidate);
+        }
+        let is_unscoped = candidate.package.context().is_none();
+        if is_unscoped && first_unscoped.is_none() {
+            first_unscoped = Some(candidate);
+        }
+
+        let version = candidate.version.clone();
+        let better_any = best_any.as_ref().is_none_or(|(best, _)| version > *best);
+        if better_any {
+            best_any = Some((version.clone(), candidate));
+        }
+        if is_unscoped
+            && best_any_unscoped
+                .as_ref()
+                .is_none_or(|(best, _)| version > *best)
+        {
+            best_any_unscoped = Some((version.clone(), candidate));
+        }
+
+        if let Some(range) = requested_range.as_ref()
+            && range.satisfies(&version)
+        {
+            let better_satisfying = best_satisfying
+                .as_ref()
+                .is_none_or(|(best, _)| version > *best);
+            if better_satisfying {
+                best_satisfying = Some((version.clone(), candidate));
+            }
+            if is_unscoped
+                && best_satisfying_unscoped
+                    .as_ref()
+                    .is_none_or(|(best, _)| version > *best)
+            {
+                best_satisfying_unscoped = Some((version, candidate));
+            }
+        }
+    }
+
+    best_satisfying_unscoped
+        .map(|(_, candidate)| candidate)
+        .or_else(|| best_satisfying.map(|(_, candidate)| candidate))
+        .or_else(|| best_any_unscoped.map(|(_, candidate)| candidate))
+        .or(first_unscoped)
+        .or_else(|| best_any.map(|(_, candidate)| candidate))
+        .or(first_match)
+}
+
 pub(super) fn collect_locked_direct_versions(
     pkg: &lpm_workspace::PackageJson,
     lockfile: &lpm_lockfile::Lockfile,
@@ -964,16 +1031,10 @@ pub(super) fn resolved_to_install_packages(
     // version. Keyed by canonical_name. Used below to compute the
     // `(name, version, source_id)` triple under which the package
     // will be filed in the lockfile.
-    let resolved_target_meta: HashMap<String, String> = resolved
-        .iter()
-        .map(|r| (r.package.canonical_name(), r.version.to_string()))
-        .collect();
     // "name\x00version" compound key — avoids allocating a PackageKey
     // (SHA-256 source_id + 2 String clones) per entry and per lookup.
-    // Safe because (name, version) is unique in the resolved set:
-    // resolved_target_meta maps one version per canonical name, and
-    // same-name-same-version cross-source packages collapse to one
-    // row via the dedup filter below.
+    // Safe because same-name-same-version cross-source packages collapse
+    // to one row via the dedup filter below.
     let rlk = |name: &str, version: &str| -> String {
         let mut k = String::with_capacity(name.len() + 1 + version.len());
         k.push_str(name);
@@ -982,14 +1043,16 @@ pub(super) fn resolved_to_install_packages(
         k
     };
     let mut root_link_map: HashMap<String, Vec<String>> = HashMap::new();
-    for local in deps.keys() {
+    for (local, requested_spec) in deps {
         let target = root_aliases
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
-        if let Some(version) = resolved_target_meta.get(&target) {
+        if let Some(package) =
+            select_resolved_package_for_requested_spec(resolved, &target, requested_spec)
+        {
             root_link_map
-                .entry(rlk(&target, version))
+                .entry(rlk(&target, &package.version.to_string()))
                 .or_default()
                 .push(local.clone());
         }
@@ -999,11 +1062,20 @@ pub(super) fn resolved_to_install_packages(
     // here rather than in `deps` so `is_direct` (above) stays false
     // for them — same key shape, separate provenance.
     for ambient in ambient_peer_installs {
-        if let Some(version) = resolved_target_meta.get(ambient) {
+        if deps.contains_key(ambient) {
+            continue;
+        }
+        if let Some(package) = resolved
+            .iter()
+            .filter(|package| package.package.canonical_name() == *ambient)
+            .max_by(|a, b| a.version.cmp(&b.version))
+        {
             // Avoid duplicate locals if the user ALSO listed the peer
             // in their `dependencies` (in which case `deps.keys()`
             // already covered it; we shouldn't double-link).
-            let entry = root_link_map.entry(rlk(ambient, version)).or_default();
+            let entry = root_link_map
+                .entry(rlk(ambient, &package.version.to_string()))
+                .or_default();
             if !entry.iter().any(|l| l == ambient) {
                 entry.push(ambient.clone());
             }

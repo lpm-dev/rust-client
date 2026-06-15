@@ -351,6 +351,10 @@ fn error_context(
     findings: Vec<GuardFinding>,
     suggested_command: Option<String>,
 ) -> LpmError {
+    let allow_example = findings
+        .first()
+        .map_or_else(default_allow_example, allow_example_for_finding);
+
     LpmError::TyposquatSuspected(Box::new(TyposquatErrorContext {
         findings: findings
             .into_iter()
@@ -362,13 +366,25 @@ fn error_context(
             })
             .collect(),
         config_path: project_dir.join("lpm.toml").display().to_string(),
-        allow_example: allow_example(),
+        allow_example,
         suggested_command,
     }))
 }
 
-fn allow_example() -> String {
-    "[[policy.typosquat.allow]]\npackage = \"axois\"\nsimilar-to = \"axios\"\nreason = \"Intentional package\"".to_string()
+fn allow_example_for_finding(finding: &GuardFinding) -> String {
+    allow_example(&finding.package, &finding.similar_to)
+}
+
+fn default_allow_example() -> String {
+    allow_example("axois", "axios")
+}
+
+fn allow_example(package: &str, similar_to: &str) -> String {
+    format!(
+        "[[policy.typosquat.allow]]\npackage = {}\nsimilar-to = {}\nreason = \"Intentional package\"",
+        Value::from(package),
+        Value::from(similar_to)
+    )
 }
 
 fn locked_in_every_root(name: &str, roots: &[BTreeSet<String>]) -> bool {
@@ -649,6 +665,28 @@ mod tests {
             context.suggested_command.as_deref(),
             Some("lpm install axios@^1")
         );
+    }
+
+    #[test]
+    fn typosquat_error_allow_example_uses_actual_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = error_context(
+            dir.path(),
+            vec![GuardFinding {
+                package: "expres".to_string(),
+                similar_to: "express".to_string(),
+                technique: "edit_distance".to_string(),
+                source: "cli".to_string(),
+            }],
+            None,
+        );
+
+        let LpmError::TyposquatSuspected(context) = err else {
+            panic!("expected typosquat error");
+        };
+        assert!(context.allow_example.contains("package = \"expres\""));
+        assert!(context.allow_example.contains("similar-to = \"express\""));
+        assert!(!context.allow_example.contains("axois"));
     }
 
     #[test]

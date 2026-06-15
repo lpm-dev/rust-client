@@ -533,6 +533,7 @@ pub async fn run(
         false, // no_sandbox
         false, // verbose: internal pipeline, no user-facing Done footer
         false, // audit_after_install: internal pipeline never runs audit
+        &[],
     )
     .await;
 
