@@ -25,6 +25,8 @@ permissions:
 
 env:
   RUST_TOOLCHAIN: "1.94.0"
+  APPLE_TEAM_ID: "823S8YKMRW"
+  APPLE_CODESIGN_IDENTITY: "Developer ID Application: Tolga Ergin (823S8YKMRW)"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
@@ -164,6 +166,93 @@ jobs:
           cp target/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
           chmod +x ${{ matrix.binary }}
 
+      - name: Import Developer ID certificate (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APPLE_DEVELOPER_ID_P12_BASE64:-}" ] || [ -z "${APPLE_DEVELOPER_ID_P12_PASSWORD:-}" ]; then
+            echo "::error::Set APPLE_DEVELOPER_ID_P12_BASE64 and APPLE_DEVELOPER_ID_P12_PASSWORD before publishing macOS release artifacts."
+            exit 1
+          fi
+
+          CERT_PATH="$RUNNER_TEMP/developer-id-application.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/lpm-release-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          trap 'rm -f "$CERT_PATH"' EXIT
+
+          printf '%s' "$APPLE_DEVELOPER_ID_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "APPLE_SIGNING_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Sign binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+
+          codesign --force --timestamp --options runtime \
+            --keychain "$APPLE_SIGNING_KEYCHAIN" \
+            --sign "$APPLE_CODESIGN_IDENTITY" \
+            "${{ matrix.binary }}"
+
+          codesign --verify --strict --verbose=4 "${{ matrix.binary }}"
+          codesign -dv --verbose=4 "${{ matrix.binary }}" 2>&1 | grep -E "Authority|TeamIdentifier|Runtime|Timestamp"
+
+      - name: Notarize binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          NOTARY_ZIP="$RUNNER_TEMP/${{ matrix.binary }}.zip"
+          zip -j "$NOTARY_ZIP" "${{ matrix.binary }}"
+
+          if [ -n "${APPLE_NOTARY_KEY_BASE64:-}" ] || [ -n "${APPLE_NOTARY_KEY_ID:-}" ] || [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
+            if [ -z "${APPLE_NOTARY_KEY_BASE64:-}" ] || [ -z "${APPLE_NOTARY_KEY_ID:-}" ] || [ -z "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
+              echo "::error::Set APPLE_NOTARY_KEY_BASE64, APPLE_NOTARY_KEY_ID, and APPLE_NOTARY_ISSUER_ID together."
+              exit 1
+            fi
+
+            NOTARY_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+            trap 'rm -f "$NOTARY_KEY_PATH"' EXIT
+            printf '%s' "$APPLE_NOTARY_KEY_BASE64" | base64 --decode > "$NOTARY_KEY_PATH"
+            chmod 600 "$NOTARY_KEY_PATH"
+
+            xcrun notarytool submit "$NOTARY_ZIP" \
+              --key "$NOTARY_KEY_PATH" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              --wait \
+              --timeout 30m
+          else
+            if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
+              echo "::error::Set App Store Connect API key secrets, or set APPLE_ID and APPLE_APP_SPECIFIC_PASSWORD for notarization."
+              exit 1
+            fi
+
+            xcrun notarytool submit "$NOTARY_ZIP" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --wait \
+              --timeout 30m
+          fi
+
       - name: Stage binaries (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -182,6 +271,13 @@ jobs:
         with:
           name: lpm-sandbox-helper-win32-x64.exe
           path: lpm-sandbox-helper-win32-x64.exe
+
+      - name: Delete temporary signing keychain (macOS)
+        if: always() && runner.os == 'macOS'
+        run: |
+          if [ -n "${APPLE_SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$APPLE_SIGNING_KEYCHAIN" || true
+          fi
 
   release:
     name: Create Release
