@@ -580,7 +580,6 @@ fn link_v2_finalize_inner(
     };
     let bin_count = {
         let _s = tracing::info_span!("linker.finalize.bin_shims").entered();
-        clear_bin_dir(project_dir)?;
         create_bin_links_v2(
             project_dir,
             augmented_slice,
@@ -1203,6 +1202,53 @@ fn clear_bin_dir(project_dir: &Path) -> Result<(), LpmError> {
     remove_node_modules_entry(&bin_dir, "stale bin directory")
 }
 
+fn ensure_bin_dir(bin_dir: &Path) -> Result<(), LpmError> {
+    match bin_dir.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            return Ok(());
+        }
+        Ok(_) => {
+            remove_node_modules_entry(bin_dir, "stale bin directory")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(LpmError::Store(format!(
+                "v2 linker: failed to inspect .bin directory at {}: {error}",
+                bin_dir.display()
+            )));
+        }
+    }
+
+    std::fs::create_dir_all(bin_dir).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to create .bin/ at {}: {e}",
+            bin_dir.display()
+        ))
+    })?;
+    ensure_real_dir(bin_dir, "project .bin directory")
+}
+
+fn reconcile_bin_dir(bin_dir: &Path, desired: &HashSet<String>) -> Result<(), LpmError> {
+    let entries = match std::fs::read_dir(bin_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(LpmError::Store(format!(
+                "v2 linker: failed to read .bin directory at {}: {error}",
+                bin_dir.display()
+            )));
+        }
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !desired.contains(&name) {
+            remove_node_modules_entry(&entry.path(), "stale bin shim")?;
+        }
+    }
+    Ok(())
+}
+
 fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), LpmError> {
     let metadata = match path.symlink_metadata() {
         Ok(metadata) => metadata,
@@ -1336,6 +1382,11 @@ struct CompatibilityEntry<'a> {
 struct CompatibilitySibling {
     local: String,
     key: Arc<GraphKey>,
+}
+
+struct BinLinkSpec {
+    cmd_name: String,
+    target: PathBuf,
 }
 
 fn project_compatibility_root(project_dir: &Path) -> PathBuf {
@@ -2231,9 +2282,8 @@ fn create_bin_links_v2(
     // with N direct deps × ~2 bin entries each).
     let mut pkg_json_path = PathBuf::with_capacity(256);
     let mut bin_target = PathBuf::with_capacity(256);
-    let mut link_path = PathBuf::with_capacity(bin_dir.as_os_str().len() + 64);
+    let mut specs = Vec::with_capacity(targets.len());
 
-    let mut count = 0usize;
     for v2t in targets {
         if !is_direct(&v2t.target) {
             continue;
@@ -2281,12 +2331,6 @@ fn create_bin_links_v2(
         if entries.is_empty() {
             continue;
         }
-        std::fs::create_dir_all(&bin_dir).map_err(|e| {
-            LpmError::Store(format!(
-                "v2 linker: failed to create .bin/ at {}: {e}",
-                bin_dir.display()
-            ))
-        })?;
 
         for (cmd_name, bin_rel_path) in entries {
             // Reject bin entries whose key would write outside `.bin/`
@@ -2334,17 +2378,54 @@ fn create_bin_links_v2(
                 );
                 continue;
             }
-            link_path.clear();
-            link_path.push(&bin_dir);
-            link_path.push(&cmd_name);
-            // Best-effort cleanup of a stale shim.
-            if link_path.symlink_metadata().is_ok() {
-                let _ = std::fs::remove_file(&link_path);
+            specs.push(BinLinkSpec {
+                cmd_name,
+                target: bin_target.clone(),
+            });
+        }
+    }
+
+    if specs.is_empty() {
+        clear_bin_dir(project_dir)?;
+        return Ok(0);
+    }
+
+    ensure_bin_dir(&bin_dir)?;
+    let desired: HashSet<String> = specs
+        .iter()
+        .map(|spec| {
+            #[cfg(unix)]
+            {
+                spec.cmd_name.clone()
             }
-            #[cfg(unix)]
-            let relative =
-                pathdiff::diff_paths(&bin_target, &bin_dir).unwrap_or_else(|| bin_target.clone());
-            #[cfg(unix)]
+            #[cfg(windows)]
+            {
+                format!("{}.cmd", spec.cmd_name)
+            }
+        })
+        .collect();
+    reconcile_bin_dir(&bin_dir, &desired)?;
+
+    let mut link_path = PathBuf::with_capacity(bin_dir.as_os_str().len() + 64);
+    let mut count = 0usize;
+    for spec in specs {
+        link_path.clear();
+        link_path.push(&bin_dir);
+        link_path.push(&spec.cmd_name);
+
+        #[cfg(unix)]
+        let relative =
+            pathdiff::diff_paths(&spec.target, &bin_dir).unwrap_or_else(|| spec.target.clone());
+
+        #[cfg(unix)]
+        {
+            if std::fs::read_link(&link_path).is_ok_and(|existing| existing == relative) {
+                count += 1;
+                continue;
+            }
+            if link_path.symlink_metadata().is_ok() {
+                remove_node_modules_entry(&link_path, "stale bin shim")?;
+            }
             std::os::unix::fs::symlink(&relative, &link_path).map_err(|e| {
                 LpmError::Store(format!(
                     "v2 linker: failed to create bin shim {} → {}: {e}",
@@ -2352,32 +2433,43 @@ fn create_bin_links_v2(
                     relative.display()
                 ))
             })?;
-            #[cfg(windows)]
-            {
-                // Windows: emit a `.cmd` shim that invokes node.exe
-                // on the script. Mirrors v1's hoisted/.bin emission.
-                // (Junction-style symlinks to script files don't run
-                // under cmd.exe; `.cmd` shim is the cross-version
-                // path that works on every Windows lpm has shipped
-                // on.)
-                let target_str = bin_target.to_string_lossy();
-                if let Err(reason) = lpm_common::symlink::validate_cmd_path(&target_str) {
-                    tracing::warn!("v2 linker: skipping .cmd shim for {cmd_name}: {reason}");
-                    continue;
-                }
-                let cmd_content = format!(
-                    "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target_str}\" %*\n) ELSE (\n  node \"{target_str}\" %*\n)",
-                );
-                let cmd_path = bin_dir.join(format!("{cmd_name}.cmd"));
-                std::fs::write(&cmd_path, cmd_content).map_err(|e| {
-                    LpmError::Store(format!(
-                        "v2 linker: failed to write .cmd shim at {}: {e}",
-                        cmd_path.display()
-                    ))
-                })?;
-            }
-            count += 1;
         }
+
+        #[cfg(windows)]
+        {
+            // Windows: emit a `.cmd` shim that invokes node.exe
+            // on the script. Mirrors v1's hoisted/.bin emission.
+            // (Junction-style symlinks to script files don't run
+            // under cmd.exe; `.cmd` shim is the cross-version
+            // path that works on every Windows lpm has shipped
+            // on.)
+            let target_str = spec.target.to_string_lossy();
+            if let Err(reason) = lpm_common::symlink::validate_cmd_path(&target_str) {
+                tracing::warn!(
+                    "v2 linker: skipping .cmd shim for {}: {reason}",
+                    spec.cmd_name
+                );
+                continue;
+            }
+            let cmd_content = format!(
+                "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target_str}\" %*\n) ELSE (\n  node \"{target_str}\" %*\n)",
+            );
+            let cmd_path = bin_dir.join(format!("{}.cmd", spec.cmd_name));
+            if std::fs::read_to_string(&cmd_path).is_ok_and(|existing| existing == cmd_content) {
+                count += 1;
+                continue;
+            }
+            if cmd_path.symlink_metadata().is_ok() {
+                remove_node_modules_entry(&cmd_path, "stale .cmd shim")?;
+            }
+            std::fs::write(&cmd_path, cmd_content).map_err(|e| {
+                LpmError::Store(format!(
+                    "v2 linker: failed to write .cmd shim at {}: {e}",
+                    cmd_path.display()
+                ))
+            })?;
+        }
+        count += 1;
     }
     Ok(count)
 }
@@ -4087,6 +4179,117 @@ mod tests {
                 "shim must be a symlink",
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_packages_v2_reuses_up_to_date_bin_shim_on_warm_rerun() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/bin_warm_reuse");
+        write_object(
+            &store,
+            &sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"a","version":"1.0.0","bin":{"a":"cli.js"}}"#,
+                ),
+                ("cli.js", b"#!/usr/bin/env node\nconsole.log('hi');\n"),
+            ],
+        );
+        let package = target("a", "1.0.0", &sri, true);
+
+        let first = link_packages_v2(
+            &project,
+            vec![package.clone()],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.bin_linked, 1, "first run must create the shim");
+
+        let shim = project.join("node_modules").join(".bin").join("a");
+        let first_target = std::fs::read_link(&shim).expect("shim should be a symlink");
+        let first_inode = shim.symlink_metadata().expect("shim metadata").ino();
+
+        let second =
+            link_packages_v2(&project, vec![package], &store, LinkerMode::Isolated, None).unwrap();
+        assert_eq!(
+            second.bin_linked, 1,
+            "warm rerun should still report the usable shim"
+        );
+        assert_eq!(
+            std::fs::read_link(&shim).expect("shim should remain a symlink"),
+            first_target,
+            "warm rerun must keep the same shim target"
+        );
+        assert_eq!(
+            shim.symlink_metadata().expect("shim metadata").ino(),
+            first_inode,
+            "warm rerun must not unlink and recreate an already-correct shim"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_packages_v2_repairs_stale_bin_shim_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/bin_stale_target");
+        write_object(
+            &store,
+            &sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"a","version":"1.0.0","bin":{"a":"cli.js"}}"#,
+                ),
+                ("cli.js", b"#!/usr/bin/env node\nconsole.log('hi');\n"),
+            ],
+        );
+        let package = target("a", "1.0.0", &sri, true);
+        link_packages_v2(
+            &project,
+            vec![package.clone()],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        let shim = project.join("node_modules").join(".bin").join("a");
+        std::fs::remove_file(&shim).unwrap();
+        std::os::unix::fs::symlink("../wrong-target.js", &shim).unwrap();
+
+        let second =
+            link_packages_v2(&project, vec![package], &store, LinkerMode::Isolated, None).unwrap();
+        assert_eq!(second.bin_linked, 1, "repaired shim should be counted");
+
+        let repaired_target = std::fs::read_link(&shim).expect("shim should be repaired");
+        assert_ne!(
+            repaired_target,
+            PathBuf::from("../wrong-target.js"),
+            "stale shim target must be replaced"
+        );
+        assert!(
+            shim.parent()
+                .unwrap()
+                .join(repaired_target)
+                .canonicalize()
+                .expect("repaired shim target should resolve")
+                .ends_with("cli.js"),
+            "repaired shim should point at the package bin target",
+        );
     }
 
     #[test]
