@@ -39,6 +39,7 @@ use lpm_store::PackageStore;
 use lpm_workspace::ProvenanceSnapshot;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Schema version for [`BuildState`].
@@ -489,6 +490,7 @@ pub fn compute_blocked_packages_with_metadata(
         user_bound,
         BlockedPackageComputationExtras {
             advisor_approvals,
+            execution_exclusions: None,
             baseline_index: None,
         },
     )
@@ -497,6 +499,7 @@ pub fn compute_blocked_packages_with_metadata(
 struct BlockedPackageComputationExtras<'a> {
     advisor_approvals:
         Option<&'a std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>>,
+    execution_exclusions: Option<&'a HashSet<crate::commands::rebuild::RebuildPackageIdentity>>,
     baseline_index: Option<&'a lpm_store::V2BaselineIndex>,
 }
 
@@ -544,6 +547,11 @@ fn compute_blocked_packages_with_metadata_and_baseline(
                 && set
                     .iter()
                     .any(|(n, v, i, _)| n == name && v == version && i == integrity)
+            {
+                return None;
+            }
+            if let Some(set) = extras.execution_exclusions
+                && set.contains(&(name.clone(), version.clone(), integrity.clone()))
             {
                 return None;
             }
@@ -783,6 +791,33 @@ pub fn capture_blocked_set_after_install_with_metadata(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> Result<BlockedSetCapture, LpmError> {
+    capture_blocked_set_after_install_with_metadata_and_exclusions(
+        project_dir,
+        store,
+        installed,
+        policy,
+        metadata,
+        requested_capabilities,
+        user_bound,
+        advisor_approvals,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn capture_blocked_set_after_install_with_metadata_and_exclusions(
+    project_dir: &Path,
+    store: &PackageStore,
+    installed: &[(String, String, Option<String>)],
+    policy: &SecurityPolicy,
+    metadata: &BlockedSetMetadata,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+    execution_exclusions: Option<&HashSet<crate::commands::rebuild::RebuildPackageIdentity>>,
+) -> Result<BlockedSetCapture, LpmError> {
     let baseline_index = if lpm_store::StoreVersion::from_env() == lpm_store::StoreVersion::V2 {
         Some(lpm_store::V2BaselineIndex::for_project(
             project_dir,
@@ -801,6 +836,7 @@ pub fn capture_blocked_set_after_install_with_metadata(
         user_bound,
         BlockedPackageComputationExtras {
             advisor_approvals,
+            execution_exclusions,
             baseline_index: baseline_index.as_ref(),
         },
     );

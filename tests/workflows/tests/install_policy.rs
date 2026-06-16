@@ -9,19 +9,15 @@
 //!   surfaces the approval hint
 //! - `--policy=allow` and `--yolo` are accepted at parse time and
 //!   produce the auto-build code path
-//!
-//! Actual script-execution side effects are out of scope here — they
-//! depend on `node` being on PATH and the wrapper materialization
-//! pipeline (covered in `rebuild.rs`).
+//! - allow-policy install-time builds have the same lifecycle tail on
+//!   fresh and offline lockfile paths
+//! - build-state and generated bins are refreshed after successful
+//!   install-time builds
 
 mod support;
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry};
-
-type HmacSha256 = Hmac<Sha256>;
+use support::{TempProject, lpm_with_registry, write_signed_unlock};
 
 /// Mount a scripted package on the mock registry. The package
 /// declares a `postinstall` script in its `package.json` — this is
@@ -80,51 +76,78 @@ process.exit(1);
     .await;
 }
 
+async fn mount_marker_scripted_pkg(mock: &MockRegistry, name: &str) {
+    let pkg_json = serde_json::json!({
+        "name": name,
+        "version": "1.0.0",
+        "license": "MIT",
+        "main": "index.js",
+        "scripts": {
+            "postinstall": "node build.js"
+        },
+    });
+    mock.with_manifest_package(
+        pkg_json,
+        &[(
+            "build.js",
+            br#"require('fs').writeFileSync('postinstall-marker.txt', 'ran');
+"#,
+        )],
+    )
+    .await;
+}
+
+async fn mount_generated_bin_pkg(mock: &MockRegistry, name: &str, bin_name: &str) {
+    let pkg_json = serde_json::json!({
+        "name": name,
+        "version": "1.0.0",
+        "license": "MIT",
+        "main": "index.js",
+        "bin": {
+            bin_name: "bin/generated-cli.js"
+        },
+        "scripts": {
+            "postinstall": "node build-bin.js"
+        },
+    });
+    mock.with_manifest_package(
+        pkg_json,
+        &[(
+            "build-bin.js",
+            br#"const fs = require('fs');
+fs.mkdirSync('bin', { recursive: true });
+fs.writeFileSync('bin/generated-cli.js', '#!/usr/bin/env node\nconsole.log("generated-cli-ok");\n');
+fs.chmodSync('bin/generated-cli.js', 0o755);
+"#,
+        )],
+    )
+    .await;
+}
+
 fn empty_project_with_dep(dep: &str) -> TempProject {
     TempProject::empty(&format!(
         r#"{{"name":"install-policy","version":"1.0.0","dependencies":{{"{dep}":"^1.0.0"}}}}"#
     ))
 }
 
-fn write_signed_unlock(project: &TempProject, scopes: &[&str]) {
-    let now = chrono::Utc::now();
-    let project_root = std::fs::canonicalize(project.path())
-        .expect("canonicalize temp project")
-        .to_string_lossy()
-        .to_string();
-    let payload = serde_json::json!({
-        "schema_version": 1,
-        "id": format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
-        "target": "project",
-        "project_root": project_root,
-        "scopes": scopes,
-        "limits": {},
-        "issued_at": now.to_rfc3339(),
-        "expires_at": (now + chrono::Duration::minutes(10)).to_rfc3339(),
-        "issuer": "user-presence",
-    });
+fn empty_project_without_deps() -> TempProject {
+    TempProject::empty(r#"{"name":"install-policy","version":"1.0.0"}"#)
+}
 
-    let secret = [42u8; 32];
-    let security_dir = project.home().join(".lpm/security");
-    std::fs::create_dir_all(security_dir.join("unlocks")).expect("create security unlocks dir");
-    std::fs::write(security_dir.join("signing-secret.hex"), hex::encode(secret))
-        .expect("write security signing secret");
-
-    let mut mac = HmacSha256::new_from_slice(&secret).expect("valid hmac secret");
-    mac.update(&serde_json::to_vec(&payload).expect("serialize unlock payload"));
-    let signature = hex::encode(mac.finalize().into_bytes());
-    let envelope = serde_json::json!({
-        "payload": payload,
-        "signature": signature,
-    });
-    let unlock_id = envelope["payload"]["id"].as_str().unwrap();
-    std::fs::write(
-        security_dir
-            .join("unlocks")
-            .join(format!("{unlock_id}.json")),
-        serde_json::to_string_pretty(&envelope).expect("serialize unlock envelope"),
-    )
-    .expect("write signed unlock");
+fn parse_last_json_object(stdout: &[u8], stderr: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(stdout);
+    let mut starts: Vec<usize> = text.match_indices('{').map(|(idx, _)| idx).collect();
+    starts.reverse();
+    for start in starts {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text[start..]) {
+            return parsed;
+        }
+    }
+    panic!(
+        "stdout must contain a parseable JSON object\nstdout:\n{}\nstderr:\n{}",
+        text,
+        String::from_utf8_lossy(stderr),
+    );
 }
 
 // ─── parse mutual-exclusion contract ─────────────────────────────────
@@ -381,6 +404,196 @@ async fn install_policy_allow_is_accepted_at_parse_time() {
             "--policy=allow must be parsed without clap errors, got stderr:\n{stderr}",
         );
     }
+}
+
+#[tokio::test]
+async fn install_policy_allow_reports_no_blocked_packages_after_running_dependency_scripts() {
+    let project = empty_project_with_dep("scripted-marker");
+    let mock = MockRegistry::start().await;
+    mount_marker_scripted_pkg(&mock, "scripted-marker").await;
+    write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "install", "--policy=allow", "--no-sandbox"])
+        .output()
+        .expect("failed to run lpm install --policy=allow --json");
+
+    assert!(
+        output.status.success(),
+        "allow-policy install must succeed after running dependency postinstall\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope = parse_last_json_object(&output.stdout, &output.stderr);
+    assert_eq!(
+        envelope["blocked_count"],
+        serde_json::json!(0),
+        "successful allow-policy auto-build must not report packages as still blocked: {envelope}",
+    );
+    assert_eq!(
+        envelope["blocked_packages"],
+        serde_json::json!([]),
+        "successful allow-policy auto-build must clear blocked package JSON: {envelope}",
+    );
+
+    let build_state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/build-state.json"))
+            .expect("build-state.json must parse");
+    assert_eq!(
+        build_state["blocked_packages"],
+        serde_json::json!([]),
+        "successful allow-policy auto-build must persist an empty blocked set: {build_state}",
+    );
+}
+
+#[tokio::test]
+async fn install_policy_allow_links_bin_generated_by_dependency_postinstall() {
+    let project = empty_project_with_dep("generated-bin-pkg");
+    let mock = MockRegistry::start().await;
+    mount_generated_bin_pkg(&mock, "generated-bin-pkg", "generated-cli").await;
+    write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--policy=allow", "--no-sandbox"])
+        .output()
+        .expect("failed to run lpm install --policy=allow");
+
+    assert!(
+        output.status.success(),
+        "allow-policy install must succeed and generate the declared bin\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let bin_path = project.path().join("node_modules/.bin/generated-cli");
+    assert!(
+        bin_path.exists(),
+        "postinstall-generated bin must be linked into node_modules/.bin at {}",
+        bin_path.display(),
+    );
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .unwrap_or_else(|e| panic!("generated bin must be executable: {e}"));
+    assert!(
+        output.status.success(),
+        "generated bin must execute successfully\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "generated-cli-ok"
+    );
+}
+
+#[tokio::test]
+async fn install_package_policy_allow_links_bin_generated_by_dependency_postinstall() {
+    let project = empty_project_without_deps();
+    let mock = MockRegistry::start().await;
+    mount_generated_bin_pkg(&mock, "generated-bin-add-pkg", "generated-add-cli").await;
+    write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "generated-bin-add-pkg",
+            "--policy=allow",
+            "--no-sandbox",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to run lpm install <pkg> --policy=allow");
+
+    assert!(
+        output.status.success(),
+        "package-add install must succeed and generate the declared bin\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let bin_path = project.path().join("node_modules/.bin/generated-add-cli");
+    assert!(
+        bin_path.exists(),
+        "postinstall-generated bin from package-add install must be linked into node_modules/.bin at {}",
+        bin_path.display(),
+    );
+}
+
+#[tokio::test]
+async fn offline_install_policy_allow_runs_dependency_postinstall_from_lockfile() {
+    let project = empty_project_with_dep("offline-scripted-marker");
+    let mock = MockRegistry::start().await;
+    mount_marker_scripted_pkg(&mock, "offline-scripted-marker").await;
+
+    lpm_with_registry(&project, &mock.url())
+        .args(["install"])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before offline install");
+    write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--offline", "--policy=allow", "--no-sandbox"])
+        .output()
+        .expect("failed to run offline lpm install --policy=allow");
+
+    assert!(
+        output.status.success(),
+        "offline allow-policy install must run dependency postinstall from the lockfile\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let marker = project
+        .path()
+        .join("node_modules/offline-scripted-marker/postinstall-marker.txt");
+    assert!(
+        marker.exists(),
+        "offline allow-policy install must run postinstall and create {}",
+        marker.display(),
+    );
+}
+
+#[tokio::test]
+async fn offline_install_policy_allow_fails_when_dependency_postinstall_fails() {
+    let project = empty_project_with_dep("offline-scripted-fail");
+    let mock = MockRegistry::start().await;
+    mount_failing_scripted_pkg(&mock, "offline-scripted-fail").await;
+
+    lpm_with_registry(&project, &mock.url())
+        .args(["install"])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before offline install");
+    write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--offline", "--policy=allow", "--no-sandbox"])
+        .output()
+        .expect("failed to run offline lpm install --policy=allow");
+
+    assert!(
+        !output.status.success(),
+        "offline allow-policy install must fail when a dependency postinstall fails\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("postinstall failed")
+            || combined.contains("Auto-build failed")
+            || combined.contains("failed to build"),
+        "offline install must surface the failing lifecycle script, got:\n{combined}",
+    );
 }
 
 #[tokio::test]

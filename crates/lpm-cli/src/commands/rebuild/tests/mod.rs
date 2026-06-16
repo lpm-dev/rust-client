@@ -643,6 +643,7 @@ fn toposort_respects_dependency_order() {
         ScriptablePackage {
             name: "a".into(),
             version: "1.0.0".into(),
+            integrity: None,
             wrapper_id: None,
             store_path: PathBuf::new(),
             scripts: HashMap::new(),
@@ -653,6 +654,7 @@ fn toposort_respects_dependency_order() {
         ScriptablePackage {
             name: "b".into(),
             version: "1.0.0".into(),
+            integrity: None,
             wrapper_id: None,
             store_path: PathBuf::new(),
             scripts: HashMap::new(),
@@ -1098,6 +1100,7 @@ fn stale_detection_finds_packages_without_scripts() {
         ScriptablePackage {
             name: "sharp".into(),
             version: "0.33.0".into(),
+            integrity: None,
             wrapper_id: None,
             store_path: std::path::PathBuf::new(),
             scripts: HashMap::from([("postinstall".into(), "node setup".into())]),
@@ -1108,6 +1111,7 @@ fn stale_detection_finds_packages_without_scripts() {
         ScriptablePackage {
             name: "esbuild".into(),
             version: "0.21.0".into(),
+            integrity: None,
             wrapper_id: None,
             store_path: std::path::PathBuf::new(),
             scripts: HashMap::from([("postinstall".into(), "node install.js".into())]),
@@ -1366,6 +1370,7 @@ fn synthetic_scriptable(name: &str, is_built: bool, is_trusted: bool) -> Scripta
     ScriptablePackage {
         name: name.into(),
         version: "1.0.0".into(),
+        integrity: None,
         wrapper_id: None,
         store_path: std::path::PathBuf::from("/unused"),
         scripts: HashMap::from([("postinstall".into(), "node x.js".into())]),

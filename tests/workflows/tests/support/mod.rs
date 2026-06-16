@@ -53,6 +53,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
 /// A temporary project directory copied from a fixture, with fully isolated
 /// HOME, store, cache, and config directories.
 ///
@@ -139,6 +141,51 @@ impl TempProject {
         std::fs::write(&path, content)
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
     }
+}
+
+/// Write a short-lived signed project unlock for workflow scenarios that
+/// intentionally need to cross the security-approval boundary.
+pub fn write_signed_unlock(project: &TempProject, scopes: &[&str]) {
+    use hmac::Mac;
+
+    let now = chrono::Utc::now();
+    let project_root = std::fs::canonicalize(project.path())
+        .expect("canonicalize temp project")
+        .to_string_lossy()
+        .to_string();
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "id": format!("unl_{}", now.timestamp_nanos_opt().unwrap_or_default()),
+        "target": "project",
+        "project_root": project_root,
+        "scopes": scopes,
+        "limits": {},
+        "issued_at": now.to_rfc3339(),
+        "expires_at": (now + chrono::Duration::minutes(10)).to_rfc3339(),
+        "issuer": "user-presence",
+    });
+
+    let secret = [42u8; 32];
+    let security_dir = project.home().join(".lpm/security");
+    std::fs::create_dir_all(security_dir.join("unlocks")).expect("create security unlocks dir");
+    std::fs::write(security_dir.join("signing-secret.hex"), hex::encode(secret))
+        .expect("write security signing secret");
+
+    let mut mac = HmacSha256::new_from_slice(&secret).expect("valid hmac secret");
+    mac.update(&serde_json::to_vec(&payload).expect("serialize unlock payload"));
+    let signature = hex::encode(mac.finalize().into_bytes());
+    let envelope = serde_json::json!({
+        "payload": payload,
+        "signature": signature,
+    });
+    let unlock_id = envelope["payload"]["id"].as_str().unwrap();
+    std::fs::write(
+        security_dir
+            .join("unlocks")
+            .join(format!("{unlock_id}.json")),
+        serde_json::to_string_pretty(&envelope).expect("serialize unlock envelope"),
+    )
+    .expect("write signed unlock");
 }
 
 /// Common interface for `assert_cmd::Command` and `std::process::Command`

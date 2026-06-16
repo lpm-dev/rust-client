@@ -51,6 +51,7 @@ pub(super) fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<Str
 pub(super) struct ScriptablePackage {
     pub(super) name: String,
     pub(super) version: String,
+    pub(super) integrity: Option<String>,
     /// Wrapper-id for non-Registry sources. `None` for Registry deps
     /// (canonical CAS-backed wrapper segment shape `<safe>@<version>`);
     /// `Some(wid)` for Tarball / Directory / Link / Git sources
@@ -76,6 +77,24 @@ pub(super) struct ScriptablePackage {
     /// most call sites only care about the boolean and splitting the
     /// read avoids threading [`TrustReason`] through downstream code.
     pub(super) trust_reason: TrustReason,
+}
+
+pub(crate) type RebuildPackageIdentity = (String, String, Option<String>);
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RebuildRunReport {
+    pub(crate) covered_packages: Vec<RebuildPackageIdentity>,
+    pub(crate) built_packages: Vec<RebuildPackageIdentity>,
+}
+
+impl RebuildRunReport {
+    pub(crate) fn covered_any_packages(&self) -> bool {
+        !self.covered_packages.is_empty()
+    }
+
+    pub(crate) fn built_any_packages(&self) -> bool {
+        !self.built_packages.is_empty()
+    }
 }
 
 pub(super) fn rebuild_dry_run_envelope(
