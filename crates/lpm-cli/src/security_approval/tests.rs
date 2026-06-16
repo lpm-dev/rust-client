@@ -925,6 +925,45 @@ fn audit_log_truncation_is_detected_by_signed_head() {
 }
 
 #[test]
+fn audit_log_concurrent_appends_preserve_jsonl_and_hash_chain() {
+    let temp = tempdir().unwrap();
+
+    with_test_env(temp.path(), || {
+        const WRITERS: usize = 32;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::with_capacity(WRITERS);
+
+        for index in 0..WRITERS {
+            let start = std::sync::Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                let event = AuditEvent {
+                    schema_version: AUDIT_EVENT_SCHEMA_VERSION,
+                    occurred_at: Utc::now(),
+                    event: "guarded-attempt".into(),
+                    allowed: false,
+                    scopes: vec![ApprovalScope::CooldownBypass.as_str().to_string()],
+                    project_root: None,
+                    packages: Vec::new(),
+                    source: Some(ApprovalSource::CliFlag.as_str().to_string()),
+                    unlock_id: None,
+                    detail: Some(format!("concurrent append {index}")),
+                };
+                start.wait();
+                append_audit_event(&event)
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let log_path = audit_log_path().unwrap();
+        let (_tail, count) = read_audit_log_tail(&log_path).unwrap();
+        assert_eq!(count, WRITERS as u64);
+    });
+}
+
+#[test]
 fn audit_log_appends_after_unsigned_legacy_entries() {
     let temp = tempdir().unwrap();
 

@@ -168,7 +168,7 @@ mod prelude {
     pub(super) use super::native_auth::request_native_approval;
     pub(super) use super::paths::{
         approved_global_trust_path, approved_posture_path, approved_projects_dir, audit_head_path,
-        audit_log_path, security_dir, signing_secret_path, unlocks_dir,
+        audit_lock_path, audit_log_path, security_dir, signing_secret_path, unlocks_dir,
     };
     pub(super) use super::posture::{
         load_authorized_posture, load_effective_authorized_posture, persist_authorized_posture,

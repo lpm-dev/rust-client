@@ -424,6 +424,10 @@ fn quarantine_security_state_file(
 }
 
 pub fn repair_security_state() -> Result<SecurityRepairReport, LpmError> {
+    lpm_common::with_exclusive_lock(audit_lock_path()?, repair_security_state_locked)
+}
+
+fn repair_security_state_locked() -> Result<SecurityRepairReport, LpmError> {
     let security_dir = security_dir()?;
     let paths = signed_security_state_paths()?;
     let audit_log_path = existing_nonempty_audit_log_path()?;
