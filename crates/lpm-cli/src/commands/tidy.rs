@@ -925,6 +925,7 @@ async fn reconcile_install(client: &RegistryClient, project_dir: &Path) -> Resul
         None,
         None,
         None,
+        &[],
         crate::provenance_fetch::DriftIgnorePolicy::default(),
         crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
         InstallOmitPolicy::default(),

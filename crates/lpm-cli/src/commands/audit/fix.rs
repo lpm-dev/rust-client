@@ -207,6 +207,7 @@ pub async fn run_fix(
         None,  // script_policy_override
         None,  // advisor_override
         None,  // min_release_age_override
+        &[],
         crate::provenance_fetch::DriftIgnorePolicy::default(),
         crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
         crate::commands::install::InstallOmitPolicy::default(),

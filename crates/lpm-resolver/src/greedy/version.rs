@@ -34,10 +34,11 @@ pub(super) fn is_workspace_specifier(range_str: &str) -> bool {
 /// after resolution so lockfiles remain portable across hosts.
 #[cfg(test)]
 pub(super) fn find_best_version(info: &CachedPackageInfo, range: &NpmRange) -> VersionPick {
-    find_best_version_with_policy(info, range, &ResolverPolicy::default())
+    find_best_version_with_policy(&CanonicalKey::Root, info, range, &ResolverPolicy::default())
 }
 
 pub(super) fn find_best_version_with_policy(
+    canonical: &CanonicalKey,
     info: &CachedPackageInfo,
     range: &NpmRange,
     policy: &ResolverPolicy,
@@ -47,7 +48,7 @@ pub(super) fn find_best_version_with_policy(
         if !range.satisfies(v) {
             continue;
         }
-        match release_age_status_for_version(info, v, policy) {
+        match release_age_status_for_version(canonical, info, v, policy) {
             ReleaseTimeStatus::Allowed => {}
             ReleaseTimeStatus::Missing => {
                 return VersionPick::BlockedByReleaseAge {

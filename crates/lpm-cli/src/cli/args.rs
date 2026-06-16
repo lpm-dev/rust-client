@@ -414,6 +414,11 @@ pub(crate) enum Commands {
         #[arg(long, value_name = "DUR")]
         min_release_age: Option<String>,
 
+        /// Exempt one exact package name from minimumReleaseAge for this install only.
+        /// Repeatable. Aliases must be excluded by their canonical target name.
+        #[arg(long, value_name = "PKG")]
+        min_release_age_exclude: Vec<String>,
+
         /// Skip the provenance-drift check for this
         /// specific package name (repeatable). The drift gate blocks
         /// on publisher identity changes between a prior approval
@@ -1615,6 +1620,9 @@ pub(crate) enum Commands {
         /// Override the minimumReleaseAge cooldown for this dlx run only.
         #[arg(long, value_name = "DUR")]
         min_release_age: Option<String>,
+        /// Exempt one exact package name from minimumReleaseAge for this dlx run only.
+        #[arg(long, value_name = "PKG")]
+        min_release_age_exclude: Vec<String>,
         /// Extra arguments passed to the binary.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -2238,6 +2246,11 @@ pub(crate) enum Commands {
         /// Override the minimumReleaseAge cooldown for this install only.
         #[arg(long, value_name = "DUR")]
         min_release_age: Option<String>,
+
+        /// Exempt one exact package name from minimumReleaseAge for this install only.
+        /// Repeatable. Aliases must be excluded by their canonical target name.
+        #[arg(long, value_name = "PKG")]
+        min_release_age_exclude: Vec<String>,
 
         /// Skip the provenance-drift check for this package name.
         #[arg(long, value_name = "PKG")]

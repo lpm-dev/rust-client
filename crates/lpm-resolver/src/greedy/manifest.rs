@@ -120,7 +120,7 @@ pub(super) async fn fetch_metadata_for_resolver(
 ) -> Result<FetchedMetadata, ResolveError> {
     let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
     let fetched = parse_fetched_metadata(metadata);
-    if !fetched.info.needs_policy_metadata(policy) {
+    if !fetched.info.needs_policy_metadata(canonical, policy) {
         return Ok(fetched);
     }
     let full = fetch_full_metadata_raw(client, route_table, canonical).await?;
@@ -147,7 +147,7 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
     shared_cache: &SharedCache,
     policy: &ResolverPolicy,
 ) -> Result<Arc<CachedPackageInfo>, ResolveError> {
-    if !info.needs_policy_metadata(policy) {
+    if !info.needs_policy_metadata(canonical, policy) {
         return Ok(info);
     }
     if !matches!(canonical, CanonicalKey::Npm { .. }) {

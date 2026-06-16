@@ -198,6 +198,7 @@ pub(super) fn install_omit_policy_from_cli(
 /// any of the five overrides on the way to `install_global::run` is
 /// caught by the tests in this module.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn build_install_global_overrides(
     allow_new: bool,
     auto_build: bool,
@@ -205,6 +206,35 @@ pub(super) fn build_install_global_overrides(
     yolo: bool,
     triage_alias: bool,
     min_release_age: Option<&str>,
+    ignore_provenance_drift: Vec<String>,
+    ignore_provenance_drift_all: bool,
+    unverified_provenance: Vec<String>,
+    unverified_provenance_all: bool,
+) -> Result<commands::install_global::InstallGlobalOverrides, lpm_common::LpmError> {
+    build_install_global_overrides_with_excludes(
+        allow_new,
+        auto_build,
+        policy,
+        yolo,
+        triage_alias,
+        min_release_age,
+        Vec::new(),
+        ignore_provenance_drift,
+        ignore_provenance_drift_all,
+        unverified_provenance,
+        unverified_provenance_all,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_install_global_overrides_with_excludes(
+    allow_new: bool,
+    auto_build: bool,
+    policy: Option<&str>,
+    yolo: bool,
+    triage_alias: bool,
+    min_release_age: Option<&str>,
+    min_release_age_exclude: Vec<String>,
     ignore_provenance_drift: Vec<String>,
     ignore_provenance_drift_all: bool,
     unverified_provenance: Vec<String>,
@@ -220,6 +250,10 @@ pub(super) fn build_install_global_overrides(
         Some(s) => Some(crate::release_age_config::parse_duration(s)?),
         None => None,
     };
+    let min_release_age_exclude = crate::release_age_config::validate_release_age_excludes(
+        "--min-release-age-exclude",
+        &min_release_age_exclude,
+    )?;
     let drift_ignore_policy = crate::provenance_fetch::DriftIgnorePolicy::from_cli(
         ignore_provenance_drift,
         ignore_provenance_drift_all,
@@ -232,6 +266,7 @@ pub(super) fn build_install_global_overrides(
         allow_new,
         strict_peer_dependencies_override: None,
         min_release_age_override,
+        min_release_age_exclude,
         drift_ignore_policy,
         verify_policy,
         // Forward the resolved policy as `Some(p)` so the inner
@@ -904,6 +939,47 @@ mod tests {
         assert!(
             err.to_string().contains("garbage"),
             "garbage min-release-age must surface a parser error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_install_global_overrides_parses_min_release_age_exclude() {
+        let o = build_install_global_overrides_with_excludes(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec!["react".to_string(), "@scope/pkg".to_string()],
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            o.min_release_age_exclude,
+            vec!["react".to_string(), "@scope/pkg".to_string()]
+        );
+
+        let err = build_install_global_overrides_with_excludes(
+            false,
+            false,
+            None,
+            false,
+            false,
+            None,
+            vec!["@scope/*".to_string()],
+            vec![],
+            false,
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("exact package names"),
+            "glob exclude must surface a parser error: {err}"
         );
     }
 

@@ -124,6 +124,55 @@ fn find_best_version_handles_exact_pin() {
     );
 }
 
+fn set_published_at(info: &mut CachedPackageInfo, version: &str, published_at: &str) {
+    info.dist.get_mut(version).unwrap().published_at = Some(published_at.to_string());
+}
+
+#[test]
+fn find_best_version_skips_too_fresh_latest_when_release_age_is_active() {
+    let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
+    set_published_at(&mut info, "1.1.0", "2025-01-03T00:00:00.000Z");
+    set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+    let range = NpmRange::parse("^1.0.0").unwrap();
+
+    assert_eq!(
+        picked(find_best_version_with_policy(
+            &CanonicalKey::npm("release-age-target"),
+            &info,
+            &range,
+            &policy,
+        ))
+        .to_string(),
+        "1.0.0"
+    );
+}
+
+#[test]
+fn find_best_version_release_age_exclude_allows_latest_for_canonical_package() {
+    let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
+    set_published_at(&mut info, "1.1.0", "2025-01-03T00:00:00.000Z");
+    set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
+    let policy = ResolverPolicy::with_cutoff_unix_and_release_age_excludes(
+        86_400,
+        1_735_776_000,
+        Default::default(),
+        [CanonicalKey::npm("release-age-target")],
+    );
+    let range = NpmRange::parse("^1.0.0").unwrap();
+
+    assert_eq!(
+        picked(find_best_version_with_policy(
+            &CanonicalKey::npm("release-age-target"),
+            &info,
+            &range,
+            &policy,
+        ))
+        .to_string(),
+        "1.1.0"
+    );
+}
+
 #[test]
 fn find_best_version_ignores_platform_when_selecting_version() {
     // Platform filtering happens after resolution so lockfiles stay
@@ -166,7 +215,13 @@ fn find_best_version_skips_trust_downgrade_when_older_candidate_satisfies_range(
     let range = NpmRange::parse("^1.0.0").unwrap();
 
     assert_eq!(
-        picked(find_best_version_with_policy(&info, &range, &policy)).to_string(),
+        picked(find_best_version_with_policy(
+            &CanonicalKey::Root,
+            &info,
+            &range,
+            &policy
+        ))
+        .to_string(),
         "1.0.0"
     );
 }
@@ -182,7 +237,7 @@ fn find_best_version_blocks_exact_trust_downgrade() {
     let range = NpmRange::parse("1.1.0").unwrap();
 
     assert!(matches!(
-        find_best_version_with_policy(&info, &range, &policy),
+        find_best_version_with_policy(&CanonicalKey::Root, &info, &range, &policy),
         VersionPick::BlockedByTrustPolicy { .. }
     ));
 }
@@ -1345,6 +1400,47 @@ fn process_edge_reuses_newest_existing_version_when_multiple_satisfy_range() {
         vec![("shared".to_string(), newer)],
         "reuse must be independent of the order compatible nodes were allocated"
     );
+}
+
+#[test]
+fn root_edge_allocates_best_version_when_only_lower_existing_version_satisfies_range() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let shared = CanonicalKey::npm("shared");
+    push_node(&mut state, shared.clone(), "1.2.0");
+
+    let edge = Edge {
+        parent: 0,
+        local_name: "shared".to_string(),
+        canonical: shared.clone(),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    let info = mk_info(&["1.9.0", "1.2.0"], &[]);
+
+    process_edge(&edge, &info, &mut state).unwrap();
+
+    let root_shared_id = state.nodes[0]
+        .children
+        .iter()
+        .find(|(name, _)| name == "shared")
+        .map(|(_, id)| *id)
+        .unwrap();
+    assert_eq!(
+        state.nodes[root_shared_id as usize].version.to_string(),
+        "1.9.0",
+        "root dependency edges must pick their natural best version, not a lower transitive version that already satisfies the range"
+    );
+    let mut versions: Vec<String> = state.resolved[&shared]
+        .iter()
+        .map(|(version, _)| version.to_string())
+        .collect();
+    versions.sort();
+    assert_eq!(versions, vec!["1.2.0", "1.9.0"]);
 }
 
 #[test]

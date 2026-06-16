@@ -13,6 +13,7 @@ pub struct InstallGlobalOverrides {
     pub allow_new: bool,
     pub strict_peer_dependencies_override: Option<bool>,
     pub min_release_age_override: Option<u64>,
+    pub min_release_age_exclude: Vec<String>,
     pub drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
     /// Composed `(EnforceMode, SkipPolicy)` for the install-time
     /// Sigstore verifier. Canonicalized from the
@@ -46,6 +47,7 @@ pub(super) async fn do_install(
             auto_build: overrides.auto_build,
             script_policy_override: overrides.script_policy_override,
             min_release_age_override: overrides.min_release_age_override,
+            min_release_age_exclude: &overrides.min_release_age_exclude,
             drift_ignore_policy: overrides.drift_ignore_policy.clone(),
             verify_policy: overrides.verify_policy.clone(),
         },

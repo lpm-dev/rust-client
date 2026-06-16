@@ -2407,6 +2407,13 @@ async fn install_add_with_transitive_same_name_keeps_only_the_new_direct_version
         !stderr.contains("+ chalk@4.1.2"),
         "added-list must not surface the transitive chalk version as direct:\n{stderr}"
     );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).expect("package.json parses");
+    assert_eq!(
+        manifest["dependencies"]["chalk"],
+        serde_json::json!("^5.0.0"),
+        "bare direct add must save the newly requested latest version, not the existing transitive version"
+    );
 }
 
 #[tokio::test]
@@ -6078,19 +6085,19 @@ fn install_no_strict_ssl_setting_emits_no_warning() {
 
 // ─── release-age cooldown gate ─────────────────────
 //
-// P3 ship criteria: the install-time cooldown gate that blocks
-// recently-published packages. Five behaviors pinned: (1) `--min-release-age`
-// CLI override fires, (2) `--allow-new` is an orthogonal bypass, (3)
-// `~/.lpm/config.toml` overrides the 24h default, (4) `package.json > lpm
-// > minimumReleaseAge` overrides the global config, (5) explicit version
-// pins do NOT bypass the cooldown (D7 plan decision — pin-bypass would
-// open the renovate/dependabot supply-chain attack vector).
+// The install-time cooldown gate blocks recently-published packages.
+// Behaviors pinned here: CLI overrides, per-install bypasses, global
+// config, package.json config, exact package excludes, range fallback,
+// transitive fallback, and the invariant that exact version pins do not
+// bypass the cooldown.
 
 const RELEASE_AGE_PKG: &str = "@lpm.dev/acme.widget";
 const RELEASE_AGE_VERSION: &str = "1.0.0";
 const RELEASE_AGE_RANGE_PKG: &str = "release-age-range-pkg";
 const RELEASE_AGE_PARENT_PKG: &str = "release-age-parent-pkg";
 const RELEASE_AGE_CHILD_PKG: &str = "release-age-child-pkg";
+const RELEASE_AGE_ALIAS_LOCAL_PKG: &str = "release-age-alias-local";
+const RELEASE_AGE_ALIAS_TARGET_PKG: &str = "release-age-alias-target";
 const TRUST_DOWNGRADE_PKG: &str = "trust-drop-pkg";
 
 /// ISO-8601 UTC timestamp `n_secs` ago. The cooldown parser accepts
@@ -6129,20 +6136,54 @@ async fn mount_release_age_pkg(mock: &MockRegistry, published_at: &str) {
     .await;
 }
 
+fn release_age_lpm_config(
+    manifest_min_release_age: Option<u64>,
+    excludes: &[&str],
+) -> Option<serde_json::Value> {
+    let mut lpm = serde_json::Map::new();
+    if let Some(secs) = manifest_min_release_age {
+        lpm.insert(
+            "minimumReleaseAge".to_string(),
+            serde_json::Value::Number(secs.into()),
+        );
+    }
+    if !excludes.is_empty() {
+        lpm.insert(
+            "minimumReleaseAgeExclude".to_string(),
+            serde_json::json!(excludes),
+        );
+    }
+    (!lpm.is_empty()).then_some(serde_json::Value::Object(lpm))
+}
+
 /// Write the consumer's `package.json` for the release-age tests.
 /// `manifest_min_release_age` injects `lpm.minimumReleaseAge = <secs>`.
-fn write_release_age_manifest(project: &TempProject, manifest_min_release_age: Option<u64>) {
+fn write_release_age_manifest_with_deps(
+    project: &TempProject,
+    dependencies: serde_json::Value,
+    manifest_min_release_age: Option<u64>,
+    excludes: &[&str],
+) {
     let mut manifest = serde_json::json!({
         "name": "release-age-test",
         "version": "1.0.0",
-        "dependencies": { RELEASE_AGE_PKG: RELEASE_AGE_VERSION }
+        "dependencies": dependencies
     });
-    if let Some(secs) = manifest_min_release_age {
-        manifest["lpm"] = serde_json::json!({ "minimumReleaseAge": secs });
+    if let Some(lpm) = release_age_lpm_config(manifest_min_release_age, excludes) {
+        manifest["lpm"] = lpm;
     }
     project.write_file(
         "package.json",
         &serde_json::to_string_pretty(&manifest).unwrap(),
+    );
+}
+
+fn write_release_age_manifest(project: &TempProject, manifest_min_release_age: Option<u64>) {
+    write_release_age_manifest_with_deps(
+        project,
+        serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
+        manifest_min_release_age,
+        &[],
     );
 }
 
@@ -6328,6 +6369,34 @@ async fn mount_release_age_transitive_fallback_pkgs(mock: &MockRegistry) {
     .await;
     mock.with_batch_metadata(vec![parent_metadata, child_metadata])
         .await;
+}
+
+async fn mount_release_age_alias_target_pkg(mock: &MockRegistry, published_at: &str) {
+    let tarball = make_tarball(RELEASE_AGE_ALIAS_TARGET_PKG, RELEASE_AGE_VERSION);
+    mock.with_package_published_at(
+        RELEASE_AGE_ALIAS_TARGET_PKG,
+        RELEASE_AGE_VERSION,
+        &tarball,
+        published_at,
+    )
+    .await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": RELEASE_AGE_ALIAS_TARGET_PKG,
+        "dist-tags": { "latest": RELEASE_AGE_VERSION },
+        "versions": {
+            RELEASE_AGE_VERSION: {
+                "name": RELEASE_AGE_ALIAS_TARGET_PKG,
+                "version": RELEASE_AGE_VERSION,
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_ALIAS_TARGET_PKG, RELEASE_AGE_VERSION),
+                    "integrity": compute_integrity(&tarball),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { RELEASE_AGE_VERSION: published_at }
+    })])
+    .await;
 }
 
 async fn mount_trust_downgrade_pkg(mock: &MockRegistry) {
@@ -6718,6 +6787,172 @@ async fn install_selects_older_parent_when_newer_parent_requires_too_fresh_child
 }
 
 #[tokio::test]
+async fn install_package_json_min_release_age_exclude_allows_fresh_direct_dependency() {
+    let project = TempProject::empty("");
+    write_release_age_manifest_with_deps(
+        &project,
+        serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
+        None,
+        &[RELEASE_AGE_PKG],
+    );
+
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "exact package exclude must allow the fresh direct dependency; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_cooldown_not_blocked(&out);
+}
+
+#[tokio::test]
+async fn install_min_release_age_exclude_cli_allows_fresh_direct_dependency() {
+    let project = TempProject::empty("");
+    write_release_age_manifest(&project, None);
+
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--min-release-age-exclude",
+            RELEASE_AGE_PKG,
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "CLI package exclude must allow the fresh direct dependency; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_cooldown_not_blocked(&out);
+}
+
+#[tokio::test]
+async fn install_min_release_age_exclude_applies_to_transitive_child_only() {
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name":"release-age-transitive-exclude",
+            "version":"1.0.0",
+            "dependencies":{{"{RELEASE_AGE_PARENT_PKG}":"^1.0.0"}},
+            "lpm":{{
+                "minimumReleaseAge":86400,
+                "minimumReleaseAgeExclude":["{RELEASE_AGE_CHILD_PKG}"]
+            }}
+        }}"#
+    ));
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    mount_release_age_transitive_fallback_pkgs(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "child exclude must allow the newer parent tree while keeping parent release-age policy active; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let installed_parent = project.read_file(&format!(
+        "node_modules/{RELEASE_AGE_PARENT_PKG}/package.json"
+    ));
+    let parent_manifest: serde_json::Value =
+        serde_json::from_str(&installed_parent).expect("installed parent package.json must parse");
+    assert_eq!(parent_manifest["version"], serde_json::json!("1.1.0"));
+}
+
+#[tokio::test]
+async fn install_min_release_age_exclude_matches_alias_target_canonical_name() {
+    let project = TempProject::empty("");
+    write_release_age_manifest_with_deps(
+        &project,
+        serde_json::json!({
+            RELEASE_AGE_ALIAS_LOCAL_PKG: format!("npm:{RELEASE_AGE_ALIAS_TARGET_PKG}@{RELEASE_AGE_VERSION}")
+        }),
+        Some(86_400),
+        &[RELEASE_AGE_ALIAS_TARGET_PKG],
+    );
+
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    mount_release_age_alias_target_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "alias target canonical exclude must allow the fresh target package; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_cooldown_not_blocked(&out);
+}
+
+#[tokio::test]
+async fn install_min_release_age_exclude_does_not_match_alias_local_name() {
+    let project = TempProject::empty("");
+    write_release_age_manifest_with_deps(
+        &project,
+        serde_json::json!({
+            RELEASE_AGE_ALIAS_LOCAL_PKG: format!("npm:{RELEASE_AGE_ALIAS_TARGET_PKG}@{RELEASE_AGE_VERSION}")
+        }),
+        Some(86_400),
+        &[RELEASE_AGE_ALIAS_LOCAL_PKG],
+    );
+
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    mount_release_age_alias_target_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert_cooldown_blocked(&out);
+}
+
+#[tokio::test]
 async fn install_trust_policy_no_downgrade_blocks_exact_version_that_drops_trust_evidence() {
     let project = TempProject::empty(&format!(
         r#"{{
@@ -6860,11 +7095,9 @@ async fn install_package_json_min_release_age_overrides_global_config() {
     assert_cooldown_not_blocked(&out);
 }
 
-/// Plan D7 regression: an explicit version pin (`pkg@1.0.0`) must NOT
-/// bypass the cooldown. v1 of the plan proposed pin-bypass; v2 rejected
-/// it because renovate/dependabot auto-pin PRs would otherwise land
-/// compromised versions during the detection window. This test guards
-/// that the rejected behavior never re-lands.
+/// An explicit version pin (`pkg@1.0.0`) must NOT bypass the cooldown.
+/// Otherwise renovate/dependabot auto-pin PRs could land compromised
+/// versions during the detection window.
 #[tokio::test]
 async fn install_explicit_version_pin_does_not_bypass_cooldown() {
     let project = TempProject::empty("");

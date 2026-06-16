@@ -24,6 +24,7 @@ pub(super) struct InnerGlobalInstallOptions<'a> {
     pub(super) auto_build: bool,
     pub(super) script_policy_override: Option<ScriptPolicy>,
     pub(super) min_release_age_override: Option<u64>,
+    pub(super) min_release_age_exclude: &'a [String],
     pub(super) drift_ignore_policy: DriftIgnorePolicy,
     pub(super) verify_policy: VerifyPolicy,
 }
@@ -71,6 +72,7 @@ pub(super) async fn run_inner_global_install(
         options.script_policy_override,
         None,
         options.min_release_age_override,
+        options.min_release_age_exclude,
         options.drift_ignore_policy,
         options.verify_policy,
         crate::commands::install::InstallOmitPolicy::default(),

@@ -462,14 +462,19 @@ fn print_dlx_identity(identity: &DlxResolvedIdentity) {
 ///
 /// Uses LPM's own install pipeline (self-hosted, no npm dependency).
 /// Caches installations for 24 hours from install time. Use `--refresh` to force reinstall.
+pub struct DlxOptions<'a> {
+    pub extra_args: &'a [String],
+    pub refresh: bool,
+    pub allow_new: bool,
+    pub min_release_age_override: Option<u64>,
+    pub min_release_age_exclude: &'a [String],
+}
+
 pub async fn dlx(
     client: &lpm_registry::RegistryClient,
     project_dir: &Path,
     package_spec: &str,
-    extra_args: &[String],
-    refresh: bool,
-    allow_new: bool,
-    min_release_age_override: Option<u64>,
+    options: DlxOptions<'_>,
 ) -> Result<(), LpmError> {
     let target = resolve_dlx_target(project_dir, package_spec)?;
     let cache_dir = lpm_runner::dlx::dlx_cache_dir(&target.cache_key)?;
@@ -494,21 +499,21 @@ pub async fn dlx(
         && cached_identity
             .as_ref()
             .is_some_and(|identity| cache_identity_matches_target(identity, &target));
-    let needs_install = refresh || !was_ready;
+    let needs_install = options.refresh || !was_ready;
     install_ui::phase(&format!("Resolving {}", install_ui::yellow(package_spec)));
-    if !refresh && was_ready {
+    if !options.refresh && was_ready {
         install_ui::phase(&format!(
             "Reusing dlx cache entry ({})",
             install_ui::status_ok("fresh"),
         ));
-    } else if !refresh && !install.root().join("node_modules/.bin").is_dir() {
+    } else if !options.refresh && !install.root().join("node_modules/.bin").is_dir() {
         // First install or evicted entry — silent install (matches prior dlx behavior).
-    } else if !refresh && cached_identity.is_none() {
+    } else if !options.refresh && cached_identity.is_none() {
         install_ui::phase(&format!(
             "Refreshing unaudited dlx cache entry for {}",
             install_ui::yellow(package_spec),
         ));
-    } else if !refresh {
+    } else if !options.refresh {
         // Markers present but TTL expired — be loud about the reinstall.
         install_ui::phase(&format!(
             "Refreshing expired dlx cache entry for {}",
@@ -539,7 +544,7 @@ pub async fn dlx(
             false, // offline
             crate::commands::install::FrozenLockfileMode::Never,
             false, // force
-            allow_new,
+            options.allow_new,
             false, // strict_integrity
             None,  // strict_peer_dependencies_override
             None,  // linker_override
@@ -552,7 +557,8 @@ pub async fn dlx(
             None,  // requested_add_count: dlx is not an add-path install
             None,  // script_policy_override: `lpm dlx` does not expose policy flags
             None,  // advisor_override: `lpm dlx` does not expose `--advisor`
-            min_release_age_override,
+            options.min_release_age_override,
+            options.min_release_age_exclude,
             crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm dlx` enforces drift
             crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: dlx honors env + config posture chain
             crate::commands::install::InstallOmitPolicy::default(),
@@ -596,6 +602,6 @@ pub async fn dlx(
         project_dir,
         install.root(),
         &target.install_spec,
-        extra_args,
+        options.extra_args,
     )
 }

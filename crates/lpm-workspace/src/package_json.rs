@@ -362,6 +362,10 @@ pub struct LpmConfig {
     #[serde(default, rename = "minimumReleaseAge")]
     pub minimum_release_age: Option<u64>,
 
+    /// Exact package names exempted from the minimum release age gate.
+    #[serde(default, rename = "minimumReleaseAgeExclude")]
+    pub minimum_release_age_exclude: Vec<String>,
+
     /// Whether `engines.lpm` and `engines.node` constraints from the
     /// workspace root are enforced. Default `true` (enforced) when
     /// unset.
@@ -1135,6 +1139,17 @@ mod tests {
         let pkg: PackageJson = serde_json::from_str(json).unwrap();
         let lpm = pkg.lpm.unwrap();
         assert_eq!(lpm.minimum_release_age, Some(86400u64));
+    }
+
+    #[test]
+    fn test_minimum_release_age_exclude() {
+        let json = r#"{"lpm": {"minimumReleaseAgeExclude": ["react", "@scope/pkg"]}}"#;
+        let pkg: PackageJson = serde_json::from_str(json).unwrap();
+        let lpm = pkg.lpm.unwrap();
+        assert_eq!(
+            lpm.minimum_release_age_exclude,
+            vec!["react".to_string(), "@scope/pkg".to_string()]
+        );
     }
 
     #[test]

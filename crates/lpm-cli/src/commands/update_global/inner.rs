@@ -27,6 +27,7 @@ pub(super) async fn do_install_upgrade(
             auto_build: false,
             script_policy_override: None,
             min_release_age_override: None,
+            min_release_age_exclude: &[],
             drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy::default(),
             verify_policy: crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
         },

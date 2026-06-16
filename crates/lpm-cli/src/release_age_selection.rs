@@ -1,6 +1,6 @@
 use lpm_common::LpmError;
 use lpm_registry::PackageMetadata;
-use lpm_resolver::{ReleaseTimeStatus, ResolverPolicy, TrustPolicyMode};
+use lpm_resolver::{CanonicalKey, ReleaseTimeStatus, ResolverPolicy, TrustPolicyMode};
 use lpm_semver::{Version, VersionReq};
 use std::path::Path;
 
@@ -10,15 +10,41 @@ pub(crate) fn resolver_policy_for_project(
     allow_new: bool,
     json_output: bool,
 ) -> Result<ResolverPolicy, LpmError> {
-    let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
+    resolver_policy_for_project_with_excludes(
         project_dir,
         min_release_age_override,
+        &[],
+        allow_new,
+        json_output,
+    )
+}
+
+pub(crate) fn resolver_policy_for_project_with_excludes(
+    project_dir: &Path,
+    min_release_age_override: Option<u64>,
+    min_release_age_exclude: &[String],
+    allow_new: bool,
+    json_output: bool,
+) -> Result<ResolverPolicy, LpmError> {
+    let config = crate::release_age_config::ReleaseAgeResolver::resolve_config(
+        project_dir,
+        min_release_age_override,
+        min_release_age_exclude,
         json_output,
     )?;
-    let minimum_release_age_secs = if allow_new { 0 } else { effective_min_age_secs };
-    Ok(ResolverPolicy::new(
+    let minimum_release_age_secs = if allow_new {
+        0
+    } else {
+        config.minimum_release_age_secs
+    };
+    let excludes = config
+        .minimum_release_age_exclude
+        .iter()
+        .map(|name| CanonicalKey::from_dep_name(name));
+    Ok(ResolverPolicy::new_with_release_age_excludes(
         minimum_release_age_secs,
         TrustPolicyMode::Off,
+        excludes,
     ))
 }
 
@@ -26,8 +52,9 @@ pub(crate) fn latest_allowed_version(
     metadata: &PackageMetadata,
     policy: &ResolverPolicy,
 ) -> Option<String> {
+    let canonical = CanonicalKey::from_dep_name(&metadata.name);
     if let Some(latest) = metadata.latest_version_tag()
-        && version_allowed_by_policy(metadata, latest, policy)
+        && version_allowed_by_policy(&canonical, metadata, latest, policy)
         && Version::parse(latest).is_ok()
     {
         return Some(latest.to_string());
@@ -39,13 +66,14 @@ pub(crate) fn latest_allowed_version(
         .into_iter()
         .rev()
         .map(|version| version.to_string())
-        .find(|version| version_allowed_by_policy(metadata, version, policy))
+        .find(|version| version_allowed_by_policy(&canonical, metadata, version, policy))
 }
 
 pub(crate) fn latest_allowed_version_or_policy_error(
     metadata: &PackageMetadata,
     policy: &ResolverPolicy,
 ) -> Result<String, LpmError> {
+    let canonical = CanonicalKey::from_dep_name(&metadata.name);
     if let Some(version) = latest_allowed_version(metadata, policy) {
         return Ok(version);
     }
@@ -57,17 +85,20 @@ pub(crate) fn latest_allowed_version_or_policy_error(
         )));
     };
     let candidate = candidate.to_string();
-    Err(policy_blocked_error(metadata, &candidate, policy))
+    Err(policy_blocked_error(
+        &canonical, metadata, &candidate, policy,
+    ))
 }
 
 pub(crate) fn allowed_version_strings(
     metadata: &PackageMetadata,
     policy: &ResolverPolicy,
 ) -> Vec<String> {
+    let canonical = CanonicalKey::from_dep_name(&metadata.name);
     metadata
         .versions
         .keys()
-        .filter(|version| version_allowed_by_policy(metadata, version, policy))
+        .filter(|version| version_allowed_by_policy(&canonical, metadata, version, policy))
         .cloned()
         .collect()
 }
@@ -77,19 +108,20 @@ pub(crate) fn resolve_version_spec_with_policy(
     spec: &str,
     policy: &ResolverPolicy,
 ) -> Result<String, LpmError> {
+    let canonical = CanonicalKey::from_dep_name(&metadata.name);
     if let Some(version) = metadata.dist_tags.get(spec) {
-        return if version_allowed_by_policy(metadata, version, policy) {
+        return if version_allowed_by_policy(&canonical, metadata, version, policy) {
             Ok(version.clone())
         } else {
-            Err(policy_blocked_error(metadata, version, policy))
+            Err(policy_blocked_error(&canonical, metadata, version, policy))
         };
     }
 
     if metadata.versions.contains_key(spec) {
-        return if version_allowed_by_policy(metadata, spec, policy) {
+        return if version_allowed_by_policy(&canonical, metadata, spec, policy) {
             Ok(spec.to_string())
         } else {
-            Err(policy_blocked_error(metadata, spec, policy))
+            Err(policy_blocked_error(&canonical, metadata, spec, policy))
         };
     }
 
@@ -103,7 +135,8 @@ pub(crate) fn resolve_version_spec_with_policy(
         )));
     }
     versions.retain(|version| {
-        req.matches(version) && version_allowed_by_policy(metadata, &version.to_string(), policy)
+        req.matches(version)
+            && version_allowed_by_policy(&canonical, metadata, &version.to_string(), policy)
     });
     if let Some(version) = versions.into_iter().max() {
         return Ok(version.to_string());
@@ -134,22 +167,29 @@ fn parse_versions(metadata: &PackageMetadata) -> Vec<Version> {
 }
 
 fn version_allowed_by_policy(
+    canonical: &CanonicalKey,
     metadata: &PackageMetadata,
     version: &str,
     policy: &ResolverPolicy,
 ) -> bool {
     matches!(
-        policy.release_time_status(metadata.time.get(version).map(String::as_str)),
+        policy.release_time_status_for_package(
+            canonical,
+            metadata.time.get(version).map(String::as_str)
+        ),
         ReleaseTimeStatus::Allowed
     )
 }
 
 fn policy_blocked_error(
+    canonical: &CanonicalKey,
     metadata: &PackageMetadata,
     version: &str,
     policy: &ResolverPolicy,
 ) -> LpmError {
-    let detail = match policy.release_time_status(metadata.time.get(version).map(String::as_str)) {
+    let detail = match policy
+        .release_time_status_for_package(canonical, metadata.time.get(version).map(String::as_str))
+    {
         ReleaseTimeStatus::Allowed => "allowed by policy".to_string(),
         ReleaseTimeStatus::Missing => format!(
             "missing publish time for minimumReleaseAge={}s",

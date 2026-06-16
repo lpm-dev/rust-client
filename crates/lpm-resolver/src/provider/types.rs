@@ -155,7 +155,7 @@ pub struct CachedPackageInfo {
 }
 
 impl CachedPackageInfo {
-    pub fn needs_policy_metadata(&self, policy: &ResolverPolicy) -> bool {
+    pub fn needs_policy_metadata(&self, package: &CanonicalKey, policy: &ResolverPolicy) -> bool {
         if policy.requires_trust_history() && !self.trust_metadata_complete {
             return true;
         }
@@ -168,7 +168,8 @@ impl CachedPackageInfo {
                 .and_then(|dist| dist.published_at.as_deref())
                 .is_none()
         });
-        missing_version_time && policy.metadata_modified_after_cutoff(self.modified.as_deref())
+        missing_version_time
+            && policy.metadata_modified_after_cutoff_for_package(package, self.modified.as_deref())
     }
 }
 
