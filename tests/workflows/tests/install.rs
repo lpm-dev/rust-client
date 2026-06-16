@@ -2407,6 +2407,13 @@ async fn install_add_with_transitive_same_name_keeps_only_the_new_direct_version
         !stderr.contains("+ chalk@4.1.2"),
         "added-list must not surface the transitive chalk version as direct:\n{stderr}"
     );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).expect("package.json parses");
+    assert_eq!(
+        manifest["dependencies"]["chalk"],
+        serde_json::json!("^5.0.0"),
+        "bare direct add must save the newly requested latest version, not the existing transitive version"
+    );
 }
 
 #[tokio::test]

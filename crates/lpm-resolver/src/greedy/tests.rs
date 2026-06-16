@@ -1403,6 +1403,47 @@ fn process_edge_reuses_newest_existing_version_when_multiple_satisfy_range() {
 }
 
 #[test]
+fn root_edge_allocates_best_version_when_only_lower_existing_version_satisfies_range() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let shared = CanonicalKey::npm("shared");
+    push_node(&mut state, shared.clone(), "1.2.0");
+
+    let edge = Edge {
+        parent: 0,
+        local_name: "shared".to_string(),
+        canonical: shared.clone(),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    let info = mk_info(&["1.9.0", "1.2.0"], &[]);
+
+    process_edge(&edge, &info, &mut state).unwrap();
+
+    let root_shared_id = state.nodes[0]
+        .children
+        .iter()
+        .find(|(name, _)| name == "shared")
+        .map(|(_, id)| *id)
+        .unwrap();
+    assert_eq!(
+        state.nodes[root_shared_id as usize].version.to_string(),
+        "1.9.0",
+        "root dependency edges must pick their natural best version, not a lower transitive version that already satisfies the range"
+    );
+    let mut versions: Vec<String> = state.resolved[&shared]
+        .iter()
+        .map(|(version, _)| version.to_string())
+        .collect();
+    versions.sort();
+    assert_eq!(versions, vec!["1.2.0", "1.9.0"]);
+}
+
+#[test]
 fn into_resolved_packages_binds_peer_by_consumer_range() {
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     push_node(&mut state, CanonicalKey::Root, "0.0.0");

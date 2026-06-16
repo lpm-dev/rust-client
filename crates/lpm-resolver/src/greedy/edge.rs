@@ -178,22 +178,24 @@ fn newest_existing_satisfying_node(
 
 /// Core reuse-or-allocate logic. The `forced` parameter, when present,
 /// carries (natural_version, optional_override) computed by the override
-/// branch in [`process_edge`]. When `None`, the function uses the
+/// branch in [`process_edge`]. When `None`, non-root edges use the
 /// pre-override fast path: any existing node satisfying the edge range
 /// is reused, otherwise [`find_best_version`] picks the newest match.
+/// Root edges pick their natural target first so an explicit top-level
+/// dependency cannot be down-selected by an earlier transitive edge that
+/// only happens to satisfy a broad range.
 fn process_edge_inner(
     edge: &Edge,
     info: &CachedPackageInfo,
     forced: Option<(NpmVersion, Option<(NpmVersion, OverrideHit)>)>,
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
-    // Determine the target version for THIS edge. Without overrides,
-    // the target is whichever existing node satisfies the range, else
-    // the newest in-range pick. With an override applied, the target
-    // is the override-forced version (used for exact-match dedupe so
-    // distinct overrides split correctly). With overrides parsed but
-    // not matching this edge, the target is the natural pick — same as
-    // the no-overrides path but skipping the redundant find_best_version.
+    let is_root_edge = edge.parent == 0;
+
+    // Determine the target version for THIS edge. Non-root edges on
+    // the no-overrides path can reuse whichever existing node satisfies
+    // the range. Root edges, override hits, and override-aware misses use
+    // the natural or forced target first, then dedupe against that target.
     let (target_version, override_hit): (NpmVersion, Option<OverrideHit>) = match forced {
         Some((natural, Some((forced_v, hit)))) => {
             let _ = natural;
@@ -201,19 +203,23 @@ fn process_edge_inner(
         }
         Some((natural, None)) => (natural, None),
         None => {
-            // Hot path — no overrides parsed. Reuse-on-range-satisfies.
-            let existing_id: Option<NodeId> = state
-                .resolved
-                .get(&edge.canonical)
-                .and_then(|nodes| newest_existing_satisfying_node(nodes, &edge.range));
-            if let Some(id) = existing_id {
-                if !edge_is_optional_in_context(edge, state) {
-                    mark_node_required_closure(state, id);
+            // Hot path — no overrides parsed. Reuse-on-range-satisfies
+            // applies only below the root; root deps define the visible
+            // install contract and must choose their own target version.
+            if !is_root_edge {
+                let existing_id: Option<NodeId> = state
+                    .resolved
+                    .get(&edge.canonical)
+                    .and_then(|nodes| newest_existing_satisfying_node(nodes, &edge.range));
+                if let Some(id) = existing_id {
+                    if !edge_is_optional_in_context(edge, state) {
+                        mark_node_required_closure(state, id);
+                    }
+                    state.nodes[edge.parent as usize]
+                        .children
+                        .push((edge.local_name.clone(), id));
+                    return Ok(());
                 }
-                state.nodes[edge.parent as usize]
-                    .children
-                    .push((edge.local_name.clone(), id));
-                return Ok(());
             }
             let version = match find_best_version_with_policy(
                 &edge.canonical,
@@ -316,7 +322,7 @@ fn process_edge_inner(
             .overrides
             .split_targets()
             .contains(&edge.canonical.to_string());
-    let must_exact_match = override_hit.is_some() || split_gate;
+    let must_exact_match = is_root_edge || override_hit.is_some() || split_gate;
     let existing_id: Option<NodeId> = state.resolved.get(&edge.canonical).and_then(|nodes| {
         if must_exact_match {
             nodes
