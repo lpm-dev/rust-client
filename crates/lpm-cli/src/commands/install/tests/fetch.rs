@@ -133,6 +133,51 @@ async fn tarball_url_install_match_succeeds() {
 }
 
 #[tokio::test]
+async fn tarball_url_install_v2_extracts_object() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let body = build_test_tarball();
+    let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/foo.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+    let url = format!("{}/foo.tgz", server.uri());
+
+    let store_root = tempfile::tempdir().unwrap();
+    let store_v2_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(store_v2_root.path());
+    let client = Arc::new(RegistryClient::new());
+    let pkg = install_package_for_tarball(&url, Some(&expected_sri));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = semaphore
+        .clone()
+        .try_acquire_owned()
+        .expect("permit must be available in test setup");
+
+    let (computed_sri, _, _) =
+        fetch_and_store_tarball_url(&client, &store, Some(&store_v2), &pkg, 0, permit)
+            .await
+            .expect("v2 tarball install must succeed");
+
+    assert_eq!(computed_sri, expected_sri);
+    assert!(
+        store_v2
+            .reusable_object_dir(&computed_sri)
+            .unwrap()
+            .is_some(),
+        "v2 tarball install must populate the object store"
+    );
+    assert_eq!(semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
 async fn tarball_url_install_mismatch_errors_no_extraction() {
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use wiremock::matchers::{method, path};
@@ -237,6 +282,60 @@ async fn tarball_url_install_cache_hit_skips_redundant_download() {
         mtime1, mtime2,
         "second install must hit the existing CAS dir, not re-extract"
     );
+}
+
+#[tokio::test]
+async fn speculative_v2_download_extracts_object() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let body = build_test_tarball();
+    let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/foo.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!("{}/foo.tgz", server.uri());
+
+    let store_root = tempfile::tempdir().unwrap();
+    let store_v2_root = tempfile::tempdir().unwrap();
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(server.uri()));
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(store_v2_root.path());
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let speculation_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let coord = Arc::new(FetchCoordinator::default());
+
+    speculative_download_and_store(
+        &client,
+        &route_table,
+        &store,
+        Some(&store_v2),
+        &semaphore,
+        Some(&speculation_semaphore),
+        &coord,
+        "test-tarball-pkg",
+        "1.0.0",
+        &url,
+        Some(&expected_sri),
+    )
+    .await
+    .expect("speculative v2 download must succeed");
+
+    assert!(
+        store_v2
+            .reusable_object_dir(&expected_sri)
+            .unwrap()
+            .is_some(),
+        "speculation must populate the v2 object store"
+    );
+    assert_eq!(semaphore.available_permits(), 1);
 }
 
 // ── : redirect handling ────────────────────────────────
