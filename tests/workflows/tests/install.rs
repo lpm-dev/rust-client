@@ -3433,6 +3433,121 @@ async fn install_creates_bin_symlink_for_binary_package() {
     );
 }
 
+#[tokio::test]
+async fn install_v2_bin_shim_resolves_project_context_from_transitive_runtime() {
+    let mock = MockRegistry::start().await;
+
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "framework-cli",
+            "version": "1.0.0",
+            "bin": { "framework-cli": "bin/framework-cli.js" },
+            "dependencies": {
+                "framework-plugin": "1.0.0"
+            }
+        }),
+        &[(
+            "bin/framework-cli.js",
+            br#"#!/usr/bin/env node
+require('framework-plugin').run();
+"#,
+        )],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "framework-plugin",
+            "version": "1.0.0",
+            "main": "index.js",
+            "dependencies": {
+                "framework-runtime": "1.0.0",
+                "runtime-helper": "1.0.0"
+            }
+        }),
+        &[(
+            "index.js",
+            br#"exports.run = () => require('framework-runtime').run();
+"#,
+        )],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "framework-runtime",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[(
+            "index.js",
+            br#"exports.run = () => console.log(require('runtime-helper').message);
+"#,
+        )],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "runtime-helper",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[(
+            "index.js",
+            br#"exports.message = 'v2-compat-ok';
+"#,
+        )],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "v2-bin-context",
+  "version": "1.0.0",
+  "dependencies": {
+    "framework-cli": "1.0.0",
+    "framework-plugin": "1.0.0",
+    "runtime-helper": "1.0.0"
+  }
+}"#,
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run v2 install for bin compatibility layout");
+    assert!(
+        install.status.success(),
+        "v2 install should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let bin_path = project
+        .path()
+        .join("node_modules")
+        .join(".bin")
+        .join("framework-cli");
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to execute {}: {e}", bin_path.display()));
+
+    assert!(
+        output.status.success(),
+        "directly executing v2 project bin must resolve project context from a transitive runtime\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "v2-compat-ok"
+    );
+}
+
 /// A `file:` local dependency must be resolved from the filesystem and linked
 /// into node_modules — no network call required.
 #[tokio::test]

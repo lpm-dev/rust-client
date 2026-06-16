@@ -129,14 +129,24 @@ impl V2BaselineIndex {
         let mut by_coords: HashMap<(String, String), InstalledPackageBaseline> = HashMap::new();
 
         // Seeds: every direct symlink under `<project>/node_modules/`
-        // whose target lives inside `<links_root>/<key>/`.
+        // whose target lives inside `<links_root>/<key>/`. Direct-bin
+        // compatibility roots point at project-local copies instead;
+        // those copies use the same `<key>` directory name, so they
+        // map back to the owning link entry before the sidecar walk.
         let mut to_visit: VecDeque<PathBuf> = VecDeque::new();
         let mut visited: HashSet<PathBuf> = HashSet::new();
         let nm_root = project_dir.join("node_modules");
+        let compatibility_root = nm_root.join(".lpm").join("compat");
         if let Ok(read_dir) = std::fs::read_dir(&nm_root) {
             for entry in read_dir.flatten() {
                 let symlink_path = entry.path();
-                seed_project_link_dir(&symlink_path, &links_root, &mut visited, &mut to_visit);
+                seed_project_link_dir(
+                    &symlink_path,
+                    &links_root,
+                    &compatibility_root,
+                    &mut visited,
+                    &mut to_visit,
+                );
 
                 // Scoped direct deps live at `node_modules/@scope/pkg`,
                 // so the project root contains a REAL `@scope/` dir and
@@ -160,6 +170,7 @@ impl V2BaselineIndex {
                         seed_project_link_dir(
                             &scope_entry.path(),
                             &links_root,
+                            &compatibility_root,
                             &mut visited,
                             &mut to_visit,
                         );
@@ -315,6 +326,7 @@ impl V2BaselineIndex {
 fn seed_project_link_dir(
     symlink_path: &Path,
     links_root: &Path,
+    compatibility_root: &Path,
     visited: &mut HashSet<PathBuf>,
     to_visit: &mut VecDeque<PathBuf>,
 ) {
@@ -334,7 +346,9 @@ fn seed_project_link_dir(
             .unwrap_or_else(|| Path::new("."))
             .join(target)
     };
-    if let Some(link_dir) = link_dir_from_target(&target, links_root)
+    let link_dir = link_dir_from_target(&target, links_root)
+        .or_else(|| link_dir_from_compatibility_target(&target, compatibility_root, links_root));
+    if let Some(link_dir) = link_dir
         && visited.insert(link_dir.clone())
     {
         to_visit.push_back(link_dir);
@@ -379,6 +393,37 @@ fn link_dir_from_target(target: &Path, links_root: &Path) -> Option<PathBuf> {
     for ancestor in canonical_target.ancestors() {
         if ancestor.parent() == Some(canonical_links_root.as_path()) {
             return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn link_dir_from_compatibility_target(
+    target: &Path,
+    compatibility_root: &Path,
+    links_root: &Path,
+) -> Option<PathBuf> {
+    for ancestor in target.ancestors() {
+        if ancestor.parent() == Some(compatibility_root) {
+            return ancestor
+                .file_name()
+                .map(|entry_name| links_root.join(entry_name));
+        }
+    }
+
+    let canonical_compatibility_root = match compatibility_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let canonical_target = match target.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    for ancestor in canonical_target.ancestors() {
+        if ancestor.parent() == Some(canonical_compatibility_root.as_path()) {
+            return ancestor
+                .file_name()
+                .map(|entry_name| links_root.join(entry_name));
         }
     }
     None
@@ -762,6 +807,76 @@ mod tests {
              Got: {:?}, expected under: {:?}",
             project_hit.package_dir,
             entry_patched
+        );
+    }
+
+    /// Direct-bin compatibility rewires `node_modules/<pkg>` to a
+    /// project-local copy under `node_modules/.lpm/compat/<key>/`.
+    /// Rebuild still needs to discover and mutate the owning v2 link
+    /// entry, not the project-local copy.
+    #[cfg(unix)]
+    #[test]
+    fn for_project_maps_compatibility_root_symlink_to_owning_link_entry() {
+        use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};
+        use chrono::Utc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+
+        let v2_links_root = dir.path().join("store").join("v2").join("links");
+        let key_dir_name = "cli-tool@1.0.0+dddddddddddddddd";
+        let entry = v2_links_root.join(key_dir_name);
+        let link_pkg = entry.join("node_modules").join("cli-tool");
+        std::fs::create_dir_all(&link_pkg).unwrap();
+        std::fs::write(
+            link_pkg.join("package.json"),
+            r#"{"name":"cli-tool","version":"1.0.0","bin":{"cli-tool":"bin/cli.js"}}"#,
+        )
+        .unwrap();
+        let meta = LinkMeta {
+            schema: 1,
+            graph_key: key_dir_name.into(),
+            graph_key_digest_hex:
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+            name: "cli-tool".into(),
+            version: "1.0.0".into(),
+            source_sri: "sha512-stub-cli-tool".into(),
+            object_path: "objects/sha512-stub-cli-tool".into(),
+            deps: vec![],
+            platform: std::sync::Arc::new(LinkMetaPlatform {
+                os: "darwin".into(),
+                cpu: "arm64".into(),
+                libc: None,
+            }),
+            created_at: Utc::now(),
+            last_referenced_at: Utc::now(),
+        };
+        meta.write_to(&entry).unwrap();
+
+        let project = dir.path().join("project");
+        let nm = project.join("node_modules");
+        let compat_pkg = nm
+            .join(".lpm")
+            .join("compat")
+            .join(key_dir_name)
+            .join("node_modules")
+            .join("cli-tool");
+        std::fs::create_dir_all(&compat_pkg).unwrap();
+        std::fs::write(
+            compat_pkg.join("package.json"),
+            r#"{"name":"cli-tool","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&compat_pkg, nm.join("cli-tool")).unwrap();
+
+        let index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
+        let hit = index
+            .lookup("cli-tool", "1.0.0")
+            .expect("compatibility root symlink must seed the owning link entry");
+        assert!(
+            hit.package_dir.starts_with(entry.join("node_modules")),
+            "compatibility root must map back to the v2 link entry; got {:?}",
+            hit.package_dir
         );
     }
 

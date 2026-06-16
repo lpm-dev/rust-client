@@ -135,7 +135,7 @@ pub(super) fn relink_bins_after_lifecycle_build(
     let result = if lpm_store::StoreVersion::from_env().is_v2() {
         let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
         let v2_targets = build_v2_targets(packages, link_targets)?;
-        lpm_linker::v2::link_packages_v2_with_compatibility_bin_names(
+        lpm_linker::v2::finalize_existing_link_entries_with_compatibility_bin_names(
             project_dir,
             v2_targets,
             &store_v2,

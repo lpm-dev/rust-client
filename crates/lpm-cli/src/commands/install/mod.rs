@@ -936,8 +936,7 @@ async fn run_with_options_under_store_lock(
         &pkg_content_for_state,
         linker_mode,
     );
-    let compatibility_bins_ready = compatibility_bin_names.is_empty()
-        || !requested_v2_mode
+    let compatibility_bins_ready = !requested_v2_mode
         || lpm_linker::v2::project_compatibility_bins_ready(project_dir, compatibility_bin_names);
     let cleanup_catalogs_in_pipeline = requested_add_count.is_none();
     if !frozen_lockfile_active
