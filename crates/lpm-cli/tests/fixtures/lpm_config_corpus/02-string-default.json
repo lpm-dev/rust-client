@@ -1,5 +1,5 @@
 {
-  "$schema": "https://lpm.dev/schemas/lpm.config.json",
+  "$schema": "https://cli.lpm.dev/schemas/lpm.config.json",
   "ecosystem": "js",
   "configSchema": {
     "component": {

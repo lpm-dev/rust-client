@@ -14,9 +14,9 @@ installs the matching platform package automatically through
 <summary>Other install methods</summary>
 
 ```bash
-brew tap lpm-dev/lpm && brew install lpm        # Homebrew
-curl -fsSL https://lpm.dev/install.sh | sh       # Standalone
-cargo install --git https://github.com/lpm-dev/rust-client lpm-cli  # Source
+brew tap lpm-dev/lpm && brew install lpm         # Homebrew
+curl -fsSL https://cli.lpm.dev/install | sh       # Standalone
+cargo install --git https://github.com/lpm-dev/rust-client lpm-cli   # Source
 ```
 
 Standalone installs and self-updates verify release download integrity before

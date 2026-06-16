@@ -88,7 +88,7 @@ fn schema_lpm_config_json_emits_hand_authored_schema_with_id() {
     // public URL. Source of truth: `crates/lpm-cli/schemas/lpm.config.schema.json`.
     assert_eq!(
         parsed["$id"].as_str(),
-        Some("https://lpm.dev/schemas/lpm.config.json"),
+        Some("https://cli.lpm.dev/schemas/lpm.config.json"),
         "lpm.config.json schema must declare its public $id, got:\n{parsed}",
     );
 }
