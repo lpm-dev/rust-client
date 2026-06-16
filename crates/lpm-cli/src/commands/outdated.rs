@@ -83,6 +83,12 @@ pub async fn run(
     } else {
         None
     };
+    let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
+        project_dir,
+        None,
+        false,
+        json_output,
+    )?;
 
     dep_entries.sort_by(|left, right| {
         left.name
@@ -125,15 +131,26 @@ pub async fn run(
 
         match metadata {
             Ok(metadata) => {
-                let latest = metadata
-                    .latest_version_tag()
-                    .unwrap_or("unknown")
-                    .to_string();
-                let wanted = metadata.resolve_version_spec(&dep.range).ok();
-
                 let installed = lockfile
                     .as_ref()
                     .and_then(|lf| lf.find_package(&dep.name).map(|p| p.version.clone()));
+                let latest = crate::release_age_selection::latest_allowed_version(
+                    &metadata,
+                    &release_age_policy,
+                )
+                .or_else(|| installed.clone())
+                .unwrap_or_else(|| {
+                    metadata
+                        .latest_version_tag()
+                        .unwrap_or("unknown")
+                        .to_string()
+                });
+                let wanted = crate::release_age_selection::resolve_version_spec_with_policy(
+                    &metadata,
+                    &dep.range,
+                    &release_age_policy,
+                )
+                .ok();
 
                 let installed_str = installed.as_deref().unwrap_or("?");
                 let is_outdated = installed.as_deref() != Some(latest.as_str());

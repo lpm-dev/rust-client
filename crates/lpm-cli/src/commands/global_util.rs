@@ -3,7 +3,6 @@ use crate::save_spec::UserSaveIntent;
 use crate::script_policy_config::ScriptPolicy;
 use lpm_common::{LpmError, LpmRoot};
 use lpm_registry::RegistryClient;
-use lpm_semver::{Version, VersionReq};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
@@ -84,17 +83,47 @@ pub(super) async fn run_inner_global_install(
     .await
 }
 
+#[cfg(test)]
 pub(super) fn pick_version(
     metadata: &lpm_registry::PackageMetadata,
     intent: &UserSaveIntent,
     command_label: &str,
 ) -> Result<String, LpmError> {
+    pick_version_with_policy(
+        metadata,
+        intent,
+        command_label,
+        &lpm_resolver::ResolverPolicy::default(),
+    )
+}
+
+pub(super) fn pick_version_with_policy(
+    metadata: &lpm_registry::PackageMetadata,
+    intent: &UserSaveIntent,
+    command_label: &str,
+    policy: &lpm_resolver::ResolverPolicy,
+) -> Result<String, LpmError> {
+    if let UserSaveIntent::Exact(version) = intent
+        && !metadata.versions.contains_key(version)
+    {
+        return Err(LpmError::Script(format!(
+            "registry no longer serves version '{version}' for '{}' - the version may have been yanked or deleted upstream",
+            metadata.name
+        )));
+    }
+
+    if let UserSaveIntent::Bare = intent {
+        return crate::release_age_selection::latest_allowed_version_or_policy_error(
+            metadata, policy,
+        );
+    }
+
     let token = match intent {
-        UserSaveIntent::Bare => "latest".to_string(),
-        UserSaveIntent::Exact(s) => return Ok(s.clone()),
+        UserSaveIntent::Exact(s) => s.clone(),
         UserSaveIntent::Range(s) => s.clone(),
         UserSaveIntent::DistTag(t) => t.clone(),
         UserSaveIntent::Wildcard => "*".to_string(),
+        UserSaveIntent::Bare => unreachable!(),
         UserSaveIntent::Workspace(_) => {
             return Err(LpmError::Script(format!(
                 "{command_label} does not support workspace: protocol"
@@ -102,41 +131,7 @@ pub(super) fn pick_version(
         }
     };
 
-    if let Some(v) = metadata.dist_tags.get(&token) {
-        return Ok(v.clone());
-    }
-    let req = VersionReq::parse(&token)
-        .map_err(|e| LpmError::Script(format!("could not parse version token '{token}': {e}")))?;
-    let mut versions: Vec<Version> = metadata
-        .versions
-        .keys()
-        .filter_map(|s| Version::parse(s).ok())
-        .collect();
-    if versions.is_empty() {
-        return Err(LpmError::Script(format!(
-            "registry returned no parseable versions for '{}'",
-            metadata.name
-        )));
-    }
-    let refs: Vec<&Version> = versions.iter().collect();
-    match lpm_semver::max_satisfying(&refs, &req) {
-        Some(v) => Ok(v.to_string()),
-        None => {
-            versions.sort();
-            Err(LpmError::Script(format!(
-                "no version of '{}' satisfies '{}'. Available: {}",
-                metadata.name,
-                token,
-                versions
-                    .iter()
-                    .rev()
-                    .take(5)
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )))
-        }
-    }
+    crate::release_age_selection::resolve_version_spec_with_policy(metadata, &token, policy)
 }
 
 pub(super) fn discover_bin_commands(
@@ -380,6 +375,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(version, "9.24.0");
+    }
+
+    #[test]
+    fn pick_version_bare_reports_release_age_block_when_all_versions_are_too_new() {
+        let mut versions = HashMap::new();
+        versions.insert(
+            "1.0.0".to_string(),
+            lpm_registry::VersionMetadata::default(),
+        );
+        let mut metadata = package_metadata("x", HashMap::new(), versions);
+        metadata
+            .time
+            .insert("1.0.0".to_string(), "2999-01-01T00:00:00.000Z".to_string());
+        let policy = lpm_resolver::ResolverPolicy::new(259_200, lpm_resolver::TrustPolicyMode::Off);
+
+        let err =
+            pick_version_with_policy(&metadata, &UserSaveIntent::Bare, "global install", &policy)
+                .unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("published too recently for minimumReleaseAge")
+                && message.contains("minimumReleaseAge=259200s"),
+            "bare global selection must surface release-age policy errors; got {message}"
+        );
     }
 
     #[test]

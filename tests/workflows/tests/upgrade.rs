@@ -12,6 +12,12 @@ mod support;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
 
+fn iso8601_n_secs_ago(n_secs: i64) -> String {
+    use chrono::SecondsFormat;
+    let dt = chrono::Utc::now() - chrono::Duration::seconds(n_secs);
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 /// Mount `pkg` on the mock with `latest_version` exposed via metadata
 /// and a real tarball at the production-shaped path
 /// `/tarballs/<name>/-/<name>-<version>.tgz` (see
@@ -185,6 +191,93 @@ async fn upgrade_upgrades_npm_packages_with_public_npm_lock_source() {
         entry.version, "2.5.0",
         "lockfile must record the upgraded npm version"
     );
+}
+
+#[tokio::test]
+async fn upgrade_selects_latest_mature_candidate_when_latest_is_inside_release_age_window() {
+    let pkg = "@lpm.dev/owner.cooldown-upgrade";
+    let project = TempProject::empty("");
+    project.write_file(
+        "package.json",
+        &format!(
+            "{{\n  \"name\": \"upgrade-release-age\",\n  \"version\": \"1.0.0\",\n  \
+             \"dependencies\": {{\n    \"{pkg}\": \"^1.0.0\"\n  }},\n  \
+             \"lpm\": {{ \"minimumReleaseAge\": 86400 }}\n}}\n"
+        ),
+    );
+    project.write_file(
+        "lpm.lock",
+        &format!(
+            "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
+             [[packages]]\nname = \"{pkg}\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://lpm.dev\"\n",
+        ),
+    );
+
+    let mock = MockRegistry::start().await;
+    let v1_0_0 = make_tarball(pkg, "1.0.0");
+    let v1_1_0 = make_tarball(pkg, "1.1.0");
+    let v1_2_0 = make_tarball(pkg, "1.2.0");
+    let metadata = serde_json::json!({
+        "name": pkg,
+        "dist-tags": { "latest": "1.2.0" },
+        "modified": iso8601_n_secs_ago(3_600),
+        "versions": {
+            "1.0.0": {
+                "name": pkg,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url(pkg, "1.0.0"),
+                    "integrity": compute_integrity(&v1_0_0),
+                },
+                "dependencies": {}
+            },
+            "1.1.0": {
+                "name": pkg,
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url(pkg, "1.1.0"),
+                    "integrity": compute_integrity(&v1_1_0),
+                },
+                "dependencies": {}
+            },
+            "1.2.0": {
+                "name": pkg,
+                "version": "1.2.0",
+                "dist": {
+                    "tarball": mock.tarball_url(pkg, "1.2.0"),
+                    "integrity": compute_integrity(&v1_2_0),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.1.0": iso8601_n_secs_ago(2 * 86_400),
+            "1.2.0": iso8601_n_secs_ago(3_600)
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        pkg,
+        metadata,
+        &[("1.0.0", v1_0_0), ("1.1.0", v1_1_0), ("1.2.0", v1_2_0)],
+    )
+    .await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y"])
+        .output()
+        .expect("spawn lpm upgrade");
+    assert!(
+        out.status.success(),
+        "upgrade must choose the newest mature version instead of rewriting to a fresh latest\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(pkg_json["dependencies"][pkg], serde_json::json!("^1.1.0"));
 }
 
 #[tokio::test]

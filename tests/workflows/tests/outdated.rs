@@ -10,6 +10,12 @@ mod support;
 use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm_with_registry};
 
+fn iso8601_n_secs_ago(n_secs: i64) -> String {
+    use chrono::SecondsFormat;
+    let dt = chrono::Utc::now() - chrono::Duration::seconds(n_secs);
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 /// Mount metadata for one `@lpm.dev/*` package on the mock so
 /// `client.get_package_metadata` resolves to a known latest tag.
 async fn mount_lpm_package_latest(mock: &MockRegistry, name: &str, latest_version: &str) {
@@ -162,6 +168,72 @@ async fn outdated_reports_non_lpm_packages_by_default() {
     assert_eq!(entry["latest"], serde_json::json!("9.9.9"));
     assert_eq!(entry["section"], serde_json::json!("dependencies"));
     assert_eq!(entry["outdated"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn outdated_treats_fresh_latest_as_up_to_date_when_current_version_is_mature() {
+    let package = "@lpm.dev/owner.cooldown-outdated";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"outdated-release-age","version":"1.0.0","dependencies":{{"{package}":"^1.0.0"}},"lpm":{{"minimumReleaseAge":86400}}}}"#,
+    ));
+    write_minimal_lockfile(&project, package, "1.0.0");
+
+    let mock = MockRegistry::start().await;
+    let v1_0_0 = make_tarball(package, "1.0.0");
+    let v1_1_0 = make_tarball(package, "1.1.0");
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": { "latest": "1.1.0" },
+        "modified": iso8601_n_secs_ago(3_600),
+        "versions": {
+            "1.0.0": {
+                "name": package,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url(package, "1.0.0"),
+                    "integrity": support::mock_registry::compute_integrity(&v1_0_0),
+                },
+                "dependencies": {}
+            },
+            "1.1.0": {
+                "name": package,
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url(package, "1.1.0"),
+                    "integrity": support::mock_registry::compute_integrity(&v1_1_0),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.1.0": iso8601_n_secs_ago(3_600)
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        package,
+        metadata,
+        &[("1.0.0", v1_0_0), ("1.1.0", v1_1_0)],
+    )
+    .await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn lpm outdated --json");
+    assert!(
+        out.status.success(),
+        "outdated should succeed when the only newer version is still inside minimumReleaseAge\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["outdated_count"], serde_json::json!(0));
+    let entry = &envelope["packages"][0];
+    assert_eq!(entry["wanted"], serde_json::json!("1.0.0"));
+    assert_eq!(entry["latest"], serde_json::json!("1.0.0"));
+    assert_eq!(entry["outdated"], serde_json::json!(false));
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use super::super::global_util::pick_version;
+use super::super::global_util::pick_version_with_policy;
 use crate::save_spec::{
     SaveConfig, SaveFlags, decide_saved_dependency_spec, parse_user_save_intent,
 };
@@ -19,6 +19,7 @@ pub(super) struct ResolvedSpec {
 pub(super) async fn pre_resolve(
     registry: &RegistryClient,
     spec: &str,
+    policy: &lpm_resolver::ResolverPolicy,
 ) -> Result<ResolvedSpec, LpmError> {
     let (name, intent) = parse_user_save_intent(spec)?;
     // Dispatch by name shape: `@lpm.dev/owner.tool` goes through the
@@ -35,7 +36,7 @@ pub(super) async fn pre_resolve(
     };
 
     // Pick a concrete version that satisfies `intent`.
-    let version_str = pick_version(&metadata, &intent, "global install")?;
+    let version_str = pick_version_with_policy(&metadata, &intent, "global install", policy)?;
     let version = Version::parse(&version_str).map_err(|e| {
         LpmError::Script(format!(
             "registry returned unparseable version '{version_str}' for '{name}': {e}"

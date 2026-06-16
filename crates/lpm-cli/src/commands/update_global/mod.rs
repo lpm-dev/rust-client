@@ -33,7 +33,7 @@ mod test_support;
 use self::commit::{UpgradeOutput, commit_upgrade_locked};
 use self::inner::do_install_upgrade;
 use self::prepare::{UpgradePrep, active_matches_planned_snapshot, prepare_upgrade_locked};
-use super::global_util::{discover_bin_commands, pick_version};
+use super::global_util::{discover_bin_commands, pick_version_with_policy};
 use crate::output;
 use crate::save_spec::{
     SaveConfig, SaveFlags, UserSaveIntent, decide_saved_dependency_spec, parse_user_save_intent,
@@ -78,7 +78,7 @@ pub async fn run(
 
     let mut plans: Vec<UpgradePlan> = Vec::new();
     for target in &targets {
-        match plan_upgrade(&root, &registry, target).await {
+        match plan_upgrade(&root, &registry, target, json_output).await {
             Ok(plan) => plans.push(plan),
             Err(e) => {
                 if !json_output {
@@ -266,6 +266,7 @@ async fn plan_upgrade(
     root: &LpmRoot,
     registry: &RegistryClient,
     target: &Target,
+    json_output: bool,
 ) -> Result<UpgradePlan, LpmError> {
     let manifest = read_for(root)?;
     let active = manifest.packages.get(&target.name).ok_or_else(|| {
@@ -302,7 +303,14 @@ async fn plan_upgrade(
         registry.get_npm_package_metadata(&target.name).await?
     };
 
-    let new_version_str = pick_version(&metadata, &intent, "global update")?;
+    let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
+        &root.global_root(),
+        None,
+        false,
+        json_output,
+    )?;
+    let new_version_str =
+        pick_version_with_policy(&metadata, &intent, "global update", &release_age_policy)?;
     let new_version = Version::parse(&new_version_str).map_err(|e| {
         LpmError::Script(format!(
             "registry returned unparseable version '{new_version_str}' for '{}': {e}",

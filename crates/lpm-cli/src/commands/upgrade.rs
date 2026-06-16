@@ -150,6 +150,12 @@ pub async fn run(
     let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let mode = resolve_mode(interactive, yes, json_output, is_tty)?;
     validate_major_for_mode(major, mode)?;
+    let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
+        project_dir,
+        None,
+        false,
+        json_output,
+    )?;
 
     // Read lockfile ONCE
     let lockfile_path = project_dir.join("lpm.lock");
@@ -216,8 +222,11 @@ pub async fn run(
             }
         };
 
-        let latest = match metadata.latest_version_tag() {
-            Some(v) => v.to_string(),
+        let latest = match crate::release_age_selection::latest_allowed_version(
+            &metadata,
+            &release_age_policy,
+        ) {
+            Some(v) => v,
             None => continue,
         };
 
@@ -230,7 +239,8 @@ pub async fn run(
             continue;
         }
 
-        let available_versions: Vec<String> = metadata.versions.keys().cloned().collect();
+        let available_versions =
+            crate::release_age_selection::allowed_version_strings(&metadata, &release_age_policy);
 
         let installed_ver = lockfile
             .as_ref()

@@ -18,9 +18,9 @@
 
 mod support;
 
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use lpm_global::{GlobalManifest, PackageEntry, PackageSource};
-use support::mock_registry::MockRegistry;
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
 use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, ResponseTemplate};
@@ -54,6 +54,11 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+fn iso8601_n_secs_ago(n_secs: i64) -> String {
+    let dt = Utc::now() - chrono::Duration::seconds(n_secs);
+    dt.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn global_root(project: &TempProject) -> std::path::PathBuf {
@@ -272,6 +277,49 @@ async fn global_list_outdated_human_output_uses_current_wanted_latest_bins_table
             && combined.contains("✓ 1 global package installed"),
         "outdated output must match the slim table-only shape, got:\n{combined}"
     );
+}
+
+#[tokio::test]
+async fn global_list_outdated_treats_fresh_latest_as_up_to_date() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let package = "@lpm.dev/acme.cooldown-cli";
+    seed_global_package_with_source(
+        &project,
+        package,
+        PackageSource::LpmDev,
+        vec!["cooldown".to_string()],
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": package,
+        "dist-tags": { "latest": "1.1.0" },
+        "modified": iso8601_n_secs_ago(3_600),
+        "versions": {
+            "1.0.0": { "name": package, "version": "1.0.0" },
+            "1.1.0": { "name": package, "version": "1.1.0" }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.1.0": iso8601_n_secs_ago(3_600)
+        }
+    })])
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "global", "list", "--outdated"])
+        .output()
+        .expect("failed to run lpm global list --outdated --json");
+    assert!(
+        output.status.success(),
+        "global list --outdated should not report a fresh latest as installable\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["count_outdated"], serde_json::json!(0));
+    assert_eq!(envelope["up_to_date"], serde_json::json!([package]));
 }
 
 #[tokio::test]
@@ -885,6 +933,165 @@ fn global_update_dry_run_on_empty_manifest_succeeds_without_writing_manifest() {
         !manifest_path.exists(),
         "dry-run must not create global manifest.json, but it exists at {}",
         manifest_path.display(),
+    );
+}
+
+#[tokio::test]
+async fn global_update_dry_run_selects_latest_mature_candidate_when_latest_is_fresh() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let package = "@lpm.dev/acme.cooldown-update";
+    seed_global_package_with_source(
+        &project,
+        package,
+        PackageSource::LpmDev,
+        vec!["cooldown-update".to_string()],
+    );
+
+    let mock = MockRegistry::start().await;
+    let v1_0_0 = make_tarball(package, "1.0.0");
+    let v1_1_0 = make_tarball(package, "1.1.0");
+    let v1_2_0 = make_tarball(package, "1.2.0");
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": { "latest": "1.2.0" },
+        "modified": iso8601_n_secs_ago(3_600),
+        "versions": {
+            "1.0.0": {
+                "name": package,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url(package, "1.0.0"),
+                    "integrity": compute_integrity(&v1_0_0),
+                },
+                "dependencies": {}
+            },
+            "1.1.0": {
+                "name": package,
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url(package, "1.1.0"),
+                    "integrity": compute_integrity(&v1_1_0),
+                },
+                "dependencies": {}
+            },
+            "1.2.0": {
+                "name": package,
+                "version": "1.2.0",
+                "dist": {
+                    "tarball": mock.tarball_url(package, "1.2.0"),
+                    "integrity": compute_integrity(&v1_2_0),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.1.0": iso8601_n_secs_ago(2 * 86_400),
+            "1.2.0": iso8601_n_secs_ago(3_600)
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        package,
+        metadata,
+        &[("1.0.0", v1_0_0), ("1.1.0", v1_1_0), ("1.2.0", v1_2_0)],
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "global", "update", package, "--dry-run"])
+        .output()
+        .expect("failed to run lpm global update --dry-run --json");
+    assert!(
+        output.status.success(),
+        "global update dry-run should plan the mature candidate\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["plans"][0]["action"], serde_json::json!("upgrade"));
+    assert_eq!(envelope["plans"][0]["to"], serde_json::json!("1.1.0"));
+}
+
+#[tokio::test]
+async fn global_update_dry_run_rejects_exact_fresh_target() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let package = "@lpm.dev/acme.cooldown-update-exact";
+    seed_global_package_with_source(
+        &project,
+        package,
+        PackageSource::LpmDev,
+        vec!["cooldown-update-exact".to_string()],
+    );
+
+    let mock = MockRegistry::start().await;
+    let v1_0_0 = make_tarball(package, "1.0.0");
+    let v1_1_0 = make_tarball(package, "1.1.0");
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": { "latest": "1.1.0" },
+        "modified": iso8601_n_secs_ago(3_600),
+        "versions": {
+            "1.0.0": {
+                "name": package,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url(package, "1.0.0"),
+                    "integrity": compute_integrity(&v1_0_0),
+                },
+                "dependencies": {}
+            },
+            "1.1.0": {
+                "name": package,
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url(package, "1.1.0"),
+                    "integrity": compute_integrity(&v1_1_0),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.1.0": iso8601_n_secs_ago(3_600)
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        package,
+        metadata,
+        &[("1.0.0", v1_0_0), ("1.1.0", v1_1_0)],
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "global",
+            "update",
+            &format!("{package}@1.1.0"),
+            "--dry-run",
+        ])
+        .output()
+        .expect("failed to run lpm global update <pkg>@<exact> --dry-run --json");
+    assert!(
+        !output.status.success(),
+        "global update dry-run must reject exact fresh targets instead of planning a version install would reject\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(
+        envelope["plans"][0]["action"],
+        serde_json::json!("plan_error")
+    );
+    assert!(
+        envelope["plans"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("minimumReleaseAge")),
+        "plan error should explain the cooldown block: {envelope:#}",
     );
 }
 
