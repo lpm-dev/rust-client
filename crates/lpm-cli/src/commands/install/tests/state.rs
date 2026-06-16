@@ -27,6 +27,31 @@ fn fast_exit_when_everything_matches() {
 }
 
 #[test]
+fn fast_exit_allows_v2_compatibility_root() {
+    let _env =
+        crate::test_env::ScopedEnv::set([("LPM_STORE_VERSION", std::ffi::OsString::from("v2"))]);
+    let dir = tempfile::tempdir().unwrap();
+    setup_installed_project(dir.path());
+    std::fs::create_dir_all(
+        dir.path()
+            .join("node_modules")
+            .join(".lpm")
+            .join("compat")
+            .join("eslint@9.39.4+51e8155e339ce359"),
+    )
+    .unwrap();
+    let pkg = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+    let lock = std::fs::read_to_string(dir.path().join("lpm.lock")).unwrap();
+    let hash = crate::install_state::compute_install_hash(&pkg, &lock);
+    std::fs::write(dir.path().join(".lpm").join("install-hash"), hash).unwrap();
+
+    assert!(
+        crate::install_state::check_install_state(dir.path()).up_to_date,
+        "v2 compatibility islands must not look like legacy v1 wrapper state"
+    );
+}
+
+#[test]
 fn fast_exit_fails_when_package_json_changed() {
     let dir = tempfile::tempdir().unwrap();
     setup_installed_project(dir.path());
