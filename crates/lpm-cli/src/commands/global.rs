@@ -265,6 +265,12 @@ async fn run_list_outdated(
     let mut outdated: Vec<OutdatedRow> = Vec::new();
     let mut up_to_date: Vec<String> = Vec::new();
     let mut unresolved: Vec<UnresolvedRow> = Vec::new();
+    let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
+        &_root.global_root(),
+        None,
+        false,
+        json_output,
+    )?;
 
     for (name, entry) in &manifest.packages {
         if entry.source == PackageSource::LocalLink {
@@ -279,7 +285,7 @@ async fn run_list_outdated(
             });
             continue;
         };
-        let latest = match pick_latest_matching(meta, &entry.saved_spec) {
+        let latest = match pick_latest_matching(meta, &entry.saved_spec, &release_age_policy) {
             Ok(v) => v,
             Err(reason) => {
                 unresolved.push(UnresolvedRow {
@@ -292,7 +298,8 @@ async fn run_list_outdated(
         if latest == entry.resolved {
             up_to_date.push(name.clone());
         } else {
-            let absolute_latest = pick_absolute_latest(meta).unwrap_or_else(|| latest.clone());
+            let absolute_latest =
+                pick_absolute_latest(meta, &release_age_policy).unwrap_or_else(|| latest.clone());
             outdated.push(OutdatedRow {
                 package: name.clone(),
                 current: entry.resolved.clone(),
@@ -344,17 +351,26 @@ struct UnresolvedRow {
 fn pick_latest_matching(
     meta: &lpm_registry::PackageMetadata,
     saved_spec: &str,
+    policy: &lpm_resolver::ResolverPolicy,
 ) -> Result<String, String> {
     // Dist-tag fast path: `latest`, `next`, etc. can appear in
     // saved_spec directly (e.g. bulk-install default). Mirrors
     // update_global.
-    if let Some(v) = meta.dist_tags.get(saved_spec) {
-        return Ok(v.clone());
+    if meta.dist_tags.contains_key(saved_spec) {
+        return crate::release_age_selection::resolve_version_spec_with_policy(
+            meta, saved_spec, policy,
+        )
+        .map_err(|error| error.to_string());
     }
     // Exact pins that disappeared upstream should surface as unresolved,
     // not silently report up-to-date.
     if lpm_semver::Version::parse(saved_spec).is_ok() {
-        if meta.versions.contains_key(saved_spec) {
+        if meta.versions.contains_key(saved_spec)
+            && crate::release_age_selection::resolve_version_spec_with_policy(
+                meta, saved_spec, policy,
+            )
+            .is_ok()
+        {
             return Ok(saved_spec.to_string());
         }
         return Err(format!(
@@ -363,41 +379,32 @@ fn pick_latest_matching(
             meta.name
         ));
     }
-    // Wildcard: highest version, period.
+    // Wildcard: highest version allowed by the active release-age policy.
     if saved_spec == "*" {
-        let mut versions: Vec<lpm_semver::Version> = meta
+        if let Some(version) = crate::release_age_selection::latest_allowed_version(meta, policy) {
+            return Ok(version);
+        }
+        if meta
             .versions
             .keys()
-            .filter_map(|s| lpm_semver::Version::parse(s).ok())
-            .collect();
-        if versions.is_empty() {
+            .all(|s| lpm_semver::Version::parse(s).is_err())
+        {
             return Err(format!("no parseable versions for '{}'", meta.name));
         }
-        versions.sort();
-        return Ok(versions.last().unwrap().to_string());
+        return Err(format!("no version of '{}' satisfies '*'", meta.name));
     }
     // Range: max-satisfying.
-    let req = lpm_semver::VersionReq::parse(saved_spec)
+    lpm_semver::VersionReq::parse(saved_spec)
         .map_err(|e| format!("saved_spec {saved_spec:?} is not a valid range: {e}"))?;
-    let versions: Vec<lpm_semver::Version> = meta
-        .versions
-        .keys()
-        .filter_map(|s| lpm_semver::Version::parse(s).ok())
-        .collect();
-    let refs: Vec<&lpm_semver::Version> = versions.iter().collect();
-    lpm_semver::max_satisfying(&refs, &req)
-        .map(|v| v.to_string())
-        .ok_or_else(|| format!("no version of '{}' satisfies '{}'", meta.name, saved_spec))
+    crate::release_age_selection::resolve_version_spec_with_policy(meta, saved_spec, policy)
+        .map_err(|error| error.to_string())
 }
 
-fn pick_absolute_latest(meta: &lpm_registry::PackageMetadata) -> Option<String> {
-    meta.dist_tags.get("latest").cloned().or_else(|| {
-        meta.versions
-            .keys()
-            .filter_map(|s| lpm_semver::Version::parse(s).ok())
-            .max()
-            .map(|v| v.to_string())
-    })
+fn pick_absolute_latest(
+    meta: &lpm_registry::PackageMetadata,
+    policy: &lpm_resolver::ResolverPolicy,
+) -> Option<String> {
+    crate::release_age_selection::latest_allowed_version(meta, policy)
 }
 
 fn emit_outdated_json(
@@ -1579,21 +1586,33 @@ mod tests {
             &["9.23.0", "9.24.0", "9.25.0-beta"],
             &[("latest", "9.24.0"), ("next", "9.25.0-beta")],
         );
-        assert_eq!(pick_latest_matching(&meta, "latest").unwrap(), "9.24.0");
-        assert_eq!(pick_latest_matching(&meta, "next").unwrap(), "9.25.0-beta");
+        let policy = lpm_resolver::ResolverPolicy::default();
+        assert_eq!(
+            pick_latest_matching(&meta, "latest", &policy).unwrap(),
+            "9.24.0"
+        );
+        assert_eq!(
+            pick_latest_matching(&meta, "next", &policy).unwrap(),
+            "9.25.0-beta"
+        );
     }
 
     #[test]
     fn pick_latest_matching_exact_version_present_in_registry_passes_through() {
         let meta = fake_metadata("eslint", &["9.23.0", "9.24.0"], &[]);
-        assert_eq!(pick_latest_matching(&meta, "9.24.0").unwrap(), "9.24.0");
+        let policy = lpm_resolver::ResolverPolicy::default();
+        assert_eq!(
+            pick_latest_matching(&meta, "9.24.0", &policy).unwrap(),
+            "9.24.0"
+        );
     }
 
     /// An exact pin the registry no longer serves must surface as `unresolved`.
     #[test]
     fn pick_latest_matching_exact_version_missing_from_registry_surfaces_as_unresolved() {
         let meta = fake_metadata("eslint", &["9.23.0", "9.24.0"], &[]);
-        let err = pick_latest_matching(&meta, "100.0.0").unwrap_err();
+        let policy = lpm_resolver::ResolverPolicy::default();
+        let err = pick_latest_matching(&meta, "100.0.0", &policy).unwrap_err();
         assert!(
             err.contains("registry no longer serves"),
             "missing exact pin must surface a 'no longer served' message; got: {err}"
@@ -1607,27 +1626,37 @@ mod tests {
     #[test]
     fn pick_latest_matching_range_picks_max_satisfying() {
         let meta = fake_metadata("eslint", &["8.99.0", "9.23.0", "9.24.0", "10.0.0"], &[]);
-        assert_eq!(pick_latest_matching(&meta, "^9").unwrap(), "9.24.0");
-        assert_eq!(pick_latest_matching(&meta, "~9.23.0").unwrap(), "9.23.0");
+        let policy = lpm_resolver::ResolverPolicy::default();
+        assert_eq!(
+            pick_latest_matching(&meta, "^9", &policy).unwrap(),
+            "9.24.0"
+        );
+        assert_eq!(
+            pick_latest_matching(&meta, "~9.23.0", &policy).unwrap(),
+            "9.23.0"
+        );
     }
 
     #[test]
     fn pick_latest_matching_wildcard_picks_highest_overall() {
         let meta = fake_metadata("eslint", &["8.99.0", "9.24.0"], &[]);
-        assert_eq!(pick_latest_matching(&meta, "*").unwrap(), "9.24.0");
+        let policy = lpm_resolver::ResolverPolicy::default();
+        assert_eq!(pick_latest_matching(&meta, "*", &policy).unwrap(), "9.24.0");
     }
 
     #[test]
     fn pick_latest_matching_unparseable_spec_errors() {
         let meta = fake_metadata("eslint", &["9.24.0"], &[]);
-        let err = pick_latest_matching(&meta, "not-a-version").unwrap_err();
+        let policy = lpm_resolver::ResolverPolicy::default();
+        let err = pick_latest_matching(&meta, "not-a-version", &policy).unwrap_err();
         assert!(err.contains("not a valid range"));
     }
 
     #[test]
     fn pick_latest_matching_range_with_no_satisfying_version_errors() {
         let meta = fake_metadata("eslint", &["8.0.0", "8.1.0"], &[]);
-        let err = pick_latest_matching(&meta, "^9").unwrap_err();
+        let policy = lpm_resolver::ResolverPolicy::default();
+        let err = pick_latest_matching(&meta, "^9", &policy).unwrap_err();
         assert!(err.contains("no version"));
     }
 

@@ -6089,6 +6089,8 @@ fn install_no_strict_ssl_setting_emits_no_warning() {
 const RELEASE_AGE_PKG: &str = "@lpm.dev/acme.widget";
 const RELEASE_AGE_VERSION: &str = "1.0.0";
 const RELEASE_AGE_RANGE_PKG: &str = "release-age-range-pkg";
+const RELEASE_AGE_PARENT_PKG: &str = "release-age-parent-pkg";
+const RELEASE_AGE_CHILD_PKG: &str = "release-age-child-pkg";
 const TRUST_DOWNGRADE_PKG: &str = "trust-drop-pkg";
 
 /// ISO-8601 UTC timestamp `n_secs` ago. The cooldown parser accepts
@@ -6245,6 +6247,87 @@ async fn mount_release_age_range_pkg(mock: &MockRegistry) {
         &[("1.0.0", v1_0_0), ("1.1.0", v1_1_0)],
     )
     .await;
+}
+
+async fn mount_release_age_transitive_fallback_pkgs(mock: &MockRegistry) {
+    let parent_1_0_0 = make_tarball(RELEASE_AGE_PARENT_PKG, "1.0.0");
+    let parent_1_1_0 = make_tarball(RELEASE_AGE_PARENT_PKG, "1.1.0");
+    let child_1_0_0 = make_tarball(RELEASE_AGE_CHILD_PKG, "1.0.0");
+    let child_2_0_0 = make_tarball(RELEASE_AGE_CHILD_PKG, "2.0.0");
+
+    let parent_metadata = serde_json::json!({
+        "name": RELEASE_AGE_PARENT_PKG,
+        "dist-tags": { "latest": "1.1.0" },
+        "modified": iso8601_n_secs_ago(2 * 86_400),
+        "versions": {
+            "1.0.0": {
+                "name": RELEASE_AGE_PARENT_PKG,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_PARENT_PKG, "1.0.0"),
+                    "integrity": compute_integrity(&parent_1_0_0),
+                },
+                "dependencies": { RELEASE_AGE_CHILD_PKG: "^1.0.0" }
+            },
+            "1.1.0": {
+                "name": RELEASE_AGE_PARENT_PKG,
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_PARENT_PKG, "1.1.0"),
+                    "integrity": compute_integrity(&parent_1_1_0),
+                },
+                "dependencies": { RELEASE_AGE_CHILD_PKG: "^2.0.0" }
+            }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.1.0": iso8601_n_secs_ago(2 * 86_400)
+        }
+    });
+    let child_metadata = serde_json::json!({
+        "name": RELEASE_AGE_CHILD_PKG,
+        "dist-tags": { "latest": "2.0.0" },
+        "modified": iso8601_n_secs_ago(3_600),
+        "versions": {
+            "1.0.0": {
+                "name": RELEASE_AGE_CHILD_PKG,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_CHILD_PKG, "1.0.0"),
+                    "integrity": compute_integrity(&child_1_0_0),
+                },
+                "dependencies": {}
+            },
+            "2.0.0": {
+                "name": RELEASE_AGE_CHILD_PKG,
+                "version": "2.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_CHILD_PKG, "2.0.0"),
+                    "integrity": compute_integrity(&child_2_0_0),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "2.0.0": iso8601_n_secs_ago(3_600)
+        }
+    });
+
+    mock.with_package_metadata_and_tarballs(
+        RELEASE_AGE_PARENT_PKG,
+        parent_metadata.clone(),
+        &[("1.0.0", parent_1_0_0), ("1.1.0", parent_1_1_0)],
+    )
+    .await;
+    mock.with_package_metadata_and_tarballs(
+        RELEASE_AGE_CHILD_PKG,
+        child_metadata.clone(),
+        &[("1.0.0", child_1_0_0), ("2.0.0", child_2_0_0)],
+    )
+    .await;
+    mock.with_batch_metadata(vec![parent_metadata, child_metadata])
+        .await;
 }
 
 async fn mount_trust_downgrade_pkg(mock: &MockRegistry) {
@@ -6594,6 +6677,44 @@ async fn install_range_selects_older_version_when_latest_is_inside_release_age_w
     let manifest: serde_json::Value =
         serde_json::from_str(&installed).expect("installed package.json must parse");
     assert_eq!(manifest["version"], serde_json::json!("1.0.0"));
+}
+
+#[tokio::test]
+async fn install_selects_older_parent_when_newer_parent_requires_too_fresh_child() {
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name":"release-age-transitive-fallback",
+            "version":"1.0.0",
+            "dependencies":{{"{RELEASE_AGE_PARENT_PKG}":"^1.0.0"}},
+            "lpm":{{"minimumReleaseAge":86400}}
+        }}"#
+    ));
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    mount_release_age_transitive_fallback_pkgs(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "install must fall back to the newest parent whose required child tree satisfies minimumReleaseAge; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let installed_parent = project.read_file(&format!(
+        "node_modules/{RELEASE_AGE_PARENT_PKG}/package.json"
+    ));
+    let parent_manifest: serde_json::Value =
+        serde_json::from_str(&installed_parent).expect("installed parent package.json must parse");
+    assert_eq!(parent_manifest["version"], serde_json::json!("1.0.0"));
 }
 
 #[tokio::test]

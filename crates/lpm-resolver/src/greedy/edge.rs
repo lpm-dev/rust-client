@@ -22,16 +22,26 @@ use super::version::{VersionPick, find_best_version_with_policy};
 /// and the [`OverrideHit`] is recorded for the install summary. The
 /// empty-overrides hot path skips this entire branch with one
 /// [`OverrideSet::is_empty`] check (single-bool indirection, zero allocs).
+#[cfg(test)]
 pub(super) fn process_edge(
     edge: &Edge,
     info: &CachedPackageInfo,
+    state: &mut ResolveState,
+) -> Result<(), ResolveError> {
+    process_edge_with_preferred(edge, info, None, state)
+}
+
+pub(super) fn process_edge_with_preferred(
+    edge: &Edge,
+    info: &CachedPackageInfo,
+    preferred: Option<NpmVersion>,
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
     // Hot path: zero-overrides installs (the common case) skip the
     // natural-pick computation entirely. Behavior matches the pre-
     // override implementation byte-for-byte.
     if state.overrides.is_empty() {
-        return process_edge_inner(edge, info, None, state);
+        return process_edge_inner(edge, info, preferred.map(|version| (version, None)), state);
     }
 
     // Slow path: at least one override entry exists. Compute the
@@ -44,7 +54,10 @@ pub(super) fn process_edge(
     };
     let canonical_name = edge.canonical.to_string();
 
-    let natural_pick = find_best_version_with_policy(info, &edge.range, &state.policy);
+    let natural_pick = preferred.map_or_else(
+        || find_best_version_with_policy(info, &edge.range, &state.policy),
+        VersionPick::Picked,
+    );
     let natural_ver = match &natural_pick {
         VersionPick::Picked(v) => Some(v.clone()),
         VersionPick::NoSatisfying

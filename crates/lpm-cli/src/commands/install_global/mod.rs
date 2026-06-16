@@ -66,9 +66,15 @@ pub async fn run(
     // Use the injected client so registry flags and session config
     // propagate into the inner project-shaped install.
     let registry = client.clone_with_config();
+    let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
+        &root.global_root(),
+        overrides.min_release_age_override,
+        overrides.allow_new,
+        json_output,
+    )?;
 
     // ─── Pre-resolve (no lock) ─────────────────────────────────────
-    let resolved = pre_resolve(&registry, spec).await?;
+    let resolved = pre_resolve(&registry, spec, &release_age_policy).await?;
     if !json_output {
         let name_safe = sanitize_for_terminal(&resolved.name);
         let version_safe = sanitize_for_terminal(&resolved.version.to_string());

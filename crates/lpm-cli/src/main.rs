@@ -37,6 +37,7 @@ mod provenance_fetch;
 mod quality;
 mod registry_signatures;
 mod release_age_config;
+mod release_age_selection;
 mod release_lookup;
 mod resolver_error;
 mod sandbox_config;

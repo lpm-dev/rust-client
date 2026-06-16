@@ -1,8 +1,44 @@
-use super::edge::process_edge;
+use super::edge::process_edge_with_preferred;
 use super::manifest::{ensure_manifest, propagate_fetch_error};
 use super::peer::drain_peer_requirements_one_pass;
 use super::prelude::*;
 use super::state::ResolveState;
+use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version};
+
+struct WalkerTreeProvider<'a> {
+    client: &'a Arc<RegistryClient>,
+    route_table: &'a RouteTable,
+    shared_cache: &'a SharedCache,
+    notify_map: &'a NotifyMap,
+    walker_done: &'a WalkerDone,
+    fetch_wait_timeout: Duration,
+    metrics: &'a StreamingBfsMetrics,
+    policy: &'a ResolverPolicy,
+}
+
+impl TreeManifestProvider for WalkerTreeProvider<'_> {
+    fn ensure_manifest<'a>(
+        &'a self,
+        canonical: &'a CanonicalKey,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + 'a>,
+    > {
+        Box::pin(async move {
+            ensure_manifest(
+                canonical,
+                self.client.clone(),
+                self.route_table,
+                self.shared_cache,
+                self.notify_map,
+                self.walker_done,
+                self.fetch_wait_timeout,
+                self.metrics,
+                self.policy,
+            )
+            .await
+        })
+    }
+}
 
 /// Entry point — same signature shape as
 /// [`crate::resolve::resolve_with_shared_cache`] so the dispatch in
@@ -109,6 +145,16 @@ pub async fn resolve_greedy_with_options_and_policy(
         policy.clone(),
     );
     state.seed_root_edges()?;
+    let tree_provider = WalkerTreeProvider {
+        client: &client,
+        route_table: &route_table,
+        shared_cache: &shared_cache,
+        notify_map: &notify_map,
+        walker_done: &walker_done,
+        fetch_wait_timeout,
+        metrics: &metrics,
+        policy: &policy,
+    };
 
     // ── Main task_queue + peer-drain fixed-point loop ──────────────
     //
@@ -140,7 +186,9 @@ pub async fn resolve_greedy_with_options_and_policy(
                     continue;
                 }
             };
-            process_edge(&edge, &info, &mut state)?;
+            let preferred =
+                preferred_tree_compatible_version(&edge, &info, &policy, &tree_provider).await;
+            process_edge_with_preferred(&edge, &info, preferred, &mut state)?;
         }
 
         // Outer: peer-drain pass. Skips synthesis when

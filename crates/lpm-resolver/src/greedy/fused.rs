@@ -1,4 +1,4 @@
-use super::edge::process_edge;
+use super::edge::process_edge_with_preferred;
 use super::manifest::{
     FetchResult, complete_metadata_fetch, ensure_policy_metadata_for_cached_manifest,
     fetch_metadata_for_resolver, parse_fetched_metadata,
@@ -6,7 +6,64 @@ use super::manifest::{
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
 use super::state::ResolveState;
+use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version};
 use super::types::Edge;
+use std::cell::Cell;
+
+struct FusedTreeProvider<'a> {
+    client: &'a Arc<RegistryClient>,
+    route_table: &'a RouteTable,
+    shared_cache: &'a SharedCache,
+    policy: &'a ResolverPolicy,
+    spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    dispatcher_rpc_count: Cell<u64>,
+    tarball_dispatched_count: Cell<u64>,
+}
+
+impl TreeManifestProvider for FusedTreeProvider<'_> {
+    fn ensure_manifest<'a>(
+        &'a self,
+        canonical: &'a CanonicalKey,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + 'a>,
+    > {
+        Box::pin(async move {
+            if let Some(info_arc) = self
+                .shared_cache
+                .get(canonical)
+                .map(|entry| entry.value().clone())
+            {
+                return ensure_policy_metadata_for_cached_manifest(
+                    canonical,
+                    info_arc,
+                    self.client,
+                    self.route_table,
+                    self.shared_cache,
+                    self.policy,
+                )
+                .await;
+            }
+
+            let fetched =
+                fetch_metadata_for_resolver(self.client, self.route_table, canonical, self.policy)
+                    .await?;
+            let info_arc = fetched.info;
+            self.shared_cache
+                .insert(canonical.clone(), info_arc.clone());
+            self.dispatcher_rpc_count
+                .set(self.dispatcher_rpc_count.get() + 1);
+            if let Some(tx) = self.spec_tx
+                && tx
+                    .try_send((canonical.to_string(), fetched.metadata))
+                    .is_ok()
+            {
+                self.tarball_dispatched_count
+                    .set(self.tarball_dispatched_count.get() + 1);
+            }
+            Ok(info_arc)
+        })
+    }
+}
 
 /// Fused dispatcher: greedy resolver IS the fetch dispatcher. Replaces the
 /// walker + resolver two-task model with a single tokio task that drains
@@ -160,6 +217,15 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
         policy.clone(),
     );
     state.seed_root_edges()?;
+    let tree_provider = FusedTreeProvider {
+        client: &client,
+        route_table: &route_table,
+        shared_cache: &shared_cache,
+        policy: &policy,
+        spec_tx: spec_tx.as_ref(),
+        dispatcher_rpc_count: Cell::new(0),
+        tarball_dispatched_count: Cell::new(0),
+    };
 
     // Loop-local state, owned by this single task. No Arcs needed
     // around `inflight` / `parked` because they never cross task
@@ -279,7 +345,10 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                     &policy,
                 )
                 .await?;
-                process_edge(&edge, &info_arc, &mut state)?;
+                let preferred =
+                    preferred_tree_compatible_version(&edge, &info_arc, &policy, &tree_provider)
+                        .await;
+                process_edge_with_preferred(&edge, &info_arc, preferred, &mut state)?;
                 continue;
             }
             // Cache miss — park the edge and spawn one fetch per
@@ -537,10 +606,11 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
             // fast-path-cache-hit ratio.
             walker_rpc_count: 0,
             escape_hatch_rpc_count: 0,
-            dispatcher_rpc_count,
+            dispatcher_rpc_count: dispatcher_rpc_count + tree_provider.dispatcher_rpc_count.get(),
             dispatcher_inflight_high_water: inflight_high_water,
             parked_max_depth,
-            tarball_dispatched_count,
+            tarball_dispatched_count: tarball_dispatched_count
+                + tree_provider.tarball_dispatched_count.get(),
             peer_prefetch_count,
         },
     })
