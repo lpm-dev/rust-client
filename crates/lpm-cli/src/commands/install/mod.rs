@@ -2822,6 +2822,7 @@ async fn run_with_options_under_store_lock(
                     Some(sri) => acc.push(lpm_linker::v2::V2Target {
                         target: lt.clone(),
                         source_sri: sri.to_string(),
+                        verified_object_tree_integrity: None,
                     }),
                     None => {
                         all_have_sri = false;
@@ -2832,6 +2833,7 @@ async fn run_with_options_under_store_lock(
                     acc.push(lpm_linker::v2::V2Target {
                         target: lt.clone(),
                         source_sri: local_source_sri_for_target(lt),
+                        verified_object_tree_integrity: None,
                     });
                 }
             }
@@ -2913,6 +2915,7 @@ async fn run_with_options_under_store_lock(
                         lpm_linker::v2::V2Target {
                             target: lt.clone(),
                             source_sri: sri,
+                            verified_object_tree_integrity: None,
                         },
                     ))
                 })
@@ -3011,7 +3014,7 @@ async fn run_with_options_under_store_lock(
             && !is_local_source
             && let Some(v2_store) = store_v2_handle.as_deref()
             && let Some(sri) = p.integrity.as_deref()
-            && v2_store.reusable_object_dir(sri)?.is_some()
+            && let Some(reusable_object) = v2_store.reusable_object(sri)?
         {
             cached += 1;
             // followup #6b — dispatch link_v2_one immediately.
@@ -3022,6 +3025,8 @@ async fn run_with_options_under_store_lock(
                 && let Some(plan) = v2_plan.as_ref()
                 && let Some(target) = v2_target_by_key.get(&install_pkg_key(p)).cloned()
             {
+                let mut target = target;
+                target.verified_object_tree_integrity = Some(reusable_object.tree_integrity);
                 let plan_arc = std::sync::Arc::clone(plan);
                 let store_arc = std::sync::Arc::clone(
                     store_v2_handle

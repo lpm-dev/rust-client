@@ -8,6 +8,7 @@
 //!
 //! v2 writes are gated behind `LPM_STORE_VERSION=v2`.
 
+use std::borrow::Cow;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -226,6 +227,29 @@ pub struct LinkEntryRequest {
     pub platform: Arc<LinkMetaPlatform>,
 }
 
+/// Object-tree digest that has been checked against the object bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedObjectTreeIntegrity(String);
+
+impl VerifiedObjectTreeIntegrity {
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[inline]
+    fn new(digest: String) -> Self {
+        Self(digest)
+    }
+}
+
+/// Object directory that is complete and has a verified tree digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusableObject {
+    pub path: PathBuf,
+    pub tree_integrity: VerifiedObjectTreeIntegrity,
+}
+
 /// Single sibling-dep symlink to create inside
 /// `links/<graph-key>/node_modules/<dep_local>/`.
 #[derive(Debug, Clone)]
@@ -305,14 +329,24 @@ impl Store {
     /// objects are removed so callers can safely refetch before
     /// linking.
     pub fn reusable_object_dir(&self, sri: &str) -> Result<Option<PathBuf>, LpmError> {
+        Ok(self.reusable_object(sri)?.map(|object| object.path))
+    }
+
+    /// Return the object directory plus the verified object-tree digest.
+    pub fn reusable_object(&self, sri: &str) -> Result<Option<ReusableObject>, LpmError> {
         let object_dir = self.paths.object_dir(sri)?;
         if !object_dir.exists() {
             return Ok(None);
         }
-        if object_dir_is_reusable_or_remove(&object_dir, "before cache reuse")? {
-            return Ok(Some(object_dir));
-        }
-        Ok(None)
+        let Some(tree_integrity) =
+            object_tree_integrity_or_remove(&object_dir, "before cache reuse")?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ReusableObject {
+            path: object_dir,
+            tree_integrity,
+        }))
     }
 
     /// Extract the supplied tarball bytes into
@@ -527,6 +561,23 @@ impl Store {
     /// - On any error mid-way, the tmp dir is cleaned up before
     ///   returning.
     pub fn populate_link_entry(&self, request: LinkEntryRequest) -> Result<LinkEntry, LpmError> {
+        self.populate_link_entry_inner(request, None)
+    }
+
+    /// Populate a link entry using a previously verified object-tree digest.
+    pub fn populate_link_entry_with_verified_object(
+        &self,
+        request: LinkEntryRequest,
+        verified_object_tree_integrity: &VerifiedObjectTreeIntegrity,
+    ) -> Result<LinkEntry, LpmError> {
+        self.populate_link_entry_inner(request, Some(verified_object_tree_integrity))
+    }
+
+    fn populate_link_entry_inner(
+        &self,
+        request: LinkEntryRequest,
+        verified_object_tree_digest: Option<&VerifiedObjectTreeIntegrity>,
+    ) -> Result<LinkEntry, LpmError> {
         let LinkEntryRequest {
             graph_key,
             source_sri,
@@ -545,7 +596,12 @@ impl Store {
         // package dir got truncated) or causes the subsequent rename
         // to hard-fail with ENOTEMPTY against a non-empty leftover.
         if final_dir.exists() {
-            if link_entry_is_reusable(&final_dir, &graph_key, &object_dir)? {
+            if link_entry_is_reusable(
+                &final_dir,
+                &graph_key,
+                &object_dir,
+                verified_object_tree_digest,
+            )? {
                 // Refresh the sidecar's "last referenced" via a single
                 // set_modified() call instead of read+touch+write+rename.
                 // On a 256-package warm install that's 256 fewer JSON
@@ -618,7 +674,14 @@ impl Store {
                 freshly_populated: true,
                 sidecar: Some(sidecar),
             }),
-            Err(_) if link_entry_is_reusable(&final_dir, &graph_key, &object_dir)? => {
+            Err(_)
+                if link_entry_is_reusable(
+                    &final_dir,
+                    &graph_key,
+                    &object_dir,
+                    verified_object_tree_digest,
+                )? =>
+            {
                 // Concurrent install beat us — discard our stage and
                 // refresh the existing sidecar's mtime.
                 let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1191,14 +1254,22 @@ fn is_complete_link_entry(dir: &Path, key: &GraphKey) -> bool {
     path.is_file()
 }
 
-fn link_entry_is_reusable(dir: &Path, key: &GraphKey, object_dir: &Path) -> Result<bool, LpmError> {
+fn link_entry_is_reusable(
+    dir: &Path,
+    key: &GraphKey,
+    object_dir: &Path,
+    verified_object_tree_digest: Option<&VerifiedObjectTreeIntegrity>,
+) -> Result<bool, LpmError> {
     if !is_complete_link_entry(dir, key) {
         return Ok(false);
     }
-    let expected = verified_object_tree_integrity(object_dir)?;
+    let expected = match verified_object_tree_digest {
+        Some(digest) => Cow::Borrowed(digest.as_str()),
+        None => Cow::Owned(verified_object_tree_integrity(object_dir)?),
+    };
     let package_dir = link_entry_package_dir(dir, key);
     let actual = compute_object_tree_integrity(&package_dir)?;
-    Ok(actual == expected)
+    Ok(actual == expected.as_ref())
 }
 
 fn link_entry_package_dir(dir: &Path, key: &GraphKey) -> PathBuf {
@@ -1228,19 +1299,26 @@ fn is_regular_file_no_symlink(path: &Path) -> bool {
 }
 
 fn object_dir_is_reusable_or_remove(dir: &Path, context: &str) -> Result<bool, LpmError> {
-    match is_verified_object_dir(dir) {
-        Ok(true) => Ok(true),
-        Ok(false) => {
-            remove_unusable_object_dir(dir, context)?;
-            Ok(false)
-        }
+    Ok(object_tree_integrity_or_remove(dir, context)?.is_some())
+}
+
+fn object_tree_integrity_or_remove(
+    dir: &Path,
+    context: &str,
+) -> Result<Option<VerifiedObjectTreeIntegrity>, LpmError> {
+    if !is_complete_object_dir(dir) {
+        remove_unusable_object_dir(dir, context)?;
+        return Ok(None);
+    }
+    match verified_object_tree_integrity(dir) {
+        Ok(digest) => Ok(Some(VerifiedObjectTreeIntegrity::new(digest))),
         Err(err) => {
             tracing::warn!(
                 target = %dir.display(),
                 "v2 store: treating object as unusable {context}: {err}"
             );
             remove_unusable_object_dir(dir, context)?;
-            Ok(false)
+            Ok(None)
         }
     }
 }
@@ -2219,6 +2297,26 @@ mod tests {
     }
 
     #[test]
+    fn reusable_object_returns_verified_tree_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"reusable_object_returns_verified_tree_integrity");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
+        );
+
+        let reusable = store.reusable_object(&sri).unwrap().unwrap();
+
+        assert_eq!(reusable.path, object_dir);
+        assert_eq!(
+            reusable.tree_integrity.as_str(),
+            read_object_tree_integrity(&reusable.path).unwrap()
+        );
+    }
+
+    #[test]
     fn remove_unusable_object_dir_treats_concurrent_delete_as_success() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("objects").join("sha512-missing");
@@ -2480,6 +2578,50 @@ mod tests {
             std::fs::read(link_index).unwrap(),
             b"module.exports = {};",
             "stale link entry must be rebuilt from the verified object"
+        );
+    }
+
+    #[test]
+    fn populate_link_entry_with_verified_object_rebuilds_stale_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let sri = synthetic_sri(b"populate_link_entry_with_verified_object_rebuilds_stale");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"verified-stale-link\"}"),
+                ("index.js", b"module.exports = {};"),
+            ],
+        );
+        let verified = store.reusable_object(&sri).unwrap().unwrap().tree_integrity;
+        let key = arc_key("verified-stale-link", "1.0.0");
+        let request = || LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri.clone(),
+            object_dir: object_dir.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        };
+
+        let first = store
+            .populate_link_entry_with_verified_object(request(), &verified)
+            .unwrap();
+        let link_index = first
+            .link_dir
+            .join("node_modules/verified-stale-link/index.js");
+        std::fs::write(&link_index, b"module.exports = 'stale';").unwrap();
+
+        let second = store
+            .populate_link_entry_with_verified_object(request(), &verified)
+            .unwrap();
+
+        assert!(second.freshly_populated);
+        assert_eq!(
+            std::fs::read(link_index).unwrap(),
+            b"module.exports = {};",
+            "verified-object fast path must still rebuild stale link entries"
         );
     }
 

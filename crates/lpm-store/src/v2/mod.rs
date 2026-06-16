@@ -47,4 +47,7 @@ pub use link_meta::{
     LINK_META_FILENAME, LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaDep, LinkMetaPlatform,
 };
 pub use platform::PlatformTuple;
-pub use store::{DepLink, LinkEntry, LinkEntryRequest, Store, StoreV2Paths};
+pub use store::{
+    DepLink, LinkEntry, LinkEntryRequest, ReusableObject, Store, StoreV2Paths,
+    VerifiedObjectTreeIntegrity,
+};

@@ -508,16 +508,7 @@ fn dir_is_nonempty(path: &Path) -> bool {
 
 /// Returns `true` iff the legacy isolated wrapper root
 /// (`node_modules/.lpm/`) contains at least one entry that is plausibly
-/// a wrapper segment (`<safe>@<version>` or `<safe>+<wid>`), as
-/// opposed to ONLY the hoisted `nested/` sub-namespace or schema
-/// metadata files.
-///
-/// Rule: any non-dotfile entry whose name is not literally `"nested"`
-/// is treated as a wrapper-segment directory. Wrapper segments cannot
-/// have the literal name `nested` because the wrapper-segment
-/// sanitizer always emits `<name><sep><version>` where `<sep>` is `@`
-/// or `+`, never the empty string — so a `nested` entry can only come
-/// from the hoisted-mode fallback root, not from a real wrapper.
+/// a wrapper segment (`<safe>@<version>` or `<safe>+<wid>`).
 fn legacy_isolated_has_wrapper_segments(path: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
@@ -525,8 +516,12 @@ fn legacy_isolated_has_wrapper_segments(path: &Path) -> bool {
     entries.flatten().any(|entry| {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        !name.starts_with('.') && name != "nested"
+        legacy_isolated_entry_name_is_wrapper_segment(&name)
     })
+}
+
+fn legacy_isolated_entry_name_is_wrapper_segment(name: &str) -> bool {
+    !name.starts_with('.') && (name.contains('@') || name.contains('+'))
 }
 
 #[cfg(test)]
@@ -932,6 +927,24 @@ mod tests {
         assert!(
             !layout.needs_layout_migration(),
             "orphan legacy nested/ must not register as isolated migration"
+        );
+    }
+
+    #[test]
+    fn needs_layout_migration_ignores_v2_compatibility_root() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        fs::create_dir_all(
+            layout
+                .isolated_legacy_wrapper_root()
+                .join("compat")
+                .join("eslint@9.39.4+51e8155e339ce359"),
+        )
+        .unwrap();
+
+        assert!(
+            !layout.needs_layout_migration(),
+            "v2 compatibility islands under node_modules/.lpm/compat must not register as legacy isolated wrappers"
         );
     }
 

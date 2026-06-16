@@ -64,6 +64,7 @@ use lpm_common::LpmError;
 use lpm_common::symlink::create_dir_symlink_or_junction;
 use lpm_store::v2::{
     DepLink, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple, Store,
+    VerifiedObjectTreeIntegrity,
 };
 
 use crate::materialize::link_dir_recursive;
@@ -88,6 +89,8 @@ pub struct V2Target {
     /// SRI of the source tarball. Required to locate the object dir
     /// at `<HOME>/.lpm/store/v2/objects/<sri>/`.
     pub source_sri: String,
+    /// Verified object-tree digest available on warm cache hits.
+    pub verified_object_tree_integrity: Option<VerifiedObjectTreeIntegrity>,
 }
 
 /// Pre-computed plan handed across the three-phase v2 link API
@@ -825,7 +828,10 @@ fn populate_one(
         deps,
         platform: Arc::clone(meta_platform),
     };
-    let entry = store.populate_link_entry(request)?;
+    let entry = match v2t.verified_object_tree_integrity.as_ref() {
+        Some(digest) => store.populate_link_entry_with_verified_object(request, digest)?,
+        None => store.populate_link_entry(request)?,
+    };
     Ok(PopulatedEntry {
         key,
         freshly_populated: entry.freshly_populated,
@@ -2517,6 +2523,7 @@ mod tests {
                 patch_fingerprint: None,
             },
             source_sri: sri.into(),
+            verified_object_tree_integrity: None,
         }
     }
 
