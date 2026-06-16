@@ -154,6 +154,10 @@ fn persist_audit_head(head: &AuditHead) -> Result<(), LpmError> {
 }
 
 pub(super) fn append_audit_event(event: &AuditEvent) -> Result<(), LpmError> {
+    lpm_common::with_exclusive_lock(audit_lock_path()?, || append_audit_event_locked(event))
+}
+
+fn append_audit_event_locked(event: &AuditEvent) -> Result<(), LpmError> {
     let path = audit_log_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

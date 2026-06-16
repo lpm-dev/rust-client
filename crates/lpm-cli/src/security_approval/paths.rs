@@ -30,6 +30,10 @@ pub(super) fn audit_log_path() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("audit.jsonl"))
 }
 
+pub(super) fn audit_lock_path() -> Result<PathBuf, LpmError> {
+    Ok(security_dir()?.join("audit.lock"))
+}
+
 pub(super) fn signing_secret_path() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("signing-secret.hex"))
 }

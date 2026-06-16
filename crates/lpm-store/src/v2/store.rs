@@ -1246,16 +1246,41 @@ fn object_dir_is_reusable_or_remove(dir: &Path, context: &str) -> Result<bool, L
 }
 
 fn remove_unusable_object_dir(dir: &Path, context: &str) -> Result<(), LpmError> {
+    let claimed_dir = claim_unusable_object_dir(dir, context)?;
+    let Some(claimed_dir) = claimed_dir else {
+        return Ok(());
+    };
     tracing::warn!(
         target = %dir.display(),
         "v2 store: removing incomplete or unverifiable object {context}"
     );
-    std::fs::remove_dir_all(dir).map_err(|e| {
+    std::fs::remove_dir_all(&claimed_dir).map_err(|e| {
         LpmError::Store(format!(
             "failed to remove incomplete or unverifiable v2 object at {} {context}: {e}",
             dir.display()
         ))
     })
+}
+
+fn claim_unusable_object_dir(dir: &Path, context: &str) -> Result<Option<PathBuf>, LpmError> {
+    for _ in 0..8 {
+        let claimed_dir = tmp_sibling(dir);
+        match std::fs::rename(dir, &claimed_dir) {
+            Ok(()) => return Ok(Some(claimed_dir)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(LpmError::Store(format!(
+                    "failed to claim incomplete or unverifiable v2 object at {} {context}: {e}",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    Err(LpmError::Store(format!(
+        "failed to claim incomplete or unverifiable v2 object at {} {context}: could not allocate a temporary removal path",
+        dir.display()
+    )))
 }
 
 fn finish_object_rename_after_collision(
@@ -2191,6 +2216,14 @@ mod tests {
             !object_dir.exists(),
             "malformed object integrity sidecars must force a fresh cache write"
         );
+    }
+
+    #[test]
+    fn remove_unusable_object_dir_treats_concurrent_delete_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("objects").join("sha512-missing");
+
+        remove_unusable_object_dir(&missing, "during concurrent cleanup").unwrap();
     }
 
     #[test]
