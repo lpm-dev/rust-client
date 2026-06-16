@@ -101,12 +101,13 @@ async fn direct_fetch(
     canonical: &CanonicalKey,
     policy: &ResolverPolicy,
 ) -> Result<Arc<CachedPackageInfo>, ResolveError> {
-    let fetched = fetch_metadata_for_resolver(client, route_table, canonical, policy).await?;
+    let fetched =
+        fetch_metadata_for_resolver(client, route_table, canonical, policy, false).await?;
     Ok(fetched.info)
 }
 
 pub(super) struct FetchedMetadata {
-    pub(super) speculation: SpeculativePackageMetadata,
+    pub(super) speculation: Option<SpeculativePackageMetadata>,
     pub(super) info: Arc<CachedPackageInfo>,
 }
 
@@ -117,27 +118,32 @@ pub(super) async fn fetch_metadata_for_resolver(
     route_table: &RouteTable,
     canonical: &CanonicalKey,
     policy: &ResolverPolicy,
+    include_speculation: bool,
 ) -> Result<FetchedMetadata, ResolveError> {
     let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
-    let fetched = parse_fetched_metadata(metadata);
+    let fetched = parse_fetched_metadata(metadata, include_speculation);
     if !fetched.info.needs_policy_metadata(canonical, policy) {
         return Ok(fetched);
     }
     let full = fetch_full_metadata_raw(client, route_table, canonical).await?;
-    Ok(parse_full_fetched_metadata(full))
+    Ok(parse_full_fetched_metadata(full, include_speculation))
 }
 
-pub(super) fn parse_fetched_metadata(metadata: lpm_registry::PackageMetadata) -> FetchedMetadata {
+pub(super) fn parse_fetched_metadata(
+    metadata: lpm_registry::PackageMetadata,
+    include_speculation: bool,
+) -> FetchedMetadata {
     let info = Arc::new(parse_metadata_to_cache_info(&metadata));
-    let speculation = SpeculativePackageMetadata::from(metadata);
+    let speculation = include_speculation.then(|| SpeculativePackageMetadata::from(metadata));
     FetchedMetadata { speculation, info }
 }
 
 pub(super) fn parse_full_fetched_metadata(
     metadata: lpm_registry::PackageMetadata,
+    include_speculation: bool,
 ) -> FetchedMetadata {
     let info = Arc::new(parse_full_metadata_to_cache_info(&metadata));
-    let speculation = SpeculativePackageMetadata::from(metadata);
+    let speculation = include_speculation.then(|| SpeculativePackageMetadata::from(metadata));
     FetchedMetadata { speculation, info }
 }
 
@@ -174,7 +180,7 @@ pub(super) fn complete_metadata_fetch(
         Ok(fetched) => {
             let FetchedMetadata { speculation, info } = fetched;
             shared_cache.insert(canonical.clone(), info);
-            if let Some(tx) = spec_tx
+            if let (Some(tx), Some(speculation)) = (spec_tx, speculation)
                 && tx.try_send((canonical.to_string(), speculation)).is_ok()
             {
                 *tarball_dispatched_count += 1;

@@ -45,9 +45,14 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                 .await;
             }
 
-            let fetched =
-                fetch_metadata_for_resolver(self.client, self.route_table, canonical, self.policy)
-                    .await?;
+            let fetched = fetch_metadata_for_resolver(
+                self.client,
+                self.route_table,
+                canonical,
+                self.policy,
+                self.spec_tx.is_some(),
+            )
+            .await?;
             let FetchedMetadata {
                 speculation,
                 info: info_arc,
@@ -56,7 +61,7 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                 .insert(canonical.clone(), info_arc.clone());
             self.dispatcher_rpc_count
                 .set(self.dispatcher_rpc_count.get() + 1);
-            if let Some(tx) = self.spec_tx
+            if let (Some(tx), Some(speculation)) = (self.spec_tx, speculation)
                 && tx.try_send((canonical.to_string(), speculation)).is_ok()
             {
                 self.tarball_dispatched_count
@@ -291,10 +296,10 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                     if !matches!(canonical, crate::package::CanonicalKey::Lpm { .. }) {
                         continue;
                     }
-                    let fetched = parse_fetched_metadata(meta);
+                    let fetched = parse_fetched_metadata(meta, spec_tx.is_some());
                     let FetchedMetadata { speculation, info } = fetched;
                     shared_cache.insert(canonical.clone(), info);
-                    if let Some(tx) = spec_tx.as_ref()
+                    if let (Some(tx), Some(speculation)) = (spec_tx.as_ref(), speculation)
                         && tx.try_send((canonical.to_string(), speculation)).is_ok()
                     {
                         tarball_dispatched_count += 1;
@@ -364,6 +369,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                 let permit = metadata_sem.clone();
                 let route_table_c = route_table.clone();
                 let policy_c = policy.clone();
+                let include_speculation = spec_tx.is_some();
                 metadata_jobs.spawn(async move {
                     // Acquire the metadata permit inside the task so
                     // the queue cap (256) limits in-flight HTTP calls,
@@ -380,6 +386,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                         &route_table_c,
                         &canonical,
                         &policy_c,
+                        include_speculation,
                     )
                     .await;
                     (canonical, result)
@@ -423,6 +430,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                 let permit = metadata_sem.clone();
                 let route_table_c = route_table.clone();
                 let policy_c = policy.clone();
+                let include_speculation = spec_tx.is_some();
                 metadata_jobs.spawn(async move {
                     let _p = permit
                         .acquire_owned()
@@ -433,6 +441,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                         &route_table_c,
                         &canonical,
                         &policy_c,
+                        include_speculation,
                     )
                     .await;
                     (canonical, result)
@@ -510,9 +519,14 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                         // direct dep), so the serial fetch here is
                         // bounded by the count of unmet-peer canonicals
                         // — usually 0–3.
-                        let fetched =
-                            fetch_metadata_for_resolver(&client, &route_table, &canonical, &policy)
-                                .await?;
+                        let fetched = fetch_metadata_for_resolver(
+                            &client,
+                            &route_table,
+                            &canonical,
+                            &policy,
+                            false,
+                        )
+                        .await?;
                         let info_arc = fetched.info;
                         shared_cache.insert(canonical.clone(), info_arc.clone());
                         Ok(info_arc)
