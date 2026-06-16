@@ -153,7 +153,7 @@ impl LpmDependencyProvider {
         let needs_upgrade = self
             .cache
             .get(key)
-            .is_some_and(|info| info.needs_policy_metadata(&self.policy));
+            .is_some_and(|info| info.needs_policy_metadata(key, &self.policy));
         if !needs_upgrade {
             return Ok(());
         }
@@ -195,7 +195,7 @@ impl LpmDependencyProvider {
                 let info = c.value();
                 info.versions
                     .iter()
-                    .filter(|version| version_allowed_by_policy(info, version, &self.policy))
+                    .filter(|version| version_allowed_by_policy(&key, info, version, &self.policy))
                     .cloned()
                     .collect()
             })

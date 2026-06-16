@@ -14,9 +14,9 @@ pub(super) async fn run_doctor_install(
         false, // json_output
         false, // offline
         crate::commands::install::FrozenLockfileMode::Never,
-        false,                                                   // force
-        false,                                                   // allow_new
-        false,                                                   // strict_integrity
+        false, // force
+        false, // allow_new
+        false, // strict_integrity
         None,  // strict_peer_dependencies_override
         None,  // linker_override
         false, // no_skills
@@ -29,6 +29,7 @@ pub(super) async fn run_doctor_install(
         None,  // script_policy_override: `lpm doctor` does not expose policy flags
         None,  // advisor_override: `lpm doctor` does not expose `--advisor`
         None,  // min_release_age_override: `lpm doctor` uses the package.json/global/default chain
+        &[],
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm doctor` enforces drift like a normal install
         crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: doctor's auto-fix install honors env + config posture chain
         crate::commands::install::InstallOmitPolicy::default(),

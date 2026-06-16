@@ -1,29 +1,37 @@
 //! release-age cooldown config loader.
 //!
-//! Resolves the effective `minimumReleaseAge` (in seconds) for a project
-//! install by walking, highest precedence first:
+//! Resolves the effective release-age config for a project install.
+//! The cooldown seconds walk this precedence chain, highest first:
 //!
 //! 1. **CLI flag**: `lpm install --min-release-age=<dur>`. Parsed via
-//!    [`parse_duration`] — accepts `h` / `d` suffixes and plain seconds.
+//!    [`parse_duration`] — accepts `m` / `h` / `d` suffixes and plain seconds.
 //! 2. **Per-project**: `package.json > lpm > minimumReleaseAge`. Read
 //!    via [`lpm_workspace::read_package_json`]; tolerant of missing /
 //!    malformed manifest (matches [`lpm_security::SecurityPolicy::from_package_json`]).
 //! 3. **Global**: `~/.lpm/config.toml` key `minimum-release-age-secs`.
-//!    Read with a path-aware fallible loader (mirrors  the //!    [`crate::save_config::SaveConfigLoader`] — malformed TOML or a
+//!    Read with a path-aware fallible loader; malformed TOML or a
 //!    garbage value surfaces a file-pathed error rather than being
 //!    silently ignored as [`crate::commands::config::GlobalConfig::load`]
 //!    would do).
-//! 4. **Default**: 86400 (24h). Matches pnpm v10 and the plan.
+//! 4. **Default**: 86400 (24h).
 //!
-//! `./lpm.toml` is deliberately NOT in this chain: per D14 the project-
-//! local TOML is scoped to save-policy keys, and the general project-
-//! config loader is a separate follow-up.
+//! `./lpm.toml` is deliberately NOT in this chain: the project-local
+//! TOML is scoped to save-policy keys, while release-age policy lives in
+//! package.json, global config, or per-invocation flags.
 //!
-//! The resolver returns `Result<u64, LpmError>`. Only the global-TOML
-//! layer can raise (file read, parse, or value-shape errors). The CLI
-//! input is validated upstream by the clap parser hook; the package.json
-//! layer is deliberately tolerant, preserving today's cooldown behaviour
-//! under D20 (P3 changes gating, not execution semantics).
+//! Exact package-name excludes are merged from the CLI
+//! `--min-release-age-exclude <pkg>` list, `package.json > lpm >
+//! minimumReleaseAgeExclude`, and `~/.lpm/config.toml >
+//! minimum-release-age-exclude` when those layers are consulted. Excludes
+//! affect only release-age selection and the install halt; lifecycle
+//! script cooldown hardening still receives publish-age data.
+//!
+//! The resolver returns `Result<ReleaseAgeConfig, LpmError>`. The global
+//! TOML layer can raise file read, parse, or value-shape errors. The CLI
+//! duration input is validated upstream by the clap parser hook; the
+//! package.json layer is deliberately tolerant of missing or malformed
+//! manifests, preserving the default cooldown behaviour for ordinary
+//! installs.
 //!
 //! The effective seconds value is then passed to
 //! [`lpm_security::SecurityPolicy::with_resolved_min_age`], which couples
@@ -36,6 +44,7 @@
 //! the install entry points alongside `allow_new`.
 
 use lpm_common::LpmError;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Default cooldown window when nothing else is configured (matches
@@ -46,10 +55,30 @@ pub(crate) const DEFAULT_MIN_RELEASE_AGE_SECS: u64 = 86400;
 
 /// TOML key in `~/.lpm/config.toml` holding the global override.
 const GLOBAL_KEY: &str = "minimum-release-age-secs";
+const GLOBAL_EXCLUDE_KEY: &str = "minimum-release-age-exclude";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleaseAgeConfig {
+    pub minimum_release_age_secs: u64,
+    pub minimum_release_age_exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GlobalReleaseAgeConfig {
+    minimum_release_age_secs: Option<u64>,
+    minimum_release_age_exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PackageReleaseAgeConfig {
+    minimum_release_age_secs: Option<u64>,
+    minimum_release_age_exclude: Vec<String>,
+}
 
 /// Parse the `--min-release-age=<dur>` CLI argument into a seconds count.
 ///
 /// Accepted forms:
+/// - `<N>m` — minutes (e.g. `10m` → 600)
 /// - `<N>h` — hours (e.g. `72h` → 259_200)
 /// - `<N>d` — days (e.g. `3d` → 259_200)
 /// - `<N>` — plain seconds (e.g. `86400`)
@@ -58,7 +87,7 @@ const GLOBAL_KEY: &str = "minimum-release-age-secs";
 /// - Empty string
 /// - Surrounding whitespace (`" 72h "`)
 /// - Bare suffix without a number (`h`, `d`)
-/// - Unsupported suffixes (`72m`, `1w`, `1y`)
+/// - Unsupported suffixes (`1w`, `1y`)
 /// - Negative values (`-5h`, `-1`)
 /// - Non-integer scalars (`0.5h`, `1.5d`)
 /// - Overflow when multiplying hours/days into seconds
@@ -175,16 +204,52 @@ impl ReleaseAgeResolver {
     /// and is unreadable / malformed / has a garbage
     /// `minimum-release-age-secs` value. A missing global file is fine
     /// (falls through to default).
+    #[cfg(test)]
     pub fn resolve(
         project_dir: &Path,
         cli_override: Option<u64>,
         json_output: bool,
     ) -> Result<u64, LpmError> {
+        Ok(
+            Self::resolve_config(project_dir, cli_override, &[], json_output)?
+                .minimum_release_age_secs,
+        )
+    }
+
+    pub fn resolve_config(
+        project_dir: &Path,
+        cli_override: Option<u64>,
+        cli_exclude: &[String],
+        json_output: bool,
+    ) -> Result<ReleaseAgeConfig, LpmError> {
         let global = crate::commands::config::GlobalConfig::load();
         let authorized = crate::security_approval::load_effective_authorized_posture()?.posture;
         let authorized_floor = authorized.minimum_release_age_secs();
         let force_security_floor = crate::security_floor::force_security_floor_enabled(&global);
         let floor = crate::security_floor::current_release_age_floor_secs(&global);
+        let mut minimum_release_age_exclude =
+            validate_release_age_excludes("--min-release-age-exclude", cli_exclude)?;
+
+        let package_config =
+            read_package_json_release_age_config(&project_dir.join("package.json"))?
+                .unwrap_or_default();
+        extend_unique_excludes(
+            &mut minimum_release_age_exclude,
+            package_config.minimum_release_age_exclude,
+        );
+        let global_release_age_config = match global_config_path() {
+            Some(path) => match read_global_release_age_config_from_file(&path) {
+                Ok(mut config) => {
+                    extend_unique_excludes(
+                        &mut minimum_release_age_exclude,
+                        std::mem::take(&mut config.minimum_release_age_exclude),
+                    );
+                    Ok(Some(config))
+                }
+                Err(err) => Err(err),
+            },
+            None => Ok(None),
+        };
 
         if let Some(secs) = cli_override {
             if secs < authorized_floor {
@@ -199,7 +264,10 @@ impl ReleaseAgeResolver {
                     Some(secs),
                     &[],
                 )?;
-                return Ok(secs);
+                return Ok(ReleaseAgeConfig {
+                    minimum_release_age_secs: secs,
+                    minimum_release_age_exclude,
+                });
             }
             if force_security_floor && secs < floor {
                 crate::security_floor::record_suppression(
@@ -211,11 +279,17 @@ impl ReleaseAgeResolver {
                     ),
                     json_output,
                 );
-                return Ok(floor);
+                return Ok(ReleaseAgeConfig {
+                    minimum_release_age_secs: floor,
+                    minimum_release_age_exclude,
+                });
             }
-            return Ok(secs);
+            return Ok(ReleaseAgeConfig {
+                minimum_release_age_secs: secs,
+                minimum_release_age_exclude,
+            });
         }
-        if let Some(secs) = read_package_json_min_age(&project_dir.join("package.json")) {
+        if let Some(secs) = package_config.minimum_release_age_secs {
             if secs < authorized_floor {
                 crate::security_approval::ensure_project_unlock(
                     crate::security_approval::ApprovalScope::CooldownBypass,
@@ -226,7 +300,10 @@ impl ReleaseAgeResolver {
                     Some(secs),
                     &[],
                 )?;
-                return Ok(secs);
+                return Ok(ReleaseAgeConfig {
+                    minimum_release_age_secs: secs,
+                    minimum_release_age_exclude,
+                });
             }
             if force_security_floor && secs < floor {
                 crate::security_floor::record_suppression(
@@ -238,12 +315,18 @@ impl ReleaseAgeResolver {
                     ),
                     json_output,
                 );
-                return Ok(floor);
+                return Ok(ReleaseAgeConfig {
+                    minimum_release_age_secs: floor,
+                    minimum_release_age_exclude,
+                });
             }
-            return Ok(secs);
+            return Ok(ReleaseAgeConfig {
+                minimum_release_age_secs: secs,
+                minimum_release_age_exclude,
+            });
         }
-        if let Some(path) = global_config_path()
-            && let Some(secs) = read_global_min_age_from_file(&path)?
+        if let Some(global_config) = global_release_age_config?
+            && let Some(secs) = global_config.minimum_release_age_secs
         {
             if secs < authorized_floor {
                 return Err(crate::security_approval::approval_required_error(
@@ -257,9 +340,15 @@ impl ReleaseAgeResolver {
                     Some(format!("lpm config set {GLOBAL_KEY} {secs}")),
                 ));
             }
-            return Ok(secs);
+            return Ok(ReleaseAgeConfig {
+                minimum_release_age_secs: secs,
+                minimum_release_age_exclude,
+            });
         }
-        Ok(DEFAULT_MIN_RELEASE_AGE_SECS)
+        Ok(ReleaseAgeConfig {
+            minimum_release_age_secs: DEFAULT_MIN_RELEASE_AGE_SECS,
+            minimum_release_age_exclude,
+        })
     }
 }
 
@@ -270,15 +359,22 @@ fn global_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".lpm").join("config.toml"))
 }
 
-/// Read `lpm.minimumReleaseAge` from a project's `package.json`.
-///
-/// Tolerant by design: missing / unreadable / malformed manifest
-/// returns `None` and the resolver falls through to the next layer.
-/// This preserves the existing cooldown behaviour where the 24h default
-/// still fires on projects without an `"lpm"` block (D20).
-fn read_package_json_min_age(pkg_json_path: &Path) -> Option<u64> {
-    let pkg = lpm_workspace::read_package_json(pkg_json_path).ok()?;
-    pkg.lpm?.minimum_release_age
+fn read_package_json_release_age_config(
+    pkg_json_path: &Path,
+) -> Result<Option<PackageReleaseAgeConfig>, LpmError> {
+    let Ok(pkg) = lpm_workspace::read_package_json(pkg_json_path) else {
+        return Ok(None);
+    };
+    let Some(lpm) = pkg.lpm else {
+        return Ok(None);
+    };
+    Ok(Some(PackageReleaseAgeConfig {
+        minimum_release_age_secs: lpm.minimum_release_age,
+        minimum_release_age_exclude: validate_release_age_excludes(
+            "package.json lpm.minimumReleaseAgeExclude",
+            &lpm.minimum_release_age_exclude,
+        )?,
+    }))
 }
 
 /// Read `minimum-release-age-secs` from a `~/.lpm/config.toml` at `path`.
@@ -292,9 +388,16 @@ fn read_package_json_min_age(pkg_json_path: &Path) -> Option<u64> {
 /// `lpm config set <key> <value>` command writes every value as a TOML
 /// string (Finding A in [`crate::save_config`]) — the documented
 /// persistent-config path must actually work.
+#[cfg(test)]
 fn read_global_min_age_from_file(path: &Path) -> Result<Option<u64>, LpmError> {
+    Ok(read_global_release_age_config_from_file(path)?.minimum_release_age_secs)
+}
+
+fn read_global_release_age_config_from_file(
+    path: &Path,
+) -> Result<GlobalReleaseAgeConfig, LpmError> {
     if !path.exists() {
-        return Ok(None);
+        return Ok(GlobalReleaseAgeConfig::default());
     }
     let raw = std::fs::read_to_string(path)
         .map_err(|e| LpmError::Registry(format!("failed to read {}: {e}", path.display())))?;
@@ -309,17 +412,29 @@ fn read_global_min_age_from_file(path: &Path) -> Result<Option<u64>, LpmError> {
             )));
         }
     };
-    let Some(value) = table.get(GLOBAL_KEY) else {
-        return Ok(None);
+    let minimum_release_age_secs = match table.get(GLOBAL_KEY) {
+        Some(value) => Some(parse_global_min_age_value(path, value)?),
+        None => None,
     };
+    let minimum_release_age_exclude = match table.get(GLOBAL_EXCLUDE_KEY) {
+        Some(value) => parse_global_release_age_exclude_value(path, value)?,
+        None => Vec::new(),
+    };
+    Ok(GlobalReleaseAgeConfig {
+        minimum_release_age_secs,
+        minimum_release_age_exclude,
+    })
+}
+
+fn parse_global_min_age_value(path: &Path, value: &toml::Value) -> Result<u64, LpmError> {
     match value {
-        toml::Value::Integer(i) => u64::try_from(*i).map(Some).map_err(|_| {
+        toml::Value::Integer(i) => u64::try_from(*i).map_err(|_| {
             LpmError::Registry(format!(
                 "{}: `{GLOBAL_KEY}` must be a non-negative integer (seconds), got {i}",
                 path.display()
             ))
         }),
-        toml::Value::String(s) => parse_strict_u64_string(s).map(Some).ok_or_else(|| {
+        toml::Value::String(s) => parse_strict_u64_string(s).ok_or_else(|| {
             LpmError::Registry(format!(
                 "{}: `{GLOBAL_KEY}` must be a non-negative integer (seconds) or a string \
                  parseable as one (e.g. \"86400\"), got \"{s}\"",
@@ -331,6 +446,121 @@ fn read_global_min_age_from_file(path: &Path) -> Result<Option<u64>, LpmError> {
             path.display()
         ))),
     }
+}
+
+fn parse_global_release_age_exclude_value(
+    path: &Path,
+    value: &toml::Value,
+) -> Result<Vec<String>, LpmError> {
+    let Some(entries) = value.as_array() else {
+        return Err(LpmError::Registry(format!(
+            "{}: `{GLOBAL_EXCLUDE_KEY}` must be an array of exact package names",
+            path.display()
+        )));
+    };
+    let raw: Result<Vec<_>, _> = entries
+        .iter()
+        .map(|entry| {
+            entry.as_str().map(str::to_string).ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "{}: `{GLOBAL_EXCLUDE_KEY}` entries must be strings",
+                    path.display()
+                ))
+            })
+        })
+        .collect();
+    validate_release_age_excludes(GLOBAL_EXCLUDE_KEY, &raw?)
+}
+
+pub(crate) fn validate_release_age_excludes(
+    source: &str,
+    excludes: &[String],
+) -> Result<Vec<String>, LpmError> {
+    let mut seen = HashSet::with_capacity(excludes.len());
+    let mut normalized = Vec::with_capacity(excludes.len());
+    for raw in excludes {
+        let package = validate_release_age_exclude(source, raw)?;
+        if seen.insert(package.clone()) {
+            normalized.push(package);
+        }
+    }
+    Ok(normalized)
+}
+
+fn validate_release_age_exclude(source: &str, raw: &str) -> Result<String, LpmError> {
+    if raw.is_empty() {
+        return Err(LpmError::Registry(format!(
+            "{source} entries must be exact package names, got an empty string"
+        )));
+    }
+    if raw.trim() != raw {
+        return Err(LpmError::Registry(format!(
+            "{source} entries must not contain surrounding whitespace: `{raw}`"
+        )));
+    }
+    if raw.chars().any(|c| matches!(c, '*' | '?' | '[' | ']')) {
+        return Err(LpmError::Registry(format!(
+            "{source} supports exact package names only; glob selectors are not supported in v1: `{raw}`"
+        )));
+    }
+    if raw.chars().any(char::is_whitespace) {
+        return Err(LpmError::Registry(format!(
+            "{source} entries must be exact package names without whitespace: `{raw}`"
+        )));
+    }
+    if raw == "<root>" {
+        return Err(LpmError::Registry(format!(
+            "{source} cannot exclude the resolver root package"
+        )));
+    }
+    if raw.contains(':') {
+        return Err(LpmError::Registry(format!(
+            "{source} supports package names only, not package specifiers or protocols: `{raw}`"
+        )));
+    }
+    if !is_exact_package_name(raw) {
+        return Err(LpmError::Registry(format!(
+            "{source} entries must be valid exact package names: `{raw}`"
+        )));
+    }
+    let version_search_start = usize::from(raw.starts_with('@'));
+    if raw[version_search_start..].contains('@') {
+        return Err(LpmError::Registry(format!(
+            "{source} supports package names only, not package versions or ranges: `{raw}`"
+        )));
+    }
+    Ok(lpm_resolver::CanonicalKey::from_dep_name(raw).to_string())
+}
+
+fn extend_unique_excludes(target: &mut Vec<String>, source: Vec<String>) {
+    if source.is_empty() {
+        return;
+    }
+    let mut seen: HashSet<String> = target.iter().cloned().collect();
+    target.reserve(source.len());
+    for package in source {
+        if seen.insert(package.clone()) {
+            target.push(package);
+        }
+    }
+}
+
+fn is_exact_package_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 256 || name.contains('\0') || name.contains("..") {
+        return false;
+    }
+    if name.starts_with('@') {
+        let Some(slash_pos) = name.find('/') else {
+            return false;
+        };
+        let scope = &name[1..slash_pos];
+        let package = &name[slash_pos + 1..];
+        return !scope.is_empty()
+            && !package.is_empty()
+            && !package.contains('/')
+            && !package.contains('\\');
+    }
+    !name.contains('/') && !name.contains('\\')
 }
 
 #[cfg(test)]
@@ -541,6 +771,88 @@ mod tests {
     }
 
     #[test]
+    fn global_file_minimum_release_age_exclude_array_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_file(
+            &path,
+            r#"minimum-release-age-exclude = ["react", "@scope/pkg"]"#,
+        );
+        let result = read_global_release_age_config_from_file(&path).unwrap();
+        assert_eq!(result.minimum_release_age_secs, None);
+        assert_eq!(
+            result.minimum_release_age_exclude,
+            vec!["react".to_string(), "@scope/pkg".to_string()]
+        );
+    }
+
+    #[test]
+    fn global_file_minimum_release_age_exclude_rejects_glob_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_file(&path, r#"minimum-release-age-exclude = ["@scope/*"]"#);
+        let err = read_global_release_age_config_from_file(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("minimum-release-age-exclude"), "got: {err}");
+        assert!(err.contains("exact package names"), "got: {err}");
+    }
+
+    #[test]
+    fn global_file_minimum_release_age_exclude_rejects_version_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_file(&path, r#"minimum-release-age-exclude = ["react@19.0.0"]"#);
+        let err = read_global_release_age_config_from_file(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("minimum-release-age-exclude"), "got: {err}");
+        assert!(err.contains("versions"), "got: {err}");
+    }
+
+    #[test]
+    fn global_file_minimum_release_age_exclude_wrong_type_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_file(&path, r#"minimum-release-age-exclude = "react""#);
+        let err = read_global_release_age_config_from_file(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("minimum-release-age-exclude"), "got: {err}");
+        assert!(err.contains("array"), "got: {err}");
+    }
+
+    #[test]
+    fn minimum_release_age_exclude_rejects_protocol_specifier() {
+        let err =
+            validate_release_age_excludes("--min-release-age-exclude", &["npm:react".to_string()])
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("package names only"), "got: {err}");
+    }
+
+    #[test]
+    fn minimum_release_age_exclude_rejects_malformed_scoped_name() {
+        let err =
+            validate_release_age_excludes("--min-release-age-exclude", &["@scope".to_string()])
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("valid exact package names"), "got: {err}");
+    }
+
+    #[test]
+    fn minimum_release_age_exclude_rejects_root_pseudo_package() {
+        let err =
+            validate_release_age_excludes("--min-release-age-exclude", &["<root>".to_string()])
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("resolver root"), "got: {err}");
+    }
+
+    #[test]
     fn global_file_negative_integer_rejected_with_path_and_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -667,14 +979,41 @@ mod tests {
         }
     }
 
+    fn write_package_json_with_min_age_and_excludes(
+        project: &Path,
+        secs: Option<u64>,
+        excludes: &[&str],
+    ) {
+        let mut lpm = serde_json::Map::new();
+        if let Some(secs) = secs {
+            lpm.insert(
+                "minimumReleaseAge".to_string(),
+                serde_json::Value::Number(secs.into()),
+            );
+        }
+        if !excludes.is_empty() {
+            lpm.insert(
+                "minimumReleaseAgeExclude".to_string(),
+                serde_json::json!(excludes),
+            );
+        }
+
+        let mut body = serde_json::json!({ "name": "p", "version": "0.0.0" });
+        if !lpm.is_empty() {
+            body["lpm"] = serde_json::Value::Object(lpm);
+        }
+        write_file(
+            &project.join("package.json"),
+            &serde_json::to_string(&body).unwrap(),
+        );
+    }
+
     fn write_package_json_with_min_age(project: &Path, secs: Option<u64>) {
-        let body = match secs {
-            Some(n) => format!(
-                r#"{{ "name": "p", "version": "0.0.0", "lpm": {{ "minimumReleaseAge": {n} }} }}"#
-            ),
-            None => r#"{ "name": "p", "version": "0.0.0" }"#.to_string(),
-        };
-        write_file(&project.join("package.json"), &body);
+        write_package_json_with_min_age_and_excludes(project, secs, &[]);
+    }
+
+    fn write_package_json_with_excludes(project: &Path, excludes: &[&str]) {
+        write_package_json_with_min_age_and_excludes(project, None, excludes);
     }
 
     fn write_global_config(home: &Path, contents: &str) {
@@ -766,6 +1105,104 @@ mod tests {
         write_file(&project.path().join("package.json"), "{ not json ===");
         let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, DEFAULT_MIN_RELEASE_AGE_SECS);
+    }
+
+    #[test]
+    fn resolve_config_includes_package_json_excludes_with_default_release_age() {
+        let project = tempfile::tempdir().unwrap();
+        let _home = scoped_home_dir();
+        write_package_json_with_excludes(project.path(), &["react", "@scope/pkg"]);
+
+        let result = ReleaseAgeResolver::resolve_config(project.path(), None, &[], true).unwrap();
+
+        assert_eq!(
+            result.minimum_release_age_secs,
+            DEFAULT_MIN_RELEASE_AGE_SECS
+        );
+        assert_eq!(
+            result.minimum_release_age_exclude,
+            vec!["react".to_string(), "@scope/pkg".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_config_merges_cli_project_and_global_excludes_when_global_sets_age() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_authorized_min_age(0);
+        write_package_json_with_excludes(project.path(), &["project-pkg", "shared-pkg"]);
+        write_global_config(
+            home.path(),
+            r#"minimum-release-age-secs = 2000
+minimum-release-age-exclude = ["global-pkg", "shared-pkg"]
+"#,
+        );
+        let cli_excludes = vec!["cli-pkg".to_string()];
+
+        let result =
+            ReleaseAgeResolver::resolve_config(project.path(), None, &cli_excludes, true).unwrap();
+
+        assert_eq!(result.minimum_release_age_secs, 2000);
+        assert_eq!(
+            result.minimum_release_age_exclude,
+            vec![
+                "cli-pkg".to_string(),
+                "project-pkg".to_string(),
+                "shared-pkg".to_string(),
+                "global-pkg".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_config_merges_global_excludes_when_cli_override_sets_age() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_authorized_min_age(0);
+        write_package_json_with_excludes(project.path(), &["project-pkg"]);
+        write_global_config(
+            home.path(),
+            r#"minimum-release-age-secs = 2000
+minimum-release-age-exclude = ["global-pkg"]
+"#,
+        );
+        let cli_excludes = vec!["cli-pkg".to_string()];
+
+        let result =
+            ReleaseAgeResolver::resolve_config(project.path(), Some(500), &cli_excludes, true)
+                .unwrap();
+
+        assert_eq!(result.minimum_release_age_secs, 500);
+        assert_eq!(
+            result.minimum_release_age_exclude,
+            vec![
+                "cli-pkg".to_string(),
+                "project-pkg".to_string(),
+                "global-pkg".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_config_merges_global_excludes_when_package_json_sets_age() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_authorized_min_age(0);
+        write_package_json_with_min_age_and_excludes(project.path(), Some(1000), &["project-pkg"]);
+        write_global_config(
+            home.path(),
+            r#"minimum-release-age-secs = 2000
+minimum-release-age-exclude = ["global-pkg"]
+"#,
+        );
+
+        let result = ReleaseAgeResolver::resolve_config(project.path(), None, &[], true).unwrap();
+
+        assert_eq!(result.minimum_release_age_secs, 1000);
+        assert_eq!(
+            result.minimum_release_age_exclude,
+            vec!["project-pkg".to_string(), "global-pkg".to_string()]
+        );
     }
 
     #[test]

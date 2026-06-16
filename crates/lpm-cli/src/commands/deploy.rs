@@ -1532,6 +1532,7 @@ pub async fn run(
         None, // script_policy_override: `lpm deploy` does not expose policy flags
         None, // advisor_override: `lpm deploy` does not expose `--advisor`
         None, // min_release_age_override: use install defaults
+        &[],
         // drift-ignore: deploy captures an already-resolved tree;
         // drift is an orthogonal gate. Deploy inherits the same
         // default "enforce"; the output dir carries whatever

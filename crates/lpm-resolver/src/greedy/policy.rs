@@ -16,6 +16,7 @@ use super::types::Edge;
 ///   return `None` even when an in-range version exists if every candidate
 ///   is filtered out.
 pub(super) fn apply_override_target_greedy(
+    canonical: &CanonicalKey,
     info: &CachedPackageInfo,
     target: &OverrideTarget,
     range: &NpmRange,
@@ -25,7 +26,7 @@ pub(super) fn apply_override_target_greedy(
         OverrideTarget::PinnedVersion { version, .. } => {
             if range.satisfies(version)
                 && matches!(
-                    release_age_status_for_version(info, version, policy),
+                    release_age_status_for_version(canonical, info, version, policy),
                     ReleaseTimeStatus::Allowed
                 )
                 && (!policy.trust_policy().is_no_downgrade()
@@ -51,7 +52,7 @@ pub(super) fn apply_override_target_greedy(
                     continue;
                 }
                 if !matches!(
-                    release_age_status_for_version(info, v, policy),
+                    release_age_status_for_version(canonical, info, v, policy),
                     ReleaseTimeStatus::Allowed
                 ) {
                     continue;

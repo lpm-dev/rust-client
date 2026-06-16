@@ -883,6 +883,7 @@ pub async fn run_add_packages(
     //: forwarded `--min-release-age=<dur>` override.
     // Opaque pass-through — see [`run_with_options`].
     min_release_age_override: Option<u64>,
+    min_release_age_exclude: &[String],
     // forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
@@ -1047,6 +1048,7 @@ pub async fn run_add_packages(
             script_policy_override,
             advisor_override,
             min_release_age_override,
+            min_release_age_exclude,
             drift_ignore_policy,
             verify_policy,
             omit_policy,
@@ -1123,6 +1125,7 @@ pub async fn run_install_filtered_add(
     //: forwarded `--min-release-age=<dur>` override.
     // Opaque pass-through — see [`run_with_options`].
     min_release_age_override: Option<u64>,
+    min_release_age_exclude: &[String],
     // forwarded `--ignore-provenance-drift[-all]`
     // policy. Opaque pass-through — see [`run_with_options`].
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
@@ -1417,6 +1420,7 @@ pub async fn run_install_filtered_add(
                 // `Option<String>` is cheap to clone.
                 advisor_override.clone(),
                 min_release_age_override,
+                min_release_age_exclude,
                 // Multi-member loop: `run_install_filtered_add` runs the
                 // install pipeline once per targeted member. Each
                 // iteration consumes the policy, so we clone per call.

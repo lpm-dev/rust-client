@@ -11,11 +11,11 @@ use super::args::{
 };
 use super::format::{argv_has_global_registry_flag, exit_with_lpm_error, parse_cli_or_exit};
 use super::helpers::{
-    argv_requests_top_level_version, build_install_global_overrides, command_needs_global_state,
-    install_omit_policy_from_cli, maybe_emit_network_fs_warning, print_version_with_notice,
-    resolve_install_project_dir, should_suppress_update_banner, spawn_background_update_check,
-    tunnel_action_requires_session, validate_global_install_project_scoped_flags,
-    validate_global_uninstall_project_scoped_flags,
+    argv_requests_top_level_version, build_install_global_overrides_with_excludes,
+    command_needs_global_state, install_omit_policy_from_cli, maybe_emit_network_fs_warning,
+    print_version_with_notice, resolve_install_project_dir, should_suppress_update_banner,
+    spawn_background_update_check, tunnel_action_requires_session,
+    validate_global_install_project_scoped_flags, validate_global_uninstall_project_scoped_flags,
 };
 
 pub(crate) fn run() -> Result<()> {
@@ -402,6 +402,7 @@ async fn async_main() -> Result<()> {
             strict_peer_dependencies,
             no_strict_peer_dependencies,
             min_release_age,
+            min_release_age_exclude,
             ignore_provenance_drift,
             ignore_provenance_drift_all,
             unverified_provenance,
@@ -515,13 +516,14 @@ async fn async_main() -> Result<()> {
                     catalog,
                 ); // not wired for global install; ignored for now.
 
-                let mut overrides = build_install_global_overrides(
+                let mut overrides = build_install_global_overrides_with_excludes(
                     allow_new,
                     auto_build,
                     policy.as_deref(),
                     yolo,
                     triage_alias,
                     min_release_age.as_deref(),
+                    min_release_age_exclude.clone(),
                     ignore_provenance_drift,
                     ignore_provenance_drift_all,
                     unverified_provenance,
@@ -828,6 +830,7 @@ async fn async_main() -> Result<()> {
                         cli_script_policy_override,
                         advisor.clone(),
                         min_release_age_override,
+                        &min_release_age_exclude,
                         drift_ignore_policy,
                         verify_policy,
                         omit_policy,
@@ -869,6 +872,7 @@ async fn async_main() -> Result<()> {
                     cli_script_policy_override,
                     advisor.clone(),
                     min_release_age_override,
+                    &min_release_age_exclude,
                     drift_ignore_policy,
                     verify_policy,
                     cli_strict_peer_dependencies,
@@ -908,6 +912,7 @@ async fn async_main() -> Result<()> {
                         cli_script_policy_override,
                         advisor.clone(),
                         min_release_age_override,
+                        &min_release_age_exclude,
                         drift_ignore_policy,
                         verify_policy,
                         cli_strict_peer_dependencies,
@@ -933,6 +938,7 @@ async fn async_main() -> Result<()> {
                         cli_script_policy_override,
                         advisor.clone(),
                         min_release_age_override,
+                        &min_release_age_exclude,
                         drift_ignore_policy,
                         verify_policy,
                         cli_strict_peer_dependencies,
@@ -1719,6 +1725,7 @@ async fn async_main() -> Result<()> {
             refresh,
             allow_new,
             min_release_age,
+            min_release_age_exclude,
             args,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -1730,10 +1737,13 @@ async fn async_main() -> Result<()> {
                 &client,
                 &cwd,
                 &package,
-                &args,
-                refresh,
-                allow_new,
-                min_release_age_override,
+                commands::run::DlxOptions {
+                    extra_args: &args,
+                    refresh,
+                    allow_new,
+                    min_release_age_override,
+                    min_release_age_exclude: &min_release_age_exclude,
+                },
             )
             .await
         }
@@ -2136,6 +2146,7 @@ async fn async_main() -> Result<()> {
             strict_peer_dependencies,
             no_strict_peer_dependencies,
             min_release_age,
+            min_release_age_exclude,
             ignore_provenance_drift,
             ignore_provenance_drift_all,
             unverified_provenance,
@@ -2297,6 +2308,7 @@ async fn async_main() -> Result<()> {
                 cli_script_policy_override,
                 advisor.clone(),
                 min_release_age_override,
+                &min_release_age_exclude,
                 drift_ignore_policy,
                 verify_policy,
                 omit_policy,

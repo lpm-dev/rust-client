@@ -55,7 +55,7 @@ pub(super) fn process_edge_with_preferred(
     let canonical_name = edge.canonical.to_string();
 
     let natural_pick = preferred.map_or_else(
-        || find_best_version_with_policy(info, &edge.range, &state.policy),
+        || find_best_version_with_policy(&edge.canonical, info, &edge.range, &state.policy),
         VersionPick::Picked,
     );
     let natural_ver = match &natural_pick {
@@ -99,7 +99,13 @@ pub(super) fn process_edge_with_preferred(
         parent_ctx_ref,
     ) {
         Some(entry) => {
-            match apply_override_target_greedy(info, &entry.target, &edge.range, &state.policy) {
+            match apply_override_target_greedy(
+                &edge.canonical,
+                info,
+                &entry.target,
+                &edge.range,
+                &state.policy,
+            ) {
                 Some(forced) => {
                     let hit = OverrideHit {
                         raw_key: entry.raw_key.clone(),
@@ -209,7 +215,12 @@ fn process_edge_inner(
                     .push((edge.local_name.clone(), id));
                 return Ok(());
             }
-            let version = match find_best_version_with_policy(info, &edge.range, &state.policy) {
+            let version = match find_best_version_with_policy(
+                &edge.canonical,
+                info,
+                &edge.range,
+                &state.policy,
+            ) {
                 VersionPick::Picked(v) => v,
                 VersionPick::NoSatisfying => {
                     return handle_no_version(edge, info, false, state);
@@ -241,7 +252,7 @@ fn process_edge_inner(
         }
     };
 
-    match release_age_status_for_version(info, &target_version, &state.policy) {
+    match release_age_status_for_version(&edge.canonical, info, &target_version, &state.policy) {
         ReleaseTimeStatus::Allowed => {}
         ReleaseTimeStatus::Missing => {
             return handle_policy_blocked(

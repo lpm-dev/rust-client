@@ -21,7 +21,7 @@ impl LpmDependencyProvider {
             if !range.contains(version) {
                 continue;
             }
-            if !version_allowed_by_policy(info, version, &self.policy) {
+            if !version_allowed_by_policy(&key, info, version, &self.policy) {
                 continue;
             }
 
@@ -53,7 +53,7 @@ impl LpmDependencyProvider {
             OverrideTarget::PinnedVersion { version, .. } => {
                 let key = CanonicalKey::from(package);
                 let allowed = self.cache.get(&key).is_some_and(|info| {
-                    version_allowed_by_policy(info.value(), version, &self.policy)
+                    version_allowed_by_policy(&key, info.value(), version, &self.policy)
                 });
                 if range.contains(version) && allowed {
                     Some(version.clone())
@@ -81,7 +81,7 @@ impl LpmDependencyProvider {
                     if !target_range.satisfies(v) {
                         continue;
                     }
-                    if !version_allowed_by_policy(info, v, &self.policy) {
+                    if !version_allowed_by_policy(&key, info, v, &self.policy) {
                         continue;
                     }
                     return Some(v.clone());

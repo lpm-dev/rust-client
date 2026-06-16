@@ -873,10 +873,11 @@ async fn run_install_filtered_add_no_match_with_fail_flag_includes_d2_hint_for_b
         false,                // allow_new
         false,                // force
         crate::save_spec::SaveFlags::default(),
-        None,                                                  // catalog_name_override
-        None,                                                  // script_policy_override
-        None,                                                  // advisor_override
-        None,                                                  // min_release_age_override
+        None, // catalog_name_override
+        None, // script_policy_override
+        None, // advisor_override
+        None, // min_release_age_override
+        &[],
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
         crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
         None,                                                  // strict_peer_dependencies_override
@@ -923,10 +924,11 @@ async fn run_install_filtered_add_no_match_for_glob_filter_does_not_emit_d2_hint
         false,
         false,
         crate::save_spec::SaveFlags::default(),
-        None,                                                  // catalog_name_override
-        None,                                                  // script_policy_override
-        None,                                                  // advisor_override
-        None,                                                  // min_release_age_override
+        None, // catalog_name_override
+        None, // script_policy_override
+        None, // advisor_override
+        None, // min_release_age_override
+        &[],
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift_ignore_policy
         crate::provenance_fetch::VerifyPolicy::default(),      // verify_policy
         None,                                                  // strict_peer_dependencies_override

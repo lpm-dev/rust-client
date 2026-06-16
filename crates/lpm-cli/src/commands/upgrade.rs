@@ -512,21 +512,22 @@ pub async fn run(
         json_output,
         false, // offline
         crate::commands::install::FrozenLockfileMode::Never,
-        false,                                                 // force
-        false,                                                 // allow_new
-        false,                                                 // strict_integrity
-        None,                                                  // strict_peer_dependencies_override
-        None,                                                  // linker_override
-        false,                                                 // no_skills
-        false,                                                 // no_editor_setup
-        false,                                                 // no_security_summary
-        false,                                                 // auto_build
-        None,                                                  // target_set
-        None,                                                  // direct_versions_out
-        None, // requested_add_count: upgrade is not an add-path install
-        None, // script_policy_override: `lpm upgrade` does not expose policy flags
-        None, // advisor_override: `lpm upgrade` does not expose `--advisor`
-        None, // min_release_age_override: `lpm upgrade` uses the chain
+        false, // force
+        false, // allow_new
+        false, // strict_integrity
+        None,  // strict_peer_dependencies_override
+        None,  // linker_override
+        false, // no_skills
+        false, // no_editor_setup
+        false, // no_security_summary
+        false, // auto_build
+        None,  // target_set
+        None,  // direct_versions_out
+        None,  // requested_add_count: upgrade is not an add-path install
+        None,  // script_policy_override: `lpm upgrade` does not expose policy flags
+        None,  // advisor_override: `lpm upgrade` does not expose `--advisor`
+        None,  // min_release_age_override: `lpm upgrade` uses the chain
+        &[],
         crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm upgrade` enforces drift
         // `lpm upgrade` does not surface its own
         // `--unverified-provenance{,-all}` flags; the verifier honors

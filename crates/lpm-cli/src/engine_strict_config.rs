@@ -74,6 +74,7 @@ mod tests {
                 linker: None,
                 trusted_dependencies: TrustedDependencies::default(),
                 minimum_release_age: None,
+                minimum_release_age_exclude: Vec::new(),
                 engine_strict,
                 overrides: Default::default(),
                 patched_dependencies: Default::default(),

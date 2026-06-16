@@ -552,6 +552,7 @@ pub async fn run_with_options(
     // [`crate::release_age_config::parse_duration`] before this fn runs, so
     // validation errors never make it this far.
     min_release_age_override: Option<u64>,
+    min_release_age_exclude: &[String],
     // canonicalized `--ignore-provenance-drift[-all]`
     // override (see [`crate::provenance_fetch::DriftIgnorePolicy`] for
     // the three variants). `EnforceAll` is the default; the drift gate
@@ -616,6 +617,7 @@ pub async fn run_with_options(
         script_policy_override,
         advisor_override,
         min_release_age_override,
+        min_release_age_exclude,
         drift_ignore_policy,
         verify_policy,
         omit_policy,
@@ -651,6 +653,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     advisor_override: Option<String>,
     min_release_age_override: Option<u64>,
+    min_release_age_exclude: &[String],
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
     verify_policy: crate::provenance_fetch::VerifyPolicy,
     omit_policy: InstallOmitPolicy,
@@ -695,6 +698,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             script_policy_override,
             advisor_override,
             min_release_age_override,
+            min_release_age_exclude,
             drift_ignore_policy,
             verify_policy,
             omit_policy,
@@ -735,6 +739,7 @@ async fn run_with_options_under_store_lock(
     // see `run_with_options` for the contract.
     advisor_override: Option<String>,
     min_release_age_override: Option<u64>,
+    min_release_age_exclude: &[String],
     drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy,
     // see `run_with_options` for the contract.
     verify_policy: crate::provenance_fetch::VerifyPolicy,
@@ -786,11 +791,13 @@ async fn run_with_options_under_store_lock(
         json_output,
     )?;
 
-    let effective_min_age_secs = crate::release_age_config::ReleaseAgeResolver::resolve(
+    let release_age_config = crate::release_age_config::ReleaseAgeResolver::resolve_config(
         project_dir,
         min_release_age_override,
+        min_release_age_exclude,
         json_output,
     )?;
+    let effective_min_age_secs = release_age_config.minimum_release_age_secs;
     if allow_new && effective_min_age_secs > 0 {
         crate::security_approval::ensure_project_unlock(
             crate::security_approval::ApprovalScope::CooldownBypass,
@@ -807,8 +814,17 @@ async fn run_with_options_under_store_lock(
         Some("no-downgrade") => lpm_resolver::TrustPolicyMode::NoDowngrade,
         _ => lpm_resolver::TrustPolicyMode::Off,
     };
-    let resolver_policy =
-        lpm_resolver::ResolverPolicy::new(resolver_min_age_secs, resolver_trust_policy);
+    let minimum_release_age_exclude = release_age_config.minimum_release_age_exclude;
+    let resolver_excludes = minimum_release_age_exclude
+        .iter()
+        .map(|name| lpm_resolver::CanonicalKey::from_dep_name(name));
+    let resolver_policy = lpm_resolver::ResolverPolicy::new_with_release_age_excludes(
+        resolver_min_age_secs,
+        resolver_trust_policy,
+        resolver_excludes,
+    );
+    let minimum_release_age_exclude: std::collections::HashSet<String> =
+        minimum_release_age_exclude.into_iter().collect();
 
     // Hoisted
     // here (above the empty-deps short-circuit, the lockfile fast
@@ -3308,6 +3324,9 @@ async fn run_with_options_under_store_lock(
     if !allow_new && !used_lockfile && cooldown_policy.minimum_release_age_secs > 0 {
         let mut too_new = Vec::new();
         for p in &packages {
+            if minimum_release_age_exclude.contains(&p.name) {
+                continue;
+            }
             let key = (p.name.clone(), p.version.clone());
             let age_secs = publish_ages.get(&key).copied();
             // Use the existing `check_release_age` semantics:
@@ -3352,14 +3371,15 @@ async fn run_with_options_under_store_lock(
                 // (2) --allow-new per-install, blanket bypass
                 // (3) package.json persistent, repo-wide
                 eprintln!(
-                    "  To override: {} or {} (this install), or set {} in package.json.",
+                    "  To override: {} for one package, {} or {} (this install), or set {} in package.json.",
+                    "--min-release-age-exclude <pkg>".bold(),
                     "--min-release-age=0".bold(),
                     "--allow-new".bold(),
                     "\"lpm\": { \"minimumReleaseAge\": 0 }".dimmed(),
                 );
             }
             return Err(LpmError::Registry(format!(
-                "{} package(s) published too recently (minimumReleaseAge={}s). Use --allow-new or --min-release-age=<dur> to override.",
+                "{} package(s) published too recently (minimumReleaseAge={}s). Use --min-release-age-exclude <pkg>, --allow-new, or --min-release-age=<dur> to override.",
                 too_new.len(),
                 cooldown_policy.minimum_release_age_secs,
             )));

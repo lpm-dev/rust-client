@@ -56,7 +56,7 @@ impl LpmDependencyProvider {
                 .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
 
                 let mut info = parse_metadata_to_cache_info(&metadata);
-                if info.needs_policy_metadata(&self.policy) {
+                if info.needs_policy_metadata(&key, &self.policy) {
                     let full = self
                         .rt
                         .block_on(self.client.get_npm_metadata_routed_full(name, route))

@@ -70,7 +70,7 @@ where
                 continue;
             }
             saw_candidate = true;
-            if !candidate_allowed(info, version, policy) {
+            if !candidate_allowed(canonical, info, version, policy) {
                 continue;
             }
             match required_dependency_tree_status(
@@ -172,12 +172,13 @@ where
 }
 
 fn candidate_allowed(
+    canonical: &CanonicalKey,
     info: &CachedPackageInfo,
     version: &NpmVersion,
     policy: &ResolverPolicy,
 ) -> bool {
     matches!(
-        release_age_status_for_version(info, version, policy),
+        release_age_status_for_version(canonical, info, version, policy),
         ReleaseTimeStatus::Allowed
     ) && (!policy.trust_policy().is_no_downgrade()
         || trust_downgrade_violation(info, version).is_none())
