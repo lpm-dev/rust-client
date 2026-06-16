@@ -49,65 +49,6 @@ pub(super) fn max_concurrent_downloads() -> usize {
     }
 }
 
-/// Single owner of the `.lpm/install-hash` write. Called from every
-/// successful exit path of [`run_with_options_under_store_lock`] —
-/// the empty-deps short-circuit AND the canonical end-of-function —
-/// so the freshness cache stays consistent regardless of which exit
-/// the install took. `dev.rs::auto_install_if_stale` used to
-/// double-write the hash with stale pre-install state, clobbering
-/// the v6 mtime/linker metadata; that block was removed when this
-/// helper became the single writer.
-///
-/// Re-reads `package.json` and `lpm.lock` AFTER the install rather
-/// than reusing pre-install captures, because save policy may have
-/// rewritten ranges (e.g., `"*"` → `"^4.3.6"`) and the linker may
-/// have written a fresh lockfile entry. A read failure on either
-/// (for example a partial install before lockfile materialization)
-/// falls back to empty-string content — same shape
-/// `check_install_state` uses on the freshness side, so the
-/// round-trip stays consistent.
-///
-/// Logs a `tracing::warn!` if the actual write fails. Previously this
-/// was `let _ = ...` (silent), which left both this writer AND the
-/// retired dev.rs writer with no observability on disk failures.
-#[derive(Debug)]
-pub(super) struct SpeculativePackageMetadata {
-    pub(super) dist_tags: HashMap<String, String>,
-    pub(super) versions: HashMap<String, SpeculativeVersionMetadata>,
-}
-
-#[derive(Debug)]
-pub(super) struct SpeculativeVersionMetadata {
-    pub(super) parsed_version: Option<lpm_resolver::NpmVersion>,
-    pub(super) tarball_url: Option<String>,
-    pub(super) integrity: Option<String>,
-    pub(super) dependencies: HashMap<String, String>,
-}
-
-impl From<lpm_registry::PackageMetadata> for SpeculativePackageMetadata {
-    fn from(meta: lpm_registry::PackageMetadata) -> Self {
-        let mut versions = HashMap::with_capacity(meta.versions.len());
-        for (version, version_meta) in meta.versions {
-            let parsed_version = lpm_resolver::NpmVersion::parse(&version).ok();
-            let tarball_url = version_meta.tarball_url().map(ToOwned::to_owned);
-            let integrity = version_meta.integrity_or_shasum().map(|s| s.into_owned());
-            versions.insert(
-                version,
-                SpeculativeVersionMetadata {
-                    parsed_version,
-                    tarball_url,
-                    integrity,
-                    dependencies: version_meta.dependencies,
-                },
-            );
-        }
-        Self {
-            dist_tags: meta.dist_tags,
-            versions,
-        }
-    }
-}
-
 /// Pick the highest version in a slim speculation packument that
 /// satisfies the given npm range string. Returns the concrete
 /// `(version, tarball_url, integrity)` tuple so the caller can dispatch
@@ -252,7 +193,7 @@ pub(super) struct DispatcherCounters {
 }
 
 /// spawn the speculation dispatcher as a standalone task.
-/// Consumes `(name, PackageMetadata)` frames from `rx` (fed by the
+/// Consumes `(name, SpeculativePackageMetadata)` frames from `rx` (fed by the
 /// walker) and issues tarball prefetches against the work queue + root
 /// range set. Extraction is refactor-only vs pre-49
 /// `run_deep_batch_with_speculation` — the dispatcher body is
@@ -260,7 +201,7 @@ pub(super) struct DispatcherCounters {
 /// fires roots-ready now; the dispatcher is just a pure consumer).
 #[allow(clippy::too_many_arguments)] // design-level: dispatcher takes the full per-install state
 pub(super) fn spawn_speculation_dispatcher(
-    rx: tokio::sync::mpsc::Receiver<(String, lpm_registry::PackageMetadata)>,
+    rx: tokio::sync::mpsc::Receiver<(String, SpeculativePackageMetadata)>,
     client: Arc<RegistryClient>,
     route_table: RouteTable,
     store: PackageStore,
@@ -482,10 +423,10 @@ pub(super) fn spawn_speculation_dispatcher(
 
             match rx.recv().await {
                 Some((name, meta)) => {
-                    metadata.insert(name.clone(), SpeculativePackageMetadata::from(meta));
+                    metadata.insert(name.clone(), meta);
                     // the roots-ready signal is owned by
                     // the walker now — the dispatcher is a pure
-                    // consumer of `(name, PackageMetadata)` frames.
+                    // consumer of `(name, SpeculativePackageMetadata)` frames.
                     if let Some(pending) = parked.remove(&name) {
                         for (range, depth, is_root) in pending {
                             work_queue.push((name.clone(), range, depth, is_root));

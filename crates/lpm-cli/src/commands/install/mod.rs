@@ -10,7 +10,8 @@ use lpm_linker::{LinkResult, LinkTarget, MaterializedPackage};
 use lpm_registry::{GateDecision, RegistryClient, RouteTable, UpstreamRoute, evaluate_cached_url};
 use lpm_resolver::{
     CachedPackageInfo, CanonicalKey, CompiledPeerRules, OverrideHit, OverrideSet,
-    PeerConflictReport, PeerWarning, ResolvedPackage, check_unmet_peers,
+    PeerConflictReport, PeerWarning, ResolvedPackage, SpeculativePackageMetadata,
+    check_unmet_peers,
 };
 use lpm_store::PackageStore;
 use lpm_workspace::PatchedDependencyEntry;
@@ -2281,7 +2282,7 @@ async fn run_with_options_under_store_lock(
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
                     seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
                     let (spec_tx, spec_rx) =
-                        tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
+                        tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
                     let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
                         spec_rx,
                         arc_client.clone(),
@@ -2332,7 +2333,7 @@ async fn run_with_options_under_store_lock(
                     // orchestration (design): spawn walker +
                     // dispatcher; resolve concurrently waiting on roots_ready.
                     // Walker is the manifest producer; the dispatcher is the
-                    // pure consumer of the existing `(name, PackageMetadata)`
+                    // pure consumer of the existing `(name, SpeculativePackageMetadata)`
                     // mpsc. The three run in parallel — walker fetches,
                     // dispatcher speculates tarballs, resolver waits on
                     // roots_ready_rx then solves against the shared cache.
@@ -2359,7 +2360,7 @@ async fn run_with_options_under_store_lock(
                     let walker_done: WalkerDone =
                         Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let (spec_tx, spec_rx) =
-                        tokio::sync::mpsc::channel::<(String, lpm_registry::PackageMetadata)>(512);
+                        tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
                     let (roots_ready_tx, roots_ready_rx) = tokio::sync::oneshot::channel::<()>();
 
                     let batch_start = Instant::now();

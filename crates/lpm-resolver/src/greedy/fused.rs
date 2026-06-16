@@ -1,7 +1,8 @@
 use super::edge::process_edge_with_preferred;
 use super::manifest::{
-    FetchResult, complete_metadata_fetch, ensure_policy_metadata_for_cached_manifest,
-    fetch_metadata_for_resolver, parse_fetched_metadata,
+    FetchResult, FetchedMetadata, complete_metadata_fetch,
+    ensure_policy_metadata_for_cached_manifest, fetch_metadata_for_resolver,
+    parse_fetched_metadata,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
@@ -15,7 +16,7 @@ struct FusedTreeProvider<'a> {
     route_table: &'a RouteTable,
     shared_cache: &'a SharedCache,
     policy: &'a ResolverPolicy,
-    spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     dispatcher_rpc_count: Cell<u64>,
     tarball_dispatched_count: Cell<u64>,
 }
@@ -47,15 +48,16 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
             let fetched =
                 fetch_metadata_for_resolver(self.client, self.route_table, canonical, self.policy)
                     .await?;
-            let info_arc = fetched.info;
+            let FetchedMetadata {
+                speculation,
+                info: info_arc,
+            } = fetched;
             self.shared_cache
                 .insert(canonical.clone(), info_arc.clone());
             self.dispatcher_rpc_count
                 .set(self.dispatcher_rpc_count.get() + 1);
             if let Some(tx) = self.spec_tx
-                && tx
-                    .try_send((canonical.to_string(), fetched.metadata))
-                    .is_ok()
+                && tx.try_send((canonical.to_string(), speculation)).is_ok()
             {
                 self.tarball_dispatched_count
                     .set(self.tarball_dispatched_count.get() + 1);
@@ -114,7 +116,7 @@ pub async fn resolve_greedy_fused(
     overrides: OverrideSet,
     route_table: RouteTable,
     npm_fanout: usize,
-    spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    spec_tx: Option<tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     auto_install_peers: bool,
 ) -> Result<ResolveResult, ResolveError> {
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
@@ -138,7 +140,7 @@ pub async fn resolve_greedy_fused_with_cache(
     overrides: OverrideSet,
     route_table: RouteTable,
     npm_fanout: usize,
-    spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    spec_tx: Option<tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     shared_cache: SharedCache,
     auto_install_peers: bool,
 ) -> Result<ResolveResult, ResolveError> {
@@ -163,7 +165,7 @@ pub async fn resolve_greedy_fused_with_cache_options(
     overrides: OverrideSet,
     route_table: RouteTable,
     npm_fanout: usize,
-    spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    spec_tx: Option<tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     shared_cache: SharedCache,
     auto_install_peers: bool,
     include_optional_dependencies: bool,
@@ -190,7 +192,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
     overrides: OverrideSet,
     route_table: RouteTable,
     npm_fanout: usize,
-    spec_tx: Option<tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    spec_tx: Option<tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     shared_cache: SharedCache,
     auto_install_peers: bool,
     include_optional_dependencies: bool,
@@ -290,11 +292,10 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                         continue;
                     }
                     let fetched = parse_fetched_metadata(meta);
-                    shared_cache.insert(canonical.clone(), fetched.info);
+                    let FetchedMetadata { speculation, info } = fetched;
+                    shared_cache.insert(canonical.clone(), info);
                     if let Some(tx) = spec_tx.as_ref()
-                        && tx
-                            .try_send((canonical.to_string(), fetched.metadata))
-                            .is_ok()
+                        && tx.try_send((canonical.to_string(), speculation)).is_ok()
                     {
                         tarball_dispatched_count += 1;
                     }

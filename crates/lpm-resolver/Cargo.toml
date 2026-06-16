@@ -24,6 +24,9 @@ futures = { workspace = true }
 ahash = "0.8"
 time = { version = "0.3", features = ["parsing"] }
 
+[features]
+bench-internals = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
@@ -33,6 +36,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "greedy"
 harness = false
+
+[[bench]]
+name = "metadata_hydration"
+harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true
