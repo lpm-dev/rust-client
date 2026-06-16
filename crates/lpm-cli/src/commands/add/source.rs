@@ -375,7 +375,7 @@ mod tests {
     // The wire contract for `lpm.config.json` accepts both the natural
     // authored form (JSON booleans, numbers) AND the legacy stringified
     // form (`"true"`, `"42"`). The schema published at
-    // `https://lpm.dev/schemas/lpm.config.json` declares booleans
+    // `https://cli.lpm.dev/schemas/lpm.config.json` declares booleans
     // natively, so the runtime MUST accept both forms or the schema and
     // the runtime would disagree on whether `"default": true` is valid.
     //

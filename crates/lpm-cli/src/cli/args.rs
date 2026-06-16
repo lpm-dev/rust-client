@@ -2748,8 +2748,9 @@ pub(crate) enum Commands {
     ///
     /// Auto-derived for typed schemas (`lpm.json`); hand-authored for
     /// the dynamic ones (`lpm.config.json`). The same schemas are
-    /// served at `https://lpm.dev/schemas/<name>.json` for editor
-    /// auto-discovery.
+    /// served at `https://cli.lpm.dev/schemas/<name>.json` for editor
+    /// auto-discovery, with `https://lpm.dev/schemas/<name>.json` kept
+    /// as a compatibility alias.
     ///
     /// Examples:
     /// ```bash

@@ -12,11 +12,12 @@
 //!   maintained alongside the consumer code with a corpus validation
 //!   test guarding against drift.
 //!
-//! Both schemas are served at `https://lpm.dev/schemas/<name>.json`
-//! for editor auto-discovery. The drift-guard test in
-//! `tests/schema_drift.rs` diffs the emitted bytes against the
-//! checked-in copy under `a-package-manager/public/schemas/` so the
-//! two repos cannot silently diverge.
+//! Both schemas are served canonically at
+//! `https://cli.lpm.dev/schemas/<name>.json` for editor auto-discovery.
+//! `https://lpm.dev/schemas/<name>.json` remains a compatibility alias.
+//! The drift-guard test in `tests/schema_drift.rs` diffs the emitted
+//! bytes against checked-in public copies so the repos cannot silently
+//! diverge.
 //!
 //! Output format:
 //! - `--out <path>` writes pretty-printed JSON to the file.
@@ -27,8 +28,8 @@ use serde_json::Value;
 
 /// Hand-authored `lpm.config.json` schema, baked into the binary at
 /// compile time. Source of truth; the copy under
-/// `a-package-manager/public/schemas/` is regenerated from this via
-/// `lpm schema lpm.config.json --out <path>` + the drift-guard test.
+/// each public schema host is regenerated from this via
+/// `lpm schema lpm.config.json --out <path>` and the drift-guard test.
 pub const LPM_CONFIG_SCHEMA: &str = include_str!("../../schemas/lpm.config.schema.json");
 
 /// Run the `lpm schema <kind>` subcommand.
@@ -88,7 +89,7 @@ mod tests {
             serde_json::from_str(LPM_CONFIG_SCHEMA).expect("baked-in schema must parse");
         assert_eq!(
             parsed.get("$id").and_then(|v| v.as_str()),
-            Some("https://lpm.dev/schemas/lpm.config.json"),
+            Some("https://cli.lpm.dev/schemas/lpm.config.json"),
             "$id must be the canonical URL so editors can auto-discover"
         );
     }
@@ -100,7 +101,7 @@ mod tests {
             serde_json::from_str(&text).expect("rendered output is JSON");
         assert_eq!(
             parsed.get("$id").and_then(|v| v.as_str()),
-            Some("https://lpm.dev/schemas/lpm.json"),
+            Some("https://cli.lpm.dev/schemas/lpm.json"),
         );
     }
 
@@ -111,7 +112,7 @@ mod tests {
             serde_json::from_str(&text).expect("rendered output is JSON");
         assert_eq!(
             parsed.get("$id").and_then(|v| v.as_str()),
-            Some("https://lpm.dev/schemas/lpm.config.json"),
+            Some("https://cli.lpm.dev/schemas/lpm.config.json"),
         );
     }
 

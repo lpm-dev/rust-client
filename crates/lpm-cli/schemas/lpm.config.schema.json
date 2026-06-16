@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://lpm.dev/schemas/lpm.config.json",
+  "$id": "https://cli.lpm.dev/schemas/lpm.config.json",
   "title": "lpm.config.json",
   "description": "Source-package configuration for `lpm add`. Lives at the tarball root; declares the configurable surface, file copy rules, and dependency injection logic that `lpm add` interprets when delivering the package's source into a consumer project.",
   "type": "object",
@@ -9,7 +9,7 @@
     "$schema": {
       "type": "string",
       "format": "uri",
-      "description": "Optional pointer to this schema for editor autocomplete. Recommended value: https://lpm.dev/schemas/lpm.config.json"
+      "description": "Optional pointer to this schema for editor autocomplete. Recommended value: https://cli.lpm.dev/schemas/lpm.config.json"
     },
     "ecosystem": {
       "type": "string",
