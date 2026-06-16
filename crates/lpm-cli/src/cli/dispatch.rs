@@ -54,12 +54,13 @@ pub(crate) fn run() -> Result<()> {
         let start = std::time::Instant::now();
 
         let pkg_content_opt = std::fs::read_to_string(cwd.join("package.json")).ok();
-        let is_workspace = pkg_content_opt
-            .as_deref()
-            .is_some_and(install_state::is_workspace_root_content)
-            || install_state::has_pnpm_workspace_yaml(&cwd);
+        let workspace_json_output = json_mode
+            && (pkg_content_opt
+                .as_deref()
+                .is_some_and(install_state::is_workspace_root_content)
+                || install_state::has_pnpm_workspace_yaml(&cwd));
 
-        if !is_workspace && let Some(pkg_content) = pkg_content_opt.as_deref() {
+        if !workspace_json_output && let Some(pkg_content) = pkg_content_opt.as_deref() {
             let state = install_state::check_install_state_with_content(&cwd, pkg_content);
             if state.up_to_date {
                 let elapsed_ms = start.elapsed().as_millis();

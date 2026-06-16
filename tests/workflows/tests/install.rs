@@ -5648,6 +5648,22 @@ fn assert_root_symlink_missing(project: &TempProject, root_name: &str) {
     );
 }
 
+fn workspace_repeat_fast_lane_project() -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+  "name": "ws-repeat-fast-lane",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+    project
+}
+
 /// Install-hash must fold member manifests into its freshness key. A
 /// workspace member's `package.json` edit that introduces a transitive
 /// `workspace:` ref must invalidate the cached hash so the second
@@ -5711,6 +5727,76 @@ fn install_hash_invalidates_on_workspace_member_manifest_change() {
     );
     assert_root_symlink_exists(&project, "foo");
     assert_root_symlink_exists(&project, "bar");
+}
+
+#[test]
+fn workspace_repeat_install_uses_sync_fast_lane_when_unchanged() {
+    let project = workspace_repeat_fast_lane_project();
+
+    let first = lpm(&project)
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .output()
+        .expect("spawn lpm install (first)");
+    assert!(
+        first.status.success(),
+        "first install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    let second = lpm(&project)
+        .arg("install")
+        .output()
+        .expect("spawn lpm install (second)");
+    assert!(
+        second.status.success(),
+        "second install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert!(
+        combined.contains("up to date ("),
+        "unchanged workspace repeat install should use the sync fast-lane output; got:\n{combined}"
+    );
+}
+
+#[test]
+fn workspace_repeat_install_json_keeps_full_pipeline_envelope_when_unchanged() {
+    let project = workspace_repeat_fast_lane_project();
+
+    let first = lpm(&project)
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .output()
+        .expect("spawn lpm install (first)");
+    assert!(
+        first.status.success(),
+        "first install failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    let second = lpm(&project)
+        .args(["--json", "install"])
+        .output()
+        .expect("spawn lpm install --json (second)");
+    assert!(
+        second.status.success(),
+        "second install --json failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&second.stdout).expect("install --json must emit JSON");
+    assert_eq!(envelope["up_to_date"], true);
+    assert!(
+        envelope.get("peer_issues").is_some_and(|v| v.is_object()),
+        "workspace --json repeat install must keep the full install envelope; got:\n{envelope}"
+    );
 }
 
 /// `lpm install --offline` re-runs the workspace-member BFS expansion
