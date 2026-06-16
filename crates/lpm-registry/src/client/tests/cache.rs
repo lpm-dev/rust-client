@@ -124,6 +124,40 @@ fn read_cache_content_returns_none_etag_when_no_etag() {
     assert!(content.unwrap().etag.is_none());
 }
 
+fn expire_cache_entry(client: &RegistryClient, cache_key: &str) {
+    let cache_path = client
+        .cache_path(cache_key)
+        .expect("cache path should be available");
+    let past = filetime::FileTime::from_unix_time(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 600,
+        0,
+    );
+    filetime::set_file_mtime(&cache_path, past).unwrap();
+}
+
+fn expire_all_cache_entries(client: &RegistryClient) {
+    let cache_dir = client
+        .cache_dir
+        .as_ref()
+        .expect("test client should have a cache dir");
+    let past = filetime::FileTime::from_unix_time(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 600,
+        0,
+    );
+    for entry in std::fs::read_dir(cache_dir).unwrap() {
+        let path = entry.unwrap().path();
+        filetime::set_file_mtime(&path, past).unwrap();
+    }
+}
+
 #[test]
 fn cache_miss_on_nonexistent_key() {
     let (client, _tmp) = client_with_temp_cache();
@@ -389,6 +423,229 @@ async fn npm_metadata_etag_304_revalidation() {
     let result2 = client.get_npm_package_metadata(npm_name).await;
     assert!(result2.is_ok(), "npm 304 revalidation should succeed");
     assert_eq!(result2.unwrap().name, npm_name);
+}
+
+#[tokio::test]
+async fn direct_npm_metadata_etag_304_revalidation_refreshes_cache() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "express";
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json(npm_name))
+                .append_header("ETag", "\"direct-v1\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client.get_npm_metadata_direct(npm_name).await.unwrap();
+    expire_cache_entry(&client, &format!("npm:{npm_name}"));
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .and(header("If-None-Match", "\"direct-v1\""))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let revalidated = client.get_npm_metadata_direct(npm_name).await.unwrap();
+    assert_eq!(revalidated.name, npm_name);
+    assert!(
+        client
+            .read_metadata_cache(&format!("npm:{npm_name}"))
+            .is_some(),
+        "304 should refresh cache freshness for the next TTL read"
+    );
+}
+
+#[tokio::test]
+async fn direct_npm_full_metadata_etag_304_revalidation_refreshes_cache() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "express";
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json(npm_name))
+                .append_header("ETag", "\"direct-full-v1\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client.get_npm_metadata_direct_full(npm_name).await.unwrap();
+    expire_cache_entry(&client, &format!("npm-full:{npm_name}"));
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .and(header("If-None-Match", "\"direct-full-v1\""))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let revalidated = client.get_npm_metadata_direct_full(npm_name).await.unwrap();
+    assert_eq!(revalidated.name, npm_name);
+    assert!(
+        client
+            .read_metadata_cache(&format!("npm-full:{npm_name}"))
+            .is_some(),
+        "304 should refresh the full-metadata cache freshness"
+    );
+}
+
+#[tokio::test]
+async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_validator() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "express";
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json(npm_name))
+                .append_header("ETag", "\"direct-v1\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client.get_npm_metadata_direct(npm_name).await.unwrap();
+    let cache_path = client
+        .cache_path(&format!("npm:{npm_name}"))
+        .expect("cache path should exist");
+    let mut corrupted_content = Vec::new();
+    corrupted_content.extend_from_slice(METADATA_CACHE_MAGIC);
+    corrupted_content.extend_from_slice(b"\"direct-v1\"");
+    corrupted_content.push(b'\n');
+    corrupted_content.extend_from_slice(b"not-valid-metadata");
+    std::fs::write(&cache_path, corrupted_content).unwrap();
+    expire_cache_entry(&client, &format!("npm:{npm_name}"));
+
+    server.reset().await;
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_for_responder = Arc::clone(&request_count);
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .respond_with(move |request: &wiremock::Request| {
+            let attempt = request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("if-none-match")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("\"direct-v1\"")
+                );
+                ResponseTemplate::new(304)
+            } else {
+                assert!(request.headers.get("if-none-match").is_none());
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version(npm_name, "2.0.0"))
+                    .append_header("ETag", "\"direct-v2\"")
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let refreshed = client.get_npm_metadata_direct(npm_name).await.unwrap();
+    assert_eq!(refreshed.latest_version.as_deref(), Some("2.0.0"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        client
+            .read_cache_content(&format!("npm:{npm_name}"))
+            .unwrap()
+            .etag
+            .as_deref(),
+        Some("\"direct-v2\"")
+    );
+}
+
+#[tokio::test]
+async fn custom_metadata_etag_304_revalidation_keeps_auth_partition() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server("https://lpm.dev");
+    let auth = bearer_for(&server.uri(), "TOKEN-A");
+
+    Mock::given(method("GET"))
+        .and(path("/private-pkg"))
+        .and(header("authorization", "Bearer TOKEN-A"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json("private-pkg"))
+                .append_header("ETag", "\"custom-v1\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client
+        .get_npm_metadata_from(&server.uri(), "private-pkg", Some(&auth))
+        .await
+        .unwrap();
+    expire_all_cache_entries(&client);
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/private-pkg"))
+        .and(header("authorization", "Bearer TOKEN-A"))
+        .and(header("If-None-Match", "\"custom-v1\""))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let revalidated = client
+        .get_npm_metadata_from(&server.uri(), "private-pkg", Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(revalidated.name, "private-pkg");
+
+    server.reset().await;
+    let cached = client
+        .get_npm_metadata_from(&server.uri(), "private-pkg", Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(cached.name, "private-pkg");
 }
 
 #[tokio::test]

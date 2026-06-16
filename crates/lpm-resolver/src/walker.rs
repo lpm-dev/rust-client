@@ -3,7 +3,7 @@
 //! The walker discovers transitive dependencies breadth-first from a root
 //! set, fetches metadata for each canonical package name, populates the
 //! shared cache (and per-canonical `Notify` waiters), and emits
-//! `(name, PackageMetadata)` frames on the speculation channel the
+//! `(name, SpeculativePackageMetadata)` frames on the speculation channel the
 //! existing dispatcher (`spawn_speculation_dispatcher` in
 //! `lpm-cli/src/commands/install.rs`, extracted from the pre-49
 //! `run_deep_batch_with_speculation`) consumes. The walker is the
@@ -27,7 +27,7 @@
 //!   1. `shared_cache.insert(canonical_key, cached_info)`
 //!   2. `notify_map[canonical_key].notify_waiters()`
 //!   3. fire `roots_ready` oneshot iff this completes the root set
-//!   4. `spec_tx.send((name, metadata)).await` — the only step that
+//!   4. `spec_tx.send((name, speculation_hint)).await` — the only step that
 //!      can `.await` on backpressure
 //!
 //! Step 4 is last so resolver visibility is never gated on dispatcher
@@ -40,6 +40,7 @@ use crate::package::CanonicalKey;
 use crate::provider::{
     CachedPackageInfo, NotifyMap, SharedCache, WalkerDone, parse_metadata_to_cache_info,
 };
+use crate::speculation::SpeculativePackageMetadata;
 #[cfg(test)]
 use lpm_registry::RouteMode;
 use lpm_registry::{
@@ -223,7 +224,7 @@ pub struct BfsWalker {
     /// Owned by install.rs and shared with the provider via the same
     /// Arc.
     walker_done: WalkerDone,
-    spec_tx: mpsc::Sender<(String, PackageMetadata)>,
+    spec_tx: mpsc::Sender<(String, SpeculativePackageMetadata)>,
     roots_ready_tx: Option<oneshot::Sender<()>>,
     dep_names: Vec<String>,
     route_table: RouteTable,
@@ -237,7 +238,7 @@ impl BfsWalker {
         shared_cache: SharedCache,
         notify_map: NotifyMap,
         walker_done: WalkerDone,
-        spec_tx: mpsc::Sender<(String, PackageMetadata)>,
+        spec_tx: mpsc::Sender<(String, SpeculativePackageMetadata)>,
         roots_ready_tx: oneshot::Sender<()>,
         dep_names: Vec<String>,
         route_table: RouteTable,
@@ -821,7 +822,8 @@ impl BfsWalker {
         // we measure the wait so `timing.resolve.streaming_bfs.spec_tx_send_wait_ms`
         // surfaces the cost.
         let send_start = Instant::now();
-        let _ = self.spec_tx.send((name.to_string(), meta.clone())).await;
+        let speculation = SpeculativePackageMetadata::from(meta);
+        let _ = self.spec_tx.send((name.to_string(), speculation)).await;
         summary.spec_tx_send_wait_ms += send_start.elapsed().as_millis();
 
         info

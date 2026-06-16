@@ -106,7 +106,7 @@ async fn direct_fetch(
 }
 
 pub(super) struct FetchedMetadata {
-    pub(super) metadata: lpm_registry::PackageMetadata,
+    pub(super) speculation: SpeculativePackageMetadata,
     pub(super) info: Arc<CachedPackageInfo>,
 }
 
@@ -129,14 +129,16 @@ pub(super) async fn fetch_metadata_for_resolver(
 
 pub(super) fn parse_fetched_metadata(metadata: lpm_registry::PackageMetadata) -> FetchedMetadata {
     let info = Arc::new(parse_metadata_to_cache_info(&metadata));
-    FetchedMetadata { metadata, info }
+    let speculation = SpeculativePackageMetadata::from(metadata);
+    FetchedMetadata { speculation, info }
 }
 
 pub(super) fn parse_full_fetched_metadata(
     metadata: lpm_registry::PackageMetadata,
 ) -> FetchedMetadata {
     let info = Arc::new(parse_full_metadata_to_cache_info(&metadata));
-    FetchedMetadata { metadata, info }
+    let speculation = SpeculativePackageMetadata::from(metadata);
+    FetchedMetadata { speculation, info }
 }
 
 pub(super) async fn ensure_policy_metadata_for_cached_manifest(
@@ -163,18 +165,17 @@ pub(super) fn complete_metadata_fetch(
     canonical: CanonicalKey,
     result: FetchResult,
     shared_cache: &SharedCache,
-    spec_tx: Option<&tokio::sync::mpsc::Sender<(String, lpm_registry::PackageMetadata)>>,
+    spec_tx: Option<&tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     tarball_dispatched_count: &mut u64,
     parked: &mut AHashMap<CanonicalKey, Vec<Edge>>,
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
     match result {
         Ok(fetched) => {
-            shared_cache.insert(canonical.clone(), fetched.info);
+            let FetchedMetadata { speculation, info } = fetched;
+            shared_cache.insert(canonical.clone(), info);
             if let Some(tx) = spec_tx
-                && tx
-                    .try_send((canonical.to_string(), fetched.metadata))
-                    .is_ok()
+                && tx.try_send((canonical.to_string(), speculation)).is_ok()
             {
                 *tarball_dispatched_count += 1;
             }
@@ -198,9 +199,8 @@ pub(super) fn complete_metadata_fetch(
     Ok(())
 }
 
-/// Raw-metadata fetch, factored out so the fused resolver can forward the
-/// original [`lpm_registry::PackageMetadata`] to `spec_tx` for tarball
-/// speculation while caching the parsed [`CachedPackageInfo`] form.
+/// Raw-metadata fetch, factored out so the fused resolver can cache the
+/// parsed [`CachedPackageInfo`] form and derive the slim speculation hint.
 ///
 /// Both NPM routes go through the abbreviated packument endpoint
 /// (`application/vnd.npm.install-v1+json`), so wire-byte savings already

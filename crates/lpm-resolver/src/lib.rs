@@ -16,6 +16,7 @@ mod provider;
 pub mod ranges;
 mod resolve;
 pub mod specifier;
+mod speculation;
 mod walker;
 
 pub use greedy::PeerConflictReport;
@@ -41,4 +42,21 @@ pub use resolve::{
     validate_allowed_versions_range, validate_allowed_versions_selector,
 };
 pub use specifier::{Specifier, SpecifierParseError};
+pub use speculation::{SpeculativePackageMetadata, SpeculativeVersionMetadata};
 pub use walker::{BfsWalker, DEFAULT_NPM_FANOUT, LevelTiming, WalkerError, WalkerSummary};
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn benchmark_parse_metadata_to_cache_info(
+    metadata: &lpm_registry::PackageMetadata,
+) -> CachedPackageInfo {
+    provider::parse_metadata_to_cache_info(metadata)
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn benchmark_parse_full_metadata_to_cache_info(
+    metadata: &lpm_registry::PackageMetadata,
+) -> CachedPackageInfo {
+    provider::parse_full_metadata_to_cache_info(metadata)
+}

@@ -93,6 +93,7 @@ mod prelude {
     pub(super) use crate::resolve::{
         ResolveError, ResolveResult, ResolvedPackage, StageTiming, resolve_peer_binding_version,
     };
+    pub(super) use crate::speculation::SpeculativePackageMetadata;
     pub(super) use ahash::{AHashMap, AHashSet};
     pub(super) use lpm_common::{ResolutionErrorContext, ResolutionFailureKind};
     #[cfg(test)]
