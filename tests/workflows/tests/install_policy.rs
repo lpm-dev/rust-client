@@ -124,6 +124,28 @@ fs.chmodSync('bin/generated-cli.js', 0o755);
     .await;
 }
 
+async fn mount_consumer_with_generated_bin_transitive(
+    mock: &MockRegistry,
+    consumer_name: &str,
+    generated_name: &str,
+) {
+    mount_generated_bin_pkg(mock, generated_name, "generated-transitive-cli").await;
+    let index_js = format!("module.exports = require.resolve('{generated_name}/package.json');\n");
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": consumer_name,
+            "version": "1.0.0",
+            "license": "MIT",
+            "main": "index.js",
+            "dependencies": {
+                generated_name: "1.0.0"
+            }
+        }),
+        &[("index.js", index_js.as_bytes())],
+    )
+    .await;
+}
+
 fn empty_project_with_dep(dep: &str) -> TempProject {
     TempProject::empty(&format!(
         r#"{{"name":"install-policy","version":"1.0.0","dependencies":{{"{dep}":"^1.0.0"}}}}"#
@@ -147,6 +169,29 @@ fn parse_last_json_object(stdout: &[u8], stderr: &[u8]) -> serde_json::Value {
         "stdout must contain a parseable JSON object\nstdout:\n{}\nstderr:\n{}",
         text,
         String::from_utf8_lossy(stderr),
+    );
+}
+
+fn assert_generated_bin_executes(project: &TempProject, bin_name: &str) {
+    let bin_path = project.path().join("node_modules/.bin").join(bin_name);
+    assert!(
+        bin_path.exists(),
+        "postinstall-generated bin must be linked into node_modules/.bin at {}",
+        bin_path.display(),
+    );
+
+    let output = std::process::Command::new(&bin_path)
+        .output()
+        .unwrap_or_else(|e| panic!("generated bin must be executable: {e}"));
+    assert!(
+        output.status.success(),
+        "generated bin must execute successfully\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "generated-cli-ok"
     );
 }
 
@@ -466,25 +511,91 @@ async fn install_policy_allow_links_bin_generated_by_dependency_postinstall() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let bin_path = project.path().join("node_modules/.bin/generated-cli");
+    assert_generated_bin_executes(&project, "generated-cli");
+}
+
+#[tokio::test]
+async fn warm_v2_reinstall_rebuilds_postinstall_generated_bin_after_node_modules_wipe() {
+    let project = empty_project_with_dep("warm-generated-bin-pkg");
+    let mock = MockRegistry::start().await;
+    mount_generated_bin_pkg(&mock, "warm-generated-bin-pkg", "warm-generated-cli").await;
+    write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+
+    let first = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["install", "--policy=allow", "--no-sandbox"])
+        .output()
+        .expect("failed to run first v2 lpm install --policy=allow");
     assert!(
-        bin_path.exists(),
-        "postinstall-generated bin must be linked into node_modules/.bin at {}",
-        bin_path.display(),
+        first.status.success(),
+        "first v2 allow-policy install must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+    assert_generated_bin_executes(&project, "warm-generated-cli");
+
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before warm v2 reinstall");
+
+    let second = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["install", "--policy=allow", "--no-sandbox"])
+        .output()
+        .expect("failed to run second v2 lpm install --policy=allow");
+    assert!(
+        second.status.success(),
+        "warm v2 reinstall must recreate lifecycle-generated bins\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
     );
 
-    let output = std::process::Command::new(&bin_path)
+    assert_generated_bin_executes(&project, "warm-generated-cli");
+}
+
+#[tokio::test]
+async fn v2_allow_policy_builds_transitive_postinstall_generated_file() {
+    let project = empty_project_with_dep("transitive-generated-consumer");
+    let mock = MockRegistry::start().await;
+    mount_consumer_with_generated_bin_transitive(
+        &mock,
+        "transitive-generated-consumer",
+        "generated-transitive-bin",
+    )
+    .await;
+    write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["install", "--policy=allow", "--no-sandbox"])
         .output()
-        .unwrap_or_else(|e| panic!("generated bin must be executable: {e}"));
+        .expect("failed to run v2 lpm install --policy=allow");
+
     assert!(
         output.status.success(),
-        "generated bin must execute successfully\nstdout: {}\nstderr: {}",
+        "v2 allow-policy install must run transitive dependency postinstall\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "generated-cli-ok"
+
+    let resolved = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg(
+            r#"const fs = require('fs');
+const path = require('path');
+const pkgJson = require('transitive-generated-consumer');
+const generated = path.join(path.dirname(pkgJson), 'bin/generated-cli.js');
+fs.accessSync(generated, fs.constants.X_OK);
+process.stdout.write(generated);
+"#,
+        )
+        .output()
+        .expect("node must resolve the transitive generated package");
+    assert!(
+        resolved.status.success(),
+        "transitive dependency postinstall must create an executable generated file\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&resolved.stdout),
+        String::from_utf8_lossy(&resolved.stderr),
     );
 }
 

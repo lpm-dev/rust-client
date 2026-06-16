@@ -273,13 +273,60 @@ pub fn link_packages_v2_with_compatibility_bin_names(
         materialized_results.into_iter().collect::<Result<_, _>>()?;
     let linked_count = linked_count_atomic.into_inner();
 
-    let finalize = link_v2_finalize(project_dir, &plan, store, self_package_name)?;
+    let finalize = link_v2_finalize_inner(project_dir, &plan, store, self_package_name, false)?;
 
     Ok(LinkResult {
         linked: linked_count,
         symlinked: finalize.symlinked,
         bin_linked: finalize.bin_count,
         skipped: augmented_slice.len().saturating_sub(linked_count),
+        self_referenced: finalize.self_referenced,
+        materialized,
+    })
+}
+
+/// Recreate only the project-side v2 wiring for link entries that
+/// already exist.
+///
+/// Used after lifecycle scripts mutate a materialized package. Unlike
+/// [`link_packages_v2_with_compatibility_bin_names`], this path never
+/// calls `Store::populate_link_entry`, so generated files written by a
+/// build step are still present when `.bin` shims are refreshed.
+pub fn finalize_existing_link_entries_with_compatibility_bin_names(
+    project_dir: &Path,
+    targets: Vec<V2Target>,
+    store: &Store,
+    linker_mode: LinkerMode,
+    self_package_name: Option<&str>,
+    compatibility_bin_names: &[String],
+) -> Result<LinkResult, LpmError> {
+    if targets.is_empty() {
+        return Ok(LinkResult {
+            linked: 0,
+            symlinked: 0,
+            bin_linked: 0,
+            skipped: 0,
+            self_referenced: false,
+            materialized: Vec::new(),
+        });
+    }
+
+    let plan = link_v2_prepare_with_compatibility_bin_names(
+        project_dir,
+        targets,
+        store,
+        linker_mode,
+        compatibility_bin_names,
+    )?;
+    let materialized = existing_link_entry_packages(&plan, store)?;
+    let skipped = plan.augmented_targets.len();
+    let finalize = link_v2_finalize_inner(project_dir, &plan, store, self_package_name, true)?;
+
+    Ok(LinkResult {
+        linked: 0,
+        symlinked: finalize.symlinked,
+        bin_linked: finalize.bin_count,
+        skipped,
         self_referenced: finalize.self_referenced,
         materialized,
     })
@@ -488,6 +535,16 @@ pub fn link_v2_finalize(
     store: &Store,
     self_package_name: Option<&str>,
 ) -> Result<LinkV2FinalizeResult, LpmError> {
+    link_v2_finalize_inner(project_dir, plan, store, self_package_name, false)
+}
+
+fn link_v2_finalize_inner(
+    project_dir: &Path,
+    plan: &LinkPlanV2,
+    store: &Store,
+    self_package_name: Option<&str>,
+    refresh_compatibility_copies: bool,
+) -> Result<LinkV2FinalizeResult, LpmError> {
     // Finalize-stage span. Nested sub-stages below split root /
     // bin / self-ref so the Tracy breakdown shows which phase
     // dominates for a given install.
@@ -515,6 +572,7 @@ pub fn link_v2_finalize(
             store,
             &plan.key_map,
             &plan.compatibility_bin_names,
+            refresh_compatibility_copies,
         )?
     };
     let bin_count = {
@@ -772,6 +830,82 @@ fn populate_one(
         key,
         freshly_populated: entry.freshly_populated,
     })
+}
+
+fn existing_link_entry_packages(
+    plan: &LinkPlanV2,
+    store: &Store,
+) -> Result<Vec<MaterializedPackage>, LpmError> {
+    let links_root = store.paths().links_root();
+    let canonical_links_root = std::fs::canonicalize(&links_root).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to inspect links root at {}: {e}",
+            links_root.display()
+        ))
+    })?;
+
+    let mut materialized = Vec::with_capacity(plan.augmented_targets.len());
+    for v2t in &plan.augmented_targets {
+        let key = plan.key_map.get_for(&v2t.target).ok_or_else(|| {
+            LpmError::Store(format!(
+                "v2 linker: missing graph key for {}@{} during existing-link validation",
+                v2t.target.name, v2t.target.version
+            ))
+        })?;
+        let package_dir = store.paths().link_package_dir(key);
+        ensure_existing_link_package_dir(
+            &package_dir,
+            &canonical_links_root,
+            &v2t.target.name,
+            &v2t.target.version,
+        )?;
+        materialized.push(MaterializedPackage {
+            name: v2t.target.name.clone(),
+            version: v2t.target.version.clone(),
+            destination: package_dir,
+        });
+    }
+    Ok(materialized)
+}
+
+fn ensure_existing_link_package_dir(
+    package_dir: &Path,
+    canonical_links_root: &Path,
+    name: &str,
+    version: &str,
+) -> Result<(), LpmError> {
+    let canonical_package_dir = std::fs::canonicalize(package_dir).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: required link entry for {name}@{version} is missing at {}: {e}",
+            package_dir.display()
+        ))
+    })?;
+    if !canonical_package_dir.starts_with(canonical_links_root) {
+        return Err(LpmError::Store(format!(
+            "v2 linker: refusing existing link entry for {name}@{version} because {} resolves outside {}",
+            package_dir.display(),
+            canonical_links_root.display()
+        )));
+    }
+    ensure_real_dir(package_dir, "existing link package")?;
+
+    let mut package_json = PathBuf::with_capacity(package_dir.as_os_str().len() + 13);
+    package_json.push(package_dir);
+    package_json.push("package.json");
+    let metadata = std::fs::symlink_metadata(&package_json).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: required package.json for {name}@{version} is missing at {}: {e}",
+            package_json.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(LpmError::Store(format!(
+            "v2 linker: refusing existing link entry for {name}@{version} with non-file package.json at {}",
+            package_json.display()
+        )));
+    }
+
+    Ok(())
 }
 
 /// Per-install lookup table from `(name, version, wrapper_id)` to the
@@ -1213,20 +1347,116 @@ fn legacy_project_compatibility_root(project_dir: &Path) -> PathBuf {
 /// LPM's project-local compatibility area.
 pub fn project_compatibility_bins_ready(project_dir: &Path, bin_names: &[String]) -> bool {
     let bin_names = normalize_compatibility_bin_names(bin_names);
-    if bin_names.is_empty() {
+    let expected_bin_names = if bin_names.is_empty() {
+        match collect_project_direct_bin_names(project_dir) {
+            Some(names) => names,
+            None => return false,
+        }
+    } else {
+        bin_names.iter().cloned().collect()
+    };
+    if expected_bin_names.is_empty() {
         return true;
     }
-
     let Ok(compatibility_root) = project_compatibility_root(project_dir).canonicalize() else {
         return false;
     };
     let bin_dir = project_dir.join("node_modules").join(".bin");
-    bin_names.iter().all(|bin_name| {
+    expected_bin_names.iter().all(|bin_name| {
         bin_dir
             .join(bin_name)
             .canonicalize()
             .is_ok_and(|real| real.starts_with(&compatibility_root))
     })
+}
+
+fn collect_project_direct_bin_names(project_dir: &Path) -> Option<HashSet<String>> {
+    let nm = project_dir.join("node_modules");
+    let entries = match std::fs::read_dir(&nm) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(HashSet::new());
+        }
+        Err(_) => return None,
+    };
+    let mut bin_names = HashSet::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return None,
+        };
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".bin" || name == ".lpm" {
+            continue;
+        }
+        if name.starts_with('@') {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => return None,
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let scoped_entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(_) => return None,
+            };
+            for scoped_entry in scoped_entries {
+                let scoped_entry = match scoped_entry {
+                    Ok(entry) => entry,
+                    Err(_) => return None,
+                };
+                let package_name =
+                    format!("{}/{}", name, scoped_entry.file_name().to_string_lossy());
+                collect_project_package_bin_names(
+                    &scoped_entry.path(),
+                    &package_name,
+                    &mut bin_names,
+                )?;
+            }
+            continue;
+        }
+        collect_project_package_bin_names(&path, &name, &mut bin_names)?;
+    }
+    Some(bin_names)
+}
+
+fn collect_project_package_bin_names(
+    package_dir: &Path,
+    fallback_package_name: &str,
+    bin_names: &mut HashSet<String>,
+) -> Option<()> {
+    let package_json = package_dir.join("package.json");
+    let content = match std::fs::read(&package_json) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(()),
+        Err(_) => return None,
+    };
+    const BIN_KEY: &[u8] = b"\"bin\"";
+    if !content.windows(BIN_KEY.len()).any(|w| w == BIN_KEY) {
+        return Some(());
+    }
+    let bin_config = match lpm_workspace::parse_bin_field(&content) {
+        Ok(Some(bin_config)) => bin_config,
+        Ok(None) => return Some(()),
+        Err(_) => return None,
+    };
+    let package_name =
+        package_name_from_manifest(&content).unwrap_or_else(|| fallback_package_name.to_string());
+    bin_names.extend(
+        bin_config
+            .entries(&package_name)
+            .into_iter()
+            .map(|(cmd_name, _)| cmd_name),
+    );
+    Some(())
+}
+
+fn package_name_from_manifest(content: &[u8]) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_slice(content).ok()?;
+    parsed.get("name")?.as_str().map(str::to_string)
 }
 
 fn create_project_compatibility_links(
@@ -1235,6 +1465,7 @@ fn create_project_compatibility_links(
     store: &Store,
     key_map: &KeyMap,
     compatibility_bin_names: &[String],
+    refresh_package_copies: bool,
 ) -> Result<CompatibilityLinks, LpmError> {
     let requested_bins = normalize_compatibility_bin_names(compatibility_bin_names);
     let roots = collect_compatibility_roots_for_bins(targets, store, key_map, &requested_bins);
@@ -1255,7 +1486,12 @@ fn create_project_compatibility_links(
 
     let mut compatibility_links = CompatibilityLinks::with_capacity(entries.len());
     for entry in &entries {
-        let package_dir = ensure_compatibility_package_copy(&compatibility_root, entry, store)?;
+        let package_dir = ensure_compatibility_package_copy(
+            &compatibility_root,
+            entry,
+            store,
+            refresh_package_copies,
+        )?;
         compatibility_links.insert(&entry.key, package_dir);
     }
 
@@ -1298,10 +1534,11 @@ fn collect_compatibility_roots_for_bins<'a>(
     key_map: &KeyMap,
     requested_bins: &[String],
 ) -> Vec<&'a V2Target> {
-    if requested_bins.is_empty() {
-        return Vec::new();
-    }
-    let requested: HashSet<&str> = requested_bins.iter().map(String::as_str).collect();
+    let requested: Option<HashSet<&str>> = if requested_bins.is_empty() {
+        None
+    } else {
+        Some(requested_bins.iter().map(String::as_str).collect())
+    };
     let mut roots = Vec::new();
     for v2t in targets {
         if !is_direct(&v2t.target) {
@@ -1337,12 +1574,20 @@ fn collect_compatibility_roots_for_bins<'a>(
                 continue;
             }
         };
-        if bin_config
-            .entries(&v2t.target.name)
-            .into_iter()
-            .any(|(cmd_name, _)| requested.contains(cmd_name.as_str()))
-        {
-            roots.push(v2t);
+        let entries = bin_config.entries(&v2t.target.name);
+        if entries.is_empty() {
+            continue;
+        }
+        match &requested {
+            Some(requested) => {
+                if entries
+                    .iter()
+                    .any(|(cmd_name, _)| requested.contains(cmd_name.as_str()))
+                {
+                    roots.push(v2t);
+                }
+            }
+            None => roots.push(v2t),
         }
     }
     roots
@@ -1602,10 +1847,11 @@ fn ensure_compatibility_package_copy(
     compatibility_root: &Path,
     entry: &CompatibilityEntry<'_>,
     store: &Store,
+    force_refresh: bool,
 ) -> Result<PathBuf, LpmError> {
     let final_dir = compatibility_entry_dir(compatibility_root, &entry.key);
     let package_dir = compatibility_package_dir(compatibility_root, &entry.key);
-    if compatibility_entry_reusable(&final_dir, entry) {
+    if !force_refresh && compatibility_entry_reusable(&final_dir, entry) {
         return Ok(package_dir);
     }
     if final_dir.symlink_metadata().is_ok() {
@@ -2614,7 +2860,7 @@ mod tests {
     }
 
     #[test]
-    fn link_packages_v2_leaves_unrequested_bins_in_store_layout() {
+    fn link_packages_v2_materializes_direct_bins_in_project_compatibility_layout() {
         let tmp = tempfile::tempdir().unwrap();
         let store = V2Store::at(tmp.path().join("store"));
         let project = tmp.path().join("project");
@@ -2643,17 +2889,140 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.bin_linked, 1, "tool's bin shim must be linked");
+        let compat_root = project
+            .join("node_modules")
+            .join(".lpm")
+            .join("compat")
+            .canonicalize()
+            .expect("direct bin should create project compatibility layout");
+        assert!(compat_root.is_dir());
+        #[cfg(unix)]
+        {
+            let shim = project.join("node_modules").join(".bin").join("tool");
+            let shim_target = std::fs::read_link(&shim).expect("tool shim should be a symlink");
+            let shim_real = shim
+                .parent()
+                .unwrap()
+                .join(shim_target)
+                .canonicalize()
+                .expect("tool shim target should resolve");
+            assert!(
+                shim_real.starts_with(&compat_root),
+                "direct bin shim should execute the project compatibility copy, got {}",
+                shim_real.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn project_compatibility_bins_ready_accepts_projects_without_direct_bins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let package_dir = project.join("node_modules").join("library");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            br#"{"name":"library","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
         assert!(
-            !project.join(".lpm").join("compat").exists(),
-            "legacy compatibility layout should not be created without a requested dev entrypoint bin",
+            project_compatibility_bins_ready(&project, &[]),
+            "projects with no direct package bins do not need a compatibility .bin layout"
         );
+    }
+
+    #[test]
+    fn project_compatibility_bins_ready_rejects_missing_shim_for_direct_bin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let package_dir = project.join("node_modules").join("tool");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            br#"{"name":"tool","version":"1.0.0","bin":{"tool":"bin/tool.js"}}"#,
+        )
+        .unwrap();
+
         assert!(
-            !project
-                .join("node_modules")
-                .join(".lpm")
-                .join("compat")
-                .exists(),
-            "compatibility layout should not be created without a requested dev entrypoint bin",
+            !project_compatibility_bins_ready(&project, &[]),
+            "a direct package bin requires a .bin shim into the compatibility layout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalize_existing_link_entries_refreshes_compatibility_copy_after_generated_bin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/generated-bin/tool");
+        write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                br#"{"name":"tool","version":"1.0.0","bin":{"tool":"bin/tool.js"}}"#,
+            )],
+        );
+        let tool = target("tool", "1.0.0", &sri, true);
+
+        let first = link_packages_v2_with_compatibility_bin_names(
+            &project,
+            vec![tool.clone()],
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &["tool".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            first.bin_linked, 0,
+            "pre-build link must skip a declared bin whose target does not exist yet"
+        );
+
+        let link_pkg = store
+            .find_link_package_dir("tool", "1.0.0")
+            .unwrap()
+            .expect("initial link must populate the v2 link entry");
+        let generated_bin = link_pkg.join("bin").join("tool.js");
+        std::fs::create_dir_all(generated_bin.parent().unwrap()).unwrap();
+        std::fs::write(&generated_bin, b"#!/usr/bin/env node\n").unwrap();
+
+        let refreshed = finalize_existing_link_entries_with_compatibility_bin_names(
+            &project,
+            vec![tool],
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &["tool".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            refreshed.bin_linked, 1,
+            "post-build finalize must link the generated bin"
+        );
+
+        let compat_root = project
+            .join("node_modules")
+            .join(".lpm")
+            .join("compat")
+            .canonicalize()
+            .expect("compatibility root should exist");
+        let shim = project.join("node_modules").join(".bin").join("tool");
+        let shim_target = std::fs::read_link(&shim).expect("tool shim should be a symlink");
+        let shim_real = shim
+            .parent()
+            .unwrap()
+            .join(shim_target)
+            .canonicalize()
+            .expect("tool shim target should resolve");
+        assert!(
+            shim_real.starts_with(&compat_root),
+            "generated bin shim should point at the refreshed compatibility copy, got {}",
+            shim_real.display(),
         );
     }
 

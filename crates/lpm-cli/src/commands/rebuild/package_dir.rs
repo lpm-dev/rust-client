@@ -79,15 +79,17 @@ pub(super) fn live_package_dir_with_v2(
     // version conflicts (a different version nested under a parent
     // would not be found by this probe), but covers the common case.
     //
-    // Under
-    // v2 mode the project's `node_modules/<name>` is a symlink into
-    // `~/.lpm/store/v2/links/<key>/node_modules/<name>/`. `is_dir()`
-    // follows the symlink, so this branch returns the (symlink) path
-    // for direct-dep v2 installs — Node resolves through the symlink
-    // at script time. No code change needed for direct deps under v2.
+    // Under v2 mode the project's `node_modules/<name>` may point at
+    // a project-local compatibility copy for direct-bin runtime
+    // behavior. Lifecycle scripts must mutate the store link entry
+    // instead, so compatibility copies fall through to the indexed v2
+    // lookup below.
     let hoisted = nm.join(name);
     if hoisted.is_dir() {
-        return hoisted;
+        let compatibility_root = nm.join(".lpm").join("compat");
+        if !path_resolves_under(&hoisted, &compatibility_root) {
+            return hoisted;
+        }
     }
 
     // — v2 store walk for transitive lifecycle scripts.
@@ -137,31 +139,23 @@ pub(super) fn live_package_dir_with_v2(
 /// it as a function lets the test suite assert the composition end-
 /// to-end without spinning up the full async [`run`] machinery.
 ///
-/// **Why the guard is `!live.starts_with(store_root)`, not a byte-
-/// equal `live != store_path` check.** The earlier draft used
-/// `PathBuf` equality, which would silently miss a future
-/// [`live_package_dir`] change that produced a structurally-different
-/// fallback (anywhere under `~/.lpm/store/`). The semantic guard —
-/// "never detach anything that lives inside the store root" — keeps
-/// the safety property intact regardless of how the fallback path
-/// is shaped, because detaching files inside `~/.lpm/store/` is
-/// exactly what we're trying to prevent.
+/// **Why the guard is store-root based, not a byte-equal
+/// `live != store_path` check.** The earlier draft used `PathBuf`
+/// equality, which would silently miss a future [`live_package_dir`]
+/// change that produced a structurally-different fallback anywhere
+/// under `~/.lpm/store/`. The semantic guard rejects canonical store
+/// bytes while allowing v2 link entries under `store/v2/links/`,
+/// because those entries are the mutable package directories scripts
+/// are supposed to build in.
 ///
-/// Pre-this
-/// function returned `Ok(store_path)` whenever the live probe fell
-/// through to the store. The caller then chdir'd into the store for
-/// the lifecycle script — which, on macOS (clonefile, CoW) was a
-/// silent corruption of the canonical bytes on first write, and on
-/// Linux (hardlinks) the early `if !live.starts_with(store_root)`
-/// branch skipped the detach so the script ran against shared
-/// inodes. Either way, lifecycle scripts running inside the store
-/// is a soundness violation; the install pipeline already gates
-/// on "linked + scripted" so the fallback was unreachable in
-/// practice but still load-bearing as a safety net.
-/// closes the hole: when the resolved path is inside the store, we
-/// return `Err(...)` instead of plowing forward. Callers already
-/// format `Err(String)` results so no caller surface change is
-/// needed.
+/// Before this guard, the function returned `Ok(store_path)` whenever
+/// the live probe fell through to the v1/object store. The caller then
+/// chdir'd into the store for the lifecycle script — which, on macOS
+/// (clonefile, CoW) was a silent corruption of the canonical bytes on
+/// first write, and on Linux (hardlinks) skipped the detach so the
+/// script ran against shared inodes. The guard closes that hole while
+/// preserving v2's intended lifecycle location:
+/// `store/v2/links/<key>/node_modules/<pkg>`.
 ///
 /// Returns the layout-aware live directory on success, or a human-
 /// readable failure string on detach error or unlinked-package
@@ -186,16 +180,18 @@ pub(super) fn prepare_live_package_dir(
         baseline_index,
     );
 
-    // hard-error when the resolved live path lands
-    // in the store. Previously this branch silently skipped detach AND
-    // returned `Ok(store_path)`, letting the caller chdir into the
-    // canonical bytes for a lifecycle script. See the function
-    // doc-comment for the full motivation.
-    if live.starts_with(store_root) {
+    let is_v2_link_entry = path_resolves_under(&live, &v2_links_root(store_root));
+    if !is_v2_link_entry && path_lives_in_protected_store_area(&live, store_root) {
         return Err(format!(
             "package {pkg_name}@{pkg_version} not linked into project — \
              refusing to run lifecycle script inside the store. \
              Run `lpm install` to materialize the wrapper tree, then retry."
+        ));
+    }
+    if !is_v2_link_entry && path_is_symlink(&live) {
+        return Err(format!(
+            "package {pkg_name}@{pkg_version} resolved to a symlinked lifecycle directory at {}",
+            live.display()
         ));
     }
 
@@ -204,4 +200,33 @@ pub(super) fn prepare_live_package_dir(
     }
 
     Ok(live)
+}
+
+fn path_lives_in_protected_store_area(path: &Path, store_root: &Path) -> bool {
+    path.starts_with(store_root) || path_resolves_under(path, store_root)
+}
+
+fn path_resolves_under(path: &Path, root: &Path) -> bool {
+    let canonical_path = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let canonical_root = match std::fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(_) => return false,
+    };
+    canonical_path.starts_with(canonical_root)
+}
+
+fn path_is_symlink(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+fn v2_links_root(store_root: &Path) -> PathBuf {
+    let mut root = PathBuf::with_capacity(store_root.as_os_str().len() + 9);
+    root.push(store_root);
+    root.push("v2");
+    root.push("links");
+    root
 }
