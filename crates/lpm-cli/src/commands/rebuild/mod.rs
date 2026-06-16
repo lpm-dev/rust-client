@@ -52,6 +52,7 @@ use self::scripts::{
     rebuild_package_label, rebuild_summary_envelope, scripts_word, toposort_packages,
     warn_stale_trusted_deps, widen_to_build_by_policy,
 };
+pub(crate) use self::scripts::{RebuildPackageIdentity, RebuildRunReport};
 pub(crate) use self::trust::{TrustReason, evaluate_trust};
 
 use crate::install_ui;
@@ -109,6 +110,43 @@ pub async fn run(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> Result<(), LpmError> {
+    run_with_report(
+        project_dir,
+        specific_packages,
+        all,
+        dry_run,
+        force,
+        timeout_secs,
+        json_output,
+        deny_all,
+        no_sandbox,
+        strict_sandbox,
+        sandbox_log,
+        effective_policy,
+        advisor_approvals,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_report(
+    project_dir: &Path,
+    specific_packages: &[String],
+    all: bool,
+    dry_run: bool,
+    force: bool,
+    timeout_secs: Option<u64>,
+    json_output: bool,
+    deny_all: bool,
+    no_sandbox: bool,
+    strict_sandbox: bool,
+    sandbox_log: bool,
+    effective_policy: ScriptPolicy,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> Result<RebuildRunReport, LpmError> {
     // hold the shared store lock across rebuild —
     // it traverses store package dirs to read package.json, compute
     // script hashes, and (for already-built check) inspect the
@@ -154,7 +192,7 @@ async fn run_under_store_lock(
     advisor_approvals: Option<
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
-) -> Result<(), LpmError> {
+) -> Result<RebuildRunReport, LpmError> {
     crate::security_floor::clear_recorded_suppressions();
     // Defense-in-depth on the sandbox flag pair. The CLI boundary
     // (clap `conflicts_with_all` on `--no-sandbox` ⊥ `--strict-sandbox`
@@ -180,7 +218,7 @@ async fn run_under_store_lock(
                 "Script execution denied. All scripts are blocked by --deny-all or lpm.scripts.denyAll config.",
             );
         }
-        return Ok(());
+        return Ok(RebuildRunReport::default());
     }
 
     // `find_installed_package_baseline`
@@ -332,6 +370,7 @@ async fn run_under_store_lock(
         scriptable_packages.push(ScriptablePackage {
             name: lp.name.clone(),
             version: lp.version.clone(),
+            integrity: lp.integrity.clone(),
             wrapper_id,
             store_path: pkg_dir,
             scripts,
@@ -375,7 +414,7 @@ async fn run_under_store_lock(
             install_ui::done("No packages have lifecycle scripts · nothing to build");
             warn_stale_trusted_deps(&policy, &scriptable_packages);
         }
-        return Ok(());
+        return Ok(RebuildRunReport::default());
     }
 
     // Warn about stale trustedDependencies entries
@@ -384,7 +423,7 @@ async fn run_under_store_lock(
     }
 
     // Determine which packages to build
-    let to_build: Vec<&ScriptablePackage> = if !specific_packages.is_empty() {
+    let selected_for_policy: Vec<&ScriptablePackage> = if !specific_packages.is_empty() {
         // Build specific packages by name
         let mut selected = Vec::new();
         let mut missing = Vec::new();
@@ -420,12 +459,19 @@ async fn run_under_store_lock(
     } else {
         widen_to_build_by_policy(&scriptable_packages, all, effective_policy)
     };
+    let covered_packages = selected_for_policy
+        .iter()
+        .map(|pkg| (pkg.name.clone(), pkg.version.clone(), pkg.integrity.clone()))
+        .collect::<Vec<_>>();
 
     // Filter out already-built (unless --force)
     let to_build: Vec<&ScriptablePackage> = if force {
-        to_build
+        selected_for_policy
     } else {
-        to_build.into_iter().filter(|p| !p.is_built).collect()
+        selected_for_policy
+            .into_iter()
+            .filter(|p| !p.is_built)
+            .collect()
     };
 
     // Sort in dependency order: if A depends on B, build B first (Kahn's toposort)
@@ -501,7 +547,10 @@ async fn run_under_store_lock(
                 }
             }
         }
-        return Ok(());
+        return Ok(RebuildRunReport {
+            covered_packages,
+            built_packages: Vec::new(),
+        });
     }
 
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_SCRIPT_TIMEOUT_SECS));
@@ -548,7 +597,10 @@ async fn run_under_store_lock(
                 }
             }
         }
-        return Ok(());
+        return Ok(RebuildRunReport {
+            covered_packages,
+            built_packages: Vec::new(),
+        });
     }
 
     // Warn if scripted packages are being skipped for lack of trust.
@@ -654,6 +706,7 @@ async fn run_under_store_lock(
     let mut successes = 0usize;
     let mut failures = 0usize;
     let mut completed_scripts = 0usize;
+    let mut built_packages = Vec::with_capacity(to_build.len());
     let package_label_width = to_build
         .iter()
         .map(|pkg| rebuild_package_label(pkg).len())
@@ -1081,6 +1134,7 @@ async fn run_under_store_lock(
                 tracing::warn!("failed to write build marker for {}: {e}", pkg.name);
             }
             successes += 1;
+            built_packages.push((pkg.name.clone(), pkg.version.clone(), pkg.integrity.clone()));
         } else {
             failures += 1;
         }
@@ -1129,6 +1183,9 @@ async fn run_under_store_lock(
             "{failures} package(s) failed to build"
         )))
     } else {
-        Ok(())
+        Ok(RebuildRunReport {
+            covered_packages,
+            built_packages,
+        })
     }
 }

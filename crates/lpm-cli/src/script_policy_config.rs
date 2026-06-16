@@ -48,10 +48,8 @@ pub enum ScriptPolicy {
     /// pre-existing behavior.
     #[default]
     Deny,
-    /// Every package trusted. `lpm rebuild` runs every lifecycle script
-    /// without the triage gate, via the existing two-phase pipeline.
-    /// Scripts still execute at `lpm rebuild` time (or autoBuild-
-    /// triggered), never at install.
+    /// Every package trusted. Install-time auto-build and `lpm rebuild`
+    /// run lifecycle scripts without the triage gate.
     Allow,
     /// Four-layer tiered gate. Greens become eligible for auto-
     /// execution in the sandbox (P6); ambers flow to layers 2/3/4

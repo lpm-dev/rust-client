@@ -1,7 +1,7 @@
 mod support;
 
 use support::assertions::{JsonType, assert_json_field, parse_json_output};
-use support::mock_registry::{MockRegistry, make_tarball};
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm_with_registry};
 
 /// `lpm download` must accept its subcommand-local `--version` flag
@@ -163,6 +163,76 @@ async fn download_accepts_single_string_platform_fields_from_npm_packument() {
             .join("package.json")
             .is_file(),
         "download must extract the package after parsing the string platform fields"
+    );
+}
+
+#[tokio::test]
+async fn download_ignores_legacy_boolean_fields_in_other_lightdash_versions() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let package = "@lightdash/cli";
+    let requested_version = "0.3168.0";
+    let tarball = make_tarball(package, requested_version);
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": { "latest": requested_version },
+        "versions": {
+            "0.103.0-alpha.9": {
+                "name": package,
+                "version": "0.103.0-alpha.9",
+                "bundleDependencies": [true]
+            },
+            "0.273.0-rc1": {
+                "name": package,
+                "version": "0.273.0-rc1",
+                "config": {
+                    "unsafe-perm": true
+                }
+            },
+            requested_version: {
+                "name": package,
+                "version": requested_version,
+                "dist": {
+                    "tarball": mock.tarball_url(package, requested_version),
+                    "integrity": compute_integrity(&tarball),
+                }
+            }
+        }
+    });
+    mock.with_package_metadata_and_tarballs(package, metadata, &[(requested_version, tarball)])
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "download",
+            package,
+            "--version",
+            requested_version,
+            "--json",
+            "--output",
+            "lightdash-out",
+        ])
+        .output()
+        .expect("failed to run lpm download for @lightdash/cli");
+
+    assert!(
+        output.status.success(),
+        "download must ignore legacy fields from unrelated historical versions:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert_eq!(json["package"], package);
+    assert_eq!(json["version"], requested_version);
+    assert!(
+        project
+            .path()
+            .join("lightdash-out")
+            .join("package.json")
+            .is_file(),
+        "download must extract the requested @lightdash/cli version"
     );
 }
 

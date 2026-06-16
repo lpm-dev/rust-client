@@ -4,14 +4,14 @@
 //! Closes the loop on the triage install lifecycle by
 //! exercising the FULL install pipeline (resolver + linker +
 //! blocked-set capture + auto-build + rebuild) instead of the
-//! unit-level pieces. Pre-fix the auto-build asymmetry, contract
-//! #3 below would have stranded a package — approved by the
-//! advisor but never executed AND removed from the blocked set,
-//! so the user has no remaining surface to review it on.
+//! unit-level pieces. Without the auto-build-aware capture guard,
+//! contract #3 would strand a package — approved by the advisor but
+//! never executed AND removed from the blocked set, so the user has
+//! no remaining surface to review it on.
 //!
 //! ## Contracts pinned
 //!
-//! All three use the same synthetic amber dep
+//! These contracts use the same synthetic amber dep
 //! (`postinstall: "node install.js"`, reserved-basename ⇒ amber)
 //! over a mock registry, plus `script-policy = triage` in
 //! `package.json`. Only the advisor + auto-build inputs change.
@@ -25,11 +25,12 @@
 //!    `select_approvals_for_capture` enforces).
 //! 3. **Triage + advisor approves + auto-build OFF** → the script
 //!    does NOT run AND the package remains in `build-state.json`.
-//!    This is the stranded-approval scenario: a pre-`662367a`
-//!    binary would have dropped the package from the blocked set
-//!    on the advisor's approval alone, even though no auto-build
-//!    fired, leaving the user with neither execution NOR a review
-//!    surface.
+//!    This is the stranded-approval scenario: the package must not
+//!    drop from the blocked set on the advisor's approval alone when
+//!    no auto-build fired.
+//! 4. **Triage + advisor approves + auto-build requested + denyAll**
+//!    → denyAll suppresses script execution, and the package remains
+//!    in `build-state.json` for later review.
 //!
 //! ## Why the mocks
 //!
@@ -62,7 +63,7 @@ use std::path::PathBuf;
 
 use support::assertions;
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm_with_registry, write_signed_unlock};
 
 // ─── Test constants ────────────────────────────────────────────────────
 
@@ -146,6 +147,26 @@ fn triage_project_manifest() -> String {
     }},
     "lpm": {{
         "scriptPolicy": "triage"
+    }}
+}}
+"#
+    )
+}
+
+#[cfg(unix)]
+fn triage_project_manifest_with_deny_all() -> String {
+    format!(
+        r#"{{
+    "name": "triage-install-lifecycle-fixture",
+    "version": "1.0.0",
+    "dependencies": {{
+        "{AMBER_DEP_NAME}": "^{AMBER_DEP_VERSION}"
+    }},
+    "lpm": {{
+        "scriptPolicy": "triage",
+        "scripts": {{
+            "denyAll": true
+        }}
     }}
 }}
 "#
@@ -387,13 +408,12 @@ async fn triage_advisor_approve_with_auto_build_runs_amber_and_drops_from_blocke
 /// **Contract 3.** The load-bearing test: advisor approves, but
 /// auto-build is OFF.
 ///
-/// Pre-`662367a`, the install pipeline unconditionally excluded
-/// advisor-approved triples from the persisted blocked set, even
-/// when `auto_build_attempted = false`. That stranded the package:
-/// the script never ran (no auto-build), AND the package vanished
-/// from `.lpm/build-state.json`, so `lpm approve-scripts` had no
-/// review surface either. The user was left with "not executed,
-/// not reviewable."
+/// The install pipeline must not exclude advisor-approved triples
+/// from the persisted blocked set when auto-build will not execute.
+/// Otherwise the script never runs, AND the package vanishes from
+/// `.lpm/build-state.json`, so `lpm approve-scripts` has no review
+/// surface either. The user is left with "not executed, not
+/// reviewable."
 ///
 /// The fix conditions the blocked-set exclusion on whether
 /// auto-build will actually fire (`select_approvals_for_capture`).
@@ -403,8 +423,7 @@ async fn triage_advisor_approve_with_auto_build_runs_amber_and_drops_from_blocke
 /// surfaces the package for `approve-scripts` even though the
 /// in-memory `AdvisorSession` would have unlocked it.
 ///
-/// This test pins the contract end-to-end. Pre-fix it fails; post-
-/// fix it passes.
+/// This test pins the contract end-to-end.
 #[cfg(unix)]
 #[tokio::test]
 async fn triage_advisor_approve_without_auto_build_strands_neither_script_nor_review() {
@@ -418,11 +437,11 @@ async fn triage_advisor_approve_without_auto_build_strands_neither_script_nor_re
     // approvals — keeps `all_trusted = false`, so
     // `auto_build_attempted = false` is reachable even though the
     // advisor approves the amber path. This is the only
-    // combinator that exercises the exact pre-fix bug:
+    // combinator that exercises the exact bug:
     //
     //   advisor approves A, auto-build never fires →
-    //     pre-fix: A drops out of blocked set anyway → stranded.
-    //     post-fix: A stays in blocked set → reviewable.
+    //     wrong: A drops out of blocked set anyway → stranded.
+    //     right: A stays in blocked set → reviewable.
     let mock = MockRegistry::start().await;
     let amber_tarball = build_amber_tarball();
     let red_tarball = build_red_tarball();
@@ -457,13 +476,65 @@ async fn triage_advisor_approve_without_auto_build_strands_neither_script_nor_re
     // didn't fire, so the script never spawned regardless of the
     // advisor's verdict. Coupled with the blocked-set assertion
     // above, the user is left with "not executed, but reviewable"
-    // — the correct end state, where pre-fix would have been "not
-    // executed AND not reviewable."
+    // — the correct end state.
     let marker = lpm_built_marker(&project);
     assert!(
         !marker.exists(),
         "amber script MUST NOT have run without auto-build firing; marker found at {}",
         marker.display(),
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn install_deny_all_keeps_advisor_approved_packages_reviewable_when_auto_build_is_suppressed()
+{
+    let mock = MockRegistry::start().await;
+    let tarball = build_amber_tarball();
+    mount_amber_dep(&mock, &tarball).await;
+
+    let project = TempProject::empty(&triage_project_manifest_with_deny_all());
+    write_signed_unlock(&project, &["scripts-triage"]);
+    let (_mock_claude_dir, claude_bin_dir) = install_mock_claude_returning_approve();
+
+    let path_var = prepend_to_path(&claude_bin_dir);
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "install",
+            "--triage",
+            "--auto-build",
+            "--advisor=claude-cli",
+        ])
+        .env("PATH", &path_var)
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "denyAll install should finish after suppressing auto-build\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let marker = lpm_built_marker(&project);
+    assert!(
+        !marker.exists(),
+        "denyAll must suppress advisor-approved auto-build execution; marker found at {}",
+        marker.display(),
+    );
+
+    let build_state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/build-state.json"))
+            .expect("build-state.json must parse");
+    let blocked_packages = build_state["blocked_packages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("build-state must include blocked_packages: {build_state}"));
+    assert!(
+        blocked_packages
+            .iter()
+            .any(|pkg| pkg["name"] == AMBER_DEP_NAME && pkg["version"] == AMBER_DEP_VERSION),
+        "advisor-approved package must remain reviewable when denyAll suppresses auto-build: {build_state}",
     );
 }
 

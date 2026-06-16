@@ -1166,11 +1166,9 @@ pub struct MarketplaceEarningsResponse {
 ///   - `true` — historical alias meaning "bundle every entry in
 ///     `dependencies`" (rare in practice).
 ///
-/// We deserialize the list shape directly. `true` / `false` collapse
-/// to an empty list with a debug log — pre-R4 behavior was "ignore
-/// bundling entirely," so this preserves the no-regression contract
-/// for the rare `bundleDependencies: true` packages while keeping the
-/// common list form first-class.
+/// We preserve string entries from the list shape. Legacy booleans
+/// collapse to an empty list, including old dirty packuments that
+/// encoded the boolean inside the array (`[true]`).
 fn deserialize_bundle_dependencies<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1207,8 +1205,10 @@ where
             A: de::SeqAccess<'de>,
         {
             let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-            while let Some(s) = seq.next_element::<String>()? {
-                out.push(s);
+            while let Some(value) = seq.next_element::<serde_json::Value>()? {
+                if let Some(name) = value.as_str() {
+                    out.push(name.to_string());
+                }
             }
             Ok(out)
         }
@@ -1522,6 +1522,58 @@ mod tests {
                 .get("ua-parser-js")
                 .map(|meta| meta.optional),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn package_metadata_ignores_legacy_boolean_bundle_dependency_entries() {
+        let json = r#"{
+            "name": "@lightdash/cli",
+            "dist-tags": {
+                "latest": "0.3168.0"
+            },
+            "versions": {
+                "0.103.0-alpha.9": {
+                    "name": "@lightdash/cli",
+                    "version": "0.103.0-alpha.9",
+                    "bundleDependencies": [true]
+                },
+                "0.273.0-rc1": {
+                    "name": "@lightdash/cli",
+                    "version": "0.273.0-rc1",
+                    "config": {
+                        "unsafe-perm": true
+                    }
+                },
+                "0.3168.0": {
+                    "name": "@lightdash/cli",
+                    "version": "0.3168.0",
+                    "bundleDependencies": ["@lightdash/common"],
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/@lightdash/cli/-/cli-0.3168.0.tgz",
+                        "integrity": "sha512-example"
+                    }
+                }
+            }
+        }"#;
+
+        let metadata: PackageMetadata =
+            serde_json::from_str(json).expect("@lightdash/cli packument shape should parse");
+
+        let legacy = metadata
+            .version("0.103.0-alpha.9")
+            .expect("metadata should include legacy version");
+        assert!(legacy.bundle_dependencies.is_empty());
+        let requested = metadata
+            .version("0.3168.0")
+            .expect("metadata should include requested version");
+        assert_eq!(
+            requested
+                .bundle_dependencies
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["@lightdash/common"]
         );
     }
 

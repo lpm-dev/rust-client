@@ -58,7 +58,7 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
     assert!(metadata.get("scripted-empty", "1.0.0").is_none());
 }
 
-/// The drift gate must appear before the `rebuild::run` auto-build
+/// The drift gate must appear before the rebuild auto-build
 /// call site. If a future refactor moves the drift check past the build
 /// call, a drifted approval could spawn scripts before containment is
 /// established.
@@ -68,7 +68,7 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
 /// a large async function; isolating it behaviorally would
 /// require mocking the full registry + provenance pipeline. A
 /// source-offset assertion catches a reorder that moves the drift block
-/// past the `rebuild::run` call at near-zero ceremony.
+/// past the rebuild call at near-zero ceremony.
 /// If the marker strings themselves get refactored, this test
 /// fails LOUDLY rather than silently drifting; the failure
 /// message names what needs updating.
@@ -79,7 +79,7 @@ fn provenance_drift_gate_precedes_build_run_call_site() {
         "/src/commands/install/mod.rs"
     ));
     const DRIFT_MARKER: &str = "provenance-drift gate";
-    const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run(";
+    const BUILD_RUN_CALL: &str = "crate::commands::rebuild::run_with_report(";
 
     let drift_pos = src.find(DRIFT_MARKER).unwrap_or_else(|| {
         panic!(
@@ -91,7 +91,7 @@ fn provenance_drift_gate_precedes_build_run_call_site() {
     });
     let build_run_pos = src.find(BUILD_RUN_CALL).unwrap_or_else(|| {
         panic!(
-            "build::run call site (`{BUILD_RUN_CALL}`) not found — the \
+            "rebuild call site (`{BUILD_RUN_CALL}`) not found — the \
              install → auto-build handoff was removed or renamed; update this \
              test to target the new call."
         )
@@ -99,7 +99,7 @@ fn provenance_drift_gate_precedes_build_run_call_site() {
     assert!(
         drift_pos < build_run_pos,
         "Order invariant broken: the provenance-drift gate (byte {drift_pos}) \
-         MUST appear before the `rebuild::run` call site (byte {build_run_pos}) in \
+         MUST appear before the rebuild call site (byte {build_run_pos}) in \
          install/mod.rs. Reordering them means a drifted approval could spawn scripts \
          before the drift check fires — violating the approved execution order."
     );

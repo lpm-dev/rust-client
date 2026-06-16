@@ -47,11 +47,9 @@ use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 
 /// Build a gzipped tarball for a mock package that declares a
-/// `postinstall` script. The script body never actually executes
-/// in this test (`lpm install` doesn't auto-run lifecycle scripts;
-/// it would take an explicit `lpm rebuild` / `lpm rebuild` for that,
-/// which this test doesn't invoke), so the script payload is just
-/// a no-op marker string.
+/// `postinstall` script. This default-policy test does not opt into
+/// allow-policy install-time builds or `lpm rebuild`, so the script
+/// payload is just a no-op marker string.
 fn make_scripted_tarball(name: &str, version: &str) -> Vec<u8> {
     let mut builder = tar::Builder::new(Vec::new());
 

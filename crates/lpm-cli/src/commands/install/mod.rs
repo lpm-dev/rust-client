@@ -1876,6 +1876,10 @@ async fn run_with_options_under_store_lock(
             script_policy_override,
             lpm_root,
             &global_config,
+            auto_build,
+            no_sandbox,
+            strict_sandbox,
+            compatibility_bin_names,
         )
         .await;
     }
@@ -4161,7 +4165,7 @@ async fn run_with_options_under_store_lock(
     // Step 5: Link into node_modules
     let link_start = Instant::now();
 
-    let link_result = if event_driven_link {
+    let mut link_result = if event_driven_link {
         //b: event-driven path. Per-pkga future release2 tasks were
         // spawned inside the fetch loop and for each cached package
         // before the loop; await them here, aggregate counters, then
@@ -4490,9 +4494,10 @@ async fn run_with_options_under_store_lock(
         all_trusted_for_auto_build,
         step10_effective_policy,
     );
+    let auto_build_will_execute = auto_build_attempted && !step10_script_policy_cfg.deny_all;
 
     let capture_start = std::time::Instant::now();
-    let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
+    let mut blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
         &installed_with_integrity,
@@ -4505,7 +4510,7 @@ async fn run_with_options_under_store_lock(
         // See `select_approvals_for_capture` for the rationale —
         // closes the "stranded approval" bug.
         select_approvals_for_capture(
-            auto_build_attempted,
+            auto_build_will_execute,
             advisor_session.as_ref().map(|s| s.approvals()),
         ),
     )?;
@@ -4909,22 +4914,16 @@ async fn run_with_options_under_store_lock(
     // they produce are still in scope here; only the autoBuild
     // predicate + the rebuild::run call read them. No duplication.
 
-    // **Review fix.** `force_security_floor`, `all_trusted_for_auto_build`,
-    // and `auto_build_attempted` are now computed BEFORE the
-    // blocked-set capture (so the capture can condition the
-    // advisor-approval exclusion on whether autoBuild will fire).
-    // The original comment block describing the kill-switch + capability
-    // gate's interaction with this predicate still applies — see the
-    // pre-capture computation above for details.
+    // These values are computed before blocked-set capture so the
+    // advisor-approval exclusion can depend on whether auto-build will
+    // actually execute.
     if auto_build_attempted {
         //: preflight version-diff cards for any green
         // about to auto-execute that has a prior-approved binding
         // for a strictly-lesser version. Renders BEFORE `rebuild::run`
         // so the user sees the unified script-body diff and the
-        // behavioral-tag delta BEFORE any code runs — satisfies the
-        // ship criterion 1 ("the exact added line before any
-        // execution"). No-ops for non-triage policies and json mode
-        // (gates inside the helper).
+        // behavioral-tag delta before any code runs. No-ops for
+        // non-triage policies and json mode (gates inside the helper).
         maybe_emit_pre_autobuild_version_diff_cards(
             project_dir,
             &store,
@@ -4934,8 +4933,9 @@ async fn run_with_options_under_store_lock(
             json_output,
         );
     }
-    if auto_build_attempted
-        && let Err(e) = crate::commands::rebuild::run(
+    let mut auto_build_report = crate::commands::rebuild::RebuildRunReport::default();
+    if auto_build_attempted {
+        match crate::commands::rebuild::run_with_report(
             project_dir,
             &[],   // no specific packages — build all trusted
             false, // not --all
@@ -4966,24 +4966,58 @@ async fn run_with_options_under_store_lock(
             advisor_session.as_ref().map(|s| s.approvals()),
         )
         .await
-    {
-        if !json_output {
-            output::warn(&format!("Auto-build failed: {e}"));
+        {
+            Ok(report) => {
+                auto_build_report = report;
+            }
+            Err(e) => {
+                if !json_output {
+                    output::warn(&format!("Auto-build failed: {e}"));
+                }
+                return Err(e);
+            }
         }
-        return Err(e);
+    }
+
+    if auto_build_report.covered_any_packages() {
+        let execution_exclusions = auto_build_report
+            .covered_packages
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        blocked_capture =
+            crate::build_state::capture_blocked_set_after_install_with_metadata_and_exclusions(
+                project_dir,
+                &store,
+                &installed_with_integrity,
+                &policy,
+                &blocked_set_metadata,
+                &install_requested_capabilities,
+                &install_user_bound,
+                select_approvals_for_capture(true, advisor_session.as_ref().map(|s| s.approvals())),
+                Some(&execution_exclusions),
+            )?;
+    }
+
+    if auto_build_report.covered_any_packages() || auto_build_report.built_any_packages() {
+        let relinked_bins = relink_bins_after_lifecycle_build(
+            project_dir,
+            &packages,
+            &link_targets,
+            linker_mode,
+            lpm_root,
+            pkg.name.as_deref(),
+            compatibility_bin_names,
+        )?;
+        link_result.bin_linked = relinked_bins;
     }
 
     // post-auto-build canonical pointer.
     //
-    // Under `script-policy = "triage"` the helper at build::run will
-    // have run greens (per Chunks 2+3 + the `should_auto_build`
-    // widening that `autoBuild: true` provides); amber / red blocked
-    // packages remain in `build-state.json`. The pre-auto-build
-    // triage summary line already fired upstream, but it is now
-    // stale — greens ran, so "N green / M amber / K red" is no
-    // longer the current state. The user needs a follow-up pointer
-    // that a) acknowledges the build happened, b) names the
-    // remaining amber+red count, c) routes to `lpm approve-scripts`.
+    // Under `script-policy = "triage"` the rebuild helper runs green
+    // packages when auto-build fires, while amber / red packages remain
+    // in `build-state.json`. The pre-auto-build triage summary line is
+    // then stale, so emit a follow-up pointer for the remaining reviews.
     //
     // JSON mode: per-entry `static_tier` enrichment below in the
     // JSON output block gives agents the machine-readable shape; no

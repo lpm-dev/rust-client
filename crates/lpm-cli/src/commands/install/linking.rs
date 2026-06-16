@@ -122,6 +122,43 @@ pub(super) fn build_v2_targets(
     Ok(v2_targets)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn relink_bins_after_lifecycle_build(
+    project_dir: &Path,
+    packages: &[InstallPackage],
+    link_targets: &[LinkTarget],
+    linker_mode: lpm_linker::LinkerMode,
+    lpm_root: &lpm_common::LpmRoot,
+    self_package_name: Option<&str>,
+    compatibility_bin_names: &[String],
+) -> Result<usize, LpmError> {
+    let result = if lpm_store::StoreVersion::from_env().is_v2() {
+        let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
+        let v2_targets = build_v2_targets(packages, link_targets)?;
+        lpm_linker::v2::link_packages_v2_with_compatibility_bin_names(
+            project_dir,
+            v2_targets,
+            &store_v2,
+            linker_mode,
+            self_package_name,
+            compatibility_bin_names,
+        )?
+    } else {
+        match linker_mode {
+            lpm_linker::LinkerMode::Hoisted => lpm_linker::link_packages_hoisted(
+                project_dir,
+                link_targets,
+                false,
+                self_package_name,
+            )?,
+            lpm_linker::LinkerMode::Isolated => {
+                lpm_linker::link_packages(project_dir, link_targets, false, self_package_name)?
+            }
+        }
+    };
+    Ok(result.bin_linked)
+}
+
 /// Offline/shared path: link packages from store, write lockfile, print output.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_link_and_finish(
@@ -148,6 +185,10 @@ pub(super) async fn run_link_and_finish(
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     lpm_root: &lpm_common::LpmRoot,
     global_config: &crate::commands::config::GlobalConfig,
+    auto_build: bool,
+    no_sandbox: bool,
+    strict_sandbox: bool,
+    compatibility_bin_names: &[String],
 ) -> Result<(), LpmError> {
     crate::security_floor::clear_recorded_suppressions();
     let force_security_floor = crate::security_floor::force_security_floor_enabled(global_config);
@@ -200,7 +241,7 @@ pub(super) async fn run_link_and_finish(
         .collect::<Result<_, _>>()?;
 
     let link_start = Instant::now();
-    let link_result = if lpm_store::StoreVersion::from_env().is_v2() {
+    let mut link_result = if lpm_store::StoreVersion::from_env().is_v2() {
         let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
         let v2_targets = build_v2_targets(&packages, &link_targets)?;
         lpm_linker::v2::link_packages_v2(
@@ -262,10 +303,15 @@ pub(super) async fn run_link_and_finish(
         json_output,
     )?;
 
-    // Lifecycle script security audit (two-phase model: install never runs scripts).
-    // Scripts are NEVER executed during install — use `lpm rebuild` instead.
-    // This matches the online install path exactly.
     let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
+    let script_policy_cfg =
+        crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+    let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
+        project_dir,
+        script_policy_override,
+        &script_policy_cfg,
+        json_output,
+    )?;
 
     // capture the install-time blocked set into
     // build-state.json. Same wiring as the online path — see comment there.
@@ -284,11 +330,25 @@ pub(super) async fn run_link_and_finish(
         crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let offline_user_bound = crate::security_approval::authorized_capability_user_bound();
-    // the fast-path / offline install does NOT
-    // run the L4 advisor (scope was tightened to the online install
-    // path). `None` passes through `compute_blocked_packages_with_metadata`
-    // unchanged for this call.
-    let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
+    let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
+        lpm_root,
+        &installed_with_integrity,
+        &policy,
+        project_dir,
+        effective_policy,
+        force_security_floor,
+        &offline_requested_capabilities,
+        &offline_user_bound,
+        None,
+    );
+    let auto_build_attempted = should_auto_build(
+        auto_build,
+        script_policy_cfg.auto_build,
+        all_trusted_for_auto_build,
+        effective_policy,
+    );
+
+    let mut blocked_capture = crate::build_state::capture_blocked_set_after_install_with_metadata(
         project_dir,
         &store,
         &installed_with_integrity,
@@ -298,6 +358,75 @@ pub(super) async fn run_link_and_finish(
         &offline_user_bound,
         None,
     )?;
+
+    let mut auto_build_report = crate::commands::rebuild::RebuildRunReport::default();
+    if auto_build_attempted {
+        match crate::commands::rebuild::run_with_report(
+            project_dir,
+            &[],
+            false,
+            false,
+            false,
+            None,
+            json_output,
+            false,
+            no_sandbox,
+            strict_sandbox,
+            false,
+            effective_policy,
+            None,
+        )
+        .await
+        {
+            Ok(report) => {
+                auto_build_report = report;
+            }
+            Err(e) => {
+                if !json_output {
+                    output::warn(&format!("Auto-build failed: {e}"));
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    if auto_build_report.covered_any_packages() || auto_build_report.built_any_packages() {
+        let execution_exclusions = auto_build_report
+            .covered_packages
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        blocked_capture =
+            crate::build_state::capture_blocked_set_after_install_with_metadata_and_exclusions(
+                project_dir,
+                &store,
+                &installed_with_integrity,
+                &policy,
+                &crate::build_state::BlockedSetMetadata::default(),
+                &offline_requested_capabilities,
+                &offline_user_bound,
+                None,
+                Some(&execution_exclusions),
+            )?;
+
+        let relinked_bins = relink_bins_after_lifecycle_build(
+            project_dir,
+            &packages,
+            &link_targets,
+            linker_mode,
+            lpm_root,
+            pkg.name.as_deref(),
+            compatibility_bin_names,
+        )?;
+        link_result.bin_linked = relinked_bins;
+    }
+
+    maybe_emit_post_auto_build_triage_pointer(
+        auto_build_attempted,
+        effective_policy,
+        &blocked_capture,
+        json_output,
+    );
 
     //: snapshot write on the fast path too — a warm
     // install that only changed `trustedDependencies` (not deps)
