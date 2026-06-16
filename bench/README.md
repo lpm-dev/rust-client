@@ -16,6 +16,7 @@ Reproducible benchmarks comparing LPM against npm, pnpm, and bun.
 ./bench/run.sh script-overhead
 ./bench/run.sh builtin-tools
 ./bench/run.sh lpm-stages            # LPM per-stage breakdown via --json
+./bench/local-install.sh             # Local deterministic LPM install benchmark
 
 # Enable the destructive cold per-stage run (wipes ~/.lpm/cache and ~/.lpm/store)
 LPM_BENCH_ALLOW_WIPE=1 ./bench/run.sh lpm-stages
@@ -32,6 +33,7 @@ LPM_BENCH_ALLOW_WIPE=1 ./bench/run.sh lpm-stages
 | `script-overhead` | Time to execute a no-op script via each package manager |
 | `builtin-tools` | `lpm lint`/`lpm fmt` vs `npx oxlint`/`npx biome` |
 | `lpm-stages` | **LPM-only.** Per-stage breakdown (resolve / fetch / link / total) parsed from `lpm install --json` |
+| `local-install.sh` | **LPM-only.** Deterministic localhost registry benchmark for cold, warm, repeat, stale-304, and fetch-breakdown scenarios |
 
 ### Why two cold-install benchmarks?
 
@@ -57,6 +59,13 @@ Empirical measurement (2026-04-14) confirmed that per-iteration `rm -rf` of each
 - Per-stage timings are LPM-only because no other package manager exposes a stable structured shape for stage breakdowns.
 - Used by Phase 32 guardrail #3: install-path features must not regress these numbers.
 - Requires `python3` for portable JSON parsing.
+
+### Local deterministic install benchmark (`local-install.sh`)
+- Starts a localhost npm-compatible fixture registry with deterministic metadata, tarballs, ETags, and `304 Not Modified` responses.
+- Uses an isolated temp `HOME` / `LPM_HOME`, so cold runs wipe only the benchmark's throwaway cache and store.
+- Default fixture: 96 packages, 16 roots, 32 versions per packument, 512 KiB tarballs. Override with `LPM_LOCAL_BENCH_PACKAGES`, `LPM_LOCAL_BENCH_ROOTS`, `LPM_LOCAL_BENCH_VERSIONS`, and `LPM_LOCAL_BENCH_TARBALL_KIB`.
+- Default route is `LPM_LOCAL_BENCH_ROUTE=proxy`, which points public npm-shaped packages at the local `--registry` Worker-compatible path. Use `LPM_LOCAL_BENCH_ROUTE=custom` to measure `.npmrc` custom-registry fanout against the same local server.
+- Runs `cold`, `warm`, `repeat`, `stale-304` (`--force` after stale cache mtimes), and `fetch` scenarios and reports medians from `lpm install --json`.
 
 ## Latest Results
 
