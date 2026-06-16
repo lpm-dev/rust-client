@@ -8,6 +8,8 @@ use super::*;
 /// legitimate metadata response and orders of magnitude below a
 /// memory-exhaustion attack from a compromised mirror or MITM.
 pub(super) const MAX_METADATA_BYTES: usize = 100 * 1024 * 1024;
+// Keep small responses inline; large packuments can monopolize an async worker.
+const BLOCKING_METADATA_PARSE_THRESHOLD: usize = 64 * 1024;
 
 /// Hard cap for non-metadata API responses (whoami, token check,
 /// quality/skills, tunnel domain ops, publish ack, error bodies).
@@ -64,15 +66,30 @@ pub(super) async fn read_capped_body(
 
 /// Read a metadata-shaped JSON response with the metadata cap.
 ///
-/// Wraps [`read_capped_body`] with the metadata-tier ceiling and
-/// `serde_json::from_slice`. Lets the metadata path share one
-/// streaming-cap implementation with the smaller-tier API path.
-pub(super) async fn parse_capped_metadata<T: serde::de::DeserializeOwned>(
+/// Wraps [`read_capped_body`] with the metadata-tier ceiling.
+///
+/// Small responses parse inline; larger metadata buffers are parsed on
+/// Tokio's blocking pool so packuments do not monopolize async workers.
+pub(super) async fn parse_capped_metadata<T: serde::de::DeserializeOwned + Send + 'static>(
     response: reqwest::Response,
     context: &str,
 ) -> Result<T, LpmError> {
     let buf = read_capped_body(response, MAX_METADATA_BYTES, context).await?;
-    serde_json::from_slice(strip_json_bom_bytes(&buf))
+    if buf.len() < BLOCKING_METADATA_PARSE_THRESHOLD {
+        return parse_metadata_buffer(&buf, context);
+    }
+
+    let context_owned = context.to_string();
+    tokio::task::spawn_blocking(move || parse_metadata_buffer(&buf, &context_owned))
+        .await
+        .map_err(|e| LpmError::Registry(format!("{context}: JSON parse task failed: {e}")))?
+}
+
+fn parse_metadata_buffer<T: serde::de::DeserializeOwned>(
+    buf: &[u8],
+    context: &str,
+) -> Result<T, LpmError> {
+    serde_json::from_slice(strip_json_bom_bytes(buf))
         .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
 }
 

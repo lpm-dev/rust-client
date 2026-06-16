@@ -1,4 +1,38 @@
 use super::*;
+use serde::de::{self, Visitor};
+
+#[derive(Debug)]
+struct ParseThread {
+    id: String,
+}
+
+impl<'de> serde::Deserialize<'de> for ParseThread {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ParseThreadVisitor;
+
+        impl Visitor<'_> for ParseThreadVisitor {
+            type Value = ParseThread;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON string")
+            }
+
+            fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(ParseThread {
+                    id: format!("{:?}", std::thread::current().id()),
+                })
+            }
+        }
+
+        deserializer.deserialize_str(ParseThreadVisitor)
+    }
+}
 
 #[tokio::test]
 async fn parse_capped_metadata_rejects_declared_oversized_content_length() {
@@ -81,6 +115,60 @@ async fn parse_capped_metadata_accepts_utf8_bom_prefixed_response() {
         .await
         .expect("BOM-prefixed response must parse");
     assert_eq!(parsed["name"], "bom-prefixed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn parse_capped_metadata_parses_small_json_on_caller_thread() {
+    use wiremock::matchers::{method, path as match_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = serde_json::to_string(&"x".repeat(1024)).unwrap();
+    Mock::given(method("GET"))
+        .and(match_path("/small"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let response = reqwest::get(format!("{}/small", server.uri()))
+        .await
+        .expect("connect");
+    let caller_thread = format!("{:?}", std::thread::current().id());
+    let parsed: ParseThread = parse_capped_metadata(response, "small-parse-test")
+        .await
+        .expect("small JSON string must parse");
+
+    assert_eq!(
+        parsed.id, caller_thread,
+        "small metadata JSON parse should avoid blocking-pool dispatch"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn parse_capped_metadata_offloads_large_json_parse() {
+    use wiremock::matchers::{method, path as match_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = serde_json::to_string(&"x".repeat(70 * 1024)).unwrap();
+    Mock::given(method("GET"))
+        .and(match_path("/large"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let response = reqwest::get(format!("{}/large", server.uri()))
+        .await
+        .expect("connect");
+    let caller_thread = format!("{:?}", std::thread::current().id());
+    let parsed: ParseThread = parse_capped_metadata(response, "large-parse-test")
+        .await
+        .expect("large JSON string must parse");
+
+    assert_ne!(
+        parsed.id, caller_thread,
+        "large metadata JSON parse should run on a blocking worker"
+    );
 }
 
 #[tokio::test]
