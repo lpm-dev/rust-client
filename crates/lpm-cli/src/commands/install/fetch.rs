@@ -575,7 +575,7 @@ pub(super) async fn speculative_download_and_store(
     // Speculation must never queue ahead of the authoritative fetch loop.
     // If all shared download permits are busy, skip this best-effort
     // prefetch and let the real fetch path own the network slot.
-    let _permit = match semaphore.try_acquire() {
+    let permit = match semaphore.try_acquire() {
         Ok(permit) => permit,
         Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(()),
         Err(tokio::sync::TryAcquireError::Closed) => {
@@ -599,6 +599,7 @@ pub(super) async fn speculative_download_and_store(
         let body = response.bytes().await.map_err(|e| {
             LpmError::Registry(format!("spec body fetch failed for {name}@{version}: {e}"))
         })?;
+        drop(permit);
         let v2_clone = v2.clone();
         let bytes = body.to_vec();
         let integrity_c = integrity.map(|s| s.to_string());
@@ -1046,6 +1047,7 @@ pub(super) async fn fetch_and_store_tarball_url(
         .download_tarball_with_integrity(url, p.integrity.as_deref())
         .await?;
     let download_ms = download_start.elapsed().as_millis();
+    drop(permit);
 
     // download_tarball_with_integrity already verified the SRI when
     // p.integrity was Some; on trust-on-first-use it returned the
@@ -1071,9 +1073,6 @@ pub(super) async fn fetch_and_store_tarball_url(
         let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
         extract_start.elapsed().as_millis()
     };
-
-    // Permit released here — extract is done, this task is finished.
-    drop(permit);
 
     let timings = TaskTimings {
         queue_wait_ms,
