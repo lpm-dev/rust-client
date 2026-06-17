@@ -3,6 +3,7 @@ use crate::output;
 use crate::overrides_state;
 use crate::patch_engine;
 use crate::patch_state;
+use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle}; // kept for concurrent download progress bar
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
@@ -97,6 +98,60 @@ impl FrozenLockfileMode {
 
 pub(crate) fn install_running_in_ci() -> bool {
     crate::install_state::ci_env_is_truthy()
+}
+
+const V2_CACHE_CHECK_MAX_CONCURRENCY: usize = 16;
+
+fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
+    let parallelism = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(4);
+    parallelism
+        .clamp(1, V2_CACHE_CHECK_MAX_CONCURRENCY)
+        .min(candidate_count.max(1))
+}
+
+async fn prevalidate_v2_reusable_objects(
+    packages: &[InstallPackage],
+    store_v2: Arc<lpm_store::v2::Store>,
+) -> Result<HashMap<String, lpm_store::v2::ReusableObject>, LpmError> {
+    let candidates: Vec<(String, String)> = packages
+        .iter()
+        .filter(|package| {
+            !matches!(
+                package.source_kind(),
+                Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
+            )
+        })
+        .filter_map(|package| {
+            Some((
+                install_pkg_key(package),
+                package.integrity.as_ref()?.clone(),
+            ))
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let candidate_count = candidates.len();
+    let concurrency = v2_cache_check_concurrency(candidate_count);
+    let mut checks = futures::stream::iter(candidates.into_iter().map(|(key, sri)| {
+        let store_v2 = Arc::clone(&store_v2);
+        tokio::task::spawn_blocking(move || store_v2.reusable_object(&sri).map(|hit| (key, hit)))
+    }))
+    .buffer_unordered(concurrency);
+
+    let mut hits = HashMap::with_capacity(candidate_count);
+    while let Some(result) = checks.next().await {
+        let (key, hit) = result
+            .map_err(|e| LpmError::Registry(format!("v2 cache check task panicked: {e}")))??;
+        if let Some(hit) = hit {
+            hits.insert(key, hit);
+        }
+    }
+    Ok(hits)
 }
 
 fn btree_from_hash_map(map: &HashMap<String, String>) -> BTreeMap<String, String> {
@@ -2929,6 +2984,16 @@ async fn run_with_options_under_store_lock(
     // at the link stage and folded into the LinkResult.
     type V2LinkHandle = tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
     let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
+    let v2_reusable_objects = if !force && v2_mode {
+        match store_v2_handle.as_ref() {
+            Some(store_v2) => {
+                prevalidate_v2_reusable_objects(&packages, std::sync::Arc::clone(store_v2)).await?
+            }
+            None => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
 
     //b: stale-entry cleanup runs once, up front — must
     // happen before any per-pkg link spawn touches `.lpm/` so the
@@ -3009,12 +3074,11 @@ async fn run_with_options_under_store_lock(
         // `expect(1)` per tarball relied on the speculation path
         // being a no-op (pre-4d drain) and broke under the wired-up
         // 4d spec path because every package was downloaded twice.
+        let package_key = install_pkg_key(p);
         if !force
             && v2_mode
             && !is_local_source
-            && let Some(v2_store) = store_v2_handle.as_deref()
-            && let Some(sri) = p.integrity.as_deref()
-            && let Some(reusable_object) = v2_store.reusable_object(sri)?
+            && let Some(reusable_object) = v2_reusable_objects.get(&package_key)
         {
             cached += 1;
             // followup #6b — dispatch link_v2_one immediately.
@@ -3023,10 +3087,11 @@ async fn run_with_options_under_store_lock(
             // with sibling fetches. Awaited at the link stage below.
             if v2_event_driven
                 && let Some(plan) = v2_plan.as_ref()
-                && let Some(target) = v2_target_by_key.get(&install_pkg_key(p)).cloned()
+                && let Some(target) = v2_target_by_key.get(&package_key).cloned()
             {
                 let mut target = target;
-                target.verified_object_tree_integrity = Some(reusable_object.tree_integrity);
+                target.verified_object_tree_integrity =
+                    Some(reusable_object.tree_integrity.clone());
                 let plan_arc = std::sync::Arc::clone(plan);
                 let store_arc = std::sync::Arc::clone(
                     store_v2_handle
@@ -3899,6 +3964,62 @@ async fn run_with_options_under_store_lock(
                         lpm_linker::link_one_package(&pd, &target, force_flag)
                     })))
                 };
+
+                if !force_flag
+                    && let (Some(store_v2), Some(expected_sri)) =
+                        (store_v2_ref.as_ref(), p.integrity.clone())
+                {
+                    let sri_for_result = expected_sri.clone();
+                    let store_v2_check = std::sync::Arc::clone(store_v2);
+                    let reusable_object = tokio::task::spawn_blocking(move || {
+                        store_v2_check.reusable_object(&expected_sri)
+                    })
+                    .await
+                    .map_err(|e| {
+                        LpmError::Registry(format!("v2 cache check task panicked: {e}"))
+                    })??;
+                    if let Some(reusable_object) = reusable_object {
+                        let v2_link_h: Option<V2LinkHandle> =
+                            if let (Some(plan), Some(target), Some(store_v2)) = (
+                                v2_plan_arc.as_ref(),
+                                v2_target_for_pkg.as_ref(),
+                                store_v2_ref.as_ref(),
+                            ) {
+                                let plan_c = std::sync::Arc::clone(plan);
+                                let mut target_c = target.clone();
+                                target_c.verified_object_tree_integrity =
+                                    Some(reusable_object.tree_integrity);
+                                let store_c = std::sync::Arc::clone(store_v2);
+                                Some(tokio::task::spawn_blocking(move || {
+                                    lpm_linker::v2::link_v2_one(&plan_c, &target_c, &store_c)
+                                }))
+                            } else {
+                                None
+                            };
+                        overall.inc(1);
+                        return Ok::<
+                            (
+                                String,
+                                String,
+                                TaskTimings,
+                                Option<LinkHandle>,
+                                Option<V2LinkHandle>,
+                                Option<String>,
+                            ),
+                            LpmError,
+                        >((
+                            install_pkg_key(&p),
+                            sri_for_result,
+                            TaskTimings {
+                                queue_wait_ms: queue_start.elapsed().as_millis(),
+                                ..Default::default()
+                            },
+                            None,
+                            v2_link_h,
+                            None,
+                        ));
+                    }
+                }
 
                 //b: only honour the store-hit short-circuit when
                 // NOT in `--force` mode. `--force` is the "re-verify
