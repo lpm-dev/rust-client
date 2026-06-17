@@ -69,31 +69,50 @@ pub(super) fn pick_speculative_version(
 ) -> Option<(String, String, Option<String>)> {
     // dist-tag path (e.g. "latest", "next", "beta")
     if let Some(pinned) = meta.dist_tags.get(range_str)
-        && let Some(vm) = meta.versions.get(pinned)
-        && let Some(url) = vm.tarball_url.as_deref()
+        && let Some(dist) = meta.info.dist.get(pinned)
+        && let Some(url) = dist.tarball_url.as_deref()
     {
-        return Some((pinned.clone(), url.to_string(), vm.integrity.clone()));
+        return Some((pinned.clone(), url.to_string(), dist.integrity.clone()));
     }
 
     let range = lpm_resolver::NpmRange::parse(range_str).ok()?;
-    let mut best: Option<(lpm_resolver::NpmVersion, &str)> = None;
-    for (v_str, vm) in meta.versions.iter() {
-        let Some(v) = vm.parsed_version.as_ref() else {
-            continue;
-        };
-        if !range.satisfies(v) {
+    let version = meta
+        .info
+        .versions
+        .iter()
+        .find(|version| range.satisfies(version))?;
+    let v_str = version.to_string();
+    let dist = meta.info.dist.get(&v_str)?;
+    let url = dist.tarball_url.clone()?;
+    let integrity = dist.integrity.clone();
+    Some((v_str, url, integrity))
+}
+
+pub(super) fn push_regular_speculative_dependencies(
+    meta: &SpeculativePackageMetadata,
+    version: &str,
+    next_depth: u32,
+    work_queue: &mut Vec<(String, String, u32, bool)>,
+) {
+    let Some(deps) = meta.info.deps.get(version) else {
+        return;
+    };
+    let optional = meta.info.optional_dep_names.get(version);
+    let aliases = meta.info.aliases.get(version);
+    for (dep_name, dep_range) in deps {
+        if optional.is_some_and(|names| names.contains(dep_name)) {
             continue;
         }
-        let better = best.as_ref().is_none_or(|(b, _)| v > b);
-        if better {
-            best = Some((v.clone(), v_str.as_str()));
-        }
+        let target_name = aliases
+            .and_then(|map| map.get(dep_name))
+            .map_or(dep_name.as_str(), String::as_str);
+        work_queue.push((
+            target_name.to_string(),
+            dep_range.clone(),
+            next_depth,
+            false,
+        ));
     }
-    let (_v, v_str) = best?;
-    let vm = meta.versions.get(v_str)?;
-    let url = vm.tarball_url.clone()?;
-    let integrity = vm.integrity.clone();
-    Some((v_str.to_string(), url, integrity))
 }
 
 /// /: stream metadata AND dispatch speculative
@@ -341,17 +360,11 @@ pub(super) fn spawn_speculation_dispatcher(
                 }
 
                 // Expand transitive deps onto the work queue (bounded by
-                // SPECULATION_MAX_DEPTH). Uses the chosen version's
-                // `dependencies` map — `dev` / `peer` / `optional` are out
-                // of scope because npm's install-time graph only chases
-                // production deps. Matches what PubGrub walks for
-                // production installs.
-                if depth < SPECULATION_MAX_DEPTH
-                    && let Some(vm) = meta.versions.get(&version)
-                {
-                    for (dep_name, dep_range) in &vm.dependencies {
-                        work_queue.push((dep_name.clone(), dep_range.clone(), depth + 1, false));
-                    }
+                // SPECULATION_MAX_DEPTH). Speculation follows regular deps
+                // only; optional deps are left to the authoritative fetch
+                // path, matching the previous raw-manifest payload.
+                if depth < SPECULATION_MAX_DEPTH {
+                    push_regular_speculative_dependencies(meta, &version, depth + 1, work_queue);
                 }
 
                 // Skip tarball speculation for auth-bearing custom

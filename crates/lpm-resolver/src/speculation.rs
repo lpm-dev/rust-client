@@ -1,64 +1,32 @@
-use crate::npm_version::NpmVersion;
+use crate::provider::{CachedPackageInfo, parse_metadata_to_cache_info};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct SpeculativePackageMetadata {
     pub dist_tags: HashMap<String, String>,
-    pub versions: HashMap<String, SpeculativeVersionMetadata>,
+    pub info: Arc<CachedPackageInfo>,
 }
 
-#[derive(Debug, Clone)]
-pub struct SpeculativeVersionMetadata {
-    pub parsed_version: Option<NpmVersion>,
-    pub tarball_url: Option<String>,
-    pub integrity: Option<String>,
-    pub dependencies: HashMap<String, String>,
+impl SpeculativePackageMetadata {
+    pub fn from_dist_tags_and_info(
+        dist_tags: HashMap<String, String>,
+        info: Arc<CachedPackageInfo>,
+    ) -> Self {
+        Self { dist_tags, info }
+    }
 }
 
 impl From<lpm_registry::PackageMetadata> for SpeculativePackageMetadata {
     fn from(meta: lpm_registry::PackageMetadata) -> Self {
-        let mut versions = HashMap::with_capacity(meta.versions.len());
-        for (version, version_meta) in meta.versions {
-            let parsed_version = NpmVersion::parse(&version).ok();
-            let tarball_url = version_meta.tarball_url().map(ToOwned::to_owned);
-            let integrity = version_meta.integrity_or_shasum().map(|s| s.into_owned());
-            versions.insert(
-                version,
-                SpeculativeVersionMetadata {
-                    parsed_version,
-                    tarball_url,
-                    integrity,
-                    dependencies: version_meta.dependencies,
-                },
-            );
-        }
-        Self {
-            dist_tags: meta.dist_tags,
-            versions,
-        }
+        let info = Arc::new(parse_metadata_to_cache_info(&meta));
+        Self::from_dist_tags_and_info(meta.dist_tags, info)
     }
 }
 
 impl From<&lpm_registry::PackageMetadata> for SpeculativePackageMetadata {
     fn from(meta: &lpm_registry::PackageMetadata) -> Self {
-        let mut versions = HashMap::with_capacity(meta.versions.len());
-        for (version, version_meta) in &meta.versions {
-            let parsed_version = NpmVersion::parse(version).ok();
-            let tarball_url = version_meta.tarball_url().map(ToOwned::to_owned);
-            let integrity = version_meta.integrity_or_shasum().map(|s| s.into_owned());
-            versions.insert(
-                version.clone(),
-                SpeculativeVersionMetadata {
-                    parsed_version,
-                    tarball_url,
-                    integrity,
-                    dependencies: version_meta.dependencies.clone(),
-                },
-            );
-        }
-        Self {
-            dist_tags: meta.dist_tags.clone(),
-            versions,
-        }
+        let info = Arc::new(parse_metadata_to_cache_info(meta));
+        Self::from_dist_tags_and_info(meta.dist_tags.clone(), info)
     }
 }

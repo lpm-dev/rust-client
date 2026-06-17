@@ -52,11 +52,49 @@ fn speculative_picker_uses_slim_metadata_for_dist_tags_and_transitive_deps() {
         ))
     );
     assert_eq!(
-        slim.versions
+        slim.info
+            .deps
             .get("1.0.0")
-            .and_then(|version| version.dependencies.get("left-pad")),
+            .and_then(|dependencies| dependencies.get("left-pad")),
         Some(&"^1.0.0".to_string())
     );
+}
+
+#[test]
+fn speculative_dependency_enqueue_rewrites_aliases_and_skips_optional_deps() {
+    let slim = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "fixture",
+        "dist-tags": {
+            "latest": "1.0.0"
+        },
+        "versions": {
+            "1.0.0": {
+                "name": "fixture",
+                "version": "1.0.0",
+                "dependencies": {
+                    "plain": "^1.0.0",
+                    "alias-local": "npm:alias-target@^2.0.0"
+                },
+                "optionalDependencies": {
+                    "optional-only": "^3.0.0"
+                },
+                "dist": {
+                    "tarball": "https://registry.example/fixture-1.0.0.tgz",
+                    "integrity": "sha512-one"
+                }
+            }
+        }
+    })));
+    let mut queue = Vec::new();
+
+    push_regular_speculative_dependencies(&slim, "1.0.0", 2, &mut queue);
+
+    let actual: std::collections::BTreeSet<_> = queue.into_iter().collect();
+    let expected = std::collections::BTreeSet::from([
+        ("alias-target".to_string(), "^2.0.0".to_string(), 2, false),
+        ("plain".to_string(), "^1.0.0".to_string(), 2, false),
+    ]);
+    assert_eq!(actual, expected);
 }
 
 #[tokio::test]
