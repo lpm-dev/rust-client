@@ -9,6 +9,13 @@ pub(super) const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 /// Maximum backoff delay (10 seconds).
 pub(super) const RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
 
+fn reqwest_error_chain(error: &reqwest::Error) -> String {
+    std::iter::successors(Some(error as &dyn std::error::Error), |err| err.source())
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>()
+        .join(" <- ")
+}
+
 impl RegistryClient {
     // ─── Internal: HTTP transport with retry ────────────────────────
 
@@ -371,6 +378,16 @@ impl RegistryClient {
             .build()
             .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
 
+        self.send_request_with_retry(request, None).await
+    }
+
+    pub(super) async fn send_request_with_retry(
+        &self,
+        request: reqwest::Request,
+        client_override: Option<reqwest::Client>,
+    ) -> Result<reqwest::Response, LpmError> {
+        self.validate_base_url()?;
+
         let mut last_error = None;
 
         for attempt in 0..=MAX_RETRIES {
@@ -378,7 +395,10 @@ impl RegistryClient {
                 LpmError::Network("request body cannot be retried (not cloneable)".into())
             })?;
 
-            let client_for_req = self.http.for_url(req.url().as_str()).await?;
+            let client_for_req = match client_override.as_ref() {
+                Some(client) => client.clone(),
+                None => self.http.for_url(req.url().as_str()).await?,
+            };
             match client_for_req.execute(req).await {
                 Ok(response) => {
                     let status = response.status().as_u16();
@@ -439,7 +459,7 @@ impl RegistryClient {
                 }
                 Err(e) => {
                     // Network-level errors (DNS, connection refused, timeout) are retryable
-                    last_error = Some(LpmError::Network(e.to_string()));
+                    last_error = Some(LpmError::Network(reqwest_error_chain(&e)));
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);
                         tokio::time::sleep(delay).await;

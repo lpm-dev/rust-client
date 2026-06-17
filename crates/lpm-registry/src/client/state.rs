@@ -87,6 +87,10 @@ pub struct RegistryClient {
     pub(super) base_url_origin: String,
     /// Precomputed ASCII-serialized origin of `npm_registry_url`.
     pub(super) npm_registry_url_origin: String,
+    /// Whether Worker-routed metadata requests should ask reqwest for HTTP/3.
+    pub(super) worker_metadata_http3_enabled: bool,
+    /// Lazily-built HTTP/3-capable client for Worker-routed metadata.
+    pub(super) worker_metadata_http3_client: Arc<tokio::sync::Mutex<Option<reqwest::Client>>>,
 }
 
 // ============================================================================
