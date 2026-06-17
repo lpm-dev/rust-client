@@ -1,6 +1,6 @@
 #!/bin/bash
 # README bench harness — npm / pnpm / bun / greedy-fusion lpm, round-robin
-# per outer iter.
+# per outer iter. Equal-footing cold install is the primary/default mode.
 #
 # Round-robin matches the methodology of `run-5cell.sh` (W4): each
 # outer iter runs all four arms back-to-back, so adjacent samples see the
@@ -9,10 +9,10 @@
 # first, lpm goes last, so lpm benefits and bun is biased somewhere
 # between). Round-robin removes that bias.
 #
-# Two modes per run:
-#   - clean   (cold install, equal footing — wipes OUTSIDE timer)
-#   - full    (cold install, reset-each-iter — lpm rotates old state
-#              OUTSIDE timer; npm/pnpm/bun wipe INSIDE timer)
+# Modes:
+#   - clean   (default; cold install, equal footing — wipes OUTSIDE timer)
+#   - full    (opt-in; cold install, reset-each-iter — lpm rotates old
+#              state OUTSIDE timer; npm/pnpm/bun wipe INSIDE timer)
 #
 # Each tool wipes its own lockfile + cache per iter. CRITICAL: bun's
 # wipe must include BOTH `bun.lock` (modern text format) and `bun.lockb`
@@ -26,6 +26,8 @@
 #
 #   BENCH_ARMS=lpm,bun ./bench/scripts/run-readme.sh 5 quick
 #   BENCH_ARMS=all     ./bench/scripts/run-readme.sh 20 readme
+#   BENCH_ARMS=npm,pnpm,bun,lpm,lpm-proxy-h3 ./bench/scripts/run-readme.sh 5 proxy-h3
+#   BENCH_INCLUDE_RESET_EACH_ITER=1 ./bench/scripts/run-readme.sh 5 reset-check
 
 set -euo pipefail
 
@@ -47,13 +49,37 @@ if [[ "$BENCH_ARMS_CSV" == "all" ]]; then
     BENCH_ARMS_CSV="lpm,bun,npm,pnpm"
 fi
 if [[ -z "$BENCH_ARMS_CSV" ]]; then
-    echo "ERROR: BENCH_ARMS must include at least one arm: lpm,bun,npm,pnpm or all"
+    echo "ERROR: BENCH_ARMS must include at least one arm: lpm,bun,npm,pnpm,lpm-proxy-h3 or all"
     exit 1
 fi
+BENCH_ARM_LIST=()
 for configured_arm in ${BENCH_ARMS_CSV//,/ }; do
     case "$configured_arm" in
-        lpm|bun|npm|pnpm) ;;
+        lpm|bun|npm|pnpm|lpm-proxy-h3) ;;
         *) echo "ERROR: unknown BENCH_ARMS entry '$configured_arm'"; exit 1;;
+    esac
+    BENCH_ARM_LIST+=("$configured_arm")
+done
+
+BENCH_INCLUDE_RESET_EACH_ITER="${BENCH_INCLUDE_RESET_EACH_ITER:-0}"
+BENCH_MODES=(clean)
+case "$BENCH_INCLUDE_RESET_EACH_ITER" in
+    1|true|TRUE|yes|YES|on|ON) BENCH_MODES+=(full);;
+    0|false|FALSE|no|NO|off|OFF|"") ;;
+    *) echo "ERROR: BENCH_INCLUDE_RESET_EACH_ITER must be 0/1, true/false, yes/no, or on/off"; exit 1;;
+esac
+BENCH_MODES_CSV="$(IFS=,; printf '%s' "${BENCH_MODES[*]}")"
+if (( ${#BENCH_ARM_LIST[@]} == 0 )); then
+    echo "ERROR: BENCH_ARMS must include at least one arm"
+    exit 1
+fi
+
+for required_tool in "${BENCH_ARM_LIST[@]}"; do
+    case "$required_tool" in
+        bun) if ! command -v bun &>/dev/null; then echo "ERROR: bun not on PATH"; exit 1; fi;;
+        npm) if ! command -v npm &>/dev/null; then echo "ERROR: npm not on PATH"; exit 1; fi;;
+        pnpm) if ! command -v pnpm &>/dev/null; then echo "ERROR: pnpm not on PATH"; exit 1; fi;;
+        lpm|lpm-proxy-h3) ;;
     esac
 done
 
@@ -75,9 +101,6 @@ DEFERRED_DELETE=()
 mkdir -p "$RESULTS" "$TRASH_DIR"
 
 if [[ ! -x "$BIN" ]]; then echo "ERROR: missing $BIN — build with cargo build --release"; exit 1; fi
-if arm_enabled bun && ! command -v bun &>/dev/null; then echo "ERROR: bun not on PATH"; exit 1; fi
-if arm_enabled npm && ! command -v npm &>/dev/null; then echo "ERROR: npm not on PATH"; exit 1; fi
-if arm_enabled pnpm && ! command -v pnpm &>/dev/null; then echo "ERROR: pnpm not on PATH"; exit 1; fi
 
 # Use a fresh work dir, not the in-tree fixture itself, so the `node_modules`
 # / lockfile churn doesn't pollute the committed fixture state.
@@ -116,6 +139,10 @@ prepare_full_lpm_reset() {
 
 run_lpm_install() {
     (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" "$BIN" install --json) > /dev/null 2>&1
+}
+
+run_lpm_proxy_h3_install() {
+    (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" LPM_NPM_ROUTE=proxy LPM_HTTP=h3-worker "$BIN" install --json) > /dev/null 2>&1
 }
 
 run_bun_install() {
@@ -161,10 +188,12 @@ run_arm() {
     local mode=$1 arm=$2
     case "$mode/$arm" in
         clean/lpm) clean_lpm; local s=$(now_ms); run_lpm_install; local e=$(now_ms);;
+        clean/lpm-proxy-h3) clean_lpm; local s=$(now_ms); run_lpm_proxy_h3_install; local e=$(now_ms);;
         clean/bun) clean_bun; local s=$(now_ms); run_bun_install; local e=$(now_ms);;
         clean/npm) clean_npm; local s=$(now_ms); run_npm_install; local e=$(now_ms);;
         clean/pnpm) clean_pnpm; local s=$(now_ms); run_pnpm_install; local e=$(now_ms);;
         full/lpm) prepare_full_lpm_reset; local s=$(now_ms); run_lpm_install; local e=$(now_ms);;
+        full/lpm-proxy-h3) prepare_full_lpm_reset; local s=$(now_ms); run_lpm_proxy_h3_install; local e=$(now_ms);;
         full/bun) local s=$(now_ms); (rm -rf "$BUN_CACHE_DIR" "${WORK}/node_modules" "${WORK}/bun.lock" "${WORK}/bun.lockb" 2>/dev/null; cd "$WORK" && bun install --ignore-scripts --cache-dir "$BUN_CACHE_DIR") > /dev/null 2>&1; local e=$(now_ms);;
         full/npm) local s=$(now_ms); (env npm_config_cache="$NPM_CACHE_DIR" npm cache clean --force > /dev/null 2>&1 || true; rm -rf "${WORK}/node_modules" "${WORK}/package-lock.json" 2>/dev/null; cd "$WORK" && env npm_config_cache="$NPM_CACHE_DIR" npm install --ignore-scripts) > /dev/null 2>&1; local e=$(now_ms);;
         full/pnpm) local s=$(now_ms); (rm -rf "$PNPM_STORE_DIR" 2>/dev/null; rm -rf "${WORK}/node_modules" "${WORK}/pnpm-lock.yaml" 2>/dev/null; cd "$WORK" && if [[ -n "$PNPM_STORE_DIR" ]]; then pnpm install --ignore-scripts --store-dir "$PNPM_STORE_DIR"; else pnpm install --ignore-scripts; fi) > /dev/null 2>&1; local e=$(now_ms);;
@@ -174,78 +203,45 @@ run_arm() {
     echo "  [${mode}] iter $i $arm = ${wall}ms"
 }
 
+run_mode_round_robin() {
+    local mode=$1 title=$2
+    echo "[$mode] $title"
+    local arm_count=${#BENCH_ARM_LIST[@]}
+    for i in $(seq 1 "$N"); do
+        local offset=$(( (i - 1) % arm_count ))
+        for (( step = 0; step < arm_count; step++ )); do
+            local arm="${BENCH_ARM_LIST[$(( (offset + step) % arm_count ))]}"
+            run_arm "$mode" "$arm"
+        done
+    done
+}
+
 echo "[bench] readme round-robin — n=${N} per arm, fixture: $(basename "$FIXTURE")"
 echo "[bench] HEAD: $(cd "$(dirname "$0")/../.." && git rev-parse --short HEAD) ($(cd "$(dirname "$0")/../.." && git branch --show-current))"
 echo "[bench] arms: $BENCH_ARMS_CSV"
-echo "[bench] full/lpm reset: out-of-band rotate"
+echo "[bench] modes: $BENCH_MODES_CSV"
+if arm_enabled lpm-proxy-h3; then
+    echo "[bench] lpm-proxy-h3: LPM_NPM_ROUTE=proxy LPM_HTTP=h3-worker"
+fi
+if [[ " $BENCH_MODES_CSV " == *full* ]]; then
+    echo "[bench] full/lpm reset: out-of-band rotate"
+fi
 date
 
 # Methodology:
-#   npm + pnpm   — sequential, n iters each. Their bun-lockfile-reuse
-#                  bias is N/A; their absolute numbers are reference
-#                  points, not the headline lpm-vs-bun comparison.
-#   lpm + bun    — strict 2-arm round-robin alternating per outer iter.
-#                  Iter 1 runs lpm-then-bun, iter 2 runs bun-then-lpm,
-#                  etc. Across n iters each arm visits position-1
-#                  (cold) and position-2 (warm-after-other) equally
-#                  often, so both see the same mix of network state.
-#                  This is the apples-to-apples like-for-like
-#                  comparison the bench/scripts baseline uses.
-
-# Order matters. Running npm/pnpm BEFORE the lpm+bun round-robin
-# would warm not just the local OS state (DNS, TCP keep-alives) but
-# also the npm CDN edge — causing bun's median to drop from ~870ms
-# to ~580ms relative to lpm. Run the lpm+bun headline FIRST while
-# the CDN is cold, then npm+pnpm afterward.
+#   All configured arms run in one round-robin per outer iter. Iter 1 starts
+#   at arm 1, iter 2 starts at arm 2, and so on. Across enough iterations,
+#   each arm sees the same mix of early/late CDN, DNS, TLS, and OS-cache
+#   state while each tool's own cache/lockfile cleanup stays outside the
+#   clean-mode timer.
 
 # ── Cold install, equal footing (wipes OUTSIDE timer) ──────────────
-echo "[clean] cold install, equal footing — wipes OUTSIDE timer"
-
-# lpm + bun round-robin (alternating order per iter) — the apples-to-
-# apples headline. Each arm visits position-1 and position-2 equally
-# often across n iters, so both see the same warm/cold network mix.
-if arm_enabled lpm && arm_enabled bun; then
-    for i in $(seq 1 "$N"); do
-        if (( i % 2 == 1 )); then arm_order=(lpm bun); else arm_order=(bun lpm); fi
-        for arm in "${arm_order[@]}"; do run_arm clean "$arm"; done
-    done
-else
-    for arm in lpm bun; do
-        if arm_enabled "$arm"; then
-            for i in $(seq 1 "$N"); do run_arm clean "$arm"; done
-        fi
-    done
-fi
-
-# npm + pnpm sequential — context numbers. Their ~1.5-7s install times
-# dwarf any 200-300ms network-warmth bias, so methodology drift is N/A.
-for arm in npm pnpm; do
-    if arm_enabled "$arm"; then
-        for i in $(seq 1 "$N"); do run_arm clean "$arm"; done
-    fi
-done
+run_mode_round_robin clean "cold install, equal footing — wipes OUTSIDE timer"
 
 # ── Cold install, reset-each-iter (lpm rotates old state) ──────────
-echo "[full] cold install, reset-each-iter — lpm rotates old state outside timer"
-
-if arm_enabled lpm && arm_enabled bun; then
-    for i in $(seq 1 "$N"); do
-        if (( i % 2 == 1 )); then arm_order=(lpm bun); else arm_order=(bun lpm); fi
-        for arm in "${arm_order[@]}"; do run_arm full "$arm"; done
-    done
-else
-    for arm in lpm bun; do
-        if arm_enabled "$arm"; then
-            for i in $(seq 1 "$N"); do run_arm full "$arm"; done
-        fi
-    done
+if [[ " $BENCH_MODES_CSV " == *full* ]]; then
+    run_mode_round_robin full "cold install, reset-each-iter — lpm rotates old state outside timer"
 fi
-
-for arm in npm pnpm; do
-    if arm_enabled "$arm"; then
-        for i in $(seq 1 "$N"); do run_arm full "$arm"; done
-    fi
-done
 
 # ── Summary ────────────────────────────────────────────────────────
 echo
@@ -253,26 +249,34 @@ echo "=== summary (n=${N}) ==="
 python3 - <<EOF
 import os, glob, statistics
 RES = "$RESULTS"
-print(f"\n{'mode':<8} {'arm':<6} {'median':>8} {'mean':>8} {'tmean10':>9} {'stdev':>7}")
-print("-" * 50)
+MODES = "$BENCH_MODES_CSV".split(",")
+ARMS = "$BENCH_ARMS_CSV".split(",")
+arm_width = max([6] + [len(arm) for arm in ARMS])
+print(f"\n{'mode':<8} {'arm':<{arm_width}} {'median':>8} {'mean':>8} {'tmean10':>9} {'stdev':>7}")
+print("-" * (44 + arm_width))
 def load(prefix, arm):
     files = sorted(glob.glob(os.path.join(RES, f"{prefix}-iter-*-{arm}.wall_ms")))
     return [int(open(f).read().strip()) for f in files]
-for mode in ("clean", "full"):
-    for arm in ("npm", "pnpm", "bun", "lpm"):
+for mode in MODES:
+    for arm in ARMS:
         v = load(mode, arm)
         if not v: continue
         s = sorted(v); n = len(v); trim = max(1, n//10)
         median = statistics.median(v); mean = statistics.mean(v)
         tmean = statistics.mean(s[trim:n-trim]) if n - 2*trim > 0 else mean
         stdev = statistics.stdev(v) if n > 1 else 0
-        print(f"{mode:<8} {arm:<6} {int(median):>8} {int(mean):>8} {int(tmean):>9} {int(stdev):>7}")
+        print(f"{mode:<8} {arm:<{arm_width}} {int(median):>8} {int(mean):>8} {int(tmean):>9} {int(stdev):>7}")
 
 print()
-for mode in ("clean", "full"):
+for mode in MODES:
     lpm_v = load(mode, "lpm"); bun_v = load(mode, "bun")
     if lpm_v and bun_v:
         print(f"  [{mode:<5}] lpm/bun ratio = {statistics.median(lpm_v)/statistics.median(bun_v):.2f}x")
+    proxy_v = load(mode, "lpm-proxy-h3")
+    if proxy_v and bun_v:
+        print(f"  [{mode:<5}] lpm-proxy-h3/bun ratio = {statistics.median(proxy_v)/statistics.median(bun_v):.2f}x")
+    if proxy_v and lpm_v:
+        print(f"  [{mode:<5}] lpm-proxy-h3/lpm ratio = {statistics.median(proxy_v)/statistics.median(lpm_v):.2f}x")
 EOF
 
 echo
