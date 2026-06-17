@@ -13,6 +13,7 @@ pub(super) const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::
 /// cache, while pathological files collapse to a cache miss before
 /// any decode work happens.
 pub(super) const METADATA_CACHE_FILE_CAP: u64 = 100 * 1024 * 1024;
+const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
 
 /// Magic header for the manifest cache file format. Replaces the
 /// per-payload HMAC-SHA256 that used to run on every write. The cache
@@ -254,8 +255,13 @@ impl RegistryClient {
     /// deserialized by the caller on a 304 response, avoiding a second file
     /// read. Does NOT check TTL — used for conditional requests where the
     /// cache may be stale.
+    #[cfg(test)]
     pub(super) fn read_cache_content(&self, key: &str) -> Option<CacheContent> {
         let path = self.cache_path(key)?;
+        Self::read_cache_content_path(&path)
+    }
+
+    pub(super) fn read_cache_content_path(path: &std::path::Path) -> Option<CacheContent> {
         if !path.exists() {
             return None;
         }
@@ -274,18 +280,82 @@ impl RegistryClient {
             return None;
         }
 
-        let content = std::fs::read(&path).ok()?;
+        let content = std::fs::read(path).ok()?;
         let (etag_bytes, data) = parse_cached_metadata_blob(&content)?;
 
+        #[cfg(test)]
         let etag = std::str::from_utf8(etag_bytes)
             .ok()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        #[cfg(not(test))]
+        let _ = etag_bytes;
 
         Some(CacheContent {
+            #[cfg(test)]
             etag,
             data: data.to_vec(),
         })
+    }
+
+    /// Read only the ETag from a cached entry for a conditional request.
+    ///
+    /// Unlike [`Self::read_cache_content`], this avoids reading the cached
+    /// packument payload before the HTTP response is known. If the server
+    /// returns 304, the caller can hydrate the cached body then.
+    pub(super) fn read_cache_validator(&self, key: &str) -> Option<CacheValidator> {
+        let path = self.cache_path(key)?;
+        Self::read_cache_validator_path(&path)
+    }
+
+    pub(super) fn read_cache_validator_path(path: &std::path::Path) -> Option<CacheValidator> {
+        use std::io::{BufRead as _, Read as _};
+
+        if !path.exists() {
+            return None;
+        }
+
+        let file_size = path.metadata().ok()?.len();
+        if file_size > METADATA_CACHE_FILE_CAP {
+            tracing::warn!(
+                path = %path.display(),
+                size = file_size,
+                cap = METADATA_CACHE_FILE_CAP,
+                "metadata cache entry exceeds size cap — treating as miss"
+            );
+            return None;
+        }
+
+        let file = std::fs::File::open(path).ok()?;
+        let mut reader =
+            std::io::BufReader::new(std::io::Read::take(file, METADATA_CACHE_FILE_CAP));
+
+        let mut magic = [0u8; METADATA_CACHE_MAGIC.len()];
+        reader.read_exact(&mut magic).ok()?;
+        if magic != *METADATA_CACHE_MAGIC {
+            return None;
+        }
+
+        let mut etag_line = Vec::with_capacity(64);
+        let bytes_read = reader
+            .by_ref()
+            .take(METADATA_CACHE_ETAG_LINE_CAP + 1)
+            .read_until(b'\n', &mut etag_line)
+            .ok()?;
+        if bytes_read == 0
+            || etag_line.last().copied() != Some(b'\n')
+            || etag_line.len() as u64 > METADATA_CACHE_ETAG_LINE_CAP
+        {
+            return None;
+        }
+        etag_line.pop();
+
+        let etag = std::str::from_utf8(&etag_line)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        Some(CacheValidator { etag })
     }
 
     /// Write metadata to cache with a magic-header marker and optional ETag.

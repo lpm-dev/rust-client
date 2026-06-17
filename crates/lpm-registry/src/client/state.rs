@@ -14,8 +14,14 @@ pub struct DownloadedTarball {
 
 /// Magic-verified cache content: ETag + raw data bytes ready for deserialization.
 pub(super) struct CacheContent {
+    #[cfg(test)]
     pub(super) etag: Option<String>,
     pub(super) data: Vec<u8>,
+}
+
+/// Magic-verified cache validator used for conditional metadata requests.
+pub(super) struct CacheValidator {
+    pub(super) etag: Option<String>,
 }
 
 /// Observability for [`RegistryClient::parallel_fetch_npm_manifests`].

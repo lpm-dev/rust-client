@@ -111,6 +111,27 @@ fn read_cache_content_returns_etag_and_data() {
 }
 
 #[test]
+fn read_cache_validator_returns_etag_without_deserializing_payload() {
+    let (client, _tmp) = client_with_temp_cache();
+    let cache_path = client
+        .cache_path("validator-key")
+        .expect("cache path should be available");
+
+    let mut content = Vec::new();
+    content.extend_from_slice(METADATA_CACHE_MAGIC);
+    content.extend_from_slice(b"W/\"validator\"");
+    content.push(b'\n');
+    content.extend_from_slice(b"not-valid-metadata");
+    std::fs::write(cache_path, content).unwrap();
+
+    let validator = client
+        .read_cache_validator("validator-key")
+        .expect("validator should be readable without decoding payload");
+
+    assert_eq!(validator.etag.as_deref(), Some("W/\"validator\""));
+}
+
+#[test]
 fn read_cache_content_returns_none_etag_when_no_etag() {
     let (client, _tmp) = client_with_temp_cache();
     let meta = test_metadata("@lpm.dev/test.no-etag-read");
@@ -246,6 +267,12 @@ async fn etag_304_revalidation_lpm_metadata() {
     assert!(result2.is_ok(), "304 revalidation should succeed");
     let meta2 = result2.unwrap();
     assert_eq!(meta2.name, pkg_name, "should return cached metadata on 304");
+    assert!(
+        client
+            .read_metadata_cache(&format!("lpm:{pkg_name}"))
+            .is_some(),
+        "304 should refresh LPM metadata cache freshness"
+    );
 }
 
 #[tokio::test]
@@ -595,6 +622,55 @@ async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_valida
             .as_deref(),
         Some("\"direct-v2\"")
     );
+}
+
+#[tokio::test]
+async fn proxy_only_metadata_etag_304_revalidation_refreshes_cache() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+
+    let npm_name = "proxy-only-pkg";
+    Mock::given(method("GET"))
+        .and(path("/api/registry/proxy-only-pkg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json(npm_name))
+                .append_header("ETag", "\"proxy-only-v1\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client
+        .get_npm_package_metadata_proxy_only(npm_name)
+        .await
+        .unwrap();
+    expire_cache_entry(&client, &format!("npm:{npm_name}"));
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/proxy-only-pkg"))
+        .and(header("If-None-Match", "\"proxy-only-v1\""))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let revalidated = client
+        .get_npm_package_metadata_proxy_only(npm_name)
+        .await
+        .unwrap();
+    assert_eq!(revalidated.name, npm_name);
+
+    server.reset().await;
+    let cached = client
+        .get_npm_package_metadata_proxy_only(npm_name)
+        .await
+        .unwrap();
+    assert_eq!(cached.name, npm_name);
 }
 
 #[tokio::test]
@@ -1417,6 +1493,12 @@ fn oversized_metadata_cache_file_collapses_to_miss() {
     assert!(
         content.is_none(),
         "read_cache_content must also refuse oversized files"
+    );
+
+    let validator = client.read_cache_validator(&key);
+    assert!(
+        validator.is_none(),
+        "read_cache_validator must also refuse oversized files"
     );
 }
 

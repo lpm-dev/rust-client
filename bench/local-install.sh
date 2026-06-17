@@ -134,6 +134,30 @@ make_cache_stale() {
 	find "$HOME_DIR/.lpm/cache" -type f -exec touch -t 200001010000 {} + 2>/dev/null || true
 }
 
+poison_metadata_etags() {
+	python3 - "$HOME_DIR/.lpm/cache/metadata" <<'PY'
+import pathlib
+import sys
+
+cache_dir = pathlib.Path(sys.argv[1])
+if not cache_dir.exists():
+    raise SystemExit(0)
+
+magic = b"LPM-MD-V3\n"
+for path in cache_dir.iterdir():
+    if not path.is_file():
+        continue
+    content = path.read_bytes()
+    if not content.startswith(magic):
+        continue
+    rest = content[len(magic):]
+    newline = rest.find(b"\n")
+    if newline < 0:
+        continue
+    path.write_bytes(magic + b'"lpm-local-stale-bench"\n' + rest[newline + 1:])
+PY
+}
+
 run_lpm_json() {
 	local output_file="$1"
 	local stderr_file="$2"
@@ -246,6 +270,9 @@ scenario "repeat" "true" --no-skills
 
 make_cache_stale
 scenario "stale-304" "make_cache_stale; rm -rf '$PROJECT_DIR/node_modules'" --no-skills --force
+
+make_cache_stale
+scenario "stale-200" "make_cache_stale; poison_metadata_etags; rm -rf '$PROJECT_DIR/node_modules'" --no-skills --force
 
 scenario "fetch" "reset_project; reset_lpm_home" --no-skills
 
