@@ -42,7 +42,7 @@ pub use resolve::{
     validate_allowed_versions_range, validate_allowed_versions_selector,
 };
 pub use specifier::{Specifier, SpecifierParseError};
-pub use speculation::{SpeculativePackageMetadata, SpeculativeVersionMetadata};
+pub use speculation::SpeculativePackageMetadata;
 pub use walker::{BfsWalker, DEFAULT_NPM_FANOUT, LevelTiming, WalkerError, WalkerSummary};
 
 #[cfg(feature = "bench-internals")]
