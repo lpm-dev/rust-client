@@ -16,10 +16,13 @@ impl RegistryClient {
         if !self.worker_metadata_http3_enabled {
             return false;
         }
+        if self.base_url_origin != DEFAULT_REGISTRY_URL {
+            return false;
+        }
         let Ok(parsed) = reqwest::Url::parse(url) else {
             return false;
         };
-        parsed.scheme() == "https" && parsed.origin().ascii_serialization() == self.base_url_origin
+        parsed.scheme() == "https" && parsed.origin().ascii_serialization() == DEFAULT_REGISTRY_URL
     }
 
     async fn worker_metadata_http3_client_for(
@@ -107,16 +110,46 @@ impl RegistryClient {
         let request = request_builder
             .build()
             .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
-        let client_override = if request.version() == reqwest::Version::HTTP_3 {
+        let attempted_worker_http3 = request.version() == reqwest::Version::HTTP_3;
+        let fallback_request = Self::worker_metadata_http3_fallback_request(&request)?;
+        let client_override = if attempted_worker_http3 {
             self.worker_metadata_http3_client.lock().await.clone()
         } else {
             None
         };
-        let response = self
-            .send_request_with_retry(request, client_override)
-            .await?;
+        let response = match self.send_request_with_retry(request, client_override).await {
+            Ok(response) => response,
+            Err(error)
+                if attempted_worker_http3
+                    && Self::worker_metadata_http3_should_fallback(&error) =>
+            {
+                let Some(fallback_request) = fallback_request else {
+                    return Err(error);
+                };
+                tracing::debug!("Worker metadata HTTP/3 failed; retrying with default transport");
+                self.send_request_with_retry(fallback_request, None).await?
+            }
+            Err(error) => return Err(error),
+        };
         crate::timing::record_metadata_http_version(response.version());
         Ok(response)
+    }
+
+    pub(super) fn worker_metadata_http3_should_fallback(error: &LpmError) -> bool {
+        matches!(error, LpmError::Network(_))
+    }
+
+    pub(super) fn worker_metadata_http3_fallback_request(
+        request: &reqwest::Request,
+    ) -> Result<Option<reqwest::Request>, LpmError> {
+        if request.version() != reqwest::Version::HTTP_3 {
+            return Ok(None);
+        }
+        let mut fallback = request.try_clone().ok_or_else(|| {
+            LpmError::Network("request body cannot be retried (not cloneable)".into())
+        })?;
+        *fallback.version_mut() = reqwest::Version::default();
+        Ok(Some(fallback))
     }
 
     fn npm_proxy_can_fallback_to_direct(error: &LpmError) -> bool {
