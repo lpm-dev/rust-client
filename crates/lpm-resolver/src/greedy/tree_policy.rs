@@ -8,6 +8,13 @@ pub(super) trait TreeManifestProvider {
         &'a self,
         canonical: &'a CanonicalKey,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + 'a>>;
+
+    fn prefetch_manifests<'a>(
+        &'a self,
+        _canonicals: &'a [CanonicalKey],
+    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(async {})
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +126,23 @@ where
         let bundled_names = info.bundled_dep_names.get(&version_str);
         let mut entries: Vec<(&String, &String)> = deps.iter().collect();
         entries.sort_by_key(|(name, _)| *name);
+        let prefetch_canonicals: Vec<CanonicalKey> = entries
+            .iter()
+            .filter_map(|(local_name, range_str)| {
+                if bundled_names.is_some_and(|names| names.contains(*local_name))
+                    || optional_names.is_some_and(|names| names.contains(*local_name))
+                    || super::version::is_workspace_specifier(range_str)
+                    || NpmRange::parse(range_str).is_err()
+                {
+                    return None;
+                }
+                Some(match aliases.and_then(|alias| alias.get(*local_name)) {
+                    Some(target) => CanonicalKey::from_dep_name(target),
+                    None => CanonicalKey::from_dep_name(local_name),
+                })
+            })
+            .collect();
+        provider.prefetch_manifests(&prefetch_canonicals).await;
 
         for (local_name, range_str) in entries {
             if bundled_names.is_some_and(|names| names.contains(local_name)) {

@@ -19,6 +19,7 @@ struct FusedTreeProvider<'a> {
     spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     dispatcher_rpc_count: Cell<u64>,
     tarball_dispatched_count: Cell<u64>,
+    worker_batch_disabled: &'a Cell<bool>,
 }
 
 impl TreeManifestProvider for FusedTreeProvider<'_> {
@@ -70,6 +71,106 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
             Ok(info_arc)
         })
     }
+
+    fn prefetch_manifests<'a>(
+        &'a self,
+        canonicals: &'a [CanonicalKey],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            if self.worker_batch_disabled.get() || canonicals.is_empty() {
+                return;
+            }
+
+            let mut seen = AHashSet::with_capacity(canonicals.len());
+            let mut names = Vec::with_capacity(canonicals.len());
+            for canonical in canonicals {
+                if self.shared_cache.contains_key(canonical) {
+                    continue;
+                }
+                let CanonicalKey::Npm { name } = canonical else {
+                    continue;
+                };
+                if !matches!(
+                    self.route_table.route_for_package(name),
+                    UpstreamRoute::LpmWorker
+                ) {
+                    continue;
+                }
+                if seen.insert(canonical.clone()) {
+                    names.push(name.clone());
+                }
+            }
+            if names.is_empty() {
+                return;
+            }
+
+            match self.client.batch_metadata_deep(&names).await {
+                Ok(batch) => {
+                    self.dispatcher_rpc_count
+                        .set(self.dispatcher_rpc_count.get() + 1);
+                    for (name, meta) in batch {
+                        let canonical = crate::package::CanonicalKey::from_dep_name(&name);
+                        if matches!(canonical, crate::package::CanonicalKey::Root) {
+                            continue;
+                        }
+                        if !matches!(
+                            self.route_table.route_for_package(&name),
+                            UpstreamRoute::LpmWorker
+                        ) {
+                            continue;
+                        }
+                        let fetched = parse_fetched_metadata(meta, self.spec_tx.is_some());
+                        let FetchedMetadata { speculation, info } = fetched;
+                        self.shared_cache.insert(canonical.clone(), info);
+                        if let (Some(tx), Some(speculation)) = (self.spec_tx, speculation)
+                            && tx.try_send((canonical.to_string(), speculation)).is_ok()
+                        {
+                            self.tarball_dispatched_count
+                                .set(self.tarball_dispatched_count.get() + 1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.worker_batch_disabled.set(true);
+                    tracing::debug!(
+                        "greedy-fusion: Worker tree prefetch batch failed ({} names): {e} \
+                         — falling back to per-package dispatch",
+                        names.len()
+                    );
+                }
+            }
+        })
+    }
+}
+
+fn spawn_metadata_fetch_job(
+    metadata_jobs: &mut tokio::task::JoinSet<(CanonicalKey, FetchResult)>,
+    metadata_sem: &Arc<tokio::sync::Semaphore>,
+    client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
+    policy: &ResolverPolicy,
+    canonical: CanonicalKey,
+    include_speculation: bool,
+) {
+    let client_c = client.clone();
+    let permit = metadata_sem.clone();
+    let route_table_c = route_table.clone();
+    let policy_c = policy.clone();
+    metadata_jobs.spawn(async move {
+        let _p = permit
+            .acquire_owned()
+            .await
+            .expect("metadata semaphore must outlive the resolver");
+        let result = fetch_metadata_for_resolver(
+            &client_c,
+            &route_table_c,
+            &canonical,
+            &policy_c,
+            include_speculation,
+        )
+        .await;
+        (canonical, result)
+    });
 }
 
 /// Fused dispatcher: greedy resolver IS the fetch dispatcher. Replaces the
@@ -224,6 +325,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
         policy.clone(),
     );
     state.seed_root_edges()?;
+    let worker_batch_disabled = Cell::new(false);
     let tree_provider = FusedTreeProvider {
         client: &client,
         route_table: &route_table,
@@ -232,6 +334,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
         spec_tx: spec_tx.as_ref(),
         dispatcher_rpc_count: Cell::new(0),
         tarball_dispatched_count: Cell::new(0),
+        worker_batch_disabled: &worker_batch_disabled,
     };
 
     // Loop-local state, owned by this single task. No Arcs needed
@@ -313,6 +416,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                 }
             }
             Err(e) => {
+                worker_batch_disabled.set(true);
                 tracing::debug!(
                     "greedy-fusion: Worker pre-batch failed ({} names): {e} \
                      — falling back to per-package dispatch",
@@ -342,6 +446,8 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
     let mut parked_max_depth: u32 = 0;
 
     loop {
+        let mut worker_batch_candidates: Vec<(CanonicalKey, String)> = Vec::new();
+
         // ── Drain `task_queue` synchronously ─────────────────────
         while let Some(edge) = state.task_queue.pop_front() {
             // Cache hit fast-path. Hot path; one DashMap lookup +
@@ -363,41 +469,114 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                 process_edge_with_preferred(&edge, &info_arc, preferred, &mut state)?;
                 continue;
             }
-            // Cache miss — park the edge and spawn one fetch per
-            // canonical. The `inflight.insert` guard ensures we don't
-            // dispatch two fetches for the same canonical when sibling
-            // parents ask in close succession (one fetch per canonical,
-            // deduped via the inflight set).
+            // Cache miss — park the edge and dispatch one fetch per
+            // canonical. Worker-routed npm misses discovered in this
+            // drain are grouped into one batch below; direct/custom
+            // routes keep the existing per-package fetch path.
             let canonical = edge.canonical.clone();
             parked.entry(canonical.clone()).or_default().push(edge);
             if inflight.insert(canonical.clone()) {
-                let client_c = client.clone();
-                let permit = metadata_sem.clone();
-                let route_table_c = route_table.clone();
-                let policy_c = policy.clone();
                 let include_speculation = spec_tx.is_some();
-                metadata_jobs.spawn(async move {
-                    // Acquire the metadata permit inside the task so
-                    // the queue cap (256) limits in-flight HTTP calls,
-                    // not spawn allocations. The `expect` guards an
-                    // invariant we control (the semaphore lives for
-                    // the resolver's lifetime); a panic here means we
-                    // dropped the semaphore early, which is a bug.
-                    let _p = permit
-                        .acquire_owned()
-                        .await
-                        .expect("metadata semaphore must outlive the resolver");
-                    let result = fetch_metadata_for_resolver(
-                        &client_c,
-                        &route_table_c,
-                        &canonical,
-                        &policy_c,
+                let worker_name = match &canonical {
+                    CanonicalKey::Npm { name }
+                        if !worker_batch_disabled.get()
+                            && matches!(
+                                route_table.route_for_package(name),
+                                UpstreamRoute::LpmWorker
+                            ) =>
+                    {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(name) = worker_name {
+                    worker_batch_candidates.push((canonical, name));
+                } else {
+                    spawn_metadata_fetch_job(
+                        &mut metadata_jobs,
+                        &metadata_sem,
+                        &client,
+                        &route_table,
+                        &policy,
+                        canonical,
                         include_speculation,
-                    )
-                    .await;
-                    (canonical, result)
-                });
-                dispatcher_rpc_count += 1;
+                    );
+                    dispatcher_rpc_count += 1;
+                }
+            }
+        }
+
+        if !worker_batch_candidates.is_empty() {
+            let worker_names: Vec<String> = worker_batch_candidates
+                .iter()
+                .map(|(_, name)| name.clone())
+                .collect();
+            match client.batch_metadata_deep(&worker_names).await {
+                Ok(batch) => {
+                    dispatcher_rpc_count += 1;
+                    let mut returned = AHashSet::with_capacity(batch.len());
+                    for (name, meta) in batch {
+                        let canonical = crate::package::CanonicalKey::from_dep_name(&name);
+                        if matches!(canonical, crate::package::CanonicalKey::Root) {
+                            continue;
+                        }
+                        if !matches!(
+                            route_table.route_for_package(&name),
+                            UpstreamRoute::LpmWorker
+                        ) {
+                            continue;
+                        }
+                        returned.insert(canonical.clone());
+                        inflight.remove(&canonical);
+                        let fetched = parse_fetched_metadata(meta, spec_tx.is_some());
+                        complete_metadata_fetch(
+                            canonical,
+                            Ok(fetched),
+                            &shared_cache,
+                            spec_tx.as_ref(),
+                            &mut tarball_dispatched_count,
+                            &mut parked,
+                            &mut state,
+                        )?;
+                    }
+
+                    for (canonical, _) in worker_batch_candidates {
+                        if returned.contains(&canonical) {
+                            continue;
+                        }
+                        spawn_metadata_fetch_job(
+                            &mut metadata_jobs,
+                            &metadata_sem,
+                            &client,
+                            &route_table,
+                            &policy,
+                            canonical,
+                            spec_tx.is_some(),
+                        );
+                        dispatcher_rpc_count += 1;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    worker_batch_disabled.set(true);
+                    tracing::debug!(
+                        "greedy-fusion: Worker tail batch failed ({} names): {e} \
+                         — falling back to per-package dispatch",
+                        worker_batch_candidates.len()
+                    );
+                    for (canonical, _) in worker_batch_candidates {
+                        spawn_metadata_fetch_job(
+                            &mut metadata_jobs,
+                            &metadata_sem,
+                            &client,
+                            &route_table,
+                            &policy,
+                            canonical,
+                            spec_tx.is_some(),
+                        );
+                        dispatcher_rpc_count += 1;
+                    }
+                }
             }
         }
 
@@ -432,26 +611,16 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                 // returns None for these (nothing was parked) so the
                 // resume step is a no-op.
                 inflight.insert(canonical.clone());
-                let client_c = client.clone();
-                let permit = metadata_sem.clone();
-                let route_table_c = route_table.clone();
-                let policy_c = policy.clone();
                 let include_speculation = spec_tx.is_some();
-                metadata_jobs.spawn(async move {
-                    let _p = permit
-                        .acquire_owned()
-                        .await
-                        .expect("metadata semaphore must outlive the resolver");
-                    let result = fetch_metadata_for_resolver(
-                        &client_c,
-                        &route_table_c,
-                        &canonical,
-                        &policy_c,
-                        include_speculation,
-                    )
-                    .await;
-                    (canonical, result)
-                });
+                spawn_metadata_fetch_job(
+                    &mut metadata_jobs,
+                    &metadata_sem,
+                    &client,
+                    &route_table,
+                    &policy,
+                    canonical,
+                    include_speculation,
+                );
                 dispatcher_rpc_count += 1;
                 peer_prefetch_count += 1;
             }
@@ -460,7 +629,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
         // High-water samples. O(unique-canonicals-parked) per tick;
         // ~tens of entries × ~134 ticks on bench/fixture-large is
         // negligible vs the network wall.
-        let inflight_now = metadata_jobs.len() as u64;
+        let inflight_now = inflight.len() as u64;
         if inflight_now > inflight_high_water {
             inflight_high_water = inflight_now;
         }
