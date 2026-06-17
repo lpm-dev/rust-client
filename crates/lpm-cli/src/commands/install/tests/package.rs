@@ -51,6 +51,54 @@ fn build_minimal_tarball_with_pkg(name: &str, version: &str) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+#[tokio::test]
+async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = lpm_store::v2::Store::at(dir.path().join("store"));
+    let tarball = build_minimal_tarball_with_pkg("cache-hit", "1.0.0");
+    let (object_dir, sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+
+    let mut pkg = fake_pkg("cache-hit", "1.0.0", true);
+    pkg.integrity = Some(sri);
+    let key = install_pkg_key(&pkg);
+
+    let hits = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
+        .await
+        .unwrap();
+
+    let hit = hits
+        .get(&key)
+        .expect("prevalidation must return the v2 object hit");
+    assert_eq!(hit.path, object_dir);
+    assert!(hit.tree_integrity.as_str().starts_with("sha256-"));
+}
+
+#[tokio::test]
+async fn prevalidate_v2_reusable_objects_removes_tampered_registry_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = lpm_store::v2::Store::at(dir.path().join("store"));
+    let tarball = build_minimal_tarball_with_pkg("tampered", "1.0.0");
+    let (object_dir, sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+    std::fs::write(
+        object_dir.join("package.json"),
+        br#"{"name":"tampered","version":"1.0.0","changed":true}"#,
+    )
+    .unwrap();
+
+    let mut pkg = fake_pkg("tampered", "1.0.0", true);
+    pkg.integrity = Some(sri);
+
+    let hits = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
+        .await
+        .unwrap();
+
+    assert!(hits.is_empty());
+    assert!(
+        !object_dir.exists(),
+        "tampered v2 objects must still be removed before cache reuse"
+    );
+}
+
 #[test]
 fn store_has_source_aware_does_not_accept_registry_for_tarball_pkg() {
     // Construct: a registry-CAS entry exists at (name, version).

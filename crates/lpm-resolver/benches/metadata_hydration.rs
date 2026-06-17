@@ -15,6 +15,7 @@ use lpm_resolver::{
     benchmark_parse_metadata_to_cache_info,
 };
 use serde_json::{Map, Value};
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 enum DependencyShape {
@@ -106,6 +107,10 @@ fn bench_metadata_hydration(c: &mut Criterion) {
             synthetic_packument(version_count, true, DependencyShape::EveryVersion);
         let (_, sparse_abbreviated_metadata) =
             synthetic_packument(version_count, false, DependencyShape::LatestOnly);
+        let speculation_info = Arc::new(benchmark_parse_metadata_to_cache_info(
+            &abbreviated_metadata,
+        ));
+        let speculation_input = (&abbreviated_metadata, speculation_info);
 
         group.bench_with_input(
             BenchmarkId::new("json_deserialize_abbreviated", version_count),
@@ -166,13 +171,14 @@ fn bench_metadata_hydration(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("speculation_projection", version_count),
-            &abbreviated_metadata,
-            |b, metadata| {
-                b.iter_batched(
-                    || metadata.clone(),
-                    |metadata| black_box(SpeculativePackageMetadata::from(metadata)),
-                    BatchSize::SmallInput,
-                );
+            &speculation_input,
+            |b, (metadata, info)| {
+                b.iter(|| {
+                    black_box(SpeculativePackageMetadata::from_dist_tags_and_info(
+                        metadata.dist_tags.clone(),
+                        info.clone(),
+                    ))
+                });
             },
         );
 
@@ -183,8 +189,11 @@ fn bench_metadata_hydration(c: &mut Criterion) {
                 b.iter_batched(
                     || metadata.clone(),
                     |metadata| {
-                        let info = benchmark_parse_metadata_to_cache_info(&metadata);
-                        let speculation = SpeculativePackageMetadata::from(metadata);
+                        let info = Arc::new(benchmark_parse_metadata_to_cache_info(&metadata));
+                        let speculation = SpeculativePackageMetadata::from_dist_tags_and_info(
+                            metadata.dist_tags,
+                            info.clone(),
+                        );
                         black_box((info, speculation))
                     },
                     BatchSize::SmallInput,

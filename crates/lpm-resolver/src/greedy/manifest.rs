@@ -134,7 +134,9 @@ pub(super) fn parse_fetched_metadata(
     include_speculation: bool,
 ) -> FetchedMetadata {
     let info = Arc::new(parse_metadata_to_cache_info(&metadata));
-    let speculation = include_speculation.then(|| SpeculativePackageMetadata::from(metadata));
+    let speculation = include_speculation.then(|| {
+        SpeculativePackageMetadata::from_dist_tags_and_info(metadata.dist_tags, info.clone())
+    });
     FetchedMetadata { speculation, info }
 }
 
@@ -143,7 +145,9 @@ pub(super) fn parse_full_fetched_metadata(
     include_speculation: bool,
 ) -> FetchedMetadata {
     let info = Arc::new(parse_full_metadata_to_cache_info(&metadata));
-    let speculation = include_speculation.then(|| SpeculativePackageMetadata::from(metadata));
+    let speculation = include_speculation.then(|| {
+        SpeculativePackageMetadata::from_dist_tags_and_info(metadata.dist_tags, info.clone())
+    });
     FetchedMetadata { speculation, info }
 }
 

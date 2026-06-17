@@ -59,6 +59,7 @@ grep -Fq 'cold' "$TMP_DIR/out.txt"
 grep -Fq 'warm' "$TMP_DIR/out.txt"
 grep -Fq 'repeat' "$TMP_DIR/out.txt"
 grep -Fq 'stale-304' "$TMP_DIR/out.txt"
+grep -Fq 'stale-200' "$TMP_DIR/out.txt"
 grep -Fq 'fetch' "$TMP_DIR/out.txt"
 
 grep -Fq -- '--registry http://127.0.0.1:' "$ARGS_FILE"
