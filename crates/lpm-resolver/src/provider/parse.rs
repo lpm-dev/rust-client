@@ -29,6 +29,19 @@ pub(crate) fn parse_full_metadata_to_cache_info(
     parse_metadata_to_cache_info_inner(metadata, true)
 }
 
+pub(crate) fn merge_release_times_into_cache_info(
+    info: &mut CachedPackageInfo,
+    release_times: &lpm_registry::ReleaseTimeMetadata,
+) {
+    for (version, dist) in &mut info.dist {
+        if dist.published_at.is_none()
+            && let Some(published_at) = release_times.time.get(version)
+        {
+            dist.published_at = Some(published_at.clone());
+        }
+    }
+}
+
 fn parse_metadata_to_cache_info_inner(
     metadata: &lpm_registry::PackageMetadata,
     trust_metadata_complete: bool,

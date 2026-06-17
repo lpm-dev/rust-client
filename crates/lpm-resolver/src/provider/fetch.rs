@@ -56,8 +56,10 @@ impl LpmDependencyProvider {
                 .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
 
                 let mut info = parse_metadata_to_cache_info(&metadata);
-                if info.needs_policy_metadata(&key, &self.policy) {
+                if info.needs_trust_metadata(&self.policy) {
                     info = self.fetch_full_policy_info(name, route, &key)?;
+                } else if info.needs_release_time_metadata(&key, &self.policy) {
+                    self.fetch_release_time_policy_info(name, route, &key, &mut info)?;
                 }
                 tracing::debug!("npm package {name}: {} versions", info.versions.len());
                 self.insert_and_notify(key, info);
@@ -95,5 +97,38 @@ impl LpmDependencyProvider {
             .block_on(self.client.refetch_npm_metadata_direct_full(name))
             .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
         Ok(parse_full_metadata_to_cache_info(&direct_full))
+    }
+
+    fn fetch_release_time_policy_info(
+        &self,
+        name: &str,
+        route: UpstreamRoute,
+        key: &CanonicalKey,
+        info: &mut CachedPackageInfo,
+    ) -> Result<(), ProviderError> {
+        let release_times = self
+            .rt
+            .block_on(
+                self.client
+                    .get_npm_release_times_routed_full(name, route.clone()),
+            )
+            .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
+        merge_release_times_into_cache_info(info, &release_times);
+        if !info.needs_policy_metadata(key, &self.policy) {
+            return Ok(());
+        }
+        if !matches!(route, UpstreamRoute::LpmWorker) {
+            return Ok(());
+        }
+
+        let direct_release_times = self
+            .rt
+            .block_on(
+                self.client
+                    .get_npm_release_times_routed_full(name, UpstreamRoute::NpmDirect),
+            )
+            .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
+        merge_release_times_into_cache_info(info, &direct_release_times);
+        Ok(())
     }
 }

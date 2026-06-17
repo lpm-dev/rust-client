@@ -30,7 +30,14 @@ impl RegistryClient {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub(super) fn deserialize_cached_metadata(data: &[u8]) -> Option<PackageMetadata> {
+        Self::deserialize_cached_metadata_as(data)
+    }
+
+    pub(super) fn deserialize_cached_metadata_as<T: serde::de::DeserializeOwned>(
+        data: &[u8],
+    ) -> Option<T> {
         rmp_serde::from_slice(data)
             .or_else(|_| serde_json::from_slice(data))
             .ok()

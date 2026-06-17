@@ -19,7 +19,10 @@ mod tests;
 
 #[allow(unused_imports)]
 pub(crate) use parse::is_valid_dep_name;
-pub(crate) use parse::{parse_full_metadata_to_cache_info, parse_metadata_to_cache_info};
+pub(crate) use parse::{
+    merge_release_times_into_cache_info, parse_full_metadata_to_cache_info,
+    parse_metadata_to_cache_info,
+};
 #[cfg(test)]
 pub(crate) use platform::Platform;
 pub use platform::is_platform_compatible;
@@ -35,8 +38,8 @@ mod prelude {
     pub(super) use super::error::{ProviderError, classify_registry_error};
     #[allow(unused_imports)]
     pub(super) use super::parse::{
-        is_valid_dep_name, is_valid_version_string, parse_full_metadata_to_cache_info,
-        parse_metadata_to_cache_info,
+        is_valid_dep_name, is_valid_version_string, merge_release_times_into_cache_info,
+        parse_full_metadata_to_cache_info, parse_metadata_to_cache_info,
     };
     #[allow(unused_imports)]
     pub(super) use super::platform::{

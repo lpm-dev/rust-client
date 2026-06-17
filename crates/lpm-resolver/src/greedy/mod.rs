@@ -86,8 +86,8 @@ mod prelude {
     pub(super) use crate::policy::{ReleaseTimeStatus, ResolverPolicy};
     pub(super) use crate::provider::{
         CachedPackageInfo, NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone,
-        parse_full_metadata_to_cache_info, parse_metadata_to_cache_info,
-        release_age_status_for_version, trust_downgrade_violation,
+        merge_release_times_into_cache_info, parse_full_metadata_to_cache_info,
+        parse_metadata_to_cache_info, release_age_status_for_version, trust_downgrade_violation,
     };
     pub(super) use crate::ranges::NpmRange;
     pub(super) use crate::resolve::{

@@ -121,12 +121,26 @@ pub(super) async fn fetch_metadata_for_resolver(
     include_speculation: bool,
 ) -> Result<FetchedMetadata, ResolveError> {
     let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
-    let fetched = parse_fetched_metadata(metadata, include_speculation);
-    if !fetched.info.needs_policy_metadata(canonical, policy) {
-        return Ok(fetched);
+    let dist_tags = metadata.dist_tags.clone();
+    let mut info = parse_metadata_to_cache_info(&metadata);
+    if info.needs_trust_metadata(policy) {
+        return fetch_full_metadata_for_policy(
+            client,
+            route_table,
+            canonical,
+            policy,
+            include_speculation,
+        )
+        .await;
     }
-    fetch_full_metadata_for_policy(client, route_table, canonical, policy, include_speculation)
-        .await
+    if info.needs_release_time_metadata(canonical, policy) {
+        fetch_release_times_for_policy(client, route_table, canonical, &mut info).await?;
+    }
+    Ok(fetched_metadata_from_info(
+        dist_tags,
+        info,
+        include_speculation,
+    ))
 }
 
 pub(super) fn parse_fetched_metadata(
@@ -144,10 +158,21 @@ pub(super) fn parse_full_fetched_metadata(
     metadata: lpm_registry::PackageMetadata,
     include_speculation: bool,
 ) -> FetchedMetadata {
-    let info = Arc::new(parse_full_metadata_to_cache_info(&metadata));
-    let speculation = include_speculation.then(|| {
-        SpeculativePackageMetadata::from_dist_tags_and_info(metadata.dist_tags, info.clone())
-    });
+    fetched_metadata_from_info(
+        metadata.dist_tags.clone(),
+        parse_full_metadata_to_cache_info(&metadata),
+        include_speculation,
+    )
+}
+
+fn fetched_metadata_from_info(
+    dist_tags: HashMap<String, String>,
+    info: CachedPackageInfo,
+    include_speculation: bool,
+) -> FetchedMetadata {
+    let info = Arc::new(info);
+    let speculation = include_speculation
+        .then(|| SpeculativePackageMetadata::from_dist_tags_and_info(dist_tags, info.clone()));
     FetchedMetadata { speculation, info }
 }
 
@@ -165,11 +190,40 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
     if !matches!(canonical, CanonicalKey::Npm { .. }) {
         return Ok(info);
     }
+    if !info.needs_trust_metadata(policy) && info.needs_release_time_metadata(canonical, policy) {
+        let mut merged = (*info).clone();
+        fetch_release_times_for_policy(client, route_table, canonical, &mut merged).await?;
+        let merged = Arc::new(merged);
+        shared_cache.insert(canonical.clone(), merged.clone());
+        return Ok(merged);
+    }
     let fetched =
         fetch_full_metadata_for_policy(client, route_table, canonical, policy, false).await?;
     let full_info = fetched.info;
     shared_cache.insert(canonical.clone(), full_info.clone());
     Ok(full_info)
+}
+
+async fn fetch_release_times_for_policy(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    info: &mut CachedPackageInfo,
+) -> Result<(), ResolveError> {
+    let CanonicalKey::Npm { name } = canonical else {
+        return Ok(());
+    };
+    let route = route_table.route_for_package(name);
+    let release_times = client
+        .get_npm_release_times_routed_full(name, route)
+        .await
+        .map_err(|e| ResolveError::DependencyFetch {
+            package: canonical.to_string(),
+            version: "*".to_string(),
+            detail: e.to_string(),
+        })?;
+    merge_release_times_into_cache_info(info, &release_times);
+    Ok(())
 }
 
 async fn fetch_full_metadata_for_policy(

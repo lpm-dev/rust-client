@@ -2327,8 +2327,10 @@ async fn run_with_options_under_store_lock(
                     u128,
                 ) = if fusion_enabled_local {
                     // ── FUSION PATH ─────────────────────────────────────
-                    let npm_fanout =
-                        positive_usize_env_or_default("LPM_NPM_FANOUT", DEFAULT_FUSION_NPM_FANOUT);
+                    let npm_fanout = positive_usize_env_or_default(
+                        "LPM_NPM_FANOUT",
+                        default_fusion_npm_fanout_for_policy(resolver_min_age_secs),
+                    );
                     let speculation_permits = positive_usize_env_or_default(
                         ENV_FUSION_SPECULATION_PERMITS,
                         DEFAULT_FUSION_SPECULATION_PERMITS,

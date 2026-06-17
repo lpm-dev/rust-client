@@ -286,6 +286,82 @@ async fn fetch_metadata_refetches_full_packument_when_release_age_needs_publish_
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn fetch_metadata_merges_release_times_without_rehydrating_versions() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("cache temp dir");
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()));
+
+    let abbreviated = serde_json::json!({
+        "name": "release-time-merge-fixture",
+        "modified": "2025-01-03T00:00:00.000Z",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "release-time-merge-fixture",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/release-time-merge-fixture.tgz",
+                    "integrity": "sha512-release-time"
+                },
+                "dependencies": { "child": "^2.0.0" }
+            }
+        }
+    });
+    let release_times_only = serde_json::json!({
+        "name": "release-time-merge-fixture",
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/release-time-merge-fixture"))
+        .and(header("Accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(abbreviated))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/release-time-merge-fixture"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(release_times_only))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+    let canonical = CanonicalKey::npm("release-time-merge-fixture");
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+
+    let fetched = fetch_metadata_for_resolver(&client, &route_table, &canonical, &policy, false)
+        .await
+        .expect("policy fetch should merge release times into abbreviated metadata");
+
+    assert_eq!(
+        fetched
+            .info
+            .deps
+            .get("1.0.0")
+            .and_then(|deps| deps.get("child"))
+            .map(String::as_str),
+        Some("^2.0.0")
+    );
+    assert_eq!(
+        fetched
+            .info
+            .dist
+            .get("1.0.0")
+            .and_then(|dist| dist.published_at.as_deref()),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn fetch_metadata_uses_direct_full_when_worker_full_omits_release_time() {
     use std::sync::{
         Arc,

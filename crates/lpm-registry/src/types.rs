@@ -1296,7 +1296,21 @@ where
     deserializer.deserialize_any(StringListVisitor)
 }
 
-// ─── Minimal types for install-time blocked-set capture ─────────────────────
+// ─── Minimal metadata views ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct ReleaseTimeMetadata {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub time: HashMap<String, String>,
+}
+
+impl ReleaseTimeMetadata {
+    pub fn matches_package(&self, expected: &str) -> bool {
+        self.name.as_deref().is_none_or(|name| name == expected)
+    }
+}
 
 /// Package metadata deserialized from the registry cache using only the fields
 /// required for install-time blocked-set capture: `time` (for `published_at`)
