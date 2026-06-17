@@ -104,9 +104,10 @@ fn parse_fetched_metadata_preserves_speculation_when_enabled() {
         .expect("speculation should be built when requested");
     assert_eq!(
         speculation
-            .versions
+            .info
+            .deps
             .get("1.0.0")
-            .and_then(|version| version.dependencies.get("left-pad"))
+            .and_then(|dependencies| dependencies.get("left-pad"))
             .map(String::as_str),
         Some("^1.0.0")
     );

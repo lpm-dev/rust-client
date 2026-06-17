@@ -792,18 +792,15 @@ impl BfsWalker {
         root_keys: &HashSet<CanonicalKey>,
         roots_inserted: &mut HashSet<CanonicalKey>,
         summary: &mut WalkerSummary,
-    ) -> CachedPackageInfo {
+    ) -> Arc<CachedPackageInfo> {
         let key = CanonicalKey::from_dep_name(name);
 
-        // (1) Insert into shared cache. Keep a clone to return so the
+        // (1) Insert into shared cache. Keep the Arc to return so the
         // caller can drive dep expansion without re-parsing or looking
         // the entry back out of the DashMap.
-        let info = parse_metadata_to_cache_info(meta);
+        let info = Arc::new(parse_metadata_to_cache_info(meta));
         let _ = is_npm; // 2026-05-07: prerelease filter removed; param retained on caller for future use
-        // Cache stores Arc<CachedPackageInfo> so per-edge resolver lookups
-        // are refcount bumps. The clone here happens once per fetch, not per edge.
-        self.shared_cache
-            .insert(key.clone(), Arc::new(info.clone()));
+        self.shared_cache.insert(key.clone(), info.clone());
 
         // (2) Fire per-canonical waiters.
         if let Some(n) = self.notify_map.get(&key) {
@@ -822,7 +819,10 @@ impl BfsWalker {
         // we measure the wait so `timing.resolve.streaming_bfs.spec_tx_send_wait_ms`
         // surfaces the cost.
         let send_start = Instant::now();
-        let speculation = SpeculativePackageMetadata::from(meta);
+        let speculation = SpeculativePackageMetadata::from_dist_tags_and_info(
+            meta.dist_tags.clone(),
+            info.clone(),
+        );
         let _ = self.spec_tx.send((name.to_string(), speculation)).await;
         summary.spec_tx_send_wait_ms += send_start.elapsed().as_millis();
 
