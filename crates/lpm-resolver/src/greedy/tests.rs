@@ -2864,6 +2864,195 @@ async fn fusion_pre_batches_lpm_dev_root_deps() {
     );
 }
 
+/// Root-level npm deps routed through the LPM Worker should use the
+/// same deep batch endpoint as lpm.dev packages. One metadata RPC can
+/// hydrate all routed root manifests, while direct mode and npmrc custom
+/// registries stay off the Worker.
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_pre_batches_worker_routed_npm_root_deps() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let npm_a_meta = metadata_json("proxy-root-a", &[]);
+    let npm_b_meta = metadata_json("proxy-root-b", &[]);
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .and(body_string_contains("\"proxy-root-a\""))
+        .and(body_string_contains("\"proxy-root-b\""))
+        .and(body_string_contains("\"deep\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "packages": {
+                        "proxy-root-a": npm_a_meta,
+                        "proxy-root-b": npm_b_meta,
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_cache_dir(None),
+    );
+
+    let mut deps = HashMap::new();
+    deps.insert("proxy-root-a".into(), "^1.0.0".into());
+    deps.insert("proxy-root-b".into(), "^1.0.0".into());
+
+    let result = resolve_greedy_fused(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Proxy),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("Worker-routed npm roots should resolve from one metadata batch");
+
+    let names: std::collections::HashSet<_> = result
+        .packages
+        .iter()
+        .map(|p| p.package.canonical_name())
+        .collect();
+    assert!(names.contains("proxy-root-a"));
+    assert!(names.contains("proxy-root-b"));
+    assert_eq!(
+        result.stage_timing.dispatcher_rpc_count, 1,
+        "Worker-routed npm root metadata should batch into one dispatcher RPC"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_direct_mode_does_not_batch_npm_root_deps() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let lpm_server = MockServer::start().await;
+    let npm_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": {}
+        })))
+        .expect(0)
+        .mount(&lpm_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/direct-root"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata_json("direct-root", &[])))
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(lpm_server.uri())
+            .with_npm_registry_url(npm_server.uri())
+            .with_cache_dir(None),
+    );
+
+    let mut deps = HashMap::new();
+    deps.insert("direct-root".into(), "^1.0.0".into());
+
+    let result = resolve_greedy_fused(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("direct npm roots should resolve from the npm registry");
+
+    assert_eq!(result.packages.len(), 1);
+    assert_eq!(result.packages[0].package.canonical_name(), "direct-root");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_falls_back_to_direct_npm_when_worker_batch_denies_access() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let proxy_server = MockServer::start().await;
+    let npm_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "upstream_proxy_entitlement_required",
+            "message": "upstream proxy access required"
+        })))
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/proxy-access-fallback"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "upstream_proxy_entitlement_required",
+            "message": "upstream proxy access required"
+        })))
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/proxy-access-fallback"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata_json("proxy-access-fallback", &[])),
+        )
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri())
+            .with_cache_dir(None),
+    );
+
+    let mut deps = HashMap::new();
+    deps.insert("proxy-access-fallback".into(), "^1.0.0".into());
+
+    let result = resolve_greedy_fused(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Proxy),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("Worker access denial should fall back to direct npm metadata");
+
+    assert_eq!(result.packages.len(), 1);
+    assert_eq!(
+        result.packages[0].package.canonical_name(),
+        "proxy-access-fallback"
+    );
+    assert_eq!(
+        result.stage_timing.dispatcher_rpc_count, 1,
+        "failed proxy batch is not a resolved-data RPC; direct fallback fetch is"
+    );
+}
+
 /// Pre-batch fallback: when the batch endpoint errors, the main
 /// loop must still resolve via per-package `fetch_metadata_raw`.
 /// This test pins the failure-mode contract: batch error →

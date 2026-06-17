@@ -69,6 +69,96 @@ async fn npm_proxy_miss_falls_back_to_direct_npm_registry() {
 }
 
 #[tokio::test]
+async fn npm_proxy_access_denial_falls_back_to_direct_npm_registry() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let proxy_server = MockServer::start().await;
+    let npm_server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+
+    let npm_name = "express-proxy-access-denied";
+    let mut client = RegistryClient::new()
+        .with_base_url(proxy_server.uri())
+        .with_npm_registry_url(npm_server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/express-proxy-access-denied"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "upstream_proxy_entitlement_required",
+            "message": "upstream proxy access required"
+        })))
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/express-proxy-access-denied"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(npm_name)))
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let result = client.get_npm_package_metadata(npm_name).await;
+    assert!(
+        result.is_ok(),
+        "proxy access denial should fall back to direct npm registry"
+    );
+    assert_eq!(result.unwrap().name, npm_name);
+}
+
+#[tokio::test]
+async fn npm_proxy_firewall_block_does_not_fallback_to_direct_npm_registry() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let proxy_server = MockServer::start().await;
+    let npm_server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+
+    let npm_name = "blocked-by-firewall";
+    let mut client = RegistryClient::new()
+        .with_base_url(proxy_server.uri())
+        .with_npm_registry_url(npm_server.uri());
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/blocked-by-firewall"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "blocked_by_lpm_firewall",
+            "package": npm_name,
+            "verdict": "malicious",
+            "reason": "test policy block",
+            "decisionId": "decision-test"
+        })))
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/blocked-by-firewall"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(npm_name)))
+        .expect(0)
+        .mount(&npm_server)
+        .await;
+
+    let result = client.get_npm_package_metadata(npm_name).await;
+    assert!(matches!(
+        result,
+        Err(LpmError::NpmFirewallBlocked {
+            package,
+            verdict,
+            reason,
+            ..
+        }) if package == npm_name && verdict == "malicious" && reason == "test policy block"
+    ));
+}
+
+#[tokio::test]
 async fn npm_proxy_wrong_package_body_returns_registry_error_without_fallback() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
