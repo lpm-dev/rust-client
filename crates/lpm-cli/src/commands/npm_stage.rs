@@ -33,6 +33,29 @@ pub(crate) struct StageDownloadResult {
     pub(crate) manifest: serde_json::Value,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NpmStageRegistrySource {
+    Default,
+    Cli,
+    Config,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NpmStageRegistry {
+    url: String,
+    source: NpmStageRegistrySource,
+}
+
+impl NpmStageRegistry {
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub(crate) fn source(&self) -> NpmStageRegistrySource {
+        self.source
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NpmStageRuntime {
     open_browser: bool,
@@ -50,22 +73,30 @@ impl NpmStageRuntime {
     }
 }
 
-pub(crate) fn resolve_npm_stage_registry(
+pub(crate) fn resolve_npm_stage_registry_with_source(
     npm_config: Option<&NpmPublishConfig>,
     cli_registry: Option<&str>,
-) -> Result<String, LpmError> {
-    let registry = match cli_registry {
+) -> Result<NpmStageRegistry, LpmError> {
+    let (registry, source) = match cli_registry {
         Some(raw) if raw.trim().is_empty() => {
             return Err(LpmError::Registry(
                 "--npm-registry must not be empty".into(),
             ));
         }
-        Some(raw) => raw.trim_end_matches('/').to_string(),
-        None => npm_config
-            .and_then(|config| config.registry.as_deref())
-            .unwrap_or(NPM_REGISTRY_URL)
-            .trim_end_matches('/')
-            .to_string(),
+        Some(raw) => (
+            raw.trim_end_matches('/').to_string(),
+            NpmStageRegistrySource::Cli,
+        ),
+        None => match npm_config.and_then(|config| config.registry.as_deref()) {
+            Some(raw) => (
+                raw.trim_end_matches('/').to_string(),
+                NpmStageRegistrySource::Config,
+            ),
+            None => (
+                NPM_REGISTRY_URL.to_string(),
+                NpmStageRegistrySource::Default,
+            ),
+        },
     };
 
     validate_npm_stage_registry(&registry)?;
@@ -73,10 +104,13 @@ pub(crate) fn resolve_npm_stage_registry(
         tracing::warn!(
             target_url = %registry,
             default_url = NPM_REGISTRY_URL,
-            "npm staged publish registry overridden — npm bearer will be sent to a non-default host; confirm this is intentional",
+            "npm staged publish registry overridden; confirm the target and credentials are intentional",
         );
     }
-    Ok(registry)
+    Ok(NpmStageRegistry {
+        url: registry,
+        source,
+    })
 }
 
 pub(crate) fn validate_npm_stage_registry(registry_url: &str) -> Result<(), LpmError> {
@@ -724,17 +758,19 @@ mod tests {
 
     #[test]
     fn resolve_npm_stage_registry_allows_loopback_http() {
-        assert_eq!(
-            resolve_npm_stage_registry(None, Some("http://127.0.0.1:4873")).unwrap(),
-            "http://127.0.0.1:4873"
-        );
+        let registry =
+            resolve_npm_stage_registry_with_source(None, Some("http://127.0.0.1:4873")).unwrap();
+
+        assert_eq!(registry.url(), "http://127.0.0.1:4873");
+        assert_eq!(registry.source(), NpmStageRegistrySource::Cli);
     }
 
     #[test]
     fn resolve_npm_stage_registry_rejects_non_loopback_http() {
-        let err = resolve_npm_stage_registry(None, Some("http://packages.example.test"))
-            .unwrap_err()
-            .to_string();
+        let err =
+            resolve_npm_stage_registry_with_source(None, Some("http://packages.example.test"))
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("use HTTPS"));
     }
 }

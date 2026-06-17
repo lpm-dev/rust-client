@@ -11,6 +11,7 @@ use wiremock::{Mock, ResponseTemplate};
 
 const NPM_ID_TOKEN: &str = "publish-oidc-id-token";
 const OIDC_NPM_TOKEN: &str = "publish-oidc-exchanged-token";
+const CUSTOM_REGISTRY_TOKEN: &str = "publish-custom-registry-token";
 
 // ─── Dry Run ─────────────────────────────────────────────────────
 
@@ -492,6 +493,114 @@ async fn publish_npm_uses_trusted_publishing_token_exchange() {
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["results"][0]["registry"], serde_json::json!("npm"));
     assert_eq!(envelope["results"][0]["auth"], serde_json::json!("oidc"));
+}
+
+#[tokio::test]
+async fn publish_npm_repo_configured_custom_registry_uses_registry_scoped_token() {
+    let mock = MockRegistry::start().await;
+    let package = "repo-custom-publish-pkg";
+    Mock::given(method("PUT"))
+        .and(path(format!("/{package}")))
+        .and(header(
+            "authorization",
+            format!("Bearer {CUSTOM_REGISTRY_TOKEN}"),
+        ))
+        .and(header("npm-command", "publish"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.0.0",
+        "description": "Repo-configured custom npm publish registry",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+    );
+
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &mock.url(),
+            "--token",
+            CUSTOM_REGISTRY_TOKEN,
+        ])
+        .output()
+        .expect("failed to store custom registry token");
+    assert!(
+        login.status.success(),
+        "custom registry login must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&login.stdout),
+        String::from_utf8_lossy(&login.stderr),
+    );
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", "ambient-npm-token")
+        .args(["--json", "publish", "--npm", "--yes"])
+        .output()
+        .expect("failed to run lpm publish --npm with custom registry token");
+
+    assert!(
+        output.status.success(),
+        "npm publish to repo-configured custom registry must use registry-scoped token\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn publish_npm_repo_configured_custom_registry_refuses_ambient_npm_token() {
+    let mock = MockRegistry::start().await;
+    let package = "repo-custom-publish-no-scoped-token";
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.0.0",
+        "description": "Repo-configured custom npm publish registry",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+    );
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", "ambient-npm-token")
+        .args(["publish", "--npm", "--yes"])
+        .output()
+        .expect("failed to run lpm publish --npm with ambient token");
+
+    assert!(
+        !output.status.success(),
+        "repo-configured custom npm registry must reject ambient NPM_TOKEN"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("registry-scoped token") && stderr.contains("lpm login --login-registry"),
+        "error must direct the user to scoped custom-registry auth, got:\n{stderr}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "ambient NPM_TOKEN must be rejected before contacting custom registry; got {} request(s)",
+        requests.len()
+    );
 }
 
 // ─── Multi-target flags ──────────────────────────────────────────
