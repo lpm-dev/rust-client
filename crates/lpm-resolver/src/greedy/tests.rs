@@ -1183,6 +1183,18 @@ fn peer_collection_records_one_requirement_per_peer() {
 }
 
 #[test]
+fn peer_collection_runs_when_sparse_cache_omits_empty_dependency_entry() {
+    let mut info = mk_info_with_peers(&["1.0.0"], &[], &[("react", "^18.0.0")], &[]);
+    info.deps.remove("1.0.0");
+
+    let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+
+    assert_eq!(state.task_queue.len(), 0);
+    assert_eq!(state.peer_requirements.len(), 1);
+    assert_eq!(state.peer_requirements[0].peer_name, "react");
+}
+
+#[test]
 fn peer_collection_does_not_push_to_task_queue() {
     // Peers go on `peer_requirements`, NOT `task_queue`. If a
     // future regression switches the push site, this test fires.
@@ -2672,6 +2684,45 @@ async fn fusion_terminates_on_empty_deps() {
     assert_eq!(result.stage_timing.dispatcher_rpc_count, 0);
     assert_eq!(result.stage_timing.dispatcher_inflight_high_water, 0);
     assert_eq!(result.stage_timing.parked_max_depth, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_auto_installs_peer_when_sparse_cache_omits_empty_dependency_entry() {
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+
+    let mut peer_host = mk_info_with_peers(&["1.0.0"], &[], &[("ghost-peer", "^1.0.0")], &[]);
+    peer_host.deps.remove("1.0.0");
+    shared_cache.insert(CanonicalKey::npm("peer-host"), Arc::new(peer_host));
+    shared_cache.insert(
+        CanonicalKey::npm("ghost-peer"),
+        Arc::new(mk_info(&["1.0.0"], &[])),
+    );
+
+    let mut deps = HashMap::new();
+    deps.insert("peer-host".to_string(), "^1.0.0".to_string());
+
+    let client = Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9"));
+    let result = resolve_greedy_fused_with_cache(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        shared_cache,
+        true,
+    )
+    .await
+    .expect("cache-only peer auto-install resolve should succeed");
+
+    let names: HashSet<String> = result
+        .packages
+        .iter()
+        .map(|pkg| pkg.package.canonical_name())
+        .collect();
+    assert!(names.contains("peer-host"));
+    assert!(names.contains("ghost-peer"));
+    assert_eq!(result.ambient_peer_installs, vec!["ghost-peer"]);
 }
 
 /// Single optional dep with a client that fails every fetch.

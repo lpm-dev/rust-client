@@ -15,65 +15,50 @@ pub(super) fn enqueue_child_deps(
     state: &mut ResolveState,
 ) {
     let ver_str = version.to_string();
-    let Some(deps) = info.deps.get(&ver_str) else {
-        return; // version has no declared deps
-    };
     let aliases = info.aliases.get(&ver_str);
     let optional_names = info.optional_dep_names.get(&ver_str);
     let bundled_names = info.bundled_dep_names.get(&ver_str);
 
-    // Sort for deterministic edge ordering — keeps test diffs stable
-    // and the resolved tree reproducible across runs.
-    let mut entries: Vec<(&String, &String)> = deps.iter().collect();
-    entries.sort_by_key(|(name, _)| *name);
+    if let Some(deps) = info.deps.get(&ver_str) {
+        // Sort for deterministic edge ordering — keeps test diffs stable
+        // and the resolved tree reproducible across runs.
+        let mut entries: Vec<(&String, &String)> = deps.iter().collect();
+        entries.sort_by_key(|(name, _)| *name);
 
-    for (local_name, range_str) in entries {
-        // Bundled deps are vendored inside the parent's tarball
-        // (`node_modules/<bundled>/` extracted alongside the parent's
-        // own files). Skip enqueueing them as separate edges so the
-        // resolver doesn't fetch a registry copy that the linker
-        // might shadow over the bundled one. The extractor preserves
-        // the in-tarball subtree implicitly; the resolver's job is
-        // just to NOT introduce a redundant registry fetch.
-        if bundled_names.is_some_and(|s| s.contains(local_name)) {
-            tracing::debug!(
-                "skipping bundled dep {} of {}@{} — provided by parent's tarball",
-                local_name,
-                parent_canonical,
-                ver_str,
-            );
-            continue;
-        }
+        for (local_name, range_str) in entries {
+            // Bundled deps are vendored inside the parent's tarball
+            // (`node_modules/<bundled>/` extracted alongside the parent's
+            // own files). Skip enqueueing them as separate edges so the
+            // resolver doesn't fetch a registry copy that the linker
+            // might shadow over the bundled one. The extractor preserves
+            // the in-tarball subtree implicitly; the resolver's job is
+            // just to NOT introduce a redundant registry fetch.
+            if bundled_names.is_some_and(|s| s.contains(local_name)) {
+                tracing::debug!(
+                    "skipping bundled dep {} of {}@{} — provided by parent's tarball",
+                    local_name,
+                    parent_canonical,
+                    ver_str,
+                );
+                continue;
+            }
 
-        let canonical = match aliases.and_then(|a| a.get(local_name)) {
-            Some(target) => CanonicalKey::from_dep_name(target),
-            None => CanonicalKey::from_dep_name(local_name),
-        };
+            let canonical = match aliases.and_then(|a| a.get(local_name)) {
+                Some(target) => CanonicalKey::from_dep_name(target),
+                None => CanonicalKey::from_dep_name(local_name),
+            };
 
-        // Registry-published packages should
-        // never declare `workspace:` deps (npm rejects them at publish
-        // time), but a malformed cache entry or a future regression
-        // could land one here. Skip with a specific log line rather
-        // than the generic "invalid range" branch so the diagnosis
-        // points at the actual cause.
-        if is_workspace_specifier(range_str) {
-            tracing::warn!(
-                "ignoring transitive `workspace:` dep '{}' from {}@{} → {} \
-                 (workspace: must be resolved upstream by lpm-workspace; \
-                 a registry-published package should not declare it)",
-                range_str,
-                parent_canonical,
-                ver_str,
-                local_name,
-            );
-            continue;
-        }
-
-        let range = match NpmRange::parse(range_str) {
-            Ok(r) => r,
-            Err(e) => {
+            // Registry-published packages should
+            // never declare `workspace:` deps (npm rejects at publish
+            // time), but a malformed cache entry or a future regression
+            // could land one here. Skip with a specific log line rather
+            // than the generic "invalid range" branch so the diagnosis
+            // points at the actual cause.
+            if is_workspace_specifier(range_str) {
                 tracing::warn!(
-                    "invalid range '{}' on {}@{} → {}: {e}",
+                    "ignoring transitive `workspace:` dep '{}' from {}@{} → {} \
+                     (workspace: must be resolved upstream by lpm-workspace; \
+                     a registry-published package should not declare it)",
                     range_str,
                     parent_canonical,
                     ver_str,
@@ -81,31 +66,45 @@ pub(super) fn enqueue_child_deps(
                 );
                 continue;
             }
-        };
 
-        let optional = state.nodes[parent_id as usize].optional
-            || optional_names.is_some_and(|set| set.contains(local_name));
-        if optional && !state.include_optional_dependencies {
-            tracing::debug!(
-                "skipping optional dep {} of {}@{} by install option",
-                local_name,
-                parent_canonical,
-                ver_str,
-            );
-            continue;
+            let range = match NpmRange::parse(range_str) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "invalid range '{}' on {}@{} → {}: {e}",
+                        range_str,
+                        parent_canonical,
+                        ver_str,
+                        local_name,
+                    );
+                    continue;
+                }
+            };
+
+            let optional = state.nodes[parent_id as usize].optional
+                || optional_names.is_some_and(|set| set.contains(local_name));
+            if optional && !state.include_optional_dependencies {
+                tracing::debug!(
+                    "skipping optional dep {} of {}@{} by install option",
+                    local_name,
+                    parent_canonical,
+                    ver_str,
+                );
+                continue;
+            }
+
+            state.task_queue.push_back(Edge {
+                parent: parent_id,
+                local_name: local_name.clone(),
+                canonical,
+                range,
+                behavior: DepBehavior {
+                    required: !optional,
+                    peer: false,
+                    optional,
+                },
+            });
         }
-
-        state.task_queue.push_back(Edge {
-            parent: parent_id,
-            local_name: local_name.clone(),
-            canonical,
-            range,
-            behavior: DepBehavior {
-                required: !optional,
-                peer: false,
-                optional,
-            },
-        });
     }
 
     // Capture every `peerDependencies` entry on this (canonical, version)
