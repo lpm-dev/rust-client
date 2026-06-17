@@ -43,9 +43,9 @@ impl NpmrcConfig {
     /// Same as [`Self::parse_layer_with_source_dir`] but allows callers
     /// to mark the layer as project-local. A project-local layer is
     /// owned by the repo and may be hostile under a malicious-clone
-    /// threat model — settings that downgrade security (today:
-    /// `strict-ssl=false`) are refused at parse time when sourced
-    /// from this layer.
+    /// threat model. Settings that downgrade TLS or use repo-controlled
+    /// env expansion for registry/auth/TLS destinations are refused when
+    /// sourced from this layer.
     pub fn parse_layer_with_options(
         content: &str,
         source_label: &str,
@@ -75,6 +75,18 @@ impl NpmrcConfig {
             let key = line[..eq_idx].trim();
             let raw_value = line[eq_idx + 1..].trim();
             let value = strip_surrounding_quotes(raw_value);
+
+            if is_project_layer
+                && contains_env_interpolation(value)
+                && project_layer_env_expansion_is_sensitive(key)
+            {
+                cfg.security_warnings.push(format!(
+                    "{source_label}:{}: env expansion in project-local .npmrc for '{key}' refused: \
+                     move this registry/auth/TLS setting to user config or use registry-scoped auth",
+                    lineno + 1,
+                ));
+                continue;
+            }
 
             // Env-var interpolation. Missing var is fatal per npm.
             let interpolated = match interpolate_env(value, env_lookup) {
@@ -130,6 +142,44 @@ fn strip_surrounding_quotes(s: &str) -> &str {
         }
     }
     s
+}
+
+fn contains_env_interpolation(value: &str) -> bool {
+    value.contains("${")
+}
+
+fn project_layer_env_expansion_is_sensitive(key: &str) -> bool {
+    if matches!(
+        key,
+        "registry"
+            | "cafile"
+            | "ca"
+            | "certfile"
+            | "keyfile"
+            | "proxy"
+            | "https-proxy"
+            | "http-proxy"
+            | "noproxy"
+            | "no-proxy"
+    ) {
+        return true;
+    }
+
+    if key.starts_with('@') && key.ends_with(":registry") {
+        return true;
+    }
+
+    let Some(rest) = key.strip_prefix("//") else {
+        return false;
+    };
+    let Some(split_idx) = rest.rfind("/:") else {
+        return false;
+    };
+    let attr = &rest[split_idx + 2..];
+    matches!(
+        attr,
+        "_authToken" | "_auth" | "_password" | "_username" | "cafile" | "certfile" | "keyfile"
+    )
 }
 
 /// Expand `${VAR}` references in `value`. On the first missing var, return
@@ -667,6 +717,55 @@ mod tests {
         );
         // No partial credential should be stored.
         assert!(cfg.origin_auth.is_empty());
+    }
+
+    #[test]
+    fn project_layer_env_expansion_for_registry_and_auth_is_refused() {
+        let content = "registry=${MALICIOUS_REGISTRY}\n\
+                       @private:registry=${MALICIOUS_REGISTRY}\n\
+                       //packages.example.test/:_authToken=${NPM_TOKEN}\n";
+        let env = fixed_env(&[
+            ("MALICIOUS_REGISTRY", "https://packages.example.test"),
+            ("NPM_TOKEN", "secret-value"),
+        ]);
+        let cfg =
+            NpmrcConfig::parse_layer_with_options(content, "project/.npmrc", None, true, &env);
+
+        assert!(cfg.default_registry.is_none());
+        assert!(cfg.scope_registries.is_empty());
+        assert!(cfg.auth_buffers.is_empty());
+        assert_eq!(
+            cfg.security_warnings.len(),
+            3,
+            "project env expansion refusals must be surfaced as security warnings: {:?}",
+            cfg.security_warnings
+        );
+    }
+
+    #[test]
+    fn project_layer_env_expansion_for_tls_destinations_is_refused() {
+        let content = "cafile=${CA_FILE}\n\
+                       certfile=${CLIENT_CERT}\n\
+                       keyfile=${CLIENT_KEY}\n\
+                       //packages.example.test/:cafile=${CA_FILE}\n";
+        let env = fixed_env(&[
+            ("CA_FILE", "/tmp/ca.pem"),
+            ("CLIENT_CERT", "/tmp/client.pem"),
+            ("CLIENT_KEY", "/tmp/client.key"),
+        ]);
+        let cfg =
+            NpmrcConfig::parse_layer_with_options(content, "project/.npmrc", None, true, &env);
+
+        assert!(cfg.tls.extra_roots.is_empty());
+        assert!(cfg.tls.identity_certfile.is_none());
+        assert!(cfg.tls.identity_keyfile.is_none());
+        assert!(cfg.tls.per_origin.is_empty());
+        assert_eq!(
+            cfg.security_warnings.len(),
+            4,
+            "project TLS env expansion refusals must be surfaced: {:?}",
+            cfg.security_warnings
+        );
     }
 
     #[test]

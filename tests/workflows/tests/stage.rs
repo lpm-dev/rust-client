@@ -12,6 +12,7 @@ const STAGE_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
 const NPM_TOKEN: &str = "stage-token";
 const NPM_ID_TOKEN: &str = "stage-oidc-id-token";
 const OIDC_NPM_TOKEN: &str = "stage-oidc-exchanged-token";
+const CUSTOM_STAGE_TOKEN: &str = "stage-custom-registry-token";
 
 #[tokio::test]
 async fn stage_publish_posts_rewritten_payload_to_npm_stage_endpoint() {
@@ -170,6 +171,100 @@ async fn stage_publish_uses_npm_trusted_publishing_token_exchange() {
             .get("authorization")
             .and_then(|value| value.to_str().ok()),
         Some(format!("Bearer {OIDC_NPM_TOKEN}").as_str()),
+    );
+}
+
+#[tokio::test]
+async fn stage_publish_repo_configured_custom_registry_uses_registry_scoped_token() {
+    let mock = MockRegistry::start().await;
+    mount_package_metadata_with_token(
+        &mock,
+        "@scope/staged-pkg",
+        serde_json::json!({"0.9.0": {}}),
+        CUSTOM_STAGE_TOKEN,
+    )
+    .await;
+    mount_stage_publish_with_token(&mock, "@scope/staged-pkg", CUSTOM_STAGE_TOKEN).await;
+    let project = stage_project();
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"name":"@scope/staged-pkg","registry":"{}"}}}}}}"#,
+            mock.url()
+        ),
+    );
+
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &mock.url(),
+            "--token",
+            CUSTOM_STAGE_TOKEN,
+        ])
+        .output()
+        .expect("failed to store custom stage registry token");
+    assert!(
+        login.status.success(),
+        "custom registry login must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&login.stdout),
+        String::from_utf8_lossy(&login.stderr),
+    );
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", "ambient-stage-npm-token")
+        .args(["--json", "stage", "publish", "--yes"])
+        .output()
+        .expect("failed to run lpm stage publish with custom registry token");
+
+    assert!(
+        output.status.success(),
+        "repo-configured stage registry must use registry-scoped token\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = parse_json(&output.stdout);
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["stageId"], serde_json::json!(STAGE_ID));
+}
+
+#[tokio::test]
+async fn stage_publish_repo_configured_custom_registry_refuses_ambient_npm_token() {
+    let mock = MockRegistry::start().await;
+    let project = stage_project();
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"name":"@scope/staged-pkg","registry":"{}"}}}}}}"#,
+            mock.url()
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", "ambient-stage-npm-token")
+        .args(["stage", "publish", "--yes"])
+        .output()
+        .expect("failed to run lpm stage publish with ambient token");
+
+    assert!(
+        !output.status.success(),
+        "repo-configured custom stage registry must reject ambient NPM_TOKEN"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("registry-scoped token") && stderr.contains("lpm login --login-registry"),
+        "error must direct the user to scoped custom-registry auth, got:\n{stderr}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "ambient NPM_TOKEN must be rejected before contacting repo-configured stage registry; got {} request(s)",
+        requests.len()
     );
 }
 

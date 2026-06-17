@@ -29,7 +29,8 @@ pub(crate) async fn publish_current_project(
     let npm_name = npm_config
         .and_then(|config| config.name.clone())
         .map_or_else(|| publish_npm::resolve_npm_name(&prepared.name, None), Ok)?;
-    let registry = npm_stage::resolve_npm_stage_registry(npm_config, options.npm_registry)?;
+    let registry =
+        npm_stage::resolve_npm_stage_registry_with_source(npm_config, options.npm_registry)?;
     let access = resolve_stage_access(options.access, &npm_name, npm_config)?;
     let (tag, tag_explicit) = resolve_stage_tag(options.tag, npm_config);
 
@@ -50,7 +51,7 @@ pub(crate) async fn publish_current_project(
             "success": true,
             "dry_run": true,
             "target": "npm",
-            "registry": registry,
+            "registry": registry.url(),
             "name": npm_name,
             "version": prepared.version,
             "tag": tag,
@@ -85,11 +86,17 @@ pub(crate) async fn publish_current_project(
         }
     }
 
-    let auth = npm_auth::resolve_publish_auth(&npm_name, &registry).await?;
+    let auth = npm_auth::resolve_publish_auth_with_policy(
+        &npm_name,
+        registry.url(),
+        auth_policy(&registry),
+    )
+    .await?;
     if auth.source() == npm_auth::NpmAuthSource::Oidc && !options.json_output {
         install_ui::phase("Using npm Trusted Publishing (OIDC)");
     }
-    let metadata = npm_stage::fetch_package_metadata(auth.token(), &npm_name, &registry).await?;
+    let metadata =
+        npm_stage::fetch_package_metadata(auth.token(), &npm_name, registry.url()).await?;
     enforce_stage_version_policy(&metadata, &npm_name, &prepared.version, tag_explicit)?;
     let version_data = publish::build_publish_version_data(
         &prepared.pkg_json,
@@ -128,7 +135,7 @@ pub(crate) async fn publish_current_project(
         &artifact.tarball_data,
         &access,
         &tag,
-        &registry,
+        registry.url(),
     )
     .await?;
     if let Some(spinner) = upload_spinner {
@@ -139,7 +146,7 @@ pub(crate) async fn publish_current_project(
         print_json(serde_json::json!({
             "success": true,
             "target": "npm",
-            "registry": registry,
+            "registry": registry.url(),
             "auth": auth.source().as_str(),
             "stageId": result.stage_id,
             "duration_ms": result.duration.as_millis() as u64,
@@ -164,17 +171,18 @@ pub(crate) async fn list(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let npm_config = read_npm_config(cwd);
-    let registry = npm_stage::resolve_npm_stage_registry(npm_config.as_ref(), npm_registry)?;
+    let registry =
+        npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
     let package_filter = npm_stage::parse_stage_list_filter(package)?;
-    let token = npm_token()?;
+    let token = npm_token(&registry)?;
     let result =
-        npm_stage::list_staged_packages(&token, &registry, package_filter.as_deref()).await?;
+        npm_stage::list_staged_packages(&token, registry.url(), package_filter.as_deref()).await?;
 
     if json_output {
         print_json(serde_json::json!({
             "success": true,
             "target": "npm",
-            "registry": registry,
+            "registry": registry.url(),
             "total": result.total,
             "data": result.items,
         }));
@@ -196,15 +204,16 @@ pub(crate) async fn view(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let npm_config = read_npm_config(cwd);
-    let registry = npm_stage::resolve_npm_stage_registry(npm_config.as_ref(), npm_registry)?;
-    let token = npm_token()?;
-    let data = npm_stage::view_staged_package(&token, &registry, stage_id).await?;
+    let registry =
+        npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
+    let token = npm_token(&registry)?;
+    let data = npm_stage::view_staged_package(&token, registry.url(), stage_id).await?;
 
     if json_output {
         print_json(serde_json::json!({
             "success": true,
             "target": "npm",
-            "registry": registry,
+            "registry": registry.url(),
             "stageId": stage_id,
             "data": data,
         }));
@@ -244,15 +253,16 @@ pub(crate) async fn download(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let npm_config = read_npm_config(cwd);
-    let registry = npm_stage::resolve_npm_stage_registry(npm_config.as_ref(), npm_registry)?;
-    let token = npm_token()?;
-    let result = npm_stage::download_staged_package(&token, &registry, stage_id, cwd).await?;
+    let registry =
+        npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
+    let token = npm_token(&registry)?;
+    let result = npm_stage::download_staged_package(&token, registry.url(), stage_id, cwd).await?;
 
     if json_output {
         print_json(serde_json::json!({
             "success": true,
             "target": "npm",
-            "registry": registry,
+            "registry": registry.url(),
             "stageId": stage_id,
             "path": result.path,
             "bytes": result.bytes,
@@ -278,13 +288,15 @@ async fn mutate_stage(
     approve: bool,
 ) -> Result<(), LpmError> {
     let npm_config = read_npm_config(cwd);
-    let registry = npm_stage::resolve_npm_stage_registry(npm_config.as_ref(), npm_registry)?;
-    let token = npm_token()?;
+    let registry =
+        npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
+    let token = npm_token(&registry)?;
     let data = if approve {
-        npm_stage::approve_staged_package(&token, &registry, stage_id, otp, json_output, yes)
+        npm_stage::approve_staged_package(&token, registry.url(), stage_id, otp, json_output, yes)
             .await?
     } else {
-        npm_stage::reject_staged_package(&token, &registry, stage_id, otp, json_output, yes).await?
+        npm_stage::reject_staged_package(&token, registry.url(), stage_id, otp, json_output, yes)
+            .await?
     };
     let action = if approve { "approved" } else { "rejected" };
 
@@ -292,7 +304,7 @@ async fn mutate_stage(
         print_json(serde_json::json!({
             "success": true,
             "target": "npm",
-            "registry": registry,
+            "registry": registry.url(),
             "stageId": stage_id,
             "action": action,
             "data": data,
@@ -307,8 +319,19 @@ async fn mutate_stage(
     Ok(())
 }
 
-fn npm_token() -> Result<String, LpmError> {
-    npm_auth::resolve_token_auth().map(|auth| auth.token().to_string())
+fn npm_token(registry: &npm_stage::NpmStageRegistry) -> Result<String, LpmError> {
+    npm_auth::resolve_token_auth_for_registry(registry.url(), auth_policy(registry))
+        .map(|auth| auth.token().to_string())
+}
+
+fn auth_policy(registry: &npm_stage::NpmStageRegistry) -> npm_auth::NpmRegistryAuthPolicy {
+    if registry.source() == npm_stage::NpmStageRegistrySource::Config
+        && !npm_auth::registry_is_default_npm(registry.url())
+    {
+        npm_auth::NpmRegistryAuthPolicy::RequireRegistryScopedToken
+    } else {
+        npm_auth::NpmRegistryAuthPolicy::AllowAmbientNpmToken
+    }
 }
 
 fn read_npm_config(cwd: &Path) -> Option<NpmPublishConfig> {

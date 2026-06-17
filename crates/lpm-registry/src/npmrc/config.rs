@@ -36,8 +36,8 @@ pub struct NpmrcConfig {
     pub warnings: Vec<String>,
     /// Security-grade warnings: facts the caller MUST surface even
     /// under `--json` output (where regular warnings are silenced to
-    /// keep stdout structured). Today this carries refusal details for
-    /// a project-local `.npmrc` trying to set `strict-ssl=false`.
+    /// keep stdout structured). Carries refusal details for project-local
+    /// `.npmrc` TLS downgrades and env-backed auth/routing.
     pub security_warnings: Vec<String>,
     /// Fatal parse errors: missing env-var interpolation, unreadable
     /// `cafile=` paths. Caller surfaces and exits non-zero before any

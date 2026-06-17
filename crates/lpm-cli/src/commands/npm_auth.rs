@@ -23,6 +23,12 @@ impl NpmAuthSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum NpmRegistryAuthPolicy {
+    RequireRegistryScopedToken,
+    AllowAmbientNpmToken,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NpmAuth {
     token: String,
@@ -43,6 +49,19 @@ pub(crate) async fn resolve_publish_auth(
     npm_name: &str,
     registry_url: &str,
 ) -> Result<NpmAuth, LpmError> {
+    resolve_publish_auth_with_policy(
+        npm_name,
+        registry_url,
+        NpmRegistryAuthPolicy::RequireRegistryScopedToken,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_publish_auth_with_policy(
+    npm_name: &str,
+    registry_url: &str,
+    policy: NpmRegistryAuthPolicy,
+) -> Result<NpmAuth, LpmError> {
     if oidc::npm_trusted_publish_jwt_available() {
         if registry_supports_npm_trusted_publishing(registry_url) {
             let oidc_error = match exchange_trusted_publish_token(npm_name, registry_url).await {
@@ -55,15 +74,12 @@ pub(crate) async fn resolve_publish_auth(
                 Err(err) => err,
             };
 
-            if let Some(token) = auth::get_npm_token() {
+            if let Ok(fallback) = resolve_token_auth_for_registry(registry_url, policy) {
                 tracing::warn!(
                     error = %oidc_error,
-                    "npm Trusted Publishing exchange failed; falling back to npm token auth",
+                    "npm Trusted Publishing exchange failed; falling back to token auth",
                 );
-                return Ok(NpmAuth {
-                    token,
-                    source: NpmAuthSource::Token,
-                });
+                return Ok(fallback);
             }
 
             return Err(oidc_error);
@@ -76,7 +92,7 @@ pub(crate) async fn resolve_publish_auth(
         );
     }
 
-    resolve_token_auth()
+    resolve_token_auth_for_registry(registry_url, policy)
 }
 
 pub(crate) fn resolve_token_auth() -> Result<NpmAuth, LpmError> {
@@ -88,10 +104,56 @@ pub(crate) fn resolve_token_auth() -> Result<NpmAuth, LpmError> {
         .ok_or_else(missing_npm_token_error)
 }
 
+pub(crate) fn resolve_token_auth_for_registry(
+    registry_url: &str,
+    policy: NpmRegistryAuthPolicy,
+) -> Result<NpmAuth, LpmError> {
+    if registry_is_default_npm(registry_url)
+        || policy == NpmRegistryAuthPolicy::AllowAmbientNpmToken
+    {
+        return resolve_token_auth();
+    }
+
+    custom_registry_token(registry_url)
+        .map(|token| NpmAuth {
+            token,
+            source: NpmAuthSource::Token,
+        })
+        .ok_or_else(|| missing_custom_registry_token_error(registry_url))
+}
+
 pub(crate) fn missing_npm_token_error() -> LpmError {
     LpmError::Registry(
         "no npm token found. Run `lpm login --npm` for browser login, pass `lpm login --npm --token <token>`, or set NPM_TOKEN.".into(),
     )
+}
+
+fn missing_custom_registry_token_error(registry_url: &str) -> LpmError {
+    let registry = normalized_registry_url(registry_url);
+    LpmError::Registry(format!(
+        "no registry-scoped token found for {registry}. Run `lpm login --login-registry {registry} --token <token>`. Generic NPM_TOKEN and `lpm login --npm` credentials are only used for {NPM_REGISTRY_URL}."
+    ))
+}
+
+fn custom_registry_token(registry_url: &str) -> Option<String> {
+    let normalized = normalized_registry_url(registry_url);
+    auth::get_custom_registry_token(&normalized)
+        .or_else(|| auth::get_custom_registry_token(&format!("{normalized}/")))
+        .or_else(|| {
+            if registry_url == normalized {
+                None
+            } else {
+                auth::get_custom_registry_token(registry_url)
+            }
+        })
+}
+
+pub(crate) fn registry_is_default_npm(registry_url: &str) -> bool {
+    normalized_registry_url(registry_url).eq_ignore_ascii_case(NPM_REGISTRY_URL)
+}
+
+fn normalized_registry_url(registry_url: &str) -> String {
+    registry_url.trim_end_matches('/').to_string()
 }
 
 async fn exchange_trusted_publish_token(
@@ -151,12 +213,12 @@ fn npm_oidc_exchange_url(registry_url: &str, npm_name: &str) -> String {
 }
 
 fn registry_supports_npm_trusted_publishing(registry_url: &str) -> bool {
-    let trimmed = registry_url.trim_end_matches('/');
+    let trimmed = normalized_registry_url(registry_url);
     if trimmed.eq_ignore_ascii_case(NPM_REGISTRY_URL) {
         return true;
     }
 
-    reqwest::Url::parse(trimmed)
+    reqwest::Url::parse(&trimmed)
         .ok()
         .and_then(|url| url.host_str().map(lpm_common::is_loopback_host))
         .unwrap_or(false)
@@ -295,7 +357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_publish_auth_falls_back_to_npm_token_when_exchange_fails() {
+    async fn resolve_publish_auth_allows_ambient_token_fallback_for_explicit_custom_registry() {
         let _env = scoped(&[
             ("NPM_ID_TOKEN", NPM_ID_TOKEN),
             ("NPM_TOKEN", "fallback-npm-token"),
@@ -309,26 +371,52 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth = resolve_publish_auth("@scope/pkg", &server.uri())
-            .await
-            .expect("npm token fallback should resolve auth");
+        let auth = resolve_publish_auth_with_policy(
+            "@scope/pkg",
+            &server.uri(),
+            NpmRegistryAuthPolicy::AllowAmbientNpmToken,
+        )
+        .await
+        .expect("explicit custom registry policy should allow npm token fallback");
 
         assert_eq!(auth.token(), "fallback-npm-token");
         assert_eq!(auth.source(), NpmAuthSource::Token);
     }
 
     #[tokio::test]
-    async fn resolve_publish_auth_skips_oidc_for_custom_registry() {
+    async fn resolve_publish_auth_allows_ambient_token_for_explicit_custom_registry() {
         let _env = scoped(&[
             ("NPM_ID_TOKEN", NPM_ID_TOKEN),
             ("NPM_TOKEN", "custom-registry-token"),
         ]);
 
-        let auth = resolve_publish_auth("@scope/pkg", "https://registry.example.test")
-            .await
-            .expect("custom npm-compatible registry should use token auth");
+        let auth = resolve_publish_auth_with_policy(
+            "@scope/pkg",
+            "https://registry.example.test",
+            NpmRegistryAuthPolicy::AllowAmbientNpmToken,
+        )
+        .await
+        .expect("explicit custom npm-compatible registry should use token auth");
 
         assert_eq!(auth.token(), "custom-registry-token");
         assert_eq!(auth.source(), NpmAuthSource::Token);
+    }
+
+    #[test]
+    fn resolve_token_auth_for_registry_rejects_ambient_token_for_repo_configured_custom_registry() {
+        let _env = scoped(&[("NPM_TOKEN", "ambient-npm-token")]);
+
+        let err = resolve_token_auth_for_registry(
+            "https://registry.example.test",
+            NpmRegistryAuthPolicy::RequireRegistryScopedToken,
+        )
+        .expect_err("repo-configured custom registry must not use ambient NPM_TOKEN");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("registry-scoped token")
+                && message.contains("lpm login --login-registry"),
+            "error should direct users to scoped registry auth, got: {message}"
+        );
     }
 }

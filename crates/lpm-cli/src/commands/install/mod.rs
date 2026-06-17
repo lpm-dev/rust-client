@@ -1387,10 +1387,9 @@ async fn run_with_options_under_store_lock(
             tagged.source, tagged.line
         ));
     }
-    // M7: project-local `.npmrc` refusals (today: strict-ssl=false)
-    // are surfaced even in JSON mode for the same reason as the
-    // `DISABLED` warning above — agent/CI runs need to see that a
-    // hostile config tried to downgrade TLS, even when it was refused.
+    // Project-local `.npmrc` security refusals are surfaced even in JSON
+    // mode: agent/CI runs need to see when repo-owned config tried to
+    // downgrade TLS or expand env-backed auth/routing, even when refused.
     for w in route_table.npmrc_security_warnings() {
         output::warn(w);
     }
