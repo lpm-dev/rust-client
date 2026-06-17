@@ -81,6 +81,37 @@ fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageI
     }
 }
 
+#[test]
+fn parse_fetched_metadata_omits_speculation_when_disabled() {
+    let metadata = serde_json::from_value(metadata_json("spec-skip", &[("left-pad", "^1.0.0")]))
+        .expect("fixture metadata should parse");
+
+    let fetched = parse_fetched_metadata(metadata, false);
+
+    assert!(fetched.speculation.is_none());
+    assert_eq!(fetched.info.versions.len(), 1);
+}
+
+#[test]
+fn parse_fetched_metadata_preserves_speculation_when_enabled() {
+    let metadata = serde_json::from_value(metadata_json("spec-keep", &[("left-pad", "^1.0.0")]))
+        .expect("fixture metadata should parse");
+
+    let fetched = parse_fetched_metadata(metadata, true);
+
+    let speculation = fetched
+        .speculation
+        .expect("speculation should be built when requested");
+    assert_eq!(
+        speculation
+            .versions
+            .get("1.0.0")
+            .and_then(|version| version.dependencies.get("left-pad"))
+            .map(String::as_str),
+        Some("^1.0.0")
+    );
+}
+
 fn picked(p: VersionPick) -> NpmVersion {
     match p {
         VersionPick::Picked(v) => v,
@@ -239,7 +270,7 @@ async fn fetch_metadata_refetches_full_packument_when_release_age_needs_publish_
     let canonical = CanonicalKey::npm("release-age-fixture");
     let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
 
-    let fetched = fetch_metadata_for_resolver(&client, &route_table, &canonical, &policy)
+    let fetched = fetch_metadata_for_resolver(&client, &route_table, &canonical, &policy, false)
         .await
         .expect("policy fetch should escalate to full metadata");
 
