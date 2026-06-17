@@ -8,6 +8,7 @@ MODE="${LPM_LIVE_METADATA_MODE:-warm-store}"
 KEEP_WORK="${LPM_LIVE_METADATA_KEEP_WORK:-0}"
 STORE_VERSION="${LPM_STORE_VERSION:-v2}"
 PREWARM_ROUTE="${LPM_LIVE_METADATA_PREWARM_ROUTE:-direct}"
+HTTP_MODE="${LPM_LIVE_METADATA_HTTP:-}"
 
 LOCAL_BIN="$REPO_ROOT/target/release/lpm-rs"
 if [[ -n "${LPM_BIN:-}" ]]; then
@@ -33,6 +34,7 @@ Environment:
   LPM_LIVE_METADATA_KEEP_WORK  keep the temp work directory when set to 1
   LPM_LIVE_METADATA_PREWARM_ROUTE
                                direct or proxy prewarm route (default: direct)
+  LPM_LIVE_METADATA_HTTP       forwarded to LPM_HTTP (example: h3-worker)
   LPM_STORE_VERSION            store layout passed to lpm (default: v2)
   BENCH_WORK_DIR               parent directory for temp work
 EOF
@@ -51,6 +53,10 @@ while [[ $# -gt 0 ]]; do
 		--keep-work)
 			KEEP_WORK=1
 			shift
+			;;
+		--http)
+			HTTP_MODE="${2:?--http requires a value}"
+			shift 2
 			;;
 		-h|--help)
 			usage
@@ -172,6 +178,7 @@ run_lpm_json() {
 			LPM_NO_UPDATE_CHECK=1 \
 			LPM_STORE_VERSION="$STORE_VERSION" \
 			LPM_NPM_ROUTE="$route" \
+			LPM_HTTP="$HTTP_MODE" \
 			NO_COLOR=1 \
 			"$BIN" install --json --no-security-summary --no-skills --no-editor-setup \
 				>"$output_file" 2>"$stderr_file"
@@ -366,6 +373,7 @@ printf 'LPM Live Metadata Route Benchmark\n'
 printf 'runs: %s\n' "$RUNS"
 printf 'mode: %s\n' "$MODE"
 printf 'binary: %s\n' "$BIN"
+printf 'lpm_http: %s\n' "${HTTP_MODE:-default}"
 printf 'work_root: %s\n' "$WORK_ROOT"
 
 if [[ "$MODE" == "warm-store" ]]; then

@@ -186,6 +186,9 @@ no-mimalloc = []
 #   tracy-capture -o profile.tracy &
 #   ./target/release/lpm-rs install
 tracy = ["dep:tracing-tracy"]
+# Experimental metadata transport benchmark. Requires:
+# RUSTFLAGS='--cfg reqwest_unstable' cargo build --release -p lpm-cli --features experimental-http3
+experimental-http3 = ["lpm-registry/experimental-http3"]
 
 [dependencies.dhat]
 version = "0.3"

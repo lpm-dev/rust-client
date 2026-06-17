@@ -1,6 +1,17 @@
 use super::*;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HttpTransportMode {
+    Default,
+    WorkerMetadataHttp3,
+}
+
 impl RegistryClient {
+    pub(super) fn worker_metadata_http3_enabled_from_env() -> bool {
+        cfg!(feature = "experimental-http3")
+            && std::env::var("LPM_HTTP").as_deref() == Ok("h3-worker")
+    }
+
     /// Compute the ASCII-serialized origin of a URL string.
     /// Returns an empty string for malformed or opaque URLs so the
     /// precomputed fields are always valid (but will never match).
@@ -97,6 +108,22 @@ impl RegistryClient {
         tls: &TlsOverrides,
         identity: Option<reqwest::Identity>,
     ) -> Result<reqwest::Client, LpmError> {
+        Self::build_http_client_with_tls_identity_and_transport(
+            connect_timeout,
+            read_timeout,
+            tls,
+            identity,
+            HttpTransportMode::Default,
+        )
+    }
+
+    fn build_http_client_with_tls_identity_and_transport(
+        connect_timeout: Duration,
+        read_timeout: Duration,
+        tls: &TlsOverrides,
+        identity: Option<reqwest::Identity>,
+        transport: HttpTransportMode,
+    ) -> Result<reqwest::Client, LpmError> {
         let mut b = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
@@ -113,7 +140,9 @@ impl RegistryClient {
             // follow.
             .redirect(reqwest::redirect::Policy::limited(10))
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")));
-        if std::env::var("LPM_HTTP").as_deref() == Ok("h1-pool") {
+        if transport == HttpTransportMode::WorkerMetadataHttp3 {
+            b = Self::apply_http3_prior_knowledge(b);
+        } else if std::env::var("LPM_HTTP").as_deref() == Ok("h1-pool") {
             b = b
                 .http1_only()
                 .pool_max_idle_per_host(64)
@@ -145,8 +174,46 @@ impl RegistryClient {
         if let Some(id) = identity {
             b = b.identity(id);
         }
-        b.build()
-            .map_err(|e| LpmError::Cert(format!("HTTP client build failed: {e}")))
+        b.build().map_err(|e| {
+            let chain: Vec<String> =
+                std::iter::successors(Some(&e as &dyn std::error::Error), |err| err.source())
+                    .map(|err| err.to_string())
+                    .collect();
+            LpmError::Cert(format!("HTTP client build failed: {}", chain.join(" <- ")))
+        })
+    }
+
+    #[cfg(feature = "experimental-http3")]
+    fn apply_http3_prior_knowledge(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        b.http3_prior_knowledge()
+    }
+
+    #[cfg(not(feature = "experimental-http3"))]
+    fn apply_http3_prior_knowledge(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        b
+    }
+
+    #[cfg(feature = "experimental-http3")]
+    pub(super) fn build_worker_metadata_http3_client_with_tls(
+        tls: &TlsOverrides,
+    ) -> Result<reqwest::Client, LpmError> {
+        let global_identity = match (
+            tls.identity_certfile.as_ref(),
+            tls.identity_keyfile.as_ref(),
+        ) {
+            (Some(cert), Some(key)) => {
+                let pp = EnvThenTtyPassphrase::new();
+                Some(load_identity(cert, key, &pp)?.identity)
+            }
+            _ => None,
+        };
+        Self::build_http_client_with_tls_identity_and_transport(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            tls,
+            global_identity,
+            HttpTransportMode::WorkerMetadataHttp3,
+        )
     }
 
     /// Create a new registry client with default settings.
@@ -208,6 +275,8 @@ impl RegistryClient {
             registry_signing_keys_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             base_url_origin: Self::url_origin(DEFAULT_REGISTRY_URL),
             npm_registry_url_origin: Self::url_origin(NPM_REGISTRY_URL),
+            worker_metadata_http3_enabled: Self::worker_metadata_http3_enabled_from_env(),
+            worker_metadata_http3_client: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -375,7 +444,7 @@ impl RegistryClient {
         let default_identity_fp = global_loaded
             .as_ref()
             .map(|l| cert_pem_fingerprint(&l.cert_pem));
-        let default_identity = global_loaded.map(|l| l.identity);
+        let default_identity = global_loaded.as_ref().map(|l| l.identity.clone());
         let default_reqwest_client = Self::build_http_client_with_tls_and_identity(
             CONNECT_TIMEOUT,
             READ_TIMEOUT,
@@ -443,6 +512,7 @@ impl RegistryClient {
             per_origin_identity_fps,
         });
         self.http = http;
+        self.worker_metadata_http3_client = Arc::new(tokio::sync::Mutex::new(None));
         Ok(self)
     }
 
@@ -563,6 +633,8 @@ impl RegistryClient {
             registry_signing_keys_cache: Arc::clone(&self.registry_signing_keys_cache),
             base_url_origin: self.base_url_origin.clone(),
             npm_registry_url_origin: self.npm_registry_url_origin.clone(),
+            worker_metadata_http3_enabled: self.worker_metadata_http3_enabled,
+            worker_metadata_http3_client: Arc::clone(&self.worker_metadata_http3_client),
         }
     }
 
@@ -576,6 +648,13 @@ impl RegistryClient {
     #[cfg(test)]
     pub(crate) fn with_synchronous_cache_writes(mut self, sync: bool) -> Self {
         self.synchronous_cache_writes = sync;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_worker_metadata_http3_enabled(mut self, enabled: bool) -> Self {
+        self.worker_metadata_http3_enabled = enabled;
+        self.worker_metadata_http3_client = Arc::new(tokio::sync::Mutex::new(None));
         self
     }
 }

@@ -23,6 +23,60 @@ async fn nonexistent_package_returns_error() {
 }
 
 #[tokio::test]
+async fn worker_metadata_http3_marks_https_worker_requests_when_experimental_feature_is_enabled() {
+    let client = RegistryClient::new()
+        .with_base_url("https://lpm.dev")
+        .with_worker_metadata_http3_enabled(true);
+    let url = "https://lpm.dev/api/registry/batch-metadata";
+
+    let request = client
+        .build_worker_metadata_get(url)
+        .await
+        .expect("request builder should be created")
+        .build()
+        .expect("request should build");
+
+    #[cfg(feature = "experimental-http3")]
+    assert_eq!(request.version(), reqwest::Version::HTTP_3);
+    #[cfg(not(feature = "experimental-http3"))]
+    assert_eq!(request.version(), reqwest::Version::default());
+}
+
+#[tokio::test]
+async fn worker_metadata_http3_does_not_mark_direct_npm_origin() {
+    let client = RegistryClient::new()
+        .with_base_url("https://lpm.dev")
+        .with_worker_metadata_http3_enabled(true);
+    let url = "https://registry.npmjs.org/react";
+
+    let request = client
+        .build_worker_metadata_get(url)
+        .await
+        .expect("request builder should be created")
+        .build()
+        .expect("request should build");
+
+    assert_eq!(request.version(), reqwest::Version::default());
+}
+
+#[tokio::test]
+async fn worker_metadata_http3_does_not_mark_http_worker_origin() {
+    let client = RegistryClient::new()
+        .with_base_url("http://localhost:4873")
+        .with_worker_metadata_http3_enabled(true);
+    let url = "http://localhost:4873/api/registry/react";
+
+    let request = client
+        .build_worker_metadata_get(url)
+        .await
+        .expect("request builder should be created")
+        .build()
+        .expect("request should build");
+
+    assert_eq!(request.version(), reqwest::Version::default());
+}
+
+#[tokio::test]
 async fn npm_proxy_miss_falls_back_to_direct_npm_registry() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "HTTP client for the LPM package registry"
 
+[features]
+experimental-http3 = ["reqwest/http3"]
+
 [dependencies]
 lpm-common = { workspace = true }
 lpm-auth = { workspace = true }

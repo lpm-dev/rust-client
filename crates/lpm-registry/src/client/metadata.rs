@@ -1,6 +1,86 @@
 use super::*;
 
 impl RegistryClient {
+    pub(super) fn apply_worker_metadata_http_version(
+        &self,
+        req: reqwest::RequestBuilder,
+        url: &str,
+    ) -> reqwest::RequestBuilder {
+        if !self.should_try_worker_metadata_http3(url) {
+            return req;
+        }
+        Self::apply_http3_request_version(req)
+    }
+
+    fn should_try_worker_metadata_http3(&self, url: &str) -> bool {
+        if !self.worker_metadata_http3_enabled {
+            return false;
+        }
+        let Ok(parsed) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        parsed.scheme() == "https" && parsed.origin().ascii_serialization() == self.base_url_origin
+    }
+
+    async fn worker_metadata_http3_client_for(
+        &self,
+        url: &str,
+    ) -> Result<Option<reqwest::Client>, LpmError> {
+        if !self.should_try_worker_metadata_http3(url) {
+            return Ok(None);
+        }
+        #[cfg(feature = "experimental-http3")]
+        {
+            let mut guard = self.worker_metadata_http3_client.lock().await;
+            if let Some(client) = guard.as_ref() {
+                return Ok(Some(client.clone()));
+            }
+            let client =
+                Self::build_worker_metadata_http3_client_with_tls(&self.http.tls_overrides)?;
+            *guard = Some(client.clone());
+            Ok(Some(client))
+        }
+        #[cfg(not(feature = "experimental-http3"))]
+        {
+            Ok(None)
+        }
+    }
+
+    #[cfg(feature = "experimental-http3")]
+    fn apply_http3_request_version(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req.version(reqwest::Version::HTTP_3)
+    }
+
+    #[cfg(not(feature = "experimental-http3"))]
+    fn apply_http3_request_version(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req
+    }
+
+    pub(super) async fn build_worker_metadata_get(
+        &self,
+        url: &str,
+    ) -> Result<reqwest::RequestBuilder, LpmError> {
+        if let Some(client) = self.worker_metadata_http3_client_for(url).await? {
+            let mut req = client.get(url);
+            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+                req = req.bearer_auth(bearer);
+            }
+            return Ok(Self::apply_http3_request_version(req));
+        }
+        let req = self.build_get(url).await?;
+        Ok(self.apply_worker_metadata_http_version(req, url))
+    }
+
+    async fn build_worker_metadata_post(
+        &self,
+        url: &str,
+    ) -> Result<reqwest::RequestBuilder, LpmError> {
+        if let Some(client) = self.worker_metadata_http3_client_for(url).await? {
+            return Ok(Self::apply_http3_request_version(client.post(url)));
+        }
+        Ok(self.http.for_url(url).await?.post(url))
+    }
+
     fn apply_cached_etag(
         req: reqwest::RequestBuilder,
         cache_validator: Option<&CacheValidator>,
@@ -24,7 +104,17 @@ impl RegistryClient {
         &self,
         request_builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, LpmError> {
-        let response = self.send_with_retry(request_builder).await?;
+        let request = request_builder
+            .build()
+            .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
+        let client_override = if request.version() == reqwest::Version::HTTP_3 {
+            self.worker_metadata_http3_client.lock().await.clone()
+        } else {
+            None
+        };
+        let response = self
+            .send_request_with_retry(request, client_override)
+            .await?;
         crate::timing::record_metadata_http_version(response.version());
         Ok(response)
     }
@@ -99,15 +189,14 @@ impl RegistryClient {
         let result = self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
                 let mut req = self
-                    .http
-                    .for_url(&url)
+                    .build_worker_metadata_post(&url)
                     .await?
-                    .post(&url)
                     .header("Accept", "application/x-ndjson")
                     .json(&body);
                 if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
                     req = req.bearer_auth(bearer);
                 }
+                let req = self.apply_worker_metadata_http_version(req, &url);
                 let response = self.send_package_metadata_request(req).await?;
 
                 let content_type = response
@@ -387,7 +476,7 @@ impl RegistryClient {
         let result = self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
                 let cache_validator = self.read_cache_validator(&cache_key);
-                let mut req = self.build_get(&url).await?;
+                let mut req = self.build_worker_metadata_get(&url).await?;
                 if let Some(etag) = cache_validator.as_ref().and_then(|c| c.etag.as_deref()) {
                     req = req.header("If-None-Match", etag);
                 }
@@ -400,7 +489,7 @@ impl RegistryClient {
                         return Ok(meta);
                     }
                     response = self
-                        .send_package_metadata_request(self.build_get(&url).await?)
+                        .send_package_metadata_request(self.build_worker_metadata_get(&url).await?)
                         .await?;
                 }
 
@@ -456,8 +545,10 @@ impl RegistryClient {
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
         let cache_validator = self.read_cache_validator(&cache_key);
 
-        let req =
-            Self::apply_cached_etag(self.build_get(&proxy_url).await?, cache_validator.as_ref());
+        let req = Self::apply_cached_etag(
+            self.build_worker_metadata_get(&proxy_url).await?,
+            cache_validator.as_ref(),
+        );
 
         match self.send_package_metadata_request(req).await {
             Ok(mut response) => {
@@ -467,7 +558,9 @@ impl RegistryClient {
                         return finish!(Ok(meta));
                     }
                     response = self
-                        .send_package_metadata_request(self.build_get(&proxy_url).await?)
+                        .send_package_metadata_request(
+                            self.build_worker_metadata_get(&proxy_url).await?,
+                        )
                         .await?;
                 }
 
@@ -661,7 +754,7 @@ impl RegistryClient {
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
         let cache_validator = self.read_cache_validator(&cache_key);
         let req = Self::apply_cached_etag(
-            self.build_get(&proxy_url)
+            self.build_worker_metadata_get(&proxy_url)
                 .await?
                 .header("Accept", "application/json"),
             cache_validator.as_ref(),
@@ -675,7 +768,7 @@ impl RegistryClient {
                 }
                 response = self
                     .send_package_metadata_request(
-                        self.build_get(&proxy_url)
+                        self.build_worker_metadata_get(&proxy_url)
                             .await?
                             .header("Accept", "application/json"),
                     )
@@ -892,7 +985,7 @@ impl RegistryClient {
 
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
         let cache_validator = self.read_cache_validator(&cache_key);
-        let mut req = self.build_get(&proxy_url).await?;
+        let mut req = self.build_worker_metadata_get(&proxy_url).await?;
         if let Some(etag) = cache_validator
             .as_ref()
             .and_then(|validator| validator.etag.as_deref())
@@ -910,7 +1003,7 @@ impl RegistryClient {
                 return finish!(Ok(meta));
             }
             response = match self
-                .send_package_metadata_request(self.build_get(&proxy_url).await?)
+                .send_package_metadata_request(self.build_worker_metadata_get(&proxy_url).await?)
                 .await
             {
                 Ok(response) => response,
