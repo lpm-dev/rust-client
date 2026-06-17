@@ -9,6 +9,10 @@ KEEP_WORK="${LPM_LIVE_METADATA_KEEP_WORK:-0}"
 STORE_VERSION="${LPM_STORE_VERSION:-v2}"
 PREWARM_ROUTE="${LPM_LIVE_METADATA_PREWARM_ROUTE:-direct}"
 HTTP_MODE="${LPM_LIVE_METADATA_HTTP:-}"
+TRANSPORT_COMPARE="${LPM_LIVE_METADATA_TRANSPORT_COMPARE:-0}"
+TRANSPORT_COMPARE_TRANSPORTS="${LPM_LIVE_METADATA_TRANSPORTS:-reqwest-h3,tokio-quiche}"
+TRANSPORT_COMPARE_PACKAGES="${LPM_LIVE_METADATA_TRANSPORT_PACKAGES:-axios,react,zod,debug}"
+TRANSPORT_COMPARE_TIMEOUT_MS="${LPM_LIVE_METADATA_TRANSPORT_TIMEOUT_MS:-30000}"
 
 LOCAL_BIN="$REPO_ROOT/target/release/lpm-rs"
 if [[ -n "${LPM_BIN:-}" ]]; then
@@ -21,7 +25,7 @@ fi
 
 usage() {
 	cat <<'EOF'
-Usage: bench/live-metadata-route.sh [--runs N] [--mode cold|warm-store] [--keep-work]
+Usage: bench/live-metadata-route.sh [--runs N] [--mode cold|warm-store] [--keep-work] [--transport-compare]
 
 Runs an interleaved live install comparison for npm direct metadata versus
 Worker-routed metadata. The warm-store mode pre-populates tarballs once, then
@@ -35,6 +39,14 @@ Environment:
   LPM_LIVE_METADATA_PREWARM_ROUTE
                                direct or proxy prewarm route (default: direct)
   LPM_LIVE_METADATA_HTTP       forwarded to LPM_HTTP (example: h3-worker)
+  LPM_LIVE_METADATA_TRANSPORT_COMPARE
+                               run reqwest-H3 vs tokio-quiche metadata RPC probe when set to 1
+  LPM_LIVE_METADATA_TRANSPORTS comma-separated transports for the probe
+                               (default: reqwest-h3,tokio-quiche)
+  LPM_LIVE_METADATA_TRANSPORT_PACKAGES
+                               comma-separated package names for the probe
+  LPM_LIVE_METADATA_TRANSPORT_TIMEOUT_MS
+                               per-sample probe timeout in milliseconds (default: 30000)
   LPM_STORE_VERSION            store layout passed to lpm (default: v2)
   BENCH_WORK_DIR               parent directory for temp work
 EOF
@@ -57,6 +69,10 @@ while [[ $# -gt 0 ]]; do
 		--http)
 			HTTP_MODE="${2:?--http requires a value}"
 			shift 2
+			;;
+		--transport-compare)
+			TRANSPORT_COMPARE=1
+			shift
 			;;
 		-h|--help)
 			usage
@@ -369,6 +385,24 @@ print_summary() {
 	' "$RESULTS"
 }
 
+run_transport_compare() {
+	local manifest="$REPO_ROOT/bench/http3-transport-compare/Cargo.toml"
+	if [[ ! -f "$manifest" ]]; then
+		echo "missing transport compare helper: $manifest" >&2
+		return 1
+	fi
+	if ! command -v cmake >/dev/null 2>&1; then
+		echo "cmake is required for tokio-quiche/BoringSSL transport comparison" >&2
+		return 1
+	fi
+	RUSTFLAGS="${RUSTFLAGS:-} --cfg reqwest_unstable" \
+		cargo run --quiet --release --manifest-path "$manifest" -- \
+			--runs "$RUNS" \
+			--transports "$TRANSPORT_COMPARE_TRANSPORTS" \
+			--packages "$TRANSPORT_COMPARE_PACKAGES" \
+			--timeout-ms "$TRANSPORT_COMPARE_TIMEOUT_MS"
+}
+
 printf 'LPM Live Metadata Route Benchmark\n'
 printf 'runs: %s\n' "$RUNS"
 printf 'mode: %s\n' "$MODE"
@@ -395,6 +429,11 @@ done
 printf 'results: %s\n' "$RESULTS"
 printf 'summary:\n'
 print_summary
+
+if [[ "$TRANSPORT_COMPARE" == "1" ]]; then
+	printf 'transport_compare:\n'
+	run_transport_compare
+fi
 
 if [[ "$FAILURES" -ne 0 ]]; then
 	exit 1

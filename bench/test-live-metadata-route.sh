@@ -132,3 +132,69 @@ if grep -Fxq "HOME=$HOME" "$ENV_FILE"; then
 fi
 
 echo "live metadata route bench helper tests passed"
+
+FAKE_BIN_DIR="$TMP_DIR/bin"
+CARGO_ARGS_FILE="$TMP_DIR/cargo-args.txt"
+CARGO_ENV_FILE="$TMP_DIR/cargo-env.txt"
+mkdir -p "$FAKE_BIN_DIR"
+
+cat > "$FAKE_BIN_DIR/cmake" <<'SH'
+#!/bin/bash
+exit 0
+SH
+chmod +x "$FAKE_BIN_DIR/cmake"
+
+cat > "$FAKE_BIN_DIR/cargo" <<'SH'
+#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" > "$LPM_TEST_CARGO_ARGS_FILE"
+printf 'RUSTFLAGS=%s\n' "${RUSTFLAGS:-}" > "$LPM_TEST_CARGO_ENV_FILE"
+cat <<'JSON'
+{
+  "samples": [
+    {
+      "transport": "reqwest-h3",
+      "sample": 1,
+      "wall_ms": 10,
+      "success": true,
+      "status": 200,
+      "body_bytes": 100,
+      "body_lines": 1,
+      "error": null
+    }
+  ],
+  "summary": [
+    {
+      "transport": "reqwest-h3",
+      "samples": 1,
+      "failures": 0,
+      "wall_ms_median": 10,
+      "body_bytes_median": 100,
+      "body_lines_median": 1,
+      "statuses": { "200": 1 }
+    }
+  ]
+}
+JSON
+SH
+chmod +x "$FAKE_BIN_DIR/cargo"
+
+export LPM_TEST_CARGO_ARGS_FILE="$CARGO_ARGS_FILE"
+export LPM_TEST_CARGO_ENV_FILE="$CARGO_ENV_FILE"
+
+PATH="$FAKE_BIN_DIR:$PATH" \
+RUNS=1 \
+BENCH_WORK_DIR="$TMP_DIR/work" \
+LPM_LIVE_METADATA_KEEP_WORK=1 \
+"$REPO_ROOT/bench/live-metadata-route.sh" --transport-compare > "$TMP_DIR/out-transport.txt" 2> "$TMP_DIR/err-transport.txt"
+
+grep -Fq 'transport_compare:' "$TMP_DIR/out-transport.txt"
+grep -Fq '"transport": "reqwest-h3"' "$TMP_DIR/out-transport.txt"
+grep -Fq 'run --quiet --release --manifest-path' "$CARGO_ARGS_FILE"
+grep -Fq -- '--runs 1' "$CARGO_ARGS_FILE"
+grep -Fq -- '--transports reqwest-h3,tokio-quiche' "$CARGO_ARGS_FILE"
+grep -Fq -- '--packages axios,react,zod,debug' "$CARGO_ARGS_FILE"
+grep -Fq -- '--timeout-ms 30000' "$CARGO_ARGS_FILE"
+grep -Fq -- '--cfg reqwest_unstable' "$CARGO_ENV_FILE"
+
+echo "live metadata route transport compare helper tests passed"
