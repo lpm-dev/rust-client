@@ -779,8 +779,30 @@ impl RegistryClient {
         &self,
         name: &str,
     ) -> Result<PackageMetadata, LpmError> {
+        self.get_npm_metadata_direct_full_inner(name, true).await
+    }
+
+    /// Fetch a full npm packument directly from `registry.npmjs.org`
+    /// without reading the existing full-metadata cache first.
+    ///
+    /// Used when a routed full-metadata source populated `npm-full:*`
+    /// with incomplete policy fields and the caller needs a fresh direct
+    /// response to repair that cache entry.
+    pub async fn refetch_npm_metadata_direct_full(
+        &self,
+        name: &str,
+    ) -> Result<PackageMetadata, LpmError> {
+        self.get_npm_metadata_direct_full_inner(name, false).await
+    }
+
+    async fn get_npm_metadata_direct_full_inner(
+        &self,
+        name: &str,
+        use_cache: bool,
+    ) -> Result<PackageMetadata, LpmError> {
         let cache_key = format!("npm-full:{name}");
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+        if use_cache && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+        {
             tracing::debug!("metadata cache hit (direct): npm-full:{name}");
             return Ok(cached);
         }
@@ -794,7 +816,9 @@ impl RegistryClient {
             }};
         }
 
-        let cache_validator = self.read_cache_validator(&cache_key);
+        let cache_validator = use_cache
+            .then(|| self.read_cache_validator(&cache_key))
+            .flatten();
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
         let req = self
             .http
@@ -807,7 +831,7 @@ impl RegistryClient {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
-        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        if use_cache && response.status() == reqwest::StatusCode::NOT_MODIFIED {
             if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
                 tracing::debug!("metadata cache revalidated (direct full 304): npm:{name}");
                 return finish!(Ok(metadata));

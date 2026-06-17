@@ -57,16 +57,43 @@ impl LpmDependencyProvider {
 
                 let mut info = parse_metadata_to_cache_info(&metadata);
                 if info.needs_policy_metadata(&key, &self.policy) {
-                    let full = self
-                        .rt
-                        .block_on(self.client.get_npm_metadata_routed_full(name, route))
-                        .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
-                    info = parse_full_metadata_to_cache_info(&full);
+                    info = self.fetch_full_policy_info(name, route, &key)?;
                 }
                 tracing::debug!("npm package {name}: {} versions", info.versions.len());
                 self.insert_and_notify(key, info);
                 Ok(())
             }
         }
+    }
+
+    pub(super) fn fetch_full_policy_info(
+        &self,
+        name: &str,
+        route: UpstreamRoute,
+        key: &CanonicalKey,
+    ) -> Result<CachedPackageInfo, ProviderError> {
+        let full = self
+            .rt
+            .block_on(
+                self.client
+                    .get_npm_metadata_routed_full(name, route.clone()),
+            )
+            .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
+        let info = parse_full_metadata_to_cache_info(&full);
+        if !info.needs_policy_metadata(key, &self.policy) {
+            return Ok(info);
+        }
+        if !matches!(route, UpstreamRoute::LpmWorker) {
+            return Ok(info);
+        }
+
+        tracing::debug!(
+            "Worker full metadata for {name} omitted policy fields; falling back to direct npm full metadata"
+        );
+        let direct_full = self
+            .rt
+            .block_on(self.client.refetch_npm_metadata_direct_full(name))
+            .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
+        Ok(parse_full_metadata_to_cache_info(&direct_full))
     }
 }

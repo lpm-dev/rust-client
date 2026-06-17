@@ -161,11 +161,8 @@ impl LpmDependencyProvider {
             return Ok(());
         };
         let route = self.route_table.route_for_package(name);
-        let metadata = self
-            .rt
-            .block_on(self.client.get_npm_metadata_routed_full(name, route))
-            .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
-        self.insert_and_notify(key.clone(), parse_full_metadata_to_cache_info(&metadata));
+        let info = self.fetch_full_policy_info(name, route, key)?;
+        self.insert_and_notify(key.clone(), info);
         Ok(())
     }
 

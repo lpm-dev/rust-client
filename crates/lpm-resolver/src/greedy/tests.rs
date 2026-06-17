@@ -285,6 +285,115 @@ async fn fetch_metadata_refetches_full_packument_when_release_age_needs_publish_
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_metadata_uses_direct_full_when_worker_full_omits_release_time() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let proxy_server = MockServer::start().await;
+    let npm_server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("cache temp dir");
+    let client = RegistryClient::new()
+        .with_base_url(proxy_server.uri())
+        .with_npm_registry_url(npm_server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()));
+
+    let worker_missing_time = serde_json::json!({
+        "name": "release-age-worker-fixture",
+        "modified": "2025-01-03T00:00:00.000Z",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "release-age-worker-fixture",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/release-age-worker-fixture.tgz",
+                    "integrity": "sha512-release-age"
+                },
+                "dependencies": {}
+            }
+        }
+    });
+    let direct_full = serde_json::json!({
+        "name": "release-age-worker-fixture",
+        "modified": "2025-01-03T00:00:00.000Z",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "release-age-worker-fixture",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/release-age-worker-fixture.tgz",
+                    "integrity": "sha512-release-age"
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z"
+        }
+    });
+
+    let worker_requests = Arc::new(AtomicUsize::new(0));
+    let worker_requests_for_responder = Arc::clone(&worker_requests);
+    Mock::given(method("GET"))
+        .and(path("/api/registry/release-age-worker-fixture"))
+        .respond_with(move |request: &wiremock::Request| {
+            let attempt = worker_requests_for_responder.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                assert_ne!(
+                    request
+                        .headers
+                        .get("accept")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("application/json")
+                );
+            } else {
+                assert_eq!(
+                    request
+                        .headers
+                        .get("accept")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("application/json")
+                );
+            }
+            ResponseTemplate::new(200).set_body_json(worker_missing_time.clone())
+        })
+        .expect(2)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/release-age-worker-fixture"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(direct_full))
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let route_table = RouteTable::from_mode_only(RouteMode::Proxy);
+    let canonical = CanonicalKey::npm("release-age-worker-fixture");
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+
+    let fetched = fetch_metadata_for_resolver(&client, &route_table, &canonical, &policy, false)
+        .await
+        .expect("policy fetch should recover direct full metadata when Worker omits time");
+
+    assert_eq!(worker_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fetched
+            .info
+            .dist
+            .get("1.0.0")
+            .and_then(|dist| dist.published_at.as_deref()),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}
+
 #[test]
 fn find_best_version_ignores_platform_when_selecting_version() {
     // Platform filtering happens after resolution so lockfiles stay
