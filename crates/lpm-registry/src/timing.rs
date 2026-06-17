@@ -28,6 +28,12 @@ use std::time::Duration;
 static METADATA_RPC_NS: AtomicU64 = AtomicU64::new(0);
 static METADATA_RPC_COUNT: AtomicU32 = AtomicU32::new(0);
 static PARSE_NDJSON_NS: AtomicU64 = AtomicU64::new(0);
+static METADATA_HTTP_09_COUNT: AtomicU32 = AtomicU32::new(0);
+static METADATA_HTTP_10_COUNT: AtomicU32 = AtomicU32::new(0);
+static METADATA_HTTP_11_COUNT: AtomicU32 = AtomicU32::new(0);
+static METADATA_HTTP_2_COUNT: AtomicU32 = AtomicU32::new(0);
+static METADATA_HTTP_3_COUNT: AtomicU32 = AtomicU32::new(0);
+static METADATA_HTTP_UNKNOWN_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Split `metadata_rpc_count` into walker-driven and provider-escape-hatch
 /// buckets. Walker code paths call [`record_walker_rpcs`] with the count
@@ -50,6 +56,16 @@ pub fn reset() {
     METADATA_RPC_COUNT.store(0, Ordering::Relaxed);
     PARSE_NDJSON_NS.store(0, Ordering::Relaxed);
     WALKER_RPC_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Reset install-scoped metadata response protocol counters.
+pub fn reset_metadata_http_versions() {
+    METADATA_HTTP_09_COUNT.store(0, Ordering::Relaxed);
+    METADATA_HTTP_10_COUNT.store(0, Ordering::Relaxed);
+    METADATA_HTTP_11_COUNT.store(0, Ordering::Relaxed);
+    METADATA_HTTP_2_COUNT.store(0, Ordering::Relaxed);
+    METADATA_HTTP_3_COUNT.store(0, Ordering::Relaxed);
+    METADATA_HTTP_UNKNOWN_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// Record wall-clock time spent in a single metadata RPC. Covers
@@ -80,6 +96,35 @@ pub fn record_parse(duration: Duration) {
 /// `record_rpc` continues to bump the total; this moves the bucketing.
 pub fn record_walker_rpcs(n: u32) {
     WALKER_RPC_COUNT.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Record the negotiated protocol version for one package-metadata response.
+pub fn record_metadata_http_version(version: reqwest::Version) {
+    if version == reqwest::Version::HTTP_09 {
+        METADATA_HTTP_09_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else if version == reqwest::Version::HTTP_10 {
+        METADATA_HTTP_10_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else if version == reqwest::Version::HTTP_11 {
+        METADATA_HTTP_11_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else if version == reqwest::Version::HTTP_2 {
+        METADATA_HTTP_2_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else if version == reqwest::Version::HTTP_3 {
+        METADATA_HTTP_3_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        METADATA_HTTP_UNKNOWN_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot package-metadata response protocol counters.
+pub fn snapshot_metadata_http_versions() -> HttpVersionCounts {
+    HttpVersionCounts {
+        http_09: METADATA_HTTP_09_COUNT.load(Ordering::Relaxed),
+        http_10: METADATA_HTTP_10_COUNT.load(Ordering::Relaxed),
+        http_11: METADATA_HTTP_11_COUNT.load(Ordering::Relaxed),
+        http_2: METADATA_HTTP_2_COUNT.load(Ordering::Relaxed),
+        http_3: METADATA_HTTP_3_COUNT.load(Ordering::Relaxed),
+        unknown: METADATA_HTTP_UNKNOWN_COUNT.load(Ordering::Relaxed),
+    }
 }
 
 /// Snapshot the accumulators without clearing them.
@@ -126,4 +171,15 @@ pub struct Snapshot {
     /// `fetch_wait_timeout`). High values indicate the walker's depth or
     /// fanout is undersized. `escape_hatch + walker == metadata_rpc_count`.
     pub escape_hatch_rpc_count: u32,
+}
+
+/// Counts of package-metadata HTTP responses by negotiated protocol version.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct HttpVersionCounts {
+    pub http_09: u32,
+    pub http_10: u32,
+    pub http_11: u32,
+    pub http_2: u32,
+    pub http_3: u32,
+    pub unknown: u32,
 }

@@ -813,6 +813,7 @@ async fn run_with_options_under_store_lock(
     lpm_root: &lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
+    lpm_registry::timing::reset_metadata_http_versions();
     crate::security_floor::clear_recorded_suppressions();
     let global_config = crate::commands::config::GlobalConfig::load();
     let verify_registry_signatures = registry_signature_verification_enabled(&global_config);
@@ -5236,6 +5237,7 @@ async fn run_with_options_under_store_lock(
         };
 
     if json_output {
+        let metadata_http_versions = lpm_registry::timing::snapshot_metadata_http_versions();
         let pkg_list: Vec<serde_json::Value> = packages
             .iter()
             .map(|p| {
@@ -5316,6 +5318,14 @@ async fn run_with_options_under_store_lock(
                            "escape_hatch_rpc_count": resolver_stage_timing.escape_hatch_rpc_count,
                            "parse_ndjson_ms": resolver_stage_timing.parse_ndjson_ms,
                            "pubgrub_ms": resolver_stage_timing.pubgrub_ms,
+                           "metadata_http_versions": {
+                               "http_09": metadata_http_versions.http_09,
+                               "http_10": metadata_http_versions.http_10,
+                               "http_11": metadata_http_versions.http_11,
+                               "http_2": metadata_http_versions.http_2,
+                               "http_3": metadata_http_versions.http_3,
+                               "unknown": metadata_http_versions.unknown,
+                           },
         // — fused metadata-dispatcher counters. Zero on
         // the walker arm; populated under greedy fusion.
         // Field shape:

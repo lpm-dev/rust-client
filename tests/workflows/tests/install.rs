@@ -1631,6 +1631,28 @@ async fn install_json_output_contains_package_list() {
         "packages array should contain 'ms', got: {packages:?}"
     );
 
+    let http_versions = &json["timing"]["resolve"]["metadata_http_versions"];
+    assert!(
+        http_versions.is_object(),
+        "timing.resolve.metadata_http_versions must be an object; got: {http_versions:?}"
+    );
+    let mut metadata_response_count = 0u64;
+    for field in [
+        "http_09", "http_10", "http_11", "http_2", "http_3", "unknown",
+    ] {
+        let count = http_versions[field].as_u64().unwrap_or_else(|| {
+            panic!(
+                "timing.resolve.metadata_http_versions.{field} must be a number; object was: {http_versions:?}"
+            )
+        });
+        metadata_response_count += count;
+    }
+    assert!(
+        metadata_response_count >= 1,
+        "fresh install must count at least one package-metadata HTTP response; \
+         object was: {http_versions:?}"
+    );
+
     //  — `timing.resolve.streaming_bfs` contract.
     // On a fresh-resolve install (not lockfile-fast-path) the walker
     // runs and the sub-object is emitted with the eight documented

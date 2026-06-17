@@ -20,6 +20,15 @@ impl RegistryClient {
             .map(str::to_string)
     }
 
+    async fn send_package_metadata_request(
+        &self,
+        request_builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, LpmError> {
+        let response = self.send_with_retry(request_builder).await?;
+        crate::timing::record_metadata_http_version(response.version());
+        Ok(response)
+    }
+
     fn npm_proxy_can_fallback_to_direct(error: &LpmError) -> bool {
         matches!(
             error,
@@ -99,7 +108,7 @@ impl RegistryClient {
                 if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
                     req = req.bearer_auth(bearer);
                 }
-                let response = self.send_with_retry(req).await?;
+                let response = self.send_package_metadata_request(req).await?;
 
                 let content_type = response
                     .headers()
@@ -383,14 +392,16 @@ impl RegistryClient {
                     req = req.header("If-None-Match", etag);
                 }
 
-                let mut response = self.send_with_retry(req).await?;
+                let mut response = self.send_package_metadata_request(req).await?;
 
                 if response.status() == reqwest::StatusCode::NOT_MODIFIED {
                     if let Some(meta) = self.cached_metadata_after_304(&cache_key).await {
                         tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
                         return Ok(meta);
                     }
-                    response = self.send_with_retry(self.build_get(&url).await?).await?;
+                    response = self
+                        .send_package_metadata_request(self.build_get(&url).await?)
+                        .await?;
                 }
 
                 let etag = response
@@ -448,7 +459,7 @@ impl RegistryClient {
         let req =
             Self::apply_cached_etag(self.build_get(&proxy_url).await?, cache_validator.as_ref());
 
-        match self.send_with_retry(req).await {
+        match self.send_package_metadata_request(req).await {
             Ok(mut response) => {
                 if response.status() == reqwest::StatusCode::NOT_MODIFIED {
                     if let Some(meta) = self.cached_metadata_after_304(&cache_key).await {
@@ -456,7 +467,7 @@ impl RegistryClient {
                         return finish!(Ok(meta));
                     }
                     response = self
-                        .send_with_retry(self.build_get(&proxy_url).await?)
+                        .send_package_metadata_request(self.build_get(&proxy_url).await?)
                         .await?;
                 }
 
@@ -510,7 +521,7 @@ impl RegistryClient {
             .get(&npm_url)
             .header("Accept", "application/vnd.npm.install-v1+json");
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
-        let mut response = match self.send_with_retry(req).await {
+        let mut response = match self.send_package_metadata_request(req).await {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
@@ -520,7 +531,7 @@ impl RegistryClient {
                 return finish!(Ok(metadata));
             }
             response = match self
-                .send_with_retry(
+                .send_package_metadata_request(
                     self.http
                         .for_url(&npm_url)
                         .await?
@@ -586,7 +597,7 @@ impl RegistryClient {
             .get(&npm_url)
             .header("Accept", "application/vnd.npm.install-v1+json");
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
-        let mut response = match self.send_with_retry(req).await {
+        let mut response = match self.send_package_metadata_request(req).await {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
@@ -596,7 +607,7 @@ impl RegistryClient {
                 return finish!(Ok(metadata));
             }
             response = match self
-                .send_with_retry(
+                .send_package_metadata_request(
                     self.http
                         .for_url(&npm_url)
                         .await?
@@ -656,14 +667,14 @@ impl RegistryClient {
             cache_validator.as_ref(),
         );
 
-        match self.send_with_retry(req).await {
+        match self.send_package_metadata_request(req).await {
             Ok(mut response) if response.status() == reqwest::StatusCode::NOT_MODIFIED => {
                 if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
                     tracing::debug!("metadata cache revalidated (full proxy 304): npm:{name}");
                     return finish!(Ok(metadata));
                 }
                 response = self
-                    .send_with_retry(
+                    .send_package_metadata_request(
                         self.build_get(&proxy_url)
                             .await?
                             .header("Accept", "application/json"),
@@ -724,7 +735,7 @@ impl RegistryClient {
             .get(&npm_url)
             .header("Accept", "application/json");
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
-        let mut response = match self.send_with_retry(req).await {
+        let mut response = match self.send_package_metadata_request(req).await {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
@@ -736,7 +747,7 @@ impl RegistryClient {
                 return finish!(Ok(metadata));
             }
             response = match self
-                .send_with_retry(
+                .send_package_metadata_request(
                     self.http
                         .for_url(&npm_url)
                         .await?
@@ -792,7 +803,7 @@ impl RegistryClient {
             .get(&npm_url)
             .header("Accept", "application/json");
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
-        let mut response = match self.send_with_retry(req).await {
+        let mut response = match self.send_package_metadata_request(req).await {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
@@ -802,7 +813,7 @@ impl RegistryClient {
                 return finish!(Ok(metadata));
             }
             response = match self
-                .send_with_retry(
+                .send_package_metadata_request(
                     self.http
                         .for_url(&npm_url)
                         .await?
@@ -865,7 +876,7 @@ impl RegistryClient {
             req = req.header("If-None-Match", etag);
         }
 
-        let mut response = match self.send_with_retry(req).await {
+        let mut response = match self.send_package_metadata_request(req).await {
             Ok(response) => response,
             Err(err) => return finish!(Err(err)),
         };
@@ -875,7 +886,7 @@ impl RegistryClient {
                 return finish!(Ok(meta));
             }
             response = match self
-                .send_with_retry(self.build_get(&proxy_url).await?)
+                .send_package_metadata_request(self.build_get(&proxy_url).await?)
                 .await
             {
                 Ok(response) => response,
@@ -1130,7 +1141,7 @@ impl RegistryClient {
         let req = apply_npmrc_auth(req, &url, auth)?;
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
 
-        let mut response = match self.send_with_retry(req).await {
+        let mut response = match self.send_package_metadata_request(req).await {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
@@ -1146,7 +1157,7 @@ impl RegistryClient {
                 .get(&url)
                 .header("Accept", "application/vnd.npm.install-v1+json");
             let req = apply_npmrc_auth(req, &url, auth)?;
-            response = match self.send_with_retry(req).await {
+            response = match self.send_package_metadata_request(req).await {
                 Ok(r) => r,
                 Err(e) => return finish!(Err(e)),
             };
@@ -1207,7 +1218,7 @@ impl RegistryClient {
             .header("Accept", "application/json");
         let req = apply_npmrc_auth(req, &url, auth)?;
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
-        let mut response = match self.send_with_retry(req).await {
+        let mut response = match self.send_package_metadata_request(req).await {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
@@ -1223,7 +1234,7 @@ impl RegistryClient {
                 .get(&url)
                 .header("Accept", "application/json");
             let req = apply_npmrc_auth(req, &url, auth)?;
-            response = match self.send_with_retry(req).await {
+            response = match self.send_package_metadata_request(req).await {
                 Ok(r) => r,
                 Err(e) => return finish!(Err(e)),
             };
