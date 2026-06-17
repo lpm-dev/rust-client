@@ -106,6 +106,9 @@ jobs:
       - name: Local install bench helper tests
         run: bash bench/test-local-install.sh
 
+      - name: Live metadata route bench helper tests
+        run: bash bench/test-live-metadata-route.sh
+
       - name: Install Node 22
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
