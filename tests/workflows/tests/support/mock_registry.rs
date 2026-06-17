@@ -6,6 +6,7 @@
 //! tests can validate install, publish, health, and auth flows without
 //! any external network calls.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
@@ -17,6 +18,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 /// common endpoint mocks. Pass `mock.url()` as `--registry` to the CLI.
 pub struct MockRegistry {
     server: MockServer,
+    tarball_integrities: Arc<Mutex<HashMap<(String, String), String>>>,
 }
 
 pub struct RegistrySigningFixture {
@@ -75,7 +77,10 @@ impl MockRegistry {
     /// Start a new mock registry on a random port.
     pub async fn start() -> Self {
         let server = MockServer::start().await;
-        MockRegistry { server }
+        MockRegistry {
+            server,
+            tarball_integrities: Arc::default(),
+        }
     }
 
     /// Adopt an already-started `MockServer`. Used by tests that
@@ -86,7 +91,10 @@ impl MockRegistry {
     /// the listener can be auto-allocated, prefer
     /// [`MockRegistry::start`] (one less moving part to set up).
     pub fn from_server(server: MockServer) -> Self {
-        MockRegistry { server }
+        MockRegistry {
+            server,
+            tarball_integrities: Arc::default(),
+        }
     }
 
     /// The base URL of the mock server (e.g., `http://127.0.0.1:PORT`).
@@ -947,6 +955,56 @@ impl MockRegistry {
         format!("{}{}", self.server.uri(), Self::tarball_path(name, version))
     }
 
+    pub fn register_tarball_bytes(&self, name: &str, version: &str, tarball_bytes: &[u8]) {
+        self.register_tarball_integrity(name, version, compute_integrity(tarball_bytes));
+    }
+
+    pub fn register_tarball_integrity(&self, name: &str, version: &str, integrity: String) {
+        self.tarball_integrities
+            .lock()
+            .expect("mock tarball integrity registry poisoned")
+            .insert((name.to_string(), version.to_string()), integrity);
+    }
+
+    fn registered_tarball_integrity(&self, name: &str, version: &str) -> Option<String> {
+        self.tarball_integrities
+            .lock()
+            .expect("mock tarball integrity registry poisoned")
+            .get(&(name.to_string(), version.to_string()))
+            .cloned()
+    }
+
+    fn normalize_batch_metadata_integrity(&self, metadata: &mut serde_json::Value) {
+        let Some(name) = metadata.get("name").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let name = name.to_string();
+        let Some(versions) = metadata
+            .get_mut("versions")
+            .and_then(|value| value.as_object_mut())
+        else {
+            return;
+        };
+        for (version, version_meta) in versions {
+            let Some(dist) = version_meta
+                .get_mut("dist")
+                .and_then(|value| value.as_object_mut())
+            else {
+                continue;
+            };
+            if dist.get("integrity").and_then(|value| value.as_str()) != Some("sha512-placeholder")
+            {
+                continue;
+            }
+            if let Some(integrity) = self.registered_tarball_integrity(&name, version) {
+                dist.insert(
+                    "integrity".to_string(),
+                    serde_json::Value::String(integrity),
+                );
+            }
+        }
+    }
+
     pub fn package_metadata(
         &self,
         name: &str,
@@ -954,6 +1012,7 @@ impl MockRegistry {
         tarball_bytes: &[u8],
     ) -> serde_json::Value {
         let integrity = compute_integrity(tarball_bytes);
+        self.register_tarball_integrity(name, version, integrity.clone());
         serde_json::json!({
             "name": name,
             "dist-tags": { "latest": version },
@@ -980,6 +1039,7 @@ impl MockRegistry {
         signer: &RegistrySigningFixture,
     ) -> serde_json::Value {
         let integrity = compute_integrity(tarball_bytes);
+        self.register_tarball_integrity(name, version, integrity.clone());
         let signature = signer.signature_json(name, version, &integrity);
         serde_json::json!({
             "name": name,
@@ -1032,6 +1092,7 @@ impl MockRegistry {
             .await;
 
         let tarball_path = Self::tarball_path(name, version);
+        self.register_tarball_bytes(name, version, tarball_bytes);
         Mock::given(method("GET"))
             .and(path(&tarball_path))
             .respond_with(
@@ -1081,6 +1142,7 @@ impl MockRegistry {
         let tarball_bytes = make_tarball_from_pkg_json(pkg_json.clone(), extra_files);
         let tarball_url = self.tarball_url(&name, &version);
         let integrity = compute_integrity(&tarball_bytes);
+        self.register_tarball_integrity(&name, &version, integrity.clone());
 
         let mut version_meta = serde_json::Map::new();
         version_meta.insert("name".to_string(), serde_json::Value::String(name.clone()));
@@ -1169,6 +1231,7 @@ impl MockRegistry {
 
         // Compute real sha512 integrity for the tarball
         let integrity = compute_integrity(tarball_bytes);
+        self.register_tarball_integrity(name, version, integrity.clone());
 
         let metadata = serde_json::json!({
             "name": name,
@@ -1241,6 +1304,7 @@ impl MockRegistry {
     ) -> &Self {
         let tarball_url = self.tarball_url(name, version);
         let integrity = compute_integrity(tarball_bytes);
+        self.register_tarball_integrity(name, version, integrity.clone());
 
         let metadata = serde_json::json!({
             "name": name,
@@ -1334,6 +1398,9 @@ impl MockRegistry {
                 // checked.
                 None => "sha512-missing".to_string(),
             };
+            if bytes_opt.is_some() {
+                self.register_tarball_integrity(name, v, integrity.clone());
+            }
             versions_map.insert(
                 (*v).to_string(),
                 serde_json::json!({
@@ -1418,6 +1485,7 @@ impl MockRegistry {
             .await;
 
         for (version, tarball_bytes) in tarballs {
+            self.register_tarball_bytes(name, version, tarball_bytes);
             let tarball_path = Self::tarball_path(name, version);
             Mock::given(method("GET"))
                 .and(path(&tarball_path))
@@ -1444,10 +1512,15 @@ impl MockRegistry {
         // bare `PackageMetadata` line fails that schema and is silently
         // dropped. Auto-wrap callers who pass raw metadata.
         let mut ndjson = String::new();
-        for pkg in &packages {
-            let line = match pkg.get("metadata") {
-                Some(_) => serde_json::to_string(pkg).unwrap(),
+        for pkg in packages {
+            let mut pkg = pkg;
+            let line = match pkg.get_mut("metadata") {
+                Some(metadata) => {
+                    self.normalize_batch_metadata_integrity(metadata);
+                    serde_json::to_string(&pkg).unwrap()
+                }
                 None => {
+                    self.normalize_batch_metadata_integrity(&mut pkg);
                     let name = pkg
                         .get("name")
                         .and_then(|v| v.as_str())

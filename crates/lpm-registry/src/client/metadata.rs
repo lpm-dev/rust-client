@@ -20,6 +20,13 @@ impl RegistryClient {
             .map(str::to_string)
     }
 
+    fn npm_proxy_can_fallback_to_direct(error: &LpmError) -> bool {
+        matches!(
+            error,
+            LpmError::AuthRequired | LpmError::UpstreamProxyEntitlementRequired { .. }
+        )
+    }
+
     async fn cached_metadata_after_304(&self, cache_key: &str) -> Option<PackageMetadata> {
         let path = self.cache_path(cache_key)?;
         tokio::task::spawn_blocking(move || {
@@ -481,12 +488,12 @@ impl RegistryClient {
             Err(LpmError::NotFound(_)) => {
                 tracing::debug!("npm metadata miss via LPM upstream proxy: {name}");
             }
-            Err(LpmError::AuthRequired) => {
-                // Proxy returned 401/403 for a bare npm package — expected
-                // when the user isn't logged in. Fall through to the public
-                // npm registry which doesn't need auth.
+            Err(error) if Self::npm_proxy_can_fallback_to_direct(&error) => {
+                // Proxy access can be unavailable for standalone npm packages.
+                // Direct npm remains the compatibility fallback; firewall
+                // block errors use a distinct variant and are not swallowed here.
                 tracing::debug!(
-                    "npm proxy auth required for {name}, falling back to public registry"
+                    "npm proxy unavailable for {name}: {error}; falling back to public registry"
                 );
             }
             Err(error) => return finish!(Err(error)),
@@ -704,7 +711,8 @@ impl RegistryClient {
                     ))));
                 }
             }
-            Ok(_) | Err(LpmError::NotFound(_)) | Err(LpmError::AuthRequired) => {}
+            Ok(_) | Err(LpmError::NotFound(_)) => {}
+            Err(error) if Self::npm_proxy_can_fallback_to_direct(&error) => {}
             Err(error) => return finish!(Err(error)),
         }
 

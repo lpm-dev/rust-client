@@ -65,6 +65,7 @@ async fn with_delayed_package(
 
     let tarball_url = format!("{}/tarballs/{name}/-/{name}-{version}.tgz", mock.url());
     let integrity = compute_integrity(&tarball_bytes);
+    mock.register_tarball_integrity(name, version, integrity.clone());
     let metadata = serde_json::json!({
         "name": name,
         "dist-tags": { "latest": version },
@@ -1174,6 +1175,7 @@ async fn install_retries_tarball_5xx_until_success() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("flaky-pkg", "1.0.0");
     let integrity = compute_integrity(&tarball);
+    mock.register_tarball_integrity("flaky-pkg", "1.0.0", integrity.clone());
     let tarball_url = format!("{}/tarballs/flaky-pkg/-/flaky-pkg-1.0.0.tgz", mock.url());
     let metadata = serde_json::json!({
         "name": "flaky-pkg",
@@ -1773,6 +1775,7 @@ async fn install_with_stale_install_hash_re_resolves_and_refetches() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("stale-pkg", "1.0.0");
     let integrity = compute_integrity(&tarball);
+    mock.register_tarball_integrity("stale-pkg", "1.0.0", integrity.clone());
     let tarball_url = format!("{}/tarballs/stale-pkg/-/stale-pkg-1.0.0.tgz", mock.url());
     let metadata = serde_json::json!({
         "name": "stale-pkg",

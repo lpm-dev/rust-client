@@ -1505,7 +1505,7 @@ async fn install_lockfile_content_matches_snapshot() {
                 "version": "2.1.3",
                 "dist": {
                     "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
-                    "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+                    "integrity": compute_integrity(&tarball),
                 },
                 "dependencies": {}
             }
@@ -3317,7 +3317,7 @@ async fn install_node_modules_package_json_has_correct_fields() {
                 "version": "2.1.3",
                 "dist": {
                     "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
-                    "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+                    "integrity": compute_integrity(&tarball),
                 },
                 "dependencies": {}
             }
@@ -3399,7 +3399,7 @@ async fn install_creates_bin_symlink_for_binary_package() {
                 "bin": { "my-cli": "./cli.js" },
                 "dist": {
                     "tarball": format!("{}/tarballs/my-cli/-/my-cli-1.0.0.tgz", mock.url()),
-                    "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+                    "integrity": compute_integrity(&tarball),
                 },
                 "dependencies": {}
             }
@@ -3947,7 +3947,7 @@ async fn install_lockfile_is_deterministic_across_fresh_installs() {
                     "version": "2.1.3",
                     "dist": {
                         "tarball": format!("{registry_url}/tarballs/ms/-/ms-2.1.3.tgz"),
-                        "integrity": "sha512-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+                        "integrity": compute_integrity(&tarball),
                     },
                     "dependencies": {}
                 }

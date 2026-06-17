@@ -249,38 +249,42 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
     // `StageTiming.peer_prefetch_count`.
     let mut peer_prefetch_count: u64 = 0;
 
-    // Pre-batch the root-level `@lpm.dev/*` deps in one round trip
+    // Pre-batch root deps routed through the LPM Worker in one round trip
     // before the main fetch loop. Without this, each such dep would
     // fire its own [`fetch_metadata_raw`] call inside the dispatcher
     // (~one RPC per package). The walker arm in `walker.rs` already
-    // batches lpm.dev names; this pre-pass brings the fused arm to
-    // parity.
+    // batches Worker-routed names; this pre-pass brings the fused arm to
+    // parity and gives Worker-routed npm roots the same metadata fast path.
     //
     // Why pre-resolve, not inside the loop:
     //   - The `shared_cache` fast-path at the top of the queue-drain step short-
     //     circuits any edge whose canonical is already cached, so
     //     populating it BEFORE [`seed_root_edges`]'s edges drain
-    //     turns N lpm.dev RPCs into 1.
-    //   - `batch_metadata_deep` walks transitive lpm.dev deps server-
-    //     side, so an install with several lpm.dev packages and
-    //     transitive lpm.dev deps gets the whole sub-tree pre-warmed
-    //     in one round trip.
+    //     turns N Worker RPCs into 1.
+    //   - `batch_metadata_deep` can return transitive metadata too, so
+    //     returned manifests are cached even when they were not direct
+    //     roots.
     //
     // Failure-mode contract:
     //   - On batch error (auth/network/server fault), fall through
-    //     silently — each lpm.dev root dep will be fetched
+    //     silently — each root dep will be fetched
     //     individually by the main loop. Slower but correct.
     //   - On per-name parse failure (server returned something we
     //     can't interpret as a CanonicalKey), skip that entry and
     //     let the main loop refetch it.
-    let lpm_root_names: Vec<String> = state
+    let worker_root_names: Vec<String> = state
         .root_deps
         .keys()
-        .filter(|k| k.starts_with("@lpm.dev/"))
+        .filter(|name| {
+            matches!(
+                route_table.route_for_package(name),
+                UpstreamRoute::LpmWorker
+            )
+        })
         .cloned()
         .collect();
-    if !lpm_root_names.is_empty() {
-        match client.batch_metadata_deep(&lpm_root_names).await {
+    if !worker_root_names.is_empty() {
+        match client.batch_metadata_deep(&worker_root_names).await {
             Ok(batch) => {
                 // One actual HTTP round trip regardless of
                 // batch.len(). The dispatcher_rpc_count metric tracks
@@ -289,11 +293,13 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                 dispatcher_rpc_count += 1;
                 for (name, meta) in batch {
                     let canonical = crate::package::CanonicalKey::from_dep_name(&name);
-                    // `from_dep_name` returns `Npm` for any name that
-                    // doesn't match the `@lpm.dev/owner.name` shape.
-                    // We trust the server here, but defend against a
-                    // mis-shaped key landing in the lpm.dev cache.
-                    if !matches!(canonical, crate::package::CanonicalKey::Lpm { .. }) {
+                    if matches!(canonical, crate::package::CanonicalKey::Root) {
+                        continue;
+                    }
+                    if !matches!(
+                        route_table.route_for_package(&name),
+                        UpstreamRoute::LpmWorker
+                    ) {
                         continue;
                     }
                     let fetched = parse_fetched_metadata(meta, spec_tx.is_some());
@@ -308,9 +314,9 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
             }
             Err(e) => {
                 tracing::debug!(
-                    "greedy-fusion: lpm.dev pre-batch failed ({} names): {e} \
+                    "greedy-fusion: Worker pre-batch failed ({} names): {e} \
                      — falling back to per-package dispatch",
-                    lpm_root_names.len()
+                    worker_root_names.len()
                 );
             }
         }
