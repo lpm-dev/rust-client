@@ -2932,6 +2932,243 @@ async fn fusion_pre_batches_worker_routed_npm_root_deps() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn fusion_batches_worker_routed_tail_misses_after_root_batch() {
+    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let proxy_server = MockServer::start().await;
+    let npm_server = MockServer::start().await;
+    let root_meta = metadata_json(
+        "proxy-root-with-tail",
+        &[("proxy-tail-a", "^1.0.0"), ("proxy-tail-b", "^1.0.0")],
+    );
+    let tail_a_meta = metadata_json("proxy-tail-a", &[]);
+    let tail_b_meta = metadata_json("proxy-tail-b", &[]);
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .and(body_string_contains("\"proxy-root-with-tail\""))
+        .and(body_string_contains("\"deep\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "packages": {
+                        "proxy-root-with-tail": root_meta,
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .and(body_string_contains("\"proxy-tail-a\""))
+        .and(body_string_contains("\"proxy-tail-b\""))
+        .and(body_string_contains("\"deep\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "packages": {
+                        "proxy-tail-a": tail_a_meta,
+                        "proxy-tail-b": tail_b_meta,
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/proxy-tail-a"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&proxy_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/proxy-tail-b"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&proxy_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy-tail-a"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&npm_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy-tail-b"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&npm_server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri())
+            .with_cache_dir(None),
+    );
+
+    let mut deps = HashMap::new();
+    deps.insert("proxy-root-with-tail".into(), "^1.0.0".into());
+
+    let result = resolve_greedy_fused(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Proxy),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("Worker-routed tail misses should resolve from one follow-up batch");
+
+    let names: std::collections::HashSet<_> = result
+        .packages
+        .iter()
+        .map(|p| p.package.canonical_name())
+        .collect();
+    assert!(names.contains("proxy-root-with-tail"));
+    assert!(names.contains("proxy-tail-a"));
+    assert!(names.contains("proxy-tail-b"));
+    assert_eq!(
+        result.stage_timing.dispatcher_rpc_count, 2,
+        "root batch plus one tail batch should replace two per-package tail fetches"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_batches_worker_routed_tree_policy_prefetch_misses() {
+    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let proxy_server = MockServer::start().await;
+    let npm_server = MockServer::start().await;
+    let root_meta = metadata_json("proxy-policy-root", &[("proxy-policy-parent", "^1.0.0")]);
+    let parent_meta = metadata_json(
+        "proxy-policy-parent",
+        &[
+            ("proxy-policy-tail-a", "^1.0.0"),
+            ("proxy-policy-tail-b", "^1.0.0"),
+        ],
+    );
+    let tail_a_meta = metadata_json("proxy-policy-tail-a", &[]);
+    let tail_b_meta = metadata_json("proxy-policy-tail-b", &[]);
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .and(body_string_contains("\"proxy-policy-root\""))
+        .and(body_string_contains("\"deep\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "packages": {
+                        "proxy-policy-root": root_meta,
+                        "proxy-policy-parent": parent_meta,
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .and(body_string_contains("\"proxy-policy-tail-a\""))
+        .and(body_string_contains("\"proxy-policy-tail-b\""))
+        .and(body_string_contains("\"deep\":true"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "packages": {
+                        "proxy-policy-tail-a": tail_a_meta,
+                        "proxy-policy-tail-b": tail_b_meta,
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/proxy-policy-tail-a"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&proxy_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/proxy-policy-tail-b"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&proxy_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy-policy-tail-a"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&npm_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/proxy-policy-tail-b"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&npm_server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri())
+            .with_cache_dir(None),
+    );
+
+    let mut deps = HashMap::new();
+    deps.insert("proxy-policy-root".into(), "^1.0.0".into());
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+
+    let result = resolve_greedy_fused_with_cache_options_and_policy(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Proxy),
+        8,
+        None,
+        shared_cache,
+        true,
+        true,
+        policy,
+    )
+    .await
+    .expect("release-age tree prefetch should batch Worker-routed missing children");
+
+    let names: std::collections::HashSet<_> = result
+        .packages
+        .iter()
+        .map(|p| p.package.canonical_name())
+        .collect();
+    assert!(names.contains("proxy-policy-root"));
+    assert!(names.contains("proxy-policy-parent"));
+    assert!(names.contains("proxy-policy-tail-a"));
+    assert!(names.contains("proxy-policy-tail-b"));
+    assert_eq!(
+        result.stage_timing.dispatcher_rpc_count, 2,
+        "root batch plus one release-age tree prefetch batch should avoid per-package tail fetches"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn fusion_direct_mode_does_not_batch_npm_root_deps() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
