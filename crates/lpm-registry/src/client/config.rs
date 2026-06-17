@@ -8,8 +8,17 @@ enum HttpTransportMode {
 
 impl RegistryClient {
     pub(super) fn worker_metadata_http3_enabled_from_env() -> bool {
-        cfg!(feature = "experimental-http3")
-            && std::env::var("LPM_HTTP").as_deref() == Ok("h3-worker")
+        Self::worker_metadata_http3_enabled_for_lpm_http(std::env::var("LPM_HTTP").ok().as_deref())
+    }
+
+    pub(super) fn worker_metadata_http3_enabled_for_lpm_http(mode: Option<&str>) -> bool {
+        if !cfg!(feature = "experimental-http3") {
+            return false;
+        }
+        !matches!(
+            mode.filter(|value| !value.is_empty()),
+            Some("default" | "h2-worker" | "h1-pool")
+        )
     }
 
     /// Compute the ASCII-serialized origin of a URL string.

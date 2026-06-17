@@ -23,10 +23,8 @@ async fn nonexistent_package_returns_error() {
 }
 
 #[tokio::test]
-async fn worker_metadata_http3_marks_https_worker_requests_when_experimental_feature_is_enabled() {
-    let client = RegistryClient::new()
-        .with_base_url("https://lpm.dev")
-        .with_worker_metadata_http3_enabled(true);
+async fn worker_metadata_http3_marks_lpm_dev_worker_requests_by_default_when_feature_is_enabled() {
+    let client = RegistryClient::new().with_base_url("https://lpm.dev");
     let url = "https://lpm.dev/api/registry/batch-metadata";
 
     let request = client
@@ -43,11 +41,45 @@ async fn worker_metadata_http3_marks_https_worker_requests_when_experimental_fea
 }
 
 #[tokio::test]
+async fn worker_metadata_http3_can_be_disabled_for_lpm_dev_worker_requests() {
+    let client = RegistryClient::new()
+        .with_base_url("https://lpm.dev")
+        .with_worker_metadata_http3_enabled(false);
+    let url = "https://lpm.dev/api/registry/batch-metadata";
+
+    let request = client
+        .build_worker_metadata_get(url)
+        .await
+        .expect("request builder should be created")
+        .build()
+        .expect("request should build");
+
+    assert_eq!(request.version(), reqwest::Version::default());
+}
+
+#[tokio::test]
 async fn worker_metadata_http3_does_not_mark_direct_npm_origin() {
     let client = RegistryClient::new()
         .with_base_url("https://lpm.dev")
         .with_worker_metadata_http3_enabled(true);
     let url = "https://registry.npmjs.org/react";
+
+    let request = client
+        .build_worker_metadata_get(url)
+        .await
+        .expect("request builder should be created")
+        .build()
+        .expect("request should build");
+
+    assert_eq!(request.version(), reqwest::Version::default());
+}
+
+#[tokio::test]
+async fn worker_metadata_http3_does_not_mark_custom_https_worker_origin_by_default() {
+    let client = RegistryClient::new()
+        .with_base_url("https://registry.example.test")
+        .with_worker_metadata_http3_enabled(true);
+    let url = "https://registry.example.test/api/registry/batch-metadata";
 
     let request = client
         .build_worker_metadata_get(url)
@@ -74,6 +106,80 @@ async fn worker_metadata_http3_does_not_mark_http_worker_origin() {
         .expect("request should build");
 
     assert_eq!(request.version(), reqwest::Version::default());
+}
+
+#[test]
+fn worker_metadata_http3_policy_prefers_h3_when_lpm_http_is_unset() {
+    let enabled = RegistryClient::worker_metadata_http3_enabled_for_lpm_http(None);
+
+    #[cfg(feature = "experimental-http3")]
+    assert!(enabled);
+    #[cfg(not(feature = "experimental-http3"))]
+    assert!(!enabled);
+}
+
+#[test]
+fn worker_metadata_http3_policy_honors_explicit_worker_h2_opt_out() {
+    let enabled = RegistryClient::worker_metadata_http3_enabled_for_lpm_http(Some("h2-worker"));
+
+    assert!(!enabled);
+}
+
+#[test]
+fn worker_metadata_http3_policy_honors_explicit_worker_h3_mode() {
+    let enabled = RegistryClient::worker_metadata_http3_enabled_for_lpm_http(Some("h3-worker"));
+
+    #[cfg(feature = "experimental-http3")]
+    assert!(enabled);
+    #[cfg(not(feature = "experimental-http3"))]
+    assert!(!enabled);
+}
+
+#[test]
+fn worker_metadata_http3_policy_honors_default_transport_opt_out() {
+    let enabled = RegistryClient::worker_metadata_http3_enabled_for_lpm_http(Some("default"));
+
+    assert!(!enabled);
+}
+
+#[test]
+fn worker_metadata_http3_policy_honors_h1_pool_transport_opt_out() {
+    let enabled = RegistryClient::worker_metadata_http3_enabled_for_lpm_http(Some("h1-pool"));
+
+    assert!(!enabled);
+}
+
+#[test]
+fn worker_metadata_http3_fallback_request_resets_version_for_default_transport() {
+    let request = reqwest::Client::new()
+        .post("https://lpm.dev/api/registry/batch-metadata")
+        .version(reqwest::Version::HTTP_3)
+        .json(&serde_json::json!({ "packages": ["react"], "deep": true }))
+        .build()
+        .expect("request should build");
+
+    let fallback = RegistryClient::worker_metadata_http3_fallback_request(&request)
+        .expect("cloneable metadata request should build fallback")
+        .expect("HTTP/3 request should have fallback");
+
+    assert_eq!(fallback.version(), reqwest::Version::default());
+    assert_eq!(fallback.url(), request.url());
+}
+
+#[test]
+fn worker_metadata_http3_fallback_only_handles_network_errors() {
+    assert!(RegistryClient::worker_metadata_http3_should_fallback(
+        &LpmError::Network("quic handshake failed".into())
+    ));
+    assert!(!RegistryClient::worker_metadata_http3_should_fallback(
+        &LpmError::Http {
+            status: 403,
+            message: "blocked".into(),
+        }
+    ));
+    assert!(!RegistryClient::worker_metadata_http3_should_fallback(
+        &LpmError::AuthRequired
+    ));
 }
 
 #[tokio::test]

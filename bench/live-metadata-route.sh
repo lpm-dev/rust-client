@@ -34,7 +34,7 @@ Environment:
   LPM_LIVE_METADATA_KEEP_WORK  keep the temp work directory when set to 1
   LPM_LIVE_METADATA_PREWARM_ROUTE
                                direct or proxy prewarm route (default: direct)
-  LPM_LIVE_METADATA_HTTP       forwarded to LPM_HTTP (example: h3-worker)
+  LPM_LIVE_METADATA_HTTP       forwarded to LPM_HTTP (h3-worker, h2-worker, default, h1-pool)
   LPM_STORE_VERSION            store layout passed to lpm (default: v2)
   BENCH_WORK_DIR               parent directory for temp work
 EOF
