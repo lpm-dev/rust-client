@@ -41,7 +41,7 @@ use self::body::{
     MAX_METADATA_BYTES, forbidden_error_from_body, parse_capped_metadata, read_capped_error_text,
 };
 use self::http::{CONNECT_TIMEOUT, READ_TIMEOUT, build_per_origin_http_client};
-use self::state::{CacheContent, CachedClient};
+use self::state::{CacheContent, CacheValidator, CachedClient};
 use self::url_gate::validate_pem_root;
 
 #[cfg(test)]
