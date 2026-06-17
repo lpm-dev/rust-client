@@ -17,39 +17,61 @@ use lpm_resolver::{
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
-fn synthetic_packument(version_count: usize, include_time: bool) -> (Vec<u8>, PackageMetadata) {
+#[derive(Clone, Copy)]
+enum DependencyShape {
+    EveryVersion,
+    LatestOnly,
+}
+
+fn synthetic_packument(
+    version_count: usize,
+    include_time: bool,
+    dependency_shape: DependencyShape,
+) -> (Vec<u8>, PackageMetadata) {
     let mut versions = Map::new();
     let mut time = Map::new();
 
     for idx in 0..version_count {
         let patch = version_count - idx;
         let version = format!("1.0.{patch}");
+        let is_latest = idx == 0;
+        let include_deps = matches!(dependency_shape, DependencyShape::EveryVersion) || is_latest;
         let mut dependencies = Map::new();
-        for dep_idx in 0..3 {
-            dependencies.insert(
-                format!("dep-{idx}-{dep_idx}"),
-                Value::String(format!("^{}.0.0", dep_idx + 1)),
-            );
+        if include_deps {
+            for dep_idx in 0..3 {
+                dependencies.insert(
+                    format!("dep-{idx}-{dep_idx}"),
+                    Value::String(format!("^{}.0.0", dep_idx + 1)),
+                );
+            }
         }
 
-        versions.insert(
-            version.clone(),
+        let mut version_obj = Map::new();
+        version_obj.insert(
+            "name".to_string(),
+            Value::String("synthetic-packument".to_string()),
+        );
+        version_obj.insert("version".to_string(), Value::String(version.clone()));
+        version_obj.insert("dependencies".to_string(), Value::Object(dependencies));
+        if include_deps {
+            version_obj.insert(
+                "peerDependencies".to_string(),
+                serde_json::json!({ "react": "^18.0.0" }),
+            );
+            version_obj.insert(
+                "optionalDependencies".to_string(),
+                serde_json::json!({ "fsevents": "^2.3.3" }),
+            );
+        }
+        version_obj.insert(
+            "dist".to_string(),
             serde_json::json!({
-                "name": "synthetic-packument",
-                "version": version,
-                "dependencies": dependencies,
-                "peerDependencies": {
-                    "react": "^18.0.0"
-                },
-                "optionalDependencies": {
-                    "fsevents": "^2.3.3"
-                },
-                "dist": {
-                    "tarball": format!("https://registry.example/synthetic-packument-{patch}.tgz"),
-                    "integrity": format!("sha512-{patch:064x}")
-                }
+                "tarball": format!("https://registry.example/synthetic-packument-{patch}.tgz"),
+                "integrity": format!("sha512-{patch:064x}")
             }),
         );
+
+        versions.insert(version.clone(), Value::Object(version_obj));
 
         if include_time {
             time.insert(
@@ -79,8 +101,12 @@ fn bench_metadata_hydration(c: &mut Criterion) {
     group.sample_size(30);
 
     for version_count in [64usize, 512, 2048] {
-        let (abbreviated_bytes, abbreviated_metadata) = synthetic_packument(version_count, false);
-        let (full_bytes, full_metadata) = synthetic_packument(version_count, true);
+        let (abbreviated_bytes, abbreviated_metadata) =
+            synthetic_packument(version_count, false, DependencyShape::EveryVersion);
+        let (full_bytes, full_metadata) =
+            synthetic_packument(version_count, true, DependencyShape::EveryVersion);
+        let (_, sparse_abbreviated_metadata) =
+            synthetic_packument(version_count, false, DependencyShape::LatestOnly);
         let speculation_info = Arc::new(benchmark_parse_metadata_to_cache_info(
             &abbreviated_metadata,
         ));
@@ -102,6 +128,17 @@ fn bench_metadata_hydration(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("resolver_projection_abbreviated", version_count),
             &abbreviated_metadata,
+            |b, metadata| {
+                b.iter(|| black_box(benchmark_parse_metadata_to_cache_info(black_box(metadata))));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new(
+                "resolver_projection_abbreviated_latest_deps_only",
+                version_count,
+            ),
+            &sparse_abbreviated_metadata,
             |b, metadata| {
                 b.iter(|| black_box(benchmark_parse_metadata_to_cache_info(black_box(metadata))));
             },

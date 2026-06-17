@@ -34,8 +34,15 @@ fn parse_metadata_to_cache_info_inner(
     trust_metadata_complete: bool,
 ) -> CachedPackageInfo {
     let version_count = metadata.versions.len();
+    let mut dependency_entry_count = 0usize;
+    for ver_meta in metadata.versions.values() {
+        if !ver_meta.dependencies.is_empty() || !ver_meta.optional_dependencies.is_empty() {
+            dependency_entry_count += 1;
+        }
+    }
     let mut versions: Vec<NpmVersion> = Vec::with_capacity(version_count);
-    let mut deps: HashMap<String, HashMap<String, String>> = HashMap::with_capacity(version_count);
+    let mut deps: HashMap<String, HashMap<String, String>> =
+        HashMap::with_capacity(dependency_entry_count);
     let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut optional_peer_names: HashMap<String, HashSet<String>> = HashMap::new();
@@ -67,7 +74,9 @@ fn parse_metadata_to_cache_info_inner(
             continue;
         }
         if let Ok(v) = NpmVersion::parse(ver_str) {
-            let mut ver_deps = HashMap::new();
+            let mut ver_deps = HashMap::with_capacity(
+                ver_meta.dependencies.len() + ver_meta.optional_dependencies.len(),
+            );
             let mut ver_aliases: HashMap<String, String> = HashMap::new();
 
             for (dep_name, dep_range) in &ver_meta.dependencies {
@@ -114,10 +123,12 @@ fn parse_metadata_to_cache_info_inner(
                 aliases.insert(ver_str.clone(), ver_aliases);
             }
 
-            deps.insert(ver_str.clone(), ver_deps);
+            if !ver_deps.is_empty() {
+                deps.insert(ver_str.clone(), ver_deps);
+            }
 
             if !ver_meta.peer_dependencies.is_empty() {
-                let mut ver_peers = HashMap::new();
+                let mut ver_peers = HashMap::with_capacity(ver_meta.peer_dependencies.len());
                 for (dep_name, dep_range) in &ver_meta.peer_dependencies {
                     if !is_valid_dep_name(dep_name) {
                         tracing::debug!("skipping invalid peer dep name: {dep_name:?}");

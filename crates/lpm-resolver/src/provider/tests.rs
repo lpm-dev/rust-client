@@ -550,6 +550,57 @@ fn metadata_with_versions(
     serde_json::from_value(value).expect("valid PackageMetadata")
 }
 
+#[test]
+fn parse_metadata_keeps_dependency_cache_sparse_for_empty_versions() {
+    let meta = metadata_with_versions(
+        "sparse-deps",
+        &[("1.0.1", &[]), ("1.0.0", &[("left-pad", "^1.0.0")])],
+    );
+    let info = parse_metadata_to_cache_info(&meta);
+
+    assert!(!info.deps.contains_key("1.0.1"));
+    assert_eq!(
+        info.deps
+            .get("1.0.0")
+            .and_then(|deps| deps.get("left-pad"))
+            .map(String::as_str),
+        Some("^1.0.0")
+    );
+}
+
+#[test]
+fn parse_metadata_keeps_peer_dependencies_when_regular_dependency_cache_is_sparse() {
+    let value = serde_json::json!({
+        "name": "peer-only",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "peer-only",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.com/peer-only-1.0.0.tgz",
+                    "integrity": "sha512-test"
+                },
+                "peerDependencies": {
+                    "react": "^18.0.0"
+                }
+            }
+        },
+    });
+    let meta: lpm_registry::PackageMetadata =
+        serde_json::from_value(value).expect("valid PackageMetadata");
+    let info = parse_metadata_to_cache_info(&meta);
+
+    assert!(!info.deps.contains_key("1.0.0"));
+    assert_eq!(
+        info.peer_deps
+            .get("1.0.0")
+            .and_then(|deps| deps.get("react"))
+            .map(String::as_str),
+        Some("^18.0.0")
+    );
+}
+
 /// Regression test for the prerelease-stripping bug found in the
 /// hoisted-mode compatibility audit (vite-react,
 /// nextjs-minimal, babel-presets fixtures all failed with
