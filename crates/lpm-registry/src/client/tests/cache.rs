@@ -545,6 +545,55 @@ async fn direct_npm_full_metadata_etag_304_revalidation_refreshes_cache() {
 }
 
 #[tokio::test]
+async fn direct_npm_full_refetch_ignores_fresh_cache_and_overwrites_it() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "express";
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json_with_version(npm_name, "1.0.0")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client.get_npm_metadata_direct_full(npm_name).await.unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json_with_version(npm_name, "2.0.0")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let refreshed = client
+        .refetch_npm_metadata_direct_full(npm_name)
+        .await
+        .unwrap();
+    assert_eq!(refreshed.latest_version.as_deref(), Some("2.0.0"));
+    assert_eq!(
+        client
+            .read_metadata_cache(&format!("npm-full:{npm_name}"))
+            .and_then(|(metadata, _etag)| metadata.latest_version),
+        Some("2.0.0".to_string())
+    );
+}
+
+#[tokio::test]
 async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_validator() {
     use std::sync::{
         Arc,

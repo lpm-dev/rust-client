@@ -285,6 +285,15 @@ fn make_package_metadata(name: &str, versions: Vec<VersionMetadata>) -> PackageM
         .last()
         .map(|version| version.version.clone())
         .expect("mock package metadata must include at least one version");
+    let time = versions
+        .iter()
+        .map(|version| {
+            (
+                version.version.clone(),
+                "2020-01-01T00:00:00.000Z".to_string(),
+            )
+        })
+        .collect();
 
     PackageMetadata {
         name: name.to_string(),
@@ -294,7 +303,7 @@ fn make_package_metadata(name: &str, versions: Vec<VersionMetadata>) -> PackageM
             .into_iter()
             .map(|version| (version.version.clone(), version))
             .collect(),
-        time: Default::default(),
+        time,
         modified: None,
         downloads: None,
         distribution_mode: None,

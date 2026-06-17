@@ -125,8 +125,8 @@ pub(super) async fn fetch_metadata_for_resolver(
     if !fetched.info.needs_policy_metadata(canonical, policy) {
         return Ok(fetched);
     }
-    let full = fetch_full_metadata_raw(client, route_table, canonical).await?;
-    Ok(parse_full_fetched_metadata(full, include_speculation))
+    fetch_full_metadata_for_policy(client, route_table, canonical, policy, include_speculation)
+        .await
 }
 
 pub(super) fn parse_fetched_metadata(
@@ -165,10 +165,51 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
     if !matches!(canonical, CanonicalKey::Npm { .. }) {
         return Ok(info);
     }
-    let full = fetch_full_metadata_raw(client, route_table, canonical).await?;
-    let full_info = Arc::new(parse_full_metadata_to_cache_info(&full));
+    let fetched =
+        fetch_full_metadata_for_policy(client, route_table, canonical, policy, false).await?;
+    let full_info = fetched.info;
     shared_cache.insert(canonical.clone(), full_info.clone());
     Ok(full_info)
+}
+
+async fn fetch_full_metadata_for_policy(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+    include_speculation: bool,
+) -> Result<FetchedMetadata, ResolveError> {
+    let full = fetch_full_metadata_raw(client, route_table, canonical).await?;
+    let fetched = parse_full_fetched_metadata(full, include_speculation);
+    if !fetched.info.needs_policy_metadata(canonical, policy) {
+        return Ok(fetched);
+    }
+
+    let CanonicalKey::Npm { name } = canonical else {
+        return Ok(fetched);
+    };
+    if !matches!(
+        route_table.route_for_package(name),
+        UpstreamRoute::LpmWorker
+    ) {
+        return Ok(fetched);
+    }
+
+    tracing::debug!(
+        "Worker full metadata for {name} omitted policy fields; falling back to direct npm full metadata"
+    );
+    let direct_full = client
+        .refetch_npm_metadata_direct_full(name)
+        .await
+        .map_err(|e| ResolveError::DependencyFetch {
+            package: canonical.to_string(),
+            version: "*".to_string(),
+            detail: e.to_string(),
+        })?;
+    Ok(parse_full_fetched_metadata(
+        direct_full,
+        include_speculation,
+    ))
 }
 
 pub(super) fn complete_metadata_fetch(

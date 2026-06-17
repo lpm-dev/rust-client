@@ -1205,6 +1205,122 @@ fn classify_registry_error_not_found_maps_to_registry() {
     assert!(matches!(p, ProviderError::Registry(_)));
 }
 
+#[test]
+fn direct_fetch_uses_direct_full_when_worker_full_omits_release_time() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let tmp = tempfile::tempdir().expect("cache temp dir");
+    let worker_requests = Arc::new(AtomicUsize::new(0));
+    let worker_requests_for_responder = Arc::clone(&worker_requests);
+
+    let (proxy_server, npm_server) = rt.block_on(async {
+        let proxy_server = MockServer::start().await;
+        let npm_server = MockServer::start().await;
+        let worker_missing_time = serde_json::json!({
+            "name": "provider-release-age-worker",
+            "modified": "2025-01-03T00:00:00.000Z",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "provider-release-age-worker",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://example.invalid/provider-release-age-worker.tgz",
+                        "integrity": "sha512-release-age"
+                    },
+                    "dependencies": {}
+                }
+            }
+        });
+        let direct_full = serde_json::json!({
+            "name": "provider-release-age-worker",
+            "modified": "2025-01-03T00:00:00.000Z",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "provider-release-age-worker",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://example.invalid/provider-release-age-worker.tgz",
+                        "integrity": "sha512-release-age"
+                    },
+                    "dependencies": {}
+                }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/registry/provider-release-age-worker"))
+            .respond_with(move |request: &wiremock::Request| {
+                let attempt = worker_requests_for_responder.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    assert_ne!(
+                        request
+                            .headers
+                            .get("accept")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("application/json")
+                    );
+                } else {
+                    assert_eq!(
+                        request
+                            .headers
+                            .get("accept")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("application/json")
+                    );
+                }
+                ResponseTemplate::new(200).set_body_json(worker_missing_time.clone())
+            })
+            .expect(2)
+            .mount(&proxy_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/provider-release-age-worker"))
+            .and(header("Accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(direct_full))
+            .expect(1)
+            .mount(&npm_server)
+            .await;
+
+        (proxy_server, npm_server)
+    });
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(proxy_server.uri())
+            .with_npm_registry_url(npm_server.uri())
+            .with_cache_dir(Some(tmp.path().to_path_buf())),
+    );
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+    let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+        .with_policy(policy)
+        .with_route_mode(RouteMode::Proxy);
+    let pkg = ResolverPackage::npm("provider-release-age-worker");
+    let key = CanonicalKey::from(&pkg);
+
+    provider
+        .direct_fetch_and_cache(&pkg)
+        .expect("provider fetch should recover direct full metadata when Worker omits time");
+
+    assert_eq!(worker_requests.load(Ordering::SeqCst), 2);
+    let cached = provider.cache.get(&key).expect("cache entry should exist");
+    assert_eq!(
+        cached
+            .dist
+            .get("1.0.0")
+            .and_then(|dist| dist.published_at.as_deref()),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}
+
 // ─── Range memoization ───────────────────────────────────────
 //
 // `NpmRange::to_pubgrub_ranges(&available_versions)` is O(N) in the
