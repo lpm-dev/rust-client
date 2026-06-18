@@ -236,7 +236,8 @@ pub async fn download_plugin(
         &asset_sha256,
         &binary_sha256,
         verification,
-    );
+    )
+    .with_current_binary_snapshot(&bin_path);
     if let Err(e) = sidecar::write_atomic(&sidecar_path, &sidecar) {
         // Sidecar write failed but binary is on disk. Roll back the
         // binary so the next run doesn't see a binary without a

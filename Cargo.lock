@@ -3371,6 +3371,7 @@ dependencies = [
 name = "lpm-plugin"
 version = "0.61.0"
 dependencies = [
+ "filetime",
  "flate2",
  "lpm-common",
  "lpm-extractor",

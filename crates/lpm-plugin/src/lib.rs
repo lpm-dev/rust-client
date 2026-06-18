@@ -25,9 +25,11 @@
 //! the upstream sidecar at `<asset_url>.sha256` (for any other version,
 //! including user-pinned and `lpm plugin update` pulls). Reuse from
 //! cache is gated on a sidecar metadata file that re-verifies platform
-//! match, on-disk binary integrity, and the trust posture of the
-//! current process. Set `LPM_ALLOW_UNVERIFIED_PLUGINS=1` to skip
-//! verification — that flag must be set on every reuse, by design.
+//! match, a hot-path file metadata snapshot, and the trust posture of
+//! the current process. If the file snapshot is missing or changed, LPM
+//! falls back to the recorded on-disk binary hash before reuse. Set
+//! `LPM_ALLOW_UNVERIFIED_PLUGINS=1` to skip verification — that flag
+//! must be set on every reuse, by design.
 //!
 //! ## Update flow
 //!
@@ -81,9 +83,9 @@ pub enum PluginInstallEvent {
 /// Reuse is gated on the sidecar metadata file, not on bare file
 /// existence. Anything that fails the sidecar check (legacy unscoped
 /// layout, missing/tampered binary, mismatched platform, retired
-/// schema, unverified-override sidecar without the env var set) is
-/// treated as a cache miss and re-installed via the full
-/// download-and-verify pipeline.
+/// schema, changed binary that fails the recorded hash, unverified-override
+/// sidecar without the env var set) is treated as a cache miss and
+/// re-installed via the full download-and-verify pipeline.
 ///
 /// Set `LPM_FORCE_TOOL_INSTALL=1` to force re-download even on a
 /// healthy cache hit (useful for recovering from corrupted installs).
