@@ -10,12 +10,15 @@
 //! Recorded fields lock the binary to its provenance (asset URL, archive
 //! checksum, on-disk binary checksum, verification source). The reuse
 //! gate validates platform match, verification posture, and on-disk
-//! integrity before allowing reuse.
+//! integrity at install time, then a file metadata snapshot on the hot
+//! reuse path. If the snapshot is missing or changed, reuse falls back to a
+//! full binary hash before refreshing the snapshot.
 
 use lpm_common::LpmError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 /// Sidecar schema version. Bump when fields change in incompatible ways;
 /// older sidecars are then treated as cache misses (we re-verify).
@@ -57,11 +60,193 @@ pub struct Sidecar {
     /// upstream checksum attests to.
     pub asset_sha256: String,
     /// SHA-256 of the binary file on disk after extraction. Used for
-    /// tamper detection at reuse time. For non-archive plugins this
-    /// equals `asset_sha256`; for archive plugins it differs.
+    /// fallback tamper detection when the metadata snapshot is missing or
+    /// changed. For non-archive plugins this equals `asset_sha256`; for
+    /// archive plugins it differs.
     pub binary_sha256: String,
+    /// File metadata observed immediately after verification. This lets the
+    /// steady-state reuse path avoid hashing large tool binaries on every
+    /// `lpm lint` / `lpm fmt` invocation while still falling back to the
+    /// recorded SHA-256 if the file changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_snapshot: Option<BinarySnapshot>,
     pub verification_source: VerificationSource,
     pub verified_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinarySnapshot {
+    pub len: u64,
+    pub modified_unix_secs: u64,
+    pub modified_subsec_nanos: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix: Option<UnixBinarySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<WindowsBinarySnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnixBinarySnapshot {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub ctime: i64,
+    pub ctime_nsec: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsBinarySnapshot {
+    pub file_attributes: u32,
+    pub creation_time: u64,
+    pub change_time: u64,
+    pub last_write_time: u64,
+    pub volume_serial_number: Option<u32>,
+    pub file_index: Option<u64>,
+}
+
+impl BinarySnapshot {
+    fn from_path(path: &Path) -> std::io::Result<Option<Self>> {
+        let metadata = std::fs::metadata(path)?;
+        Self::from_metadata_and_path(&metadata, Some(path))
+    }
+
+    fn from_metadata_and_path(
+        metadata: &std::fs::Metadata,
+        _path: Option<&Path>,
+    ) -> std::io::Result<Option<Self>> {
+        let modified = metadata.modified()?;
+        let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+            return Ok(None);
+        };
+        let unix = {
+            #[cfg(unix)]
+            {
+                Some(unix_snapshot(metadata))
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        };
+        let windows = {
+            #[cfg(windows)]
+            {
+                Some(windows_snapshot(metadata, _path))
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        };
+        Ok(Some(Self {
+            len: metadata.len(),
+            modified_unix_secs: duration.as_secs(),
+            modified_subsec_nanos: duration.subsec_nanos(),
+            unix,
+            windows,
+        }))
+    }
+
+    fn matches_path(self, path: &Path) -> bool {
+        Self::from_path(path)
+            .ok()
+            .flatten()
+            .is_some_and(|current| current == self)
+    }
+}
+
+#[cfg(unix)]
+fn unix_snapshot(metadata: &std::fs::Metadata) -> UnixBinarySnapshot {
+    use std::os::unix::fs::MetadataExt;
+
+    UnixBinarySnapshot {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mode: metadata.mode(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    }
+}
+
+#[cfg(windows)]
+fn windows_snapshot(metadata: &std::fs::Metadata, path: Option<&Path>) -> WindowsBinarySnapshot {
+    use std::os::windows::fs::MetadataExt;
+
+    let path_snapshot = path.and_then(windows_path_snapshot);
+    WindowsBinarySnapshot {
+        file_attributes: metadata.file_attributes(),
+        creation_time: metadata.creation_time(),
+        change_time: path_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.change_time)
+            .unwrap_or(0),
+        last_write_time: metadata.last_write_time(),
+        volume_serial_number: path_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.volume_serial_number),
+        file_index: path_snapshot.and_then(|snapshot| snapshot.file_index),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct WindowsPathSnapshot {
+    change_time: Option<u64>,
+    volume_serial_number: Option<u32>,
+    file_index: Option<u64>,
+}
+
+#[cfg(windows)]
+fn windows_path_snapshot(path: &Path) -> Option<WindowsPathSnapshot> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx,
+    };
+
+    let file = std::fs::File::open(path).ok()?;
+    let handle = file.as_raw_handle();
+
+    let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` comes from an open `File`, and `handle_info` points to
+    // writable storage of the exact Win32 struct size expected by the API.
+    let handle_info = if unsafe { GetFileInformationByHandle(handle, &mut handle_info) } != 0 {
+        Some(handle_info)
+    } else {
+        None
+    };
+
+    let mut basic_info = FILE_BASIC_INFO::default();
+    // SAFETY: `handle` comes from an open `File`, and `basic_info` points to
+    // writable storage for the `FileBasicInfo` query result.
+    let basic_info = if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            &mut basic_info as *mut _ as *mut _,
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } != 0
+    {
+        Some(basic_info)
+    } else {
+        None
+    };
+
+    if handle_info.is_none() && basic_info.is_none() {
+        return None;
+    }
+
+    Some(WindowsPathSnapshot {
+        change_time: basic_info.and_then(|info| u64::try_from(info.ChangeTime).ok()),
+        volume_serial_number: handle_info.map(|info| info.dwVolumeSerialNumber),
+        file_index: handle_info
+            .map(|info| ((u64::from(info.nFileIndexHigh)) << 32) | u64::from(info.nFileIndexLow)),
+    })
 }
 
 impl Sidecar {
@@ -86,9 +271,15 @@ impl Sidecar {
             asset_url: asset_url.into(),
             asset_sha256: asset_sha256.into(),
             binary_sha256: binary_sha256.into(),
+            binary_snapshot: None,
             verification_source,
             verified_at_unix: now_unix(),
         }
+    }
+
+    pub fn with_current_binary_snapshot(mut self, binary_path: &Path) -> Self {
+        self.binary_snapshot = BinarySnapshot::from_path(binary_path).ok().flatten();
+        self
     }
 }
 
@@ -144,7 +335,7 @@ pub fn validate_for_reuse(
     current_platform: &str,
     allow_unverified_override: bool,
 ) -> ReuseDecision {
-    let sidecar = match read_sidecar(sidecar_path) {
+    let mut sidecar = match read_sidecar(sidecar_path) {
         Ok(s) => s,
         Err(MissReason::SidecarMissing) => return ReuseDecision::Miss(MissReason::SidecarMissing),
         Err(reason) => return ReuseDecision::Miss(reason),
@@ -175,8 +366,16 @@ pub fn validate_for_reuse(
         return ReuseDecision::Miss(MissReason::UnverifiedOverrideRequired);
     }
 
-    if !binary_path.exists() {
-        return ReuseDecision::Miss(MissReason::BinaryMissing);
+    match std::fs::metadata(binary_path) {
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return ReuseDecision::Miss(MissReason::BinaryMissing),
+    };
+
+    if let Some(snapshot) = sidecar.binary_snapshot
+        && snapshot.matches_path(binary_path)
+    {
+        warn_if_unverified_override(&sidecar, sidecar_path, unverified_override);
+        return ReuseDecision::Hit;
     }
 
     let observed = match hash_file(binary_path) {
@@ -190,11 +389,30 @@ pub fn validate_for_reuse(
         });
     }
 
+    if let Ok(Some(snapshot)) = BinarySnapshot::from_path(binary_path)
+        && sidecar.binary_snapshot != Some(snapshot)
+    {
+        sidecar.binary_snapshot = Some(snapshot);
+        if let Err(error) = write_atomic(sidecar_path, &sidecar) {
+            tracing::debug!(
+                sidecar = %sidecar_path.display(),
+                %error,
+                "failed to refresh plugin sidecar binary snapshot after hash validation"
+            );
+        }
+    }
+
     // L12: a sidecar tagged UnverifiedOverride was honoured. Each
     // honoured reuse fires this warn so persistent env contamination
     // (`LPM_ALLOW_UNVERIFIED_PLUGINS=1` left in a shell rc) shows
     // up in trace logs every time it grants free pass, rather than
     // being silently respected forever after the initial install.
+    warn_if_unverified_override(&sidecar, sidecar_path, unverified_override);
+
+    ReuseDecision::Hit
+}
+
+fn warn_if_unverified_override(sidecar: &Sidecar, sidecar_path: &Path, unverified_override: bool) {
     if unverified_override {
         tracing::warn!(
             plugin = %sidecar.plugin_name,
@@ -205,8 +423,6 @@ pub fn validate_for_reuse(
              a binary installed without signature verification",
         );
     }
-
-    ReuseDecision::Hit
 }
 
 fn read_sidecar(path: &Path) -> Result<Sidecar, MissReason> {
@@ -294,6 +510,18 @@ mod tests {
         )
     }
 
+    fn make_sidecar_with_snapshot(
+        plugin: &str,
+        version: &str,
+        platform: &str,
+        binary_hash: &str,
+        source: VerificationSource,
+        binary_path: &Path,
+    ) -> Sidecar {
+        make_sidecar(plugin, version, platform, binary_hash, source)
+            .with_current_binary_snapshot(binary_path)
+    }
+
     #[test]
     fn hit_when_everything_matches() {
         let dir = tempfile::tempdir().unwrap();
@@ -318,6 +546,36 @@ mod tests {
             false,
         );
         assert_eq!(result, ReuseDecision::Hit);
+    }
+
+    #[test]
+    fn hash_fallback_refreshes_missing_binary_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("oxlint");
+        let hash = write_binary(&bin, b"fake oxlint bytes");
+        let sidecar = make_sidecar(
+            "oxlint",
+            "1.58.0",
+            "darwin-arm64",
+            &hash,
+            VerificationSource::Bundled,
+        );
+        let sidecar_path = dir.path().join(SIDECAR_FILE_NAME);
+        write_atomic(&sidecar_path, &sidecar).unwrap();
+
+        let result = validate_for_reuse(
+            &sidecar_path,
+            &bin,
+            "oxlint",
+            "1.58.0",
+            "darwin-arm64",
+            false,
+        );
+        assert_eq!(result, ReuseDecision::Hit);
+
+        let refreshed: Sidecar =
+            serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
+        assert!(refreshed.binary_snapshot.is_some());
     }
 
     #[test]
@@ -461,6 +719,79 @@ mod tests {
 
         // Tamper the binary after the sidecar is written.
         std::fs::write(&bin, b"tampered bytes").unwrap();
+
+        let result = validate_for_reuse(
+            &sidecar_path,
+            &bin,
+            "oxlint",
+            "1.58.0",
+            "darwin-arm64",
+            false,
+        );
+        assert!(matches!(
+            result,
+            ReuseDecision::Miss(MissReason::BinaryHashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn snapshot_mismatch_falls_back_to_hash_and_rejects_tamper() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("oxlint");
+        let hash = write_binary(&bin, b"original bytes");
+        let sidecar = make_sidecar_with_snapshot(
+            "oxlint",
+            "1.58.0",
+            "darwin-arm64",
+            &hash,
+            VerificationSource::Bundled,
+            &bin,
+        );
+        let sidecar_path = dir.path().join(SIDECAR_FILE_NAME);
+        write_atomic(&sidecar_path, &sidecar).unwrap();
+
+        std::fs::write(&bin, b"tampered bytes with different length").unwrap();
+
+        let result = validate_for_reuse(
+            &sidecar_path,
+            &bin,
+            "oxlint",
+            "1.58.0",
+            "darwin-arm64",
+            false,
+        );
+        assert!(matches!(
+            result,
+            ReuseDecision::Miss(MissReason::BinaryHashMismatch { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_mismatch_falls_back_to_hash_when_mtime_and_len_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("oxlint");
+        let original = b"original bytes";
+        let tampered = b"tampered bytes";
+        assert_eq!(original.len(), tampered.len());
+
+        let hash = write_binary(&bin, original);
+        let original_mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&bin).unwrap());
+        let sidecar = make_sidecar_with_snapshot(
+            "oxlint",
+            "1.58.0",
+            "darwin-arm64",
+            &hash,
+            VerificationSource::Bundled,
+            &bin,
+        );
+        let sidecar_path = dir.path().join(SIDECAR_FILE_NAME);
+        write_atomic(&sidecar_path, &sidecar).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&bin, tampered).unwrap();
+        filetime::set_file_mtime(&bin, original_mtime).unwrap();
 
         let result = validate_for_reuse(
             &sidecar_path,
