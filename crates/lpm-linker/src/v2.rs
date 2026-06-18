@@ -62,6 +62,8 @@ use std::sync::Arc;
 
 use lpm_common::LpmError;
 use lpm_common::symlink::create_dir_symlink_or_junction;
+#[cfg(target_os = "macos")]
+use lpm_store::v2::CompatIslandKeyEntry;
 use lpm_store::v2::{
     DepLink, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple, Store,
     VerifiedObjectTreeIntegrity,
@@ -1378,6 +1380,13 @@ struct CompatibilityEntry<'a> {
     key: Arc<GraphKey>,
 }
 
+#[cfg(target_os = "macos")]
+struct CompatIslandKeySeed<'a> {
+    dir_name: &'a str,
+    source_sri: &'a str,
+    content_integrity: String,
+}
+
 struct BinLinkSpec {
     cmd_name: String,
     target: PathBuf,
@@ -1642,8 +1651,7 @@ fn create_project_compatibility_links_store_cached(
     entries: &[CompatibilityEntry<'_>],
     refresh_package_copies: bool,
 ) -> Result<CompatibilityLinks, LpmError> {
-    let dir_names: Vec<&str> = entries.iter().map(|e| e.key.dir_name()).collect();
-    let island_key = lpm_store::v2::compat_island_key(&dir_names);
+    let island_key = store_compat_island_key(entries, store)?;
     let store_island = store.paths().compat_island_dir(&island_key);
     ensure_store_compat_island(
         &store_island,
@@ -1664,6 +1672,30 @@ fn create_project_compatibility_links_store_cached(
     }
     rewire_project_roots_to_compat(project_dir, targets, key_map, &compatibility_links)?;
     Ok(compatibility_links)
+}
+
+#[cfg(target_os = "macos")]
+fn store_compat_island_key(
+    entries: &[CompatibilityEntry<'_>],
+    store: &Store,
+) -> Result<String, LpmError> {
+    let mut seeds = Vec::with_capacity(entries.len());
+    for entry in entries {
+        seeds.push(CompatIslandKeySeed {
+            dir_name: entry.key.dir_name(),
+            source_sri: &entry.target.source_sri,
+            content_integrity: store.link_entry_content_integrity(&entry.key)?,
+        });
+    }
+    let key_entries: Vec<_> = seeds
+        .iter()
+        .map(|seed| CompatIslandKeyEntry {
+            dir_name: seed.dir_name,
+            source_sri: seed.source_sri,
+            content_integrity: &seed.content_integrity,
+        })
+        .collect();
+    Ok(lpm_store::v2::compat_island_key(&key_entries))
 }
 
 /// Build the content-keyed island in the global store if it isn't already
@@ -1690,10 +1722,9 @@ fn ensure_store_compat_island(
         }
         remove_node_modules_entry(store_island, "stale store compatibility island")?;
     }
-    let compat_root = store.paths().compat_root();
-    ensure_real_dir_or_create(compat_root, "store compatibility island root")?;
+    store.ensure_compat_root_locked()?;
 
-    let tmp = create_compatibility_tmp_dir(store_island)?;
+    let tmp = create_store_compatibility_tmp_dir(store_island)?;
     let build = (|| -> Result<(), LpmError> {
         build_compat_island_at(&tmp, entries, store, key_map, true)?;
         // Completion sentinel written last; the atomic rename below only
@@ -2175,7 +2206,19 @@ fn ensure_compatibility_package_copy(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn create_store_compatibility_tmp_dir(final_dir: &Path) -> Result<PathBuf, LpmError> {
+    create_compatibility_tmp_dir_with_mode(final_dir, true)
+}
+
 fn create_compatibility_tmp_dir(final_dir: &Path) -> Result<PathBuf, LpmError> {
+    create_compatibility_tmp_dir_with_mode(final_dir, false)
+}
+
+fn create_compatibility_tmp_dir_with_mode(
+    final_dir: &Path,
+    locked_mode: bool,
+) -> Result<PathBuf, LpmError> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COMPAT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2202,7 +2245,12 @@ fn create_compatibility_tmp_dir(final_dir: &Path) -> Result<PathBuf, LpmError> {
             base_name,
             std::process::id()
         ));
-        match std::fs::create_dir(&tmp) {
+        let created = if locked_mode {
+            create_dir_0700(&tmp)
+        } else {
+            std::fs::create_dir(&tmp)
+        };
+        match created {
             Ok(()) => return Ok(tmp),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -2217,6 +2265,22 @@ fn create_compatibility_tmp_dir(final_dir: &Path) -> Result<PathBuf, LpmError> {
         "v2 linker: failed to allocate compatibility tmp dir for {}",
         final_dir.display()
     )))
+}
+
+fn create_dir_0700(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
 }
 
 fn compatibility_entry_reusable(final_dir: &Path, entry: &CompatibilityEntry<'_>) -> bool {
@@ -2840,6 +2904,129 @@ mod tests {
             source_sri: sri.into(),
             verified_object_tree_integrity: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_tool_source(source_dir: &Path, version: &str, body: &str) {
+        std::fs::create_dir_all(source_dir).unwrap();
+        std::fs::write(
+            source_dir.join("package.json"),
+            format!(r#"{{"name":"tool","version":"{version}","bin":{{"tool":"cli.js"}}}}"#),
+        )
+        .unwrap();
+        let cli = source_dir.join("cli.js");
+        if cli.exists() {
+            std::fs::remove_file(&cli).unwrap();
+        }
+        std::fs::write(cli, body).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_cached_compat_island_refreshes_when_local_source_bytes_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let source = tmp.path().join("source-tool");
+        let source_sri = synthetic_sri(b"stable-local-tool-source");
+        let compat_bins = vec!["tool".to_string()];
+
+        write_tool_source(&source, "1.0.0", "module.exports = 'v1';\n");
+        write_local_source_object(&store, &source_sri, &source);
+        let first_project = tmp.path().join("project-one");
+        std::fs::create_dir_all(&first_project).unwrap();
+        link_packages_v2_with_compatibility_bin_names(
+            &first_project,
+            vec![target("tool", "1.0.0", &source_sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &compat_bins,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(first_project.join("node_modules/tool/cli.js")).unwrap(),
+            "module.exports = 'v1';\n"
+        );
+
+        write_tool_source(&source, "1.0.0", "module.exports = 'v2';\n");
+        write_local_source_object(&store, &source_sri, &source);
+        let second_project = tmp.path().join("project-two");
+        std::fs::create_dir_all(&second_project).unwrap();
+        link_packages_v2_with_compatibility_bin_names(
+            &second_project,
+            vec![target("tool", "1.0.0", &source_sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &compat_bins,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(second_project.join("node_modules/tool/cli.js")).unwrap(),
+            "module.exports = 'v2';\n",
+            "compat island cache must not reuse bytes from a prior local-source snapshot"
+        );
+        let compat_count = std::fs::read_dir(store.paths().compat_root())
+            .unwrap()
+            .filter(|entry| entry.as_ref().is_ok_and(|entry| entry.path().is_dir()))
+            .count();
+        assert_eq!(
+            compat_count, 2,
+            "changed local-source bytes should produce a distinct cached island"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", unix))]
+    #[test]
+    fn store_cached_compat_root_and_island_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let compat_root = store.paths().compat_root().to_path_buf();
+        std::fs::create_dir_all(&compat_root).unwrap();
+        std::fs::set_permissions(&compat_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sri = synthetic_sri(b"store_cached_compat_root_and_island_are_owner_only");
+        write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                br#"{"name":"tool","version":"1.0.0","bin":{"tool":"cli.js"}}"#,
+            )],
+        );
+        link_packages_v2_with_compatibility_bin_names(
+            &project,
+            vec![target("tool", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &["tool".to_string()],
+        )
+        .unwrap();
+
+        let root_mode = std::fs::metadata(&compat_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(root_mode, 0o700, "compat root mode was 0o{root_mode:o}");
+        let island = std::fs::read_dir(&compat_root)
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.ok()?.path();
+                path.is_dir().then_some(path)
+            })
+            .expect("cached island should exist");
+        let island_mode = std::fs::metadata(&island).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            island_mode, 0o700,
+            "cached island mode was 0o{island_mode:o}"
+        );
     }
 
     #[test]
