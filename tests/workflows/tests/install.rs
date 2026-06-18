@@ -10,7 +10,7 @@ use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
     make_tarball_from_pkg_json,
 };
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry, write_signed_unlock};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -6359,9 +6359,36 @@ async fn mount_release_age_pkg(mock: &MockRegistry, published_at: &str) {
     .await;
 }
 
-fn release_age_lpm_config(
+async fn mount_release_age_pkg_without_publish_time(mock: &MockRegistry) {
+    let tarball = make_tarball(RELEASE_AGE_PKG, RELEASE_AGE_VERSION);
+    let metadata = serde_json::json!({
+        "name": RELEASE_AGE_PKG,
+        "dist-tags": { "latest": RELEASE_AGE_VERSION },
+        "modified": iso8601_n_secs_ago(3_600),
+        "versions": {
+            RELEASE_AGE_VERSION: {
+                "name": RELEASE_AGE_PKG,
+                "version": RELEASE_AGE_VERSION,
+                "dist": {
+                    "tarball": mock.tarball_url(RELEASE_AGE_PKG, RELEASE_AGE_VERSION),
+                    "integrity": compute_integrity(&tarball),
+                },
+                "dependencies": {}
+            }
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        RELEASE_AGE_PKG,
+        metadata,
+        &[(RELEASE_AGE_VERSION, tarball)],
+    )
+    .await;
+}
+
+fn release_age_lpm_config_with_policy(
     manifest_min_release_age: Option<u64>,
     excludes: &[&str],
+    policy: Option<&str>,
 ) -> Option<serde_json::Value> {
     let mut lpm = serde_json::Map::new();
     if let Some(secs) = manifest_min_release_age {
@@ -6376,6 +6403,12 @@ fn release_age_lpm_config(
             serde_json::json!(excludes),
         );
     }
+    if let Some(policy) = policy {
+        lpm.insert(
+            "minimumReleaseAgePolicy".to_string(),
+            serde_json::Value::String(policy.to_string()),
+        );
+    }
     (!lpm.is_empty()).then_some(serde_json::Value::Object(lpm))
 }
 
@@ -6387,12 +6420,30 @@ fn write_release_age_manifest_with_deps(
     manifest_min_release_age: Option<u64>,
     excludes: &[&str],
 ) {
+    write_release_age_manifest_with_deps_and_policy(
+        project,
+        dependencies,
+        manifest_min_release_age,
+        excludes,
+        None,
+    );
+}
+
+fn write_release_age_manifest_with_deps_and_policy(
+    project: &TempProject,
+    dependencies: serde_json::Value,
+    manifest_min_release_age: Option<u64>,
+    excludes: &[&str],
+    policy: Option<&str>,
+) {
     let mut manifest = serde_json::json!({
         "name": "release-age-test",
         "version": "1.0.0",
         "dependencies": dependencies
     });
-    if let Some(lpm) = release_age_lpm_config(manifest_min_release_age, excludes) {
+    if let Some(lpm) =
+        release_age_lpm_config_with_policy(manifest_min_release_age, excludes, policy)
+    {
         manifest["lpm"] = lpm;
     }
     project.write_file(
@@ -7007,6 +7058,136 @@ async fn install_keeps_newer_parent_when_only_transitive_child_is_inside_release
     let parent_manifest: serde_json::Value =
         serde_json::from_str(&installed_parent).expect("installed parent package.json must parse");
     assert_eq!(parent_manifest["version"], serde_json::json!("1.1.0"));
+}
+
+#[tokio::test]
+async fn install_strict_release_age_selects_mature_transitive_path() {
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name":"release-age-strict-transitive",
+            "version":"1.0.0",
+            "dependencies":{{"{RELEASE_AGE_PARENT_PKG}":"^1.0.0"}},
+            "lpm":{{"minimumReleaseAge":86400,"minimumReleaseAgePolicy":"strict"}}
+        }}"#
+    ));
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    mount_release_age_transitive_fallback_pkgs(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    assert!(
+        out.status.success(),
+        "strict release-age install should choose the mature parent/child path; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let installed_parent = project.read_file(&format!(
+        "node_modules/{RELEASE_AGE_PARENT_PKG}/package.json"
+    ));
+    let parent_manifest: serde_json::Value =
+        serde_json::from_str(&installed_parent).expect("installed parent package.json must parse");
+    assert_eq!(parent_manifest["version"], serde_json::json!("1.0.0"));
+}
+
+#[tokio::test]
+async fn install_strict_release_age_revalidates_fresh_lockfile_entry() {
+    let project = TempProject::empty("");
+    write_release_age_manifest_with_deps(
+        &project,
+        serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
+        Some(0),
+        &[],
+    );
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
+    write_signed_unlock(&project, &["cooldown-bypass"]);
+
+    let initial = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn initial lpm install");
+    assert!(
+        initial.status.success(),
+        "cooldown-off install must create the lockfile fixture; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr),
+    );
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("registry-published-at"),
+        "fixture lockfile must persist publish time for strict replay:\n{lockfile}"
+    );
+
+    write_release_age_manifest_with_deps_and_policy(
+        &project,
+        serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
+        Some(86_400),
+        &[],
+        Some("strict"),
+    );
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before lockfile replay");
+
+    let replay = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn strict lockfile replay");
+
+    assert_cooldown_blocked(&replay);
+}
+
+#[tokio::test]
+async fn install_strict_release_age_allows_custom_registry_without_publish_times() {
+    let project = TempProject::empty("");
+    write_release_age_manifest_with_deps_and_policy(
+        &project,
+        serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
+        Some(86_400),
+        &[],
+        Some("strict"),
+    );
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    mount_release_age_pkg_without_publish_time(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn strict release-age install");
+
+    assert!(
+        out.status.success(),
+        "strict release-age should not fail closed when a custom registry omits publish times; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_cooldown_not_blocked(&out);
 }
 
 #[tokio::test]

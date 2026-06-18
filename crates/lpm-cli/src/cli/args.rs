@@ -1075,14 +1075,14 @@ pub(crate) enum Commands {
     /// Manage CLI configuration.
     Config {
         /// Action: get, set, delete, list, scripts, triage, sandbox,
-        /// sigstore, signatures, release-age.
+        /// sigstore, signatures, release-age, release-age-policy.
         action: String,
         /// Config key (for get/set/delete).
         key: Option<String>,
         /// Config value (for set).
         value: Option<String>,
         /// Non-interactive value for the `scripts` / `triage` /
-        /// `sandbox` / `sigstore` / `signatures` / `release-age` wizards. Required when stdin is not
+        /// `sandbox` / `sigstore` / `signatures` / `release-age` / `release-age-policy` wizards. Required when stdin is not
         /// a TTY. Examples:
         ///   `lpm config scripts --set triage`
         ///   `lpm config triage --set claude-cli`
@@ -1090,6 +1090,7 @@ pub(crate) enum Commands {
         ///   `lpm config sigstore --set deny`
         ///   `lpm config signatures --set true`
         ///   `lpm config release-age --set 3d`
+        ///   `lpm config release-age-policy --set strict`
         #[arg(long = "set", value_name = "VALUE")]
         set: Option<String>,
     },

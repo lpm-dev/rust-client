@@ -91,6 +91,13 @@ fn publish_ages_from_resolved_metadata(
     map
 }
 
+fn release_age_policy_applies_to_install_package(
+    policy: crate::release_age_config::ReleaseAgePolicy,
+    package: &InstallPackage,
+) -> bool {
+    policy.is_strict() || package.is_direct
+}
+
 fn direct_release_age_canonicals(deps: &HashMap<String, String>) -> Vec<CanonicalKey> {
     let mut canonicals: Vec<CanonicalKey> = deps
         .iter()
@@ -895,6 +902,7 @@ async fn run_with_options_under_store_lock(
         )?;
     }
     let resolver_min_age_secs = if allow_new { 0 } else { effective_min_age_secs };
+    let release_age_policy = release_age_config.minimum_release_age_policy;
     let resolver_trust_policy = match global_config.get_trust_policy().as_deref() {
         Some("no-downgrade") => lpm_resolver::TrustPolicyMode::NoDowngrade,
         _ => lpm_resolver::TrustPolicyMode::Off,
@@ -1303,13 +1311,21 @@ async fn run_with_options_under_store_lock(
     let resolver_excludes = minimum_release_age_exclude
         .iter()
         .map(|name| lpm_resolver::CanonicalKey::from_dep_name(name));
-    let direct_release_age_canonicals = direct_release_age_canonicals(&deps);
-    let resolver_policy = lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages(
-        resolver_min_age_secs,
-        resolver_trust_policy,
-        resolver_excludes,
-        direct_release_age_canonicals,
-    );
+    let resolver_policy = if release_age_policy.is_strict() {
+        lpm_resolver::ResolverPolicy::new_with_release_age_excludes(
+            resolver_min_age_secs,
+            resolver_trust_policy,
+            resolver_excludes,
+        )
+    } else {
+        let direct_release_age_canonicals = direct_release_age_canonicals(&deps);
+        lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages(
+            resolver_min_age_secs,
+            resolver_trust_policy,
+            resolver_excludes,
+            direct_release_age_canonicals,
+        )
+    };
     let minimum_release_age_exclude: std::collections::HashSet<String> =
         minimum_release_age_exclude.into_iter().collect();
 
@@ -3364,20 +3380,25 @@ async fn run_with_options_under_store_lock(
         effective_min_age_secs,
     );
 
-    let publish_ages: HashMap<(String, String), u64> =
-        if !used_lockfile && cooldown_policy.minimum_release_age_secs > 0 {
-            publish_ages_from_resolved_metadata(&packages)
-        } else {
-            HashMap::new()
-        };
+    let publish_ages: HashMap<(String, String), u64> = if cooldown_policy.minimum_release_age_secs
+        > 0
+        && (!used_lockfile || release_age_policy.is_strict())
+    {
+        publish_ages_from_resolved_metadata(&packages)
+    } else {
+        HashMap::new()
+    };
 
     // Enforce minimumReleaseAge: block recently published packages unless --allow-new.
-    // Only checked during fresh resolution (not lockfile fast path) because metadata
-    // was already fetched and cached by the resolver — re-fetching hits the 5-min TTL cache.
-    if !allow_new && !used_lockfile && cooldown_policy.minimum_release_age_secs > 0 {
+    // The default policy checks direct packages on fresh resolution only; strict mode
+    // also revalidates lockfile replay from stored registry-published-at timestamps.
+    if !allow_new
+        && cooldown_policy.minimum_release_age_secs > 0
+        && (!used_lockfile || release_age_policy.is_strict())
+    {
         let mut too_new = Vec::new();
         for p in &packages {
-            if !p.is_direct {
+            if !release_age_policy_applies_to_install_package(release_age_policy, p) {
                 continue;
             }
             if minimum_release_age_exclude.contains(&p.name) {

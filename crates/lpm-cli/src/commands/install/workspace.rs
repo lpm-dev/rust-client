@@ -291,6 +291,7 @@ pub(super) fn workspace_member_cache_info(
     Some(lpm_resolver::CachedPackageInfo {
         // Local workspace metadata is authoritative; avoid registry upgrade probes under policy checks.
         modified: Some("1970-01-01T00:00:00.000Z".to_string()),
+        modified_unix: Some(0),
         trust_metadata_complete: true,
         versions: vec![version],
         deps: deps_by_version,

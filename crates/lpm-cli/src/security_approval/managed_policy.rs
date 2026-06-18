@@ -385,6 +385,20 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         .transpose()?
         .flatten();
 
+    let release_age_policy = table
+        .get(crate::release_age_config::GLOBAL_POLICY_KEY)
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                managed_policy_error(&path, "must set `release-age-policy` to a string")
+            })
+        })
+        .transpose()?
+        .map(|raw| {
+            ReleaseAgePolicy::parse("release-age-policy", raw)
+                .map_err(|e| managed_policy_error(&path, e.to_string()))
+        })
+        .transpose()?;
+
     let sandbox = table.get("sandbox").and_then(|value| value.as_table());
     let sandbox_mode = sandbox
         .and_then(|tbl| tbl.get("mode"))
@@ -428,6 +442,9 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     if minimum_release_age_secs.is_some() {
         enforced_controls.push("minimum-release-age-secs".to_string());
     }
+    if release_age_policy.is_some() {
+        enforced_controls.push(crate::release_age_config::GLOBAL_POLICY_KEY.to_string());
+    }
     if sandbox_mode.is_some() {
         enforced_controls.push("sandbox.mode".to_string());
     }
@@ -447,6 +464,7 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         },
         script_policy,
         minimum_release_age_secs,
+        release_age_policy,
         sandbox_mode,
         sandbox_allow_degraded,
         sigstore_verify,

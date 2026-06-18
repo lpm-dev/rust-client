@@ -11,8 +11,9 @@ use super::tree_policy::{
 };
 use super::types::*;
 use super::version::*;
+use crate::policy::{TrustPolicyMode, parse_npm_time_unix};
 use crate::provider::{CachedDistInfo, CachedPackageInfo};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -61,6 +62,7 @@ fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageI
     }
     CachedPackageInfo {
         modified: None,
+        modified_unix: None,
         trust_metadata_complete: false,
         versions: parsed,
         deps: deps_map,
@@ -79,6 +81,7 @@ fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageI
                         integrity: Some(format!("sha512-fake-{}", v)),
                         signatures: Vec::new(),
                         published_at: None,
+                        published_at_unix: None,
                         trust_evidence: None,
                     },
                 )
@@ -164,7 +167,9 @@ fn find_best_version_handles_exact_pin() {
 }
 
 fn set_published_at(info: &mut CachedPackageInfo, version: &str, published_at: &str) {
-    info.dist.get_mut(version).unwrap().published_at = Some(published_at.to_string());
+    let dist = info.dist.get_mut(version).unwrap();
+    dist.published_at = Some(published_at.to_string());
+    dist.published_at_unix = parse_npm_time_unix(published_at);
 }
 
 #[test]
@@ -214,10 +219,19 @@ fn find_best_version_release_age_exclude_allows_latest_for_canonical_package() {
 
 struct CountingTreeProvider {
     manifests: AHashMap<CanonicalKey, Arc<CachedPackageInfo>>,
+    cached: RefCell<AHashSet<CanonicalKey>>,
     ensure_calls: Cell<usize>,
 }
 
 impl TreeManifestProvider for CountingTreeProvider {
+    fn cached_manifest(&self, canonical: &CanonicalKey) -> Option<Arc<CachedPackageInfo>> {
+        self.cached
+            .borrow()
+            .contains(canonical)
+            .then(|| self.manifests.get(canonical).cloned())
+            .flatten()
+    }
+
     fn ensure_manifest<'a>(
         &'a self,
         canonical: &'a CanonicalKey,
@@ -228,12 +242,16 @@ impl TreeManifestProvider for CountingTreeProvider {
             .get(canonical)
             .cloned()
             .ok_or_else(|| ResolveError::Internal(format!("missing manifest for {canonical}")));
-        Box::pin(async move { result })
+        Box::pin(async move {
+            let info = result?;
+            self.cached.borrow_mut().insert(canonical.clone());
+            Ok(info)
+        })
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn preferred_tree_compatible_version_reuses_cached_subtree_status() {
+async fn preferred_tree_compatible_version_reuses_cached_subtree_status_for_trust_policy() {
     let parent = CanonicalKey::npm("parent");
     let child = CanonicalKey::npm("child");
     let parent_info = mk_info(&["1.0.0"], &[("child", "^1.0.0")]);
@@ -249,9 +267,10 @@ async fn preferred_tree_compatible_version_reuses_cached_subtree_status() {
             optional: false,
         },
     };
-    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+    let policy = ResolverPolicy::new(0, TrustPolicyMode::NoDowngrade);
     let provider = CountingTreeProvider {
         manifests: AHashMap::from_iter([(child, child_info)]),
+        cached: RefCell::new(AHashSet::new()),
         ensure_calls: Cell::new(0),
     };
     let cache = TreeStatusCache::default();
@@ -291,6 +310,7 @@ async fn preferred_tree_compatible_version_skips_subtree_walk_for_scoped_release
     );
     let provider = CountingTreeProvider {
         manifests: AHashMap::from_iter([(child, child_info)]),
+        cached: RefCell::new(AHashSet::new()),
         ensure_calls: Cell::new(0),
     };
     let cache = TreeStatusCache::default();
@@ -300,6 +320,79 @@ async fn preferred_tree_compatible_version_skips_subtree_walk_for_scoped_release
 
     assert!(preferred.is_none());
     assert_eq!(provider.ensure_calls.get(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preferred_tree_compatible_version_skips_subtree_walk_for_transitive_edges() {
+    let parent = CanonicalKey::npm("parent");
+    let child = CanonicalKey::npm("child");
+    let parent_info = mk_info(&["1.0.0"], &[("child", "^1.0.0")]);
+    let child_info = Arc::new(mk_info(&["1.0.0"], &[]));
+    let edge = Edge {
+        parent: 1,
+        local_name: "parent".to_string(),
+        canonical: parent,
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+    let provider = CountingTreeProvider {
+        manifests: AHashMap::from_iter([(child, child_info)]),
+        cached: RefCell::new(AHashSet::new()),
+        ensure_calls: Cell::new(0),
+    };
+    let cache = TreeStatusCache::default();
+
+    let preferred =
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+
+    assert!(preferred.is_none());
+    assert_eq!(provider.ensure_calls.get(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preferred_tree_compatible_version_uses_bounded_release_age_lookahead() {
+    let parent = CanonicalKey::npm("parent");
+    let child = CanonicalKey::npm("child");
+    let mut parent_info = mk_info(&["1.1.0", "1.0.0"], &[("child", "^2.0.0")]);
+    parent_info.deps.insert(
+        "1.0.0".to_string(),
+        HashMap::from_iter([("child".to_string(), "^1.0.0".to_string())]),
+    );
+    set_published_at(&mut parent_info, "1.1.0", "2025-01-01T00:00:00.000Z");
+    set_published_at(&mut parent_info, "1.0.0", "2025-01-01T00:00:00.000Z");
+    let mut child_info = mk_info(&["2.0.0", "1.0.0"], &[]);
+    set_published_at(&mut child_info, "2.0.0", "2025-01-03T00:00:00.000Z");
+    set_published_at(&mut child_info, "1.0.0", "2025-01-01T00:00:00.000Z");
+    let edge = Edge {
+        parent: 0,
+        local_name: "parent".to_string(),
+        canonical: parent.clone(),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, TrustPolicyMode::Off);
+    let provider = CountingTreeProvider {
+        manifests: AHashMap::from_iter([(child, Arc::new(child_info))]),
+        cached: RefCell::new(AHashSet::new()),
+        ensure_calls: Cell::new(0),
+    };
+    let cache = TreeStatusCache::default();
+
+    let preferred =
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+
+    assert_eq!(preferred, Some(NpmVersion::parse("1.0.0").unwrap()));
+    assert_eq!(provider.ensure_calls.get(), 1);
+    assert_eq!(cache.release_age_lookahead_fetches(), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -719,10 +812,10 @@ fn find_best_version_ignores_platform_when_selecting_version() {
 #[test]
 fn find_best_version_skips_trust_downgrade_when_older_candidate_satisfies_range() {
     let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
-    info.dist.get_mut("1.0.0").unwrap().published_at = Some("2025-01-01T00:00:00.000Z".to_string());
+    set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
     info.dist.get_mut("1.0.0").unwrap().trust_evidence =
         Some(crate::policy::TrustEvidence::TrustedPublisher);
-    info.dist.get_mut("1.1.0").unwrap().published_at = Some("2025-01-02T00:00:00.000Z".to_string());
+    set_published_at(&mut info, "1.1.0", "2025-01-02T00:00:00.000Z");
     let policy = ResolverPolicy::new(0, crate::policy::TrustPolicyMode::NoDowngrade);
     let range = NpmRange::parse("^1.0.0").unwrap();
 
@@ -741,10 +834,10 @@ fn find_best_version_skips_trust_downgrade_when_older_candidate_satisfies_range(
 #[test]
 fn find_best_version_blocks_exact_trust_downgrade() {
     let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
-    info.dist.get_mut("1.0.0").unwrap().published_at = Some("2025-01-01T00:00:00.000Z".to_string());
+    set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
     info.dist.get_mut("1.0.0").unwrap().trust_evidence =
         Some(crate::policy::TrustEvidence::TrustedPublisher);
-    info.dist.get_mut("1.1.0").unwrap().published_at = Some("2025-01-02T00:00:00.000Z".to_string());
+    set_published_at(&mut info, "1.1.0", "2025-01-02T00:00:00.000Z");
     let policy = ResolverPolicy::new(0, crate::policy::TrustPolicyMode::NoDowngrade);
     let range = NpmRange::parse("1.1.0").unwrap();
 

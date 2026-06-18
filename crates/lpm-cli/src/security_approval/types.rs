@@ -106,6 +106,8 @@ pub struct AuthorizedPosture {
     pub updated_at: DateTime<Utc>,
     pub script_policy: String,
     pub minimum_release_age_secs: u64,
+    #[serde(default = "default_release_age_policy_string")]
+    pub release_age_policy: String,
     pub sandbox_mode: String,
     pub sandbox_allow_degraded: bool,
     pub sigstore_verify: String,
@@ -115,9 +117,14 @@ pub struct AuthorizedPosture {
 pub struct AuthorizedPostureView {
     pub script_policy: String,
     pub minimum_release_age_secs: u64,
+    pub release_age_policy: String,
     pub sandbox_mode: String,
     pub sandbox_allow_degraded: bool,
     pub sigstore_verify: String,
+}
+
+fn default_release_age_policy_string() -> String {
+    ReleaseAgePolicy::Direct.as_str().to_string()
 }
 
 impl Default for AuthorizedPosture {
@@ -127,6 +134,7 @@ impl Default for AuthorizedPosture {
             updated_at: Utc::now(),
             script_policy: ScriptPolicy::default().as_str().to_string(),
             minimum_release_age_secs: DEFAULT_MIN_RELEASE_AGE_SECS,
+            release_age_policy: default_release_age_policy_string(),
             sandbox_mode: ResolvedSandboxMode::Default.as_str().to_string(),
             sandbox_allow_degraded: false,
             sigstore_verify: "deny".to_string(),
@@ -141,6 +149,11 @@ impl AuthorizedPosture {
 
     pub fn minimum_release_age_secs(&self) -> u64 {
         self.minimum_release_age_secs
+    }
+
+    pub fn release_age_policy(&self) -> ReleaseAgePolicy {
+        ReleaseAgePolicy::parse("approved release-age-policy", &self.release_age_policy)
+            .unwrap_or_default()
     }
 
     pub fn sandbox_mode(&self) -> ResolvedSandboxMode {
@@ -164,6 +177,7 @@ impl AuthorizedPosture {
         AuthorizedPostureView {
             script_policy: self.script_policy.clone(),
             minimum_release_age_secs: self.minimum_release_age_secs,
+            release_age_policy: self.release_age_policy.clone(),
             sandbox_mode: self.sandbox_mode.clone(),
             sandbox_allow_degraded: self.sandbox_allow_degraded,
             sigstore_verify: self.sigstore_verify.clone(),
@@ -183,6 +197,7 @@ pub enum PostureSourceKind {
 pub struct EffectivePostureSources {
     pub script_policy: PostureSourceKind,
     pub minimum_release_age_secs: PostureSourceKind,
+    pub release_age_policy: PostureSourceKind,
     pub sandbox_mode: PostureSourceKind,
     pub sandbox_allow_degraded: PostureSourceKind,
     pub sigstore_verify: PostureSourceKind,
@@ -193,6 +208,7 @@ impl EffectivePostureSources {
         Self {
             script_policy: base,
             minimum_release_age_secs: base,
+            release_age_policy: base,
             sandbox_mode: base,
             sandbox_allow_degraded: base,
             sigstore_verify: base,
@@ -256,6 +272,7 @@ pub(super) struct ManagedPolicy {
     pub(super) status: ManagedPolicyStatus,
     pub(super) script_policy: Option<ScriptPolicy>,
     pub(super) minimum_release_age_secs: Option<u64>,
+    pub(super) release_age_policy: Option<ReleaseAgePolicy>,
     pub(super) sandbox_mode: Option<ResolvedSandboxMode>,
     pub(super) sandbox_allow_degraded: Option<bool>,
     pub(super) sigstore_verify: Option<EnforceMode>,

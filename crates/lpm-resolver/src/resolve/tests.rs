@@ -331,6 +331,7 @@ fn make_cached_info(
     // further changes.
     std::sync::Arc::new(CachedPackageInfo {
         modified: None,
+        modified_unix: None,
         trust_metadata_complete: false,
         versions: versions
             .iter()

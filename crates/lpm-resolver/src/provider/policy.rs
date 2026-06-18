@@ -6,13 +6,20 @@ pub(crate) fn release_age_status_for_version(
     version: &NpmVersion,
     policy: &ResolverPolicy,
 ) -> ReleaseTimeStatus {
-    info.dist
+    let published_unix = info
+        .dist
         .get(&version.to_string())
-        .and_then(|dist| dist.published_at.as_deref())
-        .map_or_else(
-            || policy.release_time_status_for_package(package, None),
-            |published_at| policy.release_time_status_for_package(package, Some(published_at)),
+        .and_then(|dist| dist.published_at_unix);
+    if published_unix.is_none()
+        && policy.metadata_modified_before_or_at_cutoff_for_package(
+            package,
+            info.modified.as_deref(),
+            info.modified_unix,
         )
+    {
+        return ReleaseTimeStatus::Allowed;
+    }
+    policy.release_time_status_unix_for_package(package, published_unix)
 }
 
 pub(crate) fn trust_downgrade_violation(
@@ -21,8 +28,7 @@ pub(crate) fn trust_downgrade_violation(
 ) -> Option<String> {
     let version_str = version.to_string();
     let current = info.dist.get(&version_str)?;
-    let published_at = current.published_at.as_deref()?;
-    let published_unix = parse_npm_time_unix(published_at)?;
+    let published_unix = current.published_at_unix?;
     let current_evidence = current.trust_evidence;
     let exclude_prerelease = !version.is_prerelease();
 
@@ -38,8 +44,7 @@ pub(crate) fn trust_downgrade_violation(
         let Some(dist) = info.dist.get(&candidate_str) else {
             continue;
         };
-        let Some(candidate_published) = dist.published_at.as_deref().and_then(parse_npm_time_unix)
-        else {
+        let Some(candidate_published) = dist.published_at_unix else {
             continue;
         };
         if candidate_published >= published_unix {

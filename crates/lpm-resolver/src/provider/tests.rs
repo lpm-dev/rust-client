@@ -60,6 +60,7 @@ fn peer_deps_stored_per_version() {
 
     let info = CachedPackageInfo {
         modified: None,
+        modified_unix: None,
         trust_metadata_complete: false,
         versions: vec![
             NpmVersion::parse("2.0.0").unwrap(),
@@ -469,6 +470,7 @@ fn make_info(
 ) -> CachedPackageInfo {
     CachedPackageInfo {
         modified: None,
+        modified_unix: None,
         trust_metadata_complete: false,
         versions: versions
             .iter()
@@ -1327,6 +1329,7 @@ fn release_age_package_scope_skips_unlisted_transitive_metadata_hydration() {
     let direct = CanonicalKey::npm("direct");
     let info = CachedPackageInfo {
         modified: Some("2025-01-03T00:00:00.000Z".to_string()),
+        modified_unix: parse_npm_time_unix("2025-01-03T00:00:00.000Z"),
         ..make_info(&["1.0.0"], vec![], vec![], vec![])
     };
     let policy = ResolverPolicy::with_cutoff_unix_and_release_age_packages(
@@ -1347,7 +1350,9 @@ fn release_age_package_scope_allows_unlisted_transitive_version() {
     let mut info = make_info(&["1.0.0"], vec![], vec![], vec![]);
     info.dist
         .insert("1.0.0".to_string(), CachedDistInfo::default());
-    info.dist.get_mut("1.0.0").unwrap().published_at = Some("2025-01-03T00:00:00.000Z".to_string());
+    let dist = info.dist.get_mut("1.0.0").unwrap();
+    dist.published_at = Some("2025-01-03T00:00:00.000Z".to_string());
+    dist.published_at_unix = parse_npm_time_unix("2025-01-03T00:00:00.000Z");
     let policy = ResolverPolicy::with_cutoff_unix_and_release_age_packages(
         86_400,
         parse_npm_time_unix("2025-01-02T00:00:00.000Z").unwrap(),
@@ -1464,6 +1469,7 @@ fn available_versions_cache_invalidates_when_metadata_is_upgraded() {
         "2.0.0".to_string(),
         CachedDistInfo {
             published_at: Some("2025-01-03T00:00:00.000Z".to_string()),
+            published_at_unix: parse_npm_time_unix("2025-01-03T00:00:00.000Z"),
             ..CachedDistInfo::default()
         },
     );
@@ -1471,6 +1477,7 @@ fn available_versions_cache_invalidates_when_metadata_is_upgraded() {
         "1.0.0".to_string(),
         CachedDistInfo {
             published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
+            published_at_unix: parse_npm_time_unix("2025-01-01T00:00:00.000Z"),
             ..CachedDistInfo::default()
         },
     );

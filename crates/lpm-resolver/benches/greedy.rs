@@ -92,6 +92,7 @@ fn make_graph(n: usize) -> (SharedCache, HashMap<String, String>) {
 
         let info = CachedPackageInfo {
             modified: None,
+            modified_unix: None,
             trust_metadata_complete: false,
             versions,
             deps,

@@ -24,6 +24,10 @@ pub fn load_effective_authorized_posture() -> Result<EffectiveAuthorizedPosture,
             posture.minimum_release_age_secs = minimum_release_age_secs;
             sources.minimum_release_age_secs = PostureSourceKind::ManagedPolicy;
         }
+        if let Some(release_age_policy) = policy.release_age_policy {
+            posture.release_age_policy = release_age_policy.as_str().to_string();
+            sources.release_age_policy = PostureSourceKind::ManagedPolicy;
+        }
         if let Some(sandbox_mode) = policy.sandbox_mode {
             posture.sandbox_mode = sandbox_mode.as_str().to_string();
             sources.sandbox_mode = PostureSourceKind::ManagedPolicy;
