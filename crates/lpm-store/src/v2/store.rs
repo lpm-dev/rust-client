@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lpm_common::integrity::{HashAlgorithm, Integrity};
-use lpm_common::{LpmError, LpmRoot};
+use lpm_common::{LpmError, LpmRoot, write_file_atomic};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::StageTimings;
@@ -50,6 +51,21 @@ const LOCAL_SOURCE_OBJECT_SENTINEL: &str = ".lpm-local-source";
 /// records the source tarball SRI; this records the bytes lpm links
 /// from cache on later installs.
 const OBJECT_TREE_INTEGRITY_FILENAME: &str = ".lpm-object-integrity";
+const TREE_SNAPSHOT_FILENAME: &str = ".lpm-tree-snapshot.json";
+const TREE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const TREE_SNAPSHOT_MAX_BYTES: u64 = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TreeSnapshot {
+    schema: u32,
+    content_integrity: String,
+    metadata_integrity: String,
+}
+
+struct TreeIntegrities {
+    content: String,
+    metadata: String,
+}
 
 /// Pure path helper for the v2 store layout.
 ///
@@ -1115,7 +1131,7 @@ fn populate_into(
     // Materialize the package itself from the verified object directory.
     // Link entries must not share hardlink inodes with objects: writes
     // through executable package bytes must never mutate the object store.
-    ensure_object_tree_integrity(object_dir)?;
+    let object_integrity = verified_object_tree_integrity(object_dir)?;
     let pkg_dir = node_modules.join(graph_key.name());
     if let Some(parent) = pkg_dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -1126,6 +1142,14 @@ fn populate_into(
         })?;
     }
     materialize_into(object_dir, &pkg_dir)?;
+    let package_metadata_integrity = compute_tree_metadata_integrity(&pkg_dir)?;
+    write_tree_snapshot(
+        tmp_dir,
+        &TreeIntegrities {
+            content: object_integrity,
+            metadata: package_metadata_integrity,
+        },
+    )?;
 
     // Sibling-dep symlinks. Each lives next to the package (siblings
     // under the wrapper-level node_modules) — same shape as the
@@ -1268,8 +1292,15 @@ fn link_entry_is_reusable(
         None => Cow::Owned(verified_object_tree_integrity(object_dir)?),
     };
     let package_dir = link_entry_package_dir(dir, key);
-    let actual = compute_object_tree_integrity(&package_dir)?;
-    Ok(actual == expected.as_ref())
+    if tree_snapshot_matches(dir, &package_dir, expected.as_ref())? {
+        return Ok(true);
+    }
+    let actual = compute_object_tree_integrities(&package_dir)?;
+    if actual.content == expected.as_ref() {
+        write_tree_snapshot_best_effort(dir, &actual);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn link_entry_package_dir(dir: &Path, key: &GraphKey) -> PathBuf {
@@ -1411,20 +1442,124 @@ fn object_tree_integrity_matches(dir: &Path) -> Result<bool, LpmError> {
     Ok(expected == actual)
 }
 
-fn ensure_object_tree_integrity(dir: &Path) -> Result<(), LpmError> {
-    verified_object_tree_integrity(dir).map(|_| ())
-}
-
 fn verified_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
     let expected = read_object_tree_integrity(dir)?;
-    let actual = compute_object_tree_integrity(dir)?;
-    if expected == actual {
+    if tree_snapshot_matches(dir, dir, &expected)? {
+        return Ok(expected);
+    }
+    let actual = compute_object_tree_integrities(dir)?;
+    if expected == actual.content {
+        write_tree_snapshot_best_effort(dir, &actual);
         return Ok(expected);
     }
     Err(LpmError::Store(format!(
-        "v2 object integrity mismatch at {}: expected {expected}, actual {actual}",
-        dir.display()
+        "v2 object integrity mismatch at {}: expected {expected}, actual {}",
+        dir.display(),
+        actual.content
     )))
+}
+
+fn tree_snapshot_matches(
+    snapshot_dir: &Path,
+    tree_dir: &Path,
+    expected_content_integrity: &str,
+) -> Result<bool, LpmError> {
+    let Some(snapshot) = read_tree_snapshot(snapshot_dir) else {
+        return Ok(false);
+    };
+    if snapshot.content_integrity != expected_content_integrity {
+        return Ok(false);
+    }
+    let actual_metadata = compute_tree_metadata_integrity(tree_dir)?;
+    Ok(actual_metadata == snapshot.metadata_integrity)
+}
+
+fn read_tree_snapshot(dir: &Path) -> Option<TreeSnapshot> {
+    let path = dir.join(TREE_SNAPSHOT_FILENAME);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::debug!(
+                target = %path.display(),
+                "v2 store: ignoring unreadable tree snapshot: {error}"
+            );
+            return None;
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    if metadata.len() > TREE_SNAPSHOT_MAX_BYTES {
+        tracing::debug!(
+            target = %path.display(),
+            bytes = metadata.len(),
+            "v2 store: ignoring oversized tree snapshot"
+        );
+        return None;
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::debug!(
+                target = %path.display(),
+                "v2 store: ignoring unreadable tree snapshot: {error}"
+            );
+            return None;
+        }
+    };
+    let snapshot: TreeSnapshot = match serde_json::from_slice(&bytes) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::debug!(
+                target = %path.display(),
+                "v2 store: ignoring malformed tree snapshot: {error}"
+            );
+            return None;
+        }
+    };
+    if snapshot.schema != TREE_SNAPSHOT_SCHEMA_VERSION {
+        return None;
+    }
+    if !valid_sha256_integrity(&snapshot.content_integrity)
+        || !valid_sha256_integrity(&snapshot.metadata_integrity)
+    {
+        return None;
+    }
+    Some(snapshot)
+}
+
+fn valid_sha256_integrity(value: &str) -> bool {
+    let Some(hex_part) = value.strip_prefix("sha256-") else {
+        return false;
+    };
+    hex_part.len() == 64 && hex_part.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
+fn write_tree_snapshot_best_effort(dir: &Path, integrities: &TreeIntegrities) {
+    if let Err(error) = write_tree_snapshot(dir, integrities) {
+        tracing::debug!(
+            target = %dir.display(),
+            "v2 store: failed to refresh tree snapshot: {error}"
+        );
+    }
+}
+
+fn write_tree_snapshot(dir: &Path, integrities: &TreeIntegrities) -> Result<(), LpmError> {
+    let snapshot = TreeSnapshot {
+        schema: TREE_SNAPSHOT_SCHEMA_VERSION,
+        content_integrity: integrities.content.clone(),
+        metadata_integrity: integrities.metadata.clone(),
+    };
+    let bytes = serde_json::to_vec(&snapshot)
+        .map_err(|e| LpmError::Store(format!("failed to serialize v2 tree snapshot: {e}")))?;
+    let final_path = dir.join(TREE_SNAPSHOT_FILENAME);
+    write_file_atomic(&final_path, bytes).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to atomically install v2 tree snapshot at {}: {error}",
+            final_path.display()
+        ))
+    })
 }
 
 fn read_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
@@ -1458,22 +1593,41 @@ fn read_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
 }
 
 fn write_object_tree_integrity(dir: &Path) -> Result<(), LpmError> {
-    let digest = compute_object_tree_integrity(dir)?;
+    let integrities = compute_object_tree_integrities(dir)?;
     std::fs::write(
         dir.join(OBJECT_TREE_INTEGRITY_FILENAME),
-        format!("{digest}\n"),
+        format!("{}\n", integrities.content),
     )
-    .map_err(|e| LpmError::Store(format!("failed to write v2 object integrity sidecar: {e}")))
+    .map_err(|e| LpmError::Store(format!("failed to write v2 object integrity sidecar: {e}")))?;
+    write_tree_snapshot(dir, &integrities)
 }
 
 fn compute_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
-    let mut hasher = Sha256::new();
-    hash_object_tree_dir(dir, dir, &mut hasher)?;
-    let digest = hasher.finalize();
-    Ok(format!("sha256-{}", hex::encode(digest)))
+    Ok(compute_object_tree_integrities(dir)?.content)
 }
 
-fn hash_object_tree_dir(root: &Path, dir: &Path, hasher: &mut Sha256) -> Result<(), LpmError> {
+fn compute_object_tree_integrities(dir: &Path) -> Result<TreeIntegrities, LpmError> {
+    let mut content_hasher = Sha256::new();
+    let mut metadata_hasher = Sha256::new();
+    hash_object_tree_dir(dir, dir, Some(&mut content_hasher), &mut metadata_hasher)?;
+    Ok(TreeIntegrities {
+        content: format!("sha256-{}", hex::encode(content_hasher.finalize())),
+        metadata: format!("sha256-{}", hex::encode(metadata_hasher.finalize())),
+    })
+}
+
+fn compute_tree_metadata_integrity(dir: &Path) -> Result<String, LpmError> {
+    let mut hasher = Sha256::new();
+    hash_object_tree_dir(dir, dir, None, &mut hasher)?;
+    Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+}
+
+fn hash_object_tree_dir(
+    root: &Path,
+    dir: &Path,
+    mut content_hasher: Option<&mut Sha256>,
+    metadata_hasher: &mut Sha256,
+) -> Result<(), LpmError> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| {
         LpmError::Store(format!(
@@ -1502,10 +1656,16 @@ fn hash_object_tree_dir(root: &Path, dir: &Path, hasher: &mut Sha256) -> Result<
         let file_type = metadata.file_type();
         if file_type.is_dir() {
             let mode = object_entry_mode(&metadata).to_le_bytes();
-            hash_object_tree_record(hasher, b"dir", &relative, &mode);
-            hash_object_tree_dir(root, &path, hasher)?;
+            if let Some(hasher) = content_hasher.as_deref_mut() {
+                hash_object_tree_record(hasher, b"dir", &relative, &mode);
+            }
+            hash_tree_metadata_record(metadata_hasher, b"dir", &relative, &metadata, &[]);
+            hash_object_tree_dir(root, &path, content_hasher.as_deref_mut(), metadata_hasher)?;
         } else if file_type.is_file() {
-            hash_object_file(hasher, &relative, &path, &metadata)?;
+            hash_tree_metadata_record(metadata_hasher, b"file", &relative, &metadata, &[]);
+            if let Some(hasher) = content_hasher.as_deref_mut() {
+                hash_object_file(hasher, &relative, &path, &metadata)?;
+            }
         } else if file_type.is_symlink() {
             let target = std::fs::read_link(&path).map_err(|e| {
                 LpmError::Store(format!(
@@ -1515,7 +1675,16 @@ fn hash_object_tree_dir(root: &Path, dir: &Path, hasher: &mut Sha256) -> Result<
             })?;
             let mut target_bytes = Vec::new();
             push_os_str_bytes(&mut target_bytes, target.as_os_str());
-            hash_object_tree_record(hasher, b"symlink", &relative, &target_bytes);
+            if let Some(hasher) = content_hasher.as_deref_mut() {
+                hash_object_tree_record(hasher, b"symlink", &relative, &target_bytes);
+            }
+            hash_tree_metadata_record(
+                metadata_hasher,
+                b"symlink",
+                &relative,
+                &metadata,
+                &target_bytes,
+            );
         } else {
             return Err(LpmError::Store(format!(
                 "unsupported v2 object entry type at {}",
@@ -1524,6 +1693,46 @@ fn hash_object_tree_dir(root: &Path, dir: &Path, hasher: &mut Sha256) -> Result<
         }
     }
     Ok(())
+}
+
+fn hash_tree_metadata_record(
+    hasher: &mut Sha256,
+    kind: &[u8],
+    relative: &[u8],
+    metadata: &std::fs::Metadata,
+    payload: &[u8],
+) {
+    hasher.update(kind);
+    hasher.update(b"\0");
+    hasher.update(relative);
+    hasher.update(b"\0");
+    hasher.update(object_entry_mode(metadata).to_le_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(modified_time_nanos(metadata).to_le_bytes());
+    hasher.update(change_time_nanos(metadata).to_le_bytes());
+    hasher.update((payload.len() as u64).to_le_bytes());
+    hasher.update(payload);
+}
+
+fn modified_time_nanos(metadata: &std::fs::Metadata) -> i128 {
+    let Ok(modified) = metadata.modified() else {
+        return 0;
+    };
+    match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as i128,
+        Err(error) => -(error.duration().as_nanos() as i128),
+    }
+}
+
+#[cfg(unix)]
+fn change_time_nanos(metadata: &std::fs::Metadata) -> i128 {
+    use std::os::unix::fs::MetadataExt;
+    i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+fn change_time_nanos(_metadata: &std::fs::Metadata) -> i128 {
+    0
 }
 
 fn hash_object_file(
@@ -1559,7 +1768,6 @@ fn hash_object_file(
     }
     Ok(())
 }
-
 fn hash_object_tree_record(hasher: &mut Sha256, kind: &[u8], relative: &[u8], payload: &[u8]) {
     hasher.update(kind);
     hasher.update(b"\0");
@@ -1621,13 +1829,18 @@ fn is_object_metadata_sidecar(root: &Path, path: &Path) -> bool {
     if path.parent() != Some(root) {
         return false;
     }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
     matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".integrity")
-            | Some(".lpm-security.json")
-            | Some(OBJECT_TREE_INTEGRITY_FILENAME)
-            | Some(LOCAL_SOURCE_OBJECT_SENTINEL)
-    )
+        name,
+        ".integrity"
+            | ".lpm-security.json"
+            | OBJECT_TREE_INTEGRITY_FILENAME
+            | TREE_SNAPSHOT_FILENAME
+            | LOCAL_SOURCE_OBJECT_SENTINEL
+    ) || name.starts_with(".lpm-tree-snapshot.json.tmp.")
+        || name.starts_with("..lpm-tree-snapshot.json.tmp.")
 }
 
 fn is_complete_local_source_object_dir(dir: &Path) -> bool {
@@ -2170,6 +2383,92 @@ mod tests {
         write_object_tree_integrity(&dir).unwrap();
         std::fs::write(dir.join(".integrity"), sri).unwrap();
         dir
+    }
+
+    #[test]
+    fn reusable_object_recreates_missing_tree_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"reusable_object_recreates_missing_tree_snapshot");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"snapshot\"}"),
+                ("index.js", b"ok"),
+            ],
+        );
+        let snapshot_path = object_dir.join(TREE_SNAPSHOT_FILENAME);
+        assert!(snapshot_path.is_file());
+
+        std::fs::remove_file(&snapshot_path).unwrap();
+        let reusable = store.reusable_object(&sri).unwrap().unwrap();
+
+        assert_eq!(reusable.path, object_dir);
+        assert!(
+            snapshot_path.is_file(),
+            "full-hash fallback must refresh the fast metadata snapshot"
+        );
+    }
+
+    #[test]
+    fn reusable_object_ignores_atomic_tree_snapshot_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"reusable_object_ignores_atomic_tree_snapshot_tmp_file");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"snapshot-tmp\"}"),
+                ("index.js", b"ok"),
+            ],
+        );
+        std::fs::write(
+            object_dir.join("..lpm-tree-snapshot.json.tmp.1234.0"),
+            b"partial",
+        )
+        .unwrap();
+
+        let reusable = store.reusable_object(&sri).unwrap().unwrap();
+
+        assert_eq!(reusable.path, object_dir);
+    }
+
+    #[test]
+    fn populate_link_entry_refreshes_missing_tree_snapshot_on_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"populate_link_entry_refreshes_missing_tree_snapshot_on_reuse");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"snapshot-link\"}"),
+                ("index.js", b"ok"),
+            ],
+        );
+        let key = arc_key("snapshot-link", "1.0.0");
+        let request = || LinkEntryRequest {
+            graph_key: key.clone(),
+            source_sri: sri.clone(),
+            object_dir: object_dir.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        };
+
+        let first = store.populate_link_entry(request()).unwrap();
+        let snapshot_path = first.link_dir.join(TREE_SNAPSHOT_FILENAME);
+        assert!(snapshot_path.is_file());
+
+        std::fs::remove_file(&snapshot_path).unwrap();
+        let second = store.populate_link_entry(request()).unwrap();
+
+        assert!(!second.freshly_populated);
+        assert!(
+            snapshot_path.is_file(),
+            "reusable link entries must refresh missing metadata snapshots"
+        );
     }
 
     #[test]
