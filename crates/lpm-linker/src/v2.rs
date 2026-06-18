@@ -1535,35 +1535,295 @@ fn create_project_compatibility_links(
         return Ok(CompatibilityLinks::default());
     }
 
-    let compatibility_root = ensure_project_compatibility_root(project_dir)?;
     let entries = collect_compatibility_entries(roots, targets, key_map)?;
-    let desired: HashSet<String> = entries
-        .iter()
-        .map(|entry| entry.key.dir_name().to_string())
-        .collect();
-    reconcile_compatibility_root(&compatibility_root, &desired)?;
 
+    // macOS gets the store-cached fast path: build the island once in the
+    // global store, then reproduce it in the project with a single recursive
+    // `clonefile` (~5x faster than re-copying every package, and it survives
+    // `rm -rf node_modules`). Other platforms keep the proven in-place build
+    // — without `clonefile` there is no whole-tree clone to amortize, so the
+    // store round-trip would only add a copy.
+    #[cfg(target_os = "macos")]
+    {
+        create_project_compatibility_links_store_cached(
+            project_dir,
+            targets,
+            store,
+            key_map,
+            &entries,
+            refresh_package_copies,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        create_project_compatibility_links_in_place(
+            project_dir,
+            targets,
+            store,
+            key_map,
+            &entries,
+            refresh_package_copies,
+        )
+    }
+}
+
+/// Build the island directly under `compatibility_root`: copy each entry's
+/// package tree, wire the sibling symlinks, write the per-entry markers.
+/// Returns the `key → package dir` map used to rewire project roots.
+fn build_compat_island_at(
+    compatibility_root: &Path,
+    entries: &[CompatibilityEntry<'_>],
+    store: &Store,
+    key_map: &KeyMap,
+    refresh_package_copies: bool,
+) -> Result<CompatibilityLinks, LpmError> {
     let mut compatibility_links = CompatibilityLinks::with_capacity(entries.len());
-    for entry in &entries {
+    for entry in entries {
         let package_dir = ensure_compatibility_package_copy(
-            &compatibility_root,
+            compatibility_root,
             entry,
             store,
             refresh_package_copies,
         )?;
         compatibility_links.insert(&entry.key, package_dir);
     }
-
-    for entry in &entries {
-        sync_compatibility_entry_links(&compatibility_root, entry, key_map, &compatibility_links)?;
+    for entry in entries {
+        sync_compatibility_entry_links(compatibility_root, entry, key_map, &compatibility_links)?;
     }
-
-    for entry in &entries {
-        write_compatibility_marker(&compatibility_root, entry)?;
+    for entry in entries {
+        write_compatibility_marker(compatibility_root, entry)?;
     }
+    Ok(compatibility_links)
+}
 
+/// Non-macOS path: build (and incrementally reconcile) the island directly in
+/// the project's `node_modules/.lpm/compat`. This is the original behavior,
+/// preserved verbatim where the `clonefile` fast path is unavailable.
+#[cfg(not(target_os = "macos"))]
+fn create_project_compatibility_links_in_place(
+    project_dir: &Path,
+    targets: &[V2Target],
+    store: &Store,
+    key_map: &KeyMap,
+    entries: &[CompatibilityEntry<'_>],
+    refresh_package_copies: bool,
+) -> Result<CompatibilityLinks, LpmError> {
+    let compatibility_root = ensure_project_compatibility_root(project_dir)?;
+    let desired: HashSet<String> = entries
+        .iter()
+        .map(|entry| entry.key.dir_name().to_string())
+        .collect();
+    reconcile_compatibility_root(&compatibility_root, &desired)?;
+    let compatibility_links = build_compat_island_at(
+        &compatibility_root,
+        entries,
+        store,
+        key_map,
+        refresh_package_copies,
+    )?;
     rewire_project_roots_to_compat(project_dir, targets, key_map, &compatibility_links)?;
     Ok(compatibility_links)
+}
+
+// Sentinel written last when building a store-cached island (a crash
+// mid-build leaves an island that `store_compat_island_complete` rejects).
+// Shared with `lpm cache prune`, which uses its mtime for LRU eviction.
+#[cfg(target_os = "macos")]
+use lpm_store::v2::COMPAT_ISLAND_COMPLETE_FILENAME;
+
+/// macOS path: build the island once in the global store (keyed by its entry
+/// set) and reproduce it in the project with a single recursive `clonefile`.
+#[cfg(target_os = "macos")]
+fn create_project_compatibility_links_store_cached(
+    project_dir: &Path,
+    targets: &[V2Target],
+    store: &Store,
+    key_map: &KeyMap,
+    entries: &[CompatibilityEntry<'_>],
+    refresh_package_copies: bool,
+) -> Result<CompatibilityLinks, LpmError> {
+    let dir_names: Vec<&str> = entries.iter().map(|e| e.key.dir_name()).collect();
+    let island_key = lpm_store::v2::compat_island_key(&dir_names);
+    let store_island = store.paths().compat_island_dir(&island_key);
+    ensure_store_compat_island(
+        &store_island,
+        entries,
+        store,
+        key_map,
+        refresh_package_copies,
+    )?;
+
+    let compatibility_root = materialize_island_into_project(project_dir, &store_island)?;
+
+    let mut compatibility_links = CompatibilityLinks::with_capacity(entries.len());
+    for entry in entries {
+        compatibility_links.insert(
+            &entry.key,
+            compatibility_package_dir(&compatibility_root, &entry.key),
+        );
+    }
+    rewire_project_roots_to_compat(project_dir, targets, key_map, &compatibility_links)?;
+    Ok(compatibility_links)
+}
+
+/// Build the content-keyed island in the global store if it isn't already
+/// present. Builds into a tmp sibling and atomically renames, so concurrent
+/// installs racing on the same key converge on one immutable copy.
+#[cfg(target_os = "macos")]
+fn ensure_store_compat_island(
+    store_island: &Path,
+    entries: &[CompatibilityEntry<'_>],
+    store: &Store,
+    key_map: &KeyMap,
+    force_refresh: bool,
+) -> Result<(), LpmError> {
+    if store_compat_island_complete(store_island) {
+        if !force_refresh {
+            // Reuse: refresh the sentinel's mtime so `lpm cache prune
+            // --max-age` treats an actively-used island as live (the clone
+            // that follows only reads the island, so without this an island
+            // built once would age out despite daily use). Best-effort — a
+            // missed touch only widens prune's view by one install cycle.
+            let sentinel = store_island.join(COMPAT_ISLAND_COMPLETE_FILENAME);
+            let _ = std::fs::write(&sentinel, COMPAT_META_FORMAT);
+            return Ok(());
+        }
+        remove_node_modules_entry(store_island, "stale store compatibility island")?;
+    }
+    let compat_root = store.paths().compat_root();
+    ensure_real_dir_or_create(compat_root, "store compatibility island root")?;
+
+    let tmp = create_compatibility_tmp_dir(store_island)?;
+    let build = (|| -> Result<(), LpmError> {
+        build_compat_island_at(&tmp, entries, store, key_map, true)?;
+        // Completion sentinel written last; the atomic rename below only
+        // publishes a tmp that reached this point.
+        std::fs::write(
+            tmp.join(COMPAT_ISLAND_COMPLETE_FILENAME),
+            COMPAT_META_FORMAT,
+        )
+        .map_err(|e| {
+            LpmError::Store(format!(
+                "v2 linker: failed to write island completion sentinel: {e}"
+            ))
+        })
+    })();
+    if let Err(error) = build {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(error);
+    }
+
+    match std::fs::rename(&tmp, store_island) {
+        Ok(()) => Ok(()),
+        // Lost a concurrent-build race: another install published a complete
+        // island at this key first. Discard ours and reuse theirs.
+        Err(_) if store_compat_island_complete(store_island) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err(LpmError::Store(format!(
+                "v2 linker: failed to publish store compatibility island {}: {error}",
+                store_island.display()
+            )))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn store_compat_island_complete(store_island: &Path) -> bool {
+    store_island.join(COMPAT_ISLAND_COMPLETE_FILENAME).is_file()
+}
+
+/// Reproduce the cached store island under the project's
+/// `node_modules/.lpm/compat`, returning that root. Replaces any existing
+/// project island wholesale; only reached when the install actually links
+/// (cold or `node_modules`-removed warm), never on an up-to-date install.
+#[cfg(target_os = "macos")]
+fn materialize_island_into_project(
+    project_dir: &Path,
+    store_island: &Path,
+) -> Result<PathBuf, LpmError> {
+    remove_legacy_project_compatibility_root(project_dir)?;
+    let node_modules = ensure_node_modules_dir(project_dir)?;
+    ensure_real_dir_or_create(
+        &node_modules.join(".lpm"),
+        "project node_modules/.lpm directory",
+    )?;
+    let compatibility_root = project_compatibility_root(project_dir);
+    // `clonefile` requires the destination not to exist.
+    if compatibility_root.symlink_metadata().is_ok() {
+        remove_node_modules_entry(&compatibility_root, "previous project compatibility island")?;
+    }
+    clone_or_copy_island_tree(store_island, &compatibility_root)?;
+    Ok(compatibility_root)
+}
+
+/// Recursively reproduce `src` at `dst`. Same-volume APFS: one `clonefile`
+/// (CoW). Cross-volume (rare): a symlink-preserving recursive copy.
+#[cfg(target_os = "macos")]
+fn clone_or_copy_island_tree(src: &Path, dst: &Path) -> Result<(), LpmError> {
+    if crate::materialize::try_clonefile(src, dst) {
+        return Ok(());
+    }
+    copy_tree_preserving_symlinks(src, dst)
+}
+
+/// Cross-volume fallback: copy a directory tree, hardlinking regular files
+/// and recreating symlinks verbatim so the island's relative sibling edges
+/// survive.
+#[cfg(target_os = "macos")]
+fn copy_tree_preserving_symlinks(src: &Path, dst: &Path) -> Result<(), LpmError> {
+    std::fs::create_dir_all(dst).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to create island dir {}: {e}",
+            dst.display()
+        ))
+    })?;
+    let read = std::fs::read_dir(src).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to read island {}: {e}",
+            src.display()
+        ))
+    })?;
+    for entry in read {
+        let entry = entry.map_err(|e| {
+            LpmError::Store(format!("v2 linker: failed to enumerate island entry: {e}"))
+        })?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|e| {
+            LpmError::Store(format!(
+                "v2 linker: failed to stat island entry {}: {e}",
+                src_path.display()
+            ))
+        })?;
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&src_path).map_err(|e| {
+                LpmError::Store(format!(
+                    "v2 linker: failed to read island symlink {}: {e}",
+                    src_path.display()
+                ))
+            })?;
+            std::os::unix::fs::symlink(&target, &dst_path).map_err(|e| {
+                LpmError::Store(format!(
+                    "v2 linker: failed to recreate island symlink {}: {e}",
+                    dst_path.display()
+                ))
+            })?;
+        } else if file_type.is_dir() {
+            copy_tree_preserving_symlinks(&src_path, &dst_path)?;
+        } else if file_type.is_file() && std::fs::hard_link(&src_path, &dst_path).is_err() {
+            std::fs::copy(&src_path, &dst_path).map_err(|e| {
+                LpmError::Store(format!(
+                    "v2 linker: failed to copy island file {}: {e}",
+                    src_path.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn normalize_compatibility_bin_names(bin_names: &[String]) -> Vec<String> {
@@ -1749,6 +2009,9 @@ fn compatibility_dependency_links(
     Ok(links)
 }
 
+// Only the non-macOS in-place build creates the project compat root directly;
+// the macOS store-cache path materializes it via `clonefile` instead.
+#[cfg(not(target_os = "macos"))]
 fn ensure_project_compatibility_root(project_dir: &Path) -> Result<PathBuf, LpmError> {
     remove_legacy_project_compatibility_root(project_dir)?;
     let node_modules = ensure_node_modules_dir(project_dir)?;
@@ -1845,6 +2108,9 @@ fn remove_legacy_project_compatibility_root(project_dir: &Path) -> Result<(), Lp
     Ok(())
 }
 
+// Incremental reconcile only runs on the in-place (non-macOS) build; the
+// store-cache path replaces the project island wholesale via `clonefile`.
+#[cfg(not(target_os = "macos"))]
 fn reconcile_compatibility_root(
     compatibility_root: &Path,
     desired: &HashSet<String>,
@@ -2051,13 +2317,38 @@ fn create_compatibility_sibling_link(
     if link_path.symlink_metadata().is_ok() {
         remove_node_modules_entry(&link_path, "stale compatibility sibling")?;
     }
-    create_dir_symlink_or_junction(target_package_dir, &link_path).map_err(|e| {
+    // Relative target so the island is position-independent: a whole-tree
+    // `clonefile` of the island into a project (warm-install fast path)
+    // keeps every sibling edge valid, because the link and its target move
+    // together. Same canonicalize-then-`diff_paths` strategy the v1
+    // isolated linker uses for store symlinks.
+    let relative_target = relative_compat_sibling_target(&link_path, target_package_dir);
+    create_dir_symlink_or_junction(&relative_target, &link_path).map_err(|e| {
         LpmError::Store(format!(
             "v2 linker: failed to create compatibility sibling {} -> {}: {e}",
             link_path.display(),
             target_package_dir.display()
         ))
     })
+}
+
+/// Relative symlink target for an in-island sibling edge, computed from the
+/// link's parent directory. Both paths live under the same compatibility
+/// root, so the result is an island-internal relative path (e.g.
+/// `../../<dep-key>/node_modules/<dep>`) that survives a whole-island
+/// `clonefile` to any destination.
+fn relative_compat_sibling_target(link_path: &Path, target_package_dir: &Path) -> PathBuf {
+    let Some(link_parent) = link_path.parent() else {
+        return target_package_dir.to_path_buf();
+    };
+    let link_parent_canonical = link_parent
+        .canonicalize()
+        .unwrap_or_else(|_| link_parent.to_path_buf());
+    let target_canonical = target_package_dir
+        .canonicalize()
+        .unwrap_or_else(|_| target_package_dir.to_path_buf());
+    pathdiff::diff_paths(&target_canonical, &link_parent_canonical)
+        .unwrap_or_else(|| target_canonical.clone())
 }
 
 fn write_compatibility_marker(
@@ -2796,6 +3087,120 @@ mod tests {
                 shim_real.display(),
             );
         }
+    }
+
+    /// The macOS store-cache path must: (1) publish the island once in the
+    /// global store keyed by its entry set, (2) reproduce it in the project
+    /// with position-independent (relative) internal symlinks, and (3) on a
+    /// `node_modules`-removed warm relink, reuse the cached store island
+    /// rather than rebuilding it — the whole point of the cache.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_cached_compat_island_is_reused_across_node_modules_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let tool_sri = synthetic_sri(b"v2/store-cache/tool");
+        write_object(
+            &store,
+            &tool_sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"tool","version":"1.0.0","bin":{"tool":"bin/tool.js"},"dependencies":{"helper":"1.0.0"}}"#,
+                ),
+                ("bin/tool.js", b"#!/usr/bin/env node\n"),
+            ],
+        );
+        let helper_sri = synthetic_sri(b"v2/store-cache/helper");
+        write_object(
+            &store,
+            &helper_sri,
+            &[("package.json", br#"{"name":"helper","version":"1.0.0"}"#)],
+        );
+
+        let make_targets = || {
+            let mut tool = target("tool", "1.0.0", &tool_sri, true);
+            tool.target.dependencies = vec![LinkDependency::registry("helper", "1.0.0")];
+            vec![tool, target("helper", "1.0.0", &helper_sri, false)]
+        };
+
+        link_packages_v2(&project, make_targets(), &store, LinkerMode::Isolated, None).unwrap();
+
+        // (1) Exactly one cached island, published with its completion sentinel.
+        let compat_store_root = store.paths().compat_root();
+        let islands: Vec<_> = std::fs::read_dir(compat_store_root)
+            .expect("store compat root should exist")
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .collect();
+        assert_eq!(islands.len(), 1, "exactly one cached island expected");
+        let island_dir = islands[0].path();
+        assert!(
+            island_dir.join(COMPAT_ISLAND_COMPLETE_FILENAME).is_file(),
+            "store island must carry its completion sentinel",
+        );
+
+        // (2) The project island's sibling edge must be a RELATIVE symlink so
+        // the whole-island clone stays valid at its destination.
+        let sibling = find_symlink_named(&project.join("node_modules/.lpm/compat"), "helper")
+            .expect("helper sibling symlink should exist in the project island");
+        let target_path = std::fs::read_link(&sibling).unwrap();
+        assert!(
+            target_path.is_relative(),
+            "island sibling symlink must be relative, got {}",
+            target_path.display(),
+        );
+        assert!(sibling.exists(), "relative sibling symlink must resolve");
+
+        // (3) Warm relink after node_modules removal must REUSE the cached
+        // island, not rebuild it. Drop a probe file into the store island; a
+        // rebuild publishes via atomic tmp→rename and would lose it, whereas
+        // reuse leaves the island dir untouched (only its sentinel mtime is
+        // refreshed for LRU).
+        let probe = island_dir.join(".reuse-probe");
+        std::fs::write(&probe, b"x").unwrap();
+        std::fs::remove_dir_all(project.join("node_modules")).unwrap();
+
+        link_packages_v2(&project, make_targets(), &store, LinkerMode::Isolated, None).unwrap();
+
+        let still_one = std::fs::read_dir(compat_store_root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .count();
+        assert_eq!(still_one, 1, "warm relink must not create a second island");
+        assert!(
+            probe.exists(),
+            "warm relink must reuse the cached store island, not rebuild it",
+        );
+        assert!(
+            find_symlink_named(&project.join("node_modules/.lpm/compat"), "helper")
+                .is_some_and(|p| p.exists()),
+            "project island must be reproduced after node_modules removal",
+        );
+    }
+
+    /// Recursively find the first symlink whose file name matches `name`.
+    #[cfg(target_os = "macos")]
+    fn find_symlink_named(root: &Path, name: &str) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = entry.file_type().ok()?;
+            if ft.is_symlink() {
+                if entry.file_name().to_str() == Some(name) {
+                    return Some(path);
+                }
+            } else if ft.is_dir()
+                && let Some(found) = find_symlink_named(&path, name)
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 
     #[test]

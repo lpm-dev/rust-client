@@ -35,6 +35,49 @@ const OBJECTS_DIR: &str = "objects";
 /// Subdirectory holding per-graph-key link entries.
 const LINKS_DIR: &str = "links";
 
+/// Subdirectory holding cached project-compatibility islands, keyed by the
+/// content hash of the island's entry set. A framework-toolchain island
+/// (Next/Turbopack + transitive closure) is built here once and then
+/// `clonefile`d into each project's `node_modules/.lpm/compat`, so a warm
+/// install reproduces the island in a single recursive syscall instead of
+/// re-copying every package.
+const COMPAT_DIR: &str = "compat";
+
+/// Schema tag folded into [`compat_island_key`] so a change to the island's
+/// on-disk layout invalidates every cached island instead of silently
+/// reusing a stale shape.
+const COMPAT_ISLAND_SCHEMA: &str = "lpm-compat-island-v1";
+
+/// Sentinel file the linker writes last when publishing a cached island.
+/// Its presence marks a complete island (an island dir without it crashed
+/// mid-build); its mtime is the island's "last used" stamp for LRU prune.
+/// Lives in `lpm-store` so both the linker (writer) and `lpm cache prune`
+/// (reader) agree on the layout convention.
+pub const COMPAT_ISLAND_COMPLETE_FILENAME: &str = ".lpm-island-complete";
+
+/// Derive the filesystem-safe content key for a cached compatibility island
+/// from its entry set.
+///
+/// The key is a SHA-256 over the schema tag plus the island's
+/// graph-key dir-names in sorted order, so two installs that produce the
+/// same island (same toolchain dependency closure) resolve to the same
+/// cached island regardless of entry order. Each dir-name already encodes
+/// `name@version+<context-digest>`, and a package's content SRI is fixed for
+/// a given `name@version`, so the dir-name set fully determines island
+/// content.
+pub fn compat_island_key(entry_dir_names: &[&str]) -> String {
+    let mut names: Vec<&str> = entry_dir_names.to_vec();
+    names.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update(COMPAT_ISLAND_SCHEMA.as_bytes());
+    hasher.update(b"\0");
+    for name in &names {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// One row yielded by [`Store::iter_link_entries_for_verify`]: the
 /// link directory plus either its parsed sidecar or the read/parse/
 /// schema/validation failure encountered. Named so the public
@@ -82,6 +125,8 @@ pub struct StoreV2Paths {
     objects_root: PathBuf,
     /// `~/.lpm/store/v2/links/` — precomputed for the same reason.
     links_root: PathBuf,
+    /// `~/.lpm/store/v2/compat/` — precomputed for the same reason.
+    compat_root: PathBuf,
 }
 
 impl StoreV2Paths {
@@ -90,10 +135,12 @@ impl StoreV2Paths {
         let root = lpm_root.store_root().join(STORE_V2_VERSION);
         let objects_root = root.join(OBJECTS_DIR);
         let links_root = root.join(LINKS_DIR);
+        let compat_root = root.join(COMPAT_DIR);
         Self {
             root,
             objects_root,
             links_root,
+            compat_root,
         }
     }
 
@@ -102,10 +149,12 @@ impl StoreV2Paths {
         let root = root.into();
         let objects_root = root.join(OBJECTS_DIR);
         let links_root = root.join(LINKS_DIR);
+        let compat_root = root.join(COMPAT_DIR);
         Self {
             root,
             objects_root,
             links_root,
+            compat_root,
         }
     }
 
@@ -129,6 +178,20 @@ impl StoreV2Paths {
     #[inline]
     pub fn links_root(&self) -> PathBuf {
         self.links_root.clone()
+    }
+
+    /// `~/.lpm/store/v2/compat/` — root of the cached compatibility islands.
+    #[inline]
+    pub fn compat_root(&self) -> &Path {
+        &self.compat_root
+    }
+
+    /// `~/.lpm/store/v2/compat/<island-key>/` — the cached island for a
+    /// given entry-set content key. `key` is a hex digest the caller
+    /// derives from the island's entry set, so the path is filesystem-safe.
+    #[inline]
+    pub fn compat_island_dir(&self, key: &str) -> PathBuf {
+        self.compat_root.join(key)
     }
 
     /// `~/.lpm/store/v2/objects/<algo>-<hex>/` for a given SRI.
