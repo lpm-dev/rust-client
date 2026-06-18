@@ -84,9 +84,17 @@ pub struct PruneSummary {
     pub object_entries_reachable: usize,
     /// Orphan objects — pruneable per the algorithm.
     pub object_entries_orphaned: Vec<PathBuf>,
+    /// `compat/<key>/` cached framework-compatibility islands on disk.
+    pub compat_islands_total: usize,
+    /// Orphan compat islands — pruneable. An island is orphaned when it is
+    /// incomplete (no completion sentinel — crashed mid-build) or, under
+    /// `--max-age`, its sentinel mtime (last-used stamp) predates the
+    /// cutoff. Without reachability we evict islands by LRU, never by the
+    /// project walk, so a complete recently-used island is always kept.
+    pub compat_islands_orphaned: Vec<PathBuf>,
     /// Total bytes that would be / were freed by deleting orphans.
-    /// Sum of `link_entries_orphaned` + `object_entries_orphaned`
-    /// directory sizes.
+    /// Sum of `link_entries_orphaned` + `object_entries_orphaned` +
+    /// `compat_islands_orphaned` directory sizes.
     pub bytes_freed_or_eligible: u64,
     /// Number of pending global-install tombstones (deferred-uninstall
     /// roots from `lpm uninstall -g`) counted at preview time. Both
@@ -226,6 +234,19 @@ fn run_locked(
             }
         }
 
+        // Compat-island eviction runs unconditionally under `--apply` —
+        // unlike link/object orphan deletion it's LRU + crash-recovery
+        // (never reachability), so a missing/corrupt registry can't make it
+        // wrongly wipe a live island.
+        for island in &summary.compat_islands_orphaned {
+            std::fs::remove_dir_all(island).map_err(|e| {
+                LpmError::Store(format!(
+                    "cache prune: failed to remove compat island {}: {e}",
+                    island.display()
+                ))
+            })?;
+        }
+
         // Sweep deferred global-uninstall tombstones. Errors are
         // surfaced via `summary.tombstone_sweep_error` (and a
         // `tracing::warn`) instead of being collapsed into an empty
@@ -332,6 +353,14 @@ pub fn compute_prune_plan(
             // the work `--apply` will do.
             let (tombstones_pending, tombstone_count_error) =
                 count_tombstones_with_error_capture(root);
+            // Island prune is LRU + crash-recovery only (reachability-
+            // independent), so it is safe even with no usable registry.
+            let (compat_islands_total, compat_islands_orphaned) =
+                compute_compat_island_orphans(v2_store.paths().compat_root(), max_age);
+            let bytes_freed_or_eligible = compat_islands_orphaned
+                .iter()
+                .map(|dir| dir_size(dir).unwrap_or(0))
+                .fold(0u64, u64::saturating_add);
             return Ok(PruneSummary {
                 applied: false,
                 projects_walked: 0,
@@ -342,7 +371,9 @@ pub fn compute_prune_plan(
                 object_entries_total: 0,
                 object_entries_reachable: 0,
                 object_entries_orphaned: Vec::new(),
-                bytes_freed_or_eligible: 0,
+                compat_islands_total,
+                compat_islands_orphaned,
+                bytes_freed_or_eligible,
                 tombstones_pending,
                 tombstones_swept: 0,
                 tombstones_retained: Vec::new(),
@@ -475,12 +506,25 @@ pub fn compute_prune_plan(
         }
     }
 
+    // ── Step 6: Compat-island LRU prune. The island cache (`compat/<key>/`)
+    //         is content-keyed and reachability-agnostic, so it is evicted by
+    //         LRU — never by the project walk: incomplete islands (crash
+    //         recovery) always, complete islands only when `--max-age` finds
+    //         their last-used sentinel stale. Absent on non-macOS (islands
+    //         are a macOS clonefile feature) → the dir is missing → no-op.
+    let (compat_islands_total, compat_islands_orphaned) =
+        compute_compat_island_orphans(v2_store.paths().compat_root(), max_age);
+
     let mut bytes_freed_or_eligible = 0u64;
     for dir in &link_entries_orphaned {
         bytes_freed_or_eligible =
             bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
     }
     for dir in &object_entries_orphaned {
+        bytes_freed_or_eligible =
+            bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+    }
+    for dir in &compat_islands_orphaned {
         bytes_freed_or_eligible =
             bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
     }
@@ -497,6 +541,8 @@ pub fn compute_prune_plan(
         object_entries_total,
         object_entries_reachable: object_referenced_segments.len(),
         object_entries_orphaned,
+        compat_islands_total,
+        compat_islands_orphaned,
         bytes_freed_or_eligible,
         tombstones_pending,
         tombstones_swept: 0,
@@ -622,6 +668,52 @@ fn dir_size(dir: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+/// LRU + crash-recovery orphan detection for the compat-island cache at
+/// `~/.lpm/store/v2/compat/`.
+///
+/// An island is pruneable when it has no completion sentinel (a crashed
+/// mid-build leftover) or — only under `--max-age` — when its sentinel mtime
+/// (refreshed on every island reuse) is older than the cutoff. Reachability
+/// plays no part: islands are content-keyed and shared across projects, so a
+/// project walk can't prove an island unused; LRU is the safe policy. A
+/// missing `compat/` dir (non-macOS, or no island ever built) yields
+/// `(0, [])`. mtime-read / clock-skew failures conservatively keep a complete
+/// island.
+fn compute_compat_island_orphans(
+    compat_root: &Path,
+    max_age: Option<ChronoDuration>,
+) -> (usize, Vec<PathBuf>) {
+    let read = match std::fs::read_dir(compat_root) {
+        Ok(read) => read,
+        Err(_) => return (0, Vec::new()),
+    };
+    let max_age_std = max_age.and_then(|d| d.to_std().ok());
+    let mut total = 0usize;
+    let mut orphaned = Vec::new();
+    for entry in read.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let island = entry.path();
+        total += 1;
+        let sentinel = island.join(lpm_store::v2::COMPAT_ISLAND_COMPLETE_FILENAME);
+        let Ok(meta) = std::fs::metadata(&sentinel) else {
+            orphaned.push(island);
+            continue;
+        };
+        if let Some(max_age_std) = max_age_std
+            && meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|elapsed| elapsed >= max_age_std)
+        {
+            orphaned.push(island);
+        }
+    }
+    (total, orphaned)
+}
+
 fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
     use lpm_common::format_bytes;
     let elapsed = install_ui::green(&install_ui::format_duration(elapsed));
@@ -729,6 +821,18 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
             },
         ));
     }
+    if !summary.compat_islands_orphaned.is_empty() {
+        install_ui::phase(&format!(
+            "{} stale compat island(s) {} {}",
+            summary.compat_islands_orphaned.len(),
+            if applied { "evicted" } else { "eligible —" },
+            if applied {
+                String::new()
+            } else {
+                "`lpm cache prune --apply`".to_string()
+            },
+        ));
+    }
     if !applied && summary.link_entries_orphaned.len() <= 20 {
         for dir in &summary.link_entries_orphaned {
             println!(
@@ -739,6 +843,12 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
         for dir in &summary.object_entries_orphaned {
             println!(
                 "  object orphan: {}",
+                sanitize_for_terminal(&dir.display().to_string())
+            );
+        }
+        for dir in &summary.compat_islands_orphaned {
+            println!(
+                "  compat island orphan: {}",
                 sanitize_for_terminal(&dir.display().to_string())
             );
         }
@@ -765,6 +875,12 @@ fn emit_json(summary: &PruneSummary) {
         "object_entries_reachable": summary.object_entries_reachable,
         "object_entries_orphaned": summary
             .object_entries_orphaned
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+        "compat_islands_total": summary.compat_islands_total,
+        "compat_islands_orphaned": summary
+            .compat_islands_orphaned
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
@@ -930,6 +1046,57 @@ mod tests {
         assert_eq!(summary.object_entries_total, 2);
         assert_eq!(summary.object_entries_reachable, 1);
         assert_eq!(summary.object_entries_orphaned.len(), 1);
+    }
+
+    #[test]
+    fn compat_island_prune_evicts_incomplete_and_stale_islands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let compat_root = tmp.path().join("compat");
+        std::fs::create_dir_all(&compat_root).unwrap();
+        let sentinel = lpm_store::v2::COMPAT_ISLAND_COMPLETE_FILENAME;
+
+        // Complete + freshly-used island (sentinel just written).
+        let fresh = compat_root.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join(sentinel), b"v1").unwrap();
+
+        // Incomplete island — crashed mid-build, no sentinel.
+        let incomplete = compat_root.join("incomplete");
+        std::fs::create_dir_all(&incomplete).unwrap();
+
+        // Complete but stale: sentinel mtime backdated 10 days.
+        let stale = compat_root.join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        let stale_sentinel = stale.join(sentinel);
+        std::fs::write(&stale_sentinel, b"v1").unwrap();
+        let ten_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale_sentinel)
+            .unwrap()
+            .set_modified(ten_days_ago)
+            .unwrap();
+
+        // No --max-age: only the incomplete (crash-recovery) island is pruned.
+        let (total, orphans) = compute_compat_island_orphans(&compat_root, None);
+        assert_eq!(total, 3);
+        assert_eq!(orphans, vec![incomplete.clone()]);
+
+        // --max-age 7d: incomplete + stale pruned; the fresh island is kept.
+        let (total, mut orphans) =
+            compute_compat_island_orphans(&compat_root, Some(ChronoDuration::days(7)));
+        assert_eq!(total, 3);
+        orphans.sort();
+        let mut expected = vec![incomplete, stale];
+        expected.sort();
+        assert_eq!(orphans, expected);
+
+        // Missing compat dir → no-op, never errors.
+        assert_eq!(
+            compute_compat_island_orphans(&tmp.path().join("nope"), None),
+            (0, Vec::new())
+        );
     }
 
     #[test]

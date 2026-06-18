@@ -1,0 +1,28 @@
+---
+source: tests/workflows/tests/cache_prune.rs
+expression: json
+---
+{
+  "success": true,
+  "applied": false,
+  "projects_walked": 0,
+  "registry_entries_dropped": 0,
+  "link_entries_total": 0,
+  "link_entries_reachable": 0,
+  "link_entries_orphaned": [],
+  "object_entries_total": 0,
+  "object_entries_reachable": 0,
+  "object_entries_orphaned": [],
+  "compat_islands_total": 0,
+  "compat_islands_orphaned": [],
+  "bytes_freed_or_eligible": 0,
+  "registry_missing": true,
+  "registry_corrupt": false,
+  "registry_corrupt_reason": "",
+  "tombstones_pending": 0,
+  "tombstones_swept": 0,
+  "tombstones_retained": [],
+  "tombstone_bytes_freed": 0,
+  "tombstone_count_error": null,
+  "tombstone_sweep_error": null
+}

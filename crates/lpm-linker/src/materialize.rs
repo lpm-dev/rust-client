@@ -182,8 +182,13 @@ pub(crate) fn link_dir_recursive(src: &Path, dst: &Path) -> Result<(), LpmError>
 
 /// Try to use macOS `clonefile()` syscall for instant copy-on-write.
 /// Returns true if successful, false if not (caller should fall back).
+///
+/// `clonefile` on a directory recurses the whole subtree (files, dirs, and
+/// symlinks) in a single syscall, so callers cloning a pre-built tree get a
+/// CoW copy at the cost of one syscall regardless of entry count. Requires
+/// `dst` to not already exist and `src`/`dst` to share a volume.
 #[cfg(target_os = "macos")]
-fn try_clonefile(src: &Path, dst: &Path) -> bool {
+pub(crate) fn try_clonefile(src: &Path, dst: &Path) -> bool {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 

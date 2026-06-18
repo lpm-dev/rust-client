@@ -35,6 +35,63 @@ const OBJECTS_DIR: &str = "objects";
 /// Subdirectory holding per-graph-key link entries.
 const LINKS_DIR: &str = "links";
 
+/// Subdirectory holding cached project-compatibility islands, keyed by the
+/// content hash of the island's entry set. A framework-toolchain island
+/// (Next/Turbopack + transitive closure) is built here once and then
+/// `clonefile`d into each project's `node_modules/.lpm/compat`, so a warm
+/// install reproduces the island in a single recursive syscall instead of
+/// re-copying every package.
+const COMPAT_DIR: &str = "compat";
+
+/// Schema tag folded into [`compat_island_key`] so a change to the island's
+/// on-disk layout invalidates every cached island instead of silently
+/// reusing a stale shape.
+const COMPAT_ISLAND_SCHEMA: &str = "lpm-compat-island-v1";
+
+/// Sentinel file the linker writes last when publishing a cached island.
+/// Its presence marks a complete island (an island dir without it crashed
+/// mid-build); its mtime is the island's "last used" stamp for LRU prune.
+/// Lives in `lpm-store` so both the linker (writer) and `lpm cache prune`
+/// (reader) agree on the layout convention.
+pub const COMPAT_ISLAND_COMPLETE_FILENAME: &str = ".lpm-island-complete";
+
+/// One package row folded into [`compat_island_key`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompatIslandKeyEntry<'a> {
+    pub dir_name: &'a str,
+    pub source_sri: &'a str,
+    pub content_integrity: &'a str,
+}
+
+/// Derive the filesystem-safe content key for a cached compatibility island
+/// from its entry set.
+///
+/// The key is a SHA-256 over the schema tag plus each package's graph-key
+/// dir-name, source SRI, and current link-entry content digest in sorted
+/// order. The content digest keeps stable-SRI local sources from reusing an
+/// island built from older bytes.
+pub fn compat_island_key(entries: &[CompatIslandKeyEntry<'_>]) -> String {
+    let mut entries = entries.to_vec();
+    entries.sort_unstable_by(|left, right| {
+        left.dir_name
+            .cmp(right.dir_name)
+            .then_with(|| left.source_sri.cmp(right.source_sri))
+            .then_with(|| left.content_integrity.cmp(right.content_integrity))
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(COMPAT_ISLAND_SCHEMA.as_bytes());
+    hasher.update(b"\0");
+    for entry in &entries {
+        hasher.update(entry.dir_name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(entry.source_sri.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(entry.content_integrity.as_bytes());
+        hasher.update(b"\0");
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// One row yielded by [`Store::iter_link_entries_for_verify`]: the
 /// link directory plus either its parsed sidecar or the read/parse/
 /// schema/validation failure encountered. Named so the public
@@ -82,6 +139,8 @@ pub struct StoreV2Paths {
     objects_root: PathBuf,
     /// `~/.lpm/store/v2/links/` — precomputed for the same reason.
     links_root: PathBuf,
+    /// `~/.lpm/store/v2/compat/` — precomputed for the same reason.
+    compat_root: PathBuf,
 }
 
 impl StoreV2Paths {
@@ -90,10 +149,12 @@ impl StoreV2Paths {
         let root = lpm_root.store_root().join(STORE_V2_VERSION);
         let objects_root = root.join(OBJECTS_DIR);
         let links_root = root.join(LINKS_DIR);
+        let compat_root = root.join(COMPAT_DIR);
         Self {
             root,
             objects_root,
             links_root,
+            compat_root,
         }
     }
 
@@ -102,10 +163,12 @@ impl StoreV2Paths {
         let root = root.into();
         let objects_root = root.join(OBJECTS_DIR);
         let links_root = root.join(LINKS_DIR);
+        let compat_root = root.join(COMPAT_DIR);
         Self {
             root,
             objects_root,
             links_root,
+            compat_root,
         }
     }
 
@@ -129,6 +192,20 @@ impl StoreV2Paths {
     #[inline]
     pub fn links_root(&self) -> PathBuf {
         self.links_root.clone()
+    }
+
+    /// `~/.lpm/store/v2/compat/` — root of the cached compatibility islands.
+    #[inline]
+    pub fn compat_root(&self) -> &Path {
+        &self.compat_root
+    }
+
+    /// `~/.lpm/store/v2/compat/<island-key>/` — the cached island for a
+    /// given entry-set content key. `key` is a hex digest the caller
+    /// derives from the island's entry set, so the path is filesystem-safe.
+    #[inline]
+    pub fn compat_island_dir(&self, key: &str) -> PathBuf {
+        self.compat_root.join(key)
     }
 
     /// `~/.lpm/store/v2/objects/<algo>-<hex>/` for a given SRI.
@@ -338,6 +415,17 @@ impl Store {
     /// The path helper this Store wraps.
     pub fn paths(&self) -> &StoreV2Paths {
         &self.paths
+    }
+
+    /// Ensure the cached compatibility-island root exists with store-tier
+    /// permissions.
+    pub fn ensure_compat_root_locked(&self) -> Result<(), LpmError> {
+        ensure_store_tier_dir_locked(self.paths.compat_root()).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to create v2 compat islands dir at {}: {e}",
+                self.paths.compat_root().display()
+            ))
+        })
     }
 
     /// Return the object directory when `sri` is already present and
@@ -893,6 +981,24 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    /// Return the current content digest for a populated link entry.
+    pub fn link_entry_content_integrity(&self, key: &GraphKey) -> Result<String, LpmError> {
+        let link_dir = self.paths.link_dir(key);
+        if let Some(snapshot) = read_tree_snapshot(&link_dir) {
+            return Ok(snapshot.content_integrity);
+        }
+        if !is_complete_link_entry(&link_dir, key) {
+            return Err(LpmError::Store(format!(
+                "v2 link entry {} is incomplete; cannot key compatibility island",
+                link_dir.display()
+            )));
+        }
+        let package_dir = link_entry_package_dir(&link_dir, key);
+        let actual = compute_object_tree_integrities(&package_dir)?;
+        write_tree_snapshot_best_effort(&link_dir, &actual);
+        Ok(actual.content)
     }
 
     /// **v1 → v2 cache-hit translation.** When the v1 store already
@@ -2370,6 +2476,27 @@ mod tests {
         crate::compute_sri_hash(seed)
     }
 
+    #[test]
+    fn compat_island_key_changes_when_entry_content_changes() {
+        let dir_name = "local-tool@1.0.0+abcdef1234567890";
+        let source_sri = synthetic_sri(b"stable-local-source-identity");
+        let first = compat_island_key(&[CompatIslandKeyEntry {
+            dir_name,
+            source_sri: &source_sri,
+            content_integrity: "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }]);
+        let second = compat_island_key(&[CompatIslandKeyEntry {
+            dir_name,
+            source_sri: &source_sri,
+            content_integrity: "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        }]);
+
+        assert_ne!(
+            first, second,
+            "stable-SRI local sources must get a new compat island key when their link-entry bytes change"
+        );
+    }
+
     fn write_object(store: &Store, sri: &str, files: &[(&str, &[u8])]) -> PathBuf {
         let dir = store.paths().object_dir(sri).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -2468,6 +2595,41 @@ mod tests {
         assert!(
             snapshot_path.is_file(),
             "reusable link entries must refresh missing metadata snapshots"
+        );
+    }
+
+    #[test]
+    fn link_entry_content_integrity_recreates_missing_tree_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"link_entry_content_integrity_recreates_missing_tree_snapshot");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"snapshot-link\"}"),
+                ("index.js", b"ok"),
+            ],
+        );
+        let key = arc_key("snapshot-link", "1.0.0");
+        let entry = store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: key.clone(),
+                source_sri: sri,
+                object_dir,
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+        let snapshot_path = entry.link_dir.join(TREE_SNAPSHOT_FILENAME);
+        std::fs::remove_file(&snapshot_path).unwrap();
+
+        let integrity = store.link_entry_content_integrity(&key).unwrap();
+
+        assert!(integrity.starts_with("sha256-"));
+        assert!(
+            snapshot_path.is_file(),
+            "compat island keying should repair legacy link entries missing the digest snapshot"
         );
     }
 

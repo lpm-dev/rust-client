@@ -92,6 +92,7 @@ fn prune_dry_run_with_no_registry_succeeds_without_mutation() {
     );
 
     let json = parse_json(&output.stdout);
+    insta::assert_json_snapshot!("cache_prune_dry_run_json_envelope_missing_registry", json);
     assert_eq!(json["applied"], false, "dry-run must not report applied");
     assert_eq!(
         json["registry_missing"], true,
