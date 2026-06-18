@@ -103,6 +103,19 @@ impl RegistryClient {
             .map(str::to_string)
     }
 
+    fn validate_release_time_metadata(
+        name: &str,
+        metadata: ReleaseTimeMetadata,
+    ) -> Result<ReleaseTimeMetadata, LpmError> {
+        if metadata.matches_package(name) {
+            return Ok(metadata);
+        }
+        Err(LpmError::Registry(format!(
+            "registry returned release times for unexpected package '{}' when requesting '{name}'",
+            metadata.name.as_deref().unwrap_or("<missing>")
+        )))
+    }
+
     async fn send_package_metadata_request(
         &self,
         request_builder: reqwest::RequestBuilder,
@@ -159,17 +172,24 @@ impl RegistryClient {
         )
     }
 
-    async fn cached_metadata_after_304(&self, cache_key: &str) -> Option<PackageMetadata> {
+    async fn cached_metadata_after_304_as<T>(&self, cache_key: &str) -> Option<T>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
         let path = self.cache_path(cache_key)?;
         tokio::task::spawn_blocking(move || {
             let content = Self::read_cache_content_path(&path)?;
-            let meta = Self::deserialize_cached_metadata(&content.data)?;
+            let meta = Self::deserialize_cached_metadata_as::<T>(&content.data)?;
             let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
             Some(meta)
         })
         .await
         .ok()
         .flatten()
+    }
+
+    async fn cached_metadata_after_304(&self, cache_key: &str) -> Option<PackageMetadata> {
+        self.cached_metadata_after_304_as(cache_key).await
     }
 
     /// Fetch metadata for multiple packages in a single HTTP request.
@@ -1115,6 +1135,296 @@ impl RegistryClient {
                     .await
             }
         }
+    }
+
+    pub async fn get_npm_release_times_routed_full(
+        &self,
+        name: &str,
+        route: crate::UpstreamRoute,
+    ) -> Result<ReleaseTimeMetadata, LpmError> {
+        match route {
+            crate::UpstreamRoute::LpmWorker => self.get_npm_package_release_times_full(name).await,
+            crate::UpstreamRoute::NpmDirect => {
+                self.get_npm_release_times_direct_full_inner(name, true)
+                    .await
+            }
+            crate::UpstreamRoute::Custom { target, auth } => {
+                self.get_npm_release_times_from_full(&target.base_url, name, auth.as_ref())
+                    .await
+            }
+        }
+    }
+
+    async fn get_npm_package_release_times_full(
+        &self,
+        name: &str,
+    ) -> Result<ReleaseTimeMetadata, LpmError> {
+        let cache_key = format!("npm-release-times:{name}");
+        if let Some((cached, _etag)) = self
+            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
+            .await
+            && cached.matches_package(name)
+        {
+            return Ok(cached);
+        }
+        let full_cache_key = format!("npm-full:{name}");
+        if let Some((cached, _etag)) = self
+            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&full_cache_key)
+            .await
+            && cached.matches_package(name)
+            && !cached.time.is_empty()
+        {
+            return Ok(cached);
+        }
+
+        let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
+        let cache_validator = self.read_cache_validator(&cache_key);
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let req = Self::apply_cached_etag(
+            self.build_worker_metadata_get(&proxy_url)
+                .await?
+                .header("Accept", "application/json"),
+            cache_validator.as_ref(),
+        );
+
+        match self.send_package_metadata_request(req).await {
+            Ok(mut response) => {
+                if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                    if let Some(metadata) = self
+                        .cached_metadata_after_304_as::<ReleaseTimeMetadata>(&cache_key)
+                        .await
+                        && metadata.matches_package(name)
+                    {
+                        return finish!(Ok(metadata));
+                    }
+                    response = self
+                        .send_package_metadata_request(
+                            self.build_worker_metadata_get(&proxy_url)
+                                .await?
+                                .header("Accept", "application/json"),
+                        )
+                        .await?;
+                }
+
+                if response.status().is_success() {
+                    let etag = Self::response_etag(&response);
+                    if let Ok(metadata) = parse_capped_metadata::<ReleaseTimeMetadata>(
+                        response,
+                        &format!("get_npm_package_release_times_full (proxy) {name}"),
+                    )
+                    .await
+                    {
+                        let metadata = Self::validate_release_time_metadata(name, metadata)?;
+                        if !metadata.time.is_empty() {
+                            self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+                            return finish!(Ok(metadata));
+                        }
+                    }
+                }
+            }
+            Err(LpmError::NotFound(_)) => {}
+            Err(error) if Self::npm_proxy_can_fallback_to_direct(&error) => {}
+            Err(error) => return finish!(Err(error)),
+        }
+
+        crate::timing::record_rpc(rpc_start.elapsed());
+        self.get_npm_release_times_direct_full_inner(name, false)
+            .await
+    }
+
+    async fn get_npm_release_times_direct_full_inner(
+        &self,
+        name: &str,
+        use_cache: bool,
+    ) -> Result<ReleaseTimeMetadata, LpmError> {
+        let cache_key = format!("npm-release-times:{name}");
+        if use_cache {
+            if let Some((cached, _etag)) = self
+                .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
+                .await
+                && cached.matches_package(name)
+            {
+                return Ok(cached);
+            }
+            let full_cache_key = format!("npm-full:{name}");
+            if let Some((cached, _etag)) = self
+                .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&full_cache_key)
+                .await
+                && cached.matches_package(name)
+                && !cached.time.is_empty()
+            {
+                return Ok(cached);
+            }
+        }
+
+        let cache_validator = use_cache
+            .then(|| self.read_cache_validator(&cache_key))
+            .flatten();
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let npm_url = format!("{}/{}", self.npm_registry_url, name);
+        let req = self
+            .http
+            .for_url(&npm_url)
+            .await?
+            .get(&npm_url)
+            .header("Accept", "application/json");
+        let req = Self::apply_cached_etag(req, cache_validator.as_ref());
+        let mut response = match self.send_package_metadata_request(req).await {
+            Ok(response) => response,
+            Err(err) => return finish!(Err(err)),
+        };
+        if use_cache && response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if let Some(metadata) = self
+                .cached_metadata_after_304_as::<ReleaseTimeMetadata>(&cache_key)
+                .await
+                && metadata.matches_package(name)
+            {
+                return finish!(Ok(metadata));
+            }
+            response = match self
+                .send_package_metadata_request(
+                    self.http
+                        .for_url(&npm_url)
+                        .await?
+                        .get(&npm_url)
+                        .header("Accept", "application/json"),
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => return finish!(Err(err)),
+            };
+        }
+        let etag = Self::response_etag(&response);
+        let metadata = match parse_capped_metadata::<ReleaseTimeMetadata>(
+            response,
+            &format!("get_npm_release_times_direct_full {name}"),
+        )
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(err) => return finish!(Err(err)),
+        };
+        let metadata = match Self::validate_release_time_metadata(name, metadata) {
+            Ok(metadata) => metadata,
+            Err(err) => return finish!(Err(err)),
+        };
+        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        finish!(Ok(metadata))
+    }
+
+    pub async fn get_npm_release_times_from_full(
+        &self,
+        base_url: &str,
+        name: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<ReleaseTimeMetadata, LpmError> {
+        let url = format!("{base_url}/{name}");
+        let dest_origin = crate::npmrc::OriginKey::from_request_url(&url).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "invalid registry URL '{url}' — must be http(s) with a host"
+            ))
+        })?;
+        let _ = &dest_origin;
+        let cache_key = format!(
+            "npm-release-times:{}:{url}",
+            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+        );
+
+        if let Some((cached, _etag)) = self
+            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
+            .await
+            && cached.matches_package(name)
+        {
+            return Ok(cached);
+        }
+        let full_cache_key = format!(
+            "npm-full:{}:{url}",
+            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+        );
+        if let Some((cached, _etag)) = self
+            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&full_cache_key)
+            .await
+            && cached.matches_package(name)
+            && !cached.time.is_empty()
+        {
+            return Ok(cached);
+        }
+
+        let cache_validator = self.read_cache_validator(&cache_key);
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let req = self
+            .http
+            .for_url(&url)
+            .await?
+            .get(&url)
+            .header("Accept", "application/json");
+        let req = apply_npmrc_auth(req, &url, auth)?;
+        let req = Self::apply_cached_etag(req, cache_validator.as_ref());
+        let mut response = match self.send_package_metadata_request(req).await {
+            Ok(response) => response,
+            Err(err) => return finish!(Err(err)),
+        };
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if let Some(metadata) = self
+                .cached_metadata_after_304_as::<ReleaseTimeMetadata>(&cache_key)
+                .await
+                && metadata.matches_package(name)
+            {
+                return finish!(Ok(metadata));
+            }
+            let req = self
+                .http
+                .for_url(&url)
+                .await?
+                .get(&url)
+                .header("Accept", "application/json");
+            let req = apply_npmrc_auth(req, &url, auth)?;
+            response = match self.send_package_metadata_request(req).await {
+                Ok(response) => response,
+                Err(err) => return finish!(Err(err)),
+            };
+        }
+        let etag = Self::response_etag(&response);
+        let metadata = match parse_capped_metadata::<ReleaseTimeMetadata>(
+            response,
+            &format!("get_npm_release_times_from_full {name} @ {base_url}"),
+        )
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(err) => return finish!(Err(err)),
+        };
+        let metadata = match Self::validate_release_time_metadata(name, metadata) {
+            Ok(metadata) => metadata,
+            Err(err) => return finish!(Err(err)),
+        };
+        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        finish!(Ok(metadata))
     }
 
     /// Fetch only the fields required for install-time blocked-set metadata

@@ -368,10 +368,10 @@ impl RegistryClient {
     /// `spawn_blocking` pool so it never stalls a runtime worker. Falls
     /// back to in-place sync write when no tokio runtime is available
     /// (unit tests).
-    pub(super) fn write_metadata_cache(
+    pub(super) fn write_metadata_cache<T: serde::Serialize + ?Sized>(
         &self,
         key: &str,
-        metadata: &PackageMetadata,
+        metadata: &T,
         etag: Option<&str>,
     ) {
         let Some(path) = self.cache_path(key) else {

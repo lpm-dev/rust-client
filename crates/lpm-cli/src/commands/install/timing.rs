@@ -158,6 +158,10 @@ pub(super) const DEFAULT_FUSION_SPECULATION_PERMITS: usize = DEFAULT_MAX_CONCURR
 pub(super) const ENV_FUSION_SPECULATION_PERMITS: &str = "LPM_FUSION_SPECULATION_PERMITS";
 pub(super) const ENV_VERIFY_REGISTRY_SIGNATURES: &str = "LPM_VERIFY_REGISTRY_SIGNATURES";
 
+pub(super) fn default_fusion_npm_fanout_for_policy(_minimum_release_age_secs: u64) -> usize {
+    DEFAULT_FUSION_NPM_FANOUT
+}
+
 pub(super) fn parse_positive_usize_or_default(value: &str, default: usize) -> usize {
     value
         .parse::<usize>()
@@ -277,5 +281,26 @@ impl GateStats {
             "stale_recovery_count":   self.stale_recovery.load(Ordering::Relaxed),
             "stale_hard_fail_count":  self.stale_hard_fail.load(Ordering::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_fusion_npm_fanout_for_policy_keeps_abbreviated_fast_path_wide() {
+        assert_eq!(
+            default_fusion_npm_fanout_for_policy(0),
+            DEFAULT_FUSION_NPM_FANOUT
+        );
+    }
+
+    #[test]
+    fn default_fusion_npm_fanout_for_policy_keeps_release_age_fast_path_wide() {
+        assert_eq!(
+            default_fusion_npm_fanout_for_policy(86_400),
+            DEFAULT_FUSION_NPM_FANOUT
+        );
     }
 }

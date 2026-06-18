@@ -6,9 +6,16 @@ use super::peer::*;
 use super::policy::*;
 use super::prelude::*;
 use super::state::*;
+use super::tree_policy::{
+    TreeManifestProvider, TreeStatusCache, preferred_tree_compatible_version,
+};
 use super::types::*;
 use super::version::*;
 use crate::provider::{CachedDistInfo, CachedPackageInfo};
+use std::cell::Cell;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 /// Build a minimal npm-packument JSON shape for wiremock-based
 /// resolver tests. Mirrors `walker::tests::metadata_json` so the
@@ -205,6 +212,96 @@ fn find_best_version_release_age_exclude_allows_latest_for_canonical_package() {
     );
 }
 
+struct CountingTreeProvider {
+    manifests: AHashMap<CanonicalKey, Arc<CachedPackageInfo>>,
+    ensure_calls: Cell<usize>,
+}
+
+impl TreeManifestProvider for CountingTreeProvider {
+    fn ensure_manifest<'a>(
+        &'a self,
+        canonical: &'a CanonicalKey,
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + 'a>> {
+        self.ensure_calls.set(self.ensure_calls.get() + 1);
+        let result = self
+            .manifests
+            .get(canonical)
+            .cloned()
+            .ok_or_else(|| ResolveError::Internal(format!("missing manifest for {canonical}")));
+        Box::pin(async move { result })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preferred_tree_compatible_version_reuses_cached_subtree_status() {
+    let parent = CanonicalKey::npm("parent");
+    let child = CanonicalKey::npm("child");
+    let parent_info = mk_info(&["1.0.0"], &[("child", "^1.0.0")]);
+    let child_info = Arc::new(mk_info(&["1.0.0"], &[]));
+    let edge = Edge {
+        parent: 0,
+        local_name: "parent".to_string(),
+        canonical: parent.clone(),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+    let provider = CountingTreeProvider {
+        manifests: AHashMap::from_iter([(child, child_info)]),
+        ensure_calls: Cell::new(0),
+    };
+    let cache = TreeStatusCache::default();
+
+    let first =
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+    let second =
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+
+    assert_eq!(first, Some(NpmVersion::parse("1.0.0").unwrap()));
+    assert_eq!(second, Some(NpmVersion::parse("1.0.0").unwrap()));
+    assert_eq!(provider.ensure_calls.get(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preferred_tree_compatible_version_skips_subtree_walk_for_scoped_release_age() {
+    let parent = CanonicalKey::npm("parent");
+    let child = CanonicalKey::npm("child");
+    let parent_info = mk_info(&["1.0.0"], &[("child", "^1.0.0")]);
+    let child_info = Arc::new(mk_info(&["1.0.0"], &[]));
+    let edge = Edge {
+        parent: 0,
+        local_name: "parent".to_string(),
+        canonical: parent.clone(),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    let policy = ResolverPolicy::with_cutoff_unix_and_release_age_packages(
+        86_400,
+        1_735_776_000,
+        Default::default(),
+        [parent],
+    );
+    let provider = CountingTreeProvider {
+        manifests: AHashMap::from_iter([(child, child_info)]),
+        ensure_calls: Cell::new(0),
+    };
+    let cache = TreeStatusCache::default();
+
+    let preferred =
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+
+    assert!(preferred.is_none());
+    assert_eq!(provider.ensure_calls.get(), 0);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn fetch_metadata_refetches_full_packument_when_release_age_needs_publish_time() {
     use wiremock::matchers::{header, method, path};
@@ -275,6 +372,200 @@ async fn fetch_metadata_refetches_full_packument_when_release_age_needs_publish_
         .await
         .expect("policy fetch should escalate to full metadata");
 
+    assert_eq!(
+        fetched
+            .info
+            .dist
+            .get("1.0.0")
+            .and_then(|dist| dist.published_at.as_deref()),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_metadata_skips_release_times_when_package_modified_before_cutoff() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("cache temp dir");
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()));
+
+    let abbreviated = serde_json::json!({
+        "name": "old-release-age-fixture",
+        "modified": "2025-01-01T00:00:00.000Z",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "old-release-age-fixture",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/old-release-age-fixture.tgz",
+                    "integrity": "sha512-release-age"
+                },
+                "dependencies": {}
+            }
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/old-release-age-fixture"))
+        .and(header("Accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(abbreviated))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/old-release-age-fixture"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+    let canonical = CanonicalKey::npm("old-release-age-fixture");
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+
+    let fetched = fetch_metadata_for_resolver(&client, &route_table, &canonical, &policy, false)
+        .await
+        .expect("old modified timestamp should satisfy release-age without full metadata");
+
+    assert_eq!(
+        fetched
+            .info
+            .dist
+            .get("1.0.0")
+            .and_then(|dist| dist.published_at.as_deref()),
+        None
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_metadata_skips_release_times_for_unlisted_release_age_package_scope() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("cache temp dir");
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()));
+
+    let abbreviated = serde_json::json!({
+        "name": "transitive-release-age-fixture",
+        "modified": "2025-01-03T00:00:00.000Z",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "transitive-release-age-fixture",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/transitive-release-age-fixture.tgz",
+                    "integrity": "sha512-release-age"
+                },
+                "dependencies": {}
+            }
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/transitive-release-age-fixture"))
+        .and(header("Accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(abbreviated))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/transitive-release-age-fixture"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+    let canonical = CanonicalKey::npm("transitive-release-age-fixture");
+    let policy = ResolverPolicy::with_cutoff_unix_and_release_age_packages(
+        86_400,
+        1_735_776_000,
+        Default::default(),
+        [CanonicalKey::npm("direct-release-age-fixture")],
+    );
+
+    fetch_metadata_for_resolver(&client, &route_table, &canonical, &policy, false)
+        .await
+        .expect("unlisted transitive package should not fetch release-time metadata");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fetch_metadata_merges_release_times_without_rehydrating_versions() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("cache temp dir");
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()));
+
+    let abbreviated = serde_json::json!({
+        "name": "release-time-merge-fixture",
+        "modified": "2025-01-03T00:00:00.000Z",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "release-time-merge-fixture",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/release-time-merge-fixture.tgz",
+                    "integrity": "sha512-release-time"
+                },
+                "dependencies": { "child": "^2.0.0" }
+            }
+        }
+    });
+    let release_times_only = serde_json::json!({
+        "name": "release-time-merge-fixture",
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/release-time-merge-fixture"))
+        .and(header("Accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(abbreviated))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/release-time-merge-fixture"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(release_times_only))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+    let canonical = CanonicalKey::npm("release-time-merge-fixture");
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+
+    let fetched = fetch_metadata_for_resolver(&client, &route_table, &canonical, &policy, false)
+        .await
+        .expect("policy fetch should merge release times into abbreviated metadata");
+
+    assert_eq!(
+        fetched
+            .info
+            .deps
+            .get("1.0.0")
+            .and_then(|deps| deps.get("child"))
+            .map(String::as_str),
+        Some("^2.0.0")
+    );
     assert_eq!(
         fetched
             .info

@@ -176,6 +176,46 @@ fn fake_pkg(name: &str, version: &str, is_direct: bool) -> InstallPackage {
     }
 }
 
+#[test]
+fn publish_ages_from_resolved_metadata_uses_registry_published_at() {
+    let mut old = fake_pkg("old-pkg", "1.0.0", false);
+    old.registry_published_at = Some("2020-01-01T00:00:00Z".to_string());
+    let mut invalid = fake_pkg("invalid-pkg", "1.0.0", false);
+    invalid.registry_published_at = Some("not-a-date".to_string());
+    let missing = fake_pkg("missing-pkg", "1.0.0", false);
+
+    let ages = publish_ages_from_resolved_metadata(&[old, invalid, missing]);
+
+    assert_eq!(ages.len(), 1);
+    assert!(ages.contains_key(&("old-pkg".to_string(), "1.0.0".to_string())));
+}
+
+#[test]
+fn direct_release_age_canonicals_use_alias_targets() {
+    let deps = HashMap::from_iter([
+        ("plain".to_string(), "^1.0.0".to_string()),
+        (
+            "alias-local".to_string(),
+            "npm:@scope/real@^2.0.0".to_string(),
+        ),
+        (
+            "lpm".to_string(),
+            "npm:@lpm.dev/acme.widget@^3.0.0".to_string(),
+        ),
+    ]);
+
+    let canonicals = direct_release_age_canonicals(&deps);
+
+    assert_eq!(
+        canonicals,
+        vec![
+            CanonicalKey::lpm("acme", "widget"),
+            CanonicalKey::npm("@scope/real"),
+            CanonicalKey::npm("plain"),
+        ]
+    );
+}
+
 /// Helper: real on-disk workspace fixture so resolve_install_targets can
 /// actually discover it.
 fn write_workspace_for_install_tests(root: &Path, members: &[(&str, &str)]) {

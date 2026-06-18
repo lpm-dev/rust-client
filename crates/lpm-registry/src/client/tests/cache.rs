@@ -545,6 +545,117 @@ async fn direct_npm_full_metadata_etag_304_revalidation_refreshes_cache() {
 }
 
 #[tokio::test]
+async fn direct_npm_release_times_full_accepts_time_only_metadata_and_caches_it() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "express";
+    let release_times = serde_json::json!({
+        "name": npm_name,
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(release_times))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fetched = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .expect("release-time fetch should accept a time-only response");
+    assert_eq!(
+        fetched.time.get("1.0.0").map(String::as_str),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let cached = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .expect("fresh release-time cache should avoid the network");
+    assert_eq!(
+        cached.time.get("1.0.0").map(String::as_str),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}
+
+#[tokio::test]
+async fn direct_npm_release_times_etag_304_revalidation_refreshes_cache() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "express";
+    let release_times = serde_json::json!({
+        "name": npm_name,
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(release_times)
+                .append_header("ETag", "\"release-times-v1\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .unwrap();
+    expire_cache_entry(&client, &format!("npm-release-times:{npm_name}"));
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/express"))
+        .and(header("If-None-Match", "\"release-times-v1\""))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let revalidated = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::NpmDirect)
+        .await
+        .unwrap();
+    assert_eq!(
+        revalidated.time.get("1.0.0").map(String::as_str),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+    assert!(
+        client
+            .read_metadata_cache_as::<ReleaseTimeMetadata>(&format!("npm-release-times:{npm_name}"))
+            .is_some(),
+        "304 should refresh the release-time cache freshness"
+    );
+}
+
+#[tokio::test]
 async fn direct_npm_full_refetch_ignores_fresh_cache_and_overwrites_it() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

@@ -1321,6 +1321,51 @@ fn direct_fetch_uses_direct_full_when_worker_full_omits_release_time() {
     );
 }
 
+#[test]
+fn release_age_package_scope_skips_unlisted_transitive_metadata_hydration() {
+    let transitive = CanonicalKey::npm("transitive");
+    let direct = CanonicalKey::npm("direct");
+    let info = CachedPackageInfo {
+        modified: Some("2025-01-03T00:00:00.000Z".to_string()),
+        ..make_info(&["1.0.0"], vec![], vec![], vec![])
+    };
+    let policy = ResolverPolicy::with_cutoff_unix_and_release_age_packages(
+        86_400,
+        parse_npm_time_unix("2025-01-02T00:00:00.000Z").unwrap(),
+        TrustPolicyMode::Off,
+        [direct.clone()],
+    );
+
+    assert!(!info.needs_release_time_metadata(&transitive, &policy));
+    assert!(info.needs_release_time_metadata(&direct, &policy));
+}
+
+#[test]
+fn release_age_package_scope_allows_unlisted_transitive_version() {
+    let transitive = CanonicalKey::npm("transitive");
+    let direct = CanonicalKey::npm("direct");
+    let mut info = make_info(&["1.0.0"], vec![], vec![], vec![]);
+    info.dist
+        .insert("1.0.0".to_string(), CachedDistInfo::default());
+    info.dist.get_mut("1.0.0").unwrap().published_at = Some("2025-01-03T00:00:00.000Z".to_string());
+    let policy = ResolverPolicy::with_cutoff_unix_and_release_age_packages(
+        86_400,
+        parse_npm_time_unix("2025-01-02T00:00:00.000Z").unwrap(),
+        TrustPolicyMode::Off,
+        [direct],
+    );
+    let version = NpmVersion::parse("1.0.0").unwrap();
+
+    assert!(matches!(
+        release_age_status_for_version(&transitive, &info, &version, &policy),
+        ReleaseTimeStatus::Allowed
+    ));
+    assert!(matches!(
+        release_age_status_for_version(&CanonicalKey::npm("direct"), &info, &version, &policy),
+        ReleaseTimeStatus::TooNew { .. }
+    ));
+}
+
 // ─── Range memoization ───────────────────────────────────────
 //
 // `NpmRange::to_pubgrub_ranges(&available_versions)` is O(N) in the
@@ -1386,6 +1431,75 @@ fn to_pubgrub_ranges_cached_hits_on_repeated_query() {
         2,
         "different raw-range string must key a new entry"
     );
+}
+
+#[test]
+fn available_versions_cached_hits_on_repeated_query() {
+    let pkg = ResolverPackage::npm("lodash");
+    let info = make_info(
+        &["4.17.21", "4.17.20", "4.17.19", "4.16.0", "3.10.1"],
+        vec![],
+        vec![],
+        vec![],
+    );
+
+    let client = Arc::new(RegistryClient::new());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new());
+    provider.insert_and_notify(CanonicalKey::from(&pkg), info);
+
+    let first = provider.available_versions(&pkg);
+    assert_eq!(provider.available_versions_cache.borrow().len(), 1);
+
+    let second = provider.available_versions(&pkg);
+    assert_eq!(first, second);
+    assert_eq!(provider.available_versions_cache.borrow().len(), 1);
+}
+
+#[test]
+fn available_versions_cache_invalidates_when_metadata_is_upgraded() {
+    let pkg = ResolverPackage::npm("age-gated");
+    let mut upgraded = make_info(&["2.0.0", "1.0.0"], vec![], vec![], vec![]);
+    upgraded.dist.insert(
+        "2.0.0".to_string(),
+        CachedDistInfo {
+            published_at: Some("2025-01-03T00:00:00.000Z".to_string()),
+            ..CachedDistInfo::default()
+        },
+    );
+    upgraded.dist.insert(
+        "1.0.0".to_string(),
+        CachedDistInfo {
+            published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
+            ..CachedDistInfo::default()
+        },
+    );
+
+    let client = Arc::new(RegistryClient::new());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+        .with_policy(ResolverPolicy::with_cutoff_unix(
+            86_400,
+            parse_npm_time_unix("2025-01-02T00:00:00.000Z").unwrap(),
+            TrustPolicyMode::Off,
+        ));
+    provider.insert_and_notify(
+        CanonicalKey::from(&pkg),
+        make_info(&["2.0.0", "1.0.0"], vec![], vec![], vec![]),
+    );
+    let before_upgrade = provider.available_versions(&pkg);
+    provider.insert_and_notify(CanonicalKey::from(&pkg), upgraded);
+
+    let after_upgrade = provider.available_versions(&pkg);
+
+    assert_eq!(
+        before_upgrade,
+        vec![
+            NpmVersion::parse("2.0.0").unwrap(),
+            NpmVersion::parse("1.0.0").unwrap()
+        ]
+    );
+    assert_eq!(after_upgrade, vec![NpmVersion::parse("1.0.0").unwrap()]);
 }
 
 #[test]

@@ -164,6 +164,7 @@ pub async fn resolve_greedy_with_options_and_policy(
     // process them (and their children, which may themselves declare
     // peers — caught by the next iteration). Termination: both
     // task_queue and peer_requirements empty after a single pass.
+    let tree_status_cache = super::tree_policy::TreeStatusCache::default();
     loop {
         // Inner: drain task_queue exactly as before.
         while let Some(edge) = state.task_queue.pop_front() {
@@ -186,8 +187,14 @@ pub async fn resolve_greedy_with_options_and_policy(
                     continue;
                 }
             };
-            let preferred =
-                preferred_tree_compatible_version(&edge, &info, &policy, &tree_provider).await;
+            let preferred = preferred_tree_compatible_version(
+                &edge,
+                &info,
+                &policy,
+                &tree_provider,
+                &tree_status_cache,
+            )
+            .await;
             process_edge_with_preferred(&edge, &info, preferred, &mut state)?;
         }
 

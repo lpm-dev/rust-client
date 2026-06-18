@@ -28,6 +28,7 @@
 #   BENCH_ARMS=all     ./bench/scripts/run-readme.sh 20 readme
 #   BENCH_ARMS=npm,pnpm,bun,lpm,lpm-proxy-h3 ./bench/scripts/run-readme.sh 5 proxy-h3
 #   BENCH_INCLUDE_RESET_EACH_ITER=1 ./bench/scripts/run-readme.sh 5 reset-check
+#   BENCH_LPM_SECURITY_MODE=allow-new ./bench/scripts/run-readme.sh 5 speed-compare
 
 set -euo pipefail
 
@@ -45,6 +46,19 @@ BUN_CACHE_DIR="${BENCH_BUN_CACHE_DIR:-$HOME/.bun/install/cache}"
 NPM_CACHE_DIR="${BENCH_NPM_CACHE_DIR:-$HOME/.npm}"
 BENCH_ARMS_RAW="${BENCH_ARMS:-all}"
 BENCH_ARMS_CSV="$(printf '%s' "$BENCH_ARMS_RAW" | tr -d '[:space:]')"
+BENCH_LPM_SECURITY_MODE="${BENCH_LPM_SECURITY_MODE:-default}"
+LPM_INSTALL_SECURITY_ARG=""
+case "$BENCH_LPM_SECURITY_MODE" in
+    default|secure) BENCH_LPM_SECURITY_LABEL="default minimumReleaseAge";;
+    allow-new|cooldown-bypass)
+        BENCH_LPM_SECURITY_LABEL="--allow-new cooldown bypass"
+        LPM_INSTALL_SECURITY_ARG="--allow-new"
+        ;;
+    *)
+        echo "ERROR: BENCH_LPM_SECURITY_MODE must be default or allow-new"
+        exit 1
+        ;;
+esac
 if [[ "$BENCH_ARMS_CSV" == "all" ]]; then
     BENCH_ARMS_CSV="lpm,bun,npm,pnpm"
 fi
@@ -138,11 +152,21 @@ prepare_full_lpm_reset() {
 }
 
 run_lpm_install() {
-    (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" "$BIN" install --json) > /dev/null 2>&1
+    local out="$RESULTS/last-lpm-output.json"
+    if [[ -n "$LPM_INSTALL_SECURITY_ARG" ]]; then
+        (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" "$BIN" install "$LPM_INSTALL_SECURITY_ARG" --json) > "$out"
+    else
+        (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" "$BIN" install --json) > "$out"
+    fi || { cat "$out" >&2; return 1; }
 }
 
 run_lpm_proxy_h3_install() {
-    (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" LPM_NPM_ROUTE=proxy LPM_HTTP=h3-worker "$BIN" install --json) > /dev/null 2>&1
+    local out="$RESULTS/last-lpm-proxy-h3-output.json"
+    if [[ -n "$LPM_INSTALL_SECURITY_ARG" ]]; then
+        (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" LPM_NPM_ROUTE=proxy LPM_HTTP=h3-worker "$BIN" install "$LPM_INSTALL_SECURITY_ARG" --json) > "$out"
+    else
+        (cd "$WORK" && env LPM_HOME="$EFFECTIVE_LPM_HOME" LPM_NPM_ROUTE=proxy LPM_HTTP=h3-worker "$BIN" install --json) > "$out"
+    fi || { cat "$out" >&2; return 1; }
 }
 
 run_bun_install() {
@@ -220,6 +244,7 @@ echo "[bench] readme round-robin — n=${N} per arm, fixture: $(basename "$FIXTU
 echo "[bench] HEAD: $(cd "$(dirname "$0")/../.." && git rev-parse --short HEAD) ($(cd "$(dirname "$0")/../.." && git branch --show-current))"
 echo "[bench] arms: $BENCH_ARMS_CSV"
 echo "[bench] modes: $BENCH_MODES_CSV"
+echo "[bench] lpm security: $BENCH_LPM_SECURITY_LABEL"
 if arm_enabled lpm-proxy-h3; then
     echo "[bench] lpm-proxy-h3: LPM_NPM_ROUTE=proxy LPM_HTTP=h3-worker"
 fi

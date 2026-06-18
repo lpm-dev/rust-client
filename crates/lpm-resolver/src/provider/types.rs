@@ -155,11 +155,16 @@ pub struct CachedPackageInfo {
 }
 
 impl CachedPackageInfo {
-    pub fn needs_policy_metadata(&self, package: &CanonicalKey, policy: &ResolverPolicy) -> bool {
-        if policy.requires_trust_history() && !self.trust_metadata_complete {
-            return true;
-        }
-        if !policy.release_age_active() {
+    pub fn needs_trust_metadata(&self, policy: &ResolverPolicy) -> bool {
+        policy.requires_trust_history() && !self.trust_metadata_complete
+    }
+
+    pub fn needs_release_time_metadata(
+        &self,
+        package: &CanonicalKey,
+        policy: &ResolverPolicy,
+    ) -> bool {
+        if !policy.release_age_active() || policy.release_age_excluded(package) {
             return false;
         }
         let missing_version_time = self.versions.iter().any(|version| {
@@ -170,6 +175,10 @@ impl CachedPackageInfo {
         });
         missing_version_time
             && policy.metadata_modified_after_cutoff_for_package(package, self.modified.as_deref())
+    }
+
+    pub fn needs_policy_metadata(&self, package: &CanonicalKey, policy: &ResolverPolicy) -> bool {
+        self.needs_trust_metadata(policy) || self.needs_release_time_metadata(package, policy)
     }
 }
 
@@ -269,5 +278,6 @@ pub struct LpmDependencyProvider {
     /// (e.g. a future per-split platform override) can't accidentally
     /// read stale memoized Ranges from a prior pass.
     pub(super) range_cache: RefCell<HashMap<(ResolverPackage, String), Ranges<NpmVersion>>>,
+    pub(super) available_versions_cache: RefCell<HashMap<ResolverPackage, Vec<NpmVersion>>>,
     pub(super) include_optional_dependencies: bool,
 }
