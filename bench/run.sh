@@ -461,9 +461,9 @@ bench_warm_install() {
 	if [[ -n "$LPM_BIN" ]]; then
 		cd "$work"
 		rm -rf node_modules lpm.lock lpm.lockb
-		$LPM_BIN install --allow-new > /dev/null 2>&1
+		$LPM_BIN install > /dev/null 2>&1
 		rm -rf node_modules
-		ms=$(median_ms "cd $work && rm -rf node_modules && $LPM_BIN install --allow-new")
+		ms=$(median_ms "cd $work && rm -rf node_modules && $LPM_BIN install")
 		label "lpm"; result "${ms}ms"
 	fi
 
@@ -554,7 +554,7 @@ bench_command_only() {
 	cp "$PROJECT_DIR/package.json" "$work/"
 
 	# Prepare fixture — fail closed if setup fails (no || true).
-	(cd "$work" && rm -rf node_modules lpm.lock lpm.lockb && $LPM_BIN install --allow-new >/dev/null 2>&1)
+	(cd "$work" && rm -rf node_modules lpm.lock lpm.lockb && $LPM_BIN install >/dev/null 2>&1)
 
 	# Up-to-date: everything in place, binary does the hash check and exits.
 	local ms
@@ -571,7 +571,7 @@ bench_command_only() {
 	for i in $(seq 1 $RUNS); do
 		rm -rf "$work/node_modules"
 		local start=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
-		(cd "$work" && $LPM_BIN install --allow-new) > /dev/null 2>&1
+		(cd "$work" && $LPM_BIN install) > /dev/null 2>&1
 		local end=$(($(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))') / 1000000))
 		times+=($((end - start)))
 	done
@@ -688,7 +688,7 @@ JSEOF
 lpm_timing_capture() {
 	local work="$1"
 	local out
-	out=$(cd "$work" && $LPM_BIN install --allow-new --json 2>/dev/null) || return 1
+	out=$(cd "$work" && $LPM_BIN install --json 2>/dev/null) || return 1
 	# Use python for portable JSON parsing — jq isn't guaranteed to be installed.
 	# `printf '%s'` avoids echo's backslash and leading-dash quirks.
 	printf '%s' "$out" | python3 -c '
@@ -776,7 +776,7 @@ bench_lpm_per_stage() {
 
 	# --- Warm: keep store + lockfile, wipe node_modules ---
 	# Generate a lockfile first (one-time, not measured)
-	(cd "$work" && rm -rf node_modules lpm.lock lpm.lockb && $LPM_BIN install --allow-new >/dev/null 2>&1) || true
+	(cd "$work" && rm -rf node_modules lpm.lock lpm.lockb && $LPM_BIN install >/dev/null 2>&1) || true
 	timings=$(lpm_timing_median "$work" "cd $work && rm -rf node_modules")
 	if [[ -n "$timings" ]]; then
 		read -r r f l t <<< "$timings"
