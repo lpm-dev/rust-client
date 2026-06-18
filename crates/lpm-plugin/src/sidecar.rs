@@ -109,10 +109,13 @@ pub struct WindowsBinarySnapshot {
 impl BinarySnapshot {
     fn from_path(path: &Path) -> std::io::Result<Option<Self>> {
         let metadata = std::fs::metadata(path)?;
-        Self::from_metadata(&metadata)
+        Self::from_metadata_and_path(&metadata, Some(path))
     }
 
-    fn from_metadata(metadata: &std::fs::Metadata) -> std::io::Result<Option<Self>> {
+    fn from_metadata_and_path(
+        metadata: &std::fs::Metadata,
+        _path: Option<&Path>,
+    ) -> std::io::Result<Option<Self>> {
         let modified = metadata.modified()?;
         let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
             return Ok(None);
@@ -130,7 +133,7 @@ impl BinarySnapshot {
         let windows = {
             #[cfg(windows)]
             {
-                Some(windows_snapshot(metadata))
+                Some(windows_snapshot(metadata, _path))
             }
             #[cfg(not(windows))]
             {
@@ -146,8 +149,8 @@ impl BinarySnapshot {
         }))
     }
 
-    fn matches_metadata(self, metadata: &std::fs::Metadata) -> bool {
-        Self::from_metadata(metadata)
+    fn matches_path(self, path: &Path) -> bool {
+        Self::from_path(path)
             .ok()
             .flatten()
             .is_some_and(|current| current == self)
@@ -170,17 +173,80 @@ fn unix_snapshot(metadata: &std::fs::Metadata) -> UnixBinarySnapshot {
 }
 
 #[cfg(windows)]
-fn windows_snapshot(metadata: &std::fs::Metadata) -> WindowsBinarySnapshot {
+fn windows_snapshot(metadata: &std::fs::Metadata, path: Option<&Path>) -> WindowsBinarySnapshot {
     use std::os::windows::fs::MetadataExt;
 
+    let path_snapshot = path.and_then(windows_path_snapshot);
     WindowsBinarySnapshot {
         file_attributes: metadata.file_attributes(),
         creation_time: metadata.creation_time(),
-        change_time: metadata.change_time(),
+        change_time: path_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.change_time)
+            .unwrap_or(0),
         last_write_time: metadata.last_write_time(),
-        volume_serial_number: metadata.volume_serial_number(),
-        file_index: metadata.file_index(),
+        volume_serial_number: path_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.volume_serial_number),
+        file_index: path_snapshot.and_then(|snapshot| snapshot.file_index),
     }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct WindowsPathSnapshot {
+    change_time: Option<u64>,
+    volume_serial_number: Option<u32>,
+    file_index: Option<u64>,
+}
+
+#[cfg(windows)]
+fn windows_path_snapshot(path: &Path) -> Option<WindowsPathSnapshot> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx,
+    };
+
+    let file = std::fs::File::open(path).ok()?;
+    let handle = file.as_raw_handle();
+
+    let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` comes from an open `File`, and `handle_info` points to
+    // writable storage of the exact Win32 struct size expected by the API.
+    let handle_info = if unsafe { GetFileInformationByHandle(handle, &mut handle_info) } != 0 {
+        Some(handle_info)
+    } else {
+        None
+    };
+
+    let mut basic_info = FILE_BASIC_INFO::default();
+    // SAFETY: `handle` comes from an open `File`, and `basic_info` points to
+    // writable storage for the `FileBasicInfo` query result.
+    let basic_info = if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            &mut basic_info as *mut _ as *mut _,
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } != 0
+    {
+        Some(basic_info)
+    } else {
+        None
+    };
+
+    if handle_info.is_none() && basic_info.is_none() {
+        return None;
+    }
+
+    Some(WindowsPathSnapshot {
+        change_time: basic_info.and_then(|info| u64::try_from(info.ChangeTime).ok()),
+        volume_serial_number: handle_info.map(|info| info.dwVolumeSerialNumber),
+        file_index: handle_info
+            .map(|info| ((u64::from(info.nFileIndexHigh)) << 32) | u64::from(info.nFileIndexLow)),
+    })
 }
 
 impl Sidecar {
@@ -300,13 +366,13 @@ pub fn validate_for_reuse(
         return ReuseDecision::Miss(MissReason::UnverifiedOverrideRequired);
     }
 
-    let metadata = match std::fs::metadata(binary_path) {
-        Ok(metadata) if metadata.is_file() => metadata,
+    match std::fs::metadata(binary_path) {
+        Ok(metadata) if metadata.is_file() => {}
         _ => return ReuseDecision::Miss(MissReason::BinaryMissing),
     };
 
     if let Some(snapshot) = sidecar.binary_snapshot
-        && snapshot.matches_metadata(&metadata)
+        && snapshot.matches_path(binary_path)
     {
         warn_if_unverified_override(&sidecar, sidecar_path, unverified_override);
         return ReuseDecision::Hit;
@@ -323,7 +389,7 @@ pub fn validate_for_reuse(
         });
     }
 
-    if let Ok(Some(snapshot)) = BinarySnapshot::from_metadata(&metadata)
+    if let Ok(Some(snapshot)) = BinarySnapshot::from_path(binary_path)
         && sidecar.binary_snapshot != Some(snapshot)
     {
         sidecar.binary_snapshot = Some(snapshot);

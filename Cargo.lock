@@ -3385,6 +3385,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "windows-sys 0.60.2",
  "wiremock",
  "zip",
 ]
