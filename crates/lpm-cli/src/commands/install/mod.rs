@@ -78,6 +78,34 @@ pub(crate) struct InstallOmitPolicy {
     pub optional: bool,
 }
 
+fn publish_ages_from_resolved_metadata(
+    packages: &[InstallPackage],
+) -> HashMap<(String, String), u64> {
+    let mut map = HashMap::with_capacity(packages.len());
+    for package in packages {
+        if let Some(age) = lpm_security::publish_age_secs(package.registry_published_at.as_deref())
+        {
+            map.insert((package.name.clone(), package.version.clone()), age);
+        }
+    }
+    map
+}
+
+fn direct_release_age_canonicals(deps: &HashMap<String, String>) -> Vec<CanonicalKey> {
+    let mut canonicals: Vec<CanonicalKey> = deps
+        .iter()
+        .map(|(name, range)| {
+            lpm_resolver::ranges::parse_npm_alias(range).map_or_else(
+                || CanonicalKey::from_dep_name(name),
+                |alias| CanonicalKey::from_dep_name(&alias.target),
+            )
+        })
+        .collect();
+    canonicals.sort_by_key(ToString::to_string);
+    canonicals.dedup();
+    canonicals
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum FrozenLockfileMode {
     #[default]
@@ -872,16 +900,6 @@ async fn run_with_options_under_store_lock(
         _ => lpm_resolver::TrustPolicyMode::Off,
     };
     let minimum_release_age_exclude = release_age_config.minimum_release_age_exclude;
-    let resolver_excludes = minimum_release_age_exclude
-        .iter()
-        .map(|name| lpm_resolver::CanonicalKey::from_dep_name(name));
-    let resolver_policy = lpm_resolver::ResolverPolicy::new_with_release_age_excludes(
-        resolver_min_age_secs,
-        resolver_trust_policy,
-        resolver_excludes,
-    );
-    let minimum_release_age_exclude: std::collections::HashSet<String> =
-        minimum_release_age_exclude.into_iter().collect();
 
     // Hoisted
     // here (above the empty-deps short-circuit, the lockfile fast
@@ -1281,6 +1299,19 @@ async fn run_with_options_under_store_lock(
         project_dir,
         json_output,
     );
+
+    let resolver_excludes = minimum_release_age_exclude
+        .iter()
+        .map(|name| lpm_resolver::CanonicalKey::from_dep_name(name));
+    let direct_release_age_canonicals = direct_release_age_canonicals(&deps);
+    let resolver_policy = lpm_resolver::ResolverPolicy::new_with_release_age_excludes_and_packages(
+        resolver_min_age_secs,
+        resolver_trust_policy,
+        resolver_excludes,
+        direct_release_age_canonicals,
+    );
+    let minimum_release_age_exclude: std::collections::HashSet<String> =
+        minimum_release_age_exclude.into_iter().collect();
 
     // fully parse and validate the override set
     // up-front (fail-closed). This runs BEFORE the empty-deps
@@ -3333,65 +3364,11 @@ async fn run_with_options_under_store_lock(
         effective_min_age_secs,
     );
 
-    // Option B — build a `(name, version) → publish_age_secs`
-    // map ONCE per install. The map serves both:
-    //
-    // 1. The install-level cooldown halt (existing gate,
-    // gated on `!allow_new && !used_lockfile`).
-    // 2. The L1 classifier's cooldown defense-in-depth for Lever #4
-    // (— refuse to widen `node install.js` + matching
-    // identity when the publish age is below the configured
-    // threshold, even when the install-level cooldown was
-    // bypassed via `--allow-new`).
-    //
-    // Skipped (empty map) when:
-    // - `used_lockfile` — fast-path; no fresh metadata fetched. Lever
-    // #4 will see `publish_age=None` and refuse to widen for
-    // matching-identity shapes (conservative).
-    // - `cooldown_policy.minimum_release_age_secs == 0` — user
-    // globally opted out of cooldown; Lever #4 fires unconditionally
-    // via the `min_age=0` branch in `matches_delegating_identity_green`.
-    //
-    // Metadata fetches go via [`RouteTable`] so custom-registry
-    // packages stay routed; lpm-namespace packages use the lpm-client.
-    // Both paths typically hit the resolver's <5min TTL cache, so the
-    // map build is near-zero cost on fresh-resolution installs.
-    let publish_ages: std::collections::HashMap<(String, String), u64> =
+    let publish_ages: HashMap<(String, String), u64> =
         if !used_lockfile && cooldown_policy.minimum_release_age_secs > 0 {
-            let mut map = std::collections::HashMap::with_capacity(packages.len());
-            for p in &packages {
-                if install_package_is_local_source(p) {
-                    continue;
-                }
-                let publish_time = if p.is_lpm {
-                    match lpm_common::PackageName::parse(&p.name) {
-                        Ok(pkg_name) => arc_client
-                            .get_package_metadata(&pkg_name)
-                            .await
-                            .ok()
-                            .and_then(|meta| meta.time.get(&p.version).cloned()),
-                        Err(_) => None,
-                    }
-                } else {
-                    // follow-up: route via RouteTable so
-                    // custom-registry packages don't leak names to public
-                    // npm and don't pull metadata from the wrong source on
-                    // name collisions. `get_npm_metadata_routed` honors
-                    // the npmrc-driven destination + auth.
-                    let route = route_table.route_for_package(&p.name);
-                    arc_client
-                        .get_npm_metadata_routed(&p.name, route)
-                        .await
-                        .ok()
-                        .and_then(|meta| meta.time.get(&p.version).cloned())
-                };
-                if let Some(age) = lpm_security::publish_age_secs(publish_time.as_deref()) {
-                    map.insert((p.name.clone(), p.version.clone()), age);
-                }
-            }
-            map
+            publish_ages_from_resolved_metadata(&packages)
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
 
     // Enforce minimumReleaseAge: block recently published packages unless --allow-new.
@@ -3400,6 +3377,9 @@ async fn run_with_options_under_store_lock(
     if !allow_new && !used_lockfile && cooldown_policy.minimum_release_age_secs > 0 {
         let mut too_new = Vec::new();
         for p in &packages {
+            if !p.is_direct {
+                continue;
+            }
             if minimum_release_age_exclude.contains(&p.name) {
                 continue;
             }

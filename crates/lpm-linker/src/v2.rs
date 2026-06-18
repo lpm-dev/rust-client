@@ -1378,12 +1378,6 @@ struct CompatibilityEntry<'a> {
     key: Arc<GraphKey>,
 }
 
-#[derive(Clone)]
-struct CompatibilitySibling {
-    local: String,
-    key: Arc<GraphKey>,
-}
-
 struct BinLinkSpec {
     cmd_name: String,
     target: PathBuf,
@@ -1502,18 +1496,27 @@ fn collect_project_package_bin_names(
     };
     let package_name =
         package_name_from_manifest(&content).unwrap_or_else(|| fallback_package_name.to_string());
-    bin_names.extend(
-        bin_config
-            .entries(&package_name)
-            .into_iter()
-            .map(|(cmd_name, _)| cmd_name),
-    );
+    if manifest_needs_bin_compatibility(&content) {
+        bin_names.extend(
+            bin_config
+                .entries(&package_name)
+                .into_iter()
+                .map(|(cmd_name, _)| cmd_name),
+        );
+    }
     Some(())
 }
 
 fn package_name_from_manifest(content: &[u8]) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_slice(content).ok()?;
     parsed.get("name")?.as_str().map(str::to_string)
+}
+
+fn manifest_needs_bin_compatibility(content: &[u8]) -> bool {
+    const DEPS_KEY: &[u8] = b"\"dependencies\"";
+    const PEERS_KEY: &[u8] = b"\"peerDependencies\"";
+    content.windows(DEPS_KEY.len()).any(|w| w == DEPS_KEY)
+        || content.windows(PEERS_KEY.len()).any(|w| w == PEERS_KEY)
 }
 
 fn create_project_compatibility_links(
@@ -1532,9 +1535,8 @@ fn create_project_compatibility_links(
         return Ok(CompatibilityLinks::default());
     }
 
-    let project_context = collect_project_direct_compatibility_siblings(targets, key_map);
     let compatibility_root = ensure_project_compatibility_root(project_dir)?;
-    let entries = collect_compatibility_entries(roots, targets, key_map, &project_context)?;
+    let entries = collect_compatibility_entries(roots, targets, key_map)?;
     let desired: HashSet<String> = entries
         .iter()
         .map(|entry| entry.key.dir_name().to_string())
@@ -1553,13 +1555,7 @@ fn create_project_compatibility_links(
     }
 
     for entry in &entries {
-        sync_compatibility_entry_links(
-            &compatibility_root,
-            entry,
-            key_map,
-            &compatibility_links,
-            &project_context,
-        )?;
+        sync_compatibility_entry_links(&compatibility_root, entry, key_map, &compatibility_links)?;
     }
 
     for entry in &entries {
@@ -1591,6 +1587,7 @@ fn collect_compatibility_roots_for_bins<'a>(
     key_map: &KeyMap,
     requested_bins: &[String],
 ) -> Vec<&'a V2Target> {
+    let explicit_request = !requested_bins.is_empty();
     let requested: Option<HashSet<&str>> = if requested_bins.is_empty() {
         None
     } else {
@@ -1635,6 +1632,9 @@ fn collect_compatibility_roots_for_bins<'a>(
         if entries.is_empty() {
             continue;
         }
+        if !explicit_request && v2t.target.dependencies.is_empty() && v2t.target.peers.is_empty() {
+            continue;
+        }
         match &requested {
             Some(requested) => {
                 if entries
@@ -1654,7 +1654,6 @@ fn collect_compatibility_entries<'a>(
     roots: Vec<&'a V2Target>,
     targets: &'a [V2Target],
     key_map: &KeyMap,
-    project_context: &[CompatibilitySibling],
 ) -> Result<Vec<CompatibilityEntry<'a>>, LpmError> {
     let mut targets_by_key_dir: HashMap<String, &V2Target> = HashMap::with_capacity(targets.len());
     for v2t in targets {
@@ -1664,15 +1663,6 @@ fn collect_compatibility_entries<'a>(
     }
 
     let mut queue: VecDeque<&V2Target> = roots.into();
-    for sibling in project_context {
-        let Some(target) = targets_by_key_dir.get(sibling.key.dir_name()) else {
-            return Err(LpmError::Store(format!(
-                "v2 linker: project compatibility dependency {} for root context is missing from install set",
-                sibling.key.dir_name()
-            )));
-        };
-        queue.push_back(*target);
-    }
     let mut seen: HashSet<String> = HashSet::with_capacity(targets.len());
     let mut entries = Vec::new();
     while let Some(v2t) = queue.pop_front() {
@@ -1700,31 +1690,6 @@ fn collect_compatibility_entries<'a>(
         entries.push(CompatibilityEntry { target: v2t, key });
     }
     Ok(entries)
-}
-
-fn collect_project_direct_compatibility_siblings(
-    targets: &[V2Target],
-    key_map: &KeyMap,
-) -> Vec<CompatibilitySibling> {
-    let mut siblings = Vec::new();
-    let mut seen_local = HashSet::new();
-    for v2t in targets {
-        if !v2t.target.is_direct {
-            continue;
-        }
-        let Some(key) = key_map.get_for(&v2t.target) else {
-            continue;
-        };
-        for local in direct_root_link_names(&v2t.target) {
-            if seen_local.insert(local.clone()) {
-                siblings.push(CompatibilitySibling {
-                    local,
-                    key: key.clone(),
-                });
-            }
-        }
-    }
-    siblings
 }
 
 fn compatibility_dependency_links(
@@ -2006,20 +1971,11 @@ fn sync_compatibility_entry_links(
     entry: &CompatibilityEntry<'_>,
     key_map: &KeyMap,
     compatibility_links: &CompatibilityLinks,
-    project_context: &[CompatibilitySibling],
 ) -> Result<(), LpmError> {
     let node_modules = compatibility_node_modules_dir(compatibility_root, &entry.key);
     let mut links = compatibility_dependency_links(&entry.target.target, key_map)?;
     let own_local = entry.key.name();
     links.retain(|(local, _)| local != own_local);
-    let mut seen_local: HashSet<String> = HashSet::with_capacity(links.len() + 1);
-    seen_local.insert(own_local.to_string());
-    seen_local.extend(links.iter().map(|(local, _)| local.clone()));
-    for sibling in project_context {
-        if seen_local.insert(sibling.local.clone()) {
-            links.push((sibling.local.clone(), sibling.key.clone()));
-        }
-    }
     let mut desired: HashSet<String> = HashSet::with_capacity(links.len() + 1);
     desired.insert(entry.key.name().to_string());
     desired.extend(links.iter().map(|(local, _)| local.clone()));
@@ -2224,30 +2180,6 @@ fn root_link_names(target: &LinkTarget) -> Vec<String> {
                 tracing::warn!(
                     "v2 linker: rejecting unsafe root_link_name {name:?} for {}@{} \
                      — contains path separator, traversal, or null byte",
-                    target.name,
-                    target.version
-                );
-                false
-            }
-        })
-        .collect()
-}
-
-fn direct_root_link_names(target: &LinkTarget) -> Vec<String> {
-    if !target.is_direct {
-        return Vec::new();
-    }
-    let raw: Vec<String> = target
-        .root_link_names
-        .clone()
-        .unwrap_or_else(|| vec![target.name.clone()]);
-    raw.into_iter()
-        .filter(|name| {
-            if is_safe_root_link_name(name) {
-                true
-            } else {
-                tracing::warn!(
-                    "v2 linker: rejecting unsafe direct root_link_name {name:?} for {}@{}",
                     target.name,
                     target.version
                 );
@@ -2867,7 +2799,7 @@ mod tests {
     }
 
     #[test]
-    fn link_packages_v2_compatibility_island_exposes_project_direct_context() {
+    fn link_packages_v2_compatibility_island_prefers_declared_dependency_context() {
         let tmp = tempfile::tempdir().unwrap();
         let store = V2Store::at(tmp.path().join("store"));
         let project = tmp.path().join("project");
@@ -2934,19 +2866,14 @@ mod tests {
             .join("dev-server")
             .canonicalize()
             .expect("dev-server root should resolve");
+        assert!(
+            server_real.starts_with(&compat_root),
+            "dev-server root should resolve inside compat, got {}",
+            server_real.display(),
+        );
         let compat_node_modules = server_real
             .parent()
             .expect("dev-server package dir should live under node_modules");
-
-        let delegated_real = compat_node_modules
-            .join("delegated-cli")
-            .canonicalize()
-            .expect("project direct delegated CLI should resolve inside compat");
-        assert!(
-            delegated_real.starts_with(&compat_root),
-            "delegated CLI should resolve inside compat, got {}",
-            delegated_real.display(),
-        );
 
         let shared_package_json = compat_node_modules.join("shared").join("package.json");
         let shared_manifest =
@@ -2959,13 +2886,13 @@ mod tests {
     }
 
     #[test]
-    fn link_packages_v2_materializes_direct_bins_in_project_compatibility_layout() {
+    fn link_packages_v2_skips_compatibility_for_dependency_free_direct_bin() {
         let tmp = tempfile::tempdir().unwrap();
         let store = V2Store::at(tmp.path().join("store"));
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
 
-        let sri = synthetic_sri(b"v2/unrequested-bin/tool");
+        let sri = synthetic_sri(b"v2/dependency-free-bin/tool");
         write_object(
             &store,
             &sri,
@@ -2988,13 +2915,99 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.bin_linked, 1, "tool's bin shim must be linked");
+        assert!(
+            !project
+                .join("node_modules")
+                .join(".lpm")
+                .join("compat")
+                .exists(),
+            "dependency-free direct bins should not need compatibility islands"
+        );
+        assert!(
+            project
+                .join("node_modules")
+                .join(".bin")
+                .join("tool")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn link_packages_v2_materializes_direct_bin_without_unrelated_direct_deps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let tool_sri = synthetic_sri(b"v2/default-bin/tool");
+        write_object(
+            &store,
+            &tool_sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"tool","version":"1.0.0","bin":{"tool":"bin/tool.js"},"dependencies":{"helper":"1.0.0"}}"#,
+                ),
+                ("bin/tool.js", b"#!/usr/bin/env node\n"),
+            ],
+        );
+        let helper_sri = synthetic_sri(b"v2/default-bin/helper");
+        write_object(
+            &store,
+            &helper_sri,
+            &[("package.json", br#"{"name":"helper","version":"1.0.0"}"#)],
+        );
+        let library_sri = synthetic_sri(b"v2/default-bin/library");
+        write_object(
+            &store,
+            &library_sri,
+            &[("package.json", br#"{"name":"library","version":"1.0.0"}"#)],
+        );
+
+        let mut tool = target("tool", "1.0.0", &tool_sri, true);
+        tool.target.dependencies = vec![LinkDependency::registry("helper", "1.0.0")];
+
+        let result = link_packages_v2(
+            &project,
+            vec![
+                tool,
+                target("helper", "1.0.0", &helper_sri, false),
+                target("library", "1.0.0", &library_sri, true),
+            ],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.bin_linked, 1, "tool's bin shim must still be linked");
         let compat_root = project
             .join("node_modules")
             .join(".lpm")
             .join("compat")
             .canonicalize()
             .expect("direct bin should create project compatibility layout");
-        assert!(compat_root.is_dir());
+        let copied_unrelated_library =
+            std::fs::read_dir(&compat_root)
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("library@1.0.0+"))
+                });
+        assert!(
+            !copied_unrelated_library,
+            "unrelated direct packages must not be blindly copied into compatibility islands"
+        );
+        assert!(
+            project
+                .join("node_modules")
+                .join(".bin")
+                .join("tool")
+                .exists()
+        );
         #[cfg(unix)]
         {
             let shim = project.join("node_modules").join(".bin").join("tool");
@@ -3008,6 +3021,62 @@ mod tests {
             assert!(
                 shim_real.starts_with(&compat_root),
                 "direct bin shim should execute the project compatibility copy, got {}",
+                shim_real.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn link_packages_v2_with_requested_bin_materializes_project_compatibility_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let sri = synthetic_sri(b"v2/unrequested-bin/tool");
+        write_object(
+            &store,
+            &sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"tool","version":"1.0.0","bin":{"tool":"bin/tool.js"}}"#,
+                ),
+                ("bin/tool.js", b"#!/usr/bin/env node\n"),
+            ],
+        );
+
+        let result = link_packages_v2_with_compatibility_bin_names(
+            &project,
+            vec![target("tool", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &["tool".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(result.bin_linked, 1, "tool's bin shim must be linked");
+        let compat_root = project
+            .join("node_modules")
+            .join(".lpm")
+            .join("compat")
+            .canonicalize()
+            .expect("requested direct bin should create project compatibility layout");
+        assert!(compat_root.is_dir());
+        #[cfg(unix)]
+        {
+            let shim = project.join("node_modules").join(".bin").join("tool");
+            let shim_target = std::fs::read_link(&shim).expect("tool shim should be a symlink");
+            let shim_real = shim
+                .parent()
+                .unwrap()
+                .join(shim_target)
+                .canonicalize()
+                .expect("tool shim target should resolve");
+            assert!(
+                shim_real.starts_with(&compat_root),
+                "requested direct bin shim should execute the project compatibility copy, got {}",
                 shim_real.display(),
             );
         }
@@ -3032,7 +3101,25 @@ mod tests {
     }
 
     #[test]
-    fn project_compatibility_bins_ready_rejects_missing_shim_for_direct_bin() {
+    fn project_compatibility_bins_ready_rejects_missing_discovered_direct_bin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let package_dir = project.join("node_modules").join("tool");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            br#"{"name":"tool","version":"1.0.0","bin":{"tool":"bin/tool.js"},"dependencies":{"helper":"1.0.0"}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !project_compatibility_bins_ready(&project, &[]),
+            "discovered direct package bins require a .bin shim into the compatibility layout"
+        );
+    }
+
+    #[test]
+    fn project_compatibility_bins_ready_rejects_missing_requested_shim_for_direct_bin() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
         let package_dir = project.join("node_modules").join("tool");
@@ -3044,8 +3131,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            !project_compatibility_bins_ready(&project, &[]),
-            "a direct package bin requires a .bin shim into the compatibility layout"
+            !project_compatibility_bins_ready(&project, &["tool".to_string()]),
+            "a requested package bin requires a .bin shim into the compatibility layout"
         );
     }
 

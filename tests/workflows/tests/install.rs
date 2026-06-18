@@ -6972,7 +6972,7 @@ async fn install_range_selects_older_version_when_latest_is_inside_release_age_w
 }
 
 #[tokio::test]
-async fn install_selects_older_parent_when_newer_parent_requires_too_fresh_child() {
+async fn install_keeps_newer_parent_when_only_transitive_child_is_inside_release_age_window() {
     let project = TempProject::empty(&format!(
         r#"{{
             "name":"release-age-transitive-fallback",
@@ -6997,7 +6997,7 @@ async fn install_selects_older_parent_when_newer_parent_requires_too_fresh_child
 
     assert!(
         out.status.success(),
-        "install must fall back to the newest parent whose required child tree satisfies minimumReleaseAge; stdout:\n{}\nstderr:\n{}",
+        "install must not downgrade a mature direct parent only because its transitive child is inside minimumReleaseAge; stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
@@ -7006,7 +7006,7 @@ async fn install_selects_older_parent_when_newer_parent_requires_too_fresh_child
     ));
     let parent_manifest: serde_json::Value =
         serde_json::from_str(&installed_parent).expect("installed parent package.json must parse");
-    assert_eq!(parent_manifest["version"], serde_json::json!("1.0.0"));
+    assert_eq!(parent_manifest["version"], serde_json::json!("1.1.0"));
 }
 
 #[tokio::test]
@@ -7068,47 +7068,6 @@ async fn install_min_release_age_exclude_cli_allows_fresh_direct_dependency() {
         String::from_utf8_lossy(&out.stderr),
     );
     assert_cooldown_not_blocked(&out);
-}
-
-#[tokio::test]
-async fn install_min_release_age_exclude_applies_to_transitive_child_only() {
-    let project = TempProject::empty(&format!(
-        r#"{{
-            "name":"release-age-transitive-exclude",
-            "version":"1.0.0",
-            "dependencies":{{"{RELEASE_AGE_PARENT_PKG}":"^1.0.0"}},
-            "lpm":{{
-                "minimumReleaseAge":86400,
-                "minimumReleaseAgeExclude":["{RELEASE_AGE_CHILD_PKG}"]
-            }}
-        }}"#
-    ));
-    let mock = MockRegistry::start().await;
-    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
-    mount_release_age_transitive_fallback_pkgs(&mock).await;
-
-    let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
-        .output()
-        .expect("spawn lpm install");
-
-    assert!(
-        out.status.success(),
-        "child exclude must allow the newer parent tree while keeping parent release-age policy active; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let installed_parent = project.read_file(&format!(
-        "node_modules/{RELEASE_AGE_PARENT_PKG}/package.json"
-    ));
-    let parent_manifest: serde_json::Value =
-        serde_json::from_str(&installed_parent).expect("installed parent package.json must parse");
-    assert_eq!(parent_manifest["version"], serde_json::json!("1.1.0"));
 }
 
 #[tokio::test]

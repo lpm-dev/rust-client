@@ -26,6 +26,7 @@ impl LpmDependencyProvider {
             policy: ResolverPolicy::default(),
             root_aliases: RefCell::new(HashMap::new()),
             range_cache: RefCell::new(HashMap::new()),
+            available_versions_cache: RefCell::new(HashMap::new()),
             include_optional_dependencies: true,
         }
     }
@@ -57,6 +58,7 @@ impl LpmDependencyProvider {
             policy: ResolverPolicy::default(),
             root_aliases: RefCell::new(HashMap::new()),
             range_cache: RefCell::new(HashMap::new()),
+            available_versions_cache: RefCell::new(HashMap::new()),
             include_optional_dependencies: true,
         }
     }

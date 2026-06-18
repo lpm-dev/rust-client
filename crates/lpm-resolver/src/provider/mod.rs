@@ -64,7 +64,7 @@ mod prelude {
     pub(super) use crate::package::{CanonicalKey, ResolverPackage};
     #[allow(unused_imports)]
     pub(super) use crate::policy::{
-        ReleaseTimeStatus, ResolverPolicy, TrustEvidence, parse_npm_time_unix,
+        ReleaseTimeStatus, ResolverPolicy, TrustEvidence, TrustPolicyMode, parse_npm_time_unix,
     };
     #[allow(unused_imports)]
     pub(super) use crate::ranges::NpmRange;

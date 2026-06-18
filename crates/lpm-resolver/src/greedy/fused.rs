@@ -336,6 +336,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
         tarball_dispatched_count: Cell::new(0),
         worker_batch_disabled: &worker_batch_disabled,
     };
+    let tree_status_cache = super::tree_policy::TreeStatusCache::default();
 
     // Loop-local state, owned by this single task. No Arcs needed
     // around `inflight` / `parked` because they never cross task
@@ -463,9 +464,14 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                     &policy,
                 )
                 .await?;
-                let preferred =
-                    preferred_tree_compatible_version(&edge, &info_arc, &policy, &tree_provider)
-                        .await;
+                let preferred = preferred_tree_compatible_version(
+                    &edge,
+                    &info_arc,
+                    &policy,
+                    &tree_provider,
+                    &tree_status_cache,
+                )
+                .await;
                 process_edge_with_preferred(&edge, &info_arc, preferred, &mut state)?;
                 continue;
             }

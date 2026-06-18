@@ -172,6 +172,9 @@ impl LpmDependencyProvider {
     /// and causes spurious wait-loop iterations.
     pub(super) fn insert_and_notify(&self, key: CanonicalKey, info: CachedPackageInfo) {
         self.cache.insert(key.clone(), Arc::new(info));
+        self.available_versions_cache
+            .borrow_mut()
+            .retain(|package, _| CanonicalKey::from(package) != key);
         if let Some(n) = self.notify_map.get(&key) {
             n.notify_waiters();
         }
@@ -185,18 +188,28 @@ impl LpmDependencyProvider {
     pub(super) fn available_versions(&self, package: &ResolverPackage) -> Vec<NpmVersion> {
         let _span = tracing::debug_span!("available_versions", pkg = %package).entered();
         let _prof = crate::profile::available_versions::start();
+        if let Some(cached) = self.available_versions_cache.borrow().get(package) {
+            return cached.clone();
+        }
         let key = CanonicalKey::from(package);
-        self.cache
-            .get(&key)
-            .map(|c| {
-                let info = c.value();
+        let Some(info) = self.cache.get(&key) else {
+            return Vec::new();
+        };
+        let info = info.value();
+        let versions =
+            if !self.policy.release_age_active() && !self.policy.trust_policy().is_no_downgrade() {
+                info.versions.clone()
+            } else {
                 info.versions
                     .iter()
                     .filter(|version| version_allowed_by_policy(&key, info, version, &self.policy))
                     .cloned()
                     .collect()
-            })
-            .unwrap_or_default()
+            };
+        self.available_versions_cache
+            .borrow_mut()
+            .insert(package.clone(), versions.clone());
+        versions
     }
 
     /// Memoized wrapper around [`NpmRange::to_pubgrub_ranges`]. First call

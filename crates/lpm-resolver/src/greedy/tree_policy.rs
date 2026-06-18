@@ -1,5 +1,6 @@
 use super::prelude::*;
 use super::types::Edge;
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -24,16 +25,32 @@ enum TreeStatus {
     Unknown,
 }
 
+#[derive(Default)]
+pub(super) struct TreeStatusCache {
+    entries: RefCell<AHashMap<(CanonicalKey, NpmVersion), TreeStatus>>,
+}
+
+impl TreeStatusCache {
+    fn get(&self, key: &(CanonicalKey, NpmVersion)) -> Option<TreeStatus> {
+        self.entries.borrow().get(key).copied()
+    }
+
+    fn insert(&self, key: (CanonicalKey, NpmVersion), status: TreeStatus) {
+        self.entries.borrow_mut().insert(key, status);
+    }
+}
+
 pub(super) async fn preferred_tree_compatible_version<P>(
     edge: &Edge,
     info: &CachedPackageInfo,
     policy: &ResolverPolicy,
     provider: &P,
+    cache: &TreeStatusCache,
 ) -> Option<NpmVersion>
 where
     P: TreeManifestProvider,
 {
-    if !policy.release_age_active() && !policy.requires_trust_history() {
+    if !policy.release_age_checks_all_packages() && !policy.requires_trust_history() {
         return None;
     }
 
@@ -45,6 +62,7 @@ where
         policy,
         provider,
         &mut visited,
+        cache,
     )
     .await
     {
@@ -66,6 +84,7 @@ fn pick_tree_compatible_version<'a, P>(
     policy: &'a ResolverPolicy,
     provider: &'a P,
     visited: &'a mut AHashSet<(CanonicalKey, NpmVersion)>,
+    cache: &'a TreeStatusCache,
 ) -> Pin<Box<dyn Future<Output = TreePick> + 'a>>
 where
     P: TreeManifestProvider,
@@ -81,7 +100,7 @@ where
                 continue;
             }
             match required_dependency_tree_status(
-                canonical, version, info, policy, provider, visited,
+                canonical, version, info, policy, provider, visited, cache,
             )
             .await
             {
@@ -106,6 +125,7 @@ fn required_dependency_tree_status<'a, P>(
     policy: &'a ResolverPolicy,
     provider: &'a P,
     visited: &'a mut AHashSet<(CanonicalKey, NpmVersion)>,
+    cache: &'a TreeStatusCache,
 ) -> Pin<Box<dyn Future<Output = TreeStatus> + 'a>>
 where
     P: TreeManifestProvider,
@@ -115,10 +135,15 @@ where
         if !visited.insert(visit_key.clone()) {
             return TreeStatus::Compatible;
         }
+        if let Some(status) = cache.get(&visit_key) {
+            visited.remove(&visit_key);
+            return status;
+        }
 
         let version_str = version.to_string();
         let Some(deps) = info.deps.get(&version_str) else {
             visited.remove(&visit_key);
+            cache.insert(visit_key, TreeStatus::Compatible);
             return TreeStatus::Compatible;
         };
         let aliases = info.aliases.get(&version_str);
@@ -165,6 +190,7 @@ where
                 Ok(info) => info,
                 Err(_) => {
                     visited.remove(&visit_key);
+                    cache.insert(visit_key, TreeStatus::Unknown);
                     return TreeStatus::Unknown;
                 }
             };
@@ -175,22 +201,26 @@ where
                 policy,
                 provider,
                 visited,
+                cache,
             )
             .await
             {
                 TreePick::Picked(_) => {}
                 TreePick::Incompatible => {
                     visited.remove(&visit_key);
+                    cache.insert(visit_key, TreeStatus::Incompatible);
                     return TreeStatus::Incompatible;
                 }
                 TreePick::Unknown => {
                     visited.remove(&visit_key);
+                    cache.insert(visit_key, TreeStatus::Unknown);
                     return TreeStatus::Unknown;
                 }
             }
         }
 
         visited.remove(&visit_key);
+        cache.insert(visit_key, TreeStatus::Compatible);
         TreeStatus::Compatible
     })
 }

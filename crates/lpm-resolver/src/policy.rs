@@ -23,6 +23,7 @@ pub struct ResolverPolicy {
     minimum_release_age_secs: u64,
     cutoff_unix: Option<i64>,
     minimum_release_age_exclude: HashSet<CanonicalKey>,
+    minimum_release_age_packages: Option<HashSet<CanonicalKey>>,
     ignore_missing_release_time: bool,
     trust_policy: TrustPolicyMode,
 }
@@ -33,6 +34,7 @@ impl Default for ResolverPolicy {
             minimum_release_age_secs: 0,
             cutoff_unix: None,
             minimum_release_age_exclude: HashSet::new(),
+            minimum_release_age_packages: None,
             ignore_missing_release_time: true,
             trust_policy: TrustPolicyMode::Off,
         }
@@ -53,6 +55,29 @@ impl ResolverPolicy {
         trust_policy: TrustPolicyMode,
         excludes: impl IntoIterator<Item = CanonicalKey>,
     ) -> Self {
+        Self::new_inner(minimum_release_age_secs, trust_policy, excludes, None)
+    }
+
+    pub fn new_with_release_age_excludes_and_packages(
+        minimum_release_age_secs: u64,
+        trust_policy: TrustPolicyMode,
+        excludes: impl IntoIterator<Item = CanonicalKey>,
+        packages: impl IntoIterator<Item = CanonicalKey>,
+    ) -> Self {
+        Self::new_inner(
+            minimum_release_age_secs,
+            trust_policy,
+            excludes,
+            Some(packages.into_iter().collect()),
+        )
+    }
+
+    fn new_inner(
+        minimum_release_age_secs: u64,
+        trust_policy: TrustPolicyMode,
+        excludes: impl IntoIterator<Item = CanonicalKey>,
+        packages: Option<HashSet<CanonicalKey>>,
+    ) -> Self {
         let cutoff_unix = if minimum_release_age_secs == 0 {
             None
         } else {
@@ -64,6 +89,7 @@ impl ResolverPolicy {
             minimum_release_age_secs,
             cutoff_unix,
             minimum_release_age_exclude: excludes.into_iter().collect(),
+            minimum_release_age_packages: packages,
             ignore_missing_release_time: true,
             trust_policy,
         }
@@ -79,6 +105,24 @@ impl ResolverPolicy {
             minimum_release_age_secs,
             cutoff_unix: (minimum_release_age_secs > 0).then_some(cutoff_unix),
             minimum_release_age_exclude: HashSet::new(),
+            minimum_release_age_packages: None,
+            ignore_missing_release_time: true,
+            trust_policy,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_cutoff_unix_and_release_age_packages(
+        minimum_release_age_secs: u64,
+        cutoff_unix: i64,
+        trust_policy: TrustPolicyMode,
+        packages: impl IntoIterator<Item = CanonicalKey>,
+    ) -> Self {
+        Self {
+            minimum_release_age_secs,
+            cutoff_unix: (minimum_release_age_secs > 0).then_some(cutoff_unix),
+            minimum_release_age_exclude: HashSet::new(),
+            minimum_release_age_packages: Some(packages.into_iter().collect()),
             ignore_missing_release_time: true,
             trust_policy,
         }
@@ -95,6 +139,7 @@ impl ResolverPolicy {
             minimum_release_age_secs,
             cutoff_unix: (minimum_release_age_secs > 0).then_some(cutoff_unix),
             minimum_release_age_exclude: excludes.into_iter().collect(),
+            minimum_release_age_packages: None,
             ignore_missing_release_time: true,
             trust_policy,
         }
@@ -116,6 +161,21 @@ impl ResolverPolicy {
     }
 
     #[inline]
+    pub fn release_age_applies_to_package(&self, package: &CanonicalKey) -> bool {
+        self.cutoff_unix.is_some()
+            && !self.release_age_excluded(package)
+            && self
+                .minimum_release_age_packages
+                .as_ref()
+                .is_none_or(|packages| packages.contains(package))
+    }
+
+    #[inline]
+    pub fn release_age_checks_all_packages(&self) -> bool {
+        self.cutoff_unix.is_some() && self.minimum_release_age_packages.is_none()
+    }
+
+    #[inline]
     pub fn trust_policy(&self) -> TrustPolicyMode {
         self.trust_policy
     }
@@ -134,7 +194,7 @@ impl ResolverPolicy {
         package: &CanonicalKey,
         published_at: Option<&str>,
     ) -> ReleaseTimeStatus {
-        if self.release_age_excluded(package) {
+        if !self.release_age_applies_to_package(package) {
             return ReleaseTimeStatus::Allowed;
         }
         self.release_time_status_inner(published_at)
@@ -172,7 +232,7 @@ impl ResolverPolicy {
         package: &CanonicalKey,
         modified: Option<&str>,
     ) -> bool {
-        if self.release_age_excluded(package) {
+        if !self.release_age_applies_to_package(package) {
             return false;
         }
         self.metadata_modified_after_cutoff(modified)
