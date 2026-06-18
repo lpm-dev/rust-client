@@ -38,6 +38,7 @@ pub(crate) fn merge_release_times_into_cache_info(
             && let Some(published_at) = release_times.time.get(version)
         {
             dist.published_at = Some(published_at.clone());
+            dist.published_at_unix = parse_npm_time_unix(published_at);
         }
     }
 }
@@ -216,6 +217,10 @@ fn parse_metadata_to_cache_info_inner(
                         .and_then(|dist| dist.signatures.clone())
                         .unwrap_or_default(),
                     published_at: metadata.time.get(ver_str).cloned(),
+                    published_at_unix: metadata
+                        .time
+                        .get(ver_str)
+                        .and_then(|published_at| parse_npm_time_unix(published_at)),
                     trust_evidence: detect_trust_evidence(ver_meta),
                 },
             );
@@ -229,6 +234,7 @@ fn parse_metadata_to_cache_info_inner(
 
     CachedPackageInfo {
         modified: metadata.modified.clone(),
+        modified_unix: metadata.modified.as_deref().and_then(parse_npm_time_unix),
         trust_metadata_complete,
         versions,
         deps,

@@ -44,9 +44,12 @@ pub(super) fn managed_policy_blocks_scope(
             if matches!(
                 effective.sources.minimum_release_age_secs,
                 PostureSourceKind::ManagedPolicy
+            ) || matches!(
+                effective.sources.release_age_policy,
+                PostureSourceKind::ManagedPolicy
             ) =>
         {
-            Some("minimum-release-age-secs")
+            Some("minimum-release-age")
         }
         ApprovalScope::SandboxDefault | ApprovalScope::SandboxNone
             if matches!(
@@ -461,6 +464,61 @@ pub fn authorize_persistent_release_age(
         }
     }
     posture.minimum_release_age_secs = requested_secs;
+    persist_authorized_posture(&posture)
+}
+
+pub fn authorize_persistent_release_age_policy(
+    requested: ReleaseAgePolicy,
+    json_output: bool,
+    command_hint: &str,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let current = effective.posture.release_age_policy();
+    let weakens_current = requested.loosens(current);
+    if weakens_current
+        && matches!(
+            effective.sources.release_age_policy,
+            PostureSourceKind::ManagedPolicy
+        )
+    {
+        let managed_policy = effective
+            .managed_policy
+            .as_ref()
+            .expect("managed policy source must include status metadata");
+        let err = managed_policy_write_error(
+            managed_policy,
+            crate::release_age_config::GLOBAL_POLICY_KEY,
+            requested.as_str(),
+            current.as_str(),
+        );
+        record_persistent_guarded_attempt(ApprovalScope::CooldownWindow, false, &err.to_string());
+        return Err(err);
+    }
+
+    let mut posture = load_authorized_posture()?;
+    if weakens_current {
+        confirm_persistent_weakening(
+            ApprovalScope::CooldownWindow,
+            json_output,
+            command_hint,
+            &format!(
+                "Persisting `release-age-policy = {}` weakens the approved machine posture.",
+                requested.as_str()
+            ),
+        )?;
+    } else if !matches!(
+        effective.approved_posture_source,
+        PostureSourceKind::ApprovedStore
+    ) && requested == current
+    {
+        return Ok(());
+    } else {
+        let approved = posture.release_age_policy();
+        if requested == approved || requested.loosens(approved) {
+            return Ok(());
+        }
+    }
+    posture.release_age_policy = requested.as_str().to_string();
     persist_authorized_posture(&posture)
 }
 

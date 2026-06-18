@@ -11,7 +11,7 @@ use std::io::IsTerminal;
 /// Stores config in ~/.lpm/config.toml (user/machine config).
 /// Project config lives in package.json under "lpm" key.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, seven focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, eight focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
@@ -23,8 +23,9 @@ use std::io::IsTerminal;
 ///   (operator persistent toggle for npm publisher/provenance downgrade checks).
 /// - `lpm config release-age` owns `minimum-release-age-secs = <seconds>`
 ///   via human-friendly duration inputs.
+/// - `lpm config release-age-policy` owns `release-age-policy = direct | strict`.
 ///
-/// All seven default to interactive in a TTY; `--set <value>` is the
+/// All eight default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: &str,
@@ -55,6 +56,9 @@ pub async fn run(
     }
     if action == "release-age" {
         return run_release_age_wizard(&config_path, set, json_output).await;
+    }
+    if action == "release-age-policy" {
+        return run_release_age_policy_wizard(&config_path, set, json_output).await;
     }
 
     match action {
@@ -108,6 +112,18 @@ pub async fn run(
                         &format!("lpm config set {key} {value}"),
                     )?;
                 }
+                RELEASE_AGE_POLICY_KEY => {
+                    let requested = crate::release_age_config::ReleaseAgePolicy::parse(key, value)?;
+                    crate::security_floor::reject_looser_release_age_policy_write(
+                        &global_config_view_from_value(&config),
+                        requested,
+                    )?;
+                    crate::security_approval::authorize_persistent_release_age_policy(
+                        requested,
+                        json_output,
+                        &format!("lpm config set {key} {}", requested.as_str()),
+                    )?;
+                }
                 SIGNATURES_KEY => {
                     parse_config_bool(value).map_err(|message| {
                         LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
@@ -121,6 +137,12 @@ pub async fn run(
                     toml::Value::Boolean(parse_config_bool(value).map_err(|message| {
                         LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
                     })?)
+                } else if key == RELEASE_AGE_POLICY_KEY {
+                    toml::Value::String(
+                        crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
+                            .as_str()
+                            .to_string(),
+                    )
                 } else {
                     toml::Value::String(value.to_string())
                 };
@@ -132,6 +154,12 @@ pub async fn run(
                     serde_json::Value::Bool(parse_config_bool(value).map_err(|message| {
                         LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
                     })?)
+                } else if key == RELEASE_AGE_POLICY_KEY {
+                    serde_json::Value::String(
+                        crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
+                            .as_str()
+                            .to_string(),
+                    )
                 } else {
                     serde_json::Value::String(value.to_string())
                 };
@@ -166,6 +194,17 @@ pub async fn run(
                     json_output,
                     &format!("lpm config delete {key}"),
                 )?,
+                RELEASE_AGE_POLICY_KEY => {
+                    crate::security_floor::reject_looser_release_age_policy_write(
+                        &global_config_view_from_value(&config),
+                        crate::release_age_config::ReleaseAgePolicy::Direct,
+                    )?;
+                    crate::security_approval::authorize_persistent_release_age_policy(
+                        crate::release_age_config::ReleaseAgePolicy::Direct,
+                        json_output,
+                        &format!("lpm config delete {key}"),
+                    )?;
+                }
                 "sandbox" => crate::security_approval::authorize_persistent_sandbox_mode(
                     ResolvedSandboxMode::Default,
                     json_output,
@@ -213,7 +252,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore, signatures, trust-policy, release-age"
+                 scripts, triage, sandbox, sigstore, signatures, trust-policy, release-age, release-age-policy"
             )));
         }
     }
@@ -289,6 +328,11 @@ fn guard_generic_set_against_force_floor(
                 crate::security_floor::reject_looser_release_age_write(&global, requested_secs)?;
             }
         }
+        RELEASE_AGE_POLICY_KEY => {
+            if let Ok(requested) = crate::release_age_config::ReleaseAgePolicy::parse(key, value) {
+                crate::security_floor::reject_looser_release_age_policy_write(&global, requested)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -303,6 +347,10 @@ fn guard_generic_delete_against_force_floor(
         RELEASE_AGE_KEY => crate::security_floor::reject_looser_release_age_write(
             &global,
             crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS,
+        )?,
+        RELEASE_AGE_POLICY_KEY => crate::security_floor::reject_looser_release_age_policy_write(
+            &global,
+            crate::release_age_config::ReleaseAgePolicy::Direct,
         )?,
         "sandbox" => crate::security_floor::reject_looser_sandbox_mode_write(
             &global,
@@ -504,6 +552,7 @@ impl GlobalConfig {
 // changes later.
 
 const RELEASE_AGE_KEY: &str = "minimum-release-age-secs";
+const RELEASE_AGE_POLICY_KEY: &str = crate::release_age_config::GLOBAL_POLICY_KEY;
 const DEFAULT_RELEASE_AGE_SECS: u64 = crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS;
 const CAUTIOUS_RELEASE_AGE_SECS: u64 = 3 * DEFAULT_RELEASE_AGE_SECS;
 
@@ -570,6 +619,11 @@ async fn run_release_age_wizard(
         ReleaseAgeSelection::Default => DEFAULT_RELEASE_AGE_SECS,
         ReleaseAgeSelection::Seconds(secs) => secs,
     };
+    let requested_policy = if set.is_none() && requested_secs > 0 {
+        Some(prompt_release_age_policy(config_path)?)
+    } else {
+        None
+    };
     crate::security_floor::reject_looser_release_age_write(&global, requested_secs)?;
     let command_hint = match selection {
         ReleaseAgeSelection::Default => "lpm config release-age --set default".to_string(),
@@ -586,8 +640,19 @@ async fn run_release_age_wizard(
         json_output,
         &command_hint,
     )?;
+    if let Some(policy) = requested_policy {
+        crate::security_floor::reject_looser_release_age_policy_write(&global, policy)?;
+        crate::security_approval::authorize_persistent_release_age_policy(
+            policy,
+            json_output,
+            &format!("lpm config release-age-policy --set {}", policy.as_str()),
+        )?;
+    }
 
     let persisted = persist_release_age_selection(config_path, selection)?;
+    if let Some(policy) = requested_policy {
+        persist_release_age_policy(config_path, policy)?;
+    }
     announce_release_age_set(persisted, json_output);
     Ok(())
 }
@@ -607,6 +672,44 @@ fn read_release_age_override(config_path: &std::path::Path) -> Result<Option<u64
         _ => return Ok(None),
     };
     Ok(GlobalConfig { table }.get_u64(RELEASE_AGE_KEY))
+}
+
+fn read_release_age_policy_override(
+    config_path: &std::path::Path,
+) -> Result<Option<crate::release_age_config::ReleaseAgePolicy>, LpmError> {
+    let cfg = read_config(config_path)?;
+    let table = match cfg {
+        toml::Value::Table(table) => table,
+        _ => return Ok(None),
+    };
+    let Some(raw) = table.get(RELEASE_AGE_POLICY_KEY).and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::release_age_config::ReleaseAgePolicy::parse(
+        RELEASE_AGE_POLICY_KEY,
+        raw,
+    )?))
+}
+
+fn prompt_release_age_policy(
+    config_path: &std::path::Path,
+) -> Result<crate::release_age_config::ReleaseAgePolicy, LpmError> {
+    let current = read_release_age_policy_override(config_path)?.unwrap_or_default();
+    let choice: &str = cliclack::select("Apply the release-age cooldown to which dependencies?")
+        .item(
+            "direct",
+            "direct dependencies",
+            "default; fastest normal installs",
+        )
+        .item(
+            "strict",
+            "direct and transitive dependencies",
+            "stricter supply-chain posture",
+        )
+        .initial_value(current.as_str())
+        .interact()
+        .map_err(prompt_err)?;
+    crate::release_age_config::ReleaseAgePolicy::parse(RELEASE_AGE_POLICY_KEY, choice)
 }
 
 fn persist_release_age_selection(
@@ -634,6 +737,43 @@ fn persist_release_age_selection(
 
     write_config(config_path, &cfg)?;
     Ok(persisted)
+}
+
+fn persist_release_age_policy(
+    config_path: &std::path::Path,
+    policy: crate::release_age_config::ReleaseAgePolicy,
+) -> Result<(), LpmError> {
+    persist_string(config_path, RELEASE_AGE_POLICY_KEY, policy.as_str())
+}
+
+async fn run_release_age_policy_wizard(
+    config_path: &std::path::Path,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let existing_cfg = read_config(config_path)?;
+    let global = global_config_view_from_value(&existing_cfg);
+    let policy = if let Some(value) = set {
+        crate::release_age_config::ReleaseAgePolicy::parse(RELEASE_AGE_POLICY_KEY, value)?
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err(LpmError::Registry(
+                "lpm config release-age-policy requires a TTY; use `--set direct|strict` instead"
+                    .to_string(),
+            ));
+        }
+        prompt_release_age_policy(config_path)?
+    };
+
+    crate::security_floor::reject_looser_release_age_policy_write(&global, policy)?;
+    crate::security_approval::authorize_persistent_release_age_policy(
+        policy,
+        json_output,
+        &format!("lpm config release-age-policy --set {}", policy.as_str()),
+    )?;
+    persist_release_age_policy(config_path, policy)?;
+    announce_release_age_policy_set(policy, json_output);
+    Ok(())
 }
 
 fn format_release_age_cli_value(secs: u64) -> String {
@@ -688,6 +828,27 @@ fn announce_release_age_set(value: Option<u64>, json_output: bool) {
             format_release_age_cli_value(secs).bold()
         )),
     }
+}
+
+fn announce_release_age_policy_set(
+    policy: crate::release_age_config::ReleaseAgePolicy,
+    json_output: bool,
+) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                RELEASE_AGE_POLICY_KEY: policy.as_str(),
+            }))
+            .unwrap()
+        );
+        return;
+    }
+    install_ui::done(&format!(
+        "Set release-age-policy = {}",
+        policy.as_str().bold()
+    ));
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1722,6 +1883,53 @@ mod wizard_tests {
             table.get(RELEASE_AGE_KEY).and_then(|v| v.as_str()),
             Some("43200"),
         );
+    }
+
+    #[tokio::test]
+    async fn release_age_policy_wizard_set_persists_canonical_value() {
+        let (_dir, path, _env) = tmp_config();
+
+        run_release_age_policy_wizard(&path, Some("default"), true)
+            .await
+            .unwrap();
+
+        let cfg = read_config(&path).unwrap();
+        let table = cfg.as_table().unwrap();
+        assert_eq!(
+            table.get(RELEASE_AGE_POLICY_KEY).and_then(|v| v.as_str()),
+            Some("direct")
+        );
+    }
+
+    #[tokio::test]
+    async fn release_age_policy_wizard_rejects_unknown_value() {
+        let (_dir, path, _env) = tmp_config();
+
+        let err = run_release_age_policy_wizard(&path, Some("transitive"), true)
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("release-age-policy"), "got: {msg}");
+        assert!(msg.contains("direct | strict"), "got: {msg}");
+        assert!(!path.exists(), "invalid policy must not create config.toml");
+    }
+
+    #[tokio::test]
+    async fn release_age_policy_wizard_rejects_lower_value_when_force_floor_enabled() {
+        let (_dir, path, _env) = tmp_config();
+        std::fs::write(
+            &path,
+            "force-security-floor = true\nrelease-age-policy = \"strict\"\n",
+        )
+        .unwrap();
+
+        let err = run_release_age_policy_wizard(&path, Some("direct"), true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains("release-age-policy"));
     }
 
     #[test]

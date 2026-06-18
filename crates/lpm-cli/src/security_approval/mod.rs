@@ -22,7 +22,8 @@ mod unlocks;
 
 pub(crate) use approval::record_project_trust_candidate_authorized_from_managed_flow;
 pub use approval::{
-    approval_required_error, authorize_persistent_release_age, authorize_persistent_sandbox_mode,
+    approval_required_error, authorize_persistent_release_age,
+    authorize_persistent_release_age_policy, authorize_persistent_sandbox_mode,
     authorize_persistent_script_policy, authorize_persistent_sigstore,
     ensure_global_trust_authorized, ensure_global_trust_candidate_authorized_from_trust,
     ensure_project_policy_authorized, ensure_project_trust_candidate_authorized,
@@ -201,7 +202,7 @@ mod prelude {
 
     pub(super) use crate::precedence::PurePolicyKnob;
     pub(super) use crate::provenance_fetch::EnforceMode;
-    pub(super) use crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS;
+    pub(super) use crate::release_age_config::{DEFAULT_MIN_RELEASE_AGE_SECS, ReleaseAgePolicy};
     pub(super) use crate::sandbox_config::ResolvedSandboxMode;
     pub(super) use crate::script_policy_config::ScriptPolicy;
     pub(super) use chrono::{DateTime, Utc};

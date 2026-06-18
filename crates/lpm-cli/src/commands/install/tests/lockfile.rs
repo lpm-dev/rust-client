@@ -373,6 +373,7 @@ fn resolved_to_install_packages_carries_registry_signature_metadata() {
             integrity: Some("sha512-test".to_string()),
             signatures: vec![signature.clone()],
             published_at: Some("2026-01-02T03:04:05.000Z".to_string()),
+            published_at_unix: Some(1_767_323_045),
             trust_evidence: None,
         },
     );
@@ -381,6 +382,7 @@ fn resolved_to_install_packages_carries_registry_signature_metadata() {
         lpm_resolver::CanonicalKey::npm("signed"),
         Arc::new(lpm_resolver::CachedPackageInfo {
             modified: None,
+            modified_unix: None,
             trust_metadata_complete: false,
             versions: vec![NpmVersion::parse("1.0.0").unwrap()],
             deps: HashMap::new(),

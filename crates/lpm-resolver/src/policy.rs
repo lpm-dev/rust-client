@@ -200,6 +200,17 @@ impl ResolverPolicy {
         self.release_time_status_inner(published_at)
     }
 
+    pub(crate) fn release_time_status_unix_for_package(
+        &self,
+        package: &CanonicalKey,
+        published_unix: Option<i64>,
+    ) -> ReleaseTimeStatus {
+        if !self.release_age_applies_to_package(package) {
+            return ReleaseTimeStatus::Allowed;
+        }
+        self.release_time_status_unix_inner(published_unix)
+    }
+
     fn release_time_status_inner(&self, published_at: Option<&str>) -> ReleaseTimeStatus {
         let Some(cutoff_unix) = self.cutoff_unix else {
             return ReleaseTimeStatus::Allowed;
@@ -227,25 +238,68 @@ impl ResolverPolicy {
         }
     }
 
+    fn release_time_status_unix_inner(&self, published_unix: Option<i64>) -> ReleaseTimeStatus {
+        let Some(cutoff_unix) = self.cutoff_unix else {
+            return ReleaseTimeStatus::Allowed;
+        };
+        let Some(published_unix) = published_unix else {
+            return if self.ignore_missing_release_time {
+                ReleaseTimeStatus::Allowed
+            } else {
+                ReleaseTimeStatus::Missing
+            };
+        };
+        if published_unix <= cutoff_unix {
+            ReleaseTimeStatus::Allowed
+        } else {
+            ReleaseTimeStatus::TooNew {
+                remaining_secs: (published_unix - cutoff_unix) as u64,
+            }
+        }
+    }
+
     pub(crate) fn metadata_modified_after_cutoff_for_package(
         &self,
         package: &CanonicalKey,
         modified: Option<&str>,
+        modified_unix: Option<i64>,
     ) -> bool {
         if !self.release_age_applies_to_package(package) {
             return false;
         }
-        self.metadata_modified_after_cutoff(modified)
+        self.metadata_modified_after_cutoff(modified, modified_unix)
     }
 
-    pub(crate) fn metadata_modified_after_cutoff(&self, modified: Option<&str>) -> bool {
+    pub(crate) fn metadata_modified_after_cutoff(
+        &self,
+        modified: Option<&str>,
+        modified_unix: Option<i64>,
+    ) -> bool {
         let Some(cutoff_unix) = self.cutoff_unix else {
             return false;
         };
-        let Some(modified) = modified else {
+        if modified.is_none() {
             return true;
+        }
+        modified_unix.is_none_or(|modified_unix| modified_unix > cutoff_unix)
+    }
+
+    pub(crate) fn metadata_modified_before_or_at_cutoff_for_package(
+        &self,
+        package: &CanonicalKey,
+        modified: Option<&str>,
+        modified_unix: Option<i64>,
+    ) -> bool {
+        if !self.release_age_applies_to_package(package) {
+            return false;
+        }
+        let Some(cutoff_unix) = self.cutoff_unix else {
+            return false;
         };
-        parse_npm_time_unix(modified).is_none_or(|modified_unix| modified_unix > cutoff_unix)
+        if modified.is_none() {
+            return false;
+        }
+        modified_unix.is_some_and(|modified_unix| modified_unix <= cutoff_unix)
     }
 }
 

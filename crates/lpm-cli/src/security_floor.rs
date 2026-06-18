@@ -15,7 +15,7 @@ use crate::commands::config::GlobalConfig;
 use crate::output;
 use crate::precedence::PurePolicyKnob;
 use crate::provenance_fetch::EnforceMode;
-use crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS;
+use crate::release_age_config::{DEFAULT_MIN_RELEASE_AGE_SECS, ReleaseAgePolicy};
 use crate::sandbox_config::ResolvedSandboxMode;
 use crate::script_policy_config::ScriptPolicy;
 use lpm_common::LpmError;
@@ -182,6 +182,13 @@ pub fn current_release_age_floor_secs(global: &GlobalConfig) -> u64 {
         .unwrap_or(DEFAULT_MIN_RELEASE_AGE_SECS)
 }
 
+pub fn current_release_age_policy_floor(global: &GlobalConfig) -> ReleaseAgePolicy {
+    global
+        .get_str(crate::release_age_config::GLOBAL_POLICY_KEY)
+        .and_then(|raw| ReleaseAgePolicy::parse("release-age-policy", raw).ok())
+        .unwrap_or_default()
+}
+
 pub fn current_script_policy_floor(global: &GlobalConfig) -> ScriptPolicy {
     global
         .get_str("script-policy")
@@ -227,6 +234,24 @@ pub fn reject_looser_release_age_write(
             "minimum-release-age-secs",
             requested_secs.to_string(),
             floor.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn reject_looser_release_age_policy_write(
+    global: &GlobalConfig,
+    requested: ReleaseAgePolicy,
+) -> Result<(), LpmError> {
+    if !force_security_floor_enabled(global) {
+        return Ok(());
+    }
+    let floor = current_release_age_policy_floor(global);
+    if requested.loosens(floor) {
+        return Err(security_floor_write_error(
+            crate::release_age_config::GLOBAL_POLICY_KEY,
+            requested.as_str(),
+            floor.as_str(),
         ));
     }
     Ok(())

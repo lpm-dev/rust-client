@@ -23,6 +23,12 @@ struct FusedTreeProvider<'a> {
 }
 
 impl TreeManifestProvider for FusedTreeProvider<'_> {
+    fn cached_manifest(&self, canonical: &CanonicalKey) -> Option<Arc<CachedPackageInfo>> {
+        self.shared_cache
+            .get(canonical)
+            .map(|entry| entry.value().clone())
+    }
+
     fn ensure_manifest<'a>(
         &'a self,
         canonical: &'a CanonicalKey,

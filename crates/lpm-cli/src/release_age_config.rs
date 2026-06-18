@@ -15,6 +15,10 @@
 //!    would do).
 //! 4. **Default**: 86400 (24h).
 //!
+//! `minimumReleaseAgePolicy` follows the same project/global/default
+//! tiers, using `direct` by default and `strict` for opt-in transitive
+//! enforcement.
+//!
 //! `./lpm.toml` is deliberately NOT in this chain: the project-local
 //! TOML is scoped to save-policy keys, while release-age policy lives in
 //! package.json, global config, or per-invocation flags.
@@ -56,23 +60,75 @@ pub(crate) const DEFAULT_MIN_RELEASE_AGE_SECS: u64 = 86400;
 /// TOML key in `~/.lpm/config.toml` holding the global override.
 const GLOBAL_KEY: &str = "minimum-release-age-secs";
 const GLOBAL_EXCLUDE_KEY: &str = "minimum-release-age-exclude";
+pub(crate) const GLOBAL_POLICY_KEY: &str = "release-age-policy";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReleaseAgeConfig {
     pub minimum_release_age_secs: u64,
     pub minimum_release_age_exclude: Vec<String>,
+    pub minimum_release_age_policy: ReleaseAgePolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ReleaseAgePolicy {
+    #[default]
+    Direct,
+    Strict,
+}
+
+impl ReleaseAgePolicy {
+    pub(crate) fn parse(source: &str, raw: &str) -> Result<Self, LpmError> {
+        match raw {
+            "direct" | "default" => Ok(Self::Direct),
+            "strict" => Ok(Self::Strict),
+            _ => Err(LpmError::Registry(format!(
+                "{source} must be one of: direct | strict"
+            ))),
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Strict => "strict",
+        }
+    }
+
+    pub(crate) const fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+
+    pub(crate) const fn loosens(self, floor: Self) -> bool {
+        self.rank() < floor.rank()
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Direct => 0,
+            Self::Strict => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct GlobalReleaseAgeConfig {
     minimum_release_age_secs: Option<u64>,
     minimum_release_age_exclude: Vec<String>,
+    minimum_release_age_policy: Option<ReleaseAgePolicy>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PackageReleaseAgeConfig {
     minimum_release_age_secs: Option<u64>,
     minimum_release_age_exclude: Vec<String>,
+    minimum_release_age_policy: Option<ReleaseAgePolicy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseAgePolicySource {
+    Project,
+    Global,
+    Default,
 }
 
 /// Parse the `--min-release-age=<dur>` CLI argument into a seconds count.
@@ -225,8 +281,10 @@ impl ReleaseAgeResolver {
         let global = crate::commands::config::GlobalConfig::load();
         let authorized = crate::security_approval::load_effective_authorized_posture()?.posture;
         let authorized_floor = authorized.minimum_release_age_secs();
+        let authorized_policy = authorized.release_age_policy();
         let force_security_floor = crate::security_floor::force_security_floor_enabled(&global);
         let floor = crate::security_floor::current_release_age_floor_secs(&global);
+        let policy_floor = crate::security_floor::current_release_age_policy_floor(&global);
         let mut minimum_release_age_exclude =
             validate_release_age_excludes("--min-release-age-exclude", cli_exclude)?;
 
@@ -250,6 +308,28 @@ impl ReleaseAgeResolver {
             },
             None => Ok(None),
         };
+        let global_policy = global_release_age_config
+            .as_ref()
+            .ok()
+            .and_then(|config| config.as_ref())
+            .and_then(|config| config.minimum_release_age_policy);
+        let (requested_policy, policy_source) =
+            if let Some(policy) = package_config.minimum_release_age_policy {
+                (policy, ReleaseAgePolicySource::Project)
+            } else if let Some(policy) = global_policy {
+                (policy, ReleaseAgePolicySource::Global)
+            } else {
+                (ReleaseAgePolicy::default(), ReleaseAgePolicySource::Default)
+            };
+        let effective_policy = enforce_release_age_policy_posture(
+            project_dir,
+            json_output,
+            force_security_floor,
+            requested_policy,
+            policy_source,
+            authorized_policy,
+            policy_floor,
+        )?;
 
         if let Some(secs) = cli_override {
             if secs < authorized_floor {
@@ -267,6 +347,7 @@ impl ReleaseAgeResolver {
                 return Ok(ReleaseAgeConfig {
                     minimum_release_age_secs: secs,
                     minimum_release_age_exclude,
+                    minimum_release_age_policy: effective_policy,
                 });
             }
             if force_security_floor && secs < floor {
@@ -282,11 +363,13 @@ impl ReleaseAgeResolver {
                 return Ok(ReleaseAgeConfig {
                     minimum_release_age_secs: floor,
                     minimum_release_age_exclude,
+                    minimum_release_age_policy: effective_policy,
                 });
             }
             return Ok(ReleaseAgeConfig {
                 minimum_release_age_secs: secs,
                 minimum_release_age_exclude,
+                minimum_release_age_policy: effective_policy,
             });
         }
         if let Some(secs) = package_config.minimum_release_age_secs {
@@ -303,6 +386,7 @@ impl ReleaseAgeResolver {
                 return Ok(ReleaseAgeConfig {
                     minimum_release_age_secs: secs,
                     minimum_release_age_exclude,
+                    minimum_release_age_policy: effective_policy,
                 });
             }
             if force_security_floor && secs < floor {
@@ -318,11 +402,13 @@ impl ReleaseAgeResolver {
                 return Ok(ReleaseAgeConfig {
                     minimum_release_age_secs: floor,
                     minimum_release_age_exclude,
+                    minimum_release_age_policy: effective_policy,
                 });
             }
             return Ok(ReleaseAgeConfig {
                 minimum_release_age_secs: secs,
                 minimum_release_age_exclude,
+                minimum_release_age_policy: effective_policy,
             });
         }
         if let Some(global_config) = global_release_age_config?
@@ -343,13 +429,72 @@ impl ReleaseAgeResolver {
             return Ok(ReleaseAgeConfig {
                 minimum_release_age_secs: secs,
                 minimum_release_age_exclude,
+                minimum_release_age_policy: effective_policy,
             });
         }
         Ok(ReleaseAgeConfig {
             minimum_release_age_secs: DEFAULT_MIN_RELEASE_AGE_SECS,
             minimum_release_age_exclude,
+            minimum_release_age_policy: effective_policy,
         })
     }
+}
+
+fn enforce_release_age_policy_posture(
+    project_dir: &Path,
+    json_output: bool,
+    force_security_floor: bool,
+    requested: ReleaseAgePolicy,
+    source: ReleaseAgePolicySource,
+    authorized_floor: ReleaseAgePolicy,
+    force_floor: ReleaseAgePolicy,
+) -> Result<ReleaseAgePolicy, LpmError> {
+    if requested.loosens(authorized_floor) {
+        match source {
+            ReleaseAgePolicySource::Project => {
+                crate::security_approval::ensure_project_unlock(
+                    crate::security_approval::ApprovalScope::CooldownWindow,
+                    project_dir,
+                    json_output,
+                    crate::security_approval::ApprovalSource::ProjectConfig,
+                    "package.json requests a looser minimum release age policy than this machine has approved.",
+                    None,
+                    &[],
+                )?;
+            }
+            ReleaseAgePolicySource::Global => {
+                return Err(crate::security_approval::approval_required_error(
+                    "the persisted global release-age-policy value is weaker than this machine has approved",
+                    vec![
+                        crate::security_approval::ApprovalScope::CooldownWindow
+                            .as_str()
+                            .to_string(),
+                    ],
+                    None,
+                    Some(format!(
+                        "lpm config set {GLOBAL_POLICY_KEY} {}",
+                        requested.as_str()
+                    )),
+                ));
+            }
+            ReleaseAgePolicySource::Default => {}
+        }
+    }
+    if force_security_floor && requested.loosens(force_floor) {
+        if matches!(source, ReleaseAgePolicySource::Project) {
+            crate::security_floor::record_suppression(
+                crate::security_floor::SuppressionRecord::new(
+                    crate::security_floor::GuardedControl::CooldownWindow,
+                    crate::security_floor::SuppressionSource::Project,
+                    requested.as_str(),
+                    force_floor.as_str(),
+                ),
+                json_output,
+            );
+        }
+        return Ok(force_floor);
+    }
+    Ok(requested)
 }
 
 /// Locate `~/.lpm/config.toml`. Returns `None` only when `HOME` is
@@ -374,6 +519,11 @@ fn read_package_json_release_age_config(
             "package.json lpm.minimumReleaseAgeExclude",
             &lpm.minimum_release_age_exclude,
         )?,
+        minimum_release_age_policy: lpm
+            .minimum_release_age_policy
+            .as_deref()
+            .map(|raw| ReleaseAgePolicy::parse("package.json lpm.minimumReleaseAgePolicy", raw))
+            .transpose()?,
     }))
 }
 
@@ -420,9 +570,14 @@ fn read_global_release_age_config_from_file(
         Some(value) => parse_global_release_age_exclude_value(path, value)?,
         None => Vec::new(),
     };
+    let minimum_release_age_policy = match table.get(GLOBAL_POLICY_KEY) {
+        Some(value) => Some(parse_global_release_age_policy_value(path, value)?),
+        None => None,
+    };
     Ok(GlobalReleaseAgeConfig {
         minimum_release_age_secs,
         minimum_release_age_exclude,
+        minimum_release_age_policy,
     })
 }
 
@@ -470,6 +625,20 @@ fn parse_global_release_age_exclude_value(
         })
         .collect();
     validate_release_age_excludes(GLOBAL_EXCLUDE_KEY, &raw?)
+}
+
+fn parse_global_release_age_policy_value(
+    path: &Path,
+    value: &toml::Value,
+) -> Result<ReleaseAgePolicy, LpmError> {
+    let Some(raw) = value.as_str() else {
+        return Err(LpmError::Registry(format!(
+            "{}: `{GLOBAL_POLICY_KEY}` must be a string (`direct` or `strict`)",
+            path.display()
+        )));
+    };
+    ReleaseAgePolicy::parse(GLOBAL_POLICY_KEY, raw)
+        .map_err(|err| LpmError::Registry(format!("{}: {}", path.display(), err)))
 }
 
 pub(crate) fn validate_release_age_excludes(
@@ -823,6 +992,30 @@ mod tests {
     }
 
     #[test]
+    fn global_file_release_age_policy_string_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_file(&path, r#"release-age-policy = "strict""#);
+        let result = read_global_release_age_config_from_file(&path).unwrap();
+        assert_eq!(
+            result.minimum_release_age_policy,
+            Some(ReleaseAgePolicy::Strict)
+        );
+    }
+
+    #[test]
+    fn global_file_release_age_policy_rejects_unknown_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_file(&path, r#"release-age-policy = "transitive""#);
+        let err = read_global_release_age_config_from_file(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("release-age-policy"), "got: {err}");
+        assert!(err.contains("direct | strict"), "got: {err}");
+    }
+
+    #[test]
     fn minimum_release_age_exclude_rejects_protocol_specifier() {
         let err =
             validate_release_age_excludes("--min-release-age-exclude", &["npm:react".to_string()])
@@ -1008,6 +1201,35 @@ mod tests {
         );
     }
 
+    fn write_package_json_with_min_age_and_policy(
+        project: &Path,
+        secs: Option<u64>,
+        policy: Option<&str>,
+    ) {
+        let mut lpm = serde_json::Map::new();
+        if let Some(secs) = secs {
+            lpm.insert(
+                "minimumReleaseAge".to_string(),
+                serde_json::Value::Number(secs.into()),
+            );
+        }
+        if let Some(policy) = policy {
+            lpm.insert(
+                "minimumReleaseAgePolicy".to_string(),
+                serde_json::Value::String(policy.to_string()),
+            );
+        }
+
+        let mut body = serde_json::json!({ "name": "p", "version": "0.0.0" });
+        if !lpm.is_empty() {
+            body["lpm"] = serde_json::Value::Object(lpm);
+        }
+        write_file(
+            &project.join("package.json"),
+            &serde_json::to_string(&body).unwrap(),
+        );
+    }
+
     fn write_package_json_with_min_age(project: &Path, secs: Option<u64>) {
         write_package_json_with_min_age_and_excludes(project, secs, &[]);
     }
@@ -1023,6 +1245,15 @@ mod tests {
     fn write_authorized_min_age(secs: u64) {
         let posture = crate::security_approval::AuthorizedPosture {
             minimum_release_age_secs: secs,
+            ..crate::security_approval::AuthorizedPosture::default()
+        };
+        crate::security_approval::persist_authorized_posture(&posture).unwrap();
+    }
+
+    fn write_authorized_release_age_policy(policy: ReleaseAgePolicy) {
+        let posture = crate::security_approval::AuthorizedPosture {
+            minimum_release_age_secs: 0,
+            release_age_policy: policy.as_str().to_string(),
             ..crate::security_approval::AuthorizedPosture::default()
         };
         crate::security_approval::persist_authorized_posture(&posture).unwrap();
@@ -1123,6 +1354,88 @@ mod tests {
             result.minimum_release_age_exclude,
             vec!["react".to_string(), "@scope/pkg".to_string()]
         );
+    }
+
+    #[test]
+    fn resolve_config_uses_global_release_age_policy_when_project_is_silent() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_authorized_min_age(0);
+        write_package_json_with_min_age(project.path(), None);
+        write_global_config(home.path(), r#"release-age-policy = "strict""#);
+
+        let result = ReleaseAgeResolver::resolve_config(project.path(), None, &[], true).unwrap();
+
+        assert_eq!(result.minimum_release_age_policy, ReleaseAgePolicy::Strict);
+    }
+
+    #[test]
+    fn resolve_config_package_release_age_policy_beats_global_policy() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_authorized_min_age(0);
+        write_package_json_with_min_age_and_policy(project.path(), None, Some("direct"));
+        write_global_config(home.path(), r#"release-age-policy = "strict""#);
+
+        let result = ReleaseAgeResolver::resolve_config(project.path(), None, &[], true).unwrap();
+
+        assert_eq!(result.minimum_release_age_policy, ReleaseAgePolicy::Direct);
+    }
+
+    #[test]
+    fn resolve_config_project_release_age_policy_direct_requires_unlock_after_approved_strict() {
+        let project = tempfile::tempdir().unwrap();
+        let _home = scoped_home_dir();
+        write_authorized_release_age_policy(ReleaseAgePolicy::Strict);
+        write_package_json_with_min_age_and_policy(project.path(), None, Some("direct"));
+
+        let err = ReleaseAgeResolver::resolve_config(project.path(), None, &[], true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("cooldown-window"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_config_force_floor_suppresses_project_release_age_policy_direct() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_authorized_min_age(0);
+        write_package_json_with_min_age_and_policy(project.path(), None, Some("direct"));
+        write_global_config(
+            home.path(),
+            "force-security-floor = true\nrelease-age-policy = \"strict\"\n",
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+
+        let result = ReleaseAgeResolver::resolve_config(project.path(), None, &[], true).unwrap();
+
+        assert_eq!(result.minimum_release_age_policy, ReleaseAgePolicy::Strict);
+        let suppressions = crate::security_floor::recorded_suppressions();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(
+            suppressions[0].source,
+            crate::security_floor::SuppressionSource::Project
+        );
+        assert_eq!(
+            suppressions[0].control,
+            crate::security_floor::GuardedControl::CooldownWindow
+        );
+        crate::security_floor::clear_recorded_suppressions_for_tests();
+    }
+
+    #[test]
+    fn resolve_config_rejects_invalid_package_release_age_policy() {
+        let project = tempfile::tempdir().unwrap();
+        let _home = scoped_home_dir();
+        write_package_json_with_min_age_and_policy(project.path(), None, Some("transitive"));
+
+        let err = ReleaseAgeResolver::resolve_config(project.path(), None, &[], true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("minimumReleaseAgePolicy"), "got: {err}");
+        assert!(err.contains("direct | strict"), "got: {err}");
     }
 
     #[test]

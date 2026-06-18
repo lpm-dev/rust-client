@@ -364,6 +364,14 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
             );
             println!(
                 "  {} {}",
+                install_ui::dim(&format!("{:<24}", "release age policy")),
+                sourced_policy_value(
+                    &status.effective_floor.release_age_policy,
+                    status.floor_sources.release_age_policy
+                ),
+            );
+            println!(
+                "  {} {}",
                 install_ui::dim(&format!("{:<24}", "sandbox mode")),
                 sourced_policy_value(
                     &status.effective_floor.sandbox_mode,

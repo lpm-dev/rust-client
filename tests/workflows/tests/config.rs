@@ -1,6 +1,6 @@
 mod support;
 
-use support::{TempProject, lpm};
+use support::{TempProject, assertions, lpm};
 
 fn config_path(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("config.toml")
@@ -181,6 +181,103 @@ fn config_set_trust_policy_no_downgrade_persists_string() {
     assert!(
         content.contains("trust-policy = \"no-downgrade\""),
         "trust-policy config must persist as a TOML string, got:\n{content}"
+    );
+}
+
+#[test]
+fn config_set_release_age_policy_strict_persists_canonical_string() {
+    let project = TempProject::empty(r#"{"name":"config-release-age-policy","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "release-age-policy", "strict"])
+        .output()
+        .expect("failed to run lpm config set release-age-policy strict");
+
+    assert!(
+        output.status.success(),
+        "lpm config set release-age-policy strict failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "config set release-age-policy --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["value"], serde_json::json!("strict"));
+
+    let content = std::fs::read_to_string(config_path(&project))
+        .expect("config set must create ~/.lpm/config.toml in the isolated HOME");
+    assert!(
+        content.contains("release-age-policy = \"strict\""),
+        "release-age-policy config must persist as a TOML string, got:\n{content}"
+    );
+}
+
+#[test]
+fn config_get_release_age_policy_returns_stored_value() {
+    let project = TempProject::empty(r#"{"name":"config-release-age-policy","version":"1.0.0"}"#);
+    seed_config(&project, "release-age-policy = \"strict\"\n");
+
+    let output = lpm(&project)
+        .args(["--json", "config", "get", "release-age-policy"])
+        .output()
+        .expect("failed to run lpm config get release-age-policy");
+
+    assert!(
+        output.status.success(),
+        "lpm config get release-age-policy failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "config get release-age-policy --json stdout must be valid JSON: {e}\n---\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["release-age-policy"], serde_json::json!("strict"));
+}
+
+#[test]
+fn config_set_release_age_policy_direct_requires_approval_after_strict() {
+    let project = TempProject::empty(r#"{"name":"config-release-age-policy","version":"1.0.0"}"#);
+
+    let strict = lpm(&project)
+        .args(["--json", "config", "set", "release-age-policy", "strict"])
+        .output()
+        .expect("failed to run lpm config set release-age-policy strict");
+    assert!(
+        strict.status.success(),
+        "strict setup must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&strict.stdout),
+        String::from_utf8_lossy(&strict.stderr),
+    );
+
+    let direct = lpm(&project)
+        .args(["--json", "config", "set", "release-age-policy", "direct"])
+        .output()
+        .expect("failed to run lpm config set release-age-policy direct");
+
+    assert!(
+        !direct.status.success(),
+        "weakening strict release-age-policy must require approval:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&direct.stdout),
+        String::from_utf8_lossy(&direct.stderr),
+    );
+    let envelope = assertions::assert_security_approval_required(&direct);
+    assert!(
+        envelope["error"]["requested_scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes
+                .iter()
+                .any(|scope| scope.as_str() == Some("cooldown-window"))),
+        "approval envelope must name the cooldown-window scope; got {envelope}",
     );
 }
 

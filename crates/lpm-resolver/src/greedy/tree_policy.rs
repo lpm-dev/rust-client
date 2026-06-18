@@ -1,10 +1,16 @@
 use super::prelude::*;
 use super::types::Edge;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 
+const RELEASE_AGE_LOOKAHEAD_FETCH_LIMIT: usize = 8;
+
 pub(super) trait TreeManifestProvider {
+    fn cached_manifest(&self, _canonical: &CanonicalKey) -> Option<Arc<CachedPackageInfo>> {
+        None
+    }
+
     fn ensure_manifest<'a>(
         &'a self,
         canonical: &'a CanonicalKey,
@@ -28,6 +34,7 @@ enum TreeStatus {
 #[derive(Default)]
 pub(super) struct TreeStatusCache {
     entries: RefCell<AHashMap<(CanonicalKey, NpmVersion), TreeStatus>>,
+    release_age_lookahead_fetches: Cell<usize>,
 }
 
 impl TreeStatusCache {
@@ -37,6 +44,20 @@ impl TreeStatusCache {
 
     fn insert(&self, key: (CanonicalKey, NpmVersion), status: TreeStatus) {
         self.entries.borrow_mut().insert(key, status);
+    }
+
+    fn try_spend_release_age_lookahead_fetch(&self) -> bool {
+        let used = self.release_age_lookahead_fetches.get();
+        if used >= RELEASE_AGE_LOOKAHEAD_FETCH_LIMIT {
+            return false;
+        }
+        self.release_age_lookahead_fetches.set(used + 1);
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn release_age_lookahead_fetches(&self) -> usize {
+        self.release_age_lookahead_fetches.get()
     }
 }
 
@@ -50,6 +71,9 @@ pub(super) async fn preferred_tree_compatible_version<P>(
 where
     P: TreeManifestProvider,
 {
+    if edge.parent != 0 {
+        return None;
+    }
     if !policy.release_age_checks_all_packages() && !policy.requires_trust_history() {
         return None;
     }
@@ -167,7 +191,10 @@ where
                 })
             })
             .collect();
-        provider.prefetch_manifests(&prefetch_canonicals).await;
+        let release_age_tree_policy = policy.release_age_checks_all_packages();
+        if policy.requires_trust_history() || release_age_tree_policy {
+            provider.prefetch_manifests(&prefetch_canonicals).await;
+        }
 
         for (local_name, range_str) in entries {
             if bundled_names.is_some_and(|names| names.contains(local_name)) {
@@ -186,13 +213,30 @@ where
                 Some(target) => CanonicalKey::from_dep_name(target),
                 None => CanonicalKey::from_dep_name(local_name),
             };
-            let child_info = match provider.ensure_manifest(&child_canonical).await {
-                Ok(info) => info,
-                Err(_) => {
-                    visited.remove(&visit_key);
-                    cache.insert(visit_key, TreeStatus::Unknown);
-                    return TreeStatus::Unknown;
+            let child_info = if policy.requires_trust_history() {
+                match provider.ensure_manifest(&child_canonical).await {
+                    Ok(info) => info,
+                    Err(_) => {
+                        visited.remove(&visit_key);
+                        cache.insert(visit_key, TreeStatus::Unknown);
+                        return TreeStatus::Unknown;
+                    }
                 }
+            } else if let Some(info) = provider.cached_manifest(&child_canonical) {
+                info
+            } else if release_age_tree_policy && cache.try_spend_release_age_lookahead_fetch() {
+                match provider.ensure_manifest(&child_canonical).await {
+                    Ok(info) => info,
+                    Err(_) => {
+                        visited.remove(&visit_key);
+                        cache.insert(visit_key, TreeStatus::Unknown);
+                        return TreeStatus::Unknown;
+                    }
+                }
+            } else {
+                visited.remove(&visit_key);
+                cache.insert(visit_key, TreeStatus::Unknown);
+                return TreeStatus::Unknown;
             };
             match pick_tree_compatible_version(
                 &child_canonical,

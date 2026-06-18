@@ -95,6 +95,7 @@ pub struct CachedDistInfo {
     pub integrity: Option<String>,
     pub signatures: Vec<lpm_registry::RegistrySignature>,
     pub published_at: Option<String>,
+    pub published_at_unix: Option<i64>,
     pub trust_evidence: Option<TrustEvidence>,
 }
 
@@ -104,6 +105,7 @@ pub struct CachedPackageInfo {
     /// Package-level `modified` timestamp from npm metadata. Abbreviated
     /// packuments often omit per-version `time` but keep this upper bound.
     pub modified: Option<String>,
+    pub modified_unix: Option<i64>,
     /// True when this cache entry came from a full packument fetch, so
     /// missing trust evidence can be treated as genuinely absent rather
     /// than "not present in abbreviated metadata."
@@ -174,7 +176,11 @@ impl CachedPackageInfo {
                 .is_none()
         });
         missing_version_time
-            && policy.metadata_modified_after_cutoff_for_package(package, self.modified.as_deref())
+            && policy.metadata_modified_after_cutoff_for_package(
+                package,
+                self.modified.as_deref(),
+                self.modified_unix,
+            )
     }
 
     pub fn needs_policy_metadata(&self, package: &CanonicalKey, policy: &ResolverPolicy) -> bool {
