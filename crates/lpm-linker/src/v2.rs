@@ -57,6 +57,8 @@
 //! disambiguation that flows from each target's own `wrapper_id`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(unix)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -70,8 +72,6 @@ use lpm_store::v2::{
 };
 
 use crate::materialize::link_dir_recursive;
-#[cfg(unix)]
-use crate::platform::make_bin_target_executable;
 use crate::validation::{
     ensure_real_dir_with_prefix, is_safe_node_modules_entry_name as is_safe_root_link_name,
     validate_bin_target,
@@ -1406,6 +1406,20 @@ struct BinLinkSpec {
     cmd_name: String,
     target: PathBuf,
     needs_project_node_path: bool,
+    #[cfg(unix)]
+    unix_invocation: UnixBinInvocation,
+}
+
+#[cfg(unix)]
+struct UnixShebangInvocation {
+    interpreter: String,
+    arg: Option<String>,
+}
+
+#[cfg(unix)]
+enum UnixBinInvocation {
+    Direct,
+    Shebang(UnixShebangInvocation),
 }
 
 fn project_compatibility_root(project_dir: &Path) -> PathBuf {
@@ -2567,8 +2581,9 @@ fn root_link_names(target: &LinkTarget) -> Vec<String> {
 /// `.bin/` shim creation for the v2 layout. Walks each direct dep's
 /// `package.json` from inside the link entry's package dir
 /// (`<store>/links/<graph-key>/node_modules/<name>/package.json`)
-/// and emits a relative symlink under `<project>/node_modules/.bin/<cmd>`
-/// pointing at the bin script in the link entry.
+/// and emits a project `.bin/<cmd>` shim pointing at the bin script in
+/// the link entry. Unix uses symlinks for already-executable targets
+/// and wrapper scripts for non-executable shebang targets.
 ///
 /// Only DIRECT deps get bin shims (matches npm/v1 semantics). Bin
 /// shims for transitive deps are unreachable from project scripts
@@ -2681,17 +2696,22 @@ fn create_bin_links_v2(
             bin_target.push(&pkg_dir);
             bin_target.push(&bin_rel_path);
             #[cfg(unix)]
-            if let Err(error) = make_bin_target_executable(&bin_target) {
-                tracing::warn!(
-                    "v2 linker: skipping bin {cmd_name} from {}: failed to mark target executable: {error}",
-                    v2t.target.name
-                );
-                continue;
-            }
+            let unix_invocation = match unix_bin_invocation(&bin_target) {
+                Ok(invocation) => invocation,
+                Err(error) => {
+                    tracing::warn!(
+                        "v2 linker: skipping bin {cmd_name} from {}: {error}",
+                        v2t.target.name
+                    );
+                    continue;
+                }
+            };
             specs.push(BinLinkSpec {
                 cmd_name,
                 target: bin_target.clone(),
                 needs_project_node_path,
+                #[cfg(unix)]
+                unix_invocation,
             });
         }
     }
@@ -2726,11 +2746,17 @@ fn create_bin_links_v2(
 
         #[cfg(unix)]
         {
-            if spec.needs_project_node_path {
-                write_unix_project_node_path_wrapper(
+            if spec.needs_project_node_path
+                || !matches!(spec.unix_invocation, UnixBinInvocation::Direct)
+            {
+                let project_node_modules = spec
+                    .needs_project_node_path
+                    .then_some(project_node_modules.as_path());
+                write_unix_bin_wrapper(
                     &link_path,
                     &spec.target,
-                    &project_node_modules,
+                    project_node_modules,
+                    &spec.unix_invocation,
                 )?;
             } else {
                 let relative = pathdiff::diff_paths(&spec.target, &bin_dir)
@@ -2805,12 +2831,79 @@ fn create_bin_links_v2(
 }
 
 #[cfg(unix)]
-fn write_unix_project_node_path_wrapper(
+fn unix_bin_invocation(target: &Path) -> Result<UnixBinInvocation, LpmError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(target).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to inspect bin target at {}: {e}",
+            target.display()
+        ))
+    })?;
+    if metadata.permissions().mode() & 0o111 != 0 {
+        return Ok(UnixBinInvocation::Direct);
+    }
+    Ok(UnixBinInvocation::Shebang(read_unix_shebang(target)?))
+}
+
+#[cfg(unix)]
+fn read_unix_shebang(target: &Path) -> Result<UnixShebangInvocation, LpmError> {
+    let mut file = std::fs::File::open(target).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to open non-executable bin target at {} for shebang inspection: {e}",
+            target.display()
+        ))
+    })?;
+    let mut buf = [0_u8; 512];
+    let read = file.read(&mut buf).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to read non-executable bin target at {} for shebang inspection: {e}",
+            target.display()
+        ))
+    })?;
+    let bytes = &buf[..read];
+    if !bytes.starts_with(b"#!") {
+        return Err(LpmError::Store(format!(
+            "bin target {} is not executable and has no shebang",
+            target.display()
+        )));
+    }
+    let line_end = bytes.iter().position(|byte| *byte == b'\n').unwrap_or(read);
+    let shebang = std::str::from_utf8(&bytes[2..line_end])
+        .map_err(|e| {
+            LpmError::Store(format!(
+                "bin target {} has a non-UTF-8 shebang: {e}",
+                target.display()
+            ))
+        })?
+        .trim_end_matches('\r')
+        .trim();
+    let mut parts = shebang.splitn(2, char::is_whitespace);
+    let interpreter = parts.next().ok_or_else(|| {
+        LpmError::Store(format!(
+            "bin target {} has an empty shebang",
+            target.display()
+        ))
+    })?;
+    let arg = parts
+        .next()
+        .map(str::trim)
+        .filter(|arg| !arg.is_empty())
+        .map(str::to_string);
+    Ok(UnixShebangInvocation {
+        interpreter: interpreter.to_string(),
+        arg,
+    })
+}
+
+#[cfg(unix)]
+fn write_unix_bin_wrapper(
     link_path: &Path,
     target: &Path,
-    project_node_modules: &Path,
+    project_node_modules: Option<&Path>,
+    invocation: &UnixBinInvocation,
 ) -> Result<(), LpmError> {
-    let content = unix_project_node_path_wrapper_content(target, project_node_modules);
+    let content = unix_bin_wrapper_content(target, project_node_modules, invocation);
     let metadata = match link_path.symlink_metadata() {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -2860,17 +2953,42 @@ fn set_unix_bin_shim_executable(link_path: &Path) -> Result<(), LpmError> {
 }
 
 #[cfg(unix)]
-fn unix_project_node_path_wrapper_content(target: &Path, project_node_modules: &Path) -> String {
-    format!(
-        "#!/bin/sh\nNODE_PATH={}${{NODE_PATH:+:$NODE_PATH}}\nexport NODE_PATH\nexec {} \"$@\"\n",
-        shell_quote_path(project_node_modules),
-        shell_quote_path(target),
-    )
+fn unix_bin_wrapper_content(
+    target: &Path,
+    project_node_modules: Option<&Path>,
+    invocation: &UnixBinInvocation,
+) -> String {
+    let mut content = String::with_capacity(target.as_os_str().len() + 96);
+    content.push_str("#!/bin/sh\n");
+    if let Some(project_node_modules) = project_node_modules {
+        content.push_str("NODE_PATH=");
+        content.push_str(&shell_quote_path(project_node_modules));
+        content.push_str("${NODE_PATH:+:$NODE_PATH}\nexport NODE_PATH\n");
+    }
+    content.push_str("exec ");
+    match invocation {
+        UnixBinInvocation::Direct => content.push_str(&shell_quote_path(target)),
+        UnixBinInvocation::Shebang(shebang) => {
+            content.push_str(&shell_quote(&shebang.interpreter));
+            if let Some(arg) = &shebang.arg {
+                content.push(' ');
+                content.push_str(&shell_quote(arg));
+            }
+            content.push(' ');
+            content.push_str(&shell_quote_path(target));
+        }
+    }
+    content.push_str(" \"$@\"\n");
+    content
 }
 
 #[cfg(unix)]
 fn shell_quote_path(path: &Path) -> String {
-    let value = path.to_string_lossy();
+    shell_quote(path.to_string_lossy().as_ref())
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');
     for ch in value.chars() {
@@ -2998,6 +3116,40 @@ mod tests {
     fn write_object(store: &V2Store, sri: &str, files: &[(&str, &[u8])]) -> PathBuf {
         let tarball = build_test_tarball(files);
         store.extract_object(sri, &tarball).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn assert_unix_shim_executes_under(shim: &Path, root: &Path, label: &str) {
+        let metadata = shim.symlink_metadata().expect("shim metadata");
+        if metadata.file_type().is_symlink() {
+            let shim_target = std::fs::read_link(shim).expect("shim should be a symlink");
+            let shim_real = shim
+                .parent()
+                .unwrap()
+                .join(shim_target)
+                .canonicalize()
+                .expect("shim target should resolve");
+            assert!(
+                shim_real.starts_with(root),
+                "{label} should execute inside {}, got {}",
+                root.display(),
+                shim_real.display(),
+            );
+            return;
+        }
+
+        assert!(
+            metadata.file_type().is_file(),
+            "{label} shim must be a file or symlink"
+        );
+        let content = std::fs::read_to_string(shim).expect("shim wrapper should be readable");
+        let root_text = root.to_string_lossy();
+        let root_without_private = root_text.strip_prefix("/private").unwrap_or(&root_text);
+        assert!(
+            content.contains(root_text.as_ref()) || content.contains(root_without_private),
+            "{label} wrapper should execute inside {}, got:\n{content}",
+            root.display(),
+        );
     }
 
     #[cfg(unix)]
@@ -3440,18 +3592,7 @@ mod tests {
         #[cfg(unix)]
         {
             let shim = project.join("node_modules").join(".bin").join("next");
-            let shim_target = std::fs::read_link(&shim).expect("next shim should be a symlink");
-            let shim_real = shim
-                .parent()
-                .unwrap()
-                .join(shim_target)
-                .canonicalize()
-                .expect("next shim target should resolve");
-            assert!(
-                shim_real.starts_with(&compat_root),
-                "next bin shim should execute the project-local compatibility copy, got {}",
-                shim_real.display(),
-            );
+            assert_unix_shim_executes_under(&shim, &compat_root, "next bin shim");
         }
     }
 
@@ -3867,18 +4008,7 @@ mod tests {
         #[cfg(unix)]
         {
             let shim = project.join("node_modules").join(".bin").join("tool");
-            let shim_target = std::fs::read_link(&shim).expect("tool shim should be a symlink");
-            let shim_real = shim
-                .parent()
-                .unwrap()
-                .join(shim_target)
-                .canonicalize()
-                .expect("tool shim target should resolve");
-            assert!(
-                shim_real.starts_with(&compat_root),
-                "direct bin shim should execute the project compatibility copy, got {}",
-                shim_real.display(),
-            );
+            assert_unix_shim_executes_under(&shim, &compat_root, "direct bin shim");
         }
     }
 
@@ -3923,18 +4053,7 @@ mod tests {
         #[cfg(unix)]
         {
             let shim = project.join("node_modules").join(".bin").join("tool");
-            let shim_target = std::fs::read_link(&shim).expect("tool shim should be a symlink");
-            let shim_real = shim
-                .parent()
-                .unwrap()
-                .join(shim_target)
-                .canonicalize()
-                .expect("tool shim target should resolve");
-            assert!(
-                shim_real.starts_with(&compat_root),
-                "requested direct bin shim should execute the project compatibility copy, got {}",
-                shim_real.display(),
-            );
+            assert_unix_shim_executes_under(&shim, &compat_root, "requested direct bin shim");
         }
     }
 
@@ -4054,18 +4173,7 @@ mod tests {
             .canonicalize()
             .expect("compatibility root should exist");
         let shim = project.join("node_modules").join(".bin").join("tool");
-        let shim_target = std::fs::read_link(&shim).expect("tool shim should be a symlink");
-        let shim_real = shim
-            .parent()
-            .unwrap()
-            .join(shim_target)
-            .canonicalize()
-            .expect("tool shim target should resolve");
-        assert!(
-            shim_real.starts_with(&compat_root),
-            "generated bin shim should point at the refreshed compatibility copy, got {}",
-            shim_real.display(),
-        );
+        assert_unix_shim_executes_under(&shim, &compat_root, "generated bin shim");
     }
 
     #[test]
@@ -5208,7 +5316,7 @@ mod tests {
 
     /// Benign shape still works — proves the new validators don't
     /// over-reject. A well-formed bin entry pointing at an in-package
-    /// file produces a `.bin/` symlink.
+    /// file produces an executable `.bin/` shim.
     #[test]
     fn v2_creates_bin_shim_for_well_formed_entry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5241,10 +5349,17 @@ mod tests {
         assert_eq!(result.bin_linked, 1, "well-formed bin entry must be linked");
         #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt;
+
             let shim = project.join("node_modules").join(".bin").join("a");
             assert!(
-                shim.symlink_metadata().unwrap().file_type().is_symlink(),
-                "shim must be a symlink",
+                shim.symlink_metadata().unwrap().file_type().is_file(),
+                "non-executable bin target should produce a wrapper file",
+            );
+            assert_eq!(
+                shim.metadata().unwrap().permissions().mode() & 0o111,
+                0o111,
+                "wrapper shim must be executable",
             );
         }
     }
@@ -5252,7 +5367,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn link_packages_v2_reuses_up_to_date_bin_shim_on_warm_rerun() {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let tmp = tempfile::tempdir().unwrap();
         let store = V2Store::at(tmp.path().join("store"));
@@ -5284,24 +5399,47 @@ mod tests {
         assert_eq!(first.bin_linked, 1, "first run must create the shim");
 
         let shim = project.join("node_modules").join(".bin").join("a");
-        let first_target = std::fs::read_link(&shim).expect("shim should be a symlink");
+        let package_bin = first.materialized[0].destination.join("cli.js");
+        assert_eq!(
+            std::fs::metadata(&package_bin)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "v2 bin shim creation must not chmod the shared link entry target"
+        );
+        let first_content = std::fs::read_to_string(&shim).expect("shim should be a wrapper file");
         let first_inode = shim.symlink_metadata().expect("shim metadata").ino();
 
         let second =
             link_packages_v2(&project, vec![package], &store, LinkerMode::Isolated, None).unwrap();
         assert_eq!(
+            second.linked, 0,
+            "warm rerun must reuse the existing link entry for direct-bin packages"
+        );
+        assert_eq!(
             second.bin_linked, 1,
             "warm rerun should still report the usable shim"
         );
         assert_eq!(
-            std::fs::read_link(&shim).expect("shim should remain a symlink"),
-            first_target,
-            "warm rerun must keep the same shim target"
+            std::fs::read_to_string(&shim).expect("shim should remain a wrapper file"),
+            first_content,
+            "warm rerun must keep the same wrapper content"
         );
         assert_eq!(
             shim.symlink_metadata().expect("shim metadata").ino(),
             first_inode,
             "warm rerun must not unlink and recreate an already-correct shim"
+        );
+        assert_eq!(
+            std::fs::metadata(&package_bin)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "warm rerun must leave the link entry target unmodified"
         );
     }
 
@@ -5343,20 +5481,13 @@ mod tests {
             link_packages_v2(&project, vec![package], &store, LinkerMode::Isolated, None).unwrap();
         assert_eq!(second.bin_linked, 1, "repaired shim should be counted");
 
-        let repaired_target = std::fs::read_link(&shim).expect("shim should be repaired");
-        assert_ne!(
-            repaired_target,
-            PathBuf::from("../wrong-target.js"),
-            "stale shim target must be replaced"
+        assert!(
+            shim.symlink_metadata().unwrap().file_type().is_file(),
+            "stale symlink should be replaced by the wrapper shim"
         );
         assert!(
-            shim.parent()
-                .unwrap()
-                .join(repaired_target)
-                .canonicalize()
-                .expect("repaired shim target should resolve")
-                .ends_with("cli.js"),
-            "repaired shim should point at the package bin target",
+            std::fs::read_to_string(&shim).unwrap().contains("cli.js"),
+            "repaired wrapper must execute the declared bin target",
         );
     }
 
