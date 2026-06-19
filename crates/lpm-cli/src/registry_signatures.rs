@@ -5,8 +5,77 @@ use lpm_registry::{
     RegistrySigningKey, RegistryTarget, RouteTable, UpstreamRoute,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const VERIFY_CONCURRENCY: usize = 16;
+
+#[derive(Debug, Default)]
+pub(crate) struct RegistrySignatureTimings {
+    total_wall_ns: AtomicU64,
+    hydration_ns: AtomicU64,
+    hydration_count: AtomicU64,
+    key_fetch_ns: AtomicU64,
+    key_fetch_count: AtomicU64,
+    crypto_ns: AtomicU64,
+    crypto_count: AtomicU64,
+    crypto_max_ns: AtomicU64,
+}
+
+impl RegistrySignatureTimings {
+    fn record_total_wall(&self, elapsed: std::time::Duration) {
+        self.total_wall_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn record_hydration(&self, elapsed: std::time::Duration) {
+        self.hydration_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        self.hydration_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_key_fetch(&self, elapsed: std::time::Duration) {
+        self.key_fetch_ns
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        self.key_fetch_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_crypto(&self, elapsed: std::time::Duration) {
+        let ns = elapsed.as_nanos() as u64;
+        self.crypto_ns.fetch_add(ns, Ordering::Relaxed);
+        self.crypto_count.fetch_add(1, Ordering::Relaxed);
+        let mut current = self.crypto_max_ns.load(Ordering::Relaxed);
+        while ns > current {
+            match self.crypto_max_ns.compare_exchange_weak(
+                current,
+                ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "total_wall_ms": self.total_wall_ns.load(Ordering::Relaxed) / 1_000_000,
+            "hydration": {
+                "sum_ms": self.hydration_ns.load(Ordering::Relaxed) / 1_000_000,
+                "count": self.hydration_count.load(Ordering::Relaxed),
+            },
+            "key_fetch": {
+                "sum_ms": self.key_fetch_ns.load(Ordering::Relaxed) / 1_000_000,
+                "count": self.key_fetch_count.load(Ordering::Relaxed),
+            },
+            "crypto_verify": {
+                "sum_ms": self.crypto_ns.load(Ordering::Relaxed) / 1_000_000,
+                "max_ms": self.crypto_max_ns.load(Ordering::Relaxed) / 1_000_000,
+                "count": self.crypto_count.load(Ordering::Relaxed),
+            },
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RegistrySignatureInput {
@@ -146,19 +215,39 @@ pub async fn verify_packages(
     inputs: Vec<RegistrySignatureInput>,
     allow_metadata_hydration: bool,
 ) -> RegistrySignatureReport {
-    let packages =
-        futures::stream::iter(
-            inputs.into_iter().map(|input| {
-                let client = Arc::clone(&client);
-                let route_table = route_table.clone();
-                async move {
-                    verify_one_package(client, route_table, input, allow_metadata_hydration).await
-                }
-            }),
-        )
-        .buffered(VERIFY_CONCURRENCY)
-        .collect()
-        .await;
+    verify_packages_with_timings(client, route_table, inputs, allow_metadata_hydration, None).await
+}
+
+pub(crate) async fn verify_packages_with_timings(
+    client: Arc<RegistryClient>,
+    route_table: RouteTable,
+    inputs: Vec<RegistrySignatureInput>,
+    allow_metadata_hydration: bool,
+    timings: Option<Arc<RegistrySignatureTimings>>,
+) -> RegistrySignatureReport {
+    let total_start = std::time::Instant::now();
+    let packages = futures::stream::iter(inputs.into_iter().map(|input| {
+        let client = Arc::clone(&client);
+        let route_table = route_table.clone();
+        let timings = timings.clone();
+        async move {
+            verify_one_package(
+                client,
+                route_table,
+                input,
+                allow_metadata_hydration,
+                timings.as_deref(),
+            )
+            .await
+        }
+    }))
+    .buffered(VERIFY_CONCURRENCY)
+    .collect()
+    .await;
+
+    if let Some(timings) = &timings {
+        timings.record_total_wall(total_start.elapsed());
+    }
 
     RegistrySignatureReport { packages }
 }
@@ -182,6 +271,7 @@ async fn verify_one_package(
     route_table: RouteTable,
     mut input: RegistrySignatureInput,
     allow_metadata_hydration: bool,
+    timings: Option<&RegistrySignatureTimings>,
 ) -> RegistrySignaturePackageResult {
     if input.name.starts_with("@lpm.dev/") {
         return skipped(input, RegistrySignatureReason::LpmRegistryPackage);
@@ -197,7 +287,7 @@ async fn verify_one_package(
         && (input.signatures.is_empty()
             || input.integrity.is_none()
             || input.published_at.is_none())
-        && let Err(reason) = hydrate_from_metadata(&client, &route, &mut input).await
+        && let Err(reason) = hydrate_from_metadata(&client, &route, &mut input, timings).await
     {
         return not_verified(input, reason);
     }
@@ -215,6 +305,7 @@ async fn verify_one_package(
         return not_verified(input, RegistrySignatureReason::MissingIntegrity);
     };
 
+    let key_fetch_start = std::time::Instant::now();
     let keys = match registry_signing_keys_for_route(&client, &route, &input.signatures).await {
         Ok(keys) => keys,
         Err(error) => {
@@ -224,15 +315,23 @@ async fn verify_one_package(
             );
         }
     };
+    if let Some(timings) = timings {
+        timings.record_key_fetch(key_fetch_start.elapsed());
+    }
 
-    match lpm_registry::verify_registry_signatures(
+    let crypto_start = std::time::Instant::now();
+    let verification = lpm_registry::verify_registry_signatures(
         &input.name,
         &input.version,
         integrity,
         &input.signatures,
         &keys,
         input.published_at.as_deref(),
-    ) {
+    );
+    if let Some(timings) = timings {
+        timings.record_crypto(crypto_start.elapsed());
+    }
+    match verification {
         Ok(RegistrySignatureVerification::Verified { count }) => RegistrySignaturePackageResult {
             name: input.name,
             version: input.version,
@@ -254,11 +353,18 @@ async fn hydrate_from_metadata(
     client: &RegistryClient,
     route: &UpstreamRoute,
     input: &mut RegistrySignatureInput,
+    timings: Option<&RegistrySignatureTimings>,
 ) -> Result<(), RegistrySignatureReason> {
-    let metadata = client
-        .get_npm_metadata_routed(&input.name, route.clone())
-        .await
-        .map_err(|error| RegistrySignatureReason::MetadataUnavailable(error.to_string()))?;
+    let hydration_start = std::time::Instant::now();
+    let metadata = lpm_registry::timing::with_metadata_purpose(
+        lpm_registry::timing::MetadataPurpose::SignatureHydration,
+        client.get_npm_metadata_routed(&input.name, route.clone()),
+    )
+    .await
+    .map_err(|error| RegistrySignatureReason::MetadataUnavailable(error.to_string()))?;
+    if let Some(timings) = timings {
+        timings.record_hydration(hydration_start.elapsed());
+    }
 
     let version = metadata.version(&input.version).ok_or_else(|| {
         RegistrySignatureReason::MetadataUnavailable(format!(

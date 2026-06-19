@@ -63,6 +63,74 @@ define_counter!(ensure_cached);
 define_counter!(choose_version);
 define_counter!(get_dependencies);
 
+static RELEASE_AGE_NS: AtomicU64 = AtomicU64::new(0);
+static RELEASE_AGE_CHECKS: AtomicU64 = AtomicU64::new(0);
+static RELEASE_AGE_REJECTED: AtomicU64 = AtomicU64::new(0);
+static RELEASE_AGE_MISSING: AtomicU64 = AtomicU64::new(0);
+static TRUST_POLICY_NS: AtomicU64 = AtomicU64::new(0);
+static TRUST_POLICY_CHECKS: AtomicU64 = AtomicU64::new(0);
+static TRUST_POLICY_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PolicySummary {
+    pub release_age: PolicyCheckSummary,
+    pub trust_policy: PolicyCheckSummary,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PolicyCheckSummary {
+    pub elapsed: Duration,
+    pub checked_count: u64,
+    pub rejected_count: u64,
+    pub missing_count: u64,
+}
+
+pub fn record_release_age_check(elapsed: Duration, rejected: bool, missing_release_time: bool) {
+    RELEASE_AGE_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    RELEASE_AGE_CHECKS.fetch_add(1, Ordering::Relaxed);
+    if rejected {
+        RELEASE_AGE_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+    if missing_release_time {
+        RELEASE_AGE_MISSING.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn record_trust_policy_check(elapsed: Duration, rejected: bool) {
+    TRUST_POLICY_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    TRUST_POLICY_CHECKS.fetch_add(1, Ordering::Relaxed);
+    if rejected {
+        TRUST_POLICY_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn reset_policy() {
+    RELEASE_AGE_NS.store(0, Ordering::Relaxed);
+    RELEASE_AGE_CHECKS.store(0, Ordering::Relaxed);
+    RELEASE_AGE_REJECTED.store(0, Ordering::Relaxed);
+    RELEASE_AGE_MISSING.store(0, Ordering::Relaxed);
+    TRUST_POLICY_NS.store(0, Ordering::Relaxed);
+    TRUST_POLICY_CHECKS.store(0, Ordering::Relaxed);
+    TRUST_POLICY_REJECTED.store(0, Ordering::Relaxed);
+}
+
+pub fn policy_summary() -> PolicySummary {
+    PolicySummary {
+        release_age: PolicyCheckSummary {
+            elapsed: Duration::from_nanos(RELEASE_AGE_NS.load(Ordering::Relaxed)),
+            checked_count: RELEASE_AGE_CHECKS.load(Ordering::Relaxed),
+            rejected_count: RELEASE_AGE_REJECTED.load(Ordering::Relaxed),
+            missing_count: RELEASE_AGE_MISSING.load(Ordering::Relaxed),
+        },
+        trust_policy: PolicyCheckSummary {
+            elapsed: Duration::from_nanos(TRUST_POLICY_NS.load(Ordering::Relaxed)),
+            checked_count: TRUST_POLICY_CHECKS.load(Ordering::Relaxed),
+            rejected_count: TRUST_POLICY_REJECTED.load(Ordering::Relaxed),
+            missing_count: 0,
+        },
+    }
+}
+
 /// Reset all counters. Call before resolution starts.
 pub fn reset_all() {
     to_pubgrub_ranges::reset();
@@ -70,6 +138,7 @@ pub fn reset_all() {
     ensure_cached::reset();
     choose_version::reset();
     get_dependencies::reset();
+    reset_policy();
 }
 
 /// Format a summary of all counters. Returns a multi-line string.

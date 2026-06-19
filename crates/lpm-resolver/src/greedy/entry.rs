@@ -294,6 +294,7 @@ pub async fn resolve_greedy_with_options_and_policy(
     let packages = state.into_resolved_packages(&cache);
 
     let snap = lpm_registry::timing::snapshot();
+    let policy_snap = crate::profile::policy_summary();
     Ok(ResolveResult {
         packages,
         cache,
@@ -311,6 +312,13 @@ pub async fn resolve_greedy_with_options_and_policy(
             pubgrub_ms: resolver_ms,
             walker_rpc_count: snap.walker_rpc_count,
             escape_hatch_rpc_count: snap.escape_hatch_rpc_count,
+            policy_release_age_ms: policy_snap.release_age.elapsed.as_millis() as u64,
+            policy_release_age_checked_count: policy_snap.release_age.checked_count,
+            policy_release_age_rejected_count: policy_snap.release_age.rejected_count,
+            policy_release_age_missing_count: policy_snap.release_age.missing_count,
+            policy_trust_ms: policy_snap.trust_policy.elapsed.as_millis() as u64,
+            policy_trust_checked_count: policy_snap.trust_policy.checked_count,
+            policy_trust_rejected_count: policy_snap.trust_policy.rejected_count,
             // Dispatcher counters: zero on the walker arm.
             // Populated by `resolve_greedy_fused` when `LPM_GREEDY_FUSION=1`.
             ..StageTiming::default()

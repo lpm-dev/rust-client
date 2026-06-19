@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Schema version for [`BuildState`].
 ///
@@ -66,6 +67,32 @@ pub const BUILD_STATE_VERSION: u32 = 1;
 
 /// Filename inside `<project_dir>/.lpm/`.
 pub const BUILD_STATE_FILENAME: &str = "build-state.json";
+
+static BUILD_STATE_WRITE_NS: AtomicU64 = AtomicU64::new(0);
+static BUILD_STATE_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BuildStateWriteTiming {
+    pub(crate) write_ms: u64,
+    pub(crate) write_count: u64,
+}
+
+pub(crate) fn reset_write_timing() {
+    BUILD_STATE_WRITE_NS.store(0, Ordering::Relaxed);
+    BUILD_STATE_WRITE_COUNT.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn snapshot_write_timing() -> BuildStateWriteTiming {
+    BuildStateWriteTiming {
+        write_ms: BUILD_STATE_WRITE_NS.load(Ordering::Relaxed) / 1_000_000,
+        write_count: BUILD_STATE_WRITE_COUNT.load(Ordering::Relaxed),
+    }
+}
+
+fn record_write_timing(elapsed: std::time::Duration) {
+    BUILD_STATE_WRITE_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    BUILD_STATE_WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Top-level shape of `build-state.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +282,7 @@ pub fn read_build_state(project_dir: &Path) -> Option<BuildState> {
 /// A crash between the write and the rename leaves the previous state file
 /// intact rather than corrupting it.
 pub fn write_build_state(project_dir: &Path, state: &BuildState) -> Result<(), LpmError> {
+    let write_start = std::time::Instant::now();
     let lpm_dir = project_dir.join(".lpm");
     std::fs::create_dir_all(&lpm_dir).map_err(LpmError::Io)?;
 
@@ -283,6 +311,7 @@ pub fn write_build_state(project_dir: &Path, state: &BuildState) -> Result<(), L
             ),
         ))
     })?;
+    record_write_timing(write_start.elapsed());
     Ok(())
 }
 

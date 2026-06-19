@@ -225,6 +225,10 @@ impl RegistryClient {
         if package_names.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        for package_name in package_names {
+            crate::timing::record_metadata_request(package_name);
+            crate::timing::record_metadata_cache_miss();
+        }
 
         let url = format!("{}/api/registry/batch-metadata", self.base_url);
         let body = serde_json::json!({ "packages": package_names, "deep": deep });
@@ -506,17 +510,21 @@ impl RegistryClient {
         &self,
         name: &PackageName,
     ) -> Result<PackageMetadata, LpmError> {
-        let cache_key = format!("lpm:{}", name.scoped());
+        let scoped = name.scoped();
+        crate::timing::record_metadata_request(&scoped);
+        let cache_key = format!("lpm:{scoped}");
 
         // Tier 1: TTL-based cache hit (fast path, no HTTP)
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
-            tracing::debug!("metadata cache hit: {}", name.scoped());
+            crate::timing::record_metadata_cache_hit();
+            tracing::debug!("metadata cache hit: {scoped}");
             return Ok(cached);
         }
+        crate::timing::record_metadata_cache_miss();
 
         // npm registries expect raw scoped names in the path:
         // /api/registry/@lpm.dev/owner.package (NOT percent-encoded)
-        let url = format!("{}/api/registry/{}", self.base_url, name.scoped());
+        let url = format!("{}/api/registry/{scoped}", self.base_url);
 
         // Time the network portion only. TTL cache hits above return
         // before this point, so the RPC counter never double-counts them.
@@ -571,13 +579,16 @@ impl RegistryClient {
     ///
     /// Supports ETag conditional requests for both proxy and direct npm paths.
     pub async fn get_npm_package_metadata(&self, name: &str) -> Result<PackageMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
         let cache_key = format!("npm:{name}");
 
         // Tier 1: TTL-based cache hit
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit: npm:{name}");
             return Ok(cached);
         }
+        crate::timing::record_metadata_cache_miss();
 
         // Past this point the call WILL hit a registry (proxy or upstream).
         // `record_rpc` fires in each tier's exit path (success or error)
@@ -712,13 +723,16 @@ impl RegistryClient {
     /// to it on a miss. The TTL cache is preserved so warm installs and
     /// previously-seen packages stay cache-fast.
     pub async fn get_npm_metadata_direct(&self, name: &str) -> Result<PackageMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
         let cache_key = format!("npm:{name}");
 
         // Tier 1: TTL+HMAC cache hit (same as `get_npm_package_metadata`).
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (direct): npm:{name}");
             return Ok(cached);
         }
+        crate::timing::record_metadata_cache_miss();
 
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
@@ -789,11 +803,14 @@ impl RegistryClient {
         &self,
         name: &str,
     ) -> Result<PackageMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
         let cache_key = format!("npm-full:{name}");
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit: npm-full:{name}");
             return Ok(cached);
         }
+        crate::timing::record_metadata_cache_miss();
 
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
@@ -946,12 +963,15 @@ impl RegistryClient {
         name: &str,
         use_cache: bool,
     ) -> Result<PackageMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
         let cache_key = format!("npm-full:{name}");
         if use_cache && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
         {
+            crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (direct): npm-full:{name}");
             return Ok(cached);
         }
+        crate::timing::record_metadata_cache_miss();
 
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
@@ -1021,11 +1041,14 @@ impl RegistryClient {
         &self,
         name: &str,
     ) -> Result<PackageMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
         let cache_key = format!("npm:{name}");
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (proxy-only): npm:{name}");
             return Ok(cached);
         }
+        crate::timing::record_metadata_cache_miss();
 
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
@@ -1159,12 +1182,14 @@ impl RegistryClient {
         &self,
         name: &str,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
         let cache_key = format!("npm-release-times:{name}");
         if let Some((cached, _etag)) = self
             .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
             .await
             && cached.matches_package(name)
         {
+            crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
         let full_cache_key = format!("npm-full:{name}");
@@ -1174,8 +1199,10 @@ impl RegistryClient {
             && cached.matches_package(name)
             && !cached.time.is_empty()
         {
+            crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
+        crate::timing::record_metadata_cache_miss();
 
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
         let cache_validator = self.read_cache_validator(&cache_key);
@@ -1245,6 +1272,7 @@ impl RegistryClient {
         name: &str,
         use_cache: bool,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
         let cache_key = format!("npm-release-times:{name}");
         if use_cache {
             if let Some((cached, _etag)) = self
@@ -1252,6 +1280,7 @@ impl RegistryClient {
                 .await
                 && cached.matches_package(name)
             {
+                crate::timing::record_metadata_cache_hit();
                 return Ok(cached);
             }
             let full_cache_key = format!("npm-full:{name}");
@@ -1261,9 +1290,11 @@ impl RegistryClient {
                 && cached.matches_package(name)
                 && !cached.time.is_empty()
             {
+                crate::timing::record_metadata_cache_hit();
                 return Ok(cached);
             }
         }
+        crate::timing::record_metadata_cache_miss();
 
         let cache_validator = use_cache
             .then(|| self.read_cache_validator(&cache_key))
@@ -1335,6 +1366,7 @@ impl RegistryClient {
         name: &str,
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
         let url = format!("{base_url}/{name}");
         let dest_origin = crate::npmrc::OriginKey::from_request_url(&url).ok_or_else(|| {
             LpmError::Registry(format!(
@@ -1352,6 +1384,7 @@ impl RegistryClient {
             .await
             && cached.matches_package(name)
         {
+            crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
         let full_cache_key = format!(
@@ -1364,8 +1397,10 @@ impl RegistryClient {
             && cached.matches_package(name)
             && !cached.time.is_empty()
         {
+            crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
+        crate::timing::record_metadata_cache_miss();
 
         let cache_validator = self.read_cache_validator(&cache_key);
         let rpc_start = std::time::Instant::now();
@@ -1450,6 +1485,7 @@ impl RegistryClient {
         name: &str,
         route: crate::UpstreamRoute,
     ) -> Option<crate::types::BlockedSetPackageMeta> {
+        crate::timing::record_metadata_request(name);
         // Fast path for standard npm routes whose cache key is `npm:{name}`.
         // Custom routes use a principal-fingerprint key we can't reproduce here.
         let is_standard_route = matches!(
@@ -1461,10 +1497,12 @@ impl RegistryClient {
             if let Some((meta, _)) =
                 self.read_metadata_cache_as::<crate::types::BlockedSetPackageMeta>(&cache_key)
             {
+                crate::timing::record_metadata_cache_hit();
                 tracing::debug!("blocked-set meta cache hit (minimal): {name}");
                 return Some(meta);
             }
         }
+        crate::timing::record_metadata_cache_miss();
 
         // Cache miss or custom route: fetch full metadata (writes cache),
         // then project to the minimal type without re-deserializing.
@@ -1532,6 +1570,7 @@ impl RegistryClient {
         name: &str,
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<PackageMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
         let url = format!("{base_url}/{name}");
 
         // Parse destination origin once; used for both the cache key
@@ -1575,9 +1614,11 @@ impl RegistryClient {
 
         // Tier 1: TTL+magic cache hit.
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (custom)");
             return Ok(cached);
         }
+        crate::timing::record_metadata_cache_miss();
 
         let cache_validator = self.read_cache_validator(&cache_key);
         let rpc_start = std::time::Instant::now();
@@ -1643,6 +1684,7 @@ impl RegistryClient {
         name: &str,
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<PackageMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
         let url = format!("{base_url}/{name}");
         let dest_origin = crate::npmrc::OriginKey::from_request_url(&url).ok_or_else(|| {
             LpmError::Registry(format!(
@@ -1656,9 +1698,11 @@ impl RegistryClient {
         );
 
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (custom full)");
             return Ok(cached);
         }
+        crate::timing::record_metadata_cache_miss();
 
         let cache_validator = self.read_cache_validator(&cache_key);
         let rpc_start = std::time::Instant::now();

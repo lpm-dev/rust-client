@@ -299,17 +299,19 @@ pub(super) async fn enforce_registry_signature_policy(
     packages: &[InstallPackage],
     json_output: bool,
     allow_metadata_hydration: bool,
+    timings: Option<Arc<crate::registry_signatures::RegistrySignatureTimings>>,
 ) -> Result<(), LpmError> {
     let inputs = registry_signature_inputs_from_install_packages(packages);
     if inputs.is_empty() {
         return Ok(());
     }
 
-    let report = crate::registry_signatures::verify_packages(
+    let report = crate::registry_signatures::verify_packages_with_timings(
         client,
         route_table.clone(),
         inputs,
         allow_metadata_hydration,
+        timings,
     )
     .await;
 

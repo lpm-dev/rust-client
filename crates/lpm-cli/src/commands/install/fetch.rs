@@ -706,8 +706,11 @@ pub(super) async fn resolve_tarball_url(
                 url: url.to_string(),
             });
         }
-        let (metadata_url, _metadata) =
-            metadata_tarball_url_for_package(client, route_table, name, version, is_lpm).await?;
+        let (metadata_url, _metadata) = lpm_registry::timing::with_metadata_purpose(
+            lpm_registry::timing::MetadataPurpose::TarballUrlLookup,
+            metadata_tarball_url_for_package(client, route_table, name, version, is_lpm),
+        )
+        .await?;
         if url != metadata_url {
             return Err(LpmError::Registry(format!(
                 "registry lockfile tarball for {name}@{version} does not match registry metadata \
@@ -723,8 +726,11 @@ pub(super) async fn resolve_tarball_url(
             "no tarball URL for {name}@{version}"
         )));
     }
-    let (url, _metadata) =
-        metadata_tarball_url_for_package(client, route_table, name, version, is_lpm).await?;
+    let (url, _metadata) = lpm_registry::timing::with_metadata_purpose(
+        lpm_registry::timing::MetadataPurpose::TarballUrlLookup,
+        metadata_tarball_url_for_package(client, route_table, name, version, is_lpm),
+    )
+    .await?;
     Ok(ResolvedRegistryTarballUrl { url })
 }
 

@@ -40,6 +40,7 @@ use lpm_registry::AttestationRef;
 use lpm_workspace::{ProvenanceSnapshot, ProvenanceStatus};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -495,6 +496,81 @@ pub struct ProvenanceTimings {
     pub cache_hit_ns: AtomicU64,
     pub http_ns: AtomicU64,
     pub parse_ns: AtomicU64,
+    pub cache_hit_count: AtomicU64,
+    pub http_count: AtomicU64,
+    pub verify_count: AtomicU64,
+    verify_max_ns: AtomicU64,
+    slow_verify: Mutex<Vec<ProvenancePackageTiming>>,
+}
+
+impl ProvenanceTimings {
+    fn record_verify(&self, name: &str, version: &str, elapsed: std::time::Duration) {
+        let ns = elapsed.as_nanos() as u64;
+        self.parse_ns.fetch_add(ns, Ordering::Relaxed);
+        self.verify_count.fetch_add(1, Ordering::Relaxed);
+        let mut current = self.verify_max_ns.load(Ordering::Relaxed);
+        while ns > current {
+            match self.verify_max_ns.compare_exchange_weak(
+                current,
+                ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+        if let Ok(mut slow) = self.slow_verify.lock() {
+            slow.push(ProvenancePackageTiming {
+                package: format!("{name}@{version}"),
+                ms: ns / 1_000_000,
+            });
+            slow.sort_unstable_by(|a, b| b.ms.cmp(&a.ms).then_with(|| a.package.cmp(&b.package)));
+            slow.truncate(10);
+        }
+    }
+
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cache_hit": {
+                "sum_ms": self.cache_hit_ns.load(Ordering::Relaxed) / 1_000_000,
+                "count": self.cache_hit_count.load(Ordering::Relaxed),
+            },
+            "http": {
+                "sum_ms": self.http_ns.load(Ordering::Relaxed) / 1_000_000,
+                "count": self.http_count.load(Ordering::Relaxed),
+            },
+            "verify": {
+                "sum_ms": self.parse_ns.load(Ordering::Relaxed) / 1_000_000,
+                "max_ms": self.verify_max_ns.load(Ordering::Relaxed) / 1_000_000,
+                "count": self.verify_count.load(Ordering::Relaxed),
+            },
+        })
+    }
+
+    pub(crate) fn slow_verify_json(&self) -> serde_json::Value {
+        self.slow_verify.lock().map_or_else(
+            |_| serde_json::Value::Array(Vec::new()),
+            |slow| {
+                serde_json::Value::Array(
+                    slow.iter()
+                        .map(|entry| {
+                            serde_json::json!({
+                                "package": entry.package,
+                                "ms": entry.ms,
+                            })
+                        })
+                        .collect(),
+                )
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProvenancePackageTiming {
+    package: String,
+    ms: u64,
 }
 
 // ── Public API ──────────────────────────────────────────────────
@@ -540,6 +616,7 @@ pub async fn fetch_provenance_snapshot(
         if let Some(t) = timings {
             t.cache_hit_ns
                 .fetch_add(cache_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            t.cache_hit_count.fetch_add(1, Ordering::Relaxed);
         }
         return Ok(Some(cached));
     }
@@ -556,6 +633,7 @@ pub async fn fetch_provenance_snapshot(
     if let Some(t) = timings {
         t.http_ns
             .fetch_add(http_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        t.http_count.fetch_add(1, Ordering::Relaxed);
     }
 
     // Verification: bytes are in hand, run the full
@@ -566,8 +644,7 @@ pub async fn fetch_provenance_snapshot(
     let parse_start = Instant::now();
     let snapshot = verify_bundle_or_err(&buf, url)?;
     if let Some(t) = timings {
-        t.parse_ns
-            .fetch_add(parse_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        t.record_verify(name, version, parse_start.elapsed());
     }
 
     // Successful parse — cache it and return. Cache-write failures
