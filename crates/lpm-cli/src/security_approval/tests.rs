@@ -531,17 +531,17 @@ fn macos_local_auth_reason_uses_default_when_prompt_is_empty() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn macos_local_auth_uses_biometrics_without_password_fallback() {
+fn macos_local_auth_allows_biometrics_or_password() {
     assert_eq!(
         super::native_auth::macos_local_auth_policy(),
-        objc2_local_authentication::LAPolicy::DeviceOwnerAuthenticationWithBiometrics
+        objc2_local_authentication::LAPolicy::DeviceOwnerAuthentication
     );
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn macos_local_auth_hides_password_fallback_button() {
-    assert_eq!(super::native_auth::macos_local_auth_fallback_title(), "");
+fn macos_local_auth_uses_default_password_fallback_title() {
+    assert_eq!(super::native_auth::macos_local_auth_fallback_title(), None);
 }
 
 #[test]

@@ -505,9 +505,7 @@ pub async fn run(
         };
 
         let options = lpm_tunnel::client::TunnelOptions {
-            relay_url: tunnel_relay_url
-                .map(str::to_owned)
-                .unwrap_or_else(lpm_tunnel::resolve_relay_url),
+            relay_url: tunnel_relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned),
             token: token.to_string(),
             local_port: port,
             domain: tunnel_domain.map(|s| s.to_string()),

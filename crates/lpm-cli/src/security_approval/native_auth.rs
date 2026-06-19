@@ -275,11 +275,12 @@ fn request_macos_local_authentication(prompt: &str) -> Result<bool, LpmError> {
         )));
     }
 
-    let fallback_title = NSString::from_str(macos_local_auth_fallback_title());
+    let fallback_title = macos_local_auth_fallback_title().map(NSString::from_str);
     // SAFETY: Both setters operate on a valid `LAContext`; the fallback title
-    // is copied by LocalAuthentication and the reuse duration is a scalar.
+    // is copied by LocalAuthentication when present and the reuse duration is
+    // a scalar.
     unsafe {
-        context.setLocalizedFallbackTitle(Some(&fallback_title));
+        context.setLocalizedFallbackTitle(fallback_title.as_deref());
         context.setTouchIDAuthenticationAllowableReuseDuration(0.0);
     }
     let reason = NSString::from_str(&macos_local_auth_reason(prompt));
@@ -304,12 +305,12 @@ fn request_macos_local_authentication(prompt: &str) -> Result<bool, LpmError> {
 
 #[cfg(target_os = "macos")]
 pub(super) fn macos_local_auth_policy() -> objc2_local_authentication::LAPolicy {
-    objc2_local_authentication::LAPolicy::DeviceOwnerAuthenticationWithBiometrics
+    objc2_local_authentication::LAPolicy::DeviceOwnerAuthentication
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn macos_local_auth_fallback_title() -> &'static str {
-    ""
+pub(super) fn macos_local_auth_fallback_title() -> Option<&'static str> {
+    None
 }
 
 #[cfg(target_os = "macos")]
