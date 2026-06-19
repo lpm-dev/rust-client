@@ -1982,6 +1982,9 @@ fn hash_object_tree_dir_inner(
             LpmError::Store(format!("failed to enumerate v2 object tree entry: {e}"))
         })?;
         let file_name = entry.file_name();
+        if is_object_metadata_sidecar_name(root, dir, &file_name) {
+            continue;
+        }
         let metadata = entry.metadata().map_err(|e| {
             LpmError::Store(format!(
                 "failed to stat v2 object tree entry {}: {e}",
@@ -1998,9 +2001,6 @@ fn hash_object_tree_dir_inner(
     let mut path = dir.to_path_buf();
     for entry in entries {
         let entry_name = entry.file_name;
-        if is_object_metadata_sidecar_name(root, dir, &entry_name) {
-            continue;
-        }
         let relative_len = relative.len();
         if relative_len != 0 {
             relative.push(b'/');
@@ -2884,6 +2884,44 @@ mod tests {
         let reusable = store.reusable_object(&sri).unwrap().unwrap();
 
         assert_eq!(reusable.path, object_dir);
+    }
+
+    #[test]
+    fn compute_tree_metadata_integrity_ignores_vanished_atomic_tree_snapshot_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(
+            b"compute_tree_metadata_integrity_ignores_vanished_atomic_tree_snapshot_tmp_files",
+        );
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"snapshot-vanished-tmp\"}"),
+                ("index.js", b"ok"),
+            ],
+        );
+
+        let temp_paths: Vec<PathBuf> = (0..4096)
+            .map(|idx| object_dir.join(format!("..lpm-tree-snapshot.json.tmp.1234.{idx}")))
+            .collect();
+        for path in &temp_paths {
+            std::fs::write(path, b"partial").unwrap();
+        }
+
+        let remover = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            for path in temp_paths {
+                let _ = std::fs::remove_file(path);
+            }
+        });
+        let result = compute_tree_metadata_integrity(&object_dir);
+        remover.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "vanished tree snapshot temp files should be ignored before stat: {result:?}"
+        );
     }
 
     #[test]
