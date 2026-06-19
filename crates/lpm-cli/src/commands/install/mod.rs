@@ -1021,7 +1021,14 @@ async fn run_with_options_under_store_lock(
         linker_mode,
     );
     let wf_setup_install_state_ms = setup_state_t.elapsed().as_millis();
+    // A plain `lpm install` passes no compatibility bins and does not build the
+    // framework compat island (see `create_project_compatibility_links`), so its
+    // up-to-date readiness must not require island shims that are never created.
+    // Without the empty-bins short-circuit, a project with a direct bin dep would
+    // miss the up-to-date fast-exit on every warm install. `lpm dev`/`lpm run`
+    // pass the entrypoint bin (non-empty) and still verify island readiness.
     let compatibility_bins_ready = !requested_v2_mode
+        || compatibility_bin_names.is_empty()
         || lpm_linker::v2::project_compatibility_bins_ready(project_dir, compatibility_bin_names);
     let cleanup_catalogs_in_pipeline = requested_add_count.is_none();
     if !frozen_lockfile_active
@@ -1055,6 +1062,22 @@ async fn run_with_options_under_store_lock(
                                "fetch_ms": 0u128,
                                "link_ms": 0u128,
                                "total_ms": total_ms,
+                               // Shape parity with the full-install path: a
+                               // `waterfall` is always present so consumers can
+                               // read `timing.waterfall` uniformly. No resolve /
+                               // fetch / link ran, so the cost is all setup.
+                               "waterfall": {
+                                   "setup_ms": total_ms,
+                                   "resolve_ms": 0u128,
+                                   "pre_fetch_ms": 0u128,
+                                   "fetch_ms": 0u128,
+                                   "pre_link_ms": 0u128,
+                                   "link_ms": 0u128,
+                                   "link_await_ms": 0u128,
+                                   "link_finalize_ms": 0u128,
+                                   "tail_ms": 0u128,
+                                   "total_ms": total_ms,
+                               },
                            },
             //always-present empty array: up-to-date fast
             // path runs no resolve, so no fresh conflict trace.
@@ -1594,6 +1617,22 @@ async fn run_with_options_under_store_lock(
                                "fetch_ms": 0u128,
                                "link_ms": 0u128,
                                "total_ms": total_ms,
+                               // Shape parity with the full-install path: a
+                               // `waterfall` is always present so consumers can
+                               // read `timing.waterfall` uniformly. No resolve /
+                               // fetch / link ran, so the cost is all setup.
+                               "waterfall": {
+                                   "setup_ms": total_ms,
+                                   "resolve_ms": 0u128,
+                                   "pre_fetch_ms": 0u128,
+                                   "fetch_ms": 0u128,
+                                   "pre_link_ms": 0u128,
+                                   "link_ms": 0u128,
+                                   "link_await_ms": 0u128,
+                                   "link_finalize_ms": 0u128,
+                                   "tail_ms": 0u128,
+                                   "total_ms": total_ms,
+                               },
                            },
             //always-present empty array: zero deps means
             // zero peer requirements means zero conflicts.

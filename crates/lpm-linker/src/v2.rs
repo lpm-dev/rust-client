@@ -571,7 +571,12 @@ fn link_v2_finalize_inner(
         project_dir,
         augmented_slice,
         self_package_name,
-        !plan.compatibility_bin_names.is_empty(),
+        // Always preserve `node_modules/.lpm`: the compat island under it is
+        // owned by `create_project_compatibility_links` (built / replaced /
+        // removed there), not by this stale-root-entry reconcile. Removing it
+        // here on a plain install would delete a `lpm dev`-built island and
+        // force the next dev/run to rebuild it.
+        true,
     )?;
     let reconcile_ms = stage_timer.elapsed().as_millis();
     let stage_timer = std::time::Instant::now();
