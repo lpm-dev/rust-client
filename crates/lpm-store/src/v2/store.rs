@@ -9,7 +9,7 @@
 //! v2 writes are gated behind `LPM_STORE_VERSION=v2`.
 
 use std::borrow::Cow;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1955,11 +1955,22 @@ fn compute_tree_metadata_integrity(dir: &Path) -> Result<String, LpmError> {
 fn hash_object_tree_dir(
     root: &Path,
     dir: &Path,
+    content_hasher: Option<&mut Sha256>,
+    metadata_hasher: &mut Sha256,
+) -> Result<(), LpmError> {
+    let mut relative = Vec::new();
+    hash_object_tree_dir_inner(root, dir, &mut relative, content_hasher, metadata_hasher)
+}
+
+fn hash_object_tree_dir_inner(
+    root: &Path,
+    dir: &Path,
+    relative: &mut Vec<u8>,
     mut content_hasher: Option<&mut Sha256>,
     metadata_hasher: &mut Sha256,
 ) -> Result<(), LpmError> {
     let mut entries = Vec::new();
-    // Unix DirEntry values keep the directory handle alive; store owned paths
+    // Unix DirEntry values keep the directory handle alive; store owned names
     // before recursing so deep warm-cache validation stays below RLIMIT_NOFILE.
     for entry in std::fs::read_dir(dir).map_err(|e| {
         LpmError::Store(format!(
@@ -1970,39 +1981,66 @@ fn hash_object_tree_dir(
         let entry = entry.map_err(|e| {
             LpmError::Store(format!("failed to enumerate v2 object tree entry: {e}"))
         })?;
+        let file_name = entry.file_name();
+        let metadata = entry.metadata().map_err(|e| {
+            LpmError::Store(format!(
+                "failed to stat v2 object tree entry {}: {e}",
+                dir.join(&file_name).display()
+            ))
+        })?;
         entries.push(ObjectTreeEntry {
-            file_name: entry.file_name(),
-            path: entry.path(),
+            file_name,
+            metadata,
         });
     }
     entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
 
+    let mut path = dir.to_path_buf();
     for entry in entries {
-        let path = entry.path;
-        if is_object_metadata_sidecar(root, &path) {
+        let entry_name = entry.file_name;
+        if is_object_metadata_sidecar_name(root, dir, &entry_name) {
             continue;
         }
-        let metadata = std::fs::symlink_metadata(&path).map_err(|e| {
-            LpmError::Store(format!(
-                "failed to stat v2 object tree entry {}: {e}",
-                path.display()
-            ))
-        })?;
-        let relative = object_tree_relative_path(root, &path)?;
+        let relative_len = relative.len();
+        if relative_len != 0 {
+            relative.push(b'/');
+        }
+        push_os_str_bytes(relative, &entry_name);
+        let metadata = entry.metadata;
         let file_type = metadata.file_type();
-        if file_type.is_dir() {
+        let mut path_pushed = false;
+        let result = if file_type.is_dir() {
+            path.push(&entry_name);
+            path_pushed = true;
             let mode = object_entry_mode(&metadata).to_le_bytes();
             if let Some(hasher) = content_hasher.as_deref_mut() {
-                hash_object_tree_record(hasher, b"dir", &relative, &mode);
+                hash_object_tree_record(hasher, b"dir", relative.as_slice(), &mode);
             }
-            hash_tree_metadata_record(metadata_hasher, b"dir", &relative, &metadata, &[]);
-            hash_object_tree_dir(root, &path, content_hasher.as_deref_mut(), metadata_hasher)?;
+            hash_tree_metadata_record(metadata_hasher, b"dir", relative.as_slice(), &metadata, &[]);
+            hash_object_tree_dir_inner(
+                root,
+                &path,
+                relative,
+                content_hasher.as_deref_mut(),
+                metadata_hasher,
+            )
         } else if file_type.is_file() {
-            hash_tree_metadata_record(metadata_hasher, b"file", &relative, &metadata, &[]);
+            hash_tree_metadata_record(
+                metadata_hasher,
+                b"file",
+                relative.as_slice(),
+                &metadata,
+                &[],
+            );
             if let Some(hasher) = content_hasher.as_deref_mut() {
-                hash_object_file(hasher, &relative, &path, &metadata)?;
+                path.push(&entry_name);
+                path_pushed = true;
+                hash_object_file(hasher, relative.as_slice(), &path, &metadata)?;
             }
+            Ok(())
         } else if file_type.is_symlink() {
+            path.push(&entry_name);
+            path_pushed = true;
             let target = std::fs::read_link(&path).map_err(|e| {
                 LpmError::Store(format!(
                     "failed to read v2 object symlink {}: {e}",
@@ -2012,28 +2050,36 @@ fn hash_object_tree_dir(
             let mut target_bytes = Vec::new();
             push_os_str_bytes(&mut target_bytes, target.as_os_str());
             if let Some(hasher) = content_hasher.as_deref_mut() {
-                hash_object_tree_record(hasher, b"symlink", &relative, &target_bytes);
+                hash_object_tree_record(hasher, b"symlink", relative.as_slice(), &target_bytes);
             }
             hash_tree_metadata_record(
                 metadata_hasher,
                 b"symlink",
-                &relative,
+                relative.as_slice(),
                 &metadata,
                 &target_bytes,
             );
+            Ok(())
         } else {
-            return Err(LpmError::Store(format!(
+            path.push(&entry_name);
+            path_pushed = true;
+            Err(LpmError::Store(format!(
                 "unsupported v2 object entry type at {}",
                 path.display()
-            )));
+            )))
+        };
+        relative.truncate(relative_len);
+        if path_pushed {
+            path.pop();
         }
+        result?;
     }
     Ok(())
 }
 
 struct ObjectTreeEntry {
     file_name: OsString,
-    path: PathBuf,
+    metadata: std::fs::Metadata,
 }
 
 fn hash_tree_metadata_record(
@@ -2118,24 +2164,6 @@ fn hash_object_tree_record(hasher: &mut Sha256, kind: &[u8], relative: &[u8], pa
     hasher.update(payload);
 }
 
-fn object_tree_relative_path(root: &Path, path: &Path) -> Result<Vec<u8>, LpmError> {
-    let relative = path.strip_prefix(root).map_err(|e| {
-        LpmError::Store(format!(
-            "failed to relativize v2 object path {} under {}: {e}",
-            path.display(),
-            root.display()
-        ))
-    })?;
-    let mut out = Vec::new();
-    for component in relative.components() {
-        if !out.is_empty() {
-            out.push(b'/');
-        }
-        push_os_str_bytes(&mut out, component.as_os_str());
-    }
-    Ok(out)
-}
-
 #[cfg(unix)]
 fn push_os_str_bytes(out: &mut Vec<u8>, value: &std::ffi::OsStr) {
     use std::os::unix::ffi::OsStrExt;
@@ -2167,10 +2195,20 @@ fn object_entry_mode(metadata: &std::fs::Metadata) -> u32 {
 }
 
 fn is_object_metadata_sidecar(root: &Path, path: &Path) -> bool {
-    if path.parent() != Some(root) {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    is_object_metadata_sidecar_name(root, parent, name)
+}
+
+fn is_object_metadata_sidecar_name(root: &Path, dir: &Path, name: &OsStr) -> bool {
+    if dir != root {
         return false;
     }
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+    let Some(name) = name.to_str() else {
         return false;
     };
     matches!(
@@ -3194,6 +3232,26 @@ mod tests {
         assert!(
             object_dir.join("index.js").symlink_metadata().is_err(),
             "reinstall must remove stale object entries for source files that no longer exist"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_metadata_integrity_ignores_symlink_target_file_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let object_dir = dir.path().join("object");
+        let target = dir.path().join("outside-target.js");
+        std::fs::create_dir_all(&object_dir).unwrap();
+        std::fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, object_dir.join("linked.js")).unwrap();
+
+        let before = compute_tree_metadata_integrity(&object_dir).unwrap();
+        std::fs::write(&target, b"changed-target-content").unwrap();
+        let after = compute_tree_metadata_integrity(&object_dir).unwrap();
+
+        assert_eq!(
+            before, after,
+            "metadata hashing must stat the symlink itself, not the target file"
         );
     }
 
