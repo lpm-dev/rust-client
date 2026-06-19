@@ -1653,6 +1653,12 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         fetch["v2_reusable_validation"].is_object(),
         "detail.fetch.v2_reusable_validation must expose reusable-object validation counters; got {fetch:#?}"
     );
+    for field in ["task_count", "task_sum_ms", "task_max_ms"] {
+        assert!(
+            fetch["breakdown"][field].is_number(),
+            "detail.fetch.breakdown.{field} must be numeric; got {fetch:#?}"
+        );
+    }
     for field in [
         "wall_ms",
         "plan_ms",
@@ -1754,6 +1760,25 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         detail["security"]["provenance"].is_object(),
         "detail.security.provenance must be an object"
     );
+    let speculative = envelope["timing"]["speculative"]
+        .as_object()
+        .unwrap_or_else(|| panic!("timing.speculative must be an object; got {envelope:#?}"));
+    for field in [
+        "dispatched",
+        "completed",
+        "failed",
+        "completed_before_fetch",
+        "consumed_by_fetch",
+        "duplicated_with_fetch",
+        "wasted",
+    ] {
+        assert!(
+            speculative
+                .get(field)
+                .is_some_and(serde_json::Value::is_number),
+            "timing.speculative.{field} must be numeric; got {speculative:#?}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -115,6 +115,29 @@ pub(super) fn push_regular_speculative_dependencies(
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum SpeculativeFetchOutcome {
+    Stored,
+    AlreadyPresent,
+    SkippedNoPermit,
+}
+
+pub(super) fn registry_install_pkg_key(
+    name: &str,
+    version: &str,
+    route_table: &RouteTable,
+) -> String {
+    let registry_url = registry_source_url_for(name, route_table);
+    let source = format!("registry+{registry_url}");
+    let mut key = String::with_capacity(name.len() + 1 + version.len() + 1 + source.len());
+    key.push_str(name);
+    key.push('\x00');
+    key.push_str(version);
+    key.push('\x00');
+    key.push_str(&source);
+    key
+}
+
 /// /: stream metadata AND dispatch speculative
 /// downloads in parallel with NDJSON arrival. Returns the same complete
 /// metadata `HashMap` that `batch_metadata_deep` would — callers are
@@ -152,6 +175,9 @@ pub(super) struct SpeculationJoin {
     pub(super) max_depth_reached: Arc<std::sync::atomic::AtomicU64>,
     pub(super) no_version_match: Arc<std::sync::atomic::AtomicU64>,
     pub(super) unresolved_parked: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) failed: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) skipped_no_permit: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) skipped_auth: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SpeculationJoin {
@@ -182,6 +208,9 @@ impl SpeculationJoin {
         stats.max_depth_reached = self.max_depth_reached.load(Relaxed);
         stats.no_version_match = self.no_version_match.load(Relaxed);
         stats.unresolved_parked = self.unresolved_parked.load(Relaxed);
+        stats.failed = self.failed.load(Relaxed);
+        stats.skipped_no_permit = self.skipped_no_permit.load(Relaxed);
+        stats.skipped_auth = self.skipped_auth.load(Relaxed);
         let summary = match producer_res {
             Some(Ok(Ok(summary))) => summary,
             Some(Ok(Err(e))) => {
@@ -209,6 +238,9 @@ pub(super) struct DispatcherCounters {
     pub(super) max_depth_reached: Arc<std::sync::atomic::AtomicU64>,
     pub(super) no_version_match: Arc<std::sync::atomic::AtomicU64>,
     pub(super) unresolved_parked: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) failed: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) skipped_no_permit: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) skipped_auth: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// spawn the speculation dispatcher as a standalone task.
@@ -228,6 +260,7 @@ pub(super) fn spawn_speculation_dispatcher(
     speculation_semaphore: Option<Arc<Semaphore>>,
     coord: Arc<FetchCoordinator>,
     deps: HashMap<String, String>,
+    spec_tracker: SpeculativeKeyTracker,
     // — under v2 mode the dispatcher routes downloaded
     // bytes through `v2::Store::extract_object_from_bytes` instead of
     // v1's per-`(name, version)` slot. `None` keeps the legacy v1 path
@@ -244,6 +277,7 @@ pub(super) fn spawn_speculation_dispatcher(
     let sem_spec = semaphore;
     let speculation_sem_spec = speculation_semaphore;
     let coord_spec = coord;
+    let spec_tracker_spec = spec_tracker;
     let store_v2_spec = store_v2;
 
     let dispatched = Arc::new(AtomicU64::new(0));
@@ -253,6 +287,9 @@ pub(super) fn spawn_speculation_dispatcher(
     let max_depth_reached = Arc::new(AtomicU64::new(0));
     let no_version_match = Arc::new(AtomicU64::new(0));
     let unresolved_parked = Arc::new(AtomicU64::new(0));
+    let failed = Arc::new(AtomicU64::new(0));
+    let skipped_no_permit = Arc::new(AtomicU64::new(0));
+    let skipped_auth = Arc::new(AtomicU64::new(0));
 
     let dispatched_c = dispatched.clone();
     let completed_c = completed.clone();
@@ -261,6 +298,9 @@ pub(super) fn spawn_speculation_dispatcher(
     let max_depth_c = max_depth_reached.clone();
     let no_match_c = no_version_match.clone();
     let parked_c = unresolved_parked.clone();
+    let failed_c = failed.clone();
+    let skipped_no_permit_c = skipped_no_permit.clone();
+    let skipped_auth_c = skipped_auth.clone();
 
     let mut rx = rx;
     let handle = tokio::spawn(async move {
@@ -330,6 +370,7 @@ pub(super) fn spawn_speculation_dispatcher(
                 if !already_dispatched.insert(key) {
                     return;
                 }
+                let package_key = registry_install_pkg_key(&name, &version, &route_table_spec);
 
                 let skip_auth_bearing_custom_speculation = matches!(
                     route_table_spec.route_for_package(&name),
@@ -373,6 +414,7 @@ pub(super) fn spawn_speculation_dispatcher(
                 // requests here only duplicate authenticated traffic
                 // against private mirrors.
                 if skip_auth_bearing_custom_speculation {
+                    skipped_auth_c.fetch_add(1, Relaxed);
                     return;
                 }
 
@@ -385,35 +427,48 @@ pub(super) fn spawn_speculation_dispatcher(
                 let coord = coord_spec.clone();
                 let completed_task = completed_c.clone();
                 let task_ms_task = task_ms_c.clone();
+                let failed_task = failed_c.clone();
+                let skipped_no_permit_task = skipped_no_permit_c.clone();
+                let spec_tracker_task = spec_tracker_spec.clone();
                 let store_v2_task = store_v2_spec.clone();
                 spec_tasks.push(tokio::spawn(async move {
-                let task_start = std::time::Instant::now();
-                match speculative_download_and_store(
-                    &c,
-                    &rt,
-                    &s,
-                    store_v2_task.as_deref(),
-                    &sem,
-                    spec_sem.as_ref(),
-                    &coord,
-                    &name,
-                    &version,
-                    &url,
-                    integrity.as_deref(),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        completed_task.fetch_add(1, Relaxed);
+                    let task_start = std::time::Instant::now();
+                    match speculative_download_and_store(
+                        &c,
+                        &rt,
+                        &s,
+                        store_v2_task.as_deref(),
+                        &sem,
+                        spec_sem.as_ref(),
+                        &coord,
+                        &name,
+                        &version,
+                        &url,
+                        integrity.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(SpeculativeFetchOutcome::Stored) => {
+                            completed_task.fetch_add(1, Relaxed);
+                            spec_tracker_task.record_completed(package_key);
+                        }
+                        Ok(SpeculativeFetchOutcome::AlreadyPresent) => {
+                            completed_task.fetch_add(1, Relaxed);
+                            spec_tracker_task.record_completed(package_key);
+                        }
+                        Ok(SpeculativeFetchOutcome::SkippedNoPermit) => {
+                            skipped_no_permit_task.fetch_add(1, Relaxed);
+                        }
+                        Err(e) => {
+                            failed_task.fetch_add(1, Relaxed);
+                            spec_tracker_task.record_failed(package_key);
+                            tracing::debug!(
+                                "speculative download {name}@{version} failed (real fetch remains authoritative): {e}"
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::debug!(
-                            "speculative download {name}@{version} failed (real fetch remains authoritative): {e}"
-                        );
-                    }
-                }
-                task_ms_task.fetch_add(task_start.elapsed().as_millis() as u64, Relaxed);
-            }));
+                    task_ms_task.fetch_add(task_start.elapsed().as_millis() as u64, Relaxed);
+                }));
             };
 
         // Main interleave loop: drain the work queue, then wait for the
@@ -495,6 +550,9 @@ pub(super) fn spawn_speculation_dispatcher(
             max_depth_reached,
             no_version_match,
             unresolved_parked,
+            failed,
+            skipped_no_permit,
+            skipped_auth,
         },
     )
 }
@@ -521,7 +579,7 @@ pub(super) async fn speculative_download_and_store(
     version: &str,
     url: &str,
     integrity: Option<&str>,
-) -> Result<(), LpmError> {
+) -> Result<SpeculativeFetchOutcome, LpmError> {
     use futures::stream::TryStreamExt;
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
@@ -535,21 +593,7 @@ pub(super) async fn speculative_download_and_store(
     // package to a private mirror. Tarball-URL packages have a
     // different source_id and naturally don't share locks with
     // speculation — that's correct (speculation never targets them).
-    let registry_url_str = registry_source_url_for(name, route_table);
-    // Build the same compound key ("name\x00version\x00source") that
-    // `install_pkg_key` produces for real-fetch InstallPackages so
-    // the speculation lock and the real fetch lock resolve to the
-    // same entry — both use the same route-table registry URL.
-    let speculation_key = {
-        let src = format!("registry+{registry_url_str}");
-        let mut k = String::with_capacity(name.len() + 1 + version.len() + 1 + src.len());
-        k.push_str(name);
-        k.push('\x00');
-        k.push_str(version);
-        k.push('\x00');
-        k.push_str(&src);
-        k
-    };
+    let speculation_key = registry_install_pkg_key(name, version, route_table);
     let key_lock = coord.lock_for(speculation_key).await;
     let _key_guard = key_lock.lock().await;
 
@@ -569,13 +613,15 @@ pub(super) async fn speculative_download_and_store(
         store.has_package(name, version)
     };
     if already_present {
-        return Ok(());
+        return Ok(SpeculativeFetchOutcome::AlreadyPresent);
     }
 
     let _speculation_permit = match speculation_semaphore {
         Some(limiter) => match limiter.try_acquire() {
             Ok(permit) => Some(permit),
-            Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(()),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                return Ok(SpeculativeFetchOutcome::SkippedNoPermit);
+            }
             Err(tokio::sync::TryAcquireError::Closed) => {
                 return Err(LpmError::Registry(
                     "speculation limiter semaphore closed".into(),
@@ -590,7 +636,9 @@ pub(super) async fn speculative_download_and_store(
     // prefetch and let the real fetch path own the network slot.
     let permit = match semaphore.try_acquire() {
         Ok(permit) => permit,
-        Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(()),
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            return Ok(SpeculativeFetchOutcome::SkippedNoPermit);
+        }
         Err(tokio::sync::TryAcquireError::Closed) => {
             return Err(LpmError::Registry("spec semaphore closed".into()));
         }
@@ -623,7 +671,7 @@ pub(super) async fn speculative_download_and_store(
         })
         .await
         .map_err(|e| LpmError::Registry(format!("spec v2 blocking task: {e}")))??;
-        return Ok(());
+        return Ok(SpeculativeFetchOutcome::Stored);
     }
 
     // v1 path: streaming straight to the per-`(name, version)` slot.
@@ -648,7 +696,7 @@ pub(super) async fn speculative_download_and_store(
     })
     .await
     .map_err(|e| LpmError::Registry(format!("spec blocking task: {e}")))??;
-    Ok(())
+    Ok(SpeculativeFetchOutcome::Stored)
 }
 
 pub(super) struct ResolvedRegistryTarballUrl {

@@ -350,7 +350,7 @@ async fn speculative_v2_download_extracts_object() {
     let speculation_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
     let coord = Arc::new(FetchCoordinator::default());
 
-    speculative_download_and_store(
+    let outcome = speculative_download_and_store(
         &client,
         &route_table,
         &store,
@@ -365,6 +365,7 @@ async fn speculative_v2_download_extracts_object() {
     )
     .await
     .expect("speculative v2 download must succeed");
+    assert_eq!(outcome, SpeculativeFetchOutcome::Stored);
 
     assert!(
         store_v2
@@ -374,6 +375,20 @@ async fn speculative_v2_download_extracts_object() {
         "speculation must populate the v2 object store"
     );
     assert_eq!(semaphore.available_permits(), 1);
+}
+
+#[test]
+fn registry_speculation_key_matches_install_package_key() {
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let mut package = install_package_for_tarball("ignored", None);
+    package.name = "react".to_string();
+    package.version = "19.0.0".to_string();
+    package.source = "registry+https://registry.npmjs.org".to_string();
+
+    assert_eq!(
+        registry_install_pkg_key(&package.name, &package.version, &route_table),
+        install_pkg_key(&package)
+    );
 }
 
 // ── : redirect handling ────────────────────────────────
