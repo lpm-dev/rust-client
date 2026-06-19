@@ -1014,11 +1014,13 @@ async fn run_with_options_under_store_lock(
     // Strict peer mode runs a fresh peer check because the fast path
     // does not have the resolver metadata needed to prove the tree is clean.
     let pkg_content_for_state = std::fs::read_to_string(&pkg_json_path).unwrap_or_default();
+    let setup_state_t = Instant::now();
     let install_state = crate::install_state::check_install_state_with_linker(
         project_dir,
         &pkg_content_for_state,
         linker_mode,
     );
+    let wf_setup_install_state_ms = setup_state_t.elapsed().as_millis();
     let compatibility_bins_ready = !requested_v2_mode
         || lpm_linker::v2::project_compatibility_bins_ready(project_dir, compatibility_bin_names);
     let cleanup_catalogs_in_pipeline = requested_add_count.is_none();
@@ -1408,8 +1410,10 @@ async fn run_with_options_under_store_lock(
     //
     // Fatal `${MISSING_VAR}` errors propagate via `?`, aborting the
     // install before any further work — npm parity.
+    let setup_route_t = Instant::now();
     let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
         .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+    let wf_setup_route_table_ms = setup_route_t.elapsed().as_millis();
     if !json_output {
         // Routine npmrc warnings (per-origin TLS deferred to 58.3,
         // path-prefix token loose-binding, etc.) are advisory and
@@ -2287,6 +2291,10 @@ async fn run_with_options_under_store_lock(
     // arms; hoisted it further to above the empty-deps
     // short-circuit so TLS overrides + `strict-ssl=false` security
     // warning surface for empty-deps installs too).
+    // Wall-timeline milestone: end of the pre-resolve setup band
+    // (config/npmrc/workspace/catalog/lockfile-validate). Captured here so
+    // the otherwise-invisible setup cost surfaces in `timing.waterfall`.
+    let wf_setup_ms = start.elapsed().as_millis();
     let (mut packages, resolve_ms, used_lockfile, mut platform_skipped, latest_stable_versions) =
         match lockfile_result {
             Some(fast_path) => {
@@ -2792,6 +2800,7 @@ async fn run_with_options_under_store_lock(
     // already bound above — speculative dispatcher writes into it
     // during resolve, so by the time we reach here the store may hold
     // tarballs the `has_package` loop below picks up as cache hits.
+    let wf_fetch_start_ms = start.elapsed().as_millis();
     let fetch_start = Instant::now();
 
     // — aggregation buffer for the generalized writeback.
@@ -4261,6 +4270,7 @@ async fn run_with_options_under_store_lock(
     }
 
     let fetch_ms = fetch_start.elapsed().as_millis();
+    let wf_fetch_end_ms = start.elapsed().as_millis();
 
     // Drain any speculation tail after the authoritative fetch phase.
     // This preserves resolve/fetch overlap while making completed
@@ -4292,7 +4302,18 @@ async fn run_with_options_under_store_lock(
     let _ = &link_targets; // retained for downstream consumers below
 
     // Step 5: Link into node_modules
+    let wf_link_start_ms = start.elapsed().as_millis();
     let link_start = Instant::now();
+    // Split of `link_ms` on the v2 event-driven path: time spent awaiting
+    // per-package materialization tasks that spilled past fetch vs the
+    // serial finalize pass (top-level symlinks + bin linking). Zero on the
+    // other link paths.
+    let mut wf_link_await_ms = 0u128;
+    let mut wf_link_finalize_ms = 0u128;
+    let mut wf_link_reconcile_ms = 0u128;
+    let mut wf_link_root_symlinks_ms = 0u128;
+    let mut wf_link_compatibility_ms = 0u128;
+    let mut wf_link_bin_shims_ms = 0u128;
 
     let mut link_result = if event_driven_link {
         //b: event-driven path. Per-pkga future release2 tasks were
@@ -4355,6 +4376,7 @@ async fn run_with_options_under_store_lock(
             let mut materialized_all: Vec<MaterializedPackage> =
                 Vec::with_capacity(v2_event_link_handles.len());
             let mut linked_count = 0usize;
+            let link_await_start = Instant::now();
             for h in v2_event_link_handles.drain(..) {
                 let (m, fresh) = h
                     .await
@@ -4364,8 +4386,15 @@ async fn run_with_options_under_store_lock(
                     linked_count += 1;
                 }
             }
+            wf_link_await_ms = link_await_start.elapsed().as_millis();
+            let link_finalize_start = Instant::now();
             let finalize =
                 lpm_linker::v2::link_v2_finalize(project_dir, plan, store_v2, pkg.name.as_deref())?;
+            wf_link_finalize_ms = link_finalize_start.elapsed().as_millis();
+            wf_link_reconcile_ms = finalize.reconcile_ms;
+            wf_link_root_symlinks_ms = finalize.root_symlinks_ms;
+            wf_link_compatibility_ms = finalize.compatibility_ms;
+            wf_link_bin_shims_ms = finalize.bin_shims_ms;
             let target_total = plan.augmented_targets.len();
             LinkResult {
                 linked: linked_count,
@@ -4400,6 +4429,12 @@ async fn run_with_options_under_store_lock(
     };
 
     let link_ms = link_start.elapsed().as_millis();
+    let wf_link_end_ms = start.elapsed().as_millis();
+    // Post-link tail sub-stages for `timing.waterfall.detail` (env-gated).
+    // `blocked_metadata` defaults to 0 because the lockfile-fast-path skips
+    // the enrich; the trust snapshot always runs, so it is set unconditionally.
+    let mut wf_tail_blocked_metadata_ms = 0u128;
+    let wf_tail_trust_snapshot_ms;
     // `link_ms` lands in the verbose footer and the JSON timing object;
     // no dedicated "Linked in Xms" line.
 
@@ -4461,10 +4496,11 @@ async fn run_with_options_under_store_lock(
     } else {
         let metadata =
             build_blocked_set_metadata(arc_client.as_ref(), &route_table, &packages).await;
+        wf_tail_blocked_metadata_ms = blocked_metadata_start.elapsed().as_millis();
         tracing::debug!(
             "perf.build_blocked_set_metadata pkgs={} ms={}",
             packages.len(),
-            blocked_metadata_start.elapsed().as_millis()
+            wf_tail_blocked_metadata_ms
         );
         metadata
     };
@@ -4664,10 +4700,8 @@ async fn run_with_options_under_store_lock(
         if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
             tracing::warn!("failed to write trust-snapshot.json: {e}");
         }
-        tracing::debug!(
-            "perf.trust_snapshot ms={}",
-            trust_snap_start.elapsed().as_millis()
-        );
+        wf_tail_trust_snapshot_ms = trust_snap_start.elapsed().as_millis();
+        tracing::debug!("perf.trust_snapshot ms={}", wf_tail_trust_snapshot_ms);
     }
 
     // Step 7: LPM-Native Intelligence
@@ -5268,6 +5302,25 @@ async fn run_with_options_under_store_lock(
                        "fetch_ms": fetch_ms,
                        "link_ms": link_ms,
                        "total_ms": elapsed.as_millis(),
+                       // Wall waterfall: `total_ms` decomposed into
+                       // accountable, non-overlapping wall segments (they
+                       // sum to `total_ms`), so the previously-invisible
+                       // pre-resolve setup band and post-link tail are
+                       // attributable. `pre_fetch`/`pre_link` are the
+                       // inter-phase bands (peer checks, cache-hit gating).
+                       "waterfall": {
+                           "setup_ms": wf_setup_ms,
+                           "resolve_ms": resolve_ms,
+                           "pre_fetch_ms": wf_fetch_start_ms
+                               .saturating_sub(wf_setup_ms.saturating_add(resolve_ms)),
+                           "fetch_ms": fetch_ms,
+                           "pre_link_ms": wf_link_start_ms.saturating_sub(wf_fetch_end_ms),
+                           "link_ms": link_ms,
+                           "link_await_ms": wf_link_await_ms,
+                           "link_finalize_ms": wf_link_finalize_ms,
+                           "tail_ms": elapsed.as_millis().saturating_sub(wf_link_end_ms),
+                           "total_ms": elapsed.as_millis(),
+                       },
         // Nested resolver breakdown:
         //
         // seeded this object with `platform_skipped`.
@@ -5493,6 +5546,39 @@ async fn run_with_options_under_store_lock(
                    "peer_conflicts": [],
                    "peer_issues": peer_issues_json_value(&[], &[]),
                });
+        // Env-gated verbose timing detail (`LPM_TIMING_DETAIL`): fine
+        // sub-stage breakdowns too noisy for the default envelope. Today it
+        // carries the link-finalize split — `compatibility_ms` is the
+        // framework compat island, ~0 on a plain install since it is
+        // deferred to `lpm dev`/`lpm run`. (Resolve and fetch already have
+        // always-on detail under `timing.resolve` and
+        // `timing.fetch_breakdown`.)
+        if std::env::var_os("LPM_TIMING_DETAIL").is_some() {
+            json["timing"]["waterfall"]["detail"] = serde_json::json!({
+                "setup": {
+                    "install_state_ms": wf_setup_install_state_ms,
+                    "route_table_ms": wf_setup_route_table_ms,
+                    "other_ms": wf_setup_ms.saturating_sub(
+                        wf_setup_install_state_ms.saturating_add(wf_setup_route_table_ms),
+                    ),
+                },
+                "link": {
+                    "reconcile_ms": wf_link_reconcile_ms,
+                    "root_symlinks_ms": wf_link_root_symlinks_ms,
+                    "compatibility_ms": wf_link_compatibility_ms,
+                    "bin_shims_ms": wf_link_bin_shims_ms,
+                },
+                "tail": {
+                    "blocked_metadata_ms": wf_tail_blocked_metadata_ms,
+                    "trust_snapshot_ms": wf_tail_trust_snapshot_ms,
+                    "other_ms": elapsed
+                        .as_millis()
+                        .saturating_sub(wf_link_end_ms)
+                        .saturating_sub(wf_tail_blocked_metadata_ms)
+                        .saturating_sub(wf_tail_trust_snapshot_ms),
+                },
+            });
+        }
         // surface workspace target set for agents.
         // None for legacy/standalone callers; Some(...) for the filtered path.
         if let Some(targets) = target_set {

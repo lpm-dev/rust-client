@@ -520,6 +520,13 @@ pub struct LinkV2FinalizeResult {
     pub bin_count: usize,
     /// Whether `<project>/node_modules/<self_pkg_name>` was created.
     pub self_referenced: bool,
+    /// Wall-ms in each finalize sub-stage, for `timing.waterfall.detail`.
+    /// `compatibility_ms` is the framework compat island (~0 on a plain
+    /// install since it is deferred to `lpm dev`/`lpm run`).
+    pub reconcile_ms: u128,
+    pub root_symlinks_ms: u128,
+    pub compatibility_ms: u128,
+    pub bin_shims_ms: u128,
 }
 
 /// Step 3 of the event-driven v2 link API.
@@ -559,16 +566,21 @@ fn link_v2_finalize_inner(
     )
     .entered();
     let augmented_slice = &plan.augmented_targets[..];
+    let stage_timer = std::time::Instant::now();
     reconcile_project_node_modules(
         project_dir,
         augmented_slice,
         self_package_name,
         !plan.compatibility_bin_names.is_empty(),
     )?;
+    let reconcile_ms = stage_timer.elapsed().as_millis();
+    let stage_timer = std::time::Instant::now();
     let symlinked = {
         let _s = tracing::info_span!("linker.finalize.root_symlinks").entered();
         create_root_symlinks(project_dir, augmented_slice, store, &plan.key_map)?
     };
+    let root_symlinks_ms = stage_timer.elapsed().as_millis();
+    let stage_timer = std::time::Instant::now();
     let compatibility_links = {
         let _s = tracing::info_span!("linker.finalize.compatibility").entered();
         create_project_compatibility_links(
@@ -580,6 +592,8 @@ fn link_v2_finalize_inner(
             refresh_compatibility_copies,
         )?
     };
+    let compatibility_ms = stage_timer.elapsed().as_millis();
+    let stage_timer = std::time::Instant::now();
     let bin_count = {
         let _s = tracing::info_span!("linker.finalize.bin_shims").entered();
         create_bin_links_v2(
@@ -590,6 +604,7 @@ fn link_v2_finalize_inner(
             &compatibility_links,
         )?
     };
+    let bin_shims_ms = stage_timer.elapsed().as_millis();
     let self_referenced = if let Some(self_name) = self_package_name {
         create_self_ref(project_dir, self_name)?
     } else {
@@ -599,6 +614,10 @@ fn link_v2_finalize_inner(
         symlinked,
         bin_count,
         self_referenced,
+        reconcile_ms,
+        root_symlinks_ms,
+        compatibility_ms,
+        bin_shims_ms,
     })
 }
 
@@ -1537,6 +1556,19 @@ fn create_project_compatibility_links(
     refresh_package_copies: bool,
 ) -> Result<CompatibilityLinks, LpmError> {
     let requested_bins = normalize_compatibility_bin_names(compatibility_bin_names);
+
+    // No compatibility bins requested → no island. A plain `lpm install`
+    // passes none; the framework compat island is only needed when a dev
+    // entrypoint actually runs, and `lpm dev`/`lpm run` supply that
+    // entrypoint's bin name. Treating empty as "match any bin" rebuilt the
+    // island for every bin-shipping direct dep — ~280 ms on every cold
+    // install. `lpm dev` rebuilds a missing island on startup
+    // (auto_install_if_stale → dev_entrypoint_compatibility_missing), so
+    // skipping it here is safe; leave any existing island in place (no
+    // churn — `lpm dev` owns its lifecycle).
+    if requested_bins.is_empty() {
+        return Ok(CompatibilityLinks::default());
+    }
     let roots = collect_compatibility_roots_for_bins(targets, store, key_map, &requested_bins);
 
     if roots.is_empty() {
@@ -3314,7 +3346,15 @@ mod tests {
             vec![tool, target("helper", "1.0.0", &helper_sri, false)]
         };
 
-        link_packages_v2(&project, make_targets(), &store, LinkerMode::Isolated, None).unwrap();
+        link_packages_v2_with_compatibility_bin_names(
+            &project,
+            make_targets(),
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &["tool".to_string()],
+        )
+        .unwrap();
 
         // (1) Exactly one cached island, published with its completion sentinel.
         let compat_store_root = store.paths().compat_root();
@@ -3351,7 +3391,15 @@ mod tests {
         std::fs::write(&probe, b"x").unwrap();
         std::fs::remove_dir_all(project.join("node_modules")).unwrap();
 
-        link_packages_v2(&project, make_targets(), &store, LinkerMode::Isolated, None).unwrap();
+        link_packages_v2_with_compatibility_bin_names(
+            &project,
+            make_targets(),
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &["tool".to_string()],
+        )
+        .unwrap();
 
         let still_one = std::fs::read_dir(compat_store_root)
             .unwrap()
@@ -3524,6 +3572,72 @@ mod tests {
         );
     }
 
+    /// A plain `lpm install` (no compatibility bins) links bin shims but
+    /// does NOT build the framework compat island — that work is deferred to
+    /// `lpm dev`/`lpm run`, which pass the entrypoint's bin name and rebuild
+    /// a missing island on startup. Building it for every bin-shipping direct
+    /// dep on every install cost ~280 ms cold.
+    #[test]
+    fn plain_install_links_bins_but_skips_compat_island() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let tool_sri = synthetic_sri(b"v2/plain-install/tool");
+        write_object(
+            &store,
+            &tool_sri,
+            &[
+                (
+                    "package.json",
+                    br#"{"name":"tool","version":"1.0.0","bin":{"tool":"bin/tool.js"},"dependencies":{"helper":"1.0.0"}}"#,
+                ),
+                ("bin/tool.js", b"#!/usr/bin/env node\n"),
+            ],
+        );
+        let helper_sri = synthetic_sri(b"v2/plain-install/helper");
+        write_object(
+            &store,
+            &helper_sri,
+            &[("package.json", br#"{"name":"helper","version":"1.0.0"}"#)],
+        );
+
+        let mut tool = target("tool", "1.0.0", &tool_sri, true);
+        tool.target.dependencies = vec![LinkDependency::registry("helper", "1.0.0")];
+
+        // Empty compatibility bins == plain `lpm install`.
+        let result = link_packages_v2(
+            &project,
+            vec![tool, target("helper", "1.0.0", &helper_sri, false)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.bin_linked, 1,
+            "bin shims must still be linked on a plain install"
+        );
+        assert!(
+            project
+                .join("node_modules")
+                .join(".bin")
+                .join("tool")
+                .exists(),
+            "tool's bin shim must exist after a plain install",
+        );
+        assert!(
+            !project
+                .join("node_modules")
+                .join(".lpm")
+                .join("compat")
+                .exists(),
+            "a plain install (no compatibility bins) must NOT build the compat island",
+        );
+    }
+
     #[test]
     fn link_packages_v2_materializes_direct_bin_without_unrelated_direct_deps() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3559,7 +3673,9 @@ mod tests {
         let mut tool = target("tool", "1.0.0", &tool_sri, true);
         tool.target.dependencies = vec![LinkDependency::registry("helper", "1.0.0")];
 
-        let result = link_packages_v2(
+        // The compat island is built on the explicit-bin (`lpm dev`) path;
+        // request `tool` so the selective-copy property below is exercised.
+        let result = link_packages_v2_with_compatibility_bin_names(
             &project,
             vec![
                 tool,
@@ -3569,6 +3685,7 @@ mod tests {
             &store,
             LinkerMode::Isolated,
             None,
+            &["tool".to_string()],
         )
         .unwrap();
 
