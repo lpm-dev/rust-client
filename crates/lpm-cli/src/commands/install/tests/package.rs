@@ -111,6 +111,14 @@ async fn prevalidate_v2_reusable_objects_removes_tampered_registry_objects() {
 }
 
 #[test]
+fn v2_link_task_concurrency_caps_large_warm_relink_batches() {
+    let concurrency = v2_link_task_concurrency(1309);
+
+    assert!(concurrency <= V2_LINK_TASK_MAX_CONCURRENCY);
+    assert!(concurrency < 1309);
+}
+
+#[test]
 fn store_has_source_aware_does_not_accept_registry_for_tarball_pkg() {
     // Construct: a registry-CAS entry exists at (name, version).
     // A Source::Tarball InstallPackage with the *same* (name,
