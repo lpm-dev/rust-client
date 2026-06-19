@@ -132,7 +132,8 @@ async fn prevalidate_v2_reusable_objects_returns_ready_links_for_valid_link_entr
     assert_eq!(prevalidation.candidate_count, 1);
     assert!(prevalidation.hits.is_empty());
     assert_eq!(prevalidation.ready_links.len(), 1);
-    assert_eq!(prevalidation.validation_timings.checked_count, 0);
+    assert_eq!(prevalidation.validation_timings.checked_count, 1);
+    assert_eq!(prevalidation.validation_timings.hit_count, 1);
     let ready = prevalidation
         .ready_links
         .get(&key)

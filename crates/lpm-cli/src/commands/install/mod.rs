@@ -237,7 +237,9 @@ async fn prevalidate_v2_reusable_objects(
     let mut checks = futures::stream::iter(candidates.into_iter().map(|candidate| {
         let store_v2 = Arc::clone(&store_v2);
         tokio::task::spawn_blocking(move || {
-            if let (Some(plan), Some(target)) = (
+            let (hit, timings) = store_v2.reusable_object_with_timings(&candidate.sri)?;
+            if let (Some(_), Some(plan), Some(target)) = (
+                hit.as_ref(),
                 candidate.link_reuse_plan.as_ref(),
                 candidate.link_reuse_target.as_ref(),
             ) {
@@ -252,10 +254,10 @@ async fn prevalidate_v2_reusable_objects(
                             freshly_populated: false,
                             ms: start.elapsed().as_millis(),
                         },
+                        timings,
                     });
                 }
             }
-            let (hit, timings) = store_v2.reusable_object_with_timings(&candidate.sri)?;
             Ok::<V2PrevalidationCheck, LpmError>(V2PrevalidationCheck::Object {
                 key: candidate.key,
                 hit,
@@ -272,7 +274,8 @@ async fn prevalidate_v2_reusable_objects(
         match result
             .map_err(|e| LpmError::Registry(format!("v2 cache check task panicked: {e}")))??
         {
-            V2PrevalidationCheck::ReadyLink { key, task } => {
+            V2PrevalidationCheck::ReadyLink { key, task, timings } => {
+                validation_timings.record(timings, true);
                 ready_links.insert(key, task);
             }
             V2PrevalidationCheck::Object { key, hit, timings } => {
@@ -296,6 +299,7 @@ enum V2PrevalidationCheck {
     ReadyLink {
         key: String,
         task: V2LinkTaskResult,
+        timings: lpm_store::v2::ReusableObjectCheckTimings,
     },
     Object {
         key: String,
