@@ -1457,10 +1457,6 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
     assert_eq!(envelope["patches_fingerprint"], serde_json::Value::Null);
     assert_eq!(envelope["blocked_set_fingerprint"], serde_json::Value::Null);
 
-    // `timing.waterfall` is a stable `--json` surface (the snapshot redacts the
-    // whole `timing` object as high-variance, so assert its contract here): it
-    // must be present on the full-install path and its non-overlapping segments
-    // must sum to `total_ms`.
     let waterfall = &envelope["timing"]["waterfall"];
     assert!(
         waterfall.is_object(),
@@ -1873,8 +1869,6 @@ async fn install_up_to_date_json_includes_flag() {
     assert_eq!(json["success"], true);
     assert_eq!(json["up_to_date"], true);
     assertions::assert_json_field(&json, "duration_ms", assertions::JsonType::Number);
-    // Fast-path shape parity: the up-to-date fast-exit still emits
-    // `timing.waterfall`, with its total matching `timing.total_ms`.
     assert!(
         json["timing"]["waterfall"].is_object(),
         "up-to-date --json must still emit timing.waterfall; got {json:#}"
@@ -1885,12 +1879,6 @@ async fn install_up_to_date_json_includes_flag() {
     );
 }
 
-/// A project with a direct **bin** dependency must still hit the up-to-date
-/// fast-exit on a warm install. Regression guard: deferring the framework compat
-/// island from plain installs left `project_compatibility_bins_ready` expecting
-/// an island that is never built, so a warm install would miss the fast-exit and
-/// do full work every time. The install gate now treats empty compatibility bins
-/// as ready.
 #[tokio::test]
 async fn warm_install_with_direct_bin_dep_is_up_to_date() {
     let mock = MockRegistry::start().await;
@@ -1898,11 +1886,21 @@ async fn warm_install_with_direct_bin_dep_is_up_to_date() {
         serde_json::json!({
             "name": "tool",
             "version": "1.0.0",
-            "bin": { "tool": "bin/tool.js" }
+            "bin": { "tool": "bin/tool.js" },
+            "dependencies": { "helper": "1.0.0" }
         }),
         &[("bin/tool.js", b"#!/usr/bin/env node\n")],
     );
     mock.with_package("tool", "1.0.0", &tarball).await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "helper",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = 'helper';\n")],
+    )
+    .await;
     let batch_meta = serde_json::json!({
         "name": "tool",
         "dist-tags": { "latest": "1.0.0" },
@@ -1915,7 +1913,7 @@ async fn warm_install_with_direct_bin_dep_is_up_to_date() {
                     "tarball": format!("{}/tarballs/tool/-/tool-1.0.0.tgz", mock.url()),
                     "integrity": "sha512-placeholder",
                 },
-                "dependencies": {}
+                "dependencies": { "helper": "1.0.0" }
             }
         },
         "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
@@ -1930,7 +1928,6 @@ async fn warm_install_with_direct_bin_dep_is_up_to_date() {
     }"#,
     );
 
-    // Cold install (a plain install — does not build the compat island).
     lpm_with_registry(&project, &mock.url())
         .args([
             "install",
@@ -1941,7 +1938,6 @@ async fn warm_install_with_direct_bin_dep_is_up_to_date() {
         .assert()
         .success();
 
-    // Warm install must fast-exit even though `tool` ships a bin.
     let output = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
@@ -1958,7 +1954,6 @@ async fn warm_install_with_direct_bin_dep_is_up_to_date() {
         json["up_to_date"], true,
         "a warm install with a direct bin dep must fast-exit; got {json:#}"
     );
-    // Bin shims are still linked on a plain install (only the island is skipped).
     assert!(
         project
             .path()

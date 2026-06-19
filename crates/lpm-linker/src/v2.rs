@@ -520,12 +520,13 @@ pub struct LinkV2FinalizeResult {
     pub bin_count: usize,
     /// Whether `<project>/node_modules/<self_pkg_name>` was created.
     pub self_referenced: bool,
-    /// Wall-ms in each finalize sub-stage, for `timing.waterfall.detail`.
-    /// `compatibility_ms` is the framework compat island (~0 on a plain
-    /// install since it is deferred to `lpm dev`/`lpm run`).
+    /// Time spent reconciling stale root entries.
     pub reconcile_ms: u128,
+    /// Time spent writing project root symlinks.
     pub root_symlinks_ms: u128,
+    /// Time spent preparing compatibility links.
     pub compatibility_ms: u128,
+    /// Time spent writing `.bin` shims.
     pub bin_shims_ms: u128,
 }
 
@@ -567,17 +568,7 @@ fn link_v2_finalize_inner(
     .entered();
     let augmented_slice = &plan.augmented_targets[..];
     let stage_timer = std::time::Instant::now();
-    reconcile_project_node_modules(
-        project_dir,
-        augmented_slice,
-        self_package_name,
-        // Always preserve `node_modules/.lpm`: the compat island under it is
-        // owned by `create_project_compatibility_links` (built / replaced /
-        // removed there), not by this stale-root-entry reconcile. Removing it
-        // here on a plain install would delete a `lpm dev`-built island and
-        // force the next dev/run to rebuild it.
-        true,
-    )?;
+    reconcile_project_node_modules(project_dir, augmented_slice, self_package_name, true)?;
     let reconcile_ms = stage_timer.elapsed().as_millis();
     let stage_timer = std::time::Instant::now();
     let symlinked = {
@@ -1414,6 +1405,7 @@ struct CompatIslandKeySeed<'a> {
 struct BinLinkSpec {
     cmd_name: String,
     target: PathBuf,
+    needs_project_node_path: bool,
 }
 
 fn project_compatibility_root(project_dir: &Path) -> PathBuf {
@@ -1562,15 +1554,6 @@ fn create_project_compatibility_links(
 ) -> Result<CompatibilityLinks, LpmError> {
     let requested_bins = normalize_compatibility_bin_names(compatibility_bin_names);
 
-    // No compatibility bins requested → no island. A plain `lpm install`
-    // passes none; the framework compat island is only needed when a dev
-    // entrypoint actually runs, and `lpm dev`/`lpm run` supply that
-    // entrypoint's bin name. Treating empty as "match any bin" rebuilt the
-    // island for every bin-shipping direct dep — ~280 ms on every cold
-    // install. `lpm dev` rebuilds a missing island on startup
-    // (auto_install_if_stale → dev_entrypoint_compatibility_missing), so
-    // skipping it here is safe; leave any existing island in place (no
-    // churn — `lpm dev` owns its lifecycle).
     if requested_bins.is_empty() {
         return Ok(CompatibilityLinks::default());
     }
@@ -2599,6 +2582,7 @@ fn create_bin_links_v2(
     compatibility_links: &CompatibilityLinks,
 ) -> Result<usize, LpmError> {
     let bin_dir = project_dir.join("node_modules").join(".bin");
+    let project_node_modules = project_dir.join("node_modules");
 
     // Scratch `PathBuf`s reused across iterations: the per-iteration
     // paths build into reusable buffers rather than allocating fresh
@@ -2616,8 +2600,8 @@ fn create_bin_links_v2(
             Some(k) => k,
             None => continue,
         };
-        let pkg_dir = compatibility_links
-            .package_dir_for_key(key)
+        let compatibility_pkg_dir = compatibility_links.package_dir_for_key(key);
+        let pkg_dir = compatibility_pkg_dir
             .map_or_else(|| store.paths().link_package_dir(key), Path::to_path_buf);
         pkg_json_path.clear();
         pkg_json_path.push(&pkg_dir);
@@ -2655,6 +2639,8 @@ fn create_bin_links_v2(
         if entries.is_empty() {
             continue;
         }
+        let needs_project_node_path =
+            compatibility_pkg_dir.is_none() && manifest_needs_bin_compatibility(&content);
 
         for (cmd_name, bin_rel_path) in entries {
             // Reject bin entries whose key would write outside `.bin/`
@@ -2705,6 +2691,7 @@ fn create_bin_links_v2(
             specs.push(BinLinkSpec {
                 cmd_name,
                 target: bin_target.clone(),
+                needs_project_node_path,
             });
         }
     }
@@ -2738,25 +2725,31 @@ fn create_bin_links_v2(
         link_path.push(&spec.cmd_name);
 
         #[cfg(unix)]
-        let relative =
-            pathdiff::diff_paths(&spec.target, &bin_dir).unwrap_or_else(|| spec.target.clone());
-
-        #[cfg(unix)]
         {
-            if std::fs::read_link(&link_path).is_ok_and(|existing| existing == relative) {
-                count += 1;
-                continue;
+            if spec.needs_project_node_path {
+                write_unix_project_node_path_wrapper(
+                    &link_path,
+                    &spec.target,
+                    &project_node_modules,
+                )?;
+            } else {
+                let relative = pathdiff::diff_paths(&spec.target, &bin_dir)
+                    .unwrap_or_else(|| spec.target.clone());
+                if std::fs::read_link(&link_path).is_ok_and(|existing| existing == relative) {
+                    count += 1;
+                    continue;
+                }
+                if link_path.symlink_metadata().is_ok() {
+                    remove_node_modules_entry(&link_path, "stale bin shim")?;
+                }
+                std::os::unix::fs::symlink(&relative, &link_path).map_err(|e| {
+                    LpmError::Store(format!(
+                        "v2 linker: failed to create bin shim {} → {}: {e}",
+                        link_path.display(),
+                        relative.display()
+                    ))
+                })?;
             }
-            if link_path.symlink_metadata().is_ok() {
-                remove_node_modules_entry(&link_path, "stale bin shim")?;
-            }
-            std::os::unix::fs::symlink(&relative, &link_path).map_err(|e| {
-                LpmError::Store(format!(
-                    "v2 linker: failed to create bin shim {} → {}: {e}",
-                    link_path.display(),
-                    relative.display()
-                ))
-            })?;
         }
 
         #[cfg(windows)]
@@ -2775,8 +2768,21 @@ fn create_bin_links_v2(
                 );
                 continue;
             }
+            let node_path_prefix = if spec.needs_project_node_path {
+                let node_path_str = project_node_modules.to_string_lossy();
+                if let Err(reason) = lpm_common::symlink::validate_cmd_path(&node_path_str) {
+                    tracing::warn!(
+                        "v2 linker: skipping .cmd shim for {}: {reason}",
+                        spec.cmd_name
+                    );
+                    continue;
+                }
+                format!("@SET \"NODE_PATH={node_path_str};%NODE_PATH%\"\n")
+            } else {
+                String::new()
+            };
             let cmd_content = format!(
-                "@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target_str}\" %*\n) ELSE (\n  node \"{target_str}\" %*\n)",
+                "{node_path_prefix}@IF EXIST \"%~dp0\\node.exe\" (\n  \"%~dp0\\node.exe\" \"{target_str}\" %*\n) ELSE (\n  node \"{target_str}\" %*\n)",
             );
             let cmd_path = bin_dir.join(format!("{}.cmd", spec.cmd_name));
             if std::fs::read_to_string(&cmd_path).is_ok_and(|existing| existing == cmd_content) {
@@ -2798,8 +2804,86 @@ fn create_bin_links_v2(
     Ok(count)
 }
 
-// Tiny helper called per-target — `#[inline]` so the per-iteration
-// call shrinks to a single branch.
+#[cfg(unix)]
+fn write_unix_project_node_path_wrapper(
+    link_path: &Path,
+    target: &Path,
+    project_node_modules: &Path,
+) -> Result<(), LpmError> {
+    let content = unix_project_node_path_wrapper_content(target, project_node_modules);
+    let metadata = match link_path.symlink_metadata() {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(LpmError::Store(format!(
+                "v2 linker: failed to inspect bin shim at {}: {error}",
+                link_path.display()
+            )));
+        }
+    };
+    if metadata.as_ref().is_some_and(|metadata| {
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+    }) && std::fs::read_to_string(link_path).is_ok_and(|existing| existing == content)
+    {
+        return set_unix_bin_shim_executable(link_path);
+    }
+    if metadata.is_some() {
+        remove_node_modules_entry(link_path, "stale bin shim")?;
+    }
+    std::fs::write(link_path, content).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to write bin shim at {}: {e}",
+            link_path.display()
+        ))
+    })?;
+    set_unix_bin_shim_executable(link_path)
+}
+
+#[cfg(unix)]
+fn set_unix_bin_shim_executable(link_path: &Path) -> Result<(), LpmError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(link_path)
+        .map_err(|e| {
+            LpmError::Store(format!(
+                "v2 linker: failed to inspect bin shim at {}: {e}",
+                link_path.display()
+            ))
+        })?
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(link_path, permissions).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 linker: failed to mark bin shim executable at {}: {e}",
+            link_path.display()
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn unix_project_node_path_wrapper_content(target: &Path, project_node_modules: &Path) -> String {
+    format!(
+        "#!/bin/sh\nNODE_PATH={}${{NODE_PATH:+:$NODE_PATH}}\nexport NODE_PATH\nexec {} \"$@\"\n",
+        shell_quote_path(project_node_modules),
+        shell_quote_path(target),
+    )
+}
+
+#[cfg(unix)]
+fn shell_quote_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
 #[inline]
 fn is_direct(target: &LinkTarget) -> bool {
     if let Some(names) = &target.root_link_names {
@@ -3577,11 +3661,6 @@ mod tests {
         );
     }
 
-    /// A plain `lpm install` (no compatibility bins) links bin shims but
-    /// does NOT build the framework compat island — that work is deferred to
-    /// `lpm dev`/`lpm run`, which pass the entrypoint's bin name and rebuild
-    /// a missing island on startup. Building it for every bin-shipping direct
-    /// dep on every install cost ~280 ms cold.
     #[test]
     fn plain_install_links_bins_but_skips_compat_island() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3611,7 +3690,6 @@ mod tests {
         let mut tool = target("tool", "1.0.0", &tool_sri, true);
         tool.target.dependencies = vec![LinkDependency::registry("helper", "1.0.0")];
 
-        // Empty compatibility bins == plain `lpm install`.
         let result = link_packages_v2(
             &project,
             vec![tool, target("helper", "1.0.0", &helper_sri, false)],
@@ -3625,14 +3703,22 @@ mod tests {
             result.bin_linked, 1,
             "bin shims must still be linked on a plain install"
         );
+        #[cfg(windows)]
+        let shim = project.join("node_modules").join(".bin").join("tool.cmd");
+        #[cfg(not(windows))]
+        let shim = project.join("node_modules").join(".bin").join("tool");
         assert!(
-            project
-                .join("node_modules")
-                .join(".bin")
-                .join("tool")
-                .exists(),
+            shim.exists(),
             "tool's bin shim must exist after a plain install",
         );
+        #[cfg(unix)]
+        {
+            let shim_content = std::fs::read_to_string(&shim).expect("tool shim");
+            assert!(
+                shim_content.contains("NODE_PATH="),
+                "dependency-bearing bin should get project NODE_PATH wrapper"
+            );
+        }
         assert!(
             !project
                 .join("node_modules")
@@ -3678,8 +3764,6 @@ mod tests {
         let mut tool = target("tool", "1.0.0", &tool_sri, true);
         tool.target.dependencies = vec![LinkDependency::registry("helper", "1.0.0")];
 
-        // The compat island is built on the explicit-bin (`lpm dev`) path;
-        // request `tool` so the selective-copy property below is exercised.
         let result = link_packages_v2_with_compatibility_bin_names(
             &project,
             vec![

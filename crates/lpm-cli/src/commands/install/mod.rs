@@ -1021,12 +1021,6 @@ async fn run_with_options_under_store_lock(
         linker_mode,
     );
     let wf_setup_install_state_ms = setup_state_t.elapsed().as_millis();
-    // A plain `lpm install` passes no compatibility bins and does not build the
-    // framework compat island (see `create_project_compatibility_links`), so its
-    // up-to-date readiness must not require island shims that are never created.
-    // Without the empty-bins short-circuit, a project with a direct bin dep would
-    // miss the up-to-date fast-exit on every warm install. `lpm dev`/`lpm run`
-    // pass the entrypoint bin (non-empty) and still verify island readiness.
     let compatibility_bins_ready = !requested_v2_mode
         || compatibility_bin_names.is_empty()
         || lpm_linker::v2::project_compatibility_bins_ready(project_dir, compatibility_bin_names);
@@ -1062,10 +1056,6 @@ async fn run_with_options_under_store_lock(
                                "fetch_ms": 0u128,
                                "link_ms": 0u128,
                                "total_ms": total_ms,
-                               // Shape parity with the full-install path: a
-                               // `waterfall` is always present so consumers can
-                               // read `timing.waterfall` uniformly. No resolve /
-                               // fetch / link ran, so the cost is all setup.
                                "waterfall": {
                                    "setup_ms": total_ms,
                                    "resolve_ms": 0u128,
@@ -1617,10 +1607,6 @@ async fn run_with_options_under_store_lock(
                                "fetch_ms": 0u128,
                                "link_ms": 0u128,
                                "total_ms": total_ms,
-                               // Shape parity with the full-install path: a
-                               // `waterfall` is always present so consumers can
-                               // read `timing.waterfall` uniformly. No resolve /
-                               // fetch / link ran, so the cost is all setup.
                                "waterfall": {
                                    "setup_ms": total_ms,
                                    "resolve_ms": 0u128,
@@ -2330,9 +2316,6 @@ async fn run_with_options_under_store_lock(
     // arms; hoisted it further to above the empty-deps
     // short-circuit so TLS overrides + `strict-ssl=false` security
     // warning surface for empty-deps installs too).
-    // Wall-timeline milestone: end of the pre-resolve setup band
-    // (config/npmrc/workspace/catalog/lockfile-validate). Captured here so
-    // the otherwise-invisible setup cost surfaces in `timing.waterfall`.
     let wf_setup_ms = start.elapsed().as_millis();
     let (mut packages, resolve_ms, used_lockfile, mut platform_skipped, latest_stable_versions) =
         match lockfile_result {
@@ -2799,6 +2782,7 @@ async fn run_with_options_under_store_lock(
                 (packages, ms, false, platform_skipped, latest_stable)
             }
         };
+    let wf_resolve_end_ms = start.elapsed().as_millis();
 
     if requested_v2_mode && !v2_workspace_root_pre_resolve.install_pkgs.is_empty() {
         packages.extend(v2_workspace_root_pre_resolve.install_pkgs.iter().cloned());
@@ -4469,9 +4453,6 @@ async fn run_with_options_under_store_lock(
 
     let link_ms = link_start.elapsed().as_millis();
     let wf_link_end_ms = start.elapsed().as_millis();
-    // Post-link tail sub-stages for `timing.waterfall.detail` (env-gated).
-    // `blocked_metadata` defaults to 0 because the lockfile-fast-path skips
-    // the enrich; the trust snapshot always runs, so it is set unconditionally.
     let mut wf_tail_blocked_metadata_ms = 0u128;
     let wf_tail_trust_snapshot_ms;
     // `link_ms` lands in the verbose footer and the JSON timing object;
@@ -5341,20 +5322,13 @@ async fn run_with_options_under_store_lock(
                        "fetch_ms": fetch_ms,
                        "link_ms": link_ms,
                        "total_ms": elapsed.as_millis(),
-                       // Wall waterfall: `total_ms` decomposed into
-                       // accountable, non-overlapping wall segments (they
-                       // sum to `total_ms`), so the previously-invisible
-                       // pre-resolve setup band and post-link tail are
-                       // attributable. `pre_fetch`/`pre_link` are the
-                       // inter-phase bands (peer checks, cache-hit gating).
                        "waterfall": {
                            "setup_ms": wf_setup_ms,
-                           "resolve_ms": resolve_ms,
-                           "pre_fetch_ms": wf_fetch_start_ms
-                               .saturating_sub(wf_setup_ms.saturating_add(resolve_ms)),
-                           "fetch_ms": fetch_ms,
+                           "resolve_ms": wf_resolve_end_ms.saturating_sub(wf_setup_ms),
+                           "pre_fetch_ms": wf_fetch_start_ms.saturating_sub(wf_resolve_end_ms),
+                           "fetch_ms": wf_fetch_end_ms.saturating_sub(wf_fetch_start_ms),
                            "pre_link_ms": wf_link_start_ms.saturating_sub(wf_fetch_end_ms),
-                           "link_ms": link_ms,
+                           "link_ms": wf_link_end_ms.saturating_sub(wf_link_start_ms),
                            "link_await_ms": wf_link_await_ms,
                            "link_finalize_ms": wf_link_finalize_ms,
                            "tail_ms": elapsed.as_millis().saturating_sub(wf_link_end_ms),
@@ -5585,13 +5559,6 @@ async fn run_with_options_under_store_lock(
                    "peer_conflicts": [],
                    "peer_issues": peer_issues_json_value(&[], &[]),
                });
-        // Env-gated verbose timing detail (`LPM_TIMING_DETAIL`): fine
-        // sub-stage breakdowns too noisy for the default envelope. Today it
-        // carries the link-finalize split — `compatibility_ms` is the
-        // framework compat island, ~0 on a plain install since it is
-        // deferred to `lpm dev`/`lpm run`. (Resolve and fetch already have
-        // always-on detail under `timing.resolve` and
-        // `timing.fetch_breakdown`.)
         if std::env::var_os("LPM_TIMING_DETAIL").is_some() {
             json["timing"]["waterfall"]["detail"] = serde_json::json!({
                 "setup": {
