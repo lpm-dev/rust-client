@@ -229,6 +229,42 @@ async fn npm_proxy_miss_falls_back_to_direct_npm_registry() {
 }
 
 #[tokio::test]
+async fn npm_proxy_metadata_sends_bearer_when_token_is_available() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer};
+
+    let proxy_server = MockServer::start().await;
+    let npm_name = "authenticated-proxy-metadata";
+    let saw_authorization = Arc::new(AtomicBool::new(false));
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/authenticated-proxy-metadata"))
+        .respond_with(AuthorizationRecorder {
+            saw_authorization: Arc::clone(&saw_authorization),
+            body: test_metadata_json(npm_name).into_bytes(),
+        })
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+
+    let (client, _tmp) = client_with_mock_server(&proxy_server.uri());
+    let client = client.with_token("stored-lpm-token");
+
+    let metadata = client
+        .get_npm_package_metadata(npm_name)
+        .await
+        .expect("npm proxy metadata should succeed with LPM bearer auth");
+
+    assert_eq!(metadata.name, npm_name);
+    assert!(
+        saw_authorization.load(Ordering::SeqCst),
+        "npm metadata proxy requests must attach LPM bearer auth when available"
+    );
+}
+
+#[tokio::test]
 async fn npm_proxy_access_denial_falls_back_to_direct_npm_registry() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

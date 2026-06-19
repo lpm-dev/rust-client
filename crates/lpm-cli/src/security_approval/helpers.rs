@@ -31,11 +31,31 @@ pub(super) fn project_dir_is_global_install(project_dir: &Path) -> bool {
         return false;
     };
     let global_installs = root.global_installs();
-    let canonical_global_installs =
-        std::fs::canonicalize(&global_installs).unwrap_or(global_installs);
-    let canonical_project =
-        std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let canonical_global_installs = canonicalize_existing_prefix(&global_installs);
+    let canonical_project = canonicalize_existing_prefix(project_dir);
     canonical_project.starts_with(canonical_global_installs)
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let mut cursor = path;
+    let mut suffix = PathBuf::new();
+    while let Some(parent) = cursor.parent() {
+        if let Some(name) = cursor.file_name() {
+            let mut next_suffix = PathBuf::from(name);
+            next_suffix.push(&suffix);
+            suffix = next_suffix;
+        }
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            return canonical_parent.join(suffix);
+        }
+        cursor = parent;
+    }
+
+    path.to_path_buf()
 }
 
 pub(super) fn normalized_packages(packages: &[String]) -> Vec<String> {

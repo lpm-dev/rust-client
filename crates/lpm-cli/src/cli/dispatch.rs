@@ -13,8 +13,8 @@ use super::format::{argv_has_global_registry_flag, exit_with_lpm_error, parse_cl
 use super::helpers::{
     argv_requests_top_level_version, build_install_global_overrides_with_excludes,
     command_needs_global_state, install_omit_policy_from_cli, maybe_emit_network_fs_warning,
-    print_version_with_notice, resolve_install_project_dir, should_suppress_update_banner,
-    spawn_background_update_check, tunnel_action_requires_session,
+    print_version_with_notice, resolve_install_project_dir, resolve_tunnel_bearer,
+    should_suppress_update_banner, spawn_background_update_check, tunnel_action_requires_session,
     validate_global_install_project_scoped_flags, validate_global_uninstall_project_scoped_flags,
 };
 
@@ -2376,26 +2376,16 @@ async fn async_main() -> Result<()> {
             let https_from_config = lpm_config.as_ref().and_then(|c| c.https).unwrap_or(false);
             let https = (https || https_from_config) && !no_https;
 
-            // Resolve token through the SessionManager attached to
-            // `client` so refresh-only-state recovery and
-            // session-source classification both apply. `tunnel` is a
-            // session-bound feature; `SessionRequired` rejects
-            // `--token`/`LPM_TOKEN`/CI tokens with a clear message.
-            let resolved_token = if tunnel {
-                match client.session() {
-                    Some(s) => Some(
-                        s.bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
-                            .await
-                            .map_err(|_| {
-                                lpm_common::LpmError::Tunnel(
-                                    "tunnel requires a refresh-backed `lpm login` session.\n  \
-                                     `--token` / `LPM_TOKEN` / CI tokens are not accepted."
-                                        .into(),
-                                )
-                            })?,
-                    ),
-                    None => None,
-                }
+            // Real relays require a refresh-backed session; loopback relay
+            // overrides may use ordinary tokens for local relay development
+            // and release-binary smoke tests.
+            let tunnel_relay_url = if tunnel {
+                Some(lpm_tunnel::resolve_relay_url())
+            } else {
+                None
+            };
+            let resolved_token = if let Some(relay_url) = tunnel_relay_url.as_deref() {
+                resolve_tunnel_bearer(client.session().map(|s| s.as_ref()), relay_url).await?
             } else {
                 None
             };
@@ -2409,6 +2399,7 @@ async fn async_main() -> Result<()> {
                 port,
                 host.as_deref(),
                 resolved_token.as_deref(),
+                tunnel_relay_url.as_deref(),
                 tunnel_domain.as_deref(),
                 tunnel_source,
                 &args,
@@ -2533,24 +2524,16 @@ async fn async_main() -> Result<()> {
             } else {
                 (action.as_str(), 3000u16)
             };
-            // Only the relay-facing tunnel actions need a refresh-backed session.
-            // Local log inspection and replay stay useful on a fresh machine and
-            // should not depend on keychain-backed auth state.
-            let resolved_token = if tunnel_action_requires_session(effective_action) {
-                match client.session() {
-                    Some(s) => Some(
-                        s.bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
-                            .await
-                            .map_err(|_| {
-                                lpm_common::LpmError::Tunnel(
-                                    "tunnel requires a refresh-backed `lpm login` session.\n  \
-                                     `--token` / `LPM_TOKEN` / CI tokens are not accepted."
-                                        .into(),
-                                )
-                            })?,
-                    ),
-                    None => None,
-                }
+            // Only relay-facing tunnel actions need auth. Local log inspection
+            // and replay stay useful on a fresh machine and should not depend
+            // on keychain-backed auth state.
+            let tunnel_relay_url = if tunnel_action_requires_session(effective_action) {
+                Some(lpm_tunnel::resolve_relay_url())
+            } else {
+                None
+            };
+            let resolved_token = if let Some(relay_url) = tunnel_relay_url.as_deref() {
+                resolve_tunnel_bearer(client.session().map(|s| s.as_ref()), relay_url).await?
             } else {
                 None
             };
@@ -2569,6 +2552,7 @@ async fn async_main() -> Result<()> {
                 inspect_port,
                 auto_ack,
                 session.as_deref(),
+                tunnel_relay_url.as_deref(),
             )
             .await
         }

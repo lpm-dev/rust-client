@@ -3311,6 +3311,7 @@ name = "lpm-linker"
 version = "0.61.0"
 dependencies = [
  "flate2",
+ "libc",
  "lpm-common",
  "lpm-store",
  "lpm-workspace",

@@ -9,6 +9,7 @@
 //! v2 writes are gated behind `LPM_STORE_VERSION=v2`.
 
 use std::borrow::Cow;
+use std::ffi::OsString;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1299,35 +1300,24 @@ fn create_sibling_symlink(
         )));
     }
 
-    // Link path: `<...>/node_modules/<dep.local>/`.
-    let link_path = node_modules.join(&dep.local);
+    let (link_path, ascents) = if dep.local == self_key.name() {
+        let package_dir = node_modules.join(self_key.name());
+        let nested_node_modules = package_dir.join(LINK_NODE_MODULES);
+        ensure_real_dir_or_create(&nested_node_modules, "same-name dependency node_modules")?;
+        let link_path = nested_node_modules.join(&dep.local);
+        ensure_sibling_parent_dir(&nested_node_modules, &link_path, "same-name sibling")?;
+        (
+            link_path,
+            depth_of_local(self_key.name()) + depth_of_local(&dep.local) + 4,
+        )
+    } else {
+        let link_path = node_modules.join(&dep.local);
+        ensure_sibling_parent_dir(node_modules, &link_path, "sibling")?;
+        (link_path, depth_of_local(&dep.local) + 2)
+    };
 
-    // For scoped deps (`@scope/name`), the local will already contain a
-    // `/`. We need to make sure the parent (`@scope/`) directory exists.
-    if let Some(parent) = link_path.parent()
-        && parent != node_modules
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            LpmError::Store(format!(
-                "failed to create v2 sibling parent at {}: {e}",
-                parent.display()
-            ))
-        })?;
-    }
-
-    // The symlink at `links/<self>/node_modules/<dep.local>/` resolves
-    // relative to its parent directory `links/<self>/node_modules/`.
-    // To reach the sibling target at
-    // `links/<dep.target.dir>/node_modules/<dep.target.name>/` we need
-    // to ascend two levels (out of `node_modules/`, then out of
-    // `<self>/`) and then descend back down. Scoped locals
-    // (`@scope/dep`) sit one level deeper, so add one `..` per `/`
-    // segment in the local name. The shape is
-    // `../../<dep.dir>/node_modules/<dep.name>` for non-scoped deps.
-    let depth = depth_of_local(&dep.local);
     let mut target = PathBuf::new();
-    for _ in 0..(depth + 2) {
+    for _ in 0..ascents {
         target.push("..");
     }
     target.push(dep.target.dir_name());
@@ -1342,6 +1332,65 @@ fn create_sibling_symlink(
             self_key.dir_name()
         ))
     })
+}
+
+fn ensure_sibling_parent_dir(base: &Path, link_path: &Path, label: &str) -> Result<(), LpmError> {
+    let Some(parent) = link_path.parent() else {
+        return Err(LpmError::Store(format!(
+            "v2 {label} link path has no parent: {}",
+            link_path.display()
+        )));
+    };
+    if parent == base {
+        return Ok(());
+    }
+    let relative = parent.strip_prefix(base).map_err(|e| {
+        LpmError::Store(format!(
+            "v2 {label} parent {} is outside base {}: {e}",
+            parent.display(),
+            base.display()
+        ))
+    })?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(LpmError::Store(format!(
+                "v2 {label} parent contains unsafe component at {}",
+                parent.display()
+            )));
+        };
+        current.push(name);
+        ensure_real_dir_or_create(&current, label)?;
+    }
+    Ok(())
+}
+
+fn ensure_real_dir_or_create(path: &Path, label: &str) -> Result<(), LpmError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(())
+        }
+        Ok(_) => Err(LpmError::Store(format!(
+            "refusing to create v2 {label} through non-directory path at {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    ensure_real_dir_or_create(path, label)
+                }
+                Err(error) => Err(LpmError::Store(format!(
+                    "failed to create v2 {label} directory at {}: {error}",
+                    path.display()
+                ))),
+            }
+        }
+        Err(error) => Err(LpmError::Store(format!(
+            "failed to inspect v2 {label} directory at {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 fn depth_of_local(local: &str) -> usize {
@@ -1735,20 +1784,26 @@ fn hash_object_tree_dir(
     metadata_hasher: &mut Sha256,
 ) -> Result<(), LpmError> {
     let mut entries = Vec::new();
+    // Unix DirEntry values keep the directory handle alive; store owned paths
+    // before recursing so deep warm-cache validation stays below RLIMIT_NOFILE.
     for entry in std::fs::read_dir(dir).map_err(|e| {
         LpmError::Store(format!(
             "failed to read v2 object tree at {}: {e}",
             dir.display()
         ))
     })? {
-        entries.push(entry.map_err(|e| {
+        let entry = entry.map_err(|e| {
             LpmError::Store(format!("failed to enumerate v2 object tree entry: {e}"))
-        })?);
+        })?;
+        entries.push(ObjectTreeEntry {
+            file_name: entry.file_name(),
+            path: entry.path(),
+        });
     }
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
 
     for entry in entries {
-        let path = entry.path();
+        let path = entry.path;
         if is_object_metadata_sidecar(root, &path) {
             continue;
         }
@@ -1799,6 +1854,11 @@ fn hash_object_tree_dir(
         }
     }
     Ok(())
+}
+
+struct ObjectTreeEntry {
+    file_name: OsString,
+    path: PathBuf,
 }
 
 fn hash_tree_metadata_record(
@@ -3251,6 +3311,64 @@ mod tests {
         assert!(
             sibling.exists(),
             "scoped sibling symlink must resolve to the dep's package dir"
+        );
+    }
+
+    #[test]
+    fn populate_nests_scoped_same_name_sibling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let pkg_sri = synthetic_sri(b"scoped-same-name/pkg");
+        let dep_sri = synthetic_sri(b"scoped-same-name/dep");
+        let pkg_obj = write_object(&store, &pkg_sri, &[("package.json", b"{}")]);
+        write_object(&store, &dep_sri, &[("package.json", b"{}")]);
+
+        let pkg_key = arc_key("@scope/pkg", "2.0.0");
+        let dep_key = arc_key("@scope/pkg", "1.0.0");
+
+        store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: dep_key.clone(),
+                source_sri: dep_sri.clone(),
+                object_dir: store.paths().object_dir(&dep_sri).unwrap(),
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+
+        let entry = store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: pkg_key,
+                source_sri: pkg_sri,
+                object_dir: pkg_obj,
+                deps: vec![DepLink {
+                    local: "@scope/pkg".into(),
+                    target: dep_key.clone(),
+                }],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+
+        let nested = entry
+            .link_dir
+            .join("node_modules")
+            .join("@scope")
+            .join("pkg")
+            .join("node_modules")
+            .join("@scope")
+            .join("pkg");
+        let mut expected = PathBuf::new();
+        for _ in 0..6 {
+            expected.push("..");
+        }
+        expected.push(dep_key.dir_name());
+        expected.push(LINK_NODE_MODULES);
+        expected.push(dep_key.name());
+        assert_eq!(std::fs::read_link(&nested).unwrap(), expected);
+        assert!(
+            nested.exists(),
+            "scoped same-name sibling symlink must resolve to the older package"
         );
     }
 

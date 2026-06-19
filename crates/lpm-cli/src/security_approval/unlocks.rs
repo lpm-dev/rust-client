@@ -376,6 +376,81 @@ pub(super) fn prompt_for_unlock(
     Ok(())
 }
 
+pub fn approve_project_runtime_override(
+    scope: ApprovalScope,
+    project_dir: &Path,
+    json_output: bool,
+    source: ApprovalSource,
+    message: &str,
+    packages: &[String],
+) -> Result<(), LpmError> {
+    if let Some(policy) = load_managed_policy()?
+        && let Some(err) = managed_policy_blocks_scope_direct(&policy, scope)
+    {
+        return Err(err);
+    }
+
+    let target = if project_dir_is_global_install(project_dir) {
+        UnlockTargetKind::Global
+    } else {
+        UnlockTargetKind::Project
+    };
+
+    if !matches!(source, ApprovalSource::CliFlag | ApprovalSource::EnvVar)
+        || is_automation(json_output)
+    {
+        return Err(runtime_override_approval_required(
+            scope,
+            target,
+            project_dir,
+            packages,
+        ));
+    }
+
+    crate::output::warn(message);
+    let prompt = if target == UnlockTargetKind::Global {
+        format!("Approve {} for this global install?", scope.as_str())
+    } else {
+        format!("Approve {} for this install?", scope.as_str())
+    };
+    let confirmed = request_native_approval(&prompt)?;
+    if !confirmed {
+        return Err(runtime_override_approval_required(
+            scope,
+            target,
+            project_dir,
+            packages,
+        ));
+    }
+
+    let target_label = if target == UnlockTargetKind::Global {
+        "this global install"
+    } else {
+        "this install"
+    };
+    crate::output::success(&format!("Approved {} for {target_label}.", scope.as_str(),));
+    Ok(())
+}
+
+fn runtime_override_approval_required(
+    scope: ApprovalScope,
+    target: UnlockTargetKind,
+    project_dir: &Path,
+    packages: &[String],
+) -> LpmError {
+    let project_root = if target == UnlockTargetKind::Global {
+        None
+    } else {
+        Some(canonical_project_root(project_dir))
+    };
+    approval_required_error(
+        format!("{} requires explicit approval", scope.as_str()),
+        vec![scope.as_str().to_string()],
+        project_root,
+        Some(suggested_unlock_command(scope.as_str(), target, packages)),
+    )
+}
+
 pub fn ensure_project_unlock(
     scope: ApprovalScope,
     project_dir: &Path,

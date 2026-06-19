@@ -35,6 +35,48 @@ fn with_file_secret_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
     })
 }
 
+fn with_lpm_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+    struct RestoreLpmHome(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreLpmHome {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.as_ref() {
+                    Some(value) => std::env::set_var("LPM_HOME", value),
+                    None => std::env::remove_var("LPM_HOME"),
+                }
+            }
+        }
+    }
+
+    let _restore = RestoreLpmHome(std::env::var_os("LPM_HOME"));
+    unsafe {
+        std::env::set_var("LPM_HOME", home);
+    }
+    f()
+}
+
+fn without_test_native_auth<T>(f: impl FnOnce() -> T) -> T {
+    struct RestoreTestAuth(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreTestAuth {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.as_ref() {
+                    Some(value) => std::env::set_var(TEST_AUTH_RESULT_ENV, value),
+                    None => std::env::remove_var(TEST_AUTH_RESULT_ENV),
+                }
+            }
+        }
+    }
+
+    let _restore = RestoreTestAuth(std::env::var_os(TEST_AUTH_RESULT_ENV));
+    unsafe {
+        std::env::remove_var(TEST_AUTH_RESULT_ENV);
+    }
+    f()
+}
+
 fn write_managed_policy(dir: &Path, body: &str) {
     let policy_path = dir.join("managed-security-policy.toml");
     std::fs::write(policy_path, body).unwrap();
@@ -487,6 +529,21 @@ fn macos_local_auth_reason_uses_default_when_prompt_is_empty() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_local_auth_allows_biometrics_or_password() {
+    assert_eq!(
+        super::native_auth::macos_local_auth_policy(),
+        objc2_local_authentication::LAPolicy::DeviceOwnerAuthentication
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_local_auth_uses_default_password_fallback_title() {
+    assert_eq!(super::native_auth::macos_local_auth_fallback_title(), None);
+}
+
 #[test]
 fn windows_hello_availability_uses_native_prompt_when_available() {
     assert_eq!(
@@ -872,6 +929,98 @@ fn runtime_sigstore_config_downgrade_uses_active_project_unlock() {
 }
 
 #[test]
+fn runtime_cli_approval_does_not_persist_signed_unlock_state() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_file_secret_env(temp.path(), || {
+        approve_project_runtime_override(
+            ApprovalScope::CooldownBypass,
+            &project,
+            false,
+            ApprovalSource::CliFlag,
+            "This install bypasses the minimum release age for this project.",
+            &[],
+        )
+        .unwrap();
+
+        assert!(!signing_secret_path().unwrap().exists());
+        assert!(!audit_head_path().unwrap().exists());
+        assert!(!audit_log_path().unwrap().exists());
+        assert!(!unlocks_dir().unwrap().exists());
+    });
+}
+
+#[test]
+fn runtime_cli_approval_respects_managed_policy_without_signed_state() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_file_secret_env(temp.path(), || {
+        write_managed_policy(temp.path(), "minimum-release-age-secs = 86400\n");
+
+        let err = approve_project_runtime_override(
+            ApprovalScope::CooldownBypass,
+            &project,
+            false,
+            ApprovalSource::CliFlag,
+            "This install bypasses the minimum release age for this project.",
+            &[],
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(!signing_secret_path().unwrap().exists());
+    });
+}
+
+#[test]
+fn runtime_cli_approval_for_global_install_suggests_global_unlock() {
+    let temp = tempdir().unwrap();
+
+    with_file_secret_env(temp.path(), || {
+        let lpm_home = temp.path().join("lpm-home");
+        with_lpm_home(&lpm_home, || {
+            without_test_native_auth(|| {
+                let project = lpm_common::LpmRoot::from_env()
+                    .unwrap()
+                    .global_installs()
+                    .join("fresh-tool");
+                std::fs::create_dir_all(&project).unwrap();
+
+                let err = approve_project_runtime_override(
+                    ApprovalScope::CooldownBypass,
+                    &project,
+                    true,
+                    ApprovalSource::CliFlag,
+                    "This install bypasses the minimum release age for this project.",
+                    &[],
+                )
+                .unwrap_err();
+
+                match err {
+                    LpmError::SecurityApprovalRequired {
+                        project_root,
+                        suggested_command,
+                        ..
+                    } => {
+                        assert_eq!(project_root, None);
+                        assert_eq!(
+                            suggested_command.as_deref(),
+                            Some("lpm security unlock cooldown-bypass --global --ttl 10m")
+                        );
+                    }
+                    other => panic!("expected security approval error, got {other:?}"),
+                }
+                assert!(!signing_secret_path().unwrap().exists());
+            });
+        });
+    });
+}
+
+#[test]
 fn persistent_automation_refusal_is_written_to_audit_log() {
     let temp = tempdir().unwrap();
 
@@ -921,6 +1070,33 @@ fn audit_log_truncation_is_detected_by_signed_head() {
 
         let err = append_audit_event(&event).unwrap_err();
         assert!(err.to_string().contains("signed audit head"));
+    });
+}
+
+#[test]
+fn audit_event_persists_signed_audit_head_file() {
+    let temp = tempdir().unwrap();
+
+    with_test_env(temp.path(), || {
+        let event = AuditEvent {
+            schema_version: AUDIT_EVENT_SCHEMA_VERSION,
+            occurred_at: Utc::now(),
+            event: "unlock-granted".into(),
+            allowed: true,
+            scopes: vec![ApprovalScope::CooldownBypass.as_str().to_string()],
+            project_root: None,
+            packages: Vec::new(),
+            source: Some(ApprovalSource::CliFlag.as_str().to_string()),
+            unlock_id: Some("unl_test".into()),
+            detail: Some("test".into()),
+        };
+
+        append_audit_event(&event).unwrap();
+
+        let head = read_signed_json::<AuditHead>(&audit_head_path().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.entry_count, 1);
     });
 }
 
