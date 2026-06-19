@@ -1457,6 +1457,29 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
     assert_eq!(envelope["patches_fingerprint"], serde_json::Value::Null);
     assert_eq!(envelope["blocked_set_fingerprint"], serde_json::Value::Null);
 
+    let waterfall = &envelope["timing"]["waterfall"];
+    assert!(
+        waterfall.is_object(),
+        "install --json must emit timing.waterfall; got {envelope:#}"
+    );
+    let segment = |key: &str| {
+        waterfall[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("timing.waterfall.{key} missing or non-number: {waterfall}"))
+    };
+    let segment_sum = segment("setup_ms")
+        + segment("resolve_ms")
+        + segment("pre_fetch_ms")
+        + segment("fetch_ms")
+        + segment("pre_link_ms")
+        + segment("link_ms")
+        + segment("tail_ms");
+    assert_eq!(
+        segment_sum,
+        segment("total_ms"),
+        "timing.waterfall segments must sum to total_ms"
+    );
+
     insta::with_settings!({
         filters => vec![
             // Mock registry URL (dynamic port) → [REGISTRY]
@@ -1846,6 +1869,100 @@ async fn install_up_to_date_json_includes_flag() {
     assert_eq!(json["success"], true);
     assert_eq!(json["up_to_date"], true);
     assertions::assert_json_field(&json, "duration_ms", assertions::JsonType::Number);
+    assert!(
+        json["timing"]["waterfall"].is_object(),
+        "up-to-date --json must still emit timing.waterfall; got {json:#}"
+    );
+    assert_eq!(
+        json["timing"]["waterfall"]["total_ms"], json["timing"]["total_ms"],
+        "fast-path waterfall total must match timing.total_ms"
+    );
+}
+
+#[tokio::test]
+async fn warm_install_with_direct_bin_dep_is_up_to_date() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "tool",
+            "version": "1.0.0",
+            "bin": { "tool": "bin/tool.js" },
+            "dependencies": { "helper": "1.0.0" }
+        }),
+        &[("bin/tool.js", b"#!/usr/bin/env node\n")],
+    );
+    mock.with_package("tool", "1.0.0", &tarball).await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "helper",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = 'helper';\n")],
+    )
+    .await;
+    let batch_meta = serde_json::json!({
+        "name": "tool",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "tool",
+                "version": "1.0.0",
+                "bin": { "tool": "bin/tool.js" },
+                "dist": {
+                    "tarball": format!("{}/tarballs/tool/-/tool-1.0.0.tgz", mock.url()),
+                    "integrity": "sha512-placeholder",
+                },
+                "dependencies": { "helper": "1.0.0" }
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    mock.with_batch_metadata(vec![batch_meta]).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "warm-bin-fast-exit",
+        "version": "1.0.0",
+        "dependencies": { "tool": "^1.0.0" }
+    }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run warm install --json");
+    assert!(output.status.success());
+    let json = assertions::parse_json_output(&output.stdout);
+    assert_eq!(
+        json["up_to_date"], true,
+        "a warm install with a direct bin dep must fast-exit; got {json:#}"
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules")
+            .join(".bin")
+            .join("tool")
+            .exists(),
+        "tool's bin shim must exist after a plain install"
+    );
 }
 
 // ─── Offline Mode ────────────────────────────────────────────────
