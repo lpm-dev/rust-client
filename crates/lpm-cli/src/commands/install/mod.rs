@@ -160,6 +160,32 @@ struct V2ReusablePrevalidation {
     hits: HashMap<String, lpm_store::v2::ReusableObject>,
     candidate_count: usize,
     concurrency: usize,
+    validation_timings: V2ReusableValidationTimings,
+}
+
+struct V2LinkTaskResult {
+    materialized: MaterializedPackage,
+    freshly_populated: bool,
+    ms: u128,
+}
+
+type V2LinkHandle = tokio::task::JoinHandle<Result<V2LinkTaskResult, LpmError>>;
+
+fn spawn_v2_link_task(
+    plan: std::sync::Arc<lpm_linker::v2::LinkPlanV2>,
+    target: lpm_linker::v2::V2Target,
+    store: std::sync::Arc<lpm_store::v2::Store>,
+) -> V2LinkHandle {
+    tokio::task::spawn_blocking(move || {
+        let start = Instant::now();
+        let (materialized, freshly_populated) =
+            lpm_linker::v2::link_v2_one(&plan, &target, &store)?;
+        Ok(V2LinkTaskResult {
+            materialized,
+            freshly_populated,
+            ms: start.elapsed().as_millis(),
+        })
+    })
 }
 
 async fn prevalidate_v2_reusable_objects(
@@ -187,6 +213,7 @@ async fn prevalidate_v2_reusable_objects(
             hits: HashMap::new(),
             candidate_count: 0,
             concurrency: 0,
+            validation_timings: V2ReusableValidationTimings::default(),
         });
     }
 
@@ -194,14 +221,20 @@ async fn prevalidate_v2_reusable_objects(
     let concurrency = v2_cache_check_concurrency(candidate_count);
     let mut checks = futures::stream::iter(candidates.into_iter().map(|(key, sri)| {
         let store_v2 = Arc::clone(&store_v2);
-        tokio::task::spawn_blocking(move || store_v2.reusable_object(&sri).map(|hit| (key, hit)))
+        tokio::task::spawn_blocking(move || {
+            store_v2
+                .reusable_object_with_timings(&sri)
+                .map(|(hit, timings)| (key, hit, timings))
+        })
     }))
     .buffer_unordered(concurrency);
 
     let mut hits = HashMap::with_capacity(candidate_count);
+    let mut validation_timings = V2ReusableValidationTimings::default();
     while let Some(result) = checks.next().await {
-        let (key, hit) = result
+        let (key, hit, timings) = result
             .map_err(|e| LpmError::Registry(format!("v2 cache check task panicked: {e}")))??;
+        validation_timings.record(timings, hit.is_some());
         if let Some(hit) = hit {
             hits.insert(key, hit);
         }
@@ -210,6 +243,7 @@ async fn prevalidate_v2_reusable_objects(
         hits,
         candidate_count,
         concurrency,
+        validation_timings,
     })
 }
 
@@ -2881,6 +2915,7 @@ async fn run_with_options_under_store_lock(
     let fetch_start = Instant::now();
     let fetch_plan_start = Instant::now();
     let mut fetch_stage_timings = FetchStageTimings::default();
+    let mut v2_link_task_timings = V2LinkTaskTimings::default();
 
     // — aggregation buffer for the generalized writeback.
     // Populated inside the fetch block with every (name, version) →
@@ -3119,7 +3154,6 @@ async fn run_with_options_under_store_lock(
     // Per-package v2 link handles populated by both the cache-hit
     // short-circuits below and the fetch tasks further down. Drained
     // at the link stage and folded into the LinkResult.
-    type V2LinkHandle = tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
     let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
     fetch_stage_timings.plan_ms = fetch_plan_start.elapsed().as_millis();
     let v2_prevalidate_start = Instant::now();
@@ -3132,6 +3166,7 @@ async fn run_with_options_under_store_lock(
                 hits: HashMap::new(),
                 candidate_count: 0,
                 concurrency: 0,
+                validation_timings: V2ReusableValidationTimings::default(),
             },
         }
     } else {
@@ -3139,6 +3174,7 @@ async fn run_with_options_under_store_lock(
             hits: HashMap::new(),
             candidate_count: 0,
             concurrency: 0,
+            validation_timings: V2ReusableValidationTimings::default(),
         }
     };
     fetch_stage_timings.v2_reusable_prevalidate_ms = v2_prevalidate_start.elapsed().as_millis();
@@ -3146,6 +3182,7 @@ async fn run_with_options_under_store_lock(
         v2_reusable_prevalidation.candidate_count as u64;
     fetch_stage_timings.v2_reusable_concurrency = v2_reusable_prevalidation.concurrency as u64;
     fetch_stage_timings.v2_reusable_hit_count = v2_reusable_prevalidation.hits.len() as u64;
+    fetch_stage_timings.v2_reusable_validation = v2_reusable_prevalidation.validation_timings;
     let v2_reusable_objects = v2_reusable_prevalidation.hits;
 
     //b: stale-entry cleanup runs once, up front — must
@@ -3210,9 +3247,7 @@ async fn run_with_options_under_store_lock(
                         .expect("v2_event_driven implies v2 store"),
                 );
                 fetch_stage_timings.link_dispatch_count += 1;
-                v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
-                    lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
-                }));
+                v2_event_link_handles.push(spawn_v2_link_task(plan_arc, target, store_arc));
                 record_timing_detail_ms(
                     &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
                     link_dispatch_start,
@@ -3270,9 +3305,7 @@ async fn run_with_options_under_store_lock(
                         .expect("v2_event_driven implies v2 store"),
                 );
                 fetch_stage_timings.link_dispatch_count += 1;
-                v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
-                    lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
-                }));
+                v2_event_link_handles.push(spawn_v2_link_task(plan_arc, target, store_arc));
                 record_timing_detail_ms(
                     &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
                     link_dispatch_start,
@@ -3333,9 +3366,7 @@ async fn run_with_options_under_store_lock(
                                 .expect("v2_event_driven implies v2 store"),
                         );
                         fetch_stage_timings.link_dispatch_count += 1;
-                        v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
-                            lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
-                        }));
+                        v2_event_link_handles.push(spawn_v2_link_task(plan_arc, target, store_arc));
                         record_timing_detail_ms(
                             &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
                             link_dispatch_start,
@@ -4081,8 +4112,6 @@ async fn run_with_options_under_store_lock(
                 // `event_link` is false (so `LinkHandle` is always None);
                 // under !v2_mode, `v2_plan_arc` is None (so this is
                 // always None).
-                type V2LinkHandle =
-                    tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
                 type FetchTaskResult = (
                     String,
                     Option<String>,
@@ -4178,9 +4207,7 @@ async fn run_with_options_under_store_lock(
                                 target_c.verified_object_tree_integrity =
                                     Some(reusable_object.tree_integrity);
                                 let store_c = std::sync::Arc::clone(store_v2);
-                                Some(tokio::task::spawn_blocking(move || {
-                                    lpm_linker::v2::link_v2_one(&plan_c, &target_c, &store_c)
-                                }))
+                                Some(spawn_v2_link_task(plan_c, target_c, store_c))
                             } else {
                                 None
                             };
@@ -4247,9 +4274,7 @@ async fn run_with_options_under_store_lock(
                             let plan_c = std::sync::Arc::clone(plan);
                             let target_c = target.clone();
                             let store_c = std::sync::Arc::clone(store_v2);
-                            Some(tokio::task::spawn_blocking(move || {
-                                lpm_linker::v2::link_v2_one(&plan_c, &target_c, &store_c)
-                            }))
+                            Some(spawn_v2_link_task(plan_c, target_c, store_c))
                         } else {
                             None
                         };
@@ -4352,9 +4377,7 @@ async fn run_with_options_under_store_lock(
                         let plan_c = std::sync::Arc::clone(plan);
                         let target_c = target.clone();
                         let store_c = std::sync::Arc::clone(store_v2);
-                        Some(tokio::task::spawn_blocking(move || {
-                            lpm_linker::v2::link_v2_one(&plan_c, &target_c, &store_c)
-                        }))
+                        Some(spawn_v2_link_task(plan_c, target_c, store_c))
                     } else {
                         None
                     };
@@ -4531,13 +4554,20 @@ async fn run_with_options_under_store_lock(
             let mut linked_count = 0usize;
             let link_await_start = Instant::now();
             for h in v2_event_link_handles.drain(..) {
-                let (m, fresh) = h
+                let task = h
                     .await
                     .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))??;
-                materialized_all.push(m);
-                if fresh {
+                let package_display = timing_detail_mode
+                    .trace()
+                    .then(|| format!("{}@{}", task.materialized.name, task.materialized.version));
+                v2_link_task_timings.record(task.ms, task.freshly_populated);
+                if let Some(package_display) = package_display.as_deref() {
+                    slow_package_timings.record_link_v2_one(package_display, task.ms);
+                }
+                if task.freshly_populated {
                     linked_count += 1;
                 }
+                materialized_all.push(task.materialized);
             }
             wf_link_await_ms = link_await_start.elapsed().as_millis();
             let link_finalize_start = Instant::now();
@@ -5751,6 +5781,7 @@ async fn run_with_options_under_store_lock(
                     "root_symlinks_ms": wf_link_root_symlinks_ms,
                     "compatibility_ms": wf_link_compatibility_ms,
                     "bin_shims_ms": wf_link_bin_shims_ms,
+                    "v2_one": v2_link_task_timings.to_json(wf_link_await_ms),
                 },
                 "tail": {
                     "blocked_metadata_ms": wf_tail_blocked_metadata_ms,

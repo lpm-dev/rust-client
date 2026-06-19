@@ -231,6 +231,128 @@ impl FetchBreakdown {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+pub(super) struct V2ReusableValidationTimings {
+    pub(super) checked_count: u64,
+    pub(super) hit_count: u64,
+    pub(super) miss_count: u64,
+    pub(super) total_ms: u128,
+    pub(super) max_check_ms: u128,
+    pub(super) missing_count: u64,
+    pub(super) complete_check_ms: u128,
+    pub(super) object_sidecar_read_count: u64,
+    pub(super) object_sidecar_read_ms: u128,
+    pub(super) snapshot_read_count: u64,
+    pub(super) snapshot_read_ms: u128,
+    pub(super) snapshot_hit_count: u64,
+    pub(super) snapshot_miss_count: u64,
+    pub(super) metadata_hash_count: u64,
+    pub(super) metadata_hash_ms: u128,
+    pub(super) full_hash_count: u64,
+    pub(super) full_hash_ms: u128,
+    pub(super) removed_count: u64,
+    pub(super) remove_ms: u128,
+}
+
+impl V2ReusableValidationTimings {
+    pub(super) fn record(&mut self, timings: lpm_store::v2::ReusableObjectCheckTimings, hit: bool) {
+        self.checked_count = self.checked_count.saturating_add(1);
+        if hit {
+            self.hit_count = self.hit_count.saturating_add(1);
+        } else {
+            self.miss_count = self.miss_count.saturating_add(1);
+        }
+        self.total_ms = self.total_ms.saturating_add(timings.total_ms);
+        self.max_check_ms = self.max_check_ms.max(timings.total_ms);
+        self.missing_count = self.missing_count.saturating_add(timings.missing_count);
+        self.complete_check_ms = self
+            .complete_check_ms
+            .saturating_add(timings.complete_check_ms);
+        self.object_sidecar_read_count = self
+            .object_sidecar_read_count
+            .saturating_add(timings.object_sidecar_read_count);
+        self.object_sidecar_read_ms = self
+            .object_sidecar_read_ms
+            .saturating_add(timings.object_sidecar_read_ms);
+        self.snapshot_read_count = self
+            .snapshot_read_count
+            .saturating_add(timings.snapshot_read_count);
+        self.snapshot_read_ms = self
+            .snapshot_read_ms
+            .saturating_add(timings.snapshot_read_ms);
+        self.snapshot_hit_count = self
+            .snapshot_hit_count
+            .saturating_add(timings.snapshot_hit_count);
+        self.snapshot_miss_count = self
+            .snapshot_miss_count
+            .saturating_add(timings.snapshot_miss_count);
+        self.metadata_hash_count = self
+            .metadata_hash_count
+            .saturating_add(timings.metadata_hash_count);
+        self.metadata_hash_ms = self
+            .metadata_hash_ms
+            .saturating_add(timings.metadata_hash_ms);
+        self.full_hash_count = self.full_hash_count.saturating_add(timings.full_hash_count);
+        self.full_hash_ms = self.full_hash_ms.saturating_add(timings.full_hash_ms);
+        self.removed_count = self.removed_count.saturating_add(timings.removed_count);
+        self.remove_ms = self.remove_ms.saturating_add(timings.remove_ms);
+    }
+
+    pub(super) fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "checked_count": self.checked_count,
+            "hit_count": self.hit_count,
+            "miss_count": self.miss_count,
+            "total_ms": self.total_ms,
+            "max_check_ms": self.max_check_ms,
+            "missing_count": self.missing_count,
+            "complete_check_ms": self.complete_check_ms,
+            "object_sidecar_read_count": self.object_sidecar_read_count,
+            "object_sidecar_read_ms": self.object_sidecar_read_ms,
+            "snapshot_read_count": self.snapshot_read_count,
+            "snapshot_read_ms": self.snapshot_read_ms,
+            "snapshot_hit_count": self.snapshot_hit_count,
+            "snapshot_miss_count": self.snapshot_miss_count,
+            "metadata_hash_count": self.metadata_hash_count,
+            "metadata_hash_ms": self.metadata_hash_ms,
+            "full_hash_count": self.full_hash_count,
+            "full_hash_ms": self.full_hash_ms,
+            "removed_count": self.removed_count,
+            "remove_ms": self.remove_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct V2LinkTaskTimings {
+    pub(super) task_count: u64,
+    pub(super) freshly_populated_count: u64,
+    pub(super) task_sum_ms: u128,
+    pub(super) task_max_ms: u128,
+}
+
+impl V2LinkTaskTimings {
+    pub(super) fn record(&mut self, ms: u128, freshly_populated: bool) {
+        self.task_count = self.task_count.saturating_add(1);
+        if freshly_populated {
+            self.freshly_populated_count = self.freshly_populated_count.saturating_add(1);
+        }
+        self.task_sum_ms = self.task_sum_ms.saturating_add(ms);
+        self.task_max_ms = self.task_max_ms.max(ms);
+    }
+
+    pub(super) fn to_json(self, await_ms: u128) -> serde_json::Value {
+        serde_json::json!({
+            "task_count": self.task_count,
+            "freshly_populated_count": self.freshly_populated_count,
+            "reused_entry_count": self.task_count.saturating_sub(self.freshly_populated_count),
+            "task_sum_ms": self.task_sum_ms,
+            "task_max_ms": self.task_max_ms,
+            "await_ms": await_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub(super) struct FetchStageTimings {
     pub(super) plan_ms: u128,
     pub(super) v2_reusable_prevalidate_ms: u128,
@@ -251,6 +373,7 @@ pub(super) struct FetchStageTimings {
     pub(super) v1_to_v2_translate_failure_count: u64,
     pub(super) v1_cache_hit_count: u64,
     pub(super) link_dispatch_count: u64,
+    pub(super) v2_reusable_validation: V2ReusableValidationTimings,
 }
 
 impl FetchStageTimings {
@@ -305,6 +428,7 @@ impl FetchStageTimings {
                 "v1_to_v2_translate_failure_count": self.v1_to_v2_translate_failure_count,
                 "link_dispatch_count": self.link_dispatch_count,
             },
+            "v2_reusable_validation": self.v2_reusable_validation.to_json(),
             "breakdown": breakdown.to_json(),
         })
     }
@@ -399,6 +523,7 @@ pub(super) struct SlowPackageTimings {
     extract: Vec<PackageTiming>,
     security: Vec<PackageTiming>,
     finalize: Vec<PackageTiming>,
+    link_v2_one: Vec<PackageTiming>,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +538,10 @@ impl SlowPackageTimings {
         Self::record(&mut self.extract, package, timings.extract_ms);
         Self::record(&mut self.security, package, timings.security_ms);
         Self::record(&mut self.finalize, package, timings.finalize_ms);
+    }
+
+    pub(super) fn record_link_v2_one(&mut self, package: &str, ms: u128) {
+        Self::record(&mut self.link_v2_one, package, ms);
     }
 
     fn record(bucket: &mut Vec<PackageTiming>, package: &str, ms: u128) {
@@ -433,6 +562,7 @@ impl SlowPackageTimings {
             "extract": Self::bucket_json(&self.extract),
             "security": Self::bucket_json(&self.security),
             "finalize": Self::bucket_json(&self.finalize),
+            "link_v2_one": Self::bucket_json(&self.link_v2_one),
         })
     }
 
@@ -478,6 +608,7 @@ pub(super) fn setup_only_timing_detail_json(
             "root_symlinks_ms": 0u128,
             "compatibility_ms": 0u128,
             "bin_shims_ms": 0u128,
+            "v2_one": V2LinkTaskTimings::default().to_json(0),
         },
         "tail": {
             "blocked_metadata_ms": 0u128,
@@ -643,5 +774,47 @@ mod tests {
 
         assert_eq!(json["classification"]["other_ms"], 2);
         assert_eq!(json["classification"]["link_dispatch_ms"], 4);
+    }
+
+    #[test]
+    fn fetch_stage_timings_reports_v2_reusable_validation_counters() {
+        let mut validation = V2ReusableValidationTimings::default();
+        validation.record(
+            lpm_store::v2::ReusableObjectCheckTimings {
+                total_ms: 7,
+                snapshot_hit_count: 1,
+                metadata_hash_count: 1,
+                ..lpm_store::v2::ReusableObjectCheckTimings::default()
+            },
+            true,
+        );
+        let timings = FetchStageTimings {
+            v2_reusable_validation: validation,
+            ..FetchStageTimings::default()
+        };
+
+        let json = timings.to_json(7, 1, 1, 0, FetchBreakdown::default());
+
+        assert_eq!(json["v2_reusable_validation"]["checked_count"], 1);
+        assert_eq!(json["v2_reusable_validation"]["hit_count"], 1);
+        assert_eq!(json["v2_reusable_validation"]["snapshot_hit_count"], 1);
+        assert_eq!(json["v2_reusable_validation"]["metadata_hash_count"], 1);
+        assert_eq!(json["v2_reusable_validation"]["total_ms"], 7);
+    }
+
+    #[test]
+    fn v2_link_task_timings_reports_reused_entries() {
+        let mut timings = V2LinkTaskTimings::default();
+        timings.record(5, false);
+        timings.record(8, true);
+
+        let json = timings.to_json(3);
+
+        assert_eq!(json["task_count"], 2);
+        assert_eq!(json["freshly_populated_count"], 1);
+        assert_eq!(json["reused_entry_count"], 1);
+        assert_eq!(json["task_sum_ms"], 13);
+        assert_eq!(json["task_max_ms"], 8);
+        assert_eq!(json["await_ms"], 3);
     }
 }

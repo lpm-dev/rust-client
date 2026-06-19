@@ -69,6 +69,9 @@ async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
     assert_eq!(prevalidation.candidate_count, 1);
     assert_eq!(prevalidation.hits.len(), 1);
     assert!(prevalidation.concurrency >= 1);
+    assert_eq!(prevalidation.validation_timings.checked_count, 1);
+    assert_eq!(prevalidation.validation_timings.hit_count, 1);
+    assert_eq!(prevalidation.validation_timings.snapshot_hit_count, 1);
     let hit = prevalidation
         .hits
         .get(&key)
@@ -98,6 +101,9 @@ async fn prevalidate_v2_reusable_objects_removes_tampered_registry_objects() {
 
     assert_eq!(prevalidation.candidate_count, 1);
     assert!(prevalidation.hits.is_empty());
+    assert_eq!(prevalidation.validation_timings.checked_count, 1);
+    assert_eq!(prevalidation.validation_timings.miss_count, 1);
+    assert_eq!(prevalidation.validation_timings.removed_count, 1);
     assert!(
         !object_dir.exists(),
         "tampered v2 objects must still be removed before cache reuse"

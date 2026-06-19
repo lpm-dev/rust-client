@@ -344,6 +344,41 @@ pub struct ReusableObject {
     pub tree_integrity: VerifiedObjectTreeIntegrity,
 }
 
+/// Timing and path counters for one reusable-object validation check.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReusableObjectCheckTimings {
+    /// End-to-end time spent checking this object candidate.
+    pub total_ms: u128,
+    /// Whether the object directory was absent before validation.
+    pub missing_count: u64,
+    /// Time spent checking the object directory completeness predicate.
+    pub complete_check_ms: u128,
+    /// Number of object integrity sidecar reads.
+    pub object_sidecar_read_count: u64,
+    /// Time spent reading and validating the object integrity sidecar.
+    pub object_sidecar_read_ms: u128,
+    /// Number of metadata snapshot reads attempted.
+    pub snapshot_read_count: u64,
+    /// Time spent reading and parsing metadata snapshots.
+    pub snapshot_read_ms: u128,
+    /// Number of candidates accepted by the metadata-snapshot fast path.
+    pub snapshot_hit_count: u64,
+    /// Number of candidates that missed the metadata-snapshot fast path.
+    pub snapshot_miss_count: u64,
+    /// Number of metadata-only tree hash computations.
+    pub metadata_hash_count: u64,
+    /// Time spent hashing tree metadata.
+    pub metadata_hash_ms: u128,
+    /// Number of full content-tree hash fallbacks.
+    pub full_hash_count: u64,
+    /// Time spent hashing full object contents.
+    pub full_hash_ms: u128,
+    /// Number of object directories removed as unusable.
+    pub removed_count: u64,
+    /// Time spent removing unusable object directories.
+    pub remove_ms: u128,
+}
+
 /// Single sibling-dep symlink to create inside
 /// `links/<graph-key>/node_modules/<dep_local>/`.
 #[derive(Debug, Clone)]
@@ -452,6 +487,38 @@ impl Store {
             path: object_dir,
             tree_integrity,
         }))
+    }
+
+    /// Return the reusable object and timing counters for its validation path.
+    pub fn reusable_object_with_timings(
+        &self,
+        sri: &str,
+    ) -> Result<(Option<ReusableObject>, ReusableObjectCheckTimings), LpmError> {
+        let total_start = std::time::Instant::now();
+        let mut timings = ReusableObjectCheckTimings::default();
+        let object_dir = self.paths.object_dir(sri)?;
+        if !object_dir.exists() {
+            timings.missing_count = 1;
+            timings.total_ms = total_start.elapsed().as_millis();
+            return Ok((None, timings));
+        }
+        let Some(tree_integrity) = object_tree_integrity_or_remove_with_timings(
+            &object_dir,
+            "before cache reuse",
+            &mut timings,
+        )?
+        else {
+            timings.total_ms = total_start.elapsed().as_millis();
+            return Ok((None, timings));
+        };
+        timings.total_ms = total_start.elapsed().as_millis();
+        Ok((
+            Some(ReusableObject {
+                path: object_dir,
+                tree_integrity,
+            }),
+            timings,
+        ))
     }
 
     /// Extract the supplied tarball bytes into
@@ -1492,6 +1559,43 @@ fn object_dir_is_reusable_or_remove(dir: &Path, context: &str) -> Result<bool, L
     Ok(object_tree_integrity_or_remove(dir, context)?.is_some())
 }
 
+fn object_tree_integrity_or_remove_with_timings(
+    dir: &Path,
+    context: &str,
+    timings: &mut ReusableObjectCheckTimings,
+) -> Result<Option<VerifiedObjectTreeIntegrity>, LpmError> {
+    let complete_check_start = std::time::Instant::now();
+    let complete = is_complete_object_dir(dir);
+    timings.complete_check_ms = timings
+        .complete_check_ms
+        .saturating_add(complete_check_start.elapsed().as_millis());
+    if !complete {
+        let remove_start = std::time::Instant::now();
+        remove_unusable_object_dir(dir, context)?;
+        timings.removed_count = timings.removed_count.saturating_add(1);
+        timings.remove_ms = timings
+            .remove_ms
+            .saturating_add(remove_start.elapsed().as_millis());
+        return Ok(None);
+    }
+    match verified_object_tree_integrity_with_timings(dir, timings) {
+        Ok(digest) => Ok(Some(VerifiedObjectTreeIntegrity::new(digest))),
+        Err(err) => {
+            tracing::warn!(
+                target = %dir.display(),
+                "v2 store: treating object as unusable {context}: {err}"
+            );
+            let remove_start = std::time::Instant::now();
+            remove_unusable_object_dir(dir, context)?;
+            timings.removed_count = timings.removed_count.saturating_add(1);
+            timings.remove_ms = timings
+                .remove_ms
+                .saturating_add(remove_start.elapsed().as_millis());
+            Ok(None)
+        }
+    }
+}
+
 fn object_tree_integrity_or_remove(
     dir: &Path,
     context: &str,
@@ -1618,6 +1722,36 @@ fn verified_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
     )))
 }
 
+fn verified_object_tree_integrity_with_timings(
+    dir: &Path,
+    timings: &mut ReusableObjectCheckTimings,
+) -> Result<String, LpmError> {
+    timings.object_sidecar_read_count = timings.object_sidecar_read_count.saturating_add(1);
+    let sidecar_start = std::time::Instant::now();
+    let expected = read_object_tree_integrity(dir)?;
+    timings.object_sidecar_read_ms = timings
+        .object_sidecar_read_ms
+        .saturating_add(sidecar_start.elapsed().as_millis());
+    if tree_snapshot_matches_with_timings(dir, dir, &expected, timings)? {
+        return Ok(expected);
+    }
+    timings.full_hash_count = timings.full_hash_count.saturating_add(1);
+    let full_hash_start = std::time::Instant::now();
+    let actual = compute_object_tree_integrities(dir)?;
+    timings.full_hash_ms = timings
+        .full_hash_ms
+        .saturating_add(full_hash_start.elapsed().as_millis());
+    if expected == actual.content {
+        write_tree_snapshot_best_effort(dir, &actual);
+        return Ok(expected);
+    }
+    Err(LpmError::Store(format!(
+        "v2 object integrity mismatch at {}: expected {expected}, actual {}",
+        dir.display(),
+        actual.content
+    )))
+}
+
 fn tree_snapshot_matches(
     snapshot_dir: &Path,
     tree_dir: &Path,
@@ -1631,6 +1765,43 @@ fn tree_snapshot_matches(
     }
     let actual_metadata = compute_tree_metadata_integrity(tree_dir)?;
     Ok(actual_metadata == snapshot.metadata_integrity)
+}
+
+fn tree_snapshot_matches_with_timings(
+    snapshot_dir: &Path,
+    tree_dir: &Path,
+    expected_content_integrity: &str,
+    timings: &mut ReusableObjectCheckTimings,
+) -> Result<bool, LpmError> {
+    timings.snapshot_read_count = timings.snapshot_read_count.saturating_add(1);
+    let snapshot_read_start = std::time::Instant::now();
+    let Some(snapshot) = read_tree_snapshot(snapshot_dir) else {
+        timings.snapshot_read_ms = timings
+            .snapshot_read_ms
+            .saturating_add(snapshot_read_start.elapsed().as_millis());
+        timings.snapshot_miss_count = timings.snapshot_miss_count.saturating_add(1);
+        return Ok(false);
+    };
+    timings.snapshot_read_ms = timings
+        .snapshot_read_ms
+        .saturating_add(snapshot_read_start.elapsed().as_millis());
+    if snapshot.content_integrity != expected_content_integrity {
+        timings.snapshot_miss_count = timings.snapshot_miss_count.saturating_add(1);
+        return Ok(false);
+    }
+    timings.metadata_hash_count = timings.metadata_hash_count.saturating_add(1);
+    let metadata_hash_start = std::time::Instant::now();
+    let actual_metadata = compute_tree_metadata_integrity(tree_dir)?;
+    timings.metadata_hash_ms = timings
+        .metadata_hash_ms
+        .saturating_add(metadata_hash_start.elapsed().as_millis());
+    if actual_metadata == snapshot.metadata_integrity {
+        timings.snapshot_hit_count = timings.snapshot_hit_count.saturating_add(1);
+        Ok(true)
+    } else {
+        timings.snapshot_miss_count = timings.snapshot_miss_count.saturating_add(1);
+        Ok(false)
+    }
 }
 
 fn read_tree_snapshot(dir: &Path) -> Option<TreeSnapshot> {
@@ -2600,6 +2771,57 @@ mod tests {
             snapshot_path.is_file(),
             "full-hash fallback must refresh the fast metadata snapshot"
         );
+    }
+
+    #[test]
+    fn reusable_object_with_timings_reports_snapshot_fast_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"reusable_object_with_timings_reports_snapshot_fast_path");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"snapshot-timed\"}"),
+                ("index.js", b"ok"),
+            ],
+        );
+
+        let (reusable, timings) = store.reusable_object_with_timings(&sri).unwrap();
+
+        assert_eq!(reusable.unwrap().path, object_dir);
+        assert_eq!(timings.object_sidecar_read_count, 1);
+        assert_eq!(timings.snapshot_read_count, 1);
+        assert_eq!(timings.snapshot_hit_count, 1);
+        assert_eq!(timings.snapshot_miss_count, 0);
+        assert_eq!(timings.full_hash_count, 0);
+        assert_eq!(timings.removed_count, 0);
+    }
+
+    #[test]
+    fn reusable_object_with_timings_reports_full_hash_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"reusable_object_with_timings_reports_full_hash_fallback");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"snapshot-fallback\"}"),
+                ("index.js", b"ok"),
+            ],
+        );
+        let snapshot_path = object_dir.join(TREE_SNAPSHOT_FILENAME);
+        std::fs::remove_file(&snapshot_path).unwrap();
+
+        let (reusable, timings) = store.reusable_object_with_timings(&sri).unwrap();
+
+        assert_eq!(reusable.unwrap().path, object_dir);
+        assert_eq!(timings.snapshot_hit_count, 0);
+        assert_eq!(timings.snapshot_miss_count, 1);
+        assert_eq!(timings.full_hash_count, 1);
+        assert_eq!(timings.removed_count, 0);
+        assert!(snapshot_path.is_file());
     }
 
     #[test]
