@@ -1606,6 +1606,96 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         detail["resolve"]["policy"]["trust"].is_object(),
         "detail.resolve.policy.trust must be an object"
     );
+    for field in ["wall_ms", "initial_batch_ms", "other_ms"] {
+        assert!(
+            detail["resolve"][field].is_number(),
+            "detail.resolve.{field} must be numeric; got {detail:#?}"
+        );
+    }
+    assert!(
+        detail["resolve"]["metadata"].is_object(),
+        "detail.resolve.metadata must summarize resolve metadata counters; got {detail:#?}"
+    );
+    assert!(
+        detail["resolve"]["scheduler"].is_object(),
+        "detail.resolve.scheduler must expose resolver wait/fanout counters; got {detail:#?}"
+    );
+    assert!(
+        detail["resolve"]["cpu"].is_object(),
+        "detail.resolve.cpu must expose parser/resolver CPU counters; got {detail:#?}"
+    );
+    assert!(
+        metadata
+            .iter()
+            .all(|entry| entry.get("top_duplicate_packages").is_none()),
+        "trace-only duplicate package rankings must stay out of LPM_TIMING_DETAIL=1"
+    );
+    let fetch = detail["fetch"]
+        .as_object()
+        .unwrap_or_else(|| panic!("detail.fetch must be an object; got {detail:#?}"));
+    assert!(
+        fetch["stage"].is_object(),
+        "detail.fetch.stage must expose fetch-stage wall attribution; got {fetch:#?}"
+    );
+    assert!(
+        fetch["counts"].is_object(),
+        "detail.fetch.counts must expose cache/download/link dispatch counters; got {fetch:#?}"
+    );
+    assert!(
+        fetch["classification"].is_object(),
+        "detail.fetch.classification must expose cache-classification branch timing; got {fetch:#?}"
+    );
+    assert!(
+        fetch["breakdown"].is_object(),
+        "detail.fetch.breakdown must retain the per-download breakdown; got {fetch:#?}"
+    );
+    for field in [
+        "wall_ms",
+        "plan_ms",
+        "v2_reusable_prevalidate_ms",
+        "cache_classify_ms",
+        "policy_gate_ms",
+        "download_wall_ms",
+        "other_ms",
+    ] {
+        assert!(
+            fetch["stage"][field].is_number(),
+            "detail.fetch.stage.{field} must be numeric; got {fetch:#?}"
+        );
+    }
+    for field in [
+        "wall_ms",
+        "local_source_ms",
+        "v2_reusable_hit_ms",
+        "v1_to_v2_translate_ms",
+        "v1_cache_hit_ms",
+        "download_candidate_ms",
+        "link_dispatch_ms",
+        "other_ms",
+    ] {
+        assert!(
+            fetch["classification"][field].is_number(),
+            "detail.fetch.classification.{field} must be numeric; got {fetch:#?}"
+        );
+    }
+    for field in [
+        "package_count",
+        "cached_count",
+        "download_candidate_count",
+        "v2_reusable_candidate_count",
+        "v2_reusable_hit_count",
+        "v2_reusable_concurrency",
+        "local_source_count",
+        "v1_cache_hit_count",
+        "v1_to_v2_translate_count",
+        "v1_to_v2_translate_failure_count",
+        "link_dispatch_count",
+    ] {
+        assert!(
+            fetch["counts"][field].is_number(),
+            "detail.fetch.counts.{field} must be numeric; got {fetch:#?}"
+        );
+    }
     assert!(
         detail["security"]["registry_signatures"].is_object(),
         "detail.security.registry_signatures must be an object"
@@ -1661,6 +1751,15 @@ async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
             "slow package bucket {bucket} must be an array; got {slow_packages:#}"
         );
     }
+    let metadata = envelope["timing"]["detail"]["metadata"]
+        .as_array()
+        .unwrap_or_else(|| panic!("detail.metadata must be an array; got {envelope:#}"));
+    assert!(
+        metadata
+            .iter()
+            .all(|entry| entry["top_duplicate_packages"].is_array()),
+        "LPM_TIMING_DETAIL=trace must emit duplicate metadata package buckets; got {metadata:#?}"
+    );
 }
 
 // ─── Lockfile Content Snapshot ───────────────────────────────────
