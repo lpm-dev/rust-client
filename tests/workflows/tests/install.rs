@@ -1642,6 +1642,10 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         "detail.fetch.counts must expose cache/download/link dispatch counters; got {fetch:#?}"
     );
     assert!(
+        fetch["classification"].is_object(),
+        "detail.fetch.classification must expose cache-classification branch timing; got {fetch:#?}"
+    );
+    assert!(
         fetch["breakdown"].is_object(),
         "detail.fetch.breakdown must retain the per-download breakdown; got {fetch:#?}"
     );
@@ -1657,6 +1661,21 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         assert!(
             fetch["stage"][field].is_number(),
             "detail.fetch.stage.{field} must be numeric; got {fetch:#?}"
+        );
+    }
+    for field in [
+        "wall_ms",
+        "local_source_ms",
+        "v2_reusable_hit_ms",
+        "v1_to_v2_translate_ms",
+        "v1_cache_hit_ms",
+        "download_candidate_ms",
+        "link_dispatch_ms",
+        "other_ms",
+    ] {
+        assert!(
+            fetch["classification"][field].is_number(),
+            "detail.fetch.classification.{field} must be numeric; got {fetch:#?}"
         );
     }
     for field in [

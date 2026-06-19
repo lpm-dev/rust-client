@@ -235,6 +235,12 @@ pub(super) struct FetchStageTimings {
     pub(super) plan_ms: u128,
     pub(super) v2_reusable_prevalidate_ms: u128,
     pub(super) cache_classify_ms: u128,
+    pub(super) cache_classify_local_source_ms: u128,
+    pub(super) cache_classify_v2_reusable_hit_ms: u128,
+    pub(super) cache_classify_v1_to_v2_translate_ms: u128,
+    pub(super) cache_classify_v1_cache_hit_ms: u128,
+    pub(super) cache_classify_download_candidate_ms: u128,
+    pub(super) cache_classify_link_dispatch_ms: u128,
     pub(super) policy_gate_ms: u128,
     pub(super) download_wall_ms: u128,
     pub(super) v2_reusable_candidate_count: u64,
@@ -270,6 +276,21 @@ impl FetchStageTimings {
                     .saturating_sub(self.cache_classify_ms)
                     .saturating_sub(self.policy_gate_ms)
                     .saturating_sub(self.download_wall_ms),
+            },
+            "classification": {
+                "wall_ms": self.cache_classify_ms,
+                "local_source_ms": self.cache_classify_local_source_ms,
+                "v2_reusable_hit_ms": self.cache_classify_v2_reusable_hit_ms,
+                "v1_to_v2_translate_ms": self.cache_classify_v1_to_v2_translate_ms,
+                "v1_cache_hit_ms": self.cache_classify_v1_cache_hit_ms,
+                "download_candidate_ms": self.cache_classify_download_candidate_ms,
+                "link_dispatch_ms": self.cache_classify_link_dispatch_ms,
+                "other_ms": self.cache_classify_ms
+                    .saturating_sub(self.cache_classify_local_source_ms)
+                    .saturating_sub(self.cache_classify_v2_reusable_hit_ms)
+                    .saturating_sub(self.cache_classify_v1_to_v2_translate_ms)
+                    .saturating_sub(self.cache_classify_v1_cache_hit_ms)
+                    .saturating_sub(self.cache_classify_download_candidate_ms),
             },
             "counts": {
                 "package_count": package_count as u64,
@@ -606,5 +627,21 @@ mod tests {
             default_fusion_npm_fanout_for_policy(86_400),
             DEFAULT_FUSION_NPM_FANOUT
         );
+    }
+
+    #[test]
+    fn fetch_stage_timings_reports_link_dispatch_as_classification_subset() {
+        let timings = FetchStageTimings {
+            cache_classify_ms: 10,
+            cache_classify_v2_reusable_hit_ms: 6,
+            cache_classify_download_candidate_ms: 2,
+            cache_classify_link_dispatch_ms: 4,
+            ..FetchStageTimings::default()
+        };
+
+        let json = timings.to_json(10, 1, 1, 0, FetchBreakdown::default());
+
+        assert_eq!(json["classification"]["other_ms"], 2);
+        assert_eq!(json["classification"]["link_dispatch_ms"], 4);
     }
 }

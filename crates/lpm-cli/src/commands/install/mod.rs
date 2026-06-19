@@ -146,6 +146,16 @@ fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
         .min(candidate_count.max(1))
 }
 
+fn timing_detail_start(enabled: bool) -> Option<Instant> {
+    enabled.then(Instant::now)
+}
+
+fn record_timing_detail_ms(bucket: &mut u128, start: Option<Instant>) {
+    if let Some(start) = start {
+        *bucket = bucket.saturating_add(start.elapsed().as_millis());
+    }
+}
+
 struct V2ReusablePrevalidation {
     hits: HashMap<String, lpm_store::v2::ReusableObject>,
     candidate_count: usize,
@@ -3153,6 +3163,7 @@ async fn run_with_options_under_store_lock(
     let mut to_download = Vec::new();
     let mut cached = 0usize;
     let cache_classify_start = Instant::now();
+    let fetch_detail_timing_enabled = timing_detail_mode.enabled();
 
     for p in &packages {
         // --force: re-download everything to verify integrity against registry,
@@ -3185,11 +3196,13 @@ async fn run_with_options_under_store_lock(
         }
 
         if v2_mode && is_local_source {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
             if v2_event_driven
                 && let Some(plan) = v2_plan.as_ref()
                 && let Some(target) = v2_target_by_key.get(&install_pkg_key(p)).cloned()
             {
+                let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
                 let plan_arc = std::sync::Arc::clone(plan);
                 let store_arc = std::sync::Arc::clone(
                     store_v2_handle
@@ -3200,7 +3213,15 @@ async fn run_with_options_under_store_lock(
                 v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
                     lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
                 }));
+                record_timing_detail_ms(
+                    &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+                    link_dispatch_start,
+                );
             }
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_local_source_ms,
+                classification_start,
+            );
             continue;
         }
 
@@ -3228,6 +3249,7 @@ async fn run_with_options_under_store_lock(
             && !is_local_source
             && let Some(reusable_object) = v2_reusable_objects.get(&package_key)
         {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
             // followup #6b — dispatch link_v2_one immediately.
             // The v2 object is already populated, so the link entry's
@@ -3237,6 +3259,7 @@ async fn run_with_options_under_store_lock(
                 && let Some(plan) = v2_plan.as_ref()
                 && let Some(target) = v2_target_by_key.get(&package_key).cloned()
             {
+                let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
                 let mut target = target;
                 target.verified_object_tree_integrity =
                     Some(reusable_object.tree_integrity.clone());
@@ -3250,7 +3273,15 @@ async fn run_with_options_under_store_lock(
                 v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
                     lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
                 }));
+                record_timing_detail_ms(
+                    &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+                    link_dispatch_start,
+                );
             }
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_v2_reusable_hit_ms,
+                classification_start,
+            );
             continue;
         }
 
@@ -3282,6 +3313,7 @@ async fn run_with_options_under_store_lock(
             && p.store_has_source_aware(&store, project_dir)
             && let Ok(v1_pkg_dir) = p.store_path_or_err(&store, project_dir, None)
         {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             match v2_store.populate_object_from_v1(&v1_pkg_dir, sri) {
                 Ok(_) => {
                     fetch_stage_timings.v1_to_v2_translate_count += 1;
@@ -3293,6 +3325,7 @@ async fn run_with_options_under_store_lock(
                         && let Some(plan) = v2_plan.as_ref()
                         && let Some(target) = v2_target_by_key.get(&install_pkg_key(p)).cloned()
                     {
+                        let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
                         let plan_arc = std::sync::Arc::clone(plan);
                         let store_arc = std::sync::Arc::clone(
                             store_v2_handle
@@ -3303,11 +3336,23 @@ async fn run_with_options_under_store_lock(
                         v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
                             lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
                         }));
+                        record_timing_detail_ms(
+                            &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+                            link_dispatch_start,
+                        );
                     }
+                    record_timing_detail_ms(
+                        &mut fetch_stage_timings.cache_classify_v1_to_v2_translate_ms,
+                        classification_start,
+                    );
                     continue;
                 }
                 Err(e) => {
                     fetch_stage_timings.v1_to_v2_translate_failure_count += 1;
+                    record_timing_detail_ms(
+                        &mut fetch_stage_timings.cache_classify_v1_to_v2_translate_ms,
+                        classification_start,
+                    );
                     tracing::debug!(
                         "v1→v2 translation for {}@{} failed: {e} (falling back to fetch)",
                         p.name,
@@ -3318,6 +3363,7 @@ async fn run_with_options_under_store_lock(
         }
 
         if !force && !v2_mode && p.store_has_source_aware(&store, project_dir) {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
             fetch_stage_timings.v1_cache_hit_count += 1;
             //b: spawn per-pkg link task immediately — this
@@ -3348,13 +3394,27 @@ async fn run_with_options_under_store_lock(
                 };
                 let pd = project_dir.to_path_buf();
                 let force_flag = force;
+                let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
                 fetch_stage_timings.link_dispatch_count += 1;
                 event_link_handles.push(tokio::task::spawn_blocking(move || {
                     lpm_linker::link_one_package(&pd, &target, force_flag)
                 }));
+                record_timing_detail_ms(
+                    &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+                    link_dispatch_start,
+                );
             }
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_v1_cache_hit_ms,
+                classification_start,
+            );
         } else {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             to_download.push(p.clone());
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_download_candidate_ms,
+                classification_start,
+            );
         }
     }
     fetch_stage_timings.cache_classify_ms = cache_classify_start.elapsed().as_millis();
