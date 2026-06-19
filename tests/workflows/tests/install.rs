@@ -1649,6 +1649,10 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         fetch["breakdown"].is_object(),
         "detail.fetch.breakdown must retain the per-download breakdown; got {fetch:#?}"
     );
+    assert!(
+        fetch["v2_reusable_validation"].is_object(),
+        "detail.fetch.v2_reusable_validation must expose reusable-object validation counters; got {fetch:#?}"
+    );
     for field in [
         "wall_ms",
         "plan_ms",
@@ -1694,6 +1698,52 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         assert!(
             fetch["counts"][field].is_number(),
             "detail.fetch.counts.{field} must be numeric; got {fetch:#?}"
+        );
+    }
+    for field in [
+        "checked_count",
+        "hit_count",
+        "miss_count",
+        "total_ms",
+        "max_check_ms",
+        "missing_count",
+        "complete_check_ms",
+        "object_sidecar_read_count",
+        "object_sidecar_read_ms",
+        "snapshot_read_count",
+        "snapshot_read_ms",
+        "snapshot_hit_count",
+        "snapshot_miss_count",
+        "metadata_hash_count",
+        "metadata_hash_ms",
+        "full_hash_count",
+        "full_hash_ms",
+        "removed_count",
+        "remove_ms",
+    ] {
+        assert!(
+            fetch["v2_reusable_validation"][field].is_number(),
+            "detail.fetch.v2_reusable_validation.{field} must be numeric; got {fetch:#?}"
+        );
+    }
+    let link = detail["link"]
+        .as_object()
+        .unwrap_or_else(|| panic!("detail.link must be an object; got {detail:#?}"));
+    assert!(
+        link["v2_one"].is_object(),
+        "detail.link.v2_one must expose event-driven v2 link task counters; got {link:#?}"
+    );
+    for field in [
+        "task_count",
+        "freshly_populated_count",
+        "reused_entry_count",
+        "task_sum_ms",
+        "task_max_ms",
+        "await_ms",
+    ] {
+        assert!(
+            link["v2_one"][field].is_number(),
+            "detail.link.v2_one.{field} must be numeric; got {link:#?}"
         );
     }
     assert!(
@@ -1744,6 +1794,7 @@ async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
         "extract",
         "security",
         "finalize",
+        "link_v2_one",
         "provenance_verify",
     ] {
         assert!(
