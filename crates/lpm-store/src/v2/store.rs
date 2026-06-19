@@ -344,6 +344,13 @@ pub struct ReusableObject {
     pub tree_integrity: VerifiedObjectTreeIntegrity,
 }
 
+/// Existing link entry that was validated without reading object bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusableLinkEntry {
+    pub package_dir: PathBuf,
+    pub tree_integrity: VerifiedObjectTreeIntegrity,
+}
+
 /// Timing and path counters for one reusable-object validation check.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReusableObjectCheckTimings {
@@ -1071,6 +1078,67 @@ impl Store {
         let actual = compute_object_tree_integrities(&package_dir)?;
         write_tree_snapshot_best_effort(&link_dir, &actual);
         Ok(actual.content)
+    }
+
+    /// Validate an existing link entry for reuse without walking the object tree.
+    ///
+    /// This accepts only when the link sidecar matches the requested graph key and
+    /// source SRI, the object sidecar/snapshot agree on the original object digest,
+    /// and the link package tree still matches that digest. Any uncertainty returns
+    /// `Ok(None)` so callers can fall back to full object validation.
+    pub fn reusable_link_entry_from_snapshots(
+        &self,
+        key: &GraphKey,
+        source_sri: &str,
+    ) -> Result<Option<ReusableLinkEntry>, LpmError> {
+        let link_dir = self.paths.link_dir(key);
+        if !is_complete_link_entry(&link_dir, key) {
+            return Ok(None);
+        }
+
+        let meta = match LinkMeta::read_from(&link_dir) {
+            Ok(meta) => meta,
+            Err(error) => {
+                tracing::debug!(
+                    target = %link_dir.display(),
+                    "v2 store: existing link entry is not eligible for snapshot reuse: {error}"
+                );
+                return Ok(None);
+            }
+        };
+        let expected_object_path = self.paths.relative_object_path(source_sri)?;
+        if meta.graph_key != key.dir_name()
+            || meta.source_sri != source_sri
+            || meta.object_path != expected_object_path
+        {
+            return Ok(None);
+        }
+
+        let object_dir = self.paths.object_dir(source_sri)?;
+        if !is_complete_object_dir(&object_dir) {
+            return Ok(None);
+        }
+        let object_integrity = read_object_tree_integrity(&object_dir)?;
+        let Some(object_snapshot) = read_tree_snapshot(&object_dir) else {
+            return Ok(None);
+        };
+        if object_snapshot.content_integrity != object_integrity {
+            return Ok(None);
+        }
+
+        let package_dir = link_entry_package_dir(&link_dir, key);
+        if !tree_snapshot_matches(&link_dir, &package_dir, &object_integrity)? {
+            return Ok(None);
+        }
+
+        let sidecar_path = link_dir.join(LINK_META_FILENAME);
+        if let Err(error) = LinkMeta::touch_on_disk(&sidecar_path) {
+            tracing::debug!("v2 store: cache-hit touch failed: {error}");
+        }
+        Ok(Some(ReusableLinkEntry {
+            package_dir,
+            tree_integrity: VerifiedObjectTreeIntegrity::new(object_integrity),
+        }))
     }
 
     /// **v1 → v2 cache-hit translation.** When the v1 store already
@@ -2917,6 +2985,115 @@ mod tests {
             snapshot_path.is_file(),
             "compat island keying should repair legacy link entries missing the digest snapshot"
         );
+    }
+
+    #[test]
+    fn reusable_link_entry_from_snapshots_returns_existing_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"reusable_link_entry_from_snapshots_returns_existing_package");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"snapshot-link\"}"),
+                ("index.js", b"ok"),
+            ],
+        );
+        let expected_integrity = read_object_tree_integrity(&object_dir).unwrap();
+        let key = arc_key("snapshot-link", "1.0.0");
+        let entry = store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: key.clone(),
+                source_sri: sri.clone(),
+                object_dir,
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+
+        let reusable = store
+            .reusable_link_entry_from_snapshots(&key, &sri)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            reusable.package_dir,
+            entry.link_dir.join("node_modules/snapshot-link")
+        );
+        assert_eq!(reusable.tree_integrity.as_str(), expected_integrity);
+    }
+
+    #[test]
+    fn reusable_link_entry_from_snapshots_returns_none_when_link_package_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(
+            b"reusable_link_entry_from_snapshots_returns_none_when_link_package_changes",
+        );
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"snapshot-link\"}"),
+                ("index.js", b"ok"),
+            ],
+        );
+        let key = arc_key("snapshot-link", "1.0.0");
+        let entry = store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: key.clone(),
+                source_sri: sri.clone(),
+                object_dir,
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+        std::fs::write(
+            entry.link_dir.join("node_modules/snapshot-link/index.js"),
+            b"changed",
+        )
+        .unwrap();
+
+        let reusable = store
+            .reusable_link_entry_from_snapshots(&key, &sri)
+            .unwrap();
+
+        assert!(reusable.is_none());
+    }
+
+    #[test]
+    fn reusable_link_entry_from_snapshots_returns_none_when_object_snapshot_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(
+            b"reusable_link_entry_from_snapshots_returns_none_when_object_snapshot_is_missing",
+        );
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"snapshot-link\"}"),
+                ("index.js", b"ok"),
+            ],
+        );
+        let key = arc_key("snapshot-link", "1.0.0");
+        store
+            .populate_link_entry(LinkEntryRequest {
+                graph_key: key.clone(),
+                source_sri: sri.clone(),
+                object_dir: object_dir.clone(),
+                deps: vec![],
+                platform: Arc::new(sample_meta_platform()),
+            })
+            .unwrap();
+        std::fs::remove_file(object_dir.join(TREE_SNAPSHOT_FILENAME)).unwrap();
+
+        let reusable = store
+            .reusable_link_entry_from_snapshots(&key, &sri)
+            .unwrap();
+
+        assert!(reusable.is_none());
     }
 
     #[test]
