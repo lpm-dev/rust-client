@@ -849,9 +849,22 @@ async fn run_with_options_under_store_lock(
 ) -> Result<(), LpmError> {
     let start = Instant::now();
     lpm_registry::timing::reset_metadata_http_versions();
+    lpm_registry::timing::reset_metadata_detail();
+    crate::build_state::reset_write_timing();
     crate::security_floor::clear_recorded_suppressions();
+    let timing_detail_mode = TimingDetailMode::from_env();
     let global_config = crate::commands::config::GlobalConfig::load();
     let verify_registry_signatures = registry_signature_verification_enabled(&global_config);
+    let registry_signature_timings = timing_detail_mode
+        .enabled()
+        .then(|| Arc::new(crate::registry_signatures::RegistrySignatureTimings::default()));
+    let provenance_timings = timing_detail_mode
+        .enabled()
+        .then(crate::provenance_fetch::ProvenanceTimings::default);
+    let mut slow_package_timings = SlowPackageTimings::default();
+    let mut wf_tail_lockfile_write_ms = 0u128;
+    let mut wf_tail_lockfile_write_count = 0u64;
+    let mut wf_tail_audit_after_install_ms = 0u128;
     let force_security_floor = crate::security_floor::force_security_floor_enabled(&global_config);
     let mut drift_ignore_policy = drift_ignore_policy;
     let mut verify_policy = verify_policy;
@@ -1073,6 +1086,14 @@ async fn run_with_options_under_store_lock(
                            "peer_conflicts": [],
                            "peer_issues": peer_issues_json_value(&[], &[]),
                        });
+            if timing_detail_mode.enabled() {
+                json["timing"]["detail"] = setup_only_timing_detail_json(
+                    timing_detail_mode,
+                    total_ms,
+                    wf_setup_install_state_ms,
+                    0,
+                );
+            }
             // surface workspace target set for agents.
             if let Some(targets) = target_set {
                 json["target_set"] = serde_json::Value::Array(
@@ -1624,6 +1645,14 @@ async fn run_with_options_under_store_lock(
                            "peer_conflicts": [],
                            "peer_issues": peer_issues_json_value(&[], &[]),
                        });
+            if timing_detail_mode.enabled() {
+                json["timing"]["detail"] = setup_only_timing_detail_json(
+                    timing_detail_mode,
+                    total_ms,
+                    wf_setup_install_state_ms,
+                    wf_setup_route_table_ms,
+                );
+            }
             if let Some(targets) = target_set {
                 json["target_set"] = serde_json::Value::Array(
                     targets.iter().map(|s| serde_json::json!(s)).collect(),
@@ -1978,6 +2007,7 @@ async fn run_with_options_under_store_lock(
                 &locked,
                 json_output,
                 false,
+                registry_signature_timings.clone(),
             )
             .await?;
         }
@@ -2813,6 +2843,7 @@ async fn run_with_options_under_store_lock(
             &packages,
             json_output,
             true,
+            registry_signature_timings.clone(),
         )
         .await?;
     }
@@ -3591,25 +3622,10 @@ async fn run_with_options_under_store_lock(
                 // cooldown gate above).
                 let attestation_ref = if p.is_lpm {
                     match lpm_common::PackageName::parse(&p.name) {
-                        Ok(pkg_name) => arc_client
-                            .get_package_metadata(&pkg_name)
-                            .await
-                            .ok()
-                            .and_then(|meta| {
-                                meta.versions
-                                    .get(&p.version)
-                                    .and_then(|v| v.dist.as_ref())
-                                    .and_then(|d| d.attestations.clone())
-                            }),
-                        Err(_) => None,
-                    }
-                } else {
-                    // follow-up: route via RouteTable so
-                    // the provenance-drift gate doesn't fall through to
-                    // public npm for a custom-registry package.
-                    let route = route_table.route_for_package(&p.name);
-                    arc_client
-                        .get_npm_metadata_routed(&p.name, route)
+                        Ok(pkg_name) => lpm_registry::timing::with_metadata_purpose(
+                            lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                            arc_client.get_package_metadata(&pkg_name),
+                        )
                         .await
                         .ok()
                         .and_then(|meta| {
@@ -3617,7 +3633,26 @@ async fn run_with_options_under_store_lock(
                                 .get(&p.version)
                                 .and_then(|v| v.dist.as_ref())
                                 .and_then(|d| d.attestations.clone())
-                        })
+                        }),
+                        Err(_) => None,
+                    }
+                } else {
+                    // follow-up: route via RouteTable so
+                    // the provenance-drift gate doesn't fall through to
+                    // public npm for a custom-registry package.
+                    let route = route_table.route_for_package(&p.name);
+                    lpm_registry::timing::with_metadata_purpose(
+                        lpm_registry::timing::MetadataPurpose::ProvenanceDrift,
+                        arc_client.get_npm_metadata_routed(&p.name, route),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|meta| {
+                        meta.versions
+                            .get(&p.version)
+                            .and_then(|v| v.dist.as_ref())
+                            .and_then(|d| d.attestations.clone())
+                    })
                 };
 
                 // When the operator skip-listed this name (CLI
@@ -3667,7 +3702,7 @@ async fn run_with_options_under_store_lock(
                         &p.name,
                         &p.version,
                         attestation_ref.as_ref(),
-                        None,
+                        provenance_timings.as_ref(),
                     )
                     .await;
                     // Branch arms:
@@ -3928,6 +3963,7 @@ async fn run_with_options_under_store_lock(
                 .get(&(p.name.clone(), p.version.clone()))
                 .cloned();
             let source_index_for_pkg = Arc::clone(&source_index);
+            let trace_slow_packages = timing_detail_mode.trace();
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
@@ -3940,6 +3976,15 @@ async fn run_with_options_under_store_lock(
                 // always None).
                 type V2LinkHandle =
                     tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
+                type FetchTaskResult = (
+                    String,
+                    Option<String>,
+                    String,
+                    TaskTimings,
+                    Option<LinkHandle>,
+                    Option<V2LinkHandle>,
+                    Option<String>,
+                );
 
                 // timing: spawn→key-lock→permit captures the full time this
                 // task sat queued.: now also covers the
@@ -3947,6 +3992,8 @@ async fn run_with_options_under_store_lock(
                 // the same `(name, ver)`, we wait on the per-key lock and
                 // short-circuit via the store-hit check below.
                 let queue_start = std::time::Instant::now();
+                let package_display =
+                    trace_slow_packages.then(|| format!("{}@{}", p.name, p.version));
 
                 //: per-key fetch coordination. Acquired BEFORE
                 // the download permit — if a sibling (speculation) is
@@ -4031,18 +4078,9 @@ async fn run_with_options_under_store_lock(
                                 None
                             };
                         overall.inc(1);
-                        return Ok::<
-                            (
-                                String,
-                                String,
-                                TaskTimings,
-                                Option<LinkHandle>,
-                                Option<V2LinkHandle>,
-                                Option<String>,
-                            ),
-                            LpmError,
-                        >((
+                        return Ok::<FetchTaskResult, LpmError>((
                             install_pkg_key(&p),
+                            package_display,
                             sri_for_result,
                             TaskTimings {
                                 queue_wait_ms: queue_start.elapsed().as_millis(),
@@ -4109,18 +4147,9 @@ async fn run_with_options_under_store_lock(
                             None
                         };
                     overall.inc(1);
-                    return Ok::<
-                        (
-                            String,
-                            String,
-                            TaskTimings,
-                            Option<LinkHandle>,
-                            Option<V2LinkHandle>,
-                            Option<String>,
-                        ),
-                        LpmError,
-                    >((
+                    return Ok::<FetchTaskResult, LpmError>((
                         install_pkg_key(&p),
+                        package_display,
                         sri,
                         TaskTimings {
                             queue_wait_ms: queue_start.elapsed().as_millis(),
@@ -4224,18 +4253,9 @@ async fn run_with_options_under_store_lock(
                     };
 
                 overall.inc(1);
-                Ok::<
-                    (
-                        String,
-                        String,
-                        TaskTimings,
-                        Option<LinkHandle>,
-                        Option<V2LinkHandle>,
-                        Option<String>,
-                    ),
-                    LpmError,
-                >((
+                Ok::<FetchTaskResult, LpmError>((
                     package_key,
+                    package_display,
                     computed_sri,
                     task_timings,
                     link_h,
@@ -4255,11 +4275,14 @@ async fn run_with_options_under_store_lock(
         let mut integrity_map: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for handle in handles {
-            let (pkg_key, sri, timings, link_h, v2_link_h, final_url) = handle
+            let (pkg_key, package_display, sri, timings, link_h, v2_link_h, final_url) = handle
                 .await
                 .map_err(|e| LpmError::Registry(format!("download task panicked: {e}")))??;
             integrity_map.insert(pkg_key.clone(), sri);
             fetch_breakdown.record(timings);
+            if let Some(package_display) = package_display.as_deref() {
+                slow_package_timings.record_fetch(package_display, timings);
+            }
             if let Some(lh) = link_h {
                 event_link_handles.push(lh);
             }
@@ -4513,8 +4536,11 @@ async fn run_with_options_under_store_lock(
         );
         metadata
     } else {
-        let metadata =
-            build_blocked_set_metadata(arc_client.as_ref(), &route_table, &packages).await;
+        let metadata = lpm_registry::timing::with_metadata_purpose(
+            lpm_registry::timing::MetadataPurpose::BlockedSet,
+            build_blocked_set_metadata(arc_client.as_ref(), &route_table, &packages),
+        )
+        .await;
         wf_tail_blocked_metadata_ms = blocked_metadata_start.elapsed().as_millis();
         tracing::debug!(
             "perf.build_blocked_set_metadata pkgs={} ms={}",
@@ -4979,9 +5005,13 @@ async fn run_with_options_under_store_lock(
             .importers
             .insert(".".to_string(), current_importer_snapshot.clone());
 
+        let lockfile_write_start = std::time::Instant::now();
         lockfile
             .write_all(&lockfile_path)
             .map_err(|e| LpmError::Registry(format!("failed to write lockfile: {e}")))?;
+        wf_tail_lockfile_write_ms =
+            wf_tail_lockfile_write_ms.saturating_add(lockfile_write_start.elapsed().as_millis());
+        wf_tail_lockfile_write_count = wf_tail_lockfile_write_count.saturating_add(1);
 
         lpm_lockfile::ensure_gitattributes(project_dir)
             .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
@@ -5052,9 +5082,13 @@ async fn run_with_options_under_store_lock(
                 }
             }
 
+            let lockfile_write_start = std::time::Instant::now();
             lockfile
                 .write_all(&lockfile_path)
                 .map_err(|e| LpmError::Registry(format!("failed to rewrite lockfile: {e}")))?;
+            wf_tail_lockfile_write_ms = wf_tail_lockfile_write_ms
+                .saturating_add(lockfile_write_start.elapsed().as_millis());
+            wf_tail_lockfile_write_count = wf_tail_lockfile_write_count.saturating_add(1);
 
             if !json_output {
                 // Observable output so the user can see why the
@@ -5273,10 +5307,11 @@ async fn run_with_options_under_store_lock(
     // for operators tailing `LPM_LOG`.
     let audit_summary_for_envelope: Option<crate::commands::audit::AuditCounts> =
         if audit_after_install {
-            if maybe_test_audit_after_install_should_fail() {
+            let audit_start = std::time::Instant::now();
+            let summary = if maybe_test_audit_after_install_should_fail() {
                 tracing::warn!(
                     "audit-after-install failed: test-injected failure \
-                     (LPM_TEST_AUDIT_AFTER_INSTALL_FAIL=1)"
+                 (LPM_TEST_AUDIT_AFTER_INSTALL_FAIL=1)"
                 );
                 None
             } else {
@@ -5287,7 +5322,9 @@ async fn run_with_options_under_store_lock(
                         None
                     }
                 }
-            }
+            };
+            wf_tail_audit_after_install_ms = audit_start.elapsed().as_millis();
+            summary
         } else {
             None
         };
@@ -5558,14 +5595,45 @@ async fn run_with_options_under_store_lock(
                    "peer_conflicts": [],
                    "peer_issues": peer_issues_json_value(&[], &[]),
                });
-        if std::env::var_os("LPM_TIMING_DETAIL").is_some() {
-            json["timing"]["waterfall"]["detail"] = serde_json::json!({
+        if timing_detail_mode.enabled() {
+            let build_state_write_timing = crate::build_state::snapshot_write_timing();
+            let mut detail = serde_json::json!({
                 "setup": {
                     "install_state_ms": wf_setup_install_state_ms,
                     "route_table_ms": wf_setup_route_table_ms,
                     "other_ms": wf_setup_ms.saturating_sub(
                         wf_setup_install_state_ms.saturating_add(wf_setup_route_table_ms),
                     ),
+                },
+                "metadata": metadata_detail_json(),
+                "resolve": {
+                    "policy": {
+                        "release_age": {
+                            "ms": resolver_stage_timing.policy_release_age_ms,
+                            "checked_count":
+                                resolver_stage_timing.policy_release_age_checked_count,
+                            "rejected_count":
+                                resolver_stage_timing.policy_release_age_rejected_count,
+                            "missing_count":
+                                resolver_stage_timing.policy_release_age_missing_count,
+                        },
+                        "trust": {
+                            "ms": resolver_stage_timing.policy_trust_ms,
+                            "checked_count": resolver_stage_timing.policy_trust_checked_count,
+                            "rejected_count": resolver_stage_timing.policy_trust_rejected_count,
+                        },
+                    },
+                },
+                "fetch": {
+                    "breakdown": fetch_breakdown.to_json(),
+                },
+                "security": {
+                    "registry_signatures": registry_signature_timings
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, |timings| timings.to_json()),
+                    "provenance": provenance_timings
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, |timings| timings.to_json()),
                 },
                 "link": {
                     "reconcile_ms": wf_link_reconcile_ms,
@@ -5576,13 +5644,37 @@ async fn run_with_options_under_store_lock(
                 "tail": {
                     "blocked_metadata_ms": wf_tail_blocked_metadata_ms,
                     "trust_snapshot_ms": wf_tail_trust_snapshot_ms,
+                    "lockfile_write_ms": wf_tail_lockfile_write_ms,
+                    "lockfile_write_count": wf_tail_lockfile_write_count,
+                    "build_state_write_ms": build_state_write_timing.write_ms,
+                    "build_state_write_count": build_state_write_timing.write_count,
+                    "audit_after_install_ms": wf_tail_audit_after_install_ms,
                     "other_ms": elapsed
                         .as_millis()
                         .saturating_sub(wf_link_end_ms)
                         .saturating_sub(wf_tail_blocked_metadata_ms)
-                        .saturating_sub(wf_tail_trust_snapshot_ms),
+                        .saturating_sub(wf_tail_trust_snapshot_ms)
+                        .saturating_sub(wf_tail_lockfile_write_ms)
+                        .saturating_sub(build_state_write_timing.write_ms as u128)
+                        .saturating_sub(wf_tail_audit_after_install_ms),
                 },
             });
+            if timing_detail_mode.trace() {
+                let mut slow_packages = slow_package_timings.to_json();
+                if let serde_json::Value::Object(slow_packages) = &mut slow_packages {
+                    slow_packages.insert(
+                        "provenance_verify".to_string(),
+                        provenance_timings.as_ref().map_or_else(
+                            || serde_json::Value::Array(Vec::new()),
+                            crate::provenance_fetch::ProvenanceTimings::slow_verify_json,
+                        ),
+                    );
+                }
+                detail["trace"] = serde_json::json!({
+                    "slow_packages": slow_packages,
+                });
+            }
+            json["timing"]["detail"] = detail;
         }
         // surface workspace target set for agents.
         // None for legacy/standalone callers; Some(...) for the filtered path.

@@ -1462,6 +1462,14 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
         waterfall.is_object(),
         "install --json must emit timing.waterfall; got {envelope:#}"
     );
+    assert!(
+        envelope["timing"].get("detail").is_none(),
+        "install --json must omit timing.detail unless LPM_TIMING_DETAIL is set; got {envelope:#}"
+    );
+    assert!(
+        waterfall.get("detail").is_none(),
+        "install --json must not nest detail under timing.waterfall by default; got {envelope:#}"
+    );
     let segment = |key: &str| {
         waterfall[key]
             .as_u64()
@@ -1502,6 +1510,157 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
             ".cache" => "[CACHE]",
         });
     });
+}
+
+#[tokio::test]
+async fn install_json_timing_detail_env_exposes_install_substage_probes() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"timing-detail-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TIMING_DETAIL", "1")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install --json failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
+
+    let detail = envelope["timing"]["detail"]
+        .as_object()
+        .unwrap_or_else(|| panic!("LPM_TIMING_DETAIL=1 must emit timing.detail; got {envelope:#}"));
+    assert!(
+        envelope["timing"]["waterfall"].get("detail").is_none(),
+        "detail belongs under timing.detail, not timing.waterfall.detail; got {envelope:#}"
+    );
+    assert!(detail.get("setup").is_some(), "missing detail.setup");
+    assert!(detail.get("fetch").is_some(), "missing detail.fetch");
+    assert!(detail.get("link").is_some(), "missing detail.link");
+    assert!(detail.get("tail").is_some(), "missing detail.tail");
+    assert!(
+        detail.get("trace").is_none(),
+        "trace-only package rankings must stay out of LPM_TIMING_DETAIL=1"
+    );
+
+    let metadata = detail["metadata"]
+        .as_array()
+        .unwrap_or_else(|| panic!("detail.metadata must be an array; got {detail:#?}"));
+    assert!(
+        metadata.iter().any(|entry| entry["purpose"] == "resolve"),
+        "metadata detail must include resolve attribution; got {metadata:#?}"
+    );
+    for field in [
+        "rpc_ms",
+        "rpc_count",
+        "cache_hit_count",
+        "cache_miss_count",
+        "request_count",
+        "unique_package_count",
+        "duplicate_request_count",
+    ] {
+        assert!(
+            metadata.iter().all(|entry| entry[field].is_number()),
+            "metadata entries must expose numeric {field}; got {metadata:#?}"
+        );
+    }
+
+    let tail = detail["tail"]
+        .as_object()
+        .unwrap_or_else(|| panic!("detail.tail must be an object; got {detail:#?}"));
+    for field in [
+        "blocked_metadata_ms",
+        "trust_snapshot_ms",
+        "lockfile_write_ms",
+        "lockfile_write_count",
+        "build_state_write_ms",
+        "build_state_write_count",
+        "audit_after_install_ms",
+        "other_ms",
+    ] {
+        assert!(
+            tail.get(field).is_some_and(serde_json::Value::is_number),
+            "detail.tail.{field} must be numeric; got {tail:#?}"
+        );
+    }
+
+    assert!(
+        detail["resolve"]["policy"]["release_age"].is_object(),
+        "detail.resolve.policy.release_age must be an object"
+    );
+    assert!(
+        detail["resolve"]["policy"]["trust"].is_object(),
+        "detail.resolve.policy.trust must be an object"
+    );
+    assert!(
+        detail["security"]["registry_signatures"].is_object(),
+        "detail.security.registry_signatures must be an object"
+    );
+    assert!(
+        detail["security"]["provenance"].is_object(),
+        "detail.security.provenance must be an object"
+    );
+}
+
+#[tokio::test]
+async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"timing-trace-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TIMING_DETAIL", "trace")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install --json failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
+    let slow_packages = &envelope["timing"]["detail"]["trace"]["slow_packages"];
+    assert!(
+        slow_packages.is_object(),
+        "LPM_TIMING_DETAIL=trace must emit slow package buckets; got {envelope:#}"
+    );
+    for bucket in [
+        "tarball_http",
+        "extract",
+        "security",
+        "finalize",
+        "provenance_verify",
+    ] {
+        assert!(
+            slow_packages[bucket].is_array(),
+            "slow package bucket {bucket} must be an array; got {slow_packages:#}"
+        );
+    }
 }
 
 // ─── Lockfile Content Snapshot ───────────────────────────────────
@@ -1851,8 +2010,10 @@ async fn install_up_to_date_json_includes_flag() {
         .assert()
         .success();
 
-    // Second install with --json should show up_to_date
+    // Second install with --json should show up_to_date and still honor
+    // env-gated setup-only timing detail on the true fast-exit path.
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TIMING_DETAIL", "trace")
         .args([
             "install",
             "--json",
@@ -1876,6 +2037,14 @@ async fn install_up_to_date_json_includes_flag() {
     assert_eq!(
         json["timing"]["waterfall"]["total_ms"], json["timing"]["total_ms"],
         "fast-path waterfall total must match timing.total_ms"
+    );
+    assert!(
+        json["timing"]["detail"]["setup"].is_object(),
+        "up-to-date detail must include setup timing; got {json:#}"
+    );
+    assert!(
+        json["timing"]["detail"]["trace"]["slow_packages"].is_object(),
+        "trace mode must include empty slow-package buckets on the fast path; got {json:#}"
     );
 }
 

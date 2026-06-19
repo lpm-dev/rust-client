@@ -22,7 +22,11 @@
 //! drop work. `AtomicU64` is contention-free for the single-writer
 //! case (the cold-resolve path is effectively serial).
 
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 static METADATA_RPC_NS: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +38,102 @@ static METADATA_HTTP_11_COUNT: AtomicU32 = AtomicU32::new(0);
 static METADATA_HTTP_2_COUNT: AtomicU32 = AtomicU32::new(0);
 static METADATA_HTTP_3_COUNT: AtomicU32 = AtomicU32::new(0);
 static METADATA_HTTP_UNKNOWN_COUNT: AtomicU32 = AtomicU32::new(0);
+
+tokio::task_local! {
+    static METADATA_PURPOSE: Cell<MetadataPurpose>;
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum MetadataPurpose {
+    Resolve,
+    BlockedSet,
+    SignatureHydration,
+    ProvenanceDrift,
+    TarballUrlLookup,
+}
+
+impl MetadataPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolve => "resolve",
+            Self::BlockedSet => "blocked_set",
+            Self::SignatureHydration => "signature_hydration",
+            Self::ProvenanceDrift => "provenance_drift",
+            Self::TarballUrlLookup => "tarball_url_lookup",
+        }
+    }
+}
+
+const METADATA_PURPOSES: [MetadataPurpose; 5] = [
+    MetadataPurpose::Resolve,
+    MetadataPurpose::BlockedSet,
+    MetadataPurpose::SignatureHydration,
+    MetadataPurpose::ProvenanceDrift,
+    MetadataPurpose::TarballUrlLookup,
+];
+
+#[derive(Default)]
+struct PurposeCounters {
+    rpc_ns: AtomicU64,
+    rpc_count: AtomicU64,
+    cache_hit_count: AtomicU64,
+    cache_miss_count: AtomicU64,
+    request_count: AtomicU64,
+}
+
+static RESOLVE_COUNTERS: PurposeCounters = PurposeCounters::new();
+static BLOCKED_SET_COUNTERS: PurposeCounters = PurposeCounters::new();
+static SIGNATURE_HYDRATION_COUNTERS: PurposeCounters = PurposeCounters::new();
+static PROVENANCE_DRIFT_COUNTERS: PurposeCounters = PurposeCounters::new();
+static TARBALL_URL_LOOKUP_COUNTERS: PurposeCounters = PurposeCounters::new();
+
+impl PurposeCounters {
+    const fn new() -> Self {
+        Self {
+            rpc_ns: AtomicU64::new(0),
+            rpc_count: AtomicU64::new(0),
+            cache_hit_count: AtomicU64::new(0),
+            cache_miss_count: AtomicU64::new(0),
+            request_count: AtomicU64::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.rpc_ns.store(0, Ordering::Relaxed);
+        self.rpc_count.store(0, Ordering::Relaxed);
+        self.cache_hit_count.store(0, Ordering::Relaxed);
+        self.cache_miss_count.store(0, Ordering::Relaxed);
+        self.request_count.store(0, Ordering::Relaxed);
+    }
+}
+
+fn purpose_counters(purpose: MetadataPurpose) -> &'static PurposeCounters {
+    match purpose {
+        MetadataPurpose::Resolve => &RESOLVE_COUNTERS,
+        MetadataPurpose::BlockedSet => &BLOCKED_SET_COUNTERS,
+        MetadataPurpose::SignatureHydration => &SIGNATURE_HYDRATION_COUNTERS,
+        MetadataPurpose::ProvenanceDrift => &PROVENANCE_DRIFT_COUNTERS,
+        MetadataPurpose::TarballUrlLookup => &TARBALL_URL_LOOKUP_COUNTERS,
+    }
+}
+
+fn metadata_request_counts() -> &'static Mutex<HashMap<(MetadataPurpose, String), u64>> {
+    static COUNTS: OnceLock<Mutex<HashMap<(MetadataPurpose, String), u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn current_metadata_purpose() -> MetadataPurpose {
+    METADATA_PURPOSE
+        .try_with(Cell::get)
+        .unwrap_or(MetadataPurpose::Resolve)
+}
+
+pub async fn with_metadata_purpose<T>(
+    purpose: MetadataPurpose,
+    future: impl Future<Output = T>,
+) -> T {
+    METADATA_PURPOSE.scope(Cell::new(purpose), future).await
+}
 
 /// Split `metadata_rpc_count` into walker-driven and provider-escape-hatch
 /// buckets. Walker code paths call [`record_walker_rpcs`] with the count
@@ -58,6 +158,15 @@ pub fn reset() {
     WALKER_RPC_COUNT.store(0, Ordering::Relaxed);
 }
 
+pub fn reset_metadata_detail() {
+    for purpose in METADATA_PURPOSES {
+        purpose_counters(purpose).reset();
+    }
+    if let Ok(mut counts) = metadata_request_counts().lock() {
+        counts.clear();
+    }
+}
+
 /// Reset install-scoped metadata response protocol counters.
 pub fn reset_metadata_http_versions() {
     METADATA_HTTP_09_COUNT.store(0, Ordering::Relaxed);
@@ -80,6 +189,11 @@ pub fn reset_metadata_http_versions() {
 pub fn record_rpc(duration: Duration) {
     METADATA_RPC_NS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     METADATA_RPC_COUNT.fetch_add(1, Ordering::Relaxed);
+    let counters = purpose_counters(current_metadata_purpose());
+    counters
+        .rpc_ns
+        .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    counters.rpc_count.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record CPU time spent parsing an NDJSON line (serde_json ->
@@ -113,6 +227,29 @@ pub fn record_metadata_http_version(version: reqwest::Version) {
     } else {
         METADATA_HTTP_UNKNOWN_COUNT.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+pub fn record_metadata_request(package_name: &str) {
+    let purpose = current_metadata_purpose();
+    purpose_counters(purpose)
+        .request_count
+        .fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut counts) = metadata_request_counts().lock() {
+        let key = (purpose, package_name.to_string());
+        *counts.entry(key).or_insert(0) += 1;
+    }
+}
+
+pub fn record_metadata_cache_hit() {
+    purpose_counters(current_metadata_purpose())
+        .cache_hit_count
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_metadata_cache_miss() {
+    purpose_counters(current_metadata_purpose())
+        .cache_miss_count
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// Snapshot package-metadata response protocol counters.
@@ -171,6 +308,47 @@ pub struct Snapshot {
     /// `fetch_wait_timeout`). High values indicate the walker's depth or
     /// fanout is undersized. `escape_hatch + walker == metadata_rpc_count`.
     pub escape_hatch_rpc_count: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataPurposeSnapshot {
+    pub purpose: &'static str,
+    pub rpc: Duration,
+    pub rpc_count: u64,
+    pub cache_hit_count: u64,
+    pub cache_miss_count: u64,
+    pub request_count: u64,
+    pub unique_package_count: u64,
+    pub duplicate_request_count: u64,
+}
+
+pub fn snapshot_metadata_detail() -> Vec<MetadataPurposeSnapshot> {
+    let request_counts = metadata_request_counts().lock().ok();
+    METADATA_PURPOSES
+        .iter()
+        .map(|&purpose| {
+            let counters = purpose_counters(purpose);
+            let (unique_package_count, duplicate_request_count) =
+                request_counts.as_ref().map_or((0, 0), |counts| {
+                    counts.iter().filter(|((p, _), _)| *p == purpose).fold(
+                        (0u64, 0u64),
+                        |(unique, duplicate), (_, count)| {
+                            (unique + 1, duplicate + count.saturating_sub(1))
+                        },
+                    )
+                });
+            MetadataPurposeSnapshot {
+                purpose: purpose.as_str(),
+                rpc: Duration::from_nanos(counters.rpc_ns.load(Ordering::Relaxed)),
+                rpc_count: counters.rpc_count.load(Ordering::Relaxed),
+                cache_hit_count: counters.cache_hit_count.load(Ordering::Relaxed),
+                cache_miss_count: counters.cache_miss_count.load(Ordering::Relaxed),
+                request_count: counters.request_count.load(Ordering::Relaxed),
+                unique_package_count,
+                duplicate_request_count,
+            }
+        })
+        .collect()
 }
 
 /// Counts of package-metadata HTTP responses by negotiated protocol version.

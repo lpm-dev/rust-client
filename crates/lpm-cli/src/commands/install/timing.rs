@@ -284,6 +284,154 @@ impl GateStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum TimingDetailMode {
+    Off,
+    Detail,
+    Trace,
+}
+
+impl TimingDetailMode {
+    pub(super) fn from_env() -> Self {
+        std::env::var("LPM_TIMING_DETAIL")
+            .ok()
+            .map_or(Self::Off, |value| {
+                if value.eq_ignore_ascii_case("trace") {
+                    Self::Trace
+                } else {
+                    Self::Detail
+                }
+            })
+    }
+
+    pub(super) fn enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub(super) fn trace(self) -> bool {
+        matches!(self, Self::Trace)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct SlowPackageTimings {
+    tarball_http: Vec<PackageTiming>,
+    extract: Vec<PackageTiming>,
+    security: Vec<PackageTiming>,
+    finalize: Vec<PackageTiming>,
+}
+
+#[derive(Debug, Clone)]
+struct PackageTiming {
+    package: String,
+    ms: u128,
+}
+
+impl SlowPackageTimings {
+    pub(super) fn record_fetch(&mut self, package: &str, timings: TaskTimings) {
+        Self::record(&mut self.tarball_http, package, timings.download_ms);
+        Self::record(&mut self.extract, package, timings.extract_ms);
+        Self::record(&mut self.security, package, timings.security_ms);
+        Self::record(&mut self.finalize, package, timings.finalize_ms);
+    }
+
+    fn record(bucket: &mut Vec<PackageTiming>, package: &str, ms: u128) {
+        if ms == 0 {
+            return;
+        }
+        bucket.push(PackageTiming {
+            package: package.to_string(),
+            ms,
+        });
+        bucket.sort_unstable_by(|a, b| b.ms.cmp(&a.ms).then_with(|| a.package.cmp(&b.package)));
+        bucket.truncate(10);
+    }
+
+    pub(super) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tarball_http": Self::bucket_json(&self.tarball_http),
+            "extract": Self::bucket_json(&self.extract),
+            "security": Self::bucket_json(&self.security),
+            "finalize": Self::bucket_json(&self.finalize),
+        })
+    }
+
+    fn bucket_json(bucket: &[PackageTiming]) -> serde_json::Value {
+        serde_json::Value::Array(
+            bucket
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "package": entry.package,
+                        "ms": entry.ms,
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
+pub(super) fn setup_only_timing_detail_json(
+    mode: TimingDetailMode,
+    setup_total_ms: u128,
+    install_state_ms: u128,
+    route_table_ms: u128,
+) -> serde_json::Value {
+    let mut detail = serde_json::json!({
+        "setup": {
+            "install_state_ms": install_state_ms,
+            "route_table_ms": route_table_ms,
+            "other_ms": setup_total_ms.saturating_sub(
+                install_state_ms.saturating_add(route_table_ms),
+            ),
+        },
+        "metadata": metadata_detail_json(),
+        "tail": {
+            "blocked_metadata_ms": 0u128,
+            "trust_snapshot_ms": 0u128,
+            "lockfile_write_ms": 0u128,
+            "lockfile_write_count": 0u64,
+            "build_state_write_ms": 0u64,
+            "build_state_write_count": 0u64,
+            "audit_after_install_ms": 0u128,
+            "other_ms": 0u128,
+        },
+    });
+    if mode.trace() {
+        let mut slow_packages = SlowPackageTimings::default().to_json();
+        if let serde_json::Value::Object(slow_packages) = &mut slow_packages {
+            slow_packages.insert(
+                "provenance_verify".to_string(),
+                serde_json::Value::Array(Vec::new()),
+            );
+        }
+        detail["trace"] = serde_json::json!({
+            "slow_packages": slow_packages,
+        });
+    }
+    detail
+}
+
+pub(super) fn metadata_detail_json() -> serde_json::Value {
+    serde_json::Value::Array(
+        lpm_registry::timing::snapshot_metadata_detail()
+            .into_iter()
+            .map(|snapshot| {
+                serde_json::json!({
+                    "purpose": snapshot.purpose,
+                    "rpc_ms": snapshot.rpc.as_millis(),
+                    "rpc_count": snapshot.rpc_count,
+                    "cache_hit_count": snapshot.cache_hit_count,
+                    "cache_miss_count": snapshot.cache_miss_count,
+                    "request_count": snapshot.request_count,
+                    "unique_package_count": snapshot.unique_package_count,
+                    "duplicate_request_count": snapshot.duplicate_request_count,
+                })
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

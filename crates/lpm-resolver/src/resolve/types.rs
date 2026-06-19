@@ -264,4 +264,20 @@ pub struct StageTiming {
     /// the walker arm is the legacy opt-out and not a performance
     /// target).
     pub peer_prefetch_count: u64,
+    /// CPU time spent evaluating minimum-release-age policy checks.
+    /// Counts every candidate check, including cached metadata paths
+    /// where no network request was needed.
+    pub policy_release_age_ms: u64,
+    /// Number of candidate versions evaluated by release-age policy.
+    pub policy_release_age_checked_count: u64,
+    /// Number of release-age checks that rejected a candidate.
+    pub policy_release_age_rejected_count: u64,
+    /// Number of release-age rejections caused by missing publish time.
+    pub policy_release_age_missing_count: u64,
+    /// CPU time spent evaluating trust no-downgrade policy checks.
+    pub policy_trust_ms: u64,
+    /// Number of candidate versions evaluated by trust policy.
+    pub policy_trust_checked_count: u64,
+    /// Number of trust-policy checks that rejected a candidate.
+    pub policy_trust_rejected_count: u64,
 }
