@@ -679,6 +679,7 @@ mod tests {
                 bytes_scanned: 100,
                 limit_reached: false,
                 url_domains: vec![],
+                oversized_source_files: vec![],
             },
         }
     }

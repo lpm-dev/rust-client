@@ -34,13 +34,14 @@ use manifest::ManifestTags;
 use serde::{Deserialize, Serialize};
 use source::SourceTags;
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use supply_chain::SupplyChainTags;
 
 /// Current schema version for `.lpm-security.json`.
 /// Bump this when adding new tags or changing tag semantics — cached
 /// files with older versions will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Maximum file size to scan (2MB). Files larger than this are skipped.
 /// No legitimate single source file is this large — it's bundled/generated.
@@ -52,6 +53,12 @@ const MAX_TOTAL_SCAN_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Maximum number of source files to scan per package.
 const MAX_FILES_PER_PACKAGE: usize = 5_000;
+
+/// Bytes sampled from both the head and tail of oversized source files.
+const OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES: usize = 128 * 1024;
+
+/// Maximum oversized source file evidence records persisted in metadata.
+const MAX_OVERSIZED_SOURCE_FILE_EVIDENCE: usize = 20;
 
 /// Source file extensions that should be scanned.
 const SOURCE_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
@@ -90,6 +97,24 @@ pub struct AnalysisMeta {
     /// Unique URL domains found in source code.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub url_domains: Vec<String>,
+    /// Oversized source files that exceeded the full scan ceiling and were sampled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oversized_source_files: Vec<OversizedSourceFileEvidence>,
+}
+
+/// Compact evidence for a source file that exceeded the full scan limit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OversizedSourceFileEvidence {
+    pub path: String,
+    pub size_bytes: u64,
+    pub sample_bytes_scanned: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub minified_filename: bool,
 }
 
 /// Analyze a package directory for all 22 behavioral tags.
@@ -107,9 +132,9 @@ pub fn analyze_package(package_dir: &Path) -> PackageAnalysis {
     // Use rayon for parallel scanning on packages with many files (20+).
     // Smaller packages don't benefit from thread pool overhead.
     let file_result = if source_files.len() >= 20 {
-        analyze_files_parallel(&source_files)
+        analyze_files_parallel(package_dir, &source_files)
     } else {
-        analyze_files_sequential(&source_files)
+        analyze_files_sequential(package_dir, &source_files)
     };
 
     // Set trivial tag at package level (< 10 lines across ALL source files)
@@ -154,6 +179,7 @@ pub struct FileAnalysisResult {
     pub total_export_count: usize,
     pub files_scanned: usize,
     pub bytes_scanned: u64,
+    pub oversized_source_files: Vec<OversizedSourceFileEvidence>,
 }
 
 /// Accumulated result from scanning all files.
@@ -168,17 +194,23 @@ struct AccumulatedResult {
 
 /// Analyze a single file. Returns None if the file should be skipped.
 fn analyze_single_file(
+    package_dir: &Path,
     file_path: &std::path::PathBuf,
     comment_buf: &mut Vec<u8>,
 ) -> Option<FileAnalysisResult> {
     let file_size = std::fs::metadata(file_path).ok()?.len();
     let filename = file_path.file_name()?.to_str()?.to_string();
+    let relative_path = file_path
+        .strip_prefix(package_dir)
+        .unwrap_or(file_path.as_path());
 
     if file_size > MAX_FILE_SIZE {
-        if supply_chain::is_minified_filename(&filename) {
-            return Some(oversized_minified_result(file_size));
-        }
-        return None;
+        return Some(analyze_oversized_source_file(
+            relative_path,
+            file_path,
+            file_size,
+            comment_buf,
+        ));
     }
 
     let raw_content = std::fs::read(file_path).ok()?;
@@ -199,10 +231,9 @@ fn analyze_single_file(
 /// - filtering by extension (`SOURCE_EXTENSIONS`), `.d.ts`/`.map`
 ///   exclusion, and directory filtering (`node_modules` / `__tests__` /
 ///   `test`). [`PackageAnalyzer::should_scan`] encodes the current policy.
-/// - enforcing the 2 MB per-file limit before calling in. Callers that
-///   hit an over-limit scannable file can use
-///   [`oversized_minified_result`] directly when the filename pattern
-///   matches a minified bundle.
+/// - routing files over the 2 MB full-scan limit to
+///   [`PackageAnalyzer::feed_oversized_source_file`] or another bounded
+///   sampling path instead of passing the entire file here.
 ///
 /// Pure function: no I/O, no allocations beyond the comment-stripped
 /// scratch buffer. Safe to call from any thread, no runtime needed.
@@ -237,31 +268,189 @@ fn analyze_bytes_with_scratch(
         total_export_count: trivial.export_count,
         files_scanned: 1,
         bytes_scanned: raw_content.len() as u64,
+        oversized_source_files: Vec::new(),
     }
 }
 
-/// Build the "oversized minified" result — filename-only tag for files
-/// over the 2 MB scan ceiling that still match a minified naming
-/// convention (`.min.js`, `*.bundle.js`, etc). The byte count is
-/// reported as the declared size; scan skipped to keep total bytes
-/// scanned under the per-package limit.
-fn oversized_minified_result(size: u64) -> FileAnalysisResult {
-    FileAnalysisResult {
-        source: SourceTags::default(),
-        supply_chain: SupplyChainTags {
-            minified: true,
-            ..Default::default()
-        },
-        url_domains: Vec::new(),
-        total_code_lines: 0,
-        total_export_count: 0,
-        files_scanned: 0,
-        bytes_scanned: size,
+fn analyze_oversized_source_file(
+    relative_path: &Path,
+    file_path: &Path,
+    size: u64,
+    comment_buf: &mut Vec<u8>,
+) -> FileAnalysisResult {
+    let sample = read_oversized_source_sample(file_path, size).unwrap_or_default();
+    analyze_oversized_source_sample(relative_path, size, &sample, comment_buf)
+}
+
+fn analyze_oversized_source_sample(
+    relative_path: &Path,
+    size: u64,
+    sample: &[u8],
+    comment_buf: &mut Vec<u8>,
+) -> FileAnalysisResult {
+    let filename = relative_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let mut result = if sample.is_empty() {
+        FileAnalysisResult::default()
+    } else {
+        analyze_bytes_with_scratch(filename, sample, comment_buf)
+    };
+
+    result.files_scanned = 0;
+    result.bytes_scanned = sample.len() as u64;
+    result.supply_chain.minified |= supply_chain::is_minified_filename(filename);
+
+    let evidence = OversizedSourceFileEvidence {
+        path: path_to_slash(relative_path),
+        size_bytes: size,
+        sample_bytes_scanned: sample.len() as u64,
+        signals: oversized_source_signals(&result.source, &result.supply_chain),
+        url_domains: result.url_domains.clone(),
+        minified_filename: supply_chain::is_minified_filename(filename),
+    };
+    result.oversized_source_files = vec![evidence];
+    result
+}
+
+fn read_oversized_source_sample(file_path: &Path, size: u64) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(file_path)?;
+    let chunk = OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES.min(size as usize);
+    let mut sample = Vec::with_capacity(chunk.saturating_mul(2).saturating_add(1));
+
+    read_file_chunk(&mut file, 0, chunk, &mut sample)?;
+
+    let tail_start = size.saturating_sub(chunk as u64);
+    if tail_start > chunk as u64 {
+        sample.push(b'\n');
+        read_file_chunk(&mut file, tail_start, chunk, &mut sample)?;
     }
+
+    Ok(sample)
+}
+
+fn read_file_chunk(
+    file: &mut std::fs::File,
+    start: u64,
+    max_bytes: usize,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(start))?;
+    let mut limited = file.by_ref().take(max_bytes as u64);
+    limited.read_to_end(out)?;
+    Ok(())
+}
+
+fn oversized_source_sample_from_bytes(bytes: &[u8]) -> Vec<u8> {
+    let chunk = OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES.min(bytes.len());
+    let tail_start = bytes.len().saturating_sub(chunk);
+    let mut sample = Vec::with_capacity(chunk.saturating_mul(2).saturating_add(1));
+    sample.extend_from_slice(&bytes[..chunk]);
+    if tail_start > chunk {
+        sample.push(b'\n');
+        sample.extend_from_slice(&bytes[tail_start..]);
+    }
+    sample
+}
+
+/// Build the "oversized minified" result without reading file bytes.
+fn oversized_minified_result(relative_path: &Path, size: u64) -> FileAnalysisResult {
+    let mut result = FileAnalysisResult {
+        oversized_source_files: vec![OversizedSourceFileEvidence {
+            path: path_to_slash(relative_path),
+            size_bytes: size,
+            sample_bytes_scanned: 0,
+            signals: vec!["minified".to_string()],
+            url_domains: Vec::new(),
+            minified_filename: true,
+        }],
+        ..Default::default()
+    };
+    result.supply_chain.minified = true;
+    result
+}
+
+fn oversized_source_signals(source: &SourceTags, supply_chain: &SupplyChainTags) -> Vec<String> {
+    let mut signals = Vec::new();
+    push_signal(&mut signals, source.filesystem, "filesystem");
+    push_signal(&mut signals, source.network, "network");
+    push_signal(&mut signals, source.child_process, "childProcess");
+    push_signal(&mut signals, source.environment_vars, "environmentVars");
+    push_signal(&mut signals, source.eval, "eval");
+    push_signal(&mut signals, source.native_bindings, "nativeBindings");
+    push_signal(&mut signals, source.crypto, "crypto");
+    push_signal(&mut signals, source.shell, "shell");
+    push_signal(&mut signals, source.web_socket, "webSocket");
+    push_signal(&mut signals, source.dynamic_require, "dynamicRequire");
+    push_signal(&mut signals, supply_chain.obfuscated, "obfuscated");
+    push_signal(
+        &mut signals,
+        supply_chain.high_entropy_strings,
+        "highEntropyStrings",
+    );
+    push_signal(&mut signals, supply_chain.minified, "minified");
+    push_signal(&mut signals, supply_chain.telemetry, "telemetry");
+    push_signal(&mut signals, supply_chain.url_strings, "urlStrings");
+    push_signal(&mut signals, supply_chain.protestware, "protestware");
+    signals
+}
+
+fn push_signal(signals: &mut Vec<String>, active: bool, name: &str) {
+    if active {
+        signals.push(name.to_string());
+    }
+}
+
+fn path_to_slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn extend_oversized_source_files(
+    target: &mut Vec<OversizedSourceFileEvidence>,
+    source: Vec<OversizedSourceFileEvidence>,
+) {
+    let remaining = MAX_OVERSIZED_SOURCE_FILE_EVIDENCE.saturating_sub(target.len());
+    target.extend(source.into_iter().take(remaining));
+}
+
+fn accumulate_result(
+    source_tags: &mut SourceTags,
+    supply_chain_tags: &mut SupplyChainTags,
+    all_url_domains: &mut Vec<String>,
+    total_code_lines: &mut usize,
+    total_export_count: &mut usize,
+    meta: &mut AnalysisMeta,
+    result: FileAnalysisResult,
+) {
+    let oversized = !result.oversized_source_files.is_empty();
+    *source_tags = source::merge_source_tags(source_tags, &result.source);
+    *supply_chain_tags =
+        supply_chain::merge_supply_chain_tags(supply_chain_tags, &result.supply_chain);
+    all_url_domains.extend(result.url_domains);
+    *total_code_lines += result.total_code_lines;
+    *total_export_count += result.total_export_count;
+    meta.files_scanned += result.files_scanned;
+    meta.bytes_scanned += result.bytes_scanned;
+    extend_oversized_source_files(
+        &mut meta.oversized_source_files,
+        result.oversized_source_files,
+    );
+    if oversized {
+        meta.limit_reached = true;
+    }
+}
+
+fn merge_with_limits(analyzer: &mut PackageAnalyzer, result: FileAnalysisResult) {
+    if analyzer.bytes_scanned + result.bytes_scanned > MAX_TOTAL_SCAN_BYTES {
+        analyzer.limit_reached = true;
+        return;
+    }
+    analyzer.merge(result);
 }
 
 /// Sequential file scanning (for packages with < 20 files).
-fn analyze_files_sequential(files: &[std::path::PathBuf]) -> AccumulatedResult {
+fn analyze_files_sequential(package_dir: &Path, files: &[std::path::PathBuf]) -> AccumulatedResult {
     let mut source_tags = SourceTags::default();
     let mut supply_chain_tags = SupplyChainTags::default();
     let mut meta = AnalysisMeta::default();
@@ -275,19 +464,20 @@ fn analyze_files_sequential(files: &[std::path::PathBuf]) -> AccumulatedResult {
             meta.limit_reached = true;
             break;
         }
-        if let Some(result) = analyze_single_file(file_path, &mut comment_buf) {
+        if let Some(result) = analyze_single_file(package_dir, file_path, &mut comment_buf) {
             if meta.bytes_scanned + result.bytes_scanned > MAX_TOTAL_SCAN_BYTES {
                 meta.limit_reached = true;
                 break;
             }
-            source_tags = source::merge_source_tags(&source_tags, &result.source);
-            supply_chain_tags =
-                supply_chain::merge_supply_chain_tags(&supply_chain_tags, &result.supply_chain);
-            all_url_domains.extend(result.url_domains);
-            total_code_lines += result.total_code_lines;
-            total_export_count += result.total_export_count;
-            meta.files_scanned += result.files_scanned;
-            meta.bytes_scanned += result.bytes_scanned;
+            accumulate_result(
+                &mut source_tags,
+                &mut supply_chain_tags,
+                &mut all_url_domains,
+                &mut total_code_lines,
+                &mut total_export_count,
+                &mut meta,
+                result,
+            );
         }
     }
 
@@ -302,7 +492,7 @@ fn analyze_files_sequential(files: &[std::path::PathBuf]) -> AccumulatedResult {
 }
 
 /// Parallel file scanning using rayon (for packages with 20+ files).
-fn analyze_files_parallel(files: &[std::path::PathBuf]) -> AccumulatedResult {
+fn analyze_files_parallel(package_dir: &Path, files: &[std::path::PathBuf]) -> AccumulatedResult {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -321,7 +511,7 @@ fn analyze_files_parallel(files: &[std::path::PathBuf]) -> AccumulatedResult {
                 return None;
             }
 
-            let result = analyze_single_file(file_path, comment_buf)?;
+            let result = analyze_single_file(package_dir, file_path, comment_buf)?;
             files_scanned.fetch_add(result.files_scanned, Ordering::Relaxed);
             bytes_scanned.fetch_add(result.bytes_scanned, Ordering::Relaxed);
             Some(result)
@@ -338,19 +528,20 @@ fn analyze_files_parallel(files: &[std::path::PathBuf]) -> AccumulatedResult {
     let mut meta = AnalysisMeta::default();
 
     for result in results {
-        source_tags = source::merge_source_tags(&source_tags, &result.source);
-        supply_chain_tags =
-            supply_chain::merge_supply_chain_tags(&supply_chain_tags, &result.supply_chain);
-        all_url_domains.extend(result.url_domains);
-        total_code_lines += result.total_code_lines;
-        total_export_count += result.total_export_count;
-        meta.files_scanned += result.files_scanned;
-        meta.bytes_scanned += result.bytes_scanned;
+        accumulate_result(
+            &mut source_tags,
+            &mut supply_chain_tags,
+            &mut all_url_domains,
+            &mut total_code_lines,
+            &mut total_export_count,
+            &mut meta,
+            result,
+        );
     }
 
     let limit_reached = files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
         || bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES;
-    meta.limit_reached = limit_reached;
+    meta.limit_reached |= limit_reached;
 
     AccumulatedResult {
         source: source_tags,
@@ -487,6 +678,7 @@ pub struct PackageAnalyzer {
     source: SourceTags,
     supply_chain: SupplyChainTags,
     url_domains: Vec<String>,
+    oversized_source_files: Vec<OversizedSourceFileEvidence>,
     total_code_lines: usize,
     total_export_count: usize,
     files_scanned: usize,
@@ -500,7 +692,7 @@ impl PackageAnalyzer {
         Self::default()
     }
 
-    /// Does this tar entry qualify for byte-level scanning?
+    /// Does this tar entry qualify for source analysis?
     ///
     /// Returns `true` iff:
     /// - Extension is in `SOURCE_EXTENSIONS` (js/mjs/cjs/ts/mts/cts/jsx/tsx)
@@ -508,11 +700,8 @@ impl PackageAnalyzer {
     /// - No path component is `node_modules` / `__tests__` / `test`
     /// - No path component starts with `.` (hidden files/dirs)
     ///
-    /// The size cap is intentionally NOT checked here: files over the
-    /// 2 MB scan ceiling still need the "minified by filename" tag, and
-    /// the caller handles that cheaply through [`analyze_bytes`] with an
-    /// empty slice won't reach the right path — use [`oversized_minified_result`]
-    /// via [`PackageAnalyzer::feed_oversized_minified`] for those entries.
+    /// The size cap is intentionally NOT checked here: oversized files still
+    /// need lightweight metadata via [`PackageAnalyzer::feed_oversized_source_file`].
     ///
     /// Mirrors the `collect_source_files_recursive` filter exactly so the
     /// fused path scans the same set of files as the two-pass path.
@@ -551,6 +740,11 @@ impl PackageAnalyzer {
         SOURCE_EXTENSIONS.contains(&ext)
     }
 
+    /// Should the extractor buffer this source entry for full byte-level scanning?
+    pub fn should_buffer_source(relative_path: &Path, size: u64) -> bool {
+        Self::should_scan(relative_path, size) && size <= MAX_FILE_SIZE
+    }
+
     /// Feed one scannable file's bytes. Respects per-package limits
     /// (`MAX_FILES_PER_PACKAGE` / `MAX_TOTAL_SCAN_BYTES`) — once either
     /// is hit, subsequent `feed` calls are no-ops and `limit_reached`
@@ -560,29 +754,47 @@ impl PackageAnalyzer {
             self.limit_reached = true;
             return;
         }
-        if self.bytes_scanned + bytes.len() as u64 > MAX_TOTAL_SCAN_BYTES {
-            self.limit_reached = true;
-            return;
-        }
-
         let filename = relative_path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        // Over-size files with scannable extensions still want the
-        // "minified by filename" tag — the caller should feed them via
-        // `feed_oversized_minified` (bytes unused) rather than reading
-        // megabytes into memory just to set one bool.
         if bytes.len() as u64 > MAX_FILE_SIZE {
-            if supply_chain::is_minified_filename(&filename) {
-                self.supply_chain.minified = true;
-            }
+            let sample = oversized_source_sample_from_bytes(bytes);
+            let mut comment_buf = Vec::new();
+            let result = analyze_oversized_source_sample(
+                relative_path,
+                bytes.len() as u64,
+                &sample,
+                &mut comment_buf,
+            );
+            merge_with_limits(self, result);
+            return;
+        }
+
+        if self.bytes_scanned + bytes.len() as u64 > MAX_TOTAL_SCAN_BYTES {
+            self.limit_reached = true;
             return;
         }
 
         let result = analyze_bytes(&filename, bytes);
         self.merge(result);
+    }
+
+    /// Sample an oversized source file from disk after extraction.
+    pub fn feed_oversized_source_file(
+        &mut self,
+        relative_path: &Path,
+        full_path: &Path,
+        size: u64,
+    ) {
+        if !Self::should_scan(relative_path, size) || size <= MAX_FILE_SIZE {
+            return;
+        }
+        let mut comment_buf = Vec::new();
+        let result =
+            analyze_oversized_source_file(relative_path, full_path, size, &mut comment_buf);
+        merge_with_limits(self, result);
     }
 
     /// Record an "oversized minified" file without reading its bytes.
@@ -596,20 +808,28 @@ impl PackageAnalyzer {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         if supply_chain::is_minified_filename(&filename) {
-            let result = oversized_minified_result(size);
-            self.merge(result);
+            let result = oversized_minified_result(relative_path, size);
+            merge_with_limits(self, result);
         }
     }
 
     fn merge(&mut self, result: FileAnalysisResult) {
+        let oversized = !result.oversized_source_files.is_empty();
         self.source = source::merge_source_tags(&self.source, &result.source);
         self.supply_chain =
             supply_chain::merge_supply_chain_tags(&self.supply_chain, &result.supply_chain);
         self.url_domains.extend(result.url_domains);
+        extend_oversized_source_files(
+            &mut self.oversized_source_files,
+            result.oversized_source_files,
+        );
         self.total_code_lines += result.total_code_lines;
         self.total_export_count += result.total_export_count;
         self.files_scanned += result.files_scanned;
         self.bytes_scanned += result.bytes_scanned;
+        if oversized {
+            self.limit_reached = true;
+        }
     }
 
     /// Complete the analysis: read the package manifest from disk,
@@ -630,6 +850,7 @@ impl PackageAnalyzer {
             bytes_scanned: self.bytes_scanned,
             limit_reached: self.limit_reached,
             url_domains: self.url_domains,
+            oversized_source_files: self.oversized_source_files,
         };
 
         let manifest_tags = analyze_package_manifest(package_dir);
@@ -910,6 +1131,81 @@ mod tests {
         let analysis = analyze_package(dir.path());
         assert!(analysis.supply_chain.minified);
         assert!(analysis.source.eval);
+    }
+
+    #[test]
+    fn analyze_package_samples_oversized_source_files() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_package(
+            dir.path(),
+            &[("package.json", r#"{"name":"test","license":"MIT"}"#)],
+        );
+        let source_path = dir.path().join("dist/big.js");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+
+        let mut code =
+            String::from("fetch('https://oversized.example/payload'); process.env.TOKEN;\n");
+        code.push_str(&"a".repeat(MAX_FILE_SIZE as usize + 1024));
+        code.push_str("const { exec } = require('child_process'); exec('id');\n");
+        fs::write(&source_path, code).unwrap();
+
+        let analysis = analyze_package(dir.path());
+        let oversized = analysis
+            .meta
+            .oversized_source_files
+            .first()
+            .expect("oversized evidence should be recorded");
+
+        assert_eq!(oversized.path, "dist/big.js");
+        assert!(analysis.source.network);
+        assert!(analysis.source.child_process);
+        assert!(analysis.source.environment_vars);
+        assert!(analysis.meta.limit_reached);
+        assert_eq!(analysis.meta.files_scanned, 0);
+        assert!(oversized.signals.contains(&"network".to_string()));
+        assert!(oversized.signals.contains(&"childProcess".to_string()));
+        assert!(
+            oversized
+                .url_domains
+                .contains(&"oversized.example".to_string())
+        );
+        assert!(oversized.sample_bytes_scanned < oversized.size_bytes);
+    }
+
+    #[test]
+    fn package_analyzer_samples_oversized_sources_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_package(
+            dir.path(),
+            &[("package.json", r#"{"name":"test","license":"MIT"}"#)],
+        );
+        let relative_path = Path::new("dist/huge.bundle.js");
+        let full_path = dir.path().join(relative_path);
+        fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+
+        let mut code = String::from("const ws = new WebSocket('wss://oversized.example/ws');\n");
+        code.push_str(&"b".repeat(MAX_FILE_SIZE as usize + 1024));
+        code.push_str("\neval('42');\n");
+        fs::write(&full_path, code).unwrap();
+        let size = fs::metadata(&full_path).unwrap().len();
+
+        assert!(PackageAnalyzer::should_scan(relative_path, size));
+        assert!(!PackageAnalyzer::should_buffer_source(relative_path, size));
+
+        let mut analyzer = PackageAnalyzer::new();
+        analyzer.feed_oversized_source_file(relative_path, &full_path, size);
+        let analysis = analyzer.finalize(dir.path());
+
+        let oversized = analysis
+            .meta
+            .oversized_source_files
+            .first()
+            .expect("oversized evidence should be recorded");
+        assert_eq!(oversized.path, "dist/huge.bundle.js");
+        assert!(analysis.source.web_socket);
+        assert!(analysis.source.eval);
+        assert!(analysis.supply_chain.minified);
+        assert!(oversized.minified_filename);
     }
 
     #[test]
