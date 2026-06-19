@@ -230,6 +230,65 @@ impl FetchBreakdown {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct FetchStageTimings {
+    pub(super) plan_ms: u128,
+    pub(super) v2_reusable_prevalidate_ms: u128,
+    pub(super) cache_classify_ms: u128,
+    pub(super) policy_gate_ms: u128,
+    pub(super) download_wall_ms: u128,
+    pub(super) v2_reusable_candidate_count: u64,
+    pub(super) v2_reusable_concurrency: u64,
+    pub(super) local_source_count: u64,
+    pub(super) v2_reusable_hit_count: u64,
+    pub(super) v1_to_v2_translate_count: u64,
+    pub(super) v1_to_v2_translate_failure_count: u64,
+    pub(super) v1_cache_hit_count: u64,
+    pub(super) link_dispatch_count: u64,
+}
+
+impl FetchStageTimings {
+    pub(super) fn to_json(
+        self,
+        fetch_wall_ms: u128,
+        package_count: usize,
+        cached_count: usize,
+        download_candidate_count: usize,
+        breakdown: FetchBreakdown,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "stage": {
+                "wall_ms": fetch_wall_ms,
+                "plan_ms": self.plan_ms,
+                "v2_reusable_prevalidate_ms": self.v2_reusable_prevalidate_ms,
+                "cache_classify_ms": self.cache_classify_ms,
+                "policy_gate_ms": self.policy_gate_ms,
+                "download_wall_ms": self.download_wall_ms,
+                "other_ms": fetch_wall_ms
+                    .saturating_sub(self.plan_ms)
+                    .saturating_sub(self.v2_reusable_prevalidate_ms)
+                    .saturating_sub(self.cache_classify_ms)
+                    .saturating_sub(self.policy_gate_ms)
+                    .saturating_sub(self.download_wall_ms),
+            },
+            "counts": {
+                "package_count": package_count as u64,
+                "cached_count": cached_count as u64,
+                "download_candidate_count": download_candidate_count as u64,
+                "v2_reusable_candidate_count": self.v2_reusable_candidate_count,
+                "v2_reusable_hit_count": self.v2_reusable_hit_count,
+                "v2_reusable_concurrency": self.v2_reusable_concurrency,
+                "local_source_count": self.local_source_count,
+                "v1_cache_hit_count": self.v1_cache_hit_count,
+                "v1_to_v2_translate_count": self.v1_to_v2_translate_count,
+                "v1_to_v2_translate_failure_count": self.v1_to_v2_translate_failure_count,
+                "link_dispatch_count": self.link_dispatch_count,
+            },
+            "breakdown": breakdown.to_json(),
+        })
+    }
+}
+
 ///
 ///
 /// Shared across every fetch task (must be atomic because 24
@@ -377,6 +436,7 @@ pub(super) fn setup_only_timing_detail_json(
     install_state_ms: u128,
     route_table_ms: u128,
 ) -> serde_json::Value {
+    let metadata = metadata_detail_snapshots();
     let mut detail = serde_json::json!({
         "setup": {
             "install_state_ms": install_state_ms,
@@ -385,7 +445,19 @@ pub(super) fn setup_only_timing_detail_json(
                 install_state_ms.saturating_add(route_table_ms),
             ),
         },
-        "metadata": metadata_detail_json(),
+        "metadata": metadata_detail_json_from_snapshots(&metadata, mode),
+        "resolve": resolve_detail_json(0, 0, &lpm_resolver::StageTiming::default(), &metadata),
+        "fetch": FetchStageTimings::default().to_json(0, 0, 0, 0, FetchBreakdown::default()),
+        "security": {
+            "registry_signatures": serde_json::Value::Null,
+            "provenance": serde_json::Value::Null,
+        },
+        "link": {
+            "reconcile_ms": 0u128,
+            "root_symlinks_ms": 0u128,
+            "compatibility_ms": 0u128,
+            "bin_shims_ms": 0u128,
+        },
         "tail": {
             "blocked_metadata_ms": 0u128,
             "trust_snapshot_ms": 0u128,
@@ -412,12 +484,19 @@ pub(super) fn setup_only_timing_detail_json(
     detail
 }
 
-pub(super) fn metadata_detail_json() -> serde_json::Value {
+pub(super) fn metadata_detail_snapshots() -> Vec<lpm_registry::timing::MetadataPurposeSnapshot> {
+    lpm_registry::timing::snapshot_metadata_detail()
+}
+
+pub(super) fn metadata_detail_json_from_snapshots(
+    snapshots: &[lpm_registry::timing::MetadataPurposeSnapshot],
+    mode: TimingDetailMode,
+) -> serde_json::Value {
     serde_json::Value::Array(
-        lpm_registry::timing::snapshot_metadata_detail()
-            .into_iter()
+        snapshots
+            .iter()
             .map(|snapshot| {
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "purpose": snapshot.purpose,
                     "rpc_ms": snapshot.rpc.as_millis(),
                     "rpc_count": snapshot.rpc_count,
@@ -426,10 +505,87 @@ pub(super) fn metadata_detail_json() -> serde_json::Value {
                     "request_count": snapshot.request_count,
                     "unique_package_count": snapshot.unique_package_count,
                     "duplicate_request_count": snapshot.duplicate_request_count,
-                })
+                });
+                if mode.trace() {
+                    entry["top_duplicate_packages"] = serde_json::Value::Array(
+                        snapshot
+                            .top_duplicate_packages
+                            .iter()
+                            .map(|package| {
+                                serde_json::json!({
+                                    "package": package.package.as_str(),
+                                    "request_count": package.request_count,
+                                    "duplicate_count": package.duplicate_count,
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                entry
             })
             .collect(),
     )
+}
+
+pub(super) fn resolve_detail_json(
+    resolve_wall_ms: u128,
+    initial_batch_ms: u128,
+    stage: &lpm_resolver::StageTiming,
+    metadata_snapshots: &[lpm_registry::timing::MetadataPurposeSnapshot],
+) -> serde_json::Value {
+    let default_metadata = lpm_registry::timing::MetadataPurposeSnapshot::default();
+    let resolve_metadata = metadata_snapshots
+        .iter()
+        .find(|snapshot| snapshot.purpose == "resolve")
+        .unwrap_or(&default_metadata);
+    let pubgrub_core_estimate_ms = stage.pubgrub_ms.saturating_sub(stage.followup_rpc_ms);
+    serde_json::json!({
+        "wall_ms": resolve_wall_ms,
+        "initial_batch_ms": initial_batch_ms,
+        "metadata": {
+            "rpc_sum_ms": resolve_metadata.rpc.as_millis(),
+            "rpc_count": resolve_metadata.rpc_count,
+            "cache_hit_count": resolve_metadata.cache_hit_count,
+            "cache_miss_count": resolve_metadata.cache_miss_count,
+            "request_count": resolve_metadata.request_count,
+            "unique_package_count": resolve_metadata.unique_package_count,
+            "duplicate_request_count": resolve_metadata.duplicate_request_count,
+        },
+        "scheduler": {
+            "followup_rpc_ms": stage.followup_rpc_ms,
+            "followup_rpc_count": stage.followup_rpc_count,
+            "walker_rpc_count": stage.walker_rpc_count,
+            "escape_hatch_rpc_count": stage.escape_hatch_rpc_count,
+            "dispatcher": {
+                "rpc_count": stage.dispatcher_rpc_count,
+                "inflight_high_water": stage.dispatcher_inflight_high_water,
+                "parked_max_depth": stage.parked_max_depth,
+                "tarball_dispatched": stage.tarball_dispatched_count,
+                "peer_prefetch_count": stage.peer_prefetch_count,
+            },
+        },
+        "cpu": {
+            "parse_ndjson_ms": stage.parse_ndjson_ms,
+            "pubgrub_ms": stage.pubgrub_ms,
+            "pubgrub_core_estimate_ms": pubgrub_core_estimate_ms,
+        },
+        "policy": {
+            "release_age": {
+                "ms": stage.policy_release_age_ms,
+                "checked_count": stage.policy_release_age_checked_count,
+                "rejected_count": stage.policy_release_age_rejected_count,
+                "missing_count": stage.policy_release_age_missing_count,
+            },
+            "trust": {
+                "ms": stage.policy_trust_ms,
+                "checked_count": stage.policy_trust_checked_count,
+                "rejected_count": stage.policy_trust_rejected_count,
+            },
+        },
+        "other_ms": resolve_wall_ms
+            .saturating_sub(initial_batch_ms)
+            .saturating_sub(stage.pubgrub_ms as u128),
+    })
 }
 
 #[cfg(test)]

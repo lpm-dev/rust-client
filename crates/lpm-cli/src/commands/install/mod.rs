@@ -146,10 +146,16 @@ fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
         .min(candidate_count.max(1))
 }
 
+struct V2ReusablePrevalidation {
+    hits: HashMap<String, lpm_store::v2::ReusableObject>,
+    candidate_count: usize,
+    concurrency: usize,
+}
+
 async fn prevalidate_v2_reusable_objects(
     packages: &[InstallPackage],
     store_v2: Arc<lpm_store::v2::Store>,
-) -> Result<HashMap<String, lpm_store::v2::ReusableObject>, LpmError> {
+) -> Result<V2ReusablePrevalidation, LpmError> {
     let candidates: Vec<(String, String)> = packages
         .iter()
         .filter(|package| {
@@ -167,7 +173,11 @@ async fn prevalidate_v2_reusable_objects(
         .collect();
 
     if candidates.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(V2ReusablePrevalidation {
+            hits: HashMap::new(),
+            candidate_count: 0,
+            concurrency: 0,
+        });
     }
 
     let candidate_count = candidates.len();
@@ -186,7 +196,11 @@ async fn prevalidate_v2_reusable_objects(
             hits.insert(key, hit);
         }
     }
-    Ok(hits)
+    Ok(V2ReusablePrevalidation {
+        hits,
+        candidate_count,
+        concurrency,
+    })
 }
 
 fn btree_from_hash_map(map: &HashMap<String, String>) -> BTreeMap<String, String> {
@@ -2855,6 +2869,8 @@ async fn run_with_options_under_store_lock(
     // tarballs the `has_package` loop below picks up as cache hits.
     let wf_fetch_start_ms = start.elapsed().as_millis();
     let fetch_start = Instant::now();
+    let fetch_plan_start = Instant::now();
+    let mut fetch_stage_timings = FetchStageTimings::default();
 
     // — aggregation buffer for the generalized writeback.
     // Populated inside the fetch block with every (name, version) →
@@ -3095,16 +3111,32 @@ async fn run_with_options_under_store_lock(
     // at the link stage and folded into the LinkResult.
     type V2LinkHandle = tokio::task::JoinHandle<Result<(MaterializedPackage, bool), LpmError>>;
     let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
-    let v2_reusable_objects = if !force && v2_mode {
+    fetch_stage_timings.plan_ms = fetch_plan_start.elapsed().as_millis();
+    let v2_prevalidate_start = Instant::now();
+    let v2_reusable_prevalidation = if !force && v2_mode {
         match store_v2_handle.as_ref() {
             Some(store_v2) => {
                 prevalidate_v2_reusable_objects(&packages, std::sync::Arc::clone(store_v2)).await?
             }
-            None => HashMap::new(),
+            None => V2ReusablePrevalidation {
+                hits: HashMap::new(),
+                candidate_count: 0,
+                concurrency: 0,
+            },
         }
     } else {
-        HashMap::new()
+        V2ReusablePrevalidation {
+            hits: HashMap::new(),
+            candidate_count: 0,
+            concurrency: 0,
+        }
     };
+    fetch_stage_timings.v2_reusable_prevalidate_ms = v2_prevalidate_start.elapsed().as_millis();
+    fetch_stage_timings.v2_reusable_candidate_count =
+        v2_reusable_prevalidation.candidate_count as u64;
+    fetch_stage_timings.v2_reusable_concurrency = v2_reusable_prevalidation.concurrency as u64;
+    fetch_stage_timings.v2_reusable_hit_count = v2_reusable_prevalidation.hits.len() as u64;
+    let v2_reusable_objects = v2_reusable_prevalidation.hits;
 
     //b: stale-entry cleanup runs once, up front — must
     // happen before any per-pkg link spawn touches `.lpm/` so the
@@ -3120,6 +3152,7 @@ async fn run_with_options_under_store_lock(
 
     let mut to_download = Vec::new();
     let mut cached = 0usize;
+    let cache_classify_start = Instant::now();
 
     for p in &packages {
         // --force: re-download everything to verify integrity against registry,
@@ -3147,6 +3180,9 @@ async fn run_with_options_under_store_lock(
             p.source_kind(),
             Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
         );
+        if is_local_source {
+            fetch_stage_timings.local_source_count += 1;
+        }
 
         if v2_mode && is_local_source {
             cached += 1;
@@ -3160,6 +3196,7 @@ async fn run_with_options_under_store_lock(
                         .as_ref()
                         .expect("v2_event_driven implies v2 store"),
                 );
+                fetch_stage_timings.link_dispatch_count += 1;
                 v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
                     lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
                 }));
@@ -3209,6 +3246,7 @@ async fn run_with_options_under_store_lock(
                         .as_ref()
                         .expect("v2_event_driven implies v2 store"),
                 );
+                fetch_stage_timings.link_dispatch_count += 1;
                 v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
                     lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
                 }));
@@ -3246,6 +3284,7 @@ async fn run_with_options_under_store_lock(
         {
             match v2_store.populate_object_from_v1(&v1_pkg_dir, sri) {
                 Ok(_) => {
+                    fetch_stage_timings.v1_to_v2_translate_count += 1;
                     cached += 1;
                     // followup #6b — see the v2 SRI-direct
                     // cache-hit branch above. Translation populated
@@ -3260,6 +3299,7 @@ async fn run_with_options_under_store_lock(
                                 .as_ref()
                                 .expect("v2_event_driven implies v2 store"),
                         );
+                        fetch_stage_timings.link_dispatch_count += 1;
                         v2_event_link_handles.push(tokio::task::spawn_blocking(move || {
                             lpm_linker::v2::link_v2_one(&plan_arc, &target, &store_arc)
                         }));
@@ -3267,6 +3307,7 @@ async fn run_with_options_under_store_lock(
                     continue;
                 }
                 Err(e) => {
+                    fetch_stage_timings.v1_to_v2_translate_failure_count += 1;
                     tracing::debug!(
                         "v1→v2 translation for {}@{} failed: {e} (falling back to fetch)",
                         p.name,
@@ -3278,6 +3319,7 @@ async fn run_with_options_under_store_lock(
 
         if !force && !v2_mode && p.store_has_source_aware(&store, project_dir) {
             cached += 1;
+            fetch_stage_timings.v1_cache_hit_count += 1;
             //b: spawn per-pkg link task immediately — this
             // package is already materialized in the store, so // can run in parallel with the fetch loop below.
             if event_driven_link {
@@ -3306,6 +3348,7 @@ async fn run_with_options_under_store_lock(
                 };
                 let pd = project_dir.to_path_buf();
                 let force_flag = force;
+                fetch_stage_timings.link_dispatch_count += 1;
                 event_link_handles.push(tokio::task::spawn_blocking(move || {
                     lpm_linker::link_one_package(&pd, &target, force_flag)
                 }));
@@ -3314,7 +3357,9 @@ async fn run_with_options_under_store_lock(
             to_download.push(p.clone());
         }
     }
+    fetch_stage_timings.cache_classify_ms = cache_classify_start.elapsed().as_millis();
 
+    let policy_gate_start = Instant::now();
     let drift_ignore_packages: Vec<String> = match &drift_ignore_policy {
         crate::provenance_fetch::DriftIgnorePolicy::IgnoreNames(names) => {
             let mut values: Vec<_> = names.iter().cloned().collect();
@@ -3894,6 +3939,7 @@ async fn run_with_options_under_store_lock(
             }
         }
     }
+    fetch_stage_timings.policy_gate_ms = policy_gate_start.elapsed().as_millis();
 
     let downloaded = to_download.len();
     //: accumulate per-task timings across the parallel pool so we
@@ -3908,6 +3954,7 @@ async fn run_with_options_under_store_lock(
     // regressions or non-sha512 integrity edge cases).
     let streaming_fetch = std::env::var("LPM_STREAM_FETCH").map_or(true, |v| v != "0");
     if !to_download.is_empty() {
+        let download_wall_start = Instant::now();
         let overall = ProgressBar::new(to_download.len() as u64);
         overall.set_style(
             ProgressStyle::default_bar()
@@ -4312,6 +4359,7 @@ async fn run_with_options_under_store_lock(
         apply_fetch_writebacks(&mut packages_for_lockfile);
 
         overall.finish_and_clear();
+        fetch_stage_timings.download_wall_ms = download_wall_start.elapsed().as_millis();
     }
 
     let fetch_ms = fetch_start.elapsed().as_millis();
@@ -5331,6 +5379,13 @@ async fn run_with_options_under_store_lock(
 
     if json_output {
         let metadata_http_versions = lpm_registry::timing::snapshot_metadata_http_versions();
+        let timing_metadata_detail = if timing_detail_mode.enabled() {
+            Some(metadata_detail_snapshots())
+        } else {
+            None
+        };
+        let resolve_wall_ms = wf_resolve_end_ms.saturating_sub(wf_setup_ms);
+        let fetch_wall_ms = wf_fetch_end_ms.saturating_sub(wf_fetch_start_ms);
         let pkg_list: Vec<serde_json::Value> = packages
             .iter()
             .map(|p| {
@@ -5597,6 +5652,7 @@ async fn run_with_options_under_store_lock(
                });
         if timing_detail_mode.enabled() {
             let build_state_write_timing = crate::build_state::snapshot_write_timing();
+            let metadata_snapshots = timing_metadata_detail.as_deref().unwrap_or(&[]);
             let mut detail = serde_json::json!({
                 "setup": {
                     "install_state_ms": wf_setup_install_state_ms,
@@ -5605,28 +5661,23 @@ async fn run_with_options_under_store_lock(
                         wf_setup_install_state_ms.saturating_add(wf_setup_route_table_ms),
                     ),
                 },
-                "metadata": metadata_detail_json(),
-                "resolve": {
-                    "policy": {
-                        "release_age": {
-                            "ms": resolver_stage_timing.policy_release_age_ms,
-                            "checked_count":
-                                resolver_stage_timing.policy_release_age_checked_count,
-                            "rejected_count":
-                                resolver_stage_timing.policy_release_age_rejected_count,
-                            "missing_count":
-                                resolver_stage_timing.policy_release_age_missing_count,
-                        },
-                        "trust": {
-                            "ms": resolver_stage_timing.policy_trust_ms,
-                            "checked_count": resolver_stage_timing.policy_trust_checked_count,
-                            "rejected_count": resolver_stage_timing.policy_trust_rejected_count,
-                        },
-                    },
-                },
-                "fetch": {
-                    "breakdown": fetch_breakdown.to_json(),
-                },
+                "metadata": metadata_detail_json_from_snapshots(
+                    metadata_snapshots,
+                    timing_detail_mode,
+                ),
+                "resolve": resolve_detail_json(
+                    resolve_wall_ms,
+                    initial_batch_ms,
+                    &resolver_stage_timing,
+                    metadata_snapshots,
+                ),
+                "fetch": fetch_stage_timings.to_json(
+                    fetch_wall_ms,
+                    packages.len(),
+                    cached,
+                    downloaded,
+                    fetch_breakdown,
+                ),
                 "security": {
                     "registry_signatures": registry_signature_timings
                         .as_ref()

@@ -320,6 +320,14 @@ pub struct MetadataPurposeSnapshot {
     pub request_count: u64,
     pub unique_package_count: u64,
     pub duplicate_request_count: u64,
+    pub top_duplicate_packages: Vec<MetadataDuplicatePackage>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataDuplicatePackage {
+    pub package: String,
+    pub request_count: u64,
+    pub duplicate_count: u64,
 }
 
 pub fn snapshot_metadata_detail() -> Vec<MetadataPurposeSnapshot> {
@@ -337,6 +345,25 @@ pub fn snapshot_metadata_detail() -> Vec<MetadataPurposeSnapshot> {
                         },
                     )
                 });
+            let mut top_duplicate_packages: Vec<MetadataDuplicatePackage> =
+                request_counts.as_ref().map_or_else(Vec::new, |counts| {
+                    counts
+                        .iter()
+                        .filter(|((p, _), count)| *p == purpose && **count > 1)
+                        .map(|((_, package), count)| MetadataDuplicatePackage {
+                            package: package.clone(),
+                            request_count: *count,
+                            duplicate_count: count.saturating_sub(1),
+                        })
+                        .collect()
+                });
+            top_duplicate_packages.sort_unstable_by(|a, b| {
+                b.duplicate_count
+                    .cmp(&a.duplicate_count)
+                    .then_with(|| b.request_count.cmp(&a.request_count))
+                    .then_with(|| a.package.cmp(&b.package))
+            });
+            top_duplicate_packages.truncate(10);
             MetadataPurposeSnapshot {
                 purpose: purpose.as_str(),
                 rpc: Duration::from_nanos(counters.rpc_ns.load(Ordering::Relaxed)),
@@ -346,6 +373,7 @@ pub fn snapshot_metadata_detail() -> Vec<MetadataPurposeSnapshot> {
                 request_count: counters.request_count.load(Ordering::Relaxed),
                 unique_package_count,
                 duplicate_request_count,
+                top_duplicate_packages,
             }
         })
         .collect()

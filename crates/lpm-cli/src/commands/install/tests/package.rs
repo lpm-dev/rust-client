@@ -62,11 +62,15 @@ async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
     pkg.integrity = Some(sri);
     let key = install_pkg_key(&pkg);
 
-    let hits = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
+    let prevalidation = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
         .await
         .unwrap();
 
-    let hit = hits
+    assert_eq!(prevalidation.candidate_count, 1);
+    assert_eq!(prevalidation.hits.len(), 1);
+    assert!(prevalidation.concurrency >= 1);
+    let hit = prevalidation
+        .hits
         .get(&key)
         .expect("prevalidation must return the v2 object hit");
     assert_eq!(hit.path, object_dir);
@@ -88,11 +92,12 @@ async fn prevalidate_v2_reusable_objects_removes_tampered_registry_objects() {
     let mut pkg = fake_pkg("tampered", "1.0.0", true);
     pkg.integrity = Some(sri);
 
-    let hits = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
+    let prevalidation = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
         .await
         .unwrap();
 
-    assert!(hits.is_empty());
+    assert_eq!(prevalidation.candidate_count, 1);
+    assert!(prevalidation.hits.is_empty());
     assert!(
         !object_dir.exists(),
         "tampered v2 objects must still be removed before cache reuse"
