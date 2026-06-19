@@ -521,13 +521,11 @@ impl Store {
         create_tmp_dir_locked(&tmp_dir)
             .map_err(|e| LpmError::Store(format!("failed to create v2 tmp staging dir: {e}")))?;
 
-        // Fused extract + behavioral scan in a single pass: `should_scan`
-        // filters per entry inside the tar walk, and the inspector
-        // closure feeds matching entries' bytes into the analyzer while
-        // they're still in the extractor's write buffer. The
-        // post-extract `finalize` only reads `package.json` for
-        // manifest-level tags — no second tree walk, no re-`read()` of
-        // source files.
+        // Fused extract + behavioral scan in a single pass: small source
+        // entries are buffered and fed directly into the analyzer, while
+        // oversized source entries stream to disk first and then get a
+        // bounded head/tail sample. The post-extract `finalize` only reads
+        // `package.json` for manifest-level tags.
         //
         // `RefCell` wraps the analyzer so the `FnMut` closure can mutate
         // it without exclusive borrows escaping the call site.
@@ -536,10 +534,16 @@ impl Store {
         let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
             tarball_data,
             &tmp_dir,
-            lpm_security::behavioral::PackageAnalyzer::should_scan,
+            lpm_security::behavioral::PackageAnalyzer::should_buffer_source,
             |entry| {
                 if let Some(bytes) = entry.bytes {
                     analyzer.borrow_mut().feed(entry.relative_path, bytes);
+                } else {
+                    analyzer.borrow_mut().feed_oversized_source_file(
+                        entry.relative_path,
+                        &tmp_dir.join(entry.relative_path),
+                        entry.size,
+                    );
                 }
             },
         );

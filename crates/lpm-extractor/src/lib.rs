@@ -323,13 +323,14 @@ pub struct EntryInfo<'a> {
 /// entry is safely on disk, with the entry's bytes-in-memory if the
 /// `buffer_predicate` opted to buffer that entry.
 ///
-/// Fused-scan use case: lpm-store's streaming path passes
-/// `PackageAnalyzer::should_scan` as the predicate (true for scannable
-/// JS/TS sources under the 2 MB per-file limit) and an inspector that
-/// feeds each buffered entry into a running `PackageAnalyzer`. The result
-/// is one filesystem pass instead of two — P1's extract writes files
-/// while P2's scan reads the bytes it already has in hand, eliminating
-/// the `analyze_package` post-extract walk.
+/// Fused-scan use case: lpm-store's streaming path passes a predicate
+/// that buffers scannable JS/TS sources under the behavioral scanner's
+/// per-file limit and an inspector that feeds each buffered entry into a
+/// running `PackageAnalyzer`. Oversized source files can stream to disk
+/// and be sampled by the inspector after write. The result is one
+/// filesystem pass instead of two — P1's extract writes files while P2's
+/// scan reads the bytes it already has in hand, eliminating the
+/// `analyze_package` post-extract walk.
 ///
 /// Unbuffered entries (all non-source files, `.d.ts`, `.map`, files over
 /// 2 MB, etc.) go through the original `entry.unpack()` streaming path.

@@ -276,12 +276,11 @@ impl PackageStore {
         let extractor_reader =
             std::io::Read::chain(std::io::Cursor::new(magic), &mut hashing_reader);
 
-        // Fused behavioral scan. `PackageAnalyzer::should_scan` is the
-        // buffer predicate — true for JS/TS/JSX/TSX sources outside
-        // `node_modules`/`__tests__`/`test`/hidden paths. The inspector
-        // feeds those buffered bytes into the analyzer. Non-source
-        // files stream through `entry.unpack()` unchanged, so the long
-        // tail (images, fonts, .map files) adds zero extra memory.
+        // Fused behavioral scan. The predicate buffers JS/TS/JSX/TSX
+        // sources that are small enough for the full scanner. Oversized
+        // source files stream to disk first, then the inspector asks the
+        // analyzer to read bounded head/tail samples from the written file.
+        // Non-source files stream through unchanged.
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
 
         // `&mut HashingReader` satisfies `impl Read` via the blanket impl
@@ -292,10 +291,16 @@ impl PackageStore {
         let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
             extractor_reader,
             &tmp_dir,
-            lpm_security::behavioral::PackageAnalyzer::should_scan,
+            lpm_security::behavioral::PackageAnalyzer::should_buffer_source,
             |entry| {
                 if let Some(bytes) = entry.bytes {
                     analyzer.borrow_mut().feed(entry.relative_path, bytes);
+                } else {
+                    analyzer.borrow_mut().feed_oversized_source_file(
+                        entry.relative_path,
+                        &tmp_dir.join(entry.relative_path),
+                        entry.size,
+                    );
                 }
             },
         );
