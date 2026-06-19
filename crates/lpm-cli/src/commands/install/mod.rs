@@ -136,6 +136,7 @@ pub(crate) fn install_running_in_ci() -> bool {
 }
 
 const V2_CACHE_CHECK_MAX_CONCURRENCY: usize = 16;
+const V2_LINK_TASK_MAX_CONCURRENCY: usize = 16;
 
 fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
     let parallelism = std::thread::available_parallelism()
@@ -144,6 +145,15 @@ fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
     parallelism
         .clamp(1, V2_CACHE_CHECK_MAX_CONCURRENCY)
         .min(candidate_count.max(1))
+}
+
+fn v2_link_task_concurrency(target_count: usize) -> usize {
+    let parallelism = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(4);
+    parallelism
+        .clamp(1, V2_LINK_TASK_MAX_CONCURRENCY)
+        .min(target_count.max(1))
 }
 
 fn timing_detail_start(enabled: bool) -> Option<Instant> {
@@ -175,16 +185,25 @@ fn spawn_v2_link_task(
     plan: std::sync::Arc<lpm_linker::v2::LinkPlanV2>,
     target: lpm_linker::v2::V2Target,
     store: std::sync::Arc<lpm_store::v2::Store>,
+    semaphore: Arc<Semaphore>,
 ) -> V2LinkHandle {
-    tokio::task::spawn_blocking(move || {
-        let start = Instant::now();
-        let (materialized, freshly_populated) =
-            lpm_linker::v2::link_v2_one(&plan, &target, &store)?;
-        Ok(V2LinkTaskResult {
-            materialized,
-            freshly_populated,
-            ms: start.elapsed().as_millis(),
+    tokio::spawn(async move {
+        let _permit = semaphore
+            .acquire_owned()
+            .await
+            .map_err(|_| LpmError::Registry("v2 link semaphore closed".into()))?;
+        tokio::task::spawn_blocking(move || {
+            let start = Instant::now();
+            let (materialized, freshly_populated) =
+                lpm_linker::v2::link_v2_one(&plan, &target, &store)?;
+            Ok(V2LinkTaskResult {
+                materialized,
+                freshly_populated,
+                ms: start.elapsed().as_millis(),
+            })
         })
+        .await
+        .map_err(|e| LpmError::Registry(format!("v2 link task panicked: {e}")))?
     })
 }
 
@@ -3154,6 +3173,9 @@ async fn run_with_options_under_store_lock(
     // Per-package v2 link handles populated by both the cache-hit
     // short-circuits below and the fetch tasks further down. Drained
     // at the link stage and folded into the LinkResult.
+    let v2_link_task_semaphore = Arc::new(Semaphore::new(v2_link_task_concurrency(
+        v2_target_by_key.len(),
+    )));
     let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
     fetch_stage_timings.plan_ms = fetch_plan_start.elapsed().as_millis();
     let v2_prevalidate_start = Instant::now();
@@ -3247,7 +3269,12 @@ async fn run_with_options_under_store_lock(
                         .expect("v2_event_driven implies v2 store"),
                 );
                 fetch_stage_timings.link_dispatch_count += 1;
-                v2_event_link_handles.push(spawn_v2_link_task(plan_arc, target, store_arc));
+                v2_event_link_handles.push(spawn_v2_link_task(
+                    plan_arc,
+                    target,
+                    store_arc,
+                    Arc::clone(&v2_link_task_semaphore),
+                ));
                 record_timing_detail_ms(
                     &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
                     link_dispatch_start,
@@ -3305,7 +3332,12 @@ async fn run_with_options_under_store_lock(
                         .expect("v2_event_driven implies v2 store"),
                 );
                 fetch_stage_timings.link_dispatch_count += 1;
-                v2_event_link_handles.push(spawn_v2_link_task(plan_arc, target, store_arc));
+                v2_event_link_handles.push(spawn_v2_link_task(
+                    plan_arc,
+                    target,
+                    store_arc,
+                    Arc::clone(&v2_link_task_semaphore),
+                ));
                 record_timing_detail_ms(
                     &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
                     link_dispatch_start,
@@ -3366,7 +3398,12 @@ async fn run_with_options_under_store_lock(
                                 .expect("v2_event_driven implies v2 store"),
                         );
                         fetch_stage_timings.link_dispatch_count += 1;
-                        v2_event_link_handles.push(spawn_v2_link_task(plan_arc, target, store_arc));
+                        v2_event_link_handles.push(spawn_v2_link_task(
+                            plan_arc,
+                            target,
+                            store_arc,
+                            Arc::clone(&v2_link_task_semaphore),
+                        ));
                         record_timing_detail_ms(
                             &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
                             link_dispatch_start,
@@ -4092,6 +4129,7 @@ async fn run_with_options_under_store_lock(
             } else {
                 None
             };
+            let v2_link_task_semaphore_c = Arc::clone(&v2_link_task_semaphore);
             // confidence-followup — pre-resolve THIS
             // package's patch fingerprint outside the move closure so
             // the closure doesn't carry the whole map. `None` for the
@@ -4207,7 +4245,12 @@ async fn run_with_options_under_store_lock(
                                 target_c.verified_object_tree_integrity =
                                     Some(reusable_object.tree_integrity);
                                 let store_c = std::sync::Arc::clone(store_v2);
-                                Some(spawn_v2_link_task(plan_c, target_c, store_c))
+                                Some(spawn_v2_link_task(
+                                    plan_c,
+                                    target_c,
+                                    store_c,
+                                    Arc::clone(&v2_link_task_semaphore_c),
+                                ))
                             } else {
                                 None
                             };
@@ -4274,7 +4317,12 @@ async fn run_with_options_under_store_lock(
                             let plan_c = std::sync::Arc::clone(plan);
                             let target_c = target.clone();
                             let store_c = std::sync::Arc::clone(store_v2);
-                            Some(spawn_v2_link_task(plan_c, target_c, store_c))
+                            Some(spawn_v2_link_task(
+                                plan_c,
+                                target_c,
+                                store_c,
+                                Arc::clone(&v2_link_task_semaphore_c),
+                            ))
                         } else {
                             None
                         };
@@ -4377,7 +4425,12 @@ async fn run_with_options_under_store_lock(
                         let plan_c = std::sync::Arc::clone(plan);
                         let target_c = target.clone();
                         let store_c = std::sync::Arc::clone(store_v2);
-                        Some(spawn_v2_link_task(plan_c, target_c, store_c))
+                        Some(spawn_v2_link_task(
+                            plan_c,
+                            target_c,
+                            store_c,
+                            Arc::clone(&v2_link_task_semaphore_c),
+                        ))
                     } else {
                         None
                     };
