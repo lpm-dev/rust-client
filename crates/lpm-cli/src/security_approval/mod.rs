@@ -48,10 +48,10 @@ pub use types::{
 };
 #[allow(unused_imports)]
 pub use unlocks::{
-    ensure_global_unlock, ensure_project_unlock, has_active_project_unlock,
-    list_active_global_unlocks, list_active_project_unlocks, list_active_unlocks,
-    lock_global_scopes_command, lock_project_scopes_command, unlock_global_scopes_command,
-    unlock_scopes_command,
+    approve_project_runtime_override, ensure_global_unlock, ensure_project_unlock,
+    has_active_project_unlock, list_active_global_unlocks, list_active_project_unlocks,
+    list_active_unlocks, lock_global_scopes_command, lock_project_scopes_command,
+    unlock_global_scopes_command, unlock_scopes_command,
 };
 
 const SIGNING_SECRET_BYTES: usize = 32;
@@ -61,8 +61,6 @@ pub const DEFAULT_UNLOCK_TTL_SECS: u64 = 10 * 60;
 pub const MAX_UNLOCK_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 const KEYRING_SERVICE: &str = "dev.lpm.security-approval";
 const KEYRING_ACCOUNT: &str = "signing-secret-v1";
-#[cfg(not(test))]
-const KEYRING_AUDIT_HEAD_ACCOUNT: &str = "audit-head-v1";
 #[cfg(test)]
 const SECURITY_DIR_ENV: &str = "LPM_SECURITY_DIR";
 #[cfg(not(windows))]
@@ -140,8 +138,6 @@ fn keyring_account(base: &str) -> Result<String, lpm_common::LpmError> {
 
 #[allow(unused_imports)]
 mod prelude {
-    #[cfg(not(test))]
-    pub(super) use super::KEYRING_AUDIT_HEAD_ACCOUNT;
     #[cfg(debug_assertions)]
     pub(super) use super::SECURITY_POLICY_PATH_ENV;
     pub(super) use super::{
@@ -155,7 +151,9 @@ mod prelude {
     #[cfg(test)]
     pub(super) use super::{SECURITY_DIR_ENV, TEST_AUTH_RESULT_ENV, TEST_SECRET_ENV};
 
-    pub(super) use super::approval::{approval_required_error, managed_policy_blocks_scope};
+    pub(super) use super::approval::{
+        approval_required_error, managed_policy_blocks_scope, managed_policy_blocks_scope_direct,
+    };
     pub(super) use super::audit::{
         AuditRecord, append_audit_event, audit_signature_payload, hash_json_value,
         read_audit_log_tail, record_audit_event,

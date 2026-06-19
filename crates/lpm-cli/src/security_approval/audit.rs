@@ -85,72 +85,12 @@ pub(super) fn read_audit_log_tail(path: &Path) -> Result<(Option<String>, u64), 
     Ok((previous, count))
 }
 
-#[cfg(test)]
 fn load_audit_head() -> Result<Option<AuditHead>, LpmError> {
     read_signed_json(&audit_head_path()?)
 }
 
-#[cfg(test)]
 fn persist_audit_head(head: &AuditHead) -> Result<(), LpmError> {
     write_signed_json(&audit_head_path()?, head)
-}
-
-#[cfg(not(test))]
-fn load_audit_head() -> Result<Option<AuditHead>, LpmError> {
-    if force_file_audit_head_backend() {
-        return read_signed_json(&audit_head_path()?);
-    }
-
-    let account = keyring_account(KEYRING_AUDIT_HEAD_ACCOUNT)?;
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
-        .map_err(|e| LpmError::Registry(format!("security audit keyring error: {e}")))?;
-    let raw = match entry.get_password() {
-        Ok(value) => value,
-        Err(keyring::Error::NoEntry) => return Ok(None),
-        Err(e) => {
-            return Err(LpmError::Registry(format!(
-                "security audit keyring read error: {e}"
-            )));
-        }
-    };
-    let parsed: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| LpmError::Registry(format!("security audit head parse error: {e}")))?;
-    let signature = parsed
-        .get("signature")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| LpmError::Registry("security audit head is missing a signature".into()))?;
-    let payload = parsed
-        .get("payload")
-        .cloned()
-        .ok_or_else(|| LpmError::Registry("security audit head is missing a payload".into()))?;
-    if !verify_payload_value(&payload, signature)? {
-        return Err(LpmError::Registry(
-            "security audit head failed signature verification; possible tampering".into(),
-        ));
-    }
-    let envelope: SignedEnvelope<AuditHead> = serde_json::from_value(parsed)
-        .map_err(|e| LpmError::Registry(format!("security audit head parse error: {e}")))?;
-    Ok(Some(envelope.payload))
-}
-
-#[cfg(not(test))]
-fn persist_audit_head(head: &AuditHead) -> Result<(), LpmError> {
-    if force_file_audit_head_backend() {
-        return write_signed_json(&audit_head_path()?, head);
-    }
-
-    let payload_value = serde_json::to_value(head)?;
-    let envelope = SignedEnvelope {
-        payload: head.clone(),
-        signature: sign_payload_value(&payload_value)?,
-    };
-    let body = serde_json::to_string(&envelope)?;
-    let account = keyring_account(KEYRING_AUDIT_HEAD_ACCOUNT)?;
-    keyring::Entry::new(KEYRING_SERVICE, &account)
-        .map_err(|e| LpmError::Registry(format!("security audit keyring error: {e}")))?
-        .set_password(&body)
-        .map_err(|e| LpmError::Registry(format!("security audit keyring write error: {e}")))?;
-    Ok(())
 }
 
 pub(super) fn append_audit_event(event: &AuditEvent) -> Result<(), LpmError> {

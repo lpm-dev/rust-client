@@ -84,6 +84,44 @@ pub(super) fn managed_policy_blocks_scope(
     ))
 }
 
+pub(super) fn managed_policy_blocks_scope_direct(
+    policy: &ManagedPolicy,
+    scope: ApprovalScope,
+) -> Option<LpmError> {
+    let blocked_control = match scope {
+        ApprovalScope::ScriptsAllow | ApprovalScope::ScriptsTriage
+            if policy.script_policy.is_some() =>
+        {
+            Some("script-policy")
+        }
+        ApprovalScope::CooldownBypass | ApprovalScope::CooldownWindow
+            if policy.minimum_release_age_secs.is_some() || policy.release_age_policy.is_some() =>
+        {
+            Some("minimum-release-age")
+        }
+        ApprovalScope::SandboxDefault | ApprovalScope::SandboxNone
+            if policy.sandbox_mode.is_some() =>
+        {
+            Some("sandbox.mode")
+        }
+        ApprovalScope::SandboxAllowDegraded if policy.sandbox_allow_degraded.is_some() => {
+            Some("sandbox.allow-degraded")
+        }
+        ApprovalScope::ProvenanceUnverified | ApprovalScope::ProvenanceIgnoreDrift
+            if policy.sigstore_verify.is_some() =>
+        {
+            Some("sigstore.verify")
+        }
+        _ => None,
+    }?;
+
+    Some(managed_policy_scope_error(
+        &policy.status,
+        scope,
+        blocked_control,
+    ))
+}
+
 fn approval_source_for_enforce_source(
     source: crate::provenance_fetch::EnforceModeSource,
 ) -> ApprovalSource {

@@ -3263,6 +3263,64 @@ mod tests {
     }
 
     #[test]
+    fn link_packages_v2_nests_same_name_dependency_inside_package_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let current_sri = synthetic_sri(b"link_packages_v2/same-name/current");
+        write_object(
+            &store,
+            &current_sri,
+            &[(
+                "package.json",
+                br#"{"name":"pangea-lib","version":"4.0.521","dependencies":{"pangea-lib":"2.12.192"}}"#,
+            )],
+        );
+        let legacy_sri = synthetic_sri(b"link_packages_v2/same-name/legacy");
+        write_object(
+            &store,
+            &legacy_sri,
+            &[(
+                "package.json",
+                br#"{"name":"pangea-lib","version":"2.12.192"}"#,
+            )],
+        );
+
+        let mut current = target("pangea-lib", "4.0.521", &current_sri, true);
+        current.target.dependencies = vec![LinkDependency::registry("pangea-lib", "2.12.192")];
+        let legacy = target("pangea-lib", "2.12.192", &legacy_sri, false);
+
+        let result = link_packages_v2(
+            &project,
+            vec![current, legacy],
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+
+        let current_dir = result
+            .materialized
+            .iter()
+            .find(|pkg| pkg.name == "pangea-lib" && pkg.version == "4.0.521")
+            .map(|pkg| pkg.destination.clone())
+            .expect("pangea-lib@4 should materialize");
+        let nested_legacy = current_dir.join("node_modules").join("pangea-lib");
+        assert!(
+            nested_legacy
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "same-name dependency must be nested under the package's own node_modules"
+        );
+        let legacy_manifest = std::fs::read_to_string(nested_legacy.join("package.json")).unwrap();
+        assert!(legacy_manifest.contains("2.12.192"));
+    }
+
+    #[test]
     fn link_packages_v2_materializes_next_compatibility_island_under_node_modules() {
         let tmp = tempfile::tempdir().unwrap();
         let store = V2Store::at(tmp.path().join("store"));
@@ -4932,6 +4990,131 @@ mod tests {
                 "project-side root symlink for {name} must exist after parallel materialization"
             );
             assert!(link.join("package.json").is_file());
+        }
+    }
+
+    #[cfg(unix)]
+    const LOW_NOFILE_CHILD_ENV: &str = "LPM_LINKER_LOW_NOFILE_RELINK_CHILD";
+
+    #[cfg(unix)]
+    #[test]
+    fn warm_v2_relink_does_not_exhaust_file_descriptors_under_low_limit() {
+        if std::env::var_os(LOW_NOFILE_CHILD_ENV).is_some() {
+            run_warm_v2_relink_under_low_nofile();
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("warm_v2_relink_does_not_exhaust_file_descriptors_under_low_limit")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(LOW_NOFILE_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "low-RLIMIT_NOFILE child failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    fn run_warm_v2_relink_under_low_nofile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = V2Store::at(tmp.path().join("store"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        const PACKAGE_COUNT: usize = 33;
+        const TREE_DEPTH: usize = 96;
+        let mut targets = Vec::with_capacity(PACKAGE_COUNT);
+        for i in 0..PACKAGE_COUNT {
+            let name = format!("deep-pkg-{i}");
+            let sri = synthetic_sri(format!("warm-low-nofile/{name}").as_bytes());
+            write_deep_object(&store, &sri, &name, TREE_DEPTH);
+            let verified = store.reusable_object(&sri).unwrap().unwrap().tree_integrity;
+            let mut v2t = target(&name, "1.0.0", &sri, true);
+            v2t.verified_object_tree_integrity = Some(verified);
+            targets.push(v2t);
+        }
+
+        let first = link_packages_v2(
+            &project,
+            targets.clone(),
+            &store,
+            LinkerMode::Isolated,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.linked, PACKAGE_COUNT);
+        std::fs::remove_dir_all(project.join("node_modules")).unwrap();
+
+        let _limit = NofileLimitGuard::lower_to(64);
+        let second =
+            link_packages_v2(&project, targets, &store, LinkerMode::Isolated, None).unwrap();
+
+        assert_eq!(second.linked, 0);
+        assert_eq!(second.skipped, PACKAGE_COUNT);
+        assert_eq!(second.symlinked, PACKAGE_COUNT);
+    }
+
+    #[cfg(unix)]
+    fn write_deep_object(store: &V2Store, sri: &str, name: &str, depth: usize) {
+        let package_json = format!(r#"{{"name":"{name}","version":"1.0.0"}}"#);
+        let mut deep_path = String::new();
+        for i in 0..depth {
+            if !deep_path.is_empty() {
+                deep_path.push('/');
+            }
+            deep_path.push_str(&format!("d{i:02}"));
+        }
+        deep_path.push_str("/index.js");
+
+        let files = [
+            ("package.json", package_json.as_bytes()),
+            (deep_path.as_str(), b"module.exports = {};\n".as_slice()),
+        ];
+        write_object(store, sri, &files);
+    }
+
+    #[cfg(unix)]
+    struct NofileLimitGuard {
+        previous: libc::rlimit,
+    }
+
+    #[cfg(unix)]
+    impl NofileLimitGuard {
+        fn lower_to(soft: libc::rlim_t) -> Self {
+            let mut previous = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `previous` points to valid writable storage for the kernel result.
+            let get_rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut previous) };
+            assert_eq!(get_rc, 0, "getrlimit(RLIMIT_NOFILE) failed");
+            assert!(
+                previous.rlim_cur > soft,
+                "test requires an initial RLIMIT_NOFILE above {soft}, got {}",
+                previous.rlim_cur
+            );
+
+            let mut lowered = previous;
+            lowered.rlim_cur = soft.min(previous.rlim_max);
+            // SAFETY: `lowered` is a valid rlimit for RLIMIT_NOFILE and only lowers the soft cap.
+            let set_rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) };
+            assert_eq!(set_rc, 0, "setrlimit(RLIMIT_NOFILE) failed");
+            Self { previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for NofileLimitGuard {
+        fn drop(&mut self) {
+            // SAFETY: restores the rlimit value captured from a successful getrlimit call.
+            let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.previous) };
         }
     }
 

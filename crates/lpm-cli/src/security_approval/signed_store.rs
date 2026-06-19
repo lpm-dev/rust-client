@@ -58,6 +58,48 @@ fn random_signing_secret() -> [u8; SIGNING_SECRET_BYTES] {
     secret
 }
 
+#[cfg(not(test))]
+static SIGNING_SECRET_CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, Vec<u8>>>> =
+    std::sync::OnceLock::new();
+
+fn signing_secret_cache_key() -> Result<Option<String>, SigningSecretReadError> {
+    if test_secret_override().is_some() {
+        return Ok(None);
+    }
+
+    if force_file_audit_head_backend() {
+        let path = signing_secret_path()
+            .map_err(|e| SigningSecretReadError::Unavailable(e.to_string()))?;
+        return Ok(Some(format!("file:{}", path.display())));
+    }
+
+    let account = keyring_account(KEYRING_ACCOUNT)
+        .map_err(|e| SigningSecretReadError::Unavailable(e.to_string()))?;
+    Ok(Some(format!("keyring:{KEYRING_SERVICE}:{account}")))
+}
+
+#[cfg(not(test))]
+fn cached_signing_secret(cache_key: &str) -> Option<Vec<u8>> {
+    let cache = SIGNING_SECRET_CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    cache.lock().ok()?.get(cache_key).cloned()
+}
+
+#[cfg(test)]
+fn cached_signing_secret(_cache_key: &str) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(not(test))]
+fn remember_signing_secret(cache_key: &str, secret: &[u8]) {
+    let cache = SIGNING_SECRET_CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(cache_key.to_string(), secret.to_vec());
+    }
+}
+
+#[cfg(test)]
+fn remember_signing_secret(_cache_key: &str, _secret: &[u8]) {}
+
 fn read_file_signing_secret(path: &Path) -> Result<Vec<u8>, SigningSecretReadError> {
     if !path.exists() {
         return Err(SigningSecretReadError::Missing);
@@ -97,23 +139,10 @@ fn create_file_signing_secret(path: &Path) -> Result<Vec<u8>, LpmError> {
     }
 }
 
-fn stored_signing_secret() -> Result<Vec<u8>, SigningSecretReadError> {
-    if let Some(raw) = test_secret_override() {
-        return decode_signing_secret(&raw, "test security secret override");
-    }
-
-    if force_file_audit_head_backend() {
-        let path = signing_secret_path()
-            .map_err(|e| SigningSecretReadError::Unavailable(e.to_string()))?;
-        return read_file_signing_secret(&path);
-    }
-
-    let account = keyring_account(KEYRING_ACCOUNT)
-        .map_err(|e| SigningSecretReadError::Unavailable(e.to_string()))?;
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &account).map_err(|e| {
+fn read_keyring_signing_secret(account: &str) -> Result<Vec<u8>, SigningSecretReadError> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| {
         SigningSecretReadError::Unavailable(format!("security approval keyring error: {e}"))
     })?;
-
     match entry.get_password() {
         Ok(existing) => decode_signing_secret(&existing, "security approval keyring entry"),
         Err(keyring::Error::NoEntry) => Err(SigningSecretReadError::Missing),
@@ -121,6 +150,41 @@ fn stored_signing_secret() -> Result<Vec<u8>, SigningSecretReadError> {
             "security approval keyring read error: {e}"
         ))),
     }
+}
+
+fn stored_keychain_signing_secret() -> Result<Vec<u8>, SigningSecretReadError> {
+    let account = keyring_account(KEYRING_ACCOUNT)
+        .map_err(|e| SigningSecretReadError::Unavailable(e.to_string()))?;
+    read_keyring_signing_secret(&account)
+}
+
+fn stored_signing_secret() -> Result<Vec<u8>, SigningSecretReadError> {
+    if let Some(raw) = test_secret_override() {
+        return decode_signing_secret(&raw, "test security secret override");
+    }
+
+    let cache_key = signing_secret_cache_key()?;
+    if let Some(cache_key) = cache_key.as_deref()
+        && let Some(secret) = cached_signing_secret(cache_key)
+    {
+        return Ok(secret);
+    }
+
+    if force_file_audit_head_backend() {
+        let path = signing_secret_path()
+            .map_err(|e| SigningSecretReadError::Unavailable(e.to_string()))?;
+        let secret = read_file_signing_secret(&path)?;
+        if let Some(cache_key) = cache_key.as_deref() {
+            remember_signing_secret(cache_key, &secret);
+        }
+        return Ok(secret);
+    }
+
+    let secret = stored_keychain_signing_secret()?;
+    if let Some(cache_key) = cache_key.as_deref() {
+        remember_signing_secret(cache_key, &secret);
+    }
+    Ok(secret)
 }
 
 fn read_signing_secret() -> Result<Vec<u8>, LpmError> {
@@ -137,7 +201,11 @@ fn get_or_create_signing_secret() -> Result<Vec<u8>, LpmError> {
 
 fn create_signing_secret() -> Result<Vec<u8>, LpmError> {
     if force_file_audit_head_backend() {
-        return create_file_signing_secret(&signing_secret_path()?);
+        let secret = create_file_signing_secret(&signing_secret_path()?)?;
+        if let Ok(Some(cache_key)) = signing_secret_cache_key() {
+            remember_signing_secret(&cache_key, &secret);
+        }
+        return Ok(secret);
     }
 
     let account = keyring_account(KEYRING_ACCOUNT)?;
@@ -148,7 +216,11 @@ fn create_signing_secret() -> Result<Vec<u8>, LpmError> {
     entry
         .set_password(&hex::encode(secret))
         .map_err(|e| security_store_error(format!("security approval keyring write error: {e}")))?;
-    Ok(secret.to_vec())
+    let secret = secret.to_vec();
+    if let Ok(Some(cache_key)) = signing_secret_cache_key() {
+        remember_signing_secret(&cache_key, &secret);
+    }
+    Ok(secret)
 }
 
 fn sign_payload_value_with_secret(

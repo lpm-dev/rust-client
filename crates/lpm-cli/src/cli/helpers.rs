@@ -476,6 +476,64 @@ pub(super) fn tunnel_action_requires_session(action: &str) -> bool {
     !matches!(action, "inspect" | "replay" | "log" | "logs")
 }
 
+fn relay_url_host_is_loopback(relay_url: &str) -> bool {
+    let Some((scheme, rest)) = relay_url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "ws" | "wss") {
+        return false;
+    }
+
+    let host_port = rest.split('/').next().unwrap_or("");
+    let host = if host_port.starts_with('[') {
+        host_port
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[')
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|addr| addr.is_loopback())
+}
+
+pub(super) async fn resolve_tunnel_bearer(
+    session: Option<&lpm_auth::SessionManager>,
+    relay_url: &str,
+) -> Result<Option<String>, lpm_common::LpmError> {
+    let Some(session) = session else {
+        return Ok(None);
+    };
+
+    let auth_requirement = if relay_url_host_is_loopback(relay_url) {
+        lpm_auth::AuthRequirement::TokenRequired
+    } else {
+        lpm_auth::AuthRequirement::SessionRequired
+    };
+
+    session
+        .bearer_string_for(auth_requirement)
+        .await
+        .map(Some)
+        .map_err(|_| {
+            if auth_requirement == lpm_auth::AuthRequirement::TokenRequired {
+                lpm_common::LpmError::Tunnel(
+                    "authentication required for tunnel. Run `lpm login` first.".into(),
+                )
+            } else {
+                lpm_common::LpmError::Tunnel(
+                    "tunnel requires a refresh-backed `lpm login` session.\n  \
+                     `--token` / `LPM_TOKEN` / CI tokens are not accepted."
+                        .into(),
+                )
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,5 +1328,44 @@ mod tests {
                 "expected {action} to require a relay-backed session"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tunnel_bearer_accepts_env_token_for_loopback_relay() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("LPM_TOKEN", "loopback-smoke-token".into()),
+            ("LPM_FORCE_FILE_AUTH", "1".into()),
+        ]);
+        let session = lpm_auth::SessionManager::new("http://127.0.0.1:4873", None);
+
+        let bearer =
+            resolve_tunnel_bearer(Some(&session), "ws://127.0.0.1:54321/connect?port=3000")
+                .await
+                .expect("loopback relay should accept an env token");
+
+        assert_eq!(bearer.as_deref(), Some("loopback-smoke-token"));
+    }
+
+    #[tokio::test]
+    async fn tunnel_bearer_rejects_env_token_for_non_loopback_relay() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("LPM_TOKEN", "production-token".into()),
+            ("LPM_FORCE_FILE_AUTH", "1".into()),
+        ]);
+        let session = lpm_auth::SessionManager::new("https://registry.lpm.dev", None);
+
+        let err = resolve_tunnel_bearer(Some(&session), "wss://relay.lpm.fyi/connect")
+            .await
+            .expect_err("production relay should still require a stored session");
+
+        assert!(
+            err.to_string()
+                .contains("requires a refresh-backed `lpm login` session"),
+            "unexpected error: {err}"
+        );
     }
 }

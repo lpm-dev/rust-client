@@ -261,13 +261,13 @@ fn request_macos_local_authentication(prompt: &str) -> Result<bool, LpmError> {
     use block2::RcBlock;
     use objc2::runtime::Bool;
     use objc2_foundation::{NSError, NSString};
-    use objc2_local_authentication::{LAContext, LAPolicy};
+    use objc2_local_authentication::LAContext;
     use std::sync::mpsc;
 
     // SAFETY: `new` returns a retained `LAContext` instance managed by objc2.
     let context = unsafe { LAContext::new() };
-    let policy = LAPolicy::DeviceOwnerAuthentication;
-    // SAFETY: The context is valid and `DeviceOwnerAuthentication` is a public LA policy.
+    let policy = macos_local_auth_policy();
+    // SAFETY: The context is valid and `policy` is a public LA policy.
     if let Err(error) = unsafe { context.canEvaluatePolicy_error(policy) } {
         return Err(LpmError::Registry(format!(
             "native macOS authentication is unavailable: {}",
@@ -275,6 +275,13 @@ fn request_macos_local_authentication(prompt: &str) -> Result<bool, LpmError> {
         )));
     }
 
+    let fallback_title = NSString::from_str(macos_local_auth_fallback_title());
+    // SAFETY: Both setters operate on a valid `LAContext`; the fallback title
+    // is copied by LocalAuthentication and the reuse duration is a scalar.
+    unsafe {
+        context.setLocalizedFallbackTitle(Some(&fallback_title));
+        context.setTouchIDAuthenticationAllowableReuseDuration(0.0);
+    }
     let reason = NSString::from_str(&macos_local_auth_reason(prompt));
     let (tx, rx) = mpsc::channel();
     let reply: RcBlock<dyn Fn(Bool, *mut NSError)> =
@@ -293,6 +300,16 @@ fn request_macos_local_authentication(prompt: &str) -> Result<bool, LpmError> {
             "native macOS authentication did not return a result: {err}"
         ))
     })
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn macos_local_auth_policy() -> objc2_local_authentication::LAPolicy {
+    objc2_local_authentication::LAPolicy::DeviceOwnerAuthenticationWithBiometrics
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn macos_local_auth_fallback_title() -> &'static str {
+    ""
 }
 
 #[cfg(target_os = "macos")]

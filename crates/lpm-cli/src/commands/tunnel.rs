@@ -33,6 +33,7 @@ pub async fn run(
     inspect_port: Option<u16>,
     auto_ack: bool,
     session_name: Option<&str>,
+    relay_url: Option<&str>,
 ) -> Result<(), LpmError> {
     // `Option<u16>` carries the user's intent through every layer: `None` →
     // auto-pick a free port via `bind(127.0.0.1:0)`, treat any failure as
@@ -71,6 +72,7 @@ pub async fn run(
                 inspect_port,
                 auto_ack,
                 session_name,
+                relay_url,
             )
             .await
         }
@@ -87,6 +89,7 @@ pub async fn run(
                     inspect_port,
                     auto_ack,
                     session_name,
+                    relay_url,
                 )
                 .await;
             }
@@ -124,6 +127,7 @@ async fn run_start(
     inspect_port: Option<u16>,
     auto_ack: bool,
     session_name: Option<&str>,
+    relay_url: Option<&str>,
 ) -> Result<(), LpmError> {
     let token = token.ok_or_else(|| {
         LpmError::Tunnel("authentication required. Run `lpm login` first.".into())
@@ -221,7 +225,9 @@ async fn run_start(
     });
 
     let options = lpm_tunnel::client::TunnelOptions {
-        relay_url: lpm_tunnel::resolve_relay_url(),
+        relay_url: relay_url
+            .map(str::to_owned)
+            .unwrap_or_else(lpm_tunnel::resolve_relay_url),
         token: token.to_string(),
         local_port: port,
         domain: domain.map(|s| s.to_string()),

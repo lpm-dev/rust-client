@@ -891,13 +891,12 @@ async fn run_with_options_under_store_lock(
     )?;
     let effective_min_age_secs = release_age_config.minimum_release_age_secs;
     if allow_new && effective_min_age_secs > 0 {
-        crate::security_approval::ensure_project_unlock(
+        crate::security_approval::approve_project_runtime_override(
             crate::security_approval::ApprovalScope::CooldownBypass,
             project_dir,
             json_output,
             crate::security_approval::ApprovalSource::CliFlag,
             "This install bypasses the minimum release age for this project.",
-            Some(0),
             &[],
         )?;
     }
