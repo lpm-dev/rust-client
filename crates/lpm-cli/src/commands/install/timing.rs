@@ -60,6 +60,8 @@ pub(super) struct TaskTimings {
 pub(super) struct FetchBreakdown {
     /// Number of tasks whose timings were folded in (== `downloaded`).
     pub(super) task_count: u64,
+    pub(super) task_sum_ms: u128,
+    pub(super) task_max_ms: u128,
     pub(super) queue_wait_sum_ms: u128,
     pub(super) queue_wait_max_ms: u128,
     /// — sum/max of per-task URL-lookup time. Primary
@@ -131,6 +133,26 @@ pub(super) struct SpeculativeStats {
     /// speculation (parked but the parent's deep-walk didn't cover
     /// them). Usually indicates the worker's deep-walk hit its own cap.
     pub(super) unresolved_parked: u64,
+    /// Dispatched speculative tasks that returned an error.
+    pub(super) failed: u64,
+    /// Dispatched tasks that did not start network work because all
+    /// speculative permits or shared download permits were already busy.
+    pub(super) skipped_no_permit: u64,
+    /// Dispatched packages skipped because their route carried custom-registry
+    /// auth; the authoritative fetch path remains the only credentialed actor.
+    pub(super) skipped_auth: u64,
+    /// Completed before the authoritative fetch loop started. This is the
+    /// clearest "was speculation early enough?" signal.
+    pub(super) completed_before_fetch: u64,
+    /// Final-graph packages whose authoritative fetch was skipped because a
+    /// speculative tarball had already materialized the same source-aware key.
+    pub(super) consumed_by_fetch: u64,
+    /// Final-graph packages where speculation failed and the authoritative
+    /// fetch still had to download the same source-aware key.
+    pub(super) duplicated_with_fetch: u64,
+    /// Completed speculative downloads that were not present in the final
+    /// resolved graph.
+    pub(super) wasted: u64,
 }
 
 impl SpeculativeStats {
@@ -144,7 +166,67 @@ impl SpeculativeStats {
             "max_depth_reached": self.max_depth_reached,
             "no_version_match": self.no_version_match,
             "unresolved_parked": self.unresolved_parked,
+            "failed": self.failed,
+            "skipped_no_permit": self.skipped_no_permit,
+            "skipped_auth": self.skipped_auth,
+            "completed_before_fetch": self.completed_before_fetch,
+            "consumed_by_fetch": self.consumed_by_fetch,
+            "duplicated_with_fetch": self.duplicated_with_fetch,
+            "wasted": self.wasted,
         })
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct SpeculativeKeyTracker {
+    completed_keys: std::sync::Arc<dashmap::DashSet<String>>,
+    failed_keys: std::sync::Arc<dashmap::DashSet<String>>,
+    consumed_keys: std::sync::Arc<dashmap::DashSet<String>>,
+    duplicated_keys: std::sync::Arc<dashmap::DashSet<String>>,
+}
+
+impl SpeculativeKeyTracker {
+    pub(super) fn record_completed(&self, key: String) {
+        self.completed_keys.insert(key);
+    }
+
+    pub(super) fn record_failed(&self, key: String) {
+        self.failed_keys.insert(key);
+    }
+
+    pub(super) fn mark_consumed_if_completed(&self, key: &str) {
+        if self.completed_keys.contains(key) {
+            self.consumed_keys.insert(key.to_string());
+        }
+    }
+
+    pub(super) fn mark_duplicated_if_failed(&self, key: &str) {
+        if self.failed_keys.contains(key) {
+            self.duplicated_keys.insert(key.to_string());
+        }
+    }
+
+    pub(super) fn completed_count(&self) -> u64 {
+        self.completed_keys.len() as u64
+    }
+
+    pub(super) fn consumed_count(&self) -> u64 {
+        self.consumed_keys.len() as u64
+    }
+
+    pub(super) fn duplicated_count(&self) -> u64 {
+        self.duplicated_keys.len() as u64
+    }
+
+    pub(super) fn failed_count(&self) -> u64 {
+        self.failed_keys.len() as u64
+    }
+
+    pub(super) fn wasted_count(&self, final_graph_keys: &HashSet<String>) -> u64 {
+        self.completed_keys
+            .iter()
+            .filter(|key| !final_graph_keys.contains(key.as_str()))
+            .count() as u64
     }
 }
 
@@ -199,6 +281,16 @@ impl FetchBreakdown {
     /// Fold one task's timings into the running aggregate.
     pub(super) fn record(&mut self, t: TaskTimings) {
         self.task_count += 1;
+        let task_ms = t
+            .queue_wait_ms
+            .saturating_add(t.url_lookup_ms)
+            .saturating_add(t.download_ms)
+            .saturating_add(t.integrity_ms)
+            .saturating_add(t.extract_ms)
+            .saturating_add(t.security_ms)
+            .saturating_add(t.finalize_ms);
+        self.task_sum_ms = self.task_sum_ms.saturating_add(task_ms);
+        self.task_max_ms = self.task_max_ms.max(task_ms);
         self.queue_wait_sum_ms += t.queue_wait_ms;
         self.queue_wait_max_ms = self.queue_wait_max_ms.max(t.queue_wait_ms);
         self.url_lookup_sum_ms += t.url_lookup_ms;
@@ -219,6 +311,8 @@ impl FetchBreakdown {
     pub(super) fn to_json(self) -> serde_json::Value {
         serde_json::json!({
             "task_count": self.task_count,
+            "task_sum_ms": self.task_sum_ms,
+            "task_max_ms": self.task_max_ms,
             "queue_wait":  { "sum_ms": self.queue_wait_sum_ms,  "max_ms": self.queue_wait_max_ms  },
             "url_lookup":  { "sum_ms": self.url_lookup_sum_ms,  "max_ms": self.url_lookup_max_ms  },
             "download":    { "sum_ms": self.download_sum_ms,    "max_ms": self.download_max_ms    },
@@ -803,6 +897,32 @@ mod tests {
     }
 
     #[test]
+    fn fetch_breakdown_reports_task_sum_and_max() {
+        let mut breakdown = FetchBreakdown::default();
+        breakdown.record(TaskTimings {
+            queue_wait_ms: 1,
+            url_lookup_ms: 2,
+            download_ms: 3,
+            integrity_ms: 4,
+            extract_ms: 5,
+            security_ms: 6,
+            finalize_ms: 7,
+        });
+        breakdown.record(TaskTimings {
+            queue_wait_ms: 2,
+            download_ms: 3,
+            finalize_ms: 4,
+            ..TaskTimings::default()
+        });
+
+        let json = breakdown.to_json();
+
+        assert_eq!(json["task_count"], 2);
+        assert_eq!(json["task_sum_ms"], 37);
+        assert_eq!(json["task_max_ms"], 28);
+    }
+
+    #[test]
     fn v2_link_task_timings_reports_reused_entries() {
         let mut timings = V2LinkTaskTimings::default();
         timings.record(5, false);
@@ -816,5 +936,43 @@ mod tests {
         assert_eq!(json["task_sum_ms"], 13);
         assert_eq!(json["task_max_ms"], 8);
         assert_eq!(json["await_ms"], 3);
+    }
+
+    #[test]
+    fn speculative_stats_json_reports_usefulness_counters() {
+        let stats = SpeculativeStats {
+            completed_before_fetch: 3,
+            consumed_by_fetch: 2,
+            duplicated_with_fetch: 1,
+            failed: 4,
+            wasted: 5,
+            ..SpeculativeStats::default()
+        };
+
+        let json = stats.to_json();
+
+        assert_eq!(json["completed_before_fetch"], 3);
+        assert_eq!(json["consumed_by_fetch"], 2);
+        assert_eq!(json["duplicated_with_fetch"], 1);
+        assert_eq!(json["failed"], 4);
+        assert_eq!(json["wasted"], 5);
+    }
+
+    #[test]
+    fn speculative_key_tracker_counts_consumed_duplicates_and_wasted_completed_downloads() {
+        let tracker = SpeculativeKeyTracker::default();
+        tracker.record_completed("used".to_string());
+        tracker.record_completed("wasted".to_string());
+        tracker.record_failed("failed".to_string());
+
+        tracker.mark_consumed_if_completed("used");
+        tracker.mark_duplicated_if_failed("failed");
+        let final_keys = HashSet::from(["used".to_string(), "failed".to_string()]);
+
+        assert_eq!(tracker.completed_count(), 2);
+        assert_eq!(tracker.consumed_count(), 1);
+        assert_eq!(tracker.duplicated_count(), 1);
+        assert_eq!(tracker.failed_count(), 1);
+        assert_eq!(tracker.wasted_count(&final_keys), 1);
     }
 }

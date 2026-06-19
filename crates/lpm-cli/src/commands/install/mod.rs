@@ -2371,6 +2371,7 @@ async fn run_with_options_under_store_lock(
 
     // stats — filled by the speculation dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
+    let spec_tracker = SpeculativeKeyTracker::default();
 
     //: shared fetch coordinator — serializes per-key fetch
     // work across the speculative dispatcher and the real fetch loop
@@ -2532,6 +2533,7 @@ async fn run_with_options_under_store_lock(
                         Some(Arc::new(Semaphore::new(speculation_permits))),
                         fetch_coord.clone(),
                         deps.clone(),
+                        spec_tracker.clone(),
                         store_v2_handle.clone(),
                     );
                     let res = lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy(
@@ -2564,6 +2566,9 @@ async fn run_with_options_under_store_lock(
                         max_depth_reached: dispatcher_counters.max_depth_reached,
                         no_version_match: dispatcher_counters.no_version_match,
                         unresolved_parked: dispatcher_counters.unresolved_parked,
+                        failed: dispatcher_counters.failed,
+                        skipped_no_permit: dispatcher_counters.skipped_no_permit,
+                        skipped_auth: dispatcher_counters.skipped_auth,
                     });
                     (res, 0u128)
                 } else {
@@ -2640,6 +2645,7 @@ async fn run_with_options_under_store_lock(
                         None,
                         fetch_coord.clone(),
                         deps.clone(),
+                        spec_tracker.clone(),
                         store_v2_handle.clone(),
                     );
 
@@ -2709,6 +2715,9 @@ async fn run_with_options_under_store_lock(
                         max_depth_reached: dispatcher_counters.max_depth_reached,
                         no_version_match: dispatcher_counters.no_version_match,
                         unresolved_parked: dispatcher_counters.unresolved_parked,
+                        failed: dispatcher_counters.failed,
+                        skipped_no_permit: dispatcher_counters.skipped_no_permit,
+                        skipped_auth: dispatcher_counters.skipped_auth,
                     });
 
                     (resolve_res_legacy, batch_ms)
@@ -3313,6 +3322,7 @@ async fn run_with_options_under_store_lock(
         {
             let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
+            spec_tracker.mark_consumed_if_completed(&package_key);
             // followup #6b — dispatch link_v2_one immediately.
             // The v2 object is already populated, so the link entry's
             // clonefile pass can run on the blocking pool in parallel
@@ -3434,6 +3444,7 @@ async fn run_with_options_under_store_lock(
             let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
             fetch_stage_timings.v1_cache_hit_count += 1;
+            spec_tracker.mark_consumed_if_completed(&package_key);
             //b: spawn per-pkg link task immediately — this
             // package is already materialized in the store, so // can run in parallel with the fetch loop below.
             if event_driven_link {
@@ -4081,6 +4092,7 @@ async fn run_with_options_under_store_lock(
     // temp-file spool (kept as an escape hatch for debugging fetch
     // regressions or non-sha512 integrity edge cases).
     let streaming_fetch = std::env::var("LPM_STREAM_FETCH").map_or(true, |v| v != "0");
+    spec_stats.completed_before_fetch = spec_tracker.completed_count();
     if !to_download.is_empty() {
         let download_wall_start = Instant::now();
         let overall = ProgressBar::new(to_download.len() as u64);
@@ -4130,6 +4142,7 @@ async fn run_with_options_under_store_lock(
                 None
             };
             let v2_link_task_semaphore_c = Arc::clone(&v2_link_task_semaphore);
+            let spec_tracker_c = spec_tracker.clone();
             // confidence-followup — pre-resolve THIS
             // package's patch fingerprint outside the move closure so
             // the closure doesn't carry the whole map. `None` for the
@@ -4168,13 +4181,14 @@ async fn run_with_options_under_store_lock(
                 let queue_start = std::time::Instant::now();
                 let package_display =
                     trace_slow_packages.then(|| format!("{}@{}", p.name, p.version));
+                let package_key = install_pkg_key(&p);
 
                 //: per-key fetch coordination. Acquired BEFORE
                 // the download permit — if a sibling (speculation) is
                 // already fetching this key, we wait here without consuming
                 // a permit. On wake, `has_package` is true and we skip the
                 // real fetch entirely (zero bandwidth, zero CPU).
-                let key_lock = coord.lock_for(install_pkg_key(&p)).await;
+                let key_lock = coord.lock_for(package_key.clone()).await;
                 let _key_guard = key_lock.lock().await;
 
                 // Spawn the per-pkg link task once the tarball is in the
@@ -4255,8 +4269,9 @@ async fn run_with_options_under_store_lock(
                                 None
                             };
                         overall.inc(1);
+                        spec_tracker_c.mark_consumed_if_completed(&package_key);
                         return Ok::<FetchTaskResult, LpmError>((
-                            install_pkg_key(&p),
+                            package_key,
                             package_display,
                             sri_for_result,
                             TaskTimings {
@@ -4327,8 +4342,9 @@ async fn run_with_options_under_store_lock(
                             None
                         };
                     overall.inc(1);
+                    spec_tracker_c.mark_consumed_if_completed(&package_key);
                     return Ok::<FetchTaskResult, LpmError>((
-                        install_pkg_key(&p),
+                        package_key,
                         package_display,
                         sri,
                         TaskTimings {
@@ -4400,8 +4416,6 @@ async fn run_with_options_under_store_lock(
                     )
                     .await?
                 };
-                let package_key: String = install_pkg_key(&p);
-
                 // Spawn per-pkg link immediately; the package is
                 // now materialized. Runs on the blocking pool in parallel
                 // with sibling fetch tasks still downloading.
@@ -4436,6 +4450,7 @@ async fn run_with_options_under_store_lock(
                     };
 
                 overall.inc(1);
+                spec_tracker_c.mark_duplicated_if_failed(&package_key);
                 Ok::<FetchTaskResult, LpmError>((
                     package_key,
                     package_display,
@@ -4520,6 +4535,11 @@ async fn run_with_options_under_store_lock(
         );
         walker_summary_final = Some(summary);
     }
+    let final_graph_keys: HashSet<String> = packages.iter().map(install_pkg_key).collect();
+    spec_stats.consumed_by_fetch = spec_tracker.consumed_count();
+    spec_stats.duplicated_with_fetch = spec_tracker.duplicated_count();
+    spec_stats.failed = spec_tracker.failed_count();
+    spec_stats.wasted = spec_tracker.wasted_count(&final_graph_keys);
 
     // Fetch / cache-hit counters are recorded into `fetch_ms` etc. and
     // surfaced via the verbose footer and JSON envelope. The default
