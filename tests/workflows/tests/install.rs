@@ -1827,6 +1827,46 @@ async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
             "slow package bucket {bucket} must be an array; got {slow_packages:#}"
         );
     }
+    let fetch_tasks = &slow_packages["fetch_tasks"];
+    assert!(
+        fetch_tasks.is_object(),
+        "slow package trace must include fetch task attribution buckets; got {slow_packages:#}"
+    );
+    for bucket in ["by_total", "by_extract", "by_security", "by_finalize"] {
+        assert!(
+            fetch_tasks[bucket].is_array(),
+            "fetch task bucket {bucket} must be an array; got {fetch_tasks:#}"
+        );
+    }
+    if let Some(row) = fetch_tasks["by_total"]
+        .as_array()
+        .and_then(|rows| rows.first())
+    {
+        for field in [
+            "package",
+            "task_total_ms",
+            "queue_wait_ms",
+            "url_lookup_ms",
+            "download_ms",
+            "integrity_ms",
+            "extract_ms",
+            "security_ms",
+            "finalize_ms",
+            "finalize_tree_integrity_ms",
+            "finalize_integrity_write_ms",
+            "finalize_rename_ms",
+            "finalize_collision_recovery_ms",
+            "file_count",
+            "dir_count",
+            "symlink_count",
+            "unpacked_bytes",
+        ] {
+            assert!(
+                row.get(field).is_some(),
+                "fetch task trace row must include {field}; got {row:#}"
+            );
+        }
+    }
     let metadata = envelope["timing"]["detail"]["metadata"]
         .as_array()
         .unwrap_or_else(|| panic!("detail.metadata must be an array; got {envelope:#}"));
