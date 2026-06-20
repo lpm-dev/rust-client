@@ -42,6 +42,7 @@ pub(super) struct TaskTimings {
     /// Time in `.integrity` write + atomic rename into the store path.
     /// Mirrors [`lpm_store::StageTimings::finalize_ms`].
     pub(super) finalize_ms: u128,
+    pub(super) finalize_permit_wait_ms: u128,
     pub(super) finalize_tree_integrity_ms: u128,
     pub(super) finalize_integrity_write_ms: u128,
     pub(super) finalize_rename_ms: u128,
@@ -68,6 +69,7 @@ impl TaskTimings {
             extract_ms: stage.extract_ms,
             security_ms: stage.security_ms,
             finalize_ms: stage.finalize_ms,
+            finalize_permit_wait_ms: stage.finalize_permit_wait_ms,
             finalize_tree_integrity_ms: stage.finalize_tree_integrity_ms,
             finalize_integrity_write_ms: stage.finalize_integrity_write_ms,
             finalize_rename_ms: stage.finalize_rename_ms,
@@ -86,6 +88,7 @@ impl TaskTimings {
             .saturating_add(self.integrity_ms)
             .saturating_add(self.extract_ms)
             .saturating_add(self.security_ms)
+            .saturating_add(self.finalize_permit_wait_ms)
             .saturating_add(self.finalize_ms)
     }
 }
@@ -124,6 +127,8 @@ pub(super) struct FetchBreakdown {
     pub(super) extract_max_ms: u128,
     pub(super) security_sum_ms: u128,
     pub(super) security_max_ms: u128,
+    pub(super) finalize_permit_wait_sum_ms: u128,
+    pub(super) finalize_permit_wait_max_ms: u128,
     pub(super) finalize_sum_ms: u128,
     pub(super) finalize_max_ms: u128,
 }
@@ -342,6 +347,10 @@ impl FetchBreakdown {
         self.extract_max_ms = self.extract_max_ms.max(t.extract_ms);
         self.security_sum_ms += t.security_ms;
         self.security_max_ms = self.security_max_ms.max(t.security_ms);
+        self.finalize_permit_wait_sum_ms += t.finalize_permit_wait_ms;
+        self.finalize_permit_wait_max_ms = self
+            .finalize_permit_wait_max_ms
+            .max(t.finalize_permit_wait_ms);
         self.finalize_sum_ms += t.finalize_ms;
         self.finalize_max_ms = self.finalize_max_ms.max(t.finalize_ms);
     }
@@ -358,6 +367,7 @@ impl FetchBreakdown {
             "integrity":   { "sum_ms": self.integrity_sum_ms,   "max_ms": self.integrity_max_ms   },
             "extract":     { "sum_ms": self.extract_sum_ms,     "max_ms": self.extract_max_ms     },
             "security":    { "sum_ms": self.security_sum_ms,    "max_ms": self.security_max_ms    },
+            "finalize_permit_wait": { "sum_ms": self.finalize_permit_wait_sum_ms, "max_ms": self.finalize_permit_wait_max_ms },
             "finalize":    { "sum_ms": self.finalize_sum_ms,    "max_ms": self.finalize_max_ms    },
         })
     }
@@ -779,6 +789,7 @@ impl SlowPackageTimings {
                         "integrity_ms": timings.integrity_ms,
                         "extract_ms": timings.extract_ms,
                         "security_ms": timings.security_ms,
+                        "finalize_permit_wait_ms": timings.finalize_permit_wait_ms,
                         "finalize_ms": timings.finalize_ms,
                         "finalize_tree_integrity_ms": timings.finalize_tree_integrity_ms,
                         "finalize_integrity_write_ms": timings.finalize_integrity_write_ms,
@@ -1026,12 +1037,14 @@ mod tests {
             integrity_ms: 4,
             extract_ms: 5,
             security_ms: 6,
+            finalize_permit_wait_ms: 8,
             finalize_ms: 7,
             ..TaskTimings::default()
         });
         breakdown.record(TaskTimings {
             queue_wait_ms: 2,
             download_ms: 3,
+            finalize_permit_wait_ms: 5,
             finalize_ms: 4,
             ..TaskTimings::default()
         });
@@ -1039,8 +1052,10 @@ mod tests {
         let json = breakdown.to_json();
 
         assert_eq!(json["task_count"], 2);
-        assert_eq!(json["task_sum_ms"], 37);
-        assert_eq!(json["task_max_ms"], 28);
+        assert_eq!(json["task_sum_ms"], 50);
+        assert_eq!(json["task_max_ms"], 36);
+        assert_eq!(json["finalize_permit_wait"]["sum_ms"], 13);
+        assert_eq!(json["finalize_permit_wait"]["max_ms"], 8);
     }
 
     #[test]
@@ -1056,15 +1071,16 @@ mod tests {
                 integrity_ms: 4,
                 extract_ms: 5,
                 security_ms: 6,
-                finalize_ms: 7,
-                finalize_tree_integrity_ms: 8,
-                finalize_integrity_write_ms: 9,
-                finalize_rename_ms: 10,
-                finalize_collision_recovery_ms: 11,
-                file_count: 12,
-                dir_count: 13,
-                symlink_count: 14,
-                unpacked_bytes: 15,
+                finalize_permit_wait_ms: 7,
+                finalize_ms: 8,
+                finalize_tree_integrity_ms: 9,
+                finalize_integrity_write_ms: 10,
+                finalize_rename_ms: 11,
+                finalize_collision_recovery_ms: 12,
+                file_count: 13,
+                dir_count: 14,
+                symlink_count: 15,
+                unpacked_bytes: 16,
             },
         );
 
@@ -1072,22 +1088,23 @@ mod tests {
         let row = &json["fetch_tasks"]["by_total"][0];
 
         assert_eq!(row["package"], "pkg@1.0.0");
-        assert_eq!(row["task_total_ms"], 28);
+        assert_eq!(row["task_total_ms"], 36);
         assert_eq!(row["queue_wait_ms"], 1);
         assert_eq!(row["url_lookup_ms"], 2);
         assert_eq!(row["download_ms"], 3);
         assert_eq!(row["integrity_ms"], 4);
         assert_eq!(row["extract_ms"], 5);
         assert_eq!(row["security_ms"], 6);
-        assert_eq!(row["finalize_ms"], 7);
-        assert_eq!(row["finalize_tree_integrity_ms"], 8);
-        assert_eq!(row["finalize_integrity_write_ms"], 9);
-        assert_eq!(row["finalize_rename_ms"], 10);
-        assert_eq!(row["finalize_collision_recovery_ms"], 11);
-        assert_eq!(row["file_count"], 12);
-        assert_eq!(row["dir_count"], 13);
-        assert_eq!(row["symlink_count"], 14);
-        assert_eq!(row["unpacked_bytes"], 15);
+        assert_eq!(row["finalize_permit_wait_ms"], 7);
+        assert_eq!(row["finalize_ms"], 8);
+        assert_eq!(row["finalize_tree_integrity_ms"], 9);
+        assert_eq!(row["finalize_integrity_write_ms"], 10);
+        assert_eq!(row["finalize_rename_ms"], 11);
+        assert_eq!(row["finalize_collision_recovery_ms"], 12);
+        assert_eq!(row["file_count"], 13);
+        assert_eq!(row["dir_count"], 14);
+        assert_eq!(row["symlink_count"], 15);
+        assert_eq!(row["unpacked_bytes"], 16);
     }
 
     #[test]

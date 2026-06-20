@@ -1851,6 +1851,7 @@ async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
             "integrity_ms",
             "extract_ms",
             "security_ms",
+            "finalize_permit_wait_ms",
             "finalize_ms",
             "finalize_tree_integrity_ms",
             "finalize_integrity_write_ms",
