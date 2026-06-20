@@ -11,8 +11,9 @@ pub mod tls_identity;
 pub mod types;
 
 pub use client::{
-    DownloadedTarball, FanOutStats, GateDecision, MAX_COMPRESSED_TARBALL_SIZE, RegistryClient,
-    evaluate_cached_url, is_https_url, is_localhost_url, parse_capped_api_json,
+    DownloadedTarball, FanOutStats, GateDecision, MAX_COMPRESSED_TARBALL_SIZE,
+    PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata, evaluate_cached_url,
+    is_https_url, is_localhost_url, parse_capped_api_json,
 };
 pub use npmrc::{
     NpmrcConfig, OriginKey, OriginTlsOverrides, RegistryAuth, RegistryKind, RegistryTarget,

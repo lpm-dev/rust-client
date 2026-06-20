@@ -794,6 +794,109 @@ impl RegistryClient {
         finish!(Ok(metadata))
     }
 
+    pub async fn get_npm_metadata_direct_with_timings(
+        &self,
+        name: &str,
+    ) -> Result<TimedPackageMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
+        let cache_key = format!("npm:{name}");
+        let mut timings = PackageMetadataFetchTimings::default();
+
+        let cache_read_start = std::time::Instant::now();
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+            timings.cache_hit = true;
+            crate::timing::record_metadata_cache_hit();
+            tracing::debug!("metadata cache hit (direct): npm:{name}");
+            return Ok(TimedPackageMetadata {
+                metadata: cached,
+                timings,
+            });
+        }
+        timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+        crate::timing::record_metadata_cache_miss();
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let validator_start = std::time::Instant::now();
+        let cache_validator = self.read_cache_validator(&cache_key);
+        timings.validator_read_ms = validator_start.elapsed().as_millis();
+
+        let npm_url = format!("{}/{}", self.npm_registry_url, name);
+        tracing::debug!("fetching {name} direct from npm registry");
+        let req = self
+            .http
+            .for_url(&npm_url)
+            .await?
+            .get(&npm_url)
+            .header("Accept", "application/vnd.npm.install-v1+json");
+        let req = Self::apply_cached_etag(req, cache_validator.as_ref());
+        let http_start = std::time::Instant::now();
+        let mut response = match self.send_package_metadata_request(req).await {
+            Ok(r) => {
+                timings.http_ms = timings
+                    .http_ms
+                    .saturating_add(http_start.elapsed().as_millis());
+                r
+            }
+            Err(e) => {
+                return finish!(Err(e));
+            }
+        };
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            timings.not_modified = true;
+            let cache_304_start = std::time::Instant::now();
+            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+                timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+                tracing::debug!("metadata cache revalidated (direct 304): npm:{name}");
+                return finish!(Ok(TimedPackageMetadata { metadata, timings }));
+            }
+            timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+            let req = self
+                .http
+                .for_url(&npm_url)
+                .await?
+                .get(&npm_url)
+                .header("Accept", "application/vnd.npm.install-v1+json");
+            let retry_http_start = std::time::Instant::now();
+            response = match self.send_package_metadata_request(req).await {
+                Ok(r) => {
+                    timings.http_ms = timings
+                        .http_ms
+                        .saturating_add(retry_http_start.elapsed().as_millis());
+                    r
+                }
+                Err(e) => {
+                    return finish!(Err(e));
+                }
+            };
+        }
+        let etag = Self::response_etag(&response);
+        let (metadata, body_timings) = match parse_capped_metadata_with_timing::<PackageMetadata>(
+            response,
+            &format!("get_npm_metadata_direct {name}"),
+        )
+        .await
+        {
+            Ok(parsed) => parsed,
+            Err(e) => return finish!(Err(e)),
+        };
+        timings.body_read_ms = body_timings.body_read_ms;
+        timings.json_decode_ms = body_timings.json_parse_ms;
+        timings.body_bytes = body_timings.body_bytes;
+        let cache_write_start = std::time::Instant::now();
+        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
+        finish!(Ok(TimedPackageMetadata { metadata, timings }))
+    }
+
     /// Fetch a full npm packument through the proxy/direct fallback chain.
     ///
     /// Kept separate from [`Self::get_npm_package_metadata`] so installs that

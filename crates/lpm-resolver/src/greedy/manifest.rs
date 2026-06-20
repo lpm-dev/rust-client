@@ -1,3 +1,4 @@
+use super::ExperimentalMetadataFetchTimings;
 use super::metrics::{metrics_incr_cache_wait, metrics_incr_escape_hatch, metrics_incr_timeout};
 use super::prelude::*;
 use super::state::ResolveState;
@@ -141,6 +142,64 @@ pub(super) async fn fetch_metadata_for_resolver(
         info,
         include_speculation,
     ))
+}
+
+pub(super) async fn fetch_metadata_for_resolver_with_timings(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+    include_speculation: bool,
+) -> Result<(FetchedMetadata, ExperimentalMetadataFetchTimings), ResolveError> {
+    let total_start = Instant::now();
+    let mut timings = ExperimentalMetadataFetchTimings {
+        package: canonical.to_string(),
+        ..ExperimentalMetadataFetchTimings::default()
+    };
+    let raw_start = Instant::now();
+    let raw = fetch_metadata_raw_with_timings(client, route_table, canonical).await?;
+    timings.raw_fetch_ms = raw_start.elapsed().as_millis();
+    timings.route = raw.route;
+    timings.version_count = raw.metadata.versions.len() as u64;
+    if let Some(registry) = raw.registry_timings {
+        timings.cache_hit = registry.cache_hit;
+        timings.not_modified = registry.not_modified;
+        timings.cache_read_ms = registry.cache_read_ms;
+        timings.validator_read_ms = registry.validator_read_ms;
+        timings.http_ms = registry.http_ms;
+        timings.body_read_ms = registry.body_read_ms;
+        timings.json_decode_ms = registry.json_decode_ms;
+        timings.cache_after_304_ms = registry.cache_after_304_ms;
+        timings.cache_write_dispatch_ms = registry.cache_write_dispatch_ms;
+        timings.body_bytes = registry.body_bytes;
+    }
+
+    let dist_tags = raw.metadata.dist_tags.clone();
+    let parse_start = Instant::now();
+    let mut info = parse_metadata_to_cache_info(&raw.metadata);
+    timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
+    if info.needs_trust_metadata(policy) {
+        let policy_start = Instant::now();
+        let fetched = fetch_full_metadata_for_policy(
+            client,
+            route_table,
+            canonical,
+            policy,
+            include_speculation,
+        )
+        .await?;
+        timings.policy_full_metadata_ms = policy_start.elapsed().as_millis();
+        timings.total_ms = total_start.elapsed().as_millis();
+        return Ok((fetched, timings));
+    }
+    if info.needs_release_time_metadata(canonical, policy) {
+        let policy_start = Instant::now();
+        fetch_release_times_for_policy(client, route_table, canonical, &mut info).await?;
+        timings.policy_release_time_ms = policy_start.elapsed().as_millis();
+    }
+    let fetched = fetched_metadata_from_info(dist_tags, info, include_speculation);
+    timings.total_ms = total_start.elapsed().as_millis();
+    Ok((fetched, timings))
 }
 
 pub(super) fn parse_fetched_metadata(
@@ -344,6 +403,76 @@ async fn fetch_metadata_raw(
                         .get_npm_metadata_from(&target.base_url, name, auth.as_ref())
                         .await
                 }
+            }
+            .map_err(|e| ResolveError::DependencyFetch {
+                package: canonical.to_string(),
+                version: "*".to_string(),
+                detail: e.to_string(),
+            })
+        }
+    }
+}
+
+struct RawMetadataWithTimings {
+    metadata: lpm_registry::PackageMetadata,
+    route: &'static str,
+    registry_timings: Option<lpm_registry::PackageMetadataFetchTimings>,
+}
+
+async fn fetch_metadata_raw_with_timings(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+) -> Result<RawMetadataWithTimings, ResolveError> {
+    match canonical {
+        CanonicalKey::Root => Err(ResolveError::Internal(
+            "fetch_metadata_raw called for root".to_string(),
+        )),
+        CanonicalKey::Lpm { owner, name } => {
+            let pkg_name = lpm_common::PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))
+                .map_err(|e| ResolveError::Internal(e.to_string()))?;
+            client
+                .get_package_metadata(&pkg_name)
+                .await
+                .map(|metadata| RawMetadataWithTimings {
+                    metadata,
+                    route: "lpm",
+                    registry_timings: None,
+                })
+                .map_err(|e| ResolveError::DependencyFetch {
+                    package: canonical.to_string(),
+                    version: "*".to_string(),
+                    detail: e.to_string(),
+                })
+        }
+        CanonicalKey::Npm { name } => {
+            let route = route_table.route_for_package(name);
+            match route {
+                UpstreamRoute::NpmDirect => client
+                    .get_npm_metadata_direct_with_timings(name)
+                    .await
+                    .map(|timed| RawMetadataWithTimings {
+                        metadata: timed.metadata,
+                        route: "npm_direct",
+                        registry_timings: Some(timed.timings),
+                    }),
+                UpstreamRoute::LpmWorker => {
+                    client.get_npm_package_metadata(name).await.map(|metadata| {
+                        RawMetadataWithTimings {
+                            metadata,
+                            route: "lpm_worker",
+                            registry_timings: None,
+                        }
+                    })
+                }
+                UpstreamRoute::Custom { target, auth } => client
+                    .get_npm_metadata_from(&target.base_url, name, auth.as_ref())
+                    .await
+                    .map(|metadata| RawMetadataWithTimings {
+                        metadata,
+                        route: "custom",
+                        registry_timings: None,
+                    }),
             }
             .map_err(|e| ResolveError::DependencyFetch {
                 package: canonical.to_string(),

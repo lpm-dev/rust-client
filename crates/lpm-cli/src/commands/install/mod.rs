@@ -27,6 +27,7 @@ use tokio::sync::Semaphore;
 mod catalog;
 mod fetch;
 mod gitignore;
+mod installer_spike;
 mod lifecycle;
 mod linking;
 mod lockfile;
@@ -2284,6 +2285,30 @@ async fn run_with_options_under_store_lock(
         }
         migrate_v1_to_v2(project_dir)
             .map_err(|e| LpmError::Registry(format!("v1→v2 migration failed: {e}")))?;
+    }
+
+    if installer_spike::enabled() {
+        return installer_spike::run(
+            arc_client.clone(),
+            project_dir,
+            &deps,
+            &pkg,
+            route_table.clone(),
+            json_output,
+            start,
+            linker_mode,
+            force,
+            lpm_root,
+            store_v2_handle.clone(),
+            compatibility_bin_names,
+            override_set.clone(),
+            resolver_policy.clone(),
+            auto_install_peers,
+            !omit_policy.optional,
+            &all_workspace_members,
+            &catalog_resolutions,
+        )
+        .await;
     }
 
     // pre-resolve direct

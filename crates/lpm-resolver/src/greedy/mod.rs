@@ -72,12 +72,165 @@ mod tree_policy;
 mod types;
 mod version;
 
+use std::sync::Arc;
+
+use lpm_registry::{RegistryClient, RouteTable};
+
+use crate::npm_version::NpmVersion;
+use crate::overrides::{OverrideHit, OverrideSet};
+use crate::package::CanonicalKey;
+use crate::policy::ResolverPolicy;
+use crate::provider::CachedPackageInfo;
+use crate::ranges::NpmRange;
+use crate::resolve::ResolveError;
+
 pub use entry::resolve_greedy_with_options_and_policy;
 pub use fused::{
     resolve_greedy_fused, resolve_greedy_fused_with_cache, resolve_greedy_fused_with_cache_options,
     resolve_greedy_fused_with_cache_options_and_policy,
 };
 pub use types::PeerConflictReport;
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExperimentalVersionSelection {
+    Picked(NpmVersion),
+    NoSatisfying,
+    BlockedByReleaseAge {
+        version: NpmVersion,
+        remaining_secs: u64,
+        minimum_secs: u64,
+    },
+    BlockedByTrustPolicy {
+        version: NpmVersion,
+        reason: String,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct ExperimentalMetadataFetchTimings {
+    pub package: String,
+    pub route: &'static str,
+    pub total_ms: u128,
+    pub raw_fetch_ms: u128,
+    pub cache_read_ms: u128,
+    pub validator_read_ms: u128,
+    pub http_ms: u128,
+    pub body_read_ms: u128,
+    pub json_decode_ms: u128,
+    pub cache_after_304_ms: u128,
+    pub cache_write_dispatch_ms: u128,
+    pub cache_info_parse_ms: u128,
+    pub policy_release_time_ms: u128,
+    pub policy_full_metadata_ms: u128,
+    pub body_bytes: u64,
+    pub version_count: u64,
+    pub cache_hit: bool,
+    pub not_modified: bool,
+}
+
+impl From<version::VersionPick> for ExperimentalVersionSelection {
+    fn from(value: version::VersionPick) -> Self {
+        match value {
+            version::VersionPick::Picked(version) => Self::Picked(version),
+            version::VersionPick::NoSatisfying => Self::NoSatisfying,
+            version::VersionPick::BlockedByReleaseAge {
+                version,
+                remaining_secs,
+                minimum_secs,
+            } => Self::BlockedByReleaseAge {
+                version,
+                remaining_secs,
+                minimum_secs,
+            },
+            version::VersionPick::BlockedByTrustPolicy { version, reason } => {
+                Self::BlockedByTrustPolicy { version, reason }
+            }
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn experimental_select_version_with_policy(
+    canonical: &CanonicalKey,
+    info: &CachedPackageInfo,
+    range: &NpmRange,
+    policy: &ResolverPolicy,
+) -> ExperimentalVersionSelection {
+    version::find_best_version_with_policy(canonical, info, range, policy).into()
+}
+
+#[doc(hidden)]
+pub fn experimental_select_version_with_policy_and_overrides(
+    canonical: &CanonicalKey,
+    info: &CachedPackageInfo,
+    range: &NpmRange,
+    policy: &ResolverPolicy,
+    overrides: &OverrideSet,
+    parent_canonical: Option<&str>,
+) -> (ExperimentalVersionSelection, Option<OverrideHit>) {
+    let natural_pick = version::find_best_version_with_policy(canonical, info, range, policy);
+    if overrides.is_empty() {
+        return (natural_pick.into(), None);
+    }
+
+    let natural = match &natural_pick {
+        version::VersionPick::Picked(version) => version.clone(),
+        version::VersionPick::NoSatisfying
+        | version::VersionPick::BlockedByReleaseAge { .. }
+        | version::VersionPick::BlockedByTrustPolicy { .. } => return (natural_pick.into(), None),
+    };
+
+    let canonical_name = canonical.to_string();
+    let Some(entry) = overrides.find_match(&canonical_name, &natural, parent_canonical) else {
+        return (ExperimentalVersionSelection::Picked(natural), None);
+    };
+    let Some(forced) =
+        policy::apply_override_target_greedy(canonical, info, &entry.target, range, policy)
+    else {
+        return (ExperimentalVersionSelection::Picked(natural), None);
+    };
+    let hit = OverrideHit {
+        raw_key: entry.raw_key.clone(),
+        source: entry.source,
+        package: canonical_name,
+        from_version: natural.to_string(),
+        to_version: forced.to_string(),
+        via_parent: parent_canonical.map(str::to_string),
+    };
+    (ExperimentalVersionSelection::Picked(forced), Some(hit))
+}
+
+#[doc(hidden)]
+pub async fn experimental_fetch_cached_package_info_with_policy(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+) -> Result<Arc<CachedPackageInfo>, ResolveError> {
+    manifest::fetch_metadata_for_resolver(client, route_table, canonical, policy, false)
+        .await
+        .map(|fetched| fetched.info)
+}
+
+#[doc(hidden)]
+pub async fn experimental_fetch_cached_package_info_with_policy_and_timings(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+) -> Result<(Arc<CachedPackageInfo>, ExperimentalMetadataFetchTimings), ResolveError> {
+    manifest::fetch_metadata_for_resolver_with_timings(
+        client,
+        route_table,
+        canonical,
+        policy,
+        false,
+    )
+    .await
+    .map(|(fetched, timings)| (fetched.info, timings))
+}
 
 mod prelude {
     pub(super) use crate::npm_version::NpmVersion;

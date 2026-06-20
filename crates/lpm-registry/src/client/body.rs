@@ -85,6 +85,46 @@ pub(super) async fn parse_capped_metadata<T: serde::de::DeserializeOwned + Send 
         .map_err(|e| LpmError::Registry(format!("{context}: JSON parse task failed: {e}")))?
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct MetadataBodyTimings {
+    pub(super) body_read_ms: u128,
+    pub(super) json_parse_ms: u128,
+    pub(super) body_bytes: u64,
+}
+
+pub(super) async fn parse_capped_metadata_with_timing<
+    T: serde::de::DeserializeOwned + Send + 'static,
+>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<(T, MetadataBodyTimings), LpmError> {
+    let body_start = std::time::Instant::now();
+    let buf = read_capped_body(response, MAX_METADATA_BYTES, context).await?;
+    let mut timings = MetadataBodyTimings {
+        body_read_ms: body_start.elapsed().as_millis(),
+        body_bytes: buf.len() as u64,
+        ..MetadataBodyTimings::default()
+    };
+
+    if buf.len() < BLOCKING_METADATA_PARSE_THRESHOLD {
+        let parse_start = std::time::Instant::now();
+        let parsed = parse_metadata_buffer(&buf, context)?;
+        timings.json_parse_ms = parse_start.elapsed().as_millis();
+        return Ok((parsed, timings));
+    }
+
+    let context_owned = context.to_string();
+    let (parsed, json_parse_ms) = tokio::task::spawn_blocking(move || {
+        let parse_start = std::time::Instant::now();
+        let parsed = parse_metadata_buffer(&buf, &context_owned);
+        (parsed, parse_start.elapsed().as_millis())
+    })
+    .await
+    .map_err(|e| LpmError::Registry(format!("{context}: JSON parse task failed: {e}")))?;
+    timings.json_parse_ms = json_parse_ms;
+    Ok((parsed?, timings))
+}
+
 fn parse_metadata_buffer<T: serde::de::DeserializeOwned>(
     buf: &[u8],
     context: &str,
