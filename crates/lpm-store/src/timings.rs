@@ -21,6 +21,10 @@ pub struct StageTimings {
     /// Time in integrity write + atomic rename + any remaining store
     /// bookkeeping before the package becomes visible.
     pub finalize_ms: u128,
+    /// Time spent waiting for a v2 finalize permit before the actual
+    /// finalization work starts. Zero unless the v2 finalize limiter is
+    /// enabled by environment.
+    pub finalize_permit_wait_ms: u128,
     /// Time spent computing and writing the v2 object tree integrity
     /// sidecars. Zero for store implementations that do not have an
     /// object-tree sidecar.

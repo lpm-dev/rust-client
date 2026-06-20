@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use lpm_common::integrity::{HashAlgorithm, Integrity};
 use lpm_common::{LpmError, LpmRoot, write_file_atomic};
@@ -112,6 +112,84 @@ const OBJECT_TREE_INTEGRITY_FILENAME: &str = ".lpm-object-integrity";
 const TREE_SNAPSHOT_FILENAME: &str = ".lpm-tree-snapshot.json";
 const TREE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const TREE_SNAPSHOT_MAX_BYTES: u64 = 4096;
+const ENV_V2_FINALIZE_PERMITS: &str = "LPM_V2_FINALIZE_PERMITS";
+
+static V2_FINALIZE_LIMITER: OnceLock<Option<Arc<FinalizePermitLimiter>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct FinalizePermitLimiter {
+    state: Mutex<FinalizePermitState>,
+    available: Condvar,
+}
+
+#[derive(Debug)]
+struct FinalizePermitState {
+    available: usize,
+}
+
+impl FinalizePermitLimiter {
+    fn new(permits: usize) -> Self {
+        debug_assert!(permits > 0);
+        Self {
+            state: Mutex::new(FinalizePermitState { available: permits }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> FinalizePermitGuard<'_> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.available == 0 {
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.available -= 1;
+        FinalizePermitGuard { limiter: self }
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.available += 1;
+        self.available.notify_one();
+    }
+}
+
+struct FinalizePermitGuard<'a> {
+    limiter: &'a FinalizePermitLimiter,
+}
+
+impl Drop for FinalizePermitGuard<'_> {
+    fn drop(&mut self) {
+        self.limiter.release();
+    }
+}
+
+fn parse_v2_finalize_permits(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok().filter(|&n| n > 0)
+}
+
+fn configured_v2_finalize_permits() -> Option<usize> {
+    std::env::var(ENV_V2_FINALIZE_PERMITS)
+        .ok()
+        .and_then(|value| parse_v2_finalize_permits(&value))
+}
+
+fn v2_finalize_limiter() -> Option<&'static FinalizePermitLimiter> {
+    V2_FINALIZE_LIMITER
+        .get_or_init(|| {
+            configured_v2_finalize_permits()
+                .map(FinalizePermitLimiter::new)
+                .map(Arc::new)
+        })
+        .as_deref()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TreeSnapshot {
@@ -642,6 +720,10 @@ impl Store {
             );
         }
         timings.security_ms = security_start.elapsed().as_millis();
+
+        let finalize_permit_wait_start = std::time::Instant::now();
+        let _finalize_permit = v2_finalize_limiter().map(|limiter| limiter.acquire());
+        timings.finalize_permit_wait_ms = finalize_permit_wait_start.elapsed().as_millis();
 
         // Persist the SRI alongside the object bytes for
         // post-extraction integrity verification — same `.integrity`
@@ -2810,6 +2892,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_v2_finalize_permits_accepts_only_positive_integers() {
+        assert_eq!(parse_v2_finalize_permits("4"), Some(4));
+        assert_eq!(parse_v2_finalize_permits(" 2 "), Some(2));
+        assert_eq!(parse_v2_finalize_permits("0"), None);
+        assert_eq!(parse_v2_finalize_permits(""), None);
+        assert_eq!(parse_v2_finalize_permits("nope"), None);
+    }
+
+    #[test]
+    fn finalize_permit_limiter_blocks_until_guard_drops() {
+        let limiter = Arc::new(FinalizePermitLimiter::new(1));
+        let first_guard = limiter.acquire();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let worker_limiter = Arc::clone(&limiter);
+
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let _second_guard = worker_limiter.acquire();
+            acquired_tx.send(()).unwrap();
+        });
+
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            acquired_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(first_guard);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn compat_island_key_changes_when_entry_content_changes() {
         let dir_name = "local-tool@1.0.0+abcdef1234567890";
         let source_sri = synthetic_sri(b"stable-local-source-identity");
@@ -4176,6 +4296,7 @@ mod tests {
         assert_eq!(timings_hot.extract_ms, 0);
         assert_eq!(timings_hot.security_ms, 0);
         assert_eq!(timings_hot.finalize_ms, 0);
+        assert_eq!(timings_hot.finalize_permit_wait_ms, 0);
         assert_eq!(timings_hot.finalize_tree_integrity_ms, 0);
         assert_eq!(timings_hot.finalize_integrity_write_ms, 0);
         assert_eq!(timings_hot.finalize_rename_ms, 0);
