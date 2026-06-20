@@ -42,6 +42,52 @@ pub(super) struct TaskTimings {
     /// Time in `.integrity` write + atomic rename into the store path.
     /// Mirrors [`lpm_store::StageTimings::finalize_ms`].
     pub(super) finalize_ms: u128,
+    pub(super) finalize_tree_integrity_ms: u128,
+    pub(super) finalize_integrity_write_ms: u128,
+    pub(super) finalize_rename_ms: u128,
+    pub(super) finalize_collision_recovery_ms: u128,
+    pub(super) file_count: u64,
+    pub(super) dir_count: u64,
+    pub(super) symlink_count: u64,
+    pub(super) unpacked_bytes: u64,
+}
+
+impl TaskTimings {
+    pub(super) fn from_stage(
+        queue_wait_ms: u128,
+        url_lookup_ms: u128,
+        download_ms: u128,
+        integrity_ms: u128,
+        stage: lpm_store::StageTimings,
+    ) -> Self {
+        Self {
+            queue_wait_ms,
+            url_lookup_ms,
+            download_ms,
+            integrity_ms,
+            extract_ms: stage.extract_ms,
+            security_ms: stage.security_ms,
+            finalize_ms: stage.finalize_ms,
+            finalize_tree_integrity_ms: stage.finalize_tree_integrity_ms,
+            finalize_integrity_write_ms: stage.finalize_integrity_write_ms,
+            finalize_rename_ms: stage.finalize_rename_ms,
+            finalize_collision_recovery_ms: stage.finalize_collision_recovery_ms,
+            file_count: stage.file_count,
+            dir_count: stage.dir_count,
+            symlink_count: stage.symlink_count,
+            unpacked_bytes: stage.unpacked_bytes,
+        }
+    }
+
+    pub(super) fn total_ms(self) -> u128 {
+        self.queue_wait_ms
+            .saturating_add(self.url_lookup_ms)
+            .saturating_add(self.download_ms)
+            .saturating_add(self.integrity_ms)
+            .saturating_add(self.extract_ms)
+            .saturating_add(self.security_ms)
+            .saturating_add(self.finalize_ms)
+    }
 }
 
 /// Aggregate fetch-stage breakdown across the entire parallel download pool.
@@ -281,14 +327,7 @@ impl FetchBreakdown {
     /// Fold one task's timings into the running aggregate.
     pub(super) fn record(&mut self, t: TaskTimings) {
         self.task_count += 1;
-        let task_ms = t
-            .queue_wait_ms
-            .saturating_add(t.url_lookup_ms)
-            .saturating_add(t.download_ms)
-            .saturating_add(t.integrity_ms)
-            .saturating_add(t.extract_ms)
-            .saturating_add(t.security_ms)
-            .saturating_add(t.finalize_ms);
+        let task_ms = t.total_ms();
         self.task_sum_ms = self.task_sum_ms.saturating_add(task_ms);
         self.task_max_ms = self.task_max_ms.max(task_ms);
         self.queue_wait_sum_ms += t.queue_wait_ms;
@@ -617,6 +656,10 @@ pub(super) struct SlowPackageTimings {
     extract: Vec<PackageTiming>,
     security: Vec<PackageTiming>,
     finalize: Vec<PackageTiming>,
+    fetch_tasks_by_total: Vec<FetchTaskTiming>,
+    fetch_tasks_by_extract: Vec<FetchTaskTiming>,
+    fetch_tasks_by_security: Vec<FetchTaskTiming>,
+    fetch_tasks_by_finalize: Vec<FetchTaskTiming>,
     link_v2_one: Vec<PackageTiming>,
 }
 
@@ -626,12 +669,36 @@ struct PackageTiming {
     ms: u128,
 }
 
+#[derive(Debug, Clone)]
+struct FetchTaskTiming {
+    package: String,
+    timings: TaskTimings,
+    task_total_ms: u128,
+}
+
 impl SlowPackageTimings {
     pub(super) fn record_fetch(&mut self, package: &str, timings: TaskTimings) {
         Self::record(&mut self.tarball_http, package, timings.download_ms);
         Self::record(&mut self.extract, package, timings.extract_ms);
         Self::record(&mut self.security, package, timings.security_ms);
         Self::record(&mut self.finalize, package, timings.finalize_ms);
+        let row = FetchTaskTiming {
+            package: package.to_string(),
+            timings,
+            task_total_ms: timings.total_ms(),
+        };
+        Self::record_fetch_task(&mut self.fetch_tasks_by_total, &row, |entry| {
+            entry.task_total_ms
+        });
+        Self::record_fetch_task(&mut self.fetch_tasks_by_extract, &row, |entry| {
+            entry.timings.extract_ms
+        });
+        Self::record_fetch_task(&mut self.fetch_tasks_by_security, &row, |entry| {
+            entry.timings.security_ms
+        });
+        Self::record_fetch_task(&mut self.fetch_tasks_by_finalize, &row, |entry| {
+            entry.timings.finalize_ms
+        });
     }
 
     pub(super) fn record_link_v2_one(&mut self, package: &str, ms: u128) {
@@ -650,12 +717,35 @@ impl SlowPackageTimings {
         bucket.truncate(10);
     }
 
+    fn record_fetch_task(
+        bucket: &mut Vec<FetchTaskTiming>,
+        row: &FetchTaskTiming,
+        rank_ms: impl Fn(&FetchTaskTiming) -> u128 + Copy,
+    ) {
+        if rank_ms(row) == 0 {
+            return;
+        }
+        bucket.push(row.clone());
+        bucket.sort_unstable_by(|a, b| {
+            rank_ms(b)
+                .cmp(&rank_ms(a))
+                .then_with(|| a.package.cmp(&b.package))
+        });
+        bucket.truncate(10);
+    }
+
     pub(super) fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "tarball_http": Self::bucket_json(&self.tarball_http),
             "extract": Self::bucket_json(&self.extract),
             "security": Self::bucket_json(&self.security),
             "finalize": Self::bucket_json(&self.finalize),
+            "fetch_tasks": {
+                "by_total": Self::fetch_task_bucket_json(&self.fetch_tasks_by_total),
+                "by_extract": Self::fetch_task_bucket_json(&self.fetch_tasks_by_extract),
+                "by_security": Self::fetch_task_bucket_json(&self.fetch_tasks_by_security),
+                "by_finalize": Self::fetch_task_bucket_json(&self.fetch_tasks_by_finalize),
+            },
             "link_v2_one": Self::bucket_json(&self.link_v2_one),
         })
     }
@@ -668,6 +758,36 @@ impl SlowPackageTimings {
                     serde_json::json!({
                         "package": entry.package,
                         "ms": entry.ms,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn fetch_task_bucket_json(bucket: &[FetchTaskTiming]) -> serde_json::Value {
+        serde_json::Value::Array(
+            bucket
+                .iter()
+                .map(|entry| {
+                    let timings = entry.timings;
+                    serde_json::json!({
+                        "package": entry.package,
+                        "task_total_ms": entry.task_total_ms,
+                        "queue_wait_ms": timings.queue_wait_ms,
+                        "url_lookup_ms": timings.url_lookup_ms,
+                        "download_ms": timings.download_ms,
+                        "integrity_ms": timings.integrity_ms,
+                        "extract_ms": timings.extract_ms,
+                        "security_ms": timings.security_ms,
+                        "finalize_ms": timings.finalize_ms,
+                        "finalize_tree_integrity_ms": timings.finalize_tree_integrity_ms,
+                        "finalize_integrity_write_ms": timings.finalize_integrity_write_ms,
+                        "finalize_rename_ms": timings.finalize_rename_ms,
+                        "finalize_collision_recovery_ms": timings.finalize_collision_recovery_ms,
+                        "file_count": timings.file_count,
+                        "dir_count": timings.dir_count,
+                        "symlink_count": timings.symlink_count,
+                        "unpacked_bytes": timings.unpacked_bytes,
                     })
                 })
                 .collect(),
@@ -907,6 +1027,7 @@ mod tests {
             extract_ms: 5,
             security_ms: 6,
             finalize_ms: 7,
+            ..TaskTimings::default()
         });
         breakdown.record(TaskTimings {
             queue_wait_ms: 2,
@@ -920,6 +1041,53 @@ mod tests {
         assert_eq!(json["task_count"], 2);
         assert_eq!(json["task_sum_ms"], 37);
         assert_eq!(json["task_max_ms"], 28);
+    }
+
+    #[test]
+    fn slow_package_trace_reports_fetch_task_attribution_rows() {
+        let mut slow_packages = SlowPackageTimings::default();
+
+        slow_packages.record_fetch(
+            "pkg@1.0.0",
+            TaskTimings {
+                queue_wait_ms: 1,
+                url_lookup_ms: 2,
+                download_ms: 3,
+                integrity_ms: 4,
+                extract_ms: 5,
+                security_ms: 6,
+                finalize_ms: 7,
+                finalize_tree_integrity_ms: 8,
+                finalize_integrity_write_ms: 9,
+                finalize_rename_ms: 10,
+                finalize_collision_recovery_ms: 11,
+                file_count: 12,
+                dir_count: 13,
+                symlink_count: 14,
+                unpacked_bytes: 15,
+            },
+        );
+
+        let json = slow_packages.to_json();
+        let row = &json["fetch_tasks"]["by_total"][0];
+
+        assert_eq!(row["package"], "pkg@1.0.0");
+        assert_eq!(row["task_total_ms"], 28);
+        assert_eq!(row["queue_wait_ms"], 1);
+        assert_eq!(row["url_lookup_ms"], 2);
+        assert_eq!(row["download_ms"], 3);
+        assert_eq!(row["integrity_ms"], 4);
+        assert_eq!(row["extract_ms"], 5);
+        assert_eq!(row["security_ms"], 6);
+        assert_eq!(row["finalize_ms"], 7);
+        assert_eq!(row["finalize_tree_integrity_ms"], 8);
+        assert_eq!(row["finalize_integrity_write_ms"], 9);
+        assert_eq!(row["finalize_rename_ms"], 10);
+        assert_eq!(row["finalize_collision_recovery_ms"], 11);
+        assert_eq!(row["file_count"], 12);
+        assert_eq!(row["dir_count"], 13);
+        assert_eq!(row["symlink_count"], 14);
+        assert_eq!(row["unpacked_bytes"], 15);
     }
 
     #[test]

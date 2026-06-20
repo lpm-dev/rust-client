@@ -375,11 +375,16 @@ impl PackageStore {
 
         // Finalize: write integrity, atomic rename.
         let finalize_start = std::time::Instant::now();
-        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), &computed_sri) {
+        let integrity_write_start = std::time::Instant::now();
+        let integrity_result = std::fs::write(tmp_dir.join(".integrity"), &computed_sri);
+        timings.finalize_integrity_write_ms = integrity_write_start.elapsed().as_millis();
+        if let Err(e) = integrity_result {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(LpmError::Store(format!("failed to write .integrity: {e}")));
         }
+        let rename_start = std::time::Instant::now();
         let rename_result = std::fs::rename(&tmp_dir, &dir);
+        timings.finalize_rename_ms = rename_start.elapsed().as_millis();
         timings.finalize_ms = finalize_start.elapsed().as_millis();
 
         match rename_result {
@@ -458,11 +463,12 @@ impl PackageStore {
         // order. Counted under `finalize_ms` because it's cheap
         // housekeeping, not a sub-stage we expect to optimize.
         let finalize_start = std::time::Instant::now();
-        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
+        let integrity_result = std::fs::write(tmp_dir.join(".integrity"), sri);
+        timings.finalize_integrity_write_ms = finalize_start.elapsed().as_millis();
+        if let Err(e) = integrity_result {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(LpmError::Store(format!("failed to write .integrity: {e}")));
         }
-        let integrity_write_ms = finalize_start.elapsed().as_millis();
 
         // Security analysis runs on the extracted tree before the
         // atomic rename so `.lpm-security.json` is visible atomically
@@ -485,7 +491,8 @@ impl PackageStore {
         // Finalize: atomic rename into the visible path.
         let rename_start = std::time::Instant::now();
         let rename_result = std::fs::rename(&tmp_dir, &dir);
-        timings.finalize_ms = integrity_write_ms + rename_start.elapsed().as_millis();
+        timings.finalize_rename_ms = rename_start.elapsed().as_millis();
+        timings.finalize_ms = timings.finalize_integrity_write_ms + timings.finalize_rename_ms;
 
         match rename_result {
             Ok(()) => Ok((dir, timings)),

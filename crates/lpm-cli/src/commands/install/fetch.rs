@@ -1051,15 +1051,13 @@ pub(super) async fn fetch_and_store_legacy(
 
     Ok((
         computed_sri,
-        TaskTimings {
+        TaskTimings::from_stage(
             queue_wait_ms,
             url_lookup_ms,
             download_ms,
             integrity_ms,
-            extract_ms: stage.extract_ms,
-            security_ms: stage.security_ms,
-            finalize_ms: stage.finalize_ms,
-        },
+            stage,
+        ),
         final_url,
     ))
 }
@@ -1122,40 +1120,31 @@ pub(super) async fn fetch_and_store_tarball_url(
     // download_ms because the verify is a single string compare.
     let integrity_ms = 0;
 
-    let extract_start = std::time::Instant::now();
-    let extract_ms = if let Some(store_v2) = store_v2 {
+    let stage = if let Some(store_v2) = store_v2 {
         // — v2 path. The Source::Tarball case
         // already has bytes + SRI in hand; route them straight into
         // `extract_object_from_bytes`. Re-verification through the
         // expected_integrity arg is a no-op (caller passes the same
         // SRI download_tarball_with_integrity already produced).
-        let (_obj_dir, _sri, timings) =
+        let (_obj_dir, _sri, stage) =
             store_v2.extract_object_from_bytes(&data, Some(&computed_sri))?;
-        // Tarball-URL path's telemetry historically lumps everything
-        // under extract_ms (see comment at the v1 timings construction
-        // below); under v2 we surface the v2 timings' total instead so
-        // the JSON shape stays meaningful.
-        timings.extract_ms + timings.security_ms + timings.finalize_ms
+        stage
     } else {
+        let extract_start = std::time::Instant::now();
         let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
-        extract_start.elapsed().as_millis()
+        lpm_store::StageTimings {
+            extract_ms: extract_start.elapsed().as_millis(),
+            ..Default::default()
+        }
     };
 
-    let timings = TaskTimings {
+    let timings = TaskTimings::from_stage(
         queue_wait_ms,
-        url_lookup_ms: 0, // No registry metadata round-trip.
+        0, // No registry metadata round-trip.
         download_ms,
         integrity_ms,
-        // store_tarball_at_cas_path bundles extract + security +
-        // finalize in one shared helper (store_at_dir). The legacy
-        // path can carve these apart via store_package_from_file_timed;
-        // this path doesn't have that breakdown today. Lump the
-        // total under extract_ms so the json output stays shape-
-        // compatible without misattributing security-scan time.
-        extract_ms,
-        security_ms: 0,
-        finalize_ms: 0,
-    };
+        stage,
+    );
 
     Ok((computed_sri, timings, url.to_string()))
 }
@@ -1369,15 +1358,7 @@ pub(super) async fn fetch_and_store_streaming(
 
     Ok((
         computed_sri,
-        TaskTimings {
-            queue_wait_ms,
-            url_lookup_ms,
-            download_ms,
-            integrity_ms: 0,
-            extract_ms: stage.extract_ms,
-            security_ms: stage.security_ms,
-            finalize_ms: stage.finalize_ms,
-        },
+        TaskTimings::from_stage(queue_wait_ms, url_lookup_ms, download_ms, 0, stage),
         final_url,
     ))
 }

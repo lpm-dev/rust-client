@@ -123,6 +123,15 @@ struct TreeSnapshot {
 struct TreeIntegrities {
     content: String,
     metadata: String,
+    stats: ObjectTreeStats,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ObjectTreeStats {
+    file_count: u64,
+    dir_count: u64,
+    symlink_count: u64,
+    unpacked_bytes: u64,
 }
 
 /// Pure path helper for the v2 store layout.
@@ -640,22 +649,43 @@ impl Store {
         // mixed-v1/v2 environments. Also load-bearing for
         // [`is_complete_object_dir`]'s incompleteness probe.
         let finalize_start = std::time::Instant::now();
-        if let Err(e) = write_object_tree_integrity(&tmp_dir) {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(e);
-        }
-        if let Err(e) = std::fs::write(tmp_dir.join(".integrity"), sri) {
+        let tree_integrity_start = std::time::Instant::now();
+        let integrities = match write_object_tree_integrity(&tmp_dir) {
+            Ok(integrities) => integrities,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(e);
+            }
+        };
+        timings.finalize_tree_integrity_ms = tree_integrity_start.elapsed().as_millis();
+        timings.file_count = integrities.stats.file_count;
+        timings.dir_count = integrities.stats.dir_count;
+        timings.symlink_count = integrities.stats.symlink_count;
+        timings.unpacked_bytes = integrities.stats.unpacked_bytes;
+
+        let integrity_write_start = std::time::Instant::now();
+        let integrity_result = std::fs::write(tmp_dir.join(".integrity"), sri);
+        timings.finalize_integrity_write_ms = integrity_write_start.elapsed().as_millis();
+        if let Err(e) = integrity_result {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(LpmError::Store(format!(
                 "failed to write v2 .integrity: {e}"
             )));
         }
 
-        let result = std::fs::rename(&tmp_dir, &object_dir)
-            .map(|()| object_dir.clone())
-            .or_else(|e| {
-                finish_object_rename_after_collision(&tmp_dir, &object_dir, "v2 extract", e)
-            });
+        let rename_start = std::time::Instant::now();
+        let rename_result = std::fs::rename(&tmp_dir, &object_dir);
+        timings.finalize_rename_ms = rename_start.elapsed().as_millis();
+        let result = match rename_result {
+            Ok(()) => Ok(object_dir),
+            Err(e) => {
+                let collision_start = std::time::Instant::now();
+                let result =
+                    finish_object_rename_after_collision(&tmp_dir, &object_dir, "v2 extract", e);
+                timings.finalize_collision_recovery_ms = collision_start.elapsed().as_millis();
+                result
+            }
+        };
         timings.finalize_ms = finalize_start.elapsed().as_millis();
 
         result.map(|dir| (dir, timings))
@@ -1326,6 +1356,7 @@ fn populate_into(
         &TreeIntegrities {
             content: object_integrity,
             metadata: package_metadata_integrity,
+            stats: ObjectTreeStats::default(),
         },
     )?;
 
@@ -1922,14 +1953,15 @@ fn read_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
     Ok(digest.to_string())
 }
 
-fn write_object_tree_integrity(dir: &Path) -> Result<(), LpmError> {
+fn write_object_tree_integrity(dir: &Path) -> Result<TreeIntegrities, LpmError> {
     let integrities = compute_object_tree_integrities(dir)?;
     std::fs::write(
         dir.join(OBJECT_TREE_INTEGRITY_FILENAME),
         format!("{}\n", integrities.content),
     )
     .map_err(|e| LpmError::Store(format!("failed to write v2 object integrity sidecar: {e}")))?;
-    write_tree_snapshot(dir, &integrities)
+    write_tree_snapshot(dir, &integrities)?;
+    Ok(integrities)
 }
 
 fn compute_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
@@ -1939,16 +1971,24 @@ fn compute_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
 fn compute_object_tree_integrities(dir: &Path) -> Result<TreeIntegrities, LpmError> {
     let mut content_hasher = Sha256::new();
     let mut metadata_hasher = Sha256::new();
-    hash_object_tree_dir(dir, dir, Some(&mut content_hasher), &mut metadata_hasher)?;
+    let mut stats = ObjectTreeStats::default();
+    hash_object_tree_dir(
+        dir,
+        dir,
+        Some(&mut content_hasher),
+        &mut metadata_hasher,
+        Some(&mut stats),
+    )?;
     Ok(TreeIntegrities {
         content: format!("sha256-{}", hex::encode(content_hasher.finalize())),
         metadata: format!("sha256-{}", hex::encode(metadata_hasher.finalize())),
+        stats,
     })
 }
 
 fn compute_tree_metadata_integrity(dir: &Path) -> Result<String, LpmError> {
     let mut hasher = Sha256::new();
-    hash_object_tree_dir(dir, dir, None, &mut hasher)?;
+    hash_object_tree_dir(dir, dir, None, &mut hasher, None)?;
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
@@ -1957,9 +1997,17 @@ fn hash_object_tree_dir(
     dir: &Path,
     content_hasher: Option<&mut Sha256>,
     metadata_hasher: &mut Sha256,
+    stats: Option<&mut ObjectTreeStats>,
 ) -> Result<(), LpmError> {
     let mut relative = Vec::new();
-    hash_object_tree_dir_inner(root, dir, &mut relative, content_hasher, metadata_hasher)
+    hash_object_tree_dir_inner(
+        root,
+        dir,
+        &mut relative,
+        content_hasher,
+        metadata_hasher,
+        stats,
+    )
 }
 
 fn hash_object_tree_dir_inner(
@@ -1968,6 +2016,7 @@ fn hash_object_tree_dir_inner(
     relative: &mut Vec<u8>,
     mut content_hasher: Option<&mut Sha256>,
     metadata_hasher: &mut Sha256,
+    mut stats: Option<&mut ObjectTreeStats>,
 ) -> Result<(), LpmError> {
     let mut entries = Vec::new();
     // Unix DirEntry values keep the directory handle alive; store owned names
@@ -2010,6 +2059,9 @@ fn hash_object_tree_dir_inner(
         let file_type = metadata.file_type();
         let mut path_pushed = false;
         let result = if file_type.is_dir() {
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.dir_count = stats.dir_count.saturating_add(1);
+            }
             path.push(&entry_name);
             path_pushed = true;
             let mode = object_entry_mode(&metadata).to_le_bytes();
@@ -2023,8 +2075,13 @@ fn hash_object_tree_dir_inner(
                 relative,
                 content_hasher.as_deref_mut(),
                 metadata_hasher,
+                stats.as_deref_mut(),
             )
         } else if file_type.is_file() {
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.file_count = stats.file_count.saturating_add(1);
+                stats.unpacked_bytes = stats.unpacked_bytes.saturating_add(metadata.len());
+            }
             hash_tree_metadata_record(
                 metadata_hasher,
                 b"file",
@@ -2039,6 +2096,9 @@ fn hash_object_tree_dir_inner(
             }
             Ok(())
         } else if file_type.is_symlink() {
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.symlink_count = stats.symlink_count.saturating_add(1);
+            }
             path.push(&entry_name);
             path_pushed = true;
             let target = std::fs::read_link(&path).map_err(|e| {
@@ -4066,6 +4126,26 @@ mod tests {
     }
 
     #[test]
+    fn extract_object_from_bytes_reports_tree_stats_on_cold_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let package_json = b"{\"name\":\"x\",\"version\":\"1.0.0\"}";
+        let index_js = b"module.exports = 1;\n";
+        let tarball =
+            build_test_tarball(&[("package.json", package_json), ("lib/index.js", index_js)]);
+
+        let (_, _, timings) = store.extract_object_from_bytes(&tarball, None).unwrap();
+
+        assert_eq!(timings.file_count, 2);
+        assert_eq!(timings.dir_count, 1);
+        assert_eq!(timings.symlink_count, 0);
+        assert_eq!(
+            timings.unpacked_bytes,
+            (package_json.len() + index_js.len()) as u64
+        );
+    }
+
+    #[test]
     fn extract_object_from_bytes_emits_zero_timings_on_hot_path() {
         // The contract worth testing: a re-extract of an already-
         // populated object hits the store-cache short-circuit and
@@ -4096,6 +4176,14 @@ mod tests {
         assert_eq!(timings_hot.extract_ms, 0);
         assert_eq!(timings_hot.security_ms, 0);
         assert_eq!(timings_hot.finalize_ms, 0);
+        assert_eq!(timings_hot.finalize_tree_integrity_ms, 0);
+        assert_eq!(timings_hot.finalize_integrity_write_ms, 0);
+        assert_eq!(timings_hot.finalize_rename_ms, 0);
+        assert_eq!(timings_hot.finalize_collision_recovery_ms, 0);
+        assert_eq!(timings_hot.file_count, 0);
+        assert_eq!(timings_hot.dir_count, 0);
+        assert_eq!(timings_hot.symlink_count, 0);
+        assert_eq!(timings_hot.unpacked_bytes, 0);
     }
 
     #[test]
