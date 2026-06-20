@@ -2324,6 +2324,10 @@ async fn run_with_options_under_store_lock(
         auto_build,
         script_policy_override,
         script_policy_is_default: installer_spike_script_policy_is_default,
+        has_trusted_dependencies: pkg
+            .lpm
+            .as_ref()
+            .is_some_and(|lpm| !lpm.trusted_dependencies.is_empty()),
         strict_release_age_replay: release_age_policy.is_strict() && effective_min_age_secs > 0,
         allow_new,
         is_add_invocation,

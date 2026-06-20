@@ -38,6 +38,7 @@ pub(super) struct InstallerSpikeAdmission {
     pub(super) auto_build: bool,
     pub(super) script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     pub(super) script_policy_is_default: bool,
+    pub(super) has_trusted_dependencies: bool,
     pub(super) strict_release_age_replay: bool,
     pub(super) allow_new: bool,
     pub(super) is_add_invocation: bool,
@@ -126,6 +127,7 @@ fn unsupported_admission_reasons(
     if admission.auto_build
         || admission.script_policy_override.is_some()
         || !admission.script_policy_is_default
+        || admission.has_trusted_dependencies
     {
         reasons.push("script policy/build execution options are not supported");
     }
@@ -2587,6 +2589,7 @@ mod tests {
             auto_build: false,
             script_policy_override: None,
             script_policy_is_default: true,
+            has_trusted_dependencies: false,
             strict_release_age_replay: false,
             allow_new: false,
             is_add_invocation: false,
@@ -2708,6 +2711,7 @@ mod tests {
         admission.verify_registry_signatures = true;
         admission.audit_after_install = true;
         admission.script_policy_is_default = false;
+        admission.has_trusted_dependencies = true;
         admission.strict_release_age_replay = true;
 
         let reasons = unsupported_admission_reasons(
