@@ -2731,6 +2731,24 @@ mod tests {
     }
 
     #[test]
+    fn admission_rejects_trusted_dependencies_without_other_script_policy_changes() {
+        let mut admission = benchmark_admission();
+        admission.has_trusted_dependencies = true;
+
+        let reasons = unsupported_admission_reasons(
+            admission,
+            InstallerSpikeGraphSource::Lockfile,
+            InstallerSpikeParityMode::Disabled,
+            true,
+        );
+
+        assert_eq!(
+            reasons,
+            vec!["script policy/build execution options are not supported"]
+        );
+    }
+
+    #[test]
     fn lockfile_fetch_schedule_prioritizes_direct_roots_then_fanout() {
         let mut direct = fake_package("direct-root", "1.0.0", &[]);
         direct.is_direct = true;
