@@ -37,6 +37,8 @@ pub(super) struct InstallerSpikeAdmission {
     pub(super) force_security_floor: bool,
     pub(super) auto_build: bool,
     pub(super) script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    pub(super) script_policy_is_default: bool,
+    pub(super) strict_release_age_replay: bool,
     pub(super) allow_new: bool,
     pub(super) is_add_invocation: bool,
     pub(super) has_direct_versions_out: bool,
@@ -57,6 +59,7 @@ pub(super) fn should_run(admission: InstallerSpikeAdmission) -> Result<bool, Lpm
     let reasons = unsupported_admission_reasons(
         admission,
         InstallerSpikeGraphSource::from_env(),
+        InstallerSpikeParityMode::from_env(),
         benchmark_only,
     );
     if reasons.is_empty() {
@@ -71,6 +74,7 @@ pub(super) fn should_run(admission: InstallerSpikeAdmission) -> Result<bool, Lpm
 fn unsupported_admission_reasons(
     admission: InstallerSpikeAdmission,
     graph_source: InstallerSpikeGraphSource,
+    parity_mode: InstallerSpikeParityMode,
     benchmark_only: bool,
 ) -> Vec<&'static str> {
     let mut reasons = Vec::new();
@@ -79,6 +83,9 @@ fn unsupported_admission_reasons(
     }
     if !graph_source.uses_lockfile() {
         reasons.push("set LPM_INSTALLER_SPIKE_GRAPH=lockfile");
+    }
+    if matches!(parity_mode, InstallerSpikeParityMode::FreshResolve { .. }) {
+        reasons.push("use lockfile parity or disable parity");
     }
     if !admission.frozen_lockfile_active {
         reasons.push("use a frozen lockfile install");
@@ -116,8 +123,14 @@ fn unsupported_admission_reasons(
     if admission.force_security_floor {
         reasons.push("force-security-floor is not supported");
     }
-    if admission.auto_build || admission.script_policy_override.is_some() {
+    if admission.auto_build
+        || admission.script_policy_override.is_some()
+        || !admission.script_policy_is_default
+    {
         reasons.push("script policy/build execution options are not supported");
+    }
+    if admission.strict_release_age_replay {
+        reasons.push("strict minimumReleaseAge lockfile replay is not supported");
     }
     if admission.allow_new {
         reasons.push("--allow-new is not supported");
@@ -2573,6 +2586,8 @@ mod tests {
             force_security_floor: false,
             auto_build: false,
             script_policy_override: None,
+            script_policy_is_default: true,
+            strict_release_age_replay: false,
             allow_new: false,
             is_add_invocation: false,
             has_direct_versions_out: false,
@@ -2659,6 +2674,7 @@ mod tests {
         let reasons = unsupported_admission_reasons(
             benchmark_admission(),
             InstallerSpikeGraphSource::Lockfile,
+            InstallerSpikeParityMode::Disabled,
             true,
         );
 
@@ -2673,11 +2689,13 @@ mod tests {
         let reasons = unsupported_admission_reasons(
             admission,
             InstallerSpikeGraphSource::ResolveWorklist,
+            InstallerSpikeParityMode::FreshResolve { deny: false },
             false,
         );
 
         assert!(reasons.contains(&"set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1"));
         assert!(reasons.contains(&"set LPM_INSTALLER_SPIKE_GRAPH=lockfile"));
+        assert!(reasons.contains(&"use lockfile parity or disable parity"));
         assert!(reasons.contains(&"use a frozen lockfile install"));
     }
 
@@ -2689,15 +2707,23 @@ mod tests {
         admission.has_patches = true;
         admission.verify_registry_signatures = true;
         admission.audit_after_install = true;
+        admission.script_policy_is_default = false;
+        admission.strict_release_age_replay = true;
 
-        let reasons =
-            unsupported_admission_reasons(admission, InstallerSpikeGraphSource::Lockfile, true);
+        let reasons = unsupported_admission_reasons(
+            admission,
+            InstallerSpikeGraphSource::Lockfile,
+            InstallerSpikeParityMode::Lockfile { deny: true },
+            true,
+        );
 
         assert!(reasons.contains(&"--prod/--omit=dev is not supported"));
         assert!(reasons.contains(&"workspace member links are not supported"));
         assert!(reasons.contains(&"patches are not supported"));
         assert!(reasons.contains(&"registry signature verification is not supported"));
         assert!(reasons.contains(&"audit-after-install is not supported"));
+        assert!(reasons.contains(&"script policy/build execution options are not supported"));
+        assert!(reasons.contains(&"strict minimumReleaseAge lockfile replay is not supported"));
     }
 
     #[test]

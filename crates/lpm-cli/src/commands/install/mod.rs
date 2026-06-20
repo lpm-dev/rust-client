@@ -2288,6 +2288,22 @@ async fn run_with_options_under_store_lock(
             .map_err(|e| LpmError::Registry(format!("v1→v2 migration failed: {e}")))?;
     }
 
+    let installer_spike_requested = installer_spike::enabled();
+    let installer_spike_script_policy_is_default = if installer_spike_requested {
+        let script_policy_cfg =
+            crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+        let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
+            project_dir,
+            script_policy_override,
+            &script_policy_cfg,
+            json_output,
+        )?;
+        script_policy_cfg == crate::script_policy_config::ScriptPolicyConfig::default()
+            && effective_policy == crate::script_policy_config::ScriptPolicy::Deny
+    } else {
+        true
+    };
+
     if installer_spike::should_run(installer_spike::InstallerSpikeAdmission {
         json_output,
         frozen_lockfile_active,
@@ -2307,6 +2323,8 @@ async fn run_with_options_under_store_lock(
         force_security_floor,
         auto_build,
         script_policy_override,
+        script_policy_is_default: installer_spike_script_policy_is_default,
+        strict_release_age_replay: release_age_policy.is_strict() && effective_min_age_secs > 0,
         allow_new,
         is_add_invocation,
         has_direct_versions_out: direct_versions_out.is_some(),
