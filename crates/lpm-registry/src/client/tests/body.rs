@@ -117,6 +117,31 @@ async fn parse_capped_metadata_accepts_utf8_bom_prefixed_response() {
     assert_eq!(parsed["name"], "bom-prefixed");
 }
 
+#[tokio::test]
+async fn parse_capped_metadata_with_timing_reports_body_size() {
+    use wiremock::matchers::{method, path as match_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = r#"{"name":"timed","versions":{}}"#;
+    Mock::given(method("GET"))
+        .and(match_path("/timed"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let response = reqwest::get(format!("{}/timed", server.uri()))
+        .await
+        .expect("connect");
+    let (parsed, timings): (serde_json::Value, _) =
+        parse_capped_metadata_with_timing(response, "timed-test")
+            .await
+            .expect("timed response must parse");
+
+    assert_eq!(parsed["name"], "timed");
+    assert_eq!(timings.body_bytes, body.len() as u64);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn parse_capped_metadata_parses_small_json_on_caller_thread() {
     use wiremock::matchers::{method, path as match_path};

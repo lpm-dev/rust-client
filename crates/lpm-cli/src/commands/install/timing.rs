@@ -32,6 +32,7 @@ pub(super) struct TaskTimings {
     /// non-trivial only when `integrity.algo` differs from sha512, in
     /// which case the tarball is re-read in 64 KB chunks.
     pub(super) integrity_ms: u128,
+    pub(super) extract_permit_wait_ms: u128,
     /// Time in `extract_tarball_from_file` (gzip decompress, tar walk,
     /// and write-to-staging). Mirrors [`lpm_store::StageTimings::extract_ms`].
     pub(super) extract_ms: u128,
@@ -59,6 +60,7 @@ impl TaskTimings {
         url_lookup_ms: u128,
         download_ms: u128,
         integrity_ms: u128,
+        extract_permit_wait_ms: u128,
         stage: lpm_store::StageTimings,
     ) -> Self {
         Self {
@@ -66,6 +68,7 @@ impl TaskTimings {
             url_lookup_ms,
             download_ms,
             integrity_ms,
+            extract_permit_wait_ms,
             extract_ms: stage.extract_ms,
             security_ms: stage.security_ms,
             finalize_ms: stage.finalize_ms,
@@ -86,6 +89,7 @@ impl TaskTimings {
             .saturating_add(self.url_lookup_ms)
             .saturating_add(self.download_ms)
             .saturating_add(self.integrity_ms)
+            .saturating_add(self.extract_permit_wait_ms)
             .saturating_add(self.extract_ms)
             .saturating_add(self.security_ms)
             .saturating_add(self.finalize_permit_wait_ms)
@@ -123,6 +127,8 @@ pub(super) struct FetchBreakdown {
     pub(super) download_max_ms: u128,
     pub(super) integrity_sum_ms: u128,
     pub(super) integrity_max_ms: u128,
+    pub(super) extract_permit_wait_sum_ms: u128,
+    pub(super) extract_permit_wait_max_ms: u128,
     pub(super) extract_sum_ms: u128,
     pub(super) extract_max_ms: u128,
     pub(super) security_sum_ms: u128,
@@ -343,6 +349,10 @@ impl FetchBreakdown {
         self.download_max_ms = self.download_max_ms.max(t.download_ms);
         self.integrity_sum_ms += t.integrity_ms;
         self.integrity_max_ms = self.integrity_max_ms.max(t.integrity_ms);
+        self.extract_permit_wait_sum_ms += t.extract_permit_wait_ms;
+        self.extract_permit_wait_max_ms = self
+            .extract_permit_wait_max_ms
+            .max(t.extract_permit_wait_ms);
         self.extract_sum_ms += t.extract_ms;
         self.extract_max_ms = self.extract_max_ms.max(t.extract_ms);
         self.security_sum_ms += t.security_ms;
@@ -365,6 +375,7 @@ impl FetchBreakdown {
             "url_lookup":  { "sum_ms": self.url_lookup_sum_ms,  "max_ms": self.url_lookup_max_ms  },
             "download":    { "sum_ms": self.download_sum_ms,    "max_ms": self.download_max_ms    },
             "integrity":   { "sum_ms": self.integrity_sum_ms,   "max_ms": self.integrity_max_ms   },
+            "extract_permit_wait": { "sum_ms": self.extract_permit_wait_sum_ms, "max_ms": self.extract_permit_wait_max_ms },
             "extract":     { "sum_ms": self.extract_sum_ms,     "max_ms": self.extract_max_ms     },
             "security":    { "sum_ms": self.security_sum_ms,    "max_ms": self.security_max_ms    },
             "finalize_permit_wait": { "sum_ms": self.finalize_permit_wait_sum_ms, "max_ms": self.finalize_permit_wait_max_ms },
@@ -787,6 +798,7 @@ impl SlowPackageTimings {
                         "url_lookup_ms": timings.url_lookup_ms,
                         "download_ms": timings.download_ms,
                         "integrity_ms": timings.integrity_ms,
+                        "extract_permit_wait_ms": timings.extract_permit_wait_ms,
                         "extract_ms": timings.extract_ms,
                         "security_ms": timings.security_ms,
                         "finalize_permit_wait_ms": timings.finalize_permit_wait_ms,
@@ -1035,6 +1047,7 @@ mod tests {
             url_lookup_ms: 2,
             download_ms: 3,
             integrity_ms: 4,
+            extract_permit_wait_ms: 9,
             extract_ms: 5,
             security_ms: 6,
             finalize_permit_wait_ms: 8,
@@ -1044,6 +1057,7 @@ mod tests {
         breakdown.record(TaskTimings {
             queue_wait_ms: 2,
             download_ms: 3,
+            extract_permit_wait_ms: 6,
             finalize_permit_wait_ms: 5,
             finalize_ms: 4,
             ..TaskTimings::default()
@@ -1052,8 +1066,10 @@ mod tests {
         let json = breakdown.to_json();
 
         assert_eq!(json["task_count"], 2);
-        assert_eq!(json["task_sum_ms"], 50);
-        assert_eq!(json["task_max_ms"], 36);
+        assert_eq!(json["task_sum_ms"], 65);
+        assert_eq!(json["task_max_ms"], 45);
+        assert_eq!(json["extract_permit_wait"]["sum_ms"], 15);
+        assert_eq!(json["extract_permit_wait"]["max_ms"], 9);
         assert_eq!(json["finalize_permit_wait"]["sum_ms"], 13);
         assert_eq!(json["finalize_permit_wait"]["max_ms"], 8);
     }
@@ -1069,6 +1085,7 @@ mod tests {
                 url_lookup_ms: 2,
                 download_ms: 3,
                 integrity_ms: 4,
+                extract_permit_wait_ms: 9,
                 extract_ms: 5,
                 security_ms: 6,
                 finalize_permit_wait_ms: 7,
@@ -1088,11 +1105,12 @@ mod tests {
         let row = &json["fetch_tasks"]["by_total"][0];
 
         assert_eq!(row["package"], "pkg@1.0.0");
-        assert_eq!(row["task_total_ms"], 36);
+        assert_eq!(row["task_total_ms"], 45);
         assert_eq!(row["queue_wait_ms"], 1);
         assert_eq!(row["url_lookup_ms"], 2);
         assert_eq!(row["download_ms"], 3);
         assert_eq!(row["integrity_ms"], 4);
+        assert_eq!(row["extract_permit_wait_ms"], 9);
         assert_eq!(row["extract_ms"], 5);
         assert_eq!(row["security_ms"], 6);
         assert_eq!(row["finalize_permit_wait_ms"], 7);

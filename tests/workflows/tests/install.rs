@@ -1782,6 +1782,120 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
 }
 
 #[tokio::test]
+async fn install_experimental_spike_replays_frozen_lockfile_and_emits_json() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"spike-lockfile-replay","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let lockfile_output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to create lockfile fixture");
+    assert!(
+        lockfile_output.status.success(),
+        "initial install must create a reusable lockfile\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&lockfile_output.stdout),
+        String::from_utf8_lossy(&lockfile_output.stderr)
+    );
+    assertions::assert_lockfile_exists(project.path());
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before frozen lockfile replay");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .env("LPM_INSTALLER_SPIKE_GRAPH", "lockfile")
+        .args([
+            "install",
+            "--json",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run experimental installer spike");
+
+    assert!(
+        output.status.success(),
+        "experimental lockfile replay should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("experimental install --json must emit valid JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(
+        envelope["experimental"],
+        serde_json::json!("installer-spike")
+    );
+    assert_eq!(
+        envelope["timing"]["experimental_installer_spike"]["graph_source"],
+        serde_json::json!("lockfile")
+    );
+    assert!(
+        project.file_exists("node_modules/ms/package.json"),
+        "experimental lockfile replay must install package contents"
+    );
+}
+
+#[tokio::test]
+async fn install_experimental_spike_rejects_unsupported_env_shape() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"spike-env-rejected","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run unsupported experimental installer spike");
+
+    assert!(
+        !output.status.success(),
+        "unsupported experimental shape must fail instead of falling back to normal install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.contains(
+            "experimental installer spike is limited to frozen lockfile benchmark installs"
+        ) && combined.contains("set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1")
+            && combined.contains("set LPM_INSTALLER_SPIKE_GRAPH=lockfile"),
+        "unsupported experimental shape must report the missing benchmark gates; got:\n{combined}"
+    );
+    assert!(
+        !project.file_exists("node_modules/ms/package.json"),
+        "unsupported experimental shape must not silently perform a normal install"
+    );
+}
+
+#[tokio::test]
 async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
     let mock = MockRegistry::start().await;
     mount_ms_2_1_3(&mock).await;

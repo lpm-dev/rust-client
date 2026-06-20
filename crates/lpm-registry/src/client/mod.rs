@@ -30,7 +30,10 @@ mod url_gate;
 
 pub use self::auth::AuthPosture;
 pub use self::body::parse_capped_api_json;
-pub use self::state::{DownloadedTarball, FanOutStats, HttpClients, RegistryClient};
+pub use self::state::{
+    DownloadedTarball, FanOutStats, HttpClients, PackageMetadataFetchTimings, RegistryClient,
+    TimedPackageMetadata,
+};
 pub use self::tarball::MAX_COMPRESSED_TARBALL_SIZE;
 pub use self::url_gate::{
     GateDecision, evaluate_cached_url, is_http_url, is_https_url, is_localhost_url,
@@ -38,7 +41,8 @@ pub use self::url_gate::{
 
 use self::auth::{apply_npmrc_auth, cert_pem_fingerprint, principal_fingerprint};
 use self::body::{
-    MAX_METADATA_BYTES, forbidden_error_from_body, parse_capped_metadata, read_capped_error_text,
+    MAX_METADATA_BYTES, forbidden_error_from_body, parse_capped_metadata,
+    parse_capped_metadata_with_timing, read_capped_error_text,
 };
 use self::http::{CONNECT_TIMEOUT, READ_TIMEOUT, build_per_origin_http_client};
 use self::state::{CacheContent, CacheValidator, CachedClient};

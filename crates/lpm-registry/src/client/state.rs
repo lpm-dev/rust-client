@@ -12,6 +12,26 @@ pub struct DownloadedTarball {
     pub compressed_size: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PackageMetadataFetchTimings {
+    pub cache_hit: bool,
+    pub not_modified: bool,
+    pub cache_read_ms: u128,
+    pub validator_read_ms: u128,
+    pub http_ms: u128,
+    pub body_read_ms: u128,
+    pub json_decode_ms: u128,
+    pub cache_after_304_ms: u128,
+    pub cache_write_dispatch_ms: u128,
+    pub body_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct TimedPackageMetadata {
+    pub metadata: PackageMetadata,
+    pub timings: PackageMetadataFetchTimings,
+}
+
 /// Magic-verified cache content: ETag + raw data bytes ready for deserialization.
 pub(super) struct CacheContent {
     #[cfg(test)]

@@ -1,6 +1,11 @@
 use super::*;
 
 pub(super) type FetchLock = Arc<AsyncMutex<()>>;
+pub(super) type FetchExtractLimiter = Option<Arc<tokio::sync::Semaphore>>;
+
+const ENV_FETCH_EXTRACT_PERMITS: &str = "LPM_FETCH_EXTRACT_PERMITS";
+const ENV_EXPERIMENTAL_INSTALLER_SPIKE: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE";
+const DEFAULT_EXPERIMENTAL_FETCH_EXTRACT_PERMITS: usize = 10;
 
 #[derive(Default)]
 pub(super) struct FetchCoordinator {
@@ -46,6 +51,85 @@ pub(super) fn max_concurrent_downloads() -> usize {
             ));
             DEFAULT_MAX_CONCURRENT_DOWNLOADS
         }
+    }
+}
+
+fn parse_fetch_extract_permits(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok().filter(|&n| n > 0)
+}
+
+fn configured_fetch_extract_permits(
+    explicit_permits: Option<&str>,
+    experimental_installer_spike: Option<&str>,
+) -> Option<usize> {
+    match explicit_permits {
+        Some(value) => parse_fetch_extract_permits(value),
+        None if experimental_installer_spike == Some("1") => {
+            Some(DEFAULT_EXPERIMENTAL_FETCH_EXTRACT_PERMITS)
+        }
+        None => None,
+    }
+}
+
+pub(super) fn configured_fetch_extract_limiter() -> FetchExtractLimiter {
+    let explicit_permits = std::env::var(ENV_FETCH_EXTRACT_PERMITS).ok();
+    let experimental_installer_spike = std::env::var(ENV_EXPERIMENTAL_INSTALLER_SPIKE).ok();
+    configured_fetch_extract_permits(
+        explicit_permits.as_deref(),
+        experimental_installer_spike.as_deref(),
+    )
+    .map(tokio::sync::Semaphore::new)
+    .map(Arc::new)
+}
+
+async fn acquire_fetch_extract_permit(
+    limiter: &FetchExtractLimiter,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, LpmError> {
+    match limiter {
+        Some(limiter) => Ok(Some(limiter.clone().acquire_owned().await.map_err(
+            |_| LpmError::Registry("fetch extract limiter closed unexpectedly".into()),
+        )?)),
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_fetch_extract_permits_accepts_only_positive_integers() {
+        assert_eq!(parse_fetch_extract_permits("4"), Some(4));
+        assert_eq!(parse_fetch_extract_permits(" 2 "), Some(2));
+        assert_eq!(parse_fetch_extract_permits("0"), None);
+        assert_eq!(parse_fetch_extract_permits(""), None);
+        assert_eq!(parse_fetch_extract_permits("nope"), None);
+    }
+
+    #[test]
+    fn fetch_extract_permits_stay_unbounded_when_unset_without_experimental_installer() {
+        assert_eq!(configured_fetch_extract_permits(None, None), None);
+    }
+
+    #[test]
+    fn fetch_extract_permits_default_to_measured_value_for_experimental_installer() {
+        assert_eq!(
+            configured_fetch_extract_permits(None, Some("1")),
+            Some(DEFAULT_EXPERIMENTAL_FETCH_EXTRACT_PERMITS)
+        );
+    }
+
+    #[test]
+    fn fetch_extract_permits_explicit_value_overrides_experimental_default() {
+        assert_eq!(
+            configured_fetch_extract_permits(Some("8"), Some("1")),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn fetch_extract_permits_invalid_explicit_value_keeps_existing_unbounded_escape_hatch() {
+        assert_eq!(configured_fetch_extract_permits(Some("0"), Some("1")), None);
     }
 }
 
@@ -267,6 +351,7 @@ pub(super) fn spawn_speculation_dispatcher(
     // for callers running with the env var unset (and for the migration-
     // window code paths that still write v1 alongside).
     store_v2: Option<Arc<lpm_store::v2::Store>>,
+    fetch_extract_limiter: FetchExtractLimiter,
 ) -> (tokio::task::JoinHandle<()>, DispatcherCounters) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -279,6 +364,7 @@ pub(super) fn spawn_speculation_dispatcher(
     let coord_spec = coord;
     let spec_tracker_spec = spec_tracker;
     let store_v2_spec = store_v2;
+    let fetch_extract_limiter_spec = fetch_extract_limiter;
 
     let dispatched = Arc::new(AtomicU64::new(0));
     let completed = Arc::new(AtomicU64::new(0));
@@ -431,6 +517,7 @@ pub(super) fn spawn_speculation_dispatcher(
                 let skipped_no_permit_task = skipped_no_permit_c.clone();
                 let spec_tracker_task = spec_tracker_spec.clone();
                 let store_v2_task = store_v2_spec.clone();
+                let fetch_extract_limiter_task = fetch_extract_limiter_spec.clone();
                 spec_tasks.push(tokio::spawn(async move {
                     let task_start = std::time::Instant::now();
                     match speculative_download_and_store(
@@ -445,6 +532,7 @@ pub(super) fn spawn_speculation_dispatcher(
                         &version,
                         &url,
                         integrity.as_deref(),
+                        &fetch_extract_limiter_task,
                     )
                     .await
                     {
@@ -579,6 +667,7 @@ pub(super) async fn speculative_download_and_store(
     version: &str,
     url: &str,
     integrity: Option<&str>,
+    fetch_extract_limiter: &FetchExtractLimiter,
 ) -> Result<SpeculativeFetchOutcome, LpmError> {
     use futures::stream::TryStreamExt;
     use tokio_util::io::{StreamReader, SyncIoBridge};
@@ -661,6 +750,7 @@ pub(super) async fn speculative_download_and_store(
             LpmError::Registry(format!("spec body fetch failed for {name}@{version}: {e}"))
         })?;
         drop(permit);
+        let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
         let v2_clone = v2.clone();
         let bytes = body.to_vec();
         let integrity_c = integrity.map(|s| s.to_string());
@@ -682,6 +772,7 @@ pub(super) async fn speculative_download_and_store(
     let integrity_c = integrity.map(|s| s.to_string());
     let store_owned = store.clone();
 
+    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
     tokio::task::spawn_blocking(move || {
         let sync_reader = SyncIoBridge::new(async_reader);
         store_owned
@@ -845,16 +936,17 @@ pub(super) fn handle_tarball_not_found(
 
 /// Legacy fetch path — download to temp file, reopen, extract. Returns
 /// `(computed_sri, TaskTimings)`. Called from the per-task closure under
-/// a held download semaphore permit. Kept as the default while ///'s streaming path is validated.
+/// a held download semaphore permit. Kept as the default while the
+/// streaming path is validated.
 ///
 /// `project_dir` + `gate_stats` are threaded in
 /// for the CWD-safe `handle_tarball_not_found` (which deletes
 /// lockfiles relative to the project root, not CWD) and the
 /// stale-URL same-run retry telemetry. See the design doc §
 /// Change 2 for the full retry semantics.
-// W6a — see the docs on `fetch_and_store_streaming` for why the
-// permit drop happens between download and extract. Same shape applies on
-// the legacy spool path.
+// See the docs on `fetch_and_store_streaming` for why the permit drop
+// happens between download and extract. Same shape applies on the legacy
+// spool path.
 #[allow(clippy::too_many_arguments)] // design-level: install-fetch orchestration takes the full surface
 pub(super) async fn fetch_and_store_legacy(
     client: &Arc<RegistryClient>,
@@ -868,6 +960,7 @@ pub(super) async fn fetch_and_store_legacy(
     project_dir: &Path,
     gate_stats: &Arc<GateStats>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    fetch_extract_limiter: &FetchExtractLimiter,
 ) -> Result<(String, TaskTimings, String), LpmError> {
     use std::sync::atomic::Ordering;
 
@@ -992,7 +1085,7 @@ pub(super) async fn fetch_and_store_legacy(
     // accumulated into `url_lookup_ms` above.
     let download_ms = download_start.elapsed().as_millis();
 
-    // W6a — drop the permit now that bytes are on disk.
+    // Drop the permit now that bytes are on disk.
     // Integrity verification + extract that follow are CPU+I/O bound
     // and don't need the download throttle; sibling downloads can
     // proceed while this task finishes its post-download work.
@@ -1021,6 +1114,10 @@ pub(super) async fn fetch_and_store_legacy(
         );
     }
     let integrity_ms = integrity_start.elapsed().as_millis();
+
+    let extract_permit_wait_start = std::time::Instant::now();
+    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
+    let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
 
     let stage = if let Some(store_v2) = store_v2 {
         // — v2 path. Read the on-disk tarball into
@@ -1056,6 +1153,7 @@ pub(super) async fn fetch_and_store_legacy(
             url_lookup_ms,
             download_ms,
             integrity_ms,
+            extract_permit_wait_ms,
             stage,
         ),
         final_url,
@@ -1094,6 +1192,7 @@ pub(super) async fn fetch_and_store_tarball_url(
     p: &InstallPackage,
     queue_wait_ms: u128,
     permit: tokio::sync::OwnedSemaphorePermit,
+    fetch_extract_limiter: &FetchExtractLimiter,
 ) -> Result<(String, TaskTimings, String), LpmError> {
     // The dispatch site only routes here when source_kind() returned
     // Source::Tarball, so this unwrap is contract-protected. A
@@ -1120,6 +1219,10 @@ pub(super) async fn fetch_and_store_tarball_url(
     // download_ms because the verify is a single string compare.
     let integrity_ms = 0;
 
+    let extract_permit_wait_start = std::time::Instant::now();
+    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
+    let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
+
     let stage = if let Some(store_v2) = store_v2 {
         // — v2 path. The Source::Tarball case
         // already has bytes + SRI in hand; route them straight into
@@ -1143,6 +1246,7 @@ pub(super) async fn fetch_and_store_tarball_url(
         0, // No registry metadata round-trip.
         download_ms,
         integrity_ms,
+        extract_permit_wait_ms,
         stage,
     );
 
@@ -1174,6 +1278,7 @@ pub(super) async fn fetch_and_store_streaming(
     project_dir: &Path,
     gate_stats: &Arc<GateStats>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    fetch_extract_limiter: &FetchExtractLimiter,
 ) -> Result<(String, TaskTimings, String), LpmError> {
     use std::sync::atomic::Ordering;
 
@@ -1284,14 +1389,13 @@ pub(super) async fn fetch_and_store_streaming(
         Err(e) => return Err(e),
     };
 
-    // W6a — collect the entire compressed tarball into memory
+    // Collect the entire compressed tarball into memory
     // BEFORE releasing the download permit, then release the permit
-    // BEFORE the spawn_blocking extract. Pre-W6a the permit covered
-    // download + extract end-to-end, which on `bench/fixture-large`
-    // serialized the ~141 ms max-extract tail behind every sibling's
-    // download permit hand-off. With W6a the next download can start
-    // as soon as bytes are on the heap; extract runs uncoordinated on
-    // the blocking pool.
+    // BEFORE the spawn_blocking extract. When the permit covers
+    // download + extract end-to-end, long extract tails serialize
+    // sibling download permit hand-off. Releasing it here lets the next
+    // download start as soon as bytes are on the heap; extract no
+    // longer holds a download slot and can be coordinated separately.
     //
     // Bounded memory: `download_tarball_streaming` already enforces
     // `MAX_COMPRESSED_TARBALL_SIZE` (500 MB) via `Content-Length`, and
@@ -1304,7 +1408,7 @@ pub(super) async fn fetch_and_store_streaming(
         .await
         .map_err(|e| LpmError::Network(format!("tarball stream failed: {e}")))?;
     let download_ms = download_start.elapsed().as_millis();
-    drop(permit); // release for sibling downloads — extract runs uncoordinated.
+    drop(permit); // release for sibling downloads before extract starts.
 
     let name = p.name.clone();
     let version = p.version.clone();
@@ -1315,6 +1419,10 @@ pub(super) async fn fetch_and_store_streaming(
     // `Store` derives Clone over a single PathBuf), and `None` keeps
     // the existing v1 path byte-for-byte.
     let store_v2_owned = store_v2.cloned();
+
+    let extract_permit_wait_start = std::time::Instant::now();
+    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
+    let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
 
     // Everything below runs on the blocking pool — frees the tokio async
     // workers to keep driving network reads. No download permit is held.
@@ -1358,7 +1466,14 @@ pub(super) async fn fetch_and_store_streaming(
 
     Ok((
         computed_sri,
-        TaskTimings::from_stage(queue_wait_ms, url_lookup_ms, download_ms, 0, stage),
+        TaskTimings::from_stage(
+            queue_wait_ms,
+            url_lookup_ms,
+            download_ms,
+            0,
+            extract_permit_wait_ms,
+            stage,
+        ),
         final_url,
     ))
 }

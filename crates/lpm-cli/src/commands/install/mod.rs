@@ -27,6 +27,7 @@ use tokio::sync::Semaphore;
 mod catalog;
 mod fetch;
 mod gitignore;
+mod installer_spike;
 mod lifecycle;
 mod linking;
 mod lockfile;
@@ -2227,6 +2228,7 @@ async fn run_with_options_under_store_lock(
     // 16 would saturate the network for no wall-clock win. One pool,
     // used first by speculation, then drained by real fetch.
     let fetch_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
+    let fetch_extract_limiter = configured_fetch_extract_limiter();
     //: also hoist the `PackageStore` so the speculative
     // dispatcher can write tarballs into the real store during the
     // resolve phase. Post-resolve, the fetch loop rebinds to the same
@@ -2284,6 +2286,90 @@ async fn run_with_options_under_store_lock(
         }
         migrate_v1_to_v2(project_dir)
             .map_err(|e| LpmError::Registry(format!("v1→v2 migration failed: {e}")))?;
+    }
+
+    let installer_spike_requested = installer_spike::enabled();
+    let installer_spike_script_policy_is_default = if installer_spike_requested {
+        let script_policy_cfg =
+            crate::script_policy_config::ScriptPolicyConfig::from_package_json(project_dir);
+        let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
+            project_dir,
+            script_policy_override,
+            &script_policy_cfg,
+            json_output,
+        )?;
+        script_policy_cfg == crate::script_policy_config::ScriptPolicyConfig::default()
+            && effective_policy == crate::script_policy_config::ScriptPolicy::Deny
+    } else {
+        true
+    };
+
+    if installer_spike::should_run(installer_spike::InstallerSpikeAdmission {
+        json_output,
+        frozen_lockfile_active,
+        omit_policy,
+        has_workspace_member_deps: !workspace_member_deps.is_empty()
+            || !direct_workspace_member_deps.is_empty(),
+        has_v2_workspace_member_deps: !v2_workspace_root_pre_resolve.install_pkgs.is_empty()
+            || !v2_workspace_root_pre_resolve
+                .additional_workspace_links
+                .is_empty(),
+        has_overrides: !override_set.is_empty(),
+        overrides_changed,
+        has_patches: !current_patches.is_empty(),
+        patches_changed,
+        verify_registry_signatures,
+        strict_integrity,
+        force_security_floor,
+        auto_build,
+        script_policy_override,
+        script_policy_is_default: installer_spike_script_policy_is_default,
+        has_trusted_dependencies: pkg
+            .lpm
+            .as_ref()
+            .is_some_and(|lpm| !lpm.trusted_dependencies.is_empty()),
+        strict_release_age_replay: release_age_policy.is_strict() && effective_min_age_secs > 0,
+        allow_new,
+        is_add_invocation,
+        has_direct_versions_out: direct_versions_out.is_some(),
+        has_target_set: target_set.is_some(),
+        audit_after_install,
+        no_skills,
+        no_security_summary,
+        verbose,
+        drift_ignore_policy_is_default: matches!(
+            &drift_ignore_policy,
+            crate::provenance_fetch::DriftIgnorePolicy::EnforceAll
+        ),
+        verify_policy_is_default: matches!(
+            verify_policy.enforce,
+            crate::provenance_fetch::EnforceMode::Deny
+        ) && matches!(
+            &verify_policy.skip,
+            crate::provenance_fetch::SkipPolicy::None
+        ),
+    })? {
+        return installer_spike::run(
+            arc_client.clone(),
+            project_dir,
+            &deps,
+            &pkg,
+            route_table.clone(),
+            json_output,
+            start,
+            linker_mode,
+            force,
+            lpm_root,
+            store_v2_handle.clone(),
+            compatibility_bin_names,
+            override_set.clone(),
+            resolver_policy.clone(),
+            auto_install_peers,
+            !omit_policy.optional,
+            &all_workspace_members,
+            &catalog_resolutions,
+        )
+        .await;
     }
 
     // pre-resolve direct
@@ -2535,6 +2621,7 @@ async fn run_with_options_under_store_lock(
                         deps.clone(),
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
+                        fetch_extract_limiter.clone(),
                     );
                     let res = lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy(
                         arc_client.clone(),
@@ -2647,6 +2734,7 @@ async fn run_with_options_under_store_lock(
                         deps.clone(),
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
+                        fetch_extract_limiter.clone(),
                     );
 
                     // Resolver — awaits roots_ready then solves against the
@@ -4153,6 +4241,7 @@ async fn run_with_options_under_store_lock(
                 .cloned();
             let source_index_for_pkg = Arc::clone(&source_index);
             let trace_slow_packages = timing_detail_mode.trace();
+            let fetch_extract_limiter_c = fetch_extract_limiter.clone();
 
             handles.push(tokio::spawn(async move {
                 type LinkHandle = tokio::task::JoinHandle<
@@ -4387,6 +4476,7 @@ async fn run_with_options_under_store_lock(
                         &p,
                         queue_wait_ms,
                         permit,
+                        &fetch_extract_limiter_c,
                     )
                     .await?
                 } else if streaming_fetch {
@@ -4400,6 +4490,7 @@ async fn run_with_options_under_store_lock(
                         &project_dir_buf,
                         &gate_stats_c,
                         permit,
+                        &fetch_extract_limiter_c,
                     )
                     .await?
                 } else {
@@ -4413,6 +4504,7 @@ async fn run_with_options_under_store_lock(
                         &project_dir_buf,
                         &gate_stats_c,
                         permit,
+                        &fetch_extract_limiter_c,
                     )
                     .await?
                 };
