@@ -12,12 +12,135 @@ const ENV_INSTALLER_SPIKE_CONCURRENCY: &str = "LPM_INSTALLER_SPIKE_CONCURRENCY";
 const ENV_INSTALLER_SPIKE_METADATA_CONCURRENCY: &str = "LPM_INSTALLER_SPIKE_METADATA_CONCURRENCY";
 const ENV_INSTALLER_SPIKE_GRAPH: &str = "LPM_INSTALLER_SPIKE_GRAPH";
 const ENV_INSTALLER_SPIKE_PARITY: &str = "LPM_INSTALLER_SPIKE_PARITY";
+const ENV_INSTALLER_SPIKE_BENCHMARK_ONLY: &str = "LPM_INSTALLER_SPIKE_BENCHMARK_ONLY";
 const DEFAULT_INSTALLER_SPIKE_CONCURRENCY: usize = 64;
 const DEFAULT_INSTALLER_SPIKE_METADATA_CONCURRENCY: usize = 192;
 const PARITY_SAMPLE_LIMIT: usize = 25;
 
 pub(super) fn enabled() -> bool {
     std::env::var(ENV_EXPERIMENTAL_INSTALLER_SPIKE).as_deref() == Ok("1")
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct InstallerSpikeAdmission {
+    pub(super) json_output: bool,
+    pub(super) frozen_lockfile_active: bool,
+    pub(super) omit_policy: InstallOmitPolicy,
+    pub(super) has_workspace_member_deps: bool,
+    pub(super) has_v2_workspace_member_deps: bool,
+    pub(super) has_overrides: bool,
+    pub(super) overrides_changed: bool,
+    pub(super) has_patches: bool,
+    pub(super) patches_changed: bool,
+    pub(super) verify_registry_signatures: bool,
+    pub(super) strict_integrity: bool,
+    pub(super) force_security_floor: bool,
+    pub(super) auto_build: bool,
+    pub(super) script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
+    pub(super) allow_new: bool,
+    pub(super) is_add_invocation: bool,
+    pub(super) has_direct_versions_out: bool,
+    pub(super) has_target_set: bool,
+    pub(super) audit_after_install: bool,
+    pub(super) no_skills: bool,
+    pub(super) no_security_summary: bool,
+    pub(super) verbose: bool,
+    pub(super) drift_ignore_policy_is_default: bool,
+    pub(super) verify_policy_is_default: bool,
+}
+
+pub(super) fn should_run(admission: InstallerSpikeAdmission) -> Result<bool, LpmError> {
+    if !enabled() {
+        return Ok(false);
+    }
+    let benchmark_only = std::env::var(ENV_INSTALLER_SPIKE_BENCHMARK_ONLY).as_deref() == Ok("1");
+    let reasons = unsupported_admission_reasons(
+        admission,
+        InstallerSpikeGraphSource::from_env(),
+        benchmark_only,
+    );
+    if reasons.is_empty() {
+        return Ok(true);
+    }
+    Err(LpmError::Registry(format!(
+        "experimental installer spike is limited to frozen lockfile benchmark installs; unsupported for this invocation: {}",
+        reasons.join("; ")
+    )))
+}
+
+fn unsupported_admission_reasons(
+    admission: InstallerSpikeAdmission,
+    graph_source: InstallerSpikeGraphSource,
+    benchmark_only: bool,
+) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if !benchmark_only {
+        reasons.push("set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1");
+    }
+    if !graph_source.uses_lockfile() {
+        reasons.push("set LPM_INSTALLER_SPIKE_GRAPH=lockfile");
+    }
+    if !admission.frozen_lockfile_active {
+        reasons.push("use a frozen lockfile install");
+    }
+    if !admission.json_output {
+        reasons.push("use --json");
+    }
+    if !admission.no_security_summary {
+        reasons.push("use --no-security-summary");
+    }
+    if !admission.no_skills {
+        reasons.push("use --no-skills");
+    }
+    if admission.omit_policy.dev {
+        reasons.push("--prod/--omit=dev is not supported");
+    }
+    if admission.omit_policy.optional {
+        reasons.push("--omit=optional is not supported");
+    }
+    if admission.has_workspace_member_deps || admission.has_v2_workspace_member_deps {
+        reasons.push("workspace member links are not supported");
+    }
+    if admission.has_overrides || admission.overrides_changed {
+        reasons.push("overrides are not supported");
+    }
+    if admission.has_patches || admission.patches_changed {
+        reasons.push("patches are not supported");
+    }
+    if admission.verify_registry_signatures {
+        reasons.push("registry signature verification is not supported");
+    }
+    if admission.strict_integrity {
+        reasons.push("strict integrity mode is not supported");
+    }
+    if admission.force_security_floor {
+        reasons.push("force-security-floor is not supported");
+    }
+    if admission.auto_build || admission.script_policy_override.is_some() {
+        reasons.push("script policy/build execution options are not supported");
+    }
+    if admission.allow_new {
+        reasons.push("--allow-new is not supported");
+    }
+    if admission.is_add_invocation || admission.has_direct_versions_out {
+        reasons.push("add-style installs are not supported");
+    }
+    if admission.has_target_set {
+        reasons.push("workspace filtered installs are not supported");
+    }
+    if admission.audit_after_install {
+        reasons.push("audit-after-install is not supported");
+    }
+    if admission.verbose {
+        reasons.push("--verbose is not supported");
+    }
+    if !admission.drift_ignore_policy_is_default {
+        reasons.push("provenance drift waivers are not supported");
+    }
+    if !admission.verify_policy_is_default {
+        reasons.push("provenance verification policy overrides are not supported");
+    }
+    reasons
 }
 
 type MetadataCell = Arc<OnceCell<Arc<lpm_resolver::CachedPackageInfo>>>;
@@ -545,6 +668,7 @@ pub(super) async fn run(
     let graph_source = InstallerSpikeGraphSource::from_env();
     let timing_detail_mode = TimingDetailMode::from_env();
     let fetch_queue = Arc::new(Semaphore::new(fetch_concurrency));
+    let fetch_extract_limiter = configured_fetch_extract_limiter();
     let metadata_queue = Arc::new(Semaphore::new(metadata_concurrency));
     let metadata_cache: MetadataCache = Arc::new(dashmap::DashMap::new());
     let metadata_stats = Arc::new(MetadataStats::default());
@@ -639,6 +763,7 @@ pub(super) async fn run(
                                     Arc::clone(&fetch_queue),
                                     Arc::clone(&gate_stats),
                                     force,
+                                    fetch_extract_limiter.clone(),
                                     &mut fetch_handles,
                                     &mut stats,
                                 );
@@ -687,6 +812,7 @@ pub(super) async fn run(
                 store_v2_handle.clone(),
                 Arc::clone(&gate_stats),
                 force,
+                fetch_extract_limiter.clone(),
             )
             .await?;
             stage_timings.peer_drain_ms = peer_drain_start.elapsed().as_millis();
@@ -737,6 +863,7 @@ pub(super) async fn run(
             &fetch_queue,
             Arc::clone(&gate_stats),
             force,
+            fetch_extract_limiter.clone(),
             &mut fetch_handles,
             &mut stats,
         )?;
@@ -1875,6 +2002,7 @@ async fn drain_ambient_peer_installs(
     store_v2_handle: Option<Arc<lpm_store::v2::Store>>,
     gate_stats: Arc<GateStats>,
     force: bool,
+    fetch_extract_limiter: FetchExtractLimiter,
 ) -> Result<(), LpmError> {
     if !auto_install_peers {
         return Ok(());
@@ -1974,6 +2102,7 @@ async fn drain_ambient_peer_installs(
                         Arc::clone(fetch_queue),
                         Arc::clone(&gate_stats),
                         force,
+                        fetch_extract_limiter.clone(),
                         fetch_handles,
                         stats,
                     );
@@ -2187,6 +2316,7 @@ fn spawn_fetches_for_packages(
     fetch_queue: &Arc<Semaphore>,
     gate_stats: Arc<GateStats>,
     force: bool,
+    fetch_extract_limiter: FetchExtractLimiter,
     fetch_handles: &mut HashMap<String, FetchHandle>,
     stats: &mut InstallerSpikeStats,
 ) -> Result<(), LpmError> {
@@ -2202,6 +2332,7 @@ fn spawn_fetches_for_packages(
                 Arc::clone(fetch_queue),
                 Arc::clone(&gate_stats),
                 force,
+                fetch_extract_limiter.clone(),
                 fetch_handles,
                 stats,
             );
@@ -2223,6 +2354,7 @@ fn maybe_spawn_fetch(
     fetch_queue: Arc<Semaphore>,
     gate_stats: Arc<GateStats>,
     force: bool,
+    fetch_extract_limiter: FetchExtractLimiter,
     fetch_handles: &mut HashMap<String, FetchHandle>,
     stats: &mut InstallerSpikeStats,
 ) {
@@ -2269,6 +2401,7 @@ fn maybe_spawn_fetch(
             &project_dir,
             &gate_stats,
             permit,
+            &fetch_extract_limiter,
         )
         .await?;
         Ok(FetchOutcome {
@@ -2424,6 +2557,35 @@ async fn finish_v2_event_driven_link(
 mod tests {
     use super::*;
 
+    fn benchmark_admission() -> InstallerSpikeAdmission {
+        InstallerSpikeAdmission {
+            json_output: true,
+            frozen_lockfile_active: true,
+            omit_policy: InstallOmitPolicy::default(),
+            has_workspace_member_deps: false,
+            has_v2_workspace_member_deps: false,
+            has_overrides: false,
+            overrides_changed: false,
+            has_patches: false,
+            patches_changed: false,
+            verify_registry_signatures: false,
+            strict_integrity: false,
+            force_security_floor: false,
+            auto_build: false,
+            script_policy_override: None,
+            allow_new: false,
+            is_add_invocation: false,
+            has_direct_versions_out: false,
+            has_target_set: false,
+            audit_after_install: false,
+            no_skills: true,
+            no_security_summary: true,
+            verbose: false,
+            drift_ignore_policy_is_default: true,
+            verify_policy_is_default: true,
+        }
+    }
+
     fn fake_package(name: &str, version: &str, deps: &[(&str, &str)]) -> InstallPackage {
         InstallPackage {
             name: name.to_string(),
@@ -2490,6 +2652,52 @@ mod tests {
             InstallerSpikeGraphSource::from_value(Some("unexpected")),
             InstallerSpikeGraphSource::ResolveWorklist
         );
+    }
+
+    #[test]
+    fn admission_accepts_frozen_lockfile_benchmark_shape() {
+        let reasons = unsupported_admission_reasons(
+            benchmark_admission(),
+            InstallerSpikeGraphSource::Lockfile,
+            true,
+        );
+
+        assert!(reasons.is_empty(), "unexpected reasons: {reasons:?}");
+    }
+
+    #[test]
+    fn admission_requires_benchmark_ack_frozen_lockfile_and_lockfile_graph() {
+        let mut admission = benchmark_admission();
+        admission.frozen_lockfile_active = false;
+
+        let reasons = unsupported_admission_reasons(
+            admission,
+            InstallerSpikeGraphSource::ResolveWorklist,
+            false,
+        );
+
+        assert!(reasons.contains(&"set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1"));
+        assert!(reasons.contains(&"set LPM_INSTALLER_SPIKE_GRAPH=lockfile"));
+        assert!(reasons.contains(&"use a frozen lockfile install"));
+    }
+
+    #[test]
+    fn admission_rejects_install_contracts_spike_does_not_implement() {
+        let mut admission = benchmark_admission();
+        admission.omit_policy.dev = true;
+        admission.has_workspace_member_deps = true;
+        admission.has_patches = true;
+        admission.verify_registry_signatures = true;
+        admission.audit_after_install = true;
+
+        let reasons =
+            unsupported_admission_reasons(admission, InstallerSpikeGraphSource::Lockfile, true);
+
+        assert!(reasons.contains(&"--prod/--omit=dev is not supported"));
+        assert!(reasons.contains(&"workspace member links are not supported"));
+        assert!(reasons.contains(&"patches are not supported"));
+        assert!(reasons.contains(&"registry signature verification is not supported"));
+        assert!(reasons.contains(&"audit-after-install is not supported"));
     }
 
     #[test]

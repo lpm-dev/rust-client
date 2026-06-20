@@ -119,10 +119,17 @@ async fn tarball_url_install_trust_on_first_use_lands_in_cas_path() {
     let client = Arc::new(RegistryClient::new());
     let pkg = install_package_for_tarball(&url, None);
 
-    let (computed_sri, timings, final_url) =
-        fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-            .await
-            .expect("tarball install must succeed");
+    let (computed_sri, timings, final_url) = fetch_and_store_tarball_url(
+        &client,
+        &store,
+        None,
+        &pkg,
+        0,
+        install_pkg_acquire_permit(),
+        &None,
+    )
+    .await
+    .expect("tarball install must succeed");
 
     // Returned SRI matches an independent SHA-512 of the bytes.
     assert_eq!(computed_sri, expected_sri);
@@ -162,10 +169,17 @@ async fn tarball_url_install_match_succeeds() {
     let client = Arc::new(RegistryClient::new());
     let pkg = install_package_for_tarball(&url, Some(&expected_sri));
 
-    let (computed_sri, _, _) =
-        fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-            .await
-            .expect("matching SRI must succeed");
+    let (computed_sri, _, _) = fetch_and_store_tarball_url(
+        &client,
+        &store,
+        None,
+        &pkg,
+        0,
+        install_pkg_acquire_permit(),
+        &None,
+    )
+    .await
+    .expect("matching SRI must succeed");
     assert_eq!(computed_sri, expected_sri);
     assert!(store.has_tarball(&computed_sri));
 }
@@ -200,7 +214,7 @@ async fn tarball_url_install_v2_extracts_object() {
         .expect("permit must be available in test setup");
 
     let (computed_sri, _, _) =
-        fetch_and_store_tarball_url(&client, &store, Some(&store_v2), &pkg, 0, permit)
+        fetch_and_store_tarball_url(&client, &store, Some(&store_v2), &pkg, 0, permit, &None)
             .await
             .expect("v2 tarball install must succeed");
 
@@ -242,9 +256,16 @@ async fn tarball_url_install_mismatch_errors_no_extraction() {
     let client = Arc::new(RegistryClient::new());
     let pkg = install_package_for_tarball(&url, Some(&wrong_sri));
 
-    let result =
-        fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-            .await;
+    let result = fetch_and_store_tarball_url(
+        &client,
+        &store,
+        None,
+        &pkg,
+        0,
+        install_pkg_acquire_permit(),
+        &None,
+    )
+    .await;
 
     assert!(
         matches!(result, Err(LpmError::IntegrityMismatch { .. })),
@@ -297,20 +318,34 @@ async fn tarball_url_install_cache_hit_skips_redundant_download() {
     let client = Arc::new(RegistryClient::new());
     let pkg = install_package_for_tarball(&url, None);
 
-    let (sri1, _, _) =
-        fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-            .await
-            .unwrap();
+    let (sri1, _, _) = fetch_and_store_tarball_url(
+        &client,
+        &store,
+        None,
+        &pkg,
+        0,
+        install_pkg_acquire_permit(),
+        &None,
+    )
+    .await
+    .unwrap();
     let cas_path = store.tarball_store_path(&sri1).unwrap();
     let mtime1 = std::fs::metadata(cas_path.join("package.json"))
         .unwrap()
         .modified()
         .unwrap();
 
-    let (sri2, _, _) =
-        fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-            .await
-            .unwrap();
+    let (sri2, _, _) = fetch_and_store_tarball_url(
+        &client,
+        &store,
+        None,
+        &pkg,
+        0,
+        install_pkg_acquire_permit(),
+        &None,
+    )
+    .await
+    .unwrap();
     assert_eq!(sri1, sri2);
     let mtime2 = std::fs::metadata(cas_path.join("package.json"))
         .unwrap()
@@ -362,6 +397,7 @@ async fn speculative_v2_download_extracts_object() {
         "1.0.0",
         &url,
         Some(&expected_sri),
+        &None,
     )
     .await
     .expect("speculative v2 download must succeed");
@@ -468,10 +504,17 @@ async fn tarball_url_install_handles_301_redirect() {
     let client = Arc::new(RegistryClient::new());
     let pkg = install_package_for_tarball(&declared_url, None);
 
-    let (computed_sri, _, final_url) =
-        fetch_and_store_tarball_url(&client, &store, None, &pkg, 0, install_pkg_acquire_permit())
-            .await
-            .expect("redirect must be followed");
+    let (computed_sri, _, final_url) = fetch_and_store_tarball_url(
+        &client,
+        &store,
+        None,
+        &pkg,
+        0,
+        install_pkg_acquire_permit(),
+        &None,
+    )
+    .await
+    .expect("redirect must be followed");
 
     // Bytes arrived: SRI matches independent calc on the final
     // body (proves redirect was followed and content is right).
