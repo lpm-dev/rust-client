@@ -1953,6 +1953,23 @@ impl RegistryClient {
         Vec<(String, Result<PackageMetadata, LpmError>)>,
         FanOutStats,
     ) {
+        self.parallel_fetch_npm_manifests_inner(
+            names,
+            max_concurrency,
+            crate::timing::metadata_fetch_detail_enabled(),
+        )
+        .await
+    }
+
+    pub(super) async fn parallel_fetch_npm_manifests_inner(
+        self: &Arc<Self>,
+        names: &[String],
+        max_concurrency: usize,
+        trace_metadata_fetches: bool,
+    ) -> (
+        Vec<(String, Result<PackageMetadata, LpmError>)>,
+        FanOutStats,
+    ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::sync::Semaphore;
 
@@ -1992,7 +2009,40 @@ impl RegistryClient {
                     }
                 };
 
-                let result = client.get_npm_metadata_direct(&name).await;
+                let result = if trace_metadata_fetches {
+                    let total_start = std::time::Instant::now();
+                    client
+                        .get_npm_metadata_direct_with_timings(&name)
+                        .await
+                        .map(|timed| {
+                            let timings = timed.timings;
+                            let version_count = timed.metadata.versions.len() as u64;
+                            let total_ms = total_start.elapsed().as_millis();
+                            crate::timing::record_metadata_fetch_detail(
+                                crate::timing::MetadataFetchDetailRecord {
+                                    package: name.clone(),
+                                    route: "npm_direct",
+                                    total_ms,
+                                    raw_fetch_ms: total_ms,
+                                    cache_read_ms: timings.cache_read_ms,
+                                    validator_read_ms: timings.validator_read_ms,
+                                    http_ms: timings.http_ms,
+                                    body_read_ms: timings.body_read_ms,
+                                    json_decode_ms: timings.json_decode_ms,
+                                    cache_after_304_ms: timings.cache_after_304_ms,
+                                    cache_write_dispatch_ms: timings.cache_write_dispatch_ms,
+                                    body_bytes: timings.body_bytes,
+                                    version_count,
+                                    cache_hit: timings.cache_hit,
+                                    not_modified: timings.not_modified,
+                                    ..crate::timing::MetadataFetchDetailRecord::default()
+                                },
+                            );
+                            timed.metadata
+                        })
+                } else {
+                    client.get_npm_metadata_direct(&name).await
+                };
 
                 if matches!(result, Err(LpmError::RateLimited { .. })) {
                     // Atomically claim a halving step against `ceiling`

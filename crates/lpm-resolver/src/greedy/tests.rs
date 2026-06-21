@@ -3713,6 +3713,139 @@ async fn fusion_direct_mode_does_not_batch_npm_root_deps() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn trace_metadata_fetch_records_direct_npm_timing_attribution() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _timing_guard = crate::metadata_fetch_detail_test_lock().lock().await;
+    lpm_registry::timing::reset_metadata_detail();
+
+    let npm_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/direct-trace"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(5))
+                .set_body_json(metadata_json("direct-trace", &[])),
+        )
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .with_cache_dir(None);
+    let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+    let canonical = CanonicalKey::npm("direct-trace");
+
+    let fetched = fetch_metadata_for_resolver_with_trace_detail(
+        &client,
+        &route_table,
+        &canonical,
+        &ResolverPolicy::default(),
+        false,
+        true,
+    )
+    .await
+    .expect("direct npm metadata fetch should succeed");
+
+    assert_eq!(fetched.info.versions.len(), 1);
+    let snapshot = lpm_registry::timing::snapshot_metadata_fetch_detail();
+    assert_eq!(snapshot.calls, 1);
+    assert_eq!(snapshot.route_npm_direct_count, 1);
+    assert!(
+        snapshot.attribution.raw_fetch_sum_ms > 0,
+        "delayed direct fetch should populate raw fetch timing; got {snapshot:#?}"
+    );
+    let row = snapshot
+        .top_slow_packages
+        .by_total
+        .first()
+        .unwrap_or_else(|| {
+            panic!("delayed direct fetch should rank a slow row; got {snapshot:#?}")
+        });
+    assert_eq!(row.package, "direct-trace");
+    assert_eq!(row.route, "npm_direct");
+    assert!(row.body_bytes > 0);
+    assert_eq!(row.version_count, 1);
+
+    lpm_registry::timing::reset_metadata_detail();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trace_metadata_fetch_records_cached_release_time_policy_followup() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _timing_guard = crate::metadata_fetch_detail_test_lock().lock().await;
+    lpm_registry::timing::reset_metadata_detail();
+
+    let npm_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/cached-policy-trace"))
+        .and(header("accept", "application/json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(5))
+                .set_body_json(metadata_json("cached-policy-trace", &[])),
+        )
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .with_cache_dir(None);
+    let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+    let canonical = CanonicalKey::npm("cached-policy-trace");
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let mut cached_info = mk_info(&["1.0.0"], &[]);
+    cached_info.modified = Some("2025-01-03T00:00:00.000Z".to_string());
+    cached_info.modified_unix = parse_npm_time_unix("2025-01-03T00:00:00.000Z");
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, TrustPolicyMode::Off);
+
+    let hydrated = ensure_policy_metadata_for_cached_manifest(
+        &canonical,
+        Arc::new(cached_info),
+        &client,
+        &route_table,
+        &shared_cache,
+        &policy,
+        true,
+    )
+    .await
+    .expect("cached release-age policy follow-up should hydrate publish times");
+
+    assert_eq!(
+        hydrated
+            .dist
+            .get("1.0.0")
+            .and_then(|dist| dist.published_at.as_deref()),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+    let snapshot = lpm_registry::timing::snapshot_metadata_fetch_detail();
+    assert_eq!(snapshot.calls, 1);
+    assert_eq!(snapshot.route_npm_direct_count, 1);
+    assert!(
+        snapshot.attribution.policy_release_time_sum_ms > 0,
+        "delayed policy fetch should populate release-time attribution; got {snapshot:#?}"
+    );
+    let row = snapshot
+        .top_slow_packages
+        .by_policy_release_time
+        .first()
+        .unwrap_or_else(|| {
+            panic!("delayed policy fetch should rank a release-time row; got {snapshot:#?}")
+        });
+    assert_eq!(row.package, "cached-policy-trace");
+    assert_eq!(row.route, "npm_direct");
+    assert_eq!(row.version_count, 1);
+
+    lpm_registry::timing::reset_metadata_detail();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn fusion_falls_back_to_direct_npm_when_worker_batch_denies_access() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

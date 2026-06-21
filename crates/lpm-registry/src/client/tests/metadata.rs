@@ -1122,6 +1122,64 @@ async fn parallel_fetch_preserves_input_order_across_varying_latencies() {
 }
 
 #[tokio::test]
+async fn parallel_fetch_trace_records_direct_npm_metadata_detail_rows() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = crate::timing::metadata_fetch_detail_test_lock()
+        .lock()
+        .await;
+    crate::timing::reset_metadata_detail();
+
+    let npm_server = MockServer::start().await;
+    let proxy_server = MockServer::start().await;
+    let names: Vec<String> = ["trace-one", "trace-two"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+    for name in &names {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(name))
+                    .set_delay(std::time::Duration::from_millis(5)),
+            )
+            .expect(1)
+            .mount(&npm_server)
+            .await;
+    }
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let mut client = RegistryClient::new()
+        .with_base_url(proxy_server.uri())
+        .with_npm_registry_url(npm_server.uri());
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    let client = Arc::new(client);
+
+    let (results, _stats) = client
+        .parallel_fetch_npm_manifests_inner(&names, 2, true)
+        .await;
+    let snapshot = crate::timing::snapshot_metadata_fetch_detail();
+    crate::timing::reset_metadata_detail();
+
+    assert!(results.iter().all(|(_, result)| result.is_ok()));
+    assert_eq!(snapshot.calls, 2);
+    assert_eq!(snapshot.route_npm_direct_count, 2);
+    assert!(snapshot.body_bytes_sum > 0);
+    assert_eq!(snapshot.version_count_sum, 2);
+    assert!(snapshot.attribution.raw_fetch_sum_ms > 0);
+    assert!(names.iter().all(|name| {
+        snapshot
+            .top_slow_packages
+            .by_total
+            .iter()
+            .any(|row| row.package == *name && row.route == "npm_direct")
+    }));
+}
+
+#[tokio::test]
 async fn parallel_fetch_per_entry_failures_do_not_abort_batch() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

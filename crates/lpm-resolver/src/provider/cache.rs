@@ -150,6 +150,19 @@ impl LpmDependencyProvider {
         package: &ResolverPackage,
         key: &CanonicalKey,
     ) -> Result<(), ProviderError> {
+        self.ensure_policy_metadata_with_trace(
+            package,
+            key,
+            lpm_registry::timing::metadata_fetch_detail_enabled(),
+        )
+    }
+
+    pub(super) fn ensure_policy_metadata_with_trace(
+        &self,
+        package: &ResolverPackage,
+        key: &CanonicalKey,
+        trace_metadata_fetches: bool,
+    ) -> Result<(), ProviderError> {
         let needs_upgrade = self
             .cache
             .get(key)
@@ -161,7 +174,25 @@ impl LpmDependencyProvider {
             return Ok(());
         };
         let route = self.route_table.route_for_package(name);
-        let info = self.fetch_full_policy_info(name, route, key)?;
+        let policy_start = trace_metadata_fetches.then(Instant::now);
+        let info = self.fetch_full_policy_info(name, route.clone(), key)?;
+        if let Some(start) = policy_start {
+            let elapsed = start.elapsed().as_millis();
+            lpm_registry::timing::record_metadata_fetch_detail(
+                lpm_registry::timing::MetadataFetchDetailRecord {
+                    package: key.to_string(),
+                    route: match route {
+                        UpstreamRoute::NpmDirect => "npm_direct",
+                        UpstreamRoute::LpmWorker => "lpm_worker",
+                        UpstreamRoute::Custom { .. } => "custom",
+                    },
+                    total_ms: elapsed,
+                    policy_full_metadata_ms: elapsed,
+                    version_count: info.versions.len() as u64,
+                    ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+                },
+            );
+        }
         self.insert_and_notify(key.clone(), info);
         Ok(())
     }

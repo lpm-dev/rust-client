@@ -23,43 +23,147 @@ impl LpmDependencyProvider {
                 let pkg_name = lpm_common::PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))
                     .map_err(|e| ProviderError::Registry(e.to_string()))?;
 
+                let trace_metadata_fetches = lpm_registry::timing::metadata_fetch_detail_enabled();
+                let total_start = trace_metadata_fetches.then(Instant::now);
+                let raw_start = trace_metadata_fetches.then(Instant::now);
                 let metadata = self
                     .rt
                     .block_on(self.client.get_package_metadata(&pkg_name))
                     .map_err(classify_registry_error)?;
+                let detail =
+                    raw_start.map(|start| lpm_registry::timing::MetadataFetchDetailRecord {
+                        package: key.to_string(),
+                        route: "lpm",
+                        raw_fetch_ms: start.elapsed().as_millis(),
+                        version_count: metadata.versions.len() as u64,
+                        ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+                    });
 
                 // Use shared parser. Prereleases included
                 // (range matcher handles npm prerelease semantics).
+                let parse_start = trace_metadata_fetches.then(Instant::now);
                 let info = parse_metadata_to_cache_info(&metadata);
+                if let Some(mut record) = detail {
+                    if let Some(start) = parse_start {
+                        record.cache_info_parse_ms = start.elapsed().as_millis();
+                    }
+                    if let Some(start) = total_start {
+                        record.total_ms = start.elapsed().as_millis();
+                    }
+                    lpm_registry::timing::record_metadata_fetch_detail(record);
+                }
                 self.insert_and_notify(key, info);
                 Ok(())
             }
             ResolverPackage::Npm { name, .. } => {
                 let route = self.route_table.route_for_package(name);
+                let trace_metadata_fetches = lpm_registry::timing::metadata_fetch_detail_enabled();
+                let total_start = trace_metadata_fetches.then(Instant::now);
+                let raw_start = trace_metadata_fetches.then(Instant::now);
+                let mut detail: Option<lpm_registry::timing::MetadataFetchDetailRecord> = None;
                 let metadata = match &route {
                     UpstreamRoute::LpmWorker => {
-                        self.rt.block_on(self.client.get_npm_package_metadata(name))
+                        self.rt
+                            .block_on(self.client.get_npm_package_metadata(name))
+                            .inspect(|metadata| {
+                                if let Some(start) = raw_start {
+                                    detail =
+                                        Some(lpm_registry::timing::MetadataFetchDetailRecord {
+                                            package: key.to_string(),
+                                            route: "lpm_worker",
+                                            raw_fetch_ms: start.elapsed().as_millis(),
+                                            version_count: metadata.versions.len() as u64,
+                                            ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+                                        });
+                                }
+                            })
                     }
                     UpstreamRoute::NpmDirect => {
-                        self.rt.block_on(self.client.get_npm_metadata_direct(name))
+                        if trace_metadata_fetches {
+                            self.rt
+                                .block_on(self.client.get_npm_metadata_direct_with_timings(name))
+                                .map(|timed| {
+                                    let registry = timed.timings;
+                                    detail = Some(
+                                        lpm_registry::timing::MetadataFetchDetailRecord {
+                                            package: key.to_string(),
+                                            route: "npm_direct",
+                                            raw_fetch_ms: raw_start
+                                                .map_or(0, |start| start.elapsed().as_millis()),
+                                            cache_read_ms: registry.cache_read_ms,
+                                            validator_read_ms: registry.validator_read_ms,
+                                            http_ms: registry.http_ms,
+                                            body_read_ms: registry.body_read_ms,
+                                            json_decode_ms: registry.json_decode_ms,
+                                            cache_after_304_ms: registry.cache_after_304_ms,
+                                            cache_write_dispatch_ms: registry.cache_write_dispatch_ms,
+                                            body_bytes: registry.body_bytes,
+                                            version_count: timed.metadata.versions.len() as u64,
+                                            cache_hit: registry.cache_hit,
+                                            not_modified: registry.not_modified,
+                                            ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+                                        },
+                                    );
+                                    timed.metadata
+                                })
+                        } else {
+                            self.rt.block_on(self.client.get_npm_metadata_direct(name))
+                        }
                     }
                     UpstreamRoute::Custom { target, auth } => {
                         // Auth is origin-scoped and re-verified inside
                         // `get_npm_metadata_from` before attaching the header.
-                        self.rt.block_on(self.client.get_npm_metadata_from(
-                            &target.base_url,
-                            name,
-                            auth.as_ref(),
-                        ))
+                        self.rt
+                            .block_on(self.client.get_npm_metadata_from(
+                                &target.base_url,
+                                name,
+                                auth.as_ref(),
+                            ))
+                            .inspect(|metadata| {
+                                if let Some(start) = raw_start {
+                                    detail =
+                                        Some(lpm_registry::timing::MetadataFetchDetailRecord {
+                                            package: key.to_string(),
+                                            route: "custom",
+                                            raw_fetch_ms: start.elapsed().as_millis(),
+                                            version_count: metadata.versions.len() as u64,
+                                            ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+                                        });
+                                }
+                            })
                     }
                 }
                 .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
 
+                let parse_start = trace_metadata_fetches.then(Instant::now);
                 let mut info = parse_metadata_to_cache_info(&metadata);
+                if let Some(record) = &mut detail
+                    && let Some(start) = parse_start
+                {
+                    record.cache_info_parse_ms = start.elapsed().as_millis();
+                }
                 if info.needs_trust_metadata(&self.policy) {
+                    let policy_start = trace_metadata_fetches.then(Instant::now);
                     info = self.fetch_full_policy_info(name, route, &key)?;
+                    if let Some(record) = &mut detail
+                        && let Some(start) = policy_start
+                    {
+                        record.policy_full_metadata_ms = start.elapsed().as_millis();
+                    }
                 } else if info.needs_release_time_metadata(&key, &self.policy) {
+                    let policy_start = trace_metadata_fetches.then(Instant::now);
                     self.fetch_release_time_policy_info(name, route, &key, &mut info)?;
+                    if let Some(record) = &mut detail
+                        && let Some(start) = policy_start
+                    {
+                        record.policy_release_time_ms = start.elapsed().as_millis();
+                    }
+                }
+                if let Some(mut record) = detail {
+                    if let Some(start) = total_start {
+                        record.total_ms = start.elapsed().as_millis();
+                    }
+                    lpm_registry::timing::record_metadata_fetch_detail(record);
                 }
                 tracing::debug!("npm package {name}: {} versions", info.versions.len());
                 self.insert_and_notify(key, info);

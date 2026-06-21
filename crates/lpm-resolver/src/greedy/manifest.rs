@@ -18,6 +18,7 @@ pub(super) async fn ensure_manifest(
     fetch_wait_timeout: Duration,
     metrics: &StreamingBfsMetrics,
     policy: &ResolverPolicy,
+    trace_metadata_fetches: bool,
 ) -> Result<Arc<CachedPackageInfo>, ResolveError> {
     // Fast path. Cache values are Arc-wrapped, so the clone here is a
     // refcount bump rather than a deep clone of the 7-HashMap struct.
@@ -32,6 +33,7 @@ pub(super) async fn ensure_manifest(
             route_table,
             shared_cache,
             policy,
+            trace_metadata_fetches,
         )
         .await;
     }
@@ -58,6 +60,7 @@ pub(super) async fn ensure_manifest(
                 route_table,
                 shared_cache,
                 policy,
+                trace_metadata_fetches,
             )
             .await;
         }
@@ -75,6 +78,7 @@ pub(super) async fn ensure_manifest(
                             route_table,
                             shared_cache,
                             policy,
+                            trace_metadata_fetches,
                         )
                         .await;
                     }
@@ -88,7 +92,14 @@ pub(super) async fn ensure_manifest(
 
     // Escape hatch: direct fetch.
     metrics_incr_escape_hatch(metrics);
-    let info_arc = direct_fetch(&client, route_table, canonical, policy).await?;
+    let info_arc = direct_fetch(
+        &client,
+        route_table,
+        canonical,
+        policy,
+        trace_metadata_fetches,
+    )
+    .await?;
     shared_cache.insert(canonical.clone(), info_arc.clone());
     if let Some(n) = notify_map.get(canonical) {
         n.notify_waiters();
@@ -101,9 +112,17 @@ async fn direct_fetch(
     route_table: &RouteTable,
     canonical: &CanonicalKey,
     policy: &ResolverPolicy,
+    trace_metadata_fetches: bool,
 ) -> Result<Arc<CachedPackageInfo>, ResolveError> {
-    let fetched =
-        fetch_metadata_for_resolver(client, route_table, canonical, policy, false).await?;
+    let fetched = fetch_metadata_for_resolver_with_trace_detail(
+        client,
+        route_table,
+        canonical,
+        policy,
+        false,
+        trace_metadata_fetches,
+    )
+    .await?;
     Ok(fetched.info)
 }
 
@@ -202,6 +221,62 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
     Ok((fetched, timings))
 }
 
+pub(super) async fn fetch_metadata_for_resolver_with_trace_detail(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+    include_speculation: bool,
+    trace_metadata_fetches: bool,
+) -> Result<FetchedMetadata, ResolveError> {
+    if !trace_metadata_fetches {
+        return fetch_metadata_for_resolver(
+            client,
+            route_table,
+            canonical,
+            policy,
+            include_speculation,
+        )
+        .await;
+    }
+
+    let (fetched, timings) = fetch_metadata_for_resolver_with_timings(
+        client,
+        route_table,
+        canonical,
+        policy,
+        include_speculation,
+    )
+    .await?;
+    lpm_registry::timing::record_metadata_fetch_detail(metadata_fetch_detail_record(timings));
+    Ok(fetched)
+}
+
+fn metadata_fetch_detail_record(
+    timings: ExperimentalMetadataFetchTimings,
+) -> lpm_registry::timing::MetadataFetchDetailRecord {
+    lpm_registry::timing::MetadataFetchDetailRecord {
+        package: timings.package,
+        route: timings.route,
+        total_ms: timings.total_ms,
+        raw_fetch_ms: timings.raw_fetch_ms,
+        cache_read_ms: timings.cache_read_ms,
+        validator_read_ms: timings.validator_read_ms,
+        http_ms: timings.http_ms,
+        body_read_ms: timings.body_read_ms,
+        json_decode_ms: timings.json_decode_ms,
+        cache_after_304_ms: timings.cache_after_304_ms,
+        cache_write_dispatch_ms: timings.cache_write_dispatch_ms,
+        cache_info_parse_ms: timings.cache_info_parse_ms,
+        policy_release_time_ms: timings.policy_release_time_ms,
+        policy_full_metadata_ms: timings.policy_full_metadata_ms,
+        body_bytes: timings.body_bytes,
+        version_count: timings.version_count,
+        cache_hit: timings.cache_hit,
+        not_modified: timings.not_modified,
+    }
+}
+
 pub(super) fn parse_fetched_metadata(
     metadata: lpm_registry::PackageMetadata,
     include_speculation: bool,
@@ -242,6 +317,7 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
     route_table: &RouteTable,
     shared_cache: &SharedCache,
     policy: &ResolverPolicy,
+    trace_metadata_fetches: bool,
 ) -> Result<Arc<CachedPackageInfo>, ResolveError> {
     if !info.needs_policy_metadata(canonical, policy) {
         return Ok(info);
@@ -251,16 +327,75 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
     }
     if !info.needs_trust_metadata(policy) && info.needs_release_time_metadata(canonical, policy) {
         let mut merged = (*info).clone();
+        let policy_start = trace_metadata_fetches.then(Instant::now);
         fetch_release_times_for_policy(client, route_table, canonical, &mut merged).await?;
+        if let Some(start) = policy_start {
+            let elapsed = start.elapsed().as_millis();
+            lpm_registry::timing::record_metadata_fetch_detail(
+                cached_policy_metadata_fetch_detail_record(
+                    canonical,
+                    route_table,
+                    elapsed,
+                    elapsed,
+                    0,
+                    merged.versions.len() as u64,
+                ),
+            );
+        }
         let merged = Arc::new(merged);
         shared_cache.insert(canonical.clone(), merged.clone());
         return Ok(merged);
     }
+    let policy_start = trace_metadata_fetches.then(Instant::now);
     let fetched =
         fetch_full_metadata_for_policy(client, route_table, canonical, policy, false).await?;
     let full_info = fetched.info;
+    if let Some(start) = policy_start {
+        let elapsed = start.elapsed().as_millis();
+        lpm_registry::timing::record_metadata_fetch_detail(
+            cached_policy_metadata_fetch_detail_record(
+                canonical,
+                route_table,
+                elapsed,
+                0,
+                elapsed,
+                full_info.versions.len() as u64,
+            ),
+        );
+    }
     shared_cache.insert(canonical.clone(), full_info.clone());
     Ok(full_info)
+}
+
+fn cached_policy_metadata_fetch_detail_record(
+    canonical: &CanonicalKey,
+    route_table: &RouteTable,
+    total_ms: u128,
+    policy_release_time_ms: u128,
+    policy_full_metadata_ms: u128,
+    version_count: u64,
+) -> lpm_registry::timing::MetadataFetchDetailRecord {
+    lpm_registry::timing::MetadataFetchDetailRecord {
+        package: canonical.to_string(),
+        route: route_label_for_canonical(route_table, canonical),
+        total_ms,
+        policy_release_time_ms,
+        policy_full_metadata_ms,
+        version_count,
+        ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+    }
+}
+
+fn route_label_for_canonical(route_table: &RouteTable, canonical: &CanonicalKey) -> &'static str {
+    match canonical {
+        CanonicalKey::Root => "unknown",
+        CanonicalKey::Lpm { .. } => "lpm",
+        CanonicalKey::Npm { name } => match route_table.route_for_package(name) {
+            UpstreamRoute::NpmDirect => "npm_direct",
+            UpstreamRoute::LpmWorker => "lpm_worker",
+            UpstreamRoute::Custom { .. } => "custom",
+        },
+    }
 }
 
 async fn fetch_release_times_for_policy(

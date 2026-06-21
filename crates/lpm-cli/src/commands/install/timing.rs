@@ -834,7 +834,13 @@ pub(super) fn setup_only_timing_detail_json(
             ),
         },
         "metadata": metadata_detail_json_from_snapshots(&metadata, mode),
-        "resolve": resolve_detail_json(0, 0, &lpm_resolver::StageTiming::default(), &metadata),
+        "resolve": resolve_detail_json(
+            0,
+            0,
+            &lpm_resolver::StageTiming::default(),
+            &metadata,
+            mode,
+        ),
         "fetch": FetchStageTimings::default().to_json(0, 0, 0, 0, FetchBreakdown::default()),
         "security": {
             "registry_signatures": serde_json::Value::Null,
@@ -916,11 +922,103 @@ pub(super) fn metadata_detail_json_from_snapshots(
     )
 }
 
+fn metadata_fetch_detail_json_from_snapshot(
+    snapshot: &lpm_registry::timing::MetadataFetchDetailSnapshot,
+    mode: TimingDetailMode,
+) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "scope": "per_package_metadata_fetches",
+        "batch_fetches_included": false,
+        "calls": snapshot.calls,
+        "cache_hit_count": snapshot.cache_hit_count,
+        "not_modified_count": snapshot.not_modified_count,
+        "body_bytes_sum": snapshot.body_bytes_sum,
+        "version_count_sum": snapshot.version_count_sum,
+        "routes": {
+            "npm_direct": snapshot.route_npm_direct_count,
+            "lpm_worker": snapshot.route_lpm_worker_count,
+            "custom": snapshot.route_custom_count,
+            "lpm": snapshot.route_lpm_count,
+            "unknown": snapshot.route_unknown_count,
+        },
+        "attribution": {
+            "total_sum_ms": snapshot.attribution.total_sum_ms,
+            "total_max_ms": snapshot.attribution.total_max_ms,
+            "raw_fetch_sum_ms": snapshot.attribution.raw_fetch_sum_ms,
+            "raw_fetch_max_ms": snapshot.attribution.raw_fetch_max_ms,
+            "cache_read_sum_ms": snapshot.attribution.cache_read_sum_ms,
+            "validator_read_sum_ms": snapshot.attribution.validator_read_sum_ms,
+            "http_sum_ms": snapshot.attribution.http_sum_ms,
+            "body_read_sum_ms": snapshot.attribution.body_read_sum_ms,
+            "json_decode_sum_ms": snapshot.attribution.json_decode_sum_ms,
+            "cache_after_304_sum_ms": snapshot.attribution.cache_after_304_sum_ms,
+            "cache_write_dispatch_sum_ms": snapshot.attribution.cache_write_dispatch_sum_ms,
+            "cache_info_parse_sum_ms": snapshot.attribution.cache_info_parse_sum_ms,
+            "policy_release_time_sum_ms": snapshot.attribution.policy_release_time_sum_ms,
+            "policy_full_metadata_sum_ms": snapshot.attribution.policy_full_metadata_sum_ms,
+        },
+    });
+    if mode.trace() {
+        json["top_slow_packages"] = serde_json::json!({
+            "by_total": metadata_fetch_bucket_json(&snapshot.top_slow_packages.by_total),
+            "by_raw_fetch": metadata_fetch_bucket_json(&snapshot.top_slow_packages.by_raw_fetch),
+            "by_http": metadata_fetch_bucket_json(&snapshot.top_slow_packages.by_http),
+            "by_body_read": metadata_fetch_bucket_json(&snapshot.top_slow_packages.by_body_read),
+            "by_json_decode": metadata_fetch_bucket_json(
+                &snapshot.top_slow_packages.by_json_decode,
+            ),
+            "by_cache_info_parse": metadata_fetch_bucket_json(
+                &snapshot.top_slow_packages.by_cache_info_parse,
+            ),
+            "by_policy_release_time": metadata_fetch_bucket_json(
+                &snapshot.top_slow_packages.by_policy_release_time,
+            ),
+            "by_policy_full_metadata": metadata_fetch_bucket_json(
+                &snapshot.top_slow_packages.by_policy_full_metadata,
+            ),
+        });
+    }
+    json
+}
+
+fn metadata_fetch_bucket_json(
+    bucket: &[lpm_registry::timing::MetadataFetchDetailRecord],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        bucket
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "package": record.package,
+                    "route": record.route,
+                    "total_ms": record.total_ms,
+                    "raw_fetch_ms": record.raw_fetch_ms,
+                    "cache_read_ms": record.cache_read_ms,
+                    "validator_read_ms": record.validator_read_ms,
+                    "http_ms": record.http_ms,
+                    "body_read_ms": record.body_read_ms,
+                    "json_decode_ms": record.json_decode_ms,
+                    "cache_after_304_ms": record.cache_after_304_ms,
+                    "cache_write_dispatch_ms": record.cache_write_dispatch_ms,
+                    "cache_info_parse_ms": record.cache_info_parse_ms,
+                    "policy_release_time_ms": record.policy_release_time_ms,
+                    "policy_full_metadata_ms": record.policy_full_metadata_ms,
+                    "body_bytes": record.body_bytes,
+                    "version_count": record.version_count,
+                    "cache_hit": record.cache_hit,
+                    "not_modified": record.not_modified,
+                })
+            })
+            .collect(),
+    )
+}
+
 pub(super) fn resolve_detail_json(
     resolve_wall_ms: u128,
     initial_batch_ms: u128,
     stage: &lpm_resolver::StageTiming,
     metadata_snapshots: &[lpm_registry::timing::MetadataPurposeSnapshot],
+    mode: TimingDetailMode,
 ) -> serde_json::Value {
     let default_metadata = lpm_registry::timing::MetadataPurposeSnapshot::default();
     let resolve_metadata = metadata_snapshots
@@ -928,7 +1026,7 @@ pub(super) fn resolve_detail_json(
         .find(|snapshot| snapshot.purpose == "resolve")
         .unwrap_or(&default_metadata);
     let pubgrub_core_estimate_ms = stage.pubgrub_ms.saturating_sub(stage.followup_rpc_ms);
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "wall_ms": resolve_wall_ms,
         "initial_batch_ms": initial_batch_ms,
         "metadata": {
@@ -974,7 +1072,13 @@ pub(super) fn resolve_detail_json(
         "other_ms": resolve_wall_ms
             .saturating_sub(initial_batch_ms)
             .saturating_sub(stage.pubgrub_ms as u128),
-    })
+    });
+    if mode.trace() {
+        let metadata_fetch_detail = lpm_registry::timing::snapshot_metadata_fetch_detail();
+        json["metadata_fetch"] =
+            metadata_fetch_detail_json_from_snapshot(&metadata_fetch_detail, mode);
+    }
+    json
 }
 
 #[cfg(test)]
@@ -1123,6 +1227,86 @@ mod tests {
         assert_eq!(row["dir_count"], 14);
         assert_eq!(row["symlink_count"], 15);
         assert_eq!(row["unpacked_bytes"], 16);
+    }
+
+    #[test]
+    fn metadata_fetch_trace_reports_slow_package_attribution_rows() {
+        let record = lpm_registry::timing::MetadataFetchDetailRecord {
+            package: "left-pad".to_string(),
+            route: "npm_direct",
+            total_ms: 21,
+            raw_fetch_ms: 18,
+            cache_read_ms: 1,
+            validator_read_ms: 2,
+            http_ms: 12,
+            body_read_ms: 3,
+            json_decode_ms: 4,
+            cache_after_304_ms: 5,
+            cache_write_dispatch_ms: 6,
+            cache_info_parse_ms: 7,
+            policy_release_time_ms: 8,
+            policy_full_metadata_ms: 9,
+            body_bytes: 1024,
+            version_count: 42,
+            cache_hit: true,
+            not_modified: true,
+        };
+        let snapshot = lpm_registry::timing::MetadataFetchDetailSnapshot {
+            calls: 1,
+            cache_hit_count: 1,
+            not_modified_count: 1,
+            body_bytes_sum: 1024,
+            version_count_sum: 42,
+            route_npm_direct_count: 1,
+            attribution: lpm_registry::timing::MetadataFetchAttributionSnapshot {
+                total_sum_ms: 21,
+                total_max_ms: 21,
+                raw_fetch_sum_ms: 18,
+                raw_fetch_max_ms: 18,
+                cache_read_sum_ms: 1,
+                validator_read_sum_ms: 2,
+                http_sum_ms: 12,
+                body_read_sum_ms: 3,
+                json_decode_sum_ms: 4,
+                cache_after_304_sum_ms: 5,
+                cache_write_dispatch_sum_ms: 6,
+                cache_info_parse_sum_ms: 7,
+                policy_release_time_sum_ms: 8,
+                policy_full_metadata_sum_ms: 9,
+            },
+            top_slow_packages: lpm_registry::timing::MetadataFetchSlowSnapshot {
+                by_total: vec![record],
+                ..lpm_registry::timing::MetadataFetchSlowSnapshot::default()
+            },
+            ..lpm_registry::timing::MetadataFetchDetailSnapshot::default()
+        };
+
+        let json = metadata_fetch_detail_json_from_snapshot(&snapshot, TimingDetailMode::Trace);
+        let row = &json["top_slow_packages"]["by_total"][0];
+
+        assert_eq!(json["calls"], 1);
+        assert_eq!(json["scope"], "per_package_metadata_fetches");
+        assert_eq!(json["batch_fetches_included"], false);
+        assert_eq!(json["routes"]["npm_direct"], 1);
+        assert_eq!(json["attribution"]["http_sum_ms"], 12);
+        assert_eq!(row["package"], "left-pad");
+        assert_eq!(row["route"], "npm_direct");
+        assert_eq!(row["total_ms"], 21);
+        assert_eq!(row["raw_fetch_ms"], 18);
+        assert_eq!(row["cache_read_ms"], 1);
+        assert_eq!(row["validator_read_ms"], 2);
+        assert_eq!(row["http_ms"], 12);
+        assert_eq!(row["body_read_ms"], 3);
+        assert_eq!(row["json_decode_ms"], 4);
+        assert_eq!(row["cache_after_304_ms"], 5);
+        assert_eq!(row["cache_write_dispatch_ms"], 6);
+        assert_eq!(row["cache_info_parse_ms"], 7);
+        assert_eq!(row["policy_release_time_ms"], 8);
+        assert_eq!(row["policy_full_metadata_ms"], 9);
+        assert_eq!(row["body_bytes"], 1024);
+        assert_eq!(row["version_count"], 42);
+        assert!(row["cache_hit"].as_bool().unwrap_or(false));
+        assert!(row["not_modified"].as_bool().unwrap_or(false));
     }
 
     #[test]
