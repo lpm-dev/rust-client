@@ -698,7 +698,7 @@ pub(super) async fn run(
     let graph_source = InstallerSpikeGraphSource::from_env();
     let timing_detail_mode = TimingDetailMode::from_env();
     let fetch_queue = Arc::new(Semaphore::new(fetch_concurrency));
-    let fetch_extract_limiter = configured_fetch_extract_limiter();
+    let fetch_extract_limiter = configured_fetch_extract_limiter(store_v2_handle.is_some());
     let metadata_queue = Arc::new(Semaphore::new(metadata_concurrency));
     let metadata_cache: MetadataCache = Arc::new(dashmap::DashMap::new());
     let metadata_stats = Arc::new(MetadataStats::default());

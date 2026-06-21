@@ -2212,13 +2212,13 @@ async fn run_with_options_under_store_lock(
     let mut ambient_peer_installs_for_lockfile: Vec<String> = Vec::new();
 
     //: fetch semaphore hoisted out of the fetch loop so the
-    // optional speculative dispatcher can share the 16-permit download
+    // optional speculative dispatcher can share the download
     // pool with the post-resolve real-fetch loop. Without sharing, a
-    // spec dispatcher racing 16 downloads alongside the later real loop's
-    // 16 would saturate the network for no wall-clock win. One pool,
+    // spec dispatcher racing alongside the later real loop would
+    // saturate the network for no wall-clock win. One pool,
     // used first by speculation, then drained by real fetch.
     let fetch_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
-    let fetch_extract_limiter = configured_fetch_extract_limiter();
+    let fetch_extract_limiter = configured_fetch_extract_limiter(requested_v2_mode);
     //: also hoist the `PackageStore` so the speculative
     // dispatcher can write tarballs into the real store during the
     // resolve phase. Post-resolve, the fetch loop rebinds to the same
