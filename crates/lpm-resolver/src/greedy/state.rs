@@ -2,6 +2,7 @@ use super::peer::{CachedPeerResolution, PeerResolutionCacheKey};
 use super::prelude::*;
 use super::types::{DepBehavior, Edge, NodeId, PeerConflictReport, PeerRequirement};
 use super::version::is_workspace_specifier;
+use super::version::{VersionPick, find_best_version_with_policy};
 use crate::resolve::SelectedPackageEvent;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -13,6 +14,176 @@ pub(super) struct ResolveWorkStats {
     pub(super) node_allocated_count: u64,
     pub(super) child_edge_enqueued_count: u64,
     pub(super) peer_requirement_count: u64,
+    pub(super) metadata_miss_count: u64,
+    pub(super) metadata_miss_direct_count: u64,
+    pub(super) metadata_miss_latest_known_count: u64,
+    pub(super) metadata_miss_latest_known_direct_count: u64,
+    pub(super) metadata_miss_latest_satisfies_count: u64,
+    pub(super) metadata_miss_latest_satisfies_direct_count: u64,
+    pub(super) metadata_miss_latest_matches_pick_count: u64,
+    pub(super) metadata_miss_latest_matches_pick_direct_count: u64,
+    pub(super) metadata_miss_version_doc_policy_eligible_count: u64,
+    pub(super) metadata_miss_version_doc_policy_eligible_direct_count: u64,
+    pub(super) metadata_miss_latest_matches_pick_version_doc_policy_eligible_count: u64,
+    pub(super) metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count: u64,
+    pub(super) metadata_miss_exact_count: u64,
+    pub(super) metadata_miss_star_count: u64,
+    pub(super) metadata_miss_caret_count: u64,
+    pub(super) metadata_miss_tilde_count: u64,
+    pub(super) metadata_miss_comparator_count: u64,
+    pub(super) metadata_miss_complex_count: u64,
+    pub(super) metadata_miss_other_count: u64,
+}
+
+impl ResolveWorkStats {
+    pub(super) fn record_metadata_miss(
+        &mut self,
+        canonical: &CanonicalKey,
+        range: &NpmRange,
+        route_table: &RouteTable,
+    ) {
+        self.metadata_miss_count = self.metadata_miss_count.saturating_add(1);
+        if matches!(
+            canonical,
+            CanonicalKey::Npm { name }
+                if matches!(route_table.route_for_package(name), UpstreamRoute::NpmDirect)
+        ) {
+            self.metadata_miss_direct_count = self.metadata_miss_direct_count.saturating_add(1);
+        }
+
+        match metadata_miss_range_shape(range) {
+            MetadataMissRangeShape::Exact => {
+                self.metadata_miss_exact_count = self.metadata_miss_exact_count.saturating_add(1);
+            }
+            MetadataMissRangeShape::Star => {
+                self.metadata_miss_star_count = self.metadata_miss_star_count.saturating_add(1);
+            }
+            MetadataMissRangeShape::Caret => {
+                self.metadata_miss_caret_count = self.metadata_miss_caret_count.saturating_add(1);
+            }
+            MetadataMissRangeShape::Tilde => {
+                self.metadata_miss_tilde_count = self.metadata_miss_tilde_count.saturating_add(1);
+            }
+            MetadataMissRangeShape::Comparator => {
+                self.metadata_miss_comparator_count =
+                    self.metadata_miss_comparator_count.saturating_add(1);
+            }
+            MetadataMissRangeShape::Complex => {
+                self.metadata_miss_complex_count =
+                    self.metadata_miss_complex_count.saturating_add(1);
+            }
+            MetadataMissRangeShape::Other => {
+                self.metadata_miss_other_count = self.metadata_miss_other_count.saturating_add(1);
+            }
+        }
+    }
+
+    pub(super) fn record_metadata_miss_latest(
+        &mut self,
+        canonical: &CanonicalKey,
+        range: &NpmRange,
+        info: &CachedPackageInfo,
+        latest_version: Option<&NpmVersion>,
+        route_table: &RouteTable,
+        policy: &ResolverPolicy,
+    ) {
+        let Some(latest_version) = latest_version else {
+            return;
+        };
+        self.metadata_miss_latest_known_count =
+            self.metadata_miss_latest_known_count.saturating_add(1);
+        let direct = matches!(
+            canonical,
+            CanonicalKey::Npm { name }
+                if matches!(route_table.route_for_package(name), UpstreamRoute::NpmDirect)
+        );
+        if direct {
+            self.metadata_miss_latest_known_direct_count = self
+                .metadata_miss_latest_known_direct_count
+                .saturating_add(1);
+        }
+        let version_doc_policy_eligible =
+            !policy.release_age_applies_to_package(canonical) && !policy.requires_trust_history();
+        if version_doc_policy_eligible {
+            self.metadata_miss_version_doc_policy_eligible_count = self
+                .metadata_miss_version_doc_policy_eligible_count
+                .saturating_add(1);
+            if direct {
+                self.metadata_miss_version_doc_policy_eligible_direct_count = self
+                    .metadata_miss_version_doc_policy_eligible_direct_count
+                    .saturating_add(1);
+            }
+        }
+        if range.satisfies(latest_version) {
+            self.metadata_miss_latest_satisfies_count =
+                self.metadata_miss_latest_satisfies_count.saturating_add(1);
+            if direct {
+                self.metadata_miss_latest_satisfies_direct_count = self
+                    .metadata_miss_latest_satisfies_direct_count
+                    .saturating_add(1);
+            }
+        }
+        if matches!(
+            find_best_version_with_policy(canonical, info, range, policy),
+            VersionPick::Picked(best) if &best == latest_version
+        ) {
+            self.metadata_miss_latest_matches_pick_count = self
+                .metadata_miss_latest_matches_pick_count
+                .saturating_add(1);
+            if direct {
+                self.metadata_miss_latest_matches_pick_direct_count = self
+                    .metadata_miss_latest_matches_pick_direct_count
+                    .saturating_add(1);
+            }
+            if version_doc_policy_eligible {
+                self.metadata_miss_latest_matches_pick_version_doc_policy_eligible_count = self
+                    .metadata_miss_latest_matches_pick_version_doc_policy_eligible_count
+                    .saturating_add(1);
+                if direct {
+                    self.metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count =
+                        self.metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count
+                            .saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataMissRangeShape {
+    Exact,
+    Star,
+    Caret,
+    Tilde,
+    Comparator,
+    Complex,
+    Other,
+}
+
+fn metadata_miss_range_shape(range: &NpmRange) -> MetadataMissRangeShape {
+    let raw = range.raw().trim();
+    if raw == "*" {
+        return MetadataMissRangeShape::Star;
+    }
+    if NpmVersion::parse(raw).is_ok() {
+        return MetadataMissRangeShape::Exact;
+    }
+    if raw.contains("||") || raw.contains(" - ") {
+        return MetadataMissRangeShape::Complex;
+    }
+    if raw.starts_with('^') {
+        return MetadataMissRangeShape::Caret;
+    }
+    if raw.starts_with('~') {
+        return MetadataMissRangeShape::Tilde;
+    }
+    if raw.starts_with('<') || raw.starts_with('>') || raw.starts_with('=') {
+        return MetadataMissRangeShape::Comparator;
+    }
+    if raw.contains(' ') || raw.contains(',') {
+        return MetadataMissRangeShape::Complex;
+    }
+    MetadataMissRangeShape::Other
 }
 
 /// Carrier for the per-pass mutable state. Keeps the dispatch loop
@@ -467,5 +638,32 @@ fn canonical_to_resolver_package(key: &CanonicalKey) -> ResolverPackage {
             name: name.clone(),
             context: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shape(raw: &str) -> MetadataMissRangeShape {
+        metadata_miss_range_shape(&NpmRange::parse(raw).expect("valid test range"))
+    }
+
+    #[test]
+    fn metadata_miss_range_shape_classifies_exact_versions() {
+        assert_eq!(shape("1.2.3"), MetadataMissRangeShape::Exact);
+    }
+
+    #[test]
+    fn metadata_miss_range_shape_classifies_latest_as_star() {
+        assert_eq!(shape("latest"), MetadataMissRangeShape::Star);
+    }
+
+    #[test]
+    fn metadata_miss_range_shape_classifies_common_range_operators() {
+        assert_eq!(shape("^1.2.3"), MetadataMissRangeShape::Caret);
+        assert_eq!(shape("~1.2.3"), MetadataMissRangeShape::Tilde);
+        assert_eq!(shape(">=1.2.3"), MetadataMissRangeShape::Comparator);
+        assert_eq!(shape("^1.0.0 || ^2.0.0"), MetadataMissRangeShape::Complex);
     }
 }

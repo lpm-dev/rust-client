@@ -294,6 +294,55 @@ pub struct StageTiming {
     pub work_child_edge_enqueued_count: u64,
     /// Peer requirements collected from selected package manifests.
     pub work_peer_requirement_count: u64,
+    /// Distinct canonical metadata misses that dispatched a resolver
+    /// metadata request.
+    pub work_metadata_miss_count: u64,
+    /// Metadata misses whose canonical routed directly to npm.
+    pub work_metadata_miss_direct_count: u64,
+    /// Metadata misses whose fetched metadata exposed a parseable `latest`
+    /// dist-tag.
+    pub work_metadata_miss_latest_known_count: u64,
+    /// Direct-npm metadata misses whose fetched metadata exposed a parseable
+    /// `latest` dist-tag.
+    pub work_metadata_miss_latest_known_direct_count: u64,
+    /// Metadata misses whose triggering range would accept the fetched
+    /// `latest` dist-tag.
+    pub work_metadata_miss_latest_satisfies_count: u64,
+    /// Direct-npm metadata misses whose triggering range would accept the
+    /// fetched `latest` dist-tag.
+    pub work_metadata_miss_latest_satisfies_direct_count: u64,
+    /// Metadata misses where the fetched `latest` dist-tag equals the
+    /// policy-aware version pick from the full metadata.
+    pub work_metadata_miss_latest_matches_pick_count: u64,
+    /// Direct-npm metadata misses where the fetched `latest` dist-tag equals
+    /// the policy-aware version pick from the full metadata.
+    pub work_metadata_miss_latest_matches_pick_direct_count: u64,
+    /// Metadata misses where a version/latest endpoint could satisfy resolver
+    /// policy without package-level history.
+    pub work_metadata_miss_version_doc_policy_eligible_count: u64,
+    /// Direct-npm metadata misses where a version/latest endpoint could satisfy
+    /// resolver policy without package-level history.
+    pub work_metadata_miss_version_doc_policy_eligible_direct_count: u64,
+    /// Metadata misses where `latest` matches the full-metadata pick and a
+    /// version/latest endpoint could satisfy resolver policy.
+    pub work_metadata_miss_latest_matches_pick_version_doc_policy_eligible_count: u64,
+    /// Direct-npm metadata misses where `latest` matches the full-metadata pick
+    /// and a version/latest endpoint could satisfy resolver policy.
+    pub work_metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count: u64,
+    /// Metadata misses whose triggering edge used an exact version.
+    pub work_metadata_miss_exact_count: u64,
+    /// Metadata misses whose triggering edge used `*`, empty, or `latest`.
+    pub work_metadata_miss_star_count: u64,
+    /// Metadata misses whose triggering edge used a caret range.
+    pub work_metadata_miss_caret_count: u64,
+    /// Metadata misses whose triggering edge used a tilde range.
+    pub work_metadata_miss_tilde_count: u64,
+    /// Metadata misses whose triggering edge used a comparator range.
+    pub work_metadata_miss_comparator_count: u64,
+    /// Metadata misses whose triggering edge used a union/hyphen/compound range.
+    pub work_metadata_miss_complex_count: u64,
+    /// Metadata misses whose triggering edge used another valid range shape.
+    pub work_metadata_miss_other_count: u64,
     /// Final selected package rows emitted to the install pipeline.
     pub selected_package_count: u64,
     /// Distinct canonical packages in the final selected package rows.

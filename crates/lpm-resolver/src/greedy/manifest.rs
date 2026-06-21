@@ -129,6 +129,7 @@ async fn direct_fetch(
 pub(super) struct FetchedMetadata {
     pub(super) speculation: Option<SpeculativePackageMetadata>,
     pub(super) info: Arc<CachedPackageInfo>,
+    pub(super) latest_version: Option<NpmVersion>,
 }
 
 pub(super) type FetchResult = Result<FetchedMetadata, ResolveError>;
@@ -141,6 +142,7 @@ pub(super) async fn fetch_metadata_for_resolver(
     include_speculation: bool,
 ) -> Result<FetchedMetadata, ResolveError> {
     let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
+    let latest_version = latest_version_from_metadata(&metadata);
     let dist_tags = metadata.dist_tags.clone();
     let mut info = parse_metadata_to_cache_info(&metadata);
     if info.needs_trust_metadata(policy) {
@@ -157,6 +159,7 @@ pub(super) async fn fetch_metadata_for_resolver(
         fetch_release_times_for_policy(client, route_table, canonical, &mut info).await?;
     }
     Ok(fetched_metadata_from_info(
+        latest_version,
         dist_tags,
         info,
         include_speculation,
@@ -180,6 +183,7 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
     timings.raw_fetch_ms = raw_start.elapsed().as_millis();
     timings.route = raw.route;
     timings.version_count = raw.metadata.versions.len() as u64;
+    let latest_version = latest_version_from_metadata(&raw.metadata);
     if let Some(registry) = raw.registry_timings {
         timings.cache_hit = registry.cache_hit;
         timings.not_modified = registry.not_modified;
@@ -216,7 +220,7 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
         fetch_release_times_for_policy(client, route_table, canonical, &mut info).await?;
         timings.policy_release_time_ms = policy_start.elapsed().as_millis();
     }
-    let fetched = fetched_metadata_from_info(dist_tags, info, include_speculation);
+    let fetched = fetched_metadata_from_info(latest_version, dist_tags, info, include_speculation);
     timings.total_ms = total_start.elapsed().as_millis();
     Ok((fetched, timings))
 }
@@ -281,11 +285,16 @@ pub(super) fn parse_fetched_metadata(
     metadata: lpm_registry::PackageMetadata,
     include_speculation: bool,
 ) -> FetchedMetadata {
+    let latest_version = latest_version_from_metadata(&metadata);
     let info = Arc::new(parse_metadata_to_cache_info(&metadata));
     let speculation = include_speculation.then(|| {
         SpeculativePackageMetadata::from_dist_tags_and_info(metadata.dist_tags, info.clone())
     });
-    FetchedMetadata { speculation, info }
+    FetchedMetadata {
+        speculation,
+        info,
+        latest_version,
+    }
 }
 
 pub(super) fn parse_full_fetched_metadata(
@@ -293,6 +302,7 @@ pub(super) fn parse_full_fetched_metadata(
     include_speculation: bool,
 ) -> FetchedMetadata {
     fetched_metadata_from_info(
+        latest_version_from_metadata(&metadata),
         metadata.dist_tags.clone(),
         parse_full_metadata_to_cache_info(&metadata),
         include_speculation,
@@ -300,6 +310,7 @@ pub(super) fn parse_full_fetched_metadata(
 }
 
 fn fetched_metadata_from_info(
+    latest_version: Option<NpmVersion>,
     dist_tags: HashMap<String, String>,
     info: CachedPackageInfo,
     include_speculation: bool,
@@ -307,7 +318,17 @@ fn fetched_metadata_from_info(
     let info = Arc::new(info);
     let speculation = include_speculation
         .then(|| SpeculativePackageMetadata::from_dist_tags_and_info(dist_tags, info.clone()));
-    FetchedMetadata { speculation, info }
+    FetchedMetadata {
+        speculation,
+        info,
+        latest_version,
+    }
+}
+
+fn latest_version_from_metadata(metadata: &lpm_registry::PackageMetadata) -> Option<NpmVersion> {
+    metadata
+        .latest_version_tag()
+        .and_then(|version| NpmVersion::parse(version).ok())
 }
 
 pub(super) async fn ensure_policy_metadata_for_cached_manifest(
@@ -460,37 +481,80 @@ async fn fetch_full_metadata_for_policy(
     ))
 }
 
+pub(super) struct MetadataFetchCompletion<'a> {
+    pub(super) shared_cache: &'a SharedCache,
+    pub(super) route_table: &'a RouteTable,
+    pub(super) counted_metadata_misses: &'a mut AHashSet<CanonicalKey>,
+    spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
+    pub(super) tarball_dispatched_count: &'a mut u64,
+    pub(super) parked: &'a mut AHashMap<CanonicalKey, Vec<Edge>>,
+    pub(super) state: &'a mut ResolveState,
+}
+
+impl<'a> MetadataFetchCompletion<'a> {
+    pub(super) fn new(
+        shared_cache: &'a SharedCache,
+        route_table: &'a RouteTable,
+        counted_metadata_misses: &'a mut AHashSet<CanonicalKey>,
+        spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
+        tarball_dispatched_count: &'a mut u64,
+        parked: &'a mut AHashMap<CanonicalKey, Vec<Edge>>,
+        state: &'a mut ResolveState,
+    ) -> Self {
+        Self {
+            shared_cache,
+            route_table,
+            counted_metadata_misses,
+            spec_tx,
+            tarball_dispatched_count,
+            parked,
+            state,
+        }
+    }
+}
+
 pub(super) fn complete_metadata_fetch(
     canonical: CanonicalKey,
     result: FetchResult,
-    shared_cache: &SharedCache,
-    spec_tx: Option<&tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
-    tarball_dispatched_count: &mut u64,
-    parked: &mut AHashMap<CanonicalKey, Vec<Edge>>,
-    state: &mut ResolveState,
+    completion: &mut MetadataFetchCompletion<'_>,
 ) -> Result<(), ResolveError> {
+    let count_latest_for_miss = completion.counted_metadata_misses.remove(&canonical);
     match result {
         Ok(fetched) => {
-            let FetchedMetadata { speculation, info } = fetched;
-            shared_cache.insert(canonical.clone(), info);
-            if let (Some(tx), Some(speculation)) = (spec_tx, speculation)
+            let FetchedMetadata {
+                speculation,
+                info,
+                latest_version,
+            } = fetched;
+            if let (Some(tx), Some(speculation)) = (completion.spec_tx, speculation)
                 && tx.try_send((canonical.to_string(), speculation)).is_ok()
             {
-                *tarball_dispatched_count += 1;
+                *completion.tarball_dispatched_count += 1;
             }
-            if let Some(mut edges) = parked.remove(&canonical) {
+            if let Some(mut edges) = completion.parked.remove(&canonical) {
+                if count_latest_for_miss && let Some(edge) = edges.first() {
+                    completion.state.work_stats.record_metadata_miss_latest(
+                        &canonical,
+                        &edge.range,
+                        &info,
+                        latest_version.as_ref(),
+                        completion.route_table,
+                        &completion.state.policy,
+                    );
+                }
                 edges.sort_by(|a, b| {
                     (a.parent, a.local_name.as_str()).cmp(&(b.parent, b.local_name.as_str()))
                 });
                 for e in edges {
-                    state.task_queue.push_back(e);
+                    completion.state.task_queue.push_back(e);
                 }
             }
+            completion.shared_cache.insert(canonical, info);
         }
         Err(e) => {
-            if let Some(edges) = parked.remove(&canonical) {
+            if let Some(edges) = completion.parked.remove(&canonical) {
                 for edge in edges {
-                    propagate_fetch_error(&edge, &e, state)?;
+                    propagate_fetch_error(&edge, &e, completion.state)?;
                 }
             }
         }
