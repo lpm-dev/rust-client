@@ -2101,6 +2101,159 @@ async fn install_experimental_spike_live_graph_accepts_overrides_with_parity_den
 }
 
 #[tokio::test]
+async fn install_experimental_spike_live_graph_links_file_source_with_transitive_registry_dep() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "dep-fn",
+            "version": "1.0.0",
+            "main": "index.js"
+        }),
+        &[("index.js", b"module.exports = () => 'dep-ok';\n")],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "spike-live-file-source",
+  "version": "1.0.0",
+  "dependencies": {
+    "local-pkg": "file:./packages/local-pkg"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/local-pkg/package.json",
+        r#"{
+  "name": "local-pkg",
+  "version": "0.1.0",
+  "main": "index.js",
+  "dependencies": {
+    "dep-fn": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/local-pkg/index.js",
+        "module.exports = require('dep-fn')();\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run experimental installer spike");
+
+    assert!(
+        output.status.success(),
+        "experimental live install with file: source should succeed under parity deny\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("experimental install --json must emit valid JSON: {e}\n---\n{stdout}")
+    });
+    let parity = &envelope["timing"]["experimental_installer_spike"]["parity"];
+    assert_eq!(parity["matches"], serde_json::json!(true));
+    assert_eq!(parity["candidate_count"], serde_json::json!(2));
+    assert_eq!(parity["baseline_count"], serde_json::json!(2));
+
+    let require_local = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(String(require('local-pkg')))")
+        .output()
+        .expect("run local source require");
+    assert!(
+        require_local.status.success(),
+        "local source require should resolve its registry transitive\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&require_local.stdout),
+        String::from_utf8_lossy(&require_local.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&require_local.stdout), "dep-ok");
+}
+
+#[tokio::test]
+async fn install_experimental_spike_live_graph_links_workspace_member_source() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "spike-live-workspace-source",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {
+    "ws-member-a": "workspace:*"
+  }
+}"#,
+    );
+    project.write_file(
+        "packages/ws-member-a/package.json",
+        r#"{"name":"ws-member-a","version":"1.2.3","main":"index.js"}"#,
+    );
+    project.write_file(
+        "packages/ws-member-a/index.js",
+        "module.exports = 'workspace-ok';\n",
+    );
+
+    let output = lpm(&project)
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run experimental installer spike");
+
+    assert!(
+        output.status.success(),
+        "experimental live install with workspace:* source should succeed under parity deny\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("experimental install --json must emit valid JSON: {e}\n---\n{stdout}")
+    });
+    let parity = &envelope["timing"]["experimental_installer_spike"]["parity"];
+    assert_eq!(parity["matches"], serde_json::json!(true));
+    assert_eq!(parity["candidate_count"], serde_json::json!(1));
+    assert_eq!(parity["baseline_count"], serde_json::json!(1));
+
+    let require_member = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('ws-member-a'))")
+        .output()
+        .expect("run workspace member require");
+    assert!(
+        require_member.status.success(),
+        "workspace member require should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&require_member.stdout),
+        String::from_utf8_lossy(&require_member.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&require_member.stdout),
+        "workspace-ok"
+    );
+}
+
+#[tokio::test]
 async fn install_experimental_spike_live_graph_rejects_frozen_lockfile_invocation() {
     let mock = MockRegistry::start().await;
     mount_ms_2_1_3(&mock).await;

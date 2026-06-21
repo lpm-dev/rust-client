@@ -28,6 +28,7 @@ pub(super) struct InstallerSpikeAdmission {
     pub(super) omit_policy: InstallOmitPolicy,
     pub(super) has_workspace_member_deps: bool,
     pub(super) has_v2_workspace_member_deps: bool,
+    pub(super) has_tarball_source_deps: bool,
     pub(super) has_patches: bool,
     pub(super) patches_changed: bool,
     pub(super) verify_registry_signatures: bool,
@@ -115,8 +116,13 @@ fn unsupported_admission_reasons(
     if admission.omit_policy.optional {
         reasons.push("--omit=optional is not supported");
     }
-    if admission.has_workspace_member_deps || admission.has_v2_workspace_member_deps {
-        reasons.push("workspace member links are not supported");
+    if (admission.has_workspace_member_deps || admission.has_v2_workspace_member_deps)
+        && graph_source != InstallerSpikeGraphSource::ResolveWorklist
+    {
+        reasons.push("workspace member links require resolve-worklist graph mode");
+    }
+    if admission.has_tarball_source_deps {
+        reasons.push("tarball source deps are not supported");
     }
     if admission.has_patches || admission.patches_changed {
         reasons.push("patches are not supported");
@@ -677,6 +683,9 @@ pub(super) async fn run(
     resolver_policy: lpm_resolver::ResolverPolicy,
     auto_install_peers: bool,
     include_optional_dependencies: bool,
+    pre_resolved_install_pkgs: &[InstallPackage],
+    pre_resolved_source_deps: &HashMap<String, Vec<SourceDep>>,
+    workspace_member_deps: &[WorkspaceMemberLink],
     all_workspace_members: &[WorkspaceMemberLink],
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
 ) -> Result<(), LpmError> {
@@ -863,6 +872,25 @@ pub(super) async fn run(
                 .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
             dedupe_install_packages_by_identity(&mut install_packages);
             stage_timings.package_graph_ms = package_graph_start.elapsed().as_millis();
+            merge_pre_resolved_packages(
+                &mut install_packages,
+                pre_resolved_install_pkgs,
+                pre_resolved_source_deps,
+            );
+            spawn_fetches_for_packages(
+                pre_resolved_install_pkgs,
+                &store,
+                store_v2_handle.clone(),
+                project_dir,
+                &client,
+                &route_table,
+                &fetch_queue,
+                Arc::clone(&gate_stats),
+                force,
+                fetch_extract_limiter.clone(),
+                &mut fetch_handles,
+                &mut stats,
+            )?;
             install_packages
         }
         InstallerSpikeGraphSource::Lockfile => {
@@ -883,6 +911,11 @@ pub(super) async fn run(
             stats.root_requests = deps.len() as u64;
             stats.selected_nodes = install_packages.len() as u64;
             stats.inserted_nodes = install_packages.len() as u64;
+            merge_pre_resolved_packages(
+                &mut install_packages,
+                pre_resolved_install_pkgs,
+                pre_resolved_source_deps,
+            );
             install_packages
         }
         InstallerSpikeGraphSource::Invalid => {
@@ -924,6 +957,8 @@ pub(super) async fn run(
         include_optional_dependencies,
         all_workspace_members,
         catalog_resolutions,
+        pre_resolved_install_pkgs,
+        pre_resolved_source_deps,
         project_dir,
         &install_packages,
         json_output,
@@ -936,6 +971,7 @@ pub(super) async fn run(
     stage_timings.link_targets_ms = link_targets_start.elapsed().as_millis();
     let v2_event_plan = match store_v2_handle.as_ref() {
         Some(store_v2) => {
+            populate_v2_local_source_objects(&link_targets, store_v2)?;
             let v2_targets_start = Instant::now();
             let v2_targets = build_v2_targets(&install_packages, &link_targets)?;
             stage_timings.v2_targets_ms = v2_targets_start.elapsed().as_millis();
@@ -1044,6 +1080,13 @@ pub(super) async fn run(
     stage_timings.link_task_await_ms = link_outcome.task_await_ms;
     stage_timings.link_finalize_ms = link_outcome.finalize_ms;
     let link_result = link_outcome.result;
+    let workspace_links_created = link_workspace_members(project_dir, workspace_member_deps)?;
+    if workspace_links_created > 0 && !json_output {
+        output::info(&format!(
+            "Linked {} workspace member(s)",
+            workspace_links_created.to_string().bold()
+        ));
+    }
     let link_ms = link_start.elapsed().as_millis();
     let total_ms = start.elapsed().as_millis();
 
@@ -1153,6 +1196,54 @@ fn installer_spike_metadata_concurrency() -> usize {
         .unwrap_or(DEFAULT_INSTALLER_SPIKE_METADATA_CONCURRENCY)
 }
 
+pub(super) fn has_tarball_source_deps(project_dir: &Path, deps: &HashMap<String, String>) -> bool {
+    deps.values()
+        .any(|raw| match lpm_resolver::Specifier::parse(raw) {
+            Ok(lpm_resolver::Specifier::Tarball { .. }) => true,
+            Ok(lpm_resolver::Specifier::File { path }) => {
+                std::fs::metadata(project_dir.join(path)).is_ok_and(|meta| meta.is_file())
+            }
+            _ => false,
+        })
+}
+
+fn merge_pre_resolved_packages(
+    packages: &mut Vec<InstallPackage>,
+    pre_resolved_install_pkgs: &[InstallPackage],
+    pre_resolved_source_deps: &HashMap<String, Vec<SourceDep>>,
+) {
+    if !pre_resolved_install_pkgs.is_empty() {
+        packages.extend(pre_resolved_install_pkgs.iter().cloned());
+    }
+    if !pre_resolved_source_deps.is_empty() {
+        apply_post_resolve_directory_link_fixup(packages, pre_resolved_source_deps);
+    }
+    dedupe_install_packages_by_identity(packages);
+}
+
+fn populate_v2_local_source_objects(
+    link_targets: &[LinkTarget],
+    store_v2: &lpm_store::v2::Store,
+) -> Result<(), LpmError> {
+    for target in link_targets {
+        if matches!(
+            target.materialization,
+            lpm_linker::Materialization::DirectorySource
+        ) {
+            let sri = local_source_sri_for_target(target);
+            store_v2.populate_object_from_local_source(&target.store_path, &sri)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_local_source_package(package: &InstallPackage) -> bool {
+    matches!(
+        package.source_kind(),
+        Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
+    )
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum InstallerSpikeGraphSource {
     ResolveWorklist,
@@ -1240,6 +1331,8 @@ async fn compute_parity_if_requested(
     include_optional_dependencies: bool,
     all_workspace_members: &[WorkspaceMemberLink],
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    pre_resolved_install_pkgs: &[InstallPackage],
+    pre_resolved_source_deps: &HashMap<String, Vec<SourceDep>>,
     project_dir: &Path,
     candidate_packages: &[InstallPackage],
     json_output: bool,
@@ -1288,6 +1381,11 @@ async fn compute_parity_if_requested(
             normalize_install_package_optional_reachability(
                 &mut packages,
                 &optional_dependency_names,
+            );
+            merge_pre_resolved_packages(
+                &mut packages,
+                pre_resolved_install_pkgs,
+                pre_resolved_source_deps,
             );
             packages
         }
@@ -2568,6 +2666,23 @@ fn maybe_spawn_fetch(
     let store = store.clone();
     let project_dir = project_dir.to_path_buf();
     let handle = tokio::spawn(async move {
+        if is_local_source_package(&package) {
+            if package.store_has_source_aware(&store, &project_dir) {
+                return Ok(FetchOutcome {
+                    key,
+                    package_display,
+                    computed_sri: package.integrity.clone(),
+                    timings: None,
+                    cached: true,
+                });
+            }
+            package.store_path_or_err(&store, &project_dir, None)?;
+            return Err(LpmError::Registry(format!(
+                "local source package {}@{} is missing package.json",
+                package.name, package.version
+            )));
+        }
+
         if !force
             && package.store_has_for_install_layout(
                 &store,
@@ -2764,6 +2879,7 @@ mod tests {
             omit_policy: InstallOmitPolicy::default(),
             has_workspace_member_deps: false,
             has_v2_workspace_member_deps: false,
+            has_tarball_source_deps: false,
             has_patches: false,
             patches_changed: false,
             verify_registry_signatures: false,
@@ -2983,13 +3099,45 @@ mod tests {
         );
 
         assert!(reasons.contains(&"--prod/--omit=dev is not supported"));
-        assert!(reasons.contains(&"workspace member links are not supported"));
+        assert!(reasons.contains(&"workspace member links require resolve-worklist graph mode"));
         assert!(!reasons.contains(&"overrides are not supported"));
         assert!(reasons.contains(&"patches are not supported"));
         assert!(reasons.contains(&"registry signature verification is not supported"));
         assert!(reasons.contains(&"audit-after-install is not supported"));
         assert!(reasons.contains(&"script policy/build execution options are not supported"));
         assert!(reasons.contains(&"strict minimumReleaseAge lockfile replay is not supported"));
+    }
+
+    #[test]
+    fn admission_accepts_workspace_member_links_for_live_resolve_worklist() {
+        let mut admission = benchmark_admission();
+        admission.frozen_lockfile_active = false;
+        admission.has_workspace_member_deps = true;
+        admission.has_v2_workspace_member_deps = true;
+
+        let reasons = unsupported_admission_reasons(
+            admission,
+            InstallerSpikeGraphSource::ResolveWorklist,
+            InstallerSpikeParityMode::FreshResolve { deny: true },
+            true,
+        );
+
+        assert!(reasons.is_empty(), "unexpected reasons: {reasons:?}");
+    }
+
+    #[test]
+    fn admission_rejects_tarball_source_deps() {
+        let mut admission = benchmark_admission();
+        admission.has_tarball_source_deps = true;
+
+        let reasons = unsupported_admission_reasons(
+            admission,
+            InstallerSpikeGraphSource::Lockfile,
+            InstallerSpikeParityMode::Disabled,
+            true,
+        );
+
+        assert_eq!(reasons, vec!["tarball source deps are not supported"]);
     }
 
     #[test]
