@@ -1098,7 +1098,7 @@ pub(super) fn resolve_detail_json(
             "edge_reuse_count": stage.work_edge_reuse_count,
             "edge_reuse_range_count": stage.work_edge_reuse_range_count,
             "edge_reuse_exact_count": stage.work_edge_reuse_exact_count,
-            "edge_allocating_count": stage.work_edge_process_count
+            "edge_non_reuse_count": stage.work_edge_process_count
                 .saturating_sub(stage.work_edge_reuse_count),
             "node_allocated_count": stage.work_node_allocated_count,
             "child_edge_enqueued_count": stage.work_child_edge_enqueued_count,
@@ -1382,7 +1382,7 @@ mod tests {
         assert_eq!(json["work"]["edge_reuse_count"], 4);
         assert_eq!(json["work"]["edge_reuse_range_count"], 3);
         assert_eq!(json["work"]["edge_reuse_exact_count"], 1);
-        assert_eq!(json["work"]["edge_allocating_count"], 5);
+        assert_eq!(json["work"]["edge_non_reuse_count"], 5);
         assert_eq!(json["work"]["node_allocated_count"], 5);
         assert_eq!(json["work"]["child_edge_enqueued_count"], 8);
         assert_eq!(json["work"]["peer_requirement_count"], 2);

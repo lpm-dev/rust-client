@@ -37,6 +37,7 @@ pub(super) fn process_edge_with_preferred(
     preferred: Option<NpmVersion>,
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
+    state.work_stats.edge_process_count = state.work_stats.edge_process_count.saturating_add(1);
     // Hot path: zero-overrides installs (the common case) skip the
     // natural-pick computation entirely. Behavior matches the pre-
     // override implementation byte-for-byte.
@@ -190,7 +191,6 @@ fn process_edge_inner(
     forced: Option<(NpmVersion, Option<(NpmVersion, OverrideHit)>)>,
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
-    state.work_stats.edge_process_count = state.work_stats.edge_process_count.saturating_add(1);
     let is_root_edge = edge.parent == 0;
 
     // Determine the target version for THIS edge. Non-root edges on

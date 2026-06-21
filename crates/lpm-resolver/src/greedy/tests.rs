@@ -1039,6 +1039,23 @@ fn process_edge_records_work_stats_for_allocation_and_reuse() {
 }
 
 #[test]
+fn process_edge_counts_override_path_no_version_attempt() {
+    let info = mk_info(&["4.17.21"], &[]);
+    let mut deps = HashMap::new();
+    deps.insert("lodash".to_string(), "^99.0.0".to_string());
+    let mut state = ResolveState::new(deps, override_set("lodash", "4.17.21"));
+    state.seed_root_edges().unwrap();
+
+    let root_edge = state.task_queue.pop_front().unwrap();
+    let result = process_edge(&root_edge, &info, &mut state);
+
+    assert!(result.is_err());
+    assert_eq!(state.work_stats.edge_process_count, 1);
+    assert_eq!(state.work_stats.node_allocated_count, 0);
+    assert_eq!(state.work_stats.edge_reuse_count, 0);
+}
+
+#[test]
 fn selected_package_cardinality_counts_duplicate_canonicals() {
     let packages = vec![
         ResolvedPackage {

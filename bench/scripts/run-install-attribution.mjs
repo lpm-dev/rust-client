@@ -24,6 +24,9 @@ if (summaryOnly) {
   process.exit(0);
 }
 
+const installEnvOverrides = parseEnvAssignments(process.env.LPM_ATTRIBUTION_INSTALL_ENV || '');
+const npmRoute = process.env.LPM_ATTRIBUTION_NPM_ROUTE || 'direct';
+
 const fixtures = configuredFixtures().filter((fixture) => {
   if (fs.existsSync(fixture.dir)) {
     return true;
@@ -51,8 +54,15 @@ for (const fixture of fixtures) {
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `lpm-${fixture.name}-${sample}-`));
     const projectDir = path.join(workDir, 'project');
     const lpmHome = path.join(workDir, 'lpm-home');
+    const homeDir = path.join(workDir, 'home');
+    fs.mkdirSync(homeDir, { recursive: true });
     fs.cpSync(fixture.dir, projectDir, { recursive: true });
     cleanProject(projectDir);
+    const installEnv = benchmarkEnv(lpmHome, homeDir);
+    fs.writeFileSync(
+      path.join(sampleDir, 'effective-env.json'),
+      `${JSON.stringify(redactedEnv(installEnv), null, 2)}\n`,
+    );
 
     const started = process.hrtime.bigint();
     const result = spawnSync(
@@ -67,13 +77,7 @@ for (const fixture of fixtures) {
       {
         cwd: projectDir,
         encoding: 'utf8',
-        env: {
-          ...process.env,
-          LPM_HOME: lpmHome,
-          LPM_STORE_VERSION: 'v2',
-          LPM_TIMING_DETAIL: 'trace',
-          LPM_NPM_ROUTE: process.env.LPM_NPM_ROUTE || 'direct',
-        },
+        env: installEnv,
         maxBuffer: 64 * 1024 * 1024,
       },
     );
@@ -82,6 +86,12 @@ for (const fixture of fixtures) {
 
     fs.writeFileSync(path.join(sampleDir, 'stdout.json'), result.stdout || '');
     fs.writeFileSync(path.join(sampleDir, 'stderr.log'), result.stderr || '');
+    if (result.error) {
+      fs.writeFileSync(
+        path.join(sampleDir, 'spawn-error.txt'),
+        `${result.error.stack || result.error}\n`,
+      );
+    }
 
     let json = null;
     try {
@@ -103,7 +113,7 @@ for (const fixture of fixtures) {
     );
 
     if (!keepProjects && !(keepFailedProjects && metrics.exit_code !== 0)) {
-      fs.rmSync(workDir, { recursive: true, force: true });
+      removeTree(workDir, { required: false });
     } else {
       fs.writeFileSync(path.join(sampleDir, 'project-dir.txt'), `${projectDir}\n`);
     }
@@ -155,7 +165,123 @@ function cleanProject(projectDir) {
     'bun.lockb',
     'yarn.lock',
   ]) {
-    fs.rmSync(path.join(projectDir, entry), { recursive: true, force: true });
+    removeTree(path.join(projectDir, entry));
+  }
+}
+
+function removeTree(target, options = {}) {
+  const required = options.required ?? true;
+  let lastError = null;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      return true;
+    } catch (error) {
+      lastError = error;
+      sleepSync(100 * (attempt + 1));
+    }
+  }
+  if (required) {
+    throw lastError;
+  }
+  console.warn(`[warn] could not remove temp directory: ${target}: ${lastError}`);
+  return false;
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function benchmarkEnv(lpmHome, homeDir) {
+  const env = {};
+  for (const key of [
+    'PATH',
+    'SHELL',
+    'LANG',
+    'LC_ALL',
+    'TMPDIR',
+    'TMP',
+    'TEMP',
+    'SSL_CERT_FILE',
+    'SSL_CERT_DIR',
+    'NODE_EXTRA_CA_CERTS',
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'ALL_PROXY',
+    'NO_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'all_proxy',
+    'no_proxy',
+    'SystemRoot',
+    'WINDIR',
+    'COMSPEC',
+    'PATHEXT',
+  ]) {
+    if (process.env[key] != null) {
+      env[key] = process.env[key];
+    }
+  }
+  env.HOME = homeDir;
+  env.USERPROFILE = homeDir;
+  env.XDG_CACHE_HOME = path.join(homeDir, '.cache');
+  env.XDG_CONFIG_HOME = path.join(homeDir, '.config');
+  env.XDG_DATA_HOME = path.join(homeDir, '.local', 'share');
+  env.NPM_CONFIG_USERCONFIG = path.join(homeDir, '.npmrc');
+  env.LPM_HOME = lpmHome;
+  env.LPM_STORE_VERSION = 'v2';
+  env.LPM_TIMING_DETAIL = 'trace';
+  env.LPM_NPM_ROUTE = npmRoute;
+  return { ...env, ...installEnvOverrides };
+}
+
+function parseEnvAssignments(raw) {
+  const assignments = {};
+  for (const entry of raw
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)) {
+    const equals = entry.indexOf('=');
+    if (equals <= 0) {
+      throw new Error(`invalid LPM_ATTRIBUTION_INSTALL_ENV entry: ${entry}`);
+    }
+    const key = entry.slice(0, equals).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw new Error(`invalid environment variable name: ${key}`);
+    }
+    assignments[key] = entry.slice(equals + 1);
+  }
+  return assignments;
+}
+
+function redactedEnv(env) {
+  return Object.fromEntries(
+    Object.entries(env)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => [key, redactEnvValue(key, value)]),
+  );
+}
+
+function redactEnvValue(key, value) {
+  if (/(TOKEN|SECRET|PASSWORD|PASS|AUTH|COOKIE|KEY|CREDENTIAL)/i.test(key)) {
+    return '[redacted]';
+  }
+  if (/proxy/i.test(key)) {
+    return redactUrlCredentials(value);
+  }
+  return value;
+}
+
+function redactUrlCredentials(value) {
+  try {
+    const url = new URL(value);
+    if (url.username || url.password) {
+      url.username = url.username ? '[redacted]' : '';
+      url.password = url.password ? '[redacted]' : '';
+    }
+    return url.toString();
+  } catch {
+    return value;
   }
 }
 
@@ -247,6 +373,13 @@ function extractMetrics(json, wallMs, exitCode) {
       'resolve',
       'work',
       'edge_reuse_exact_count',
+    ]),
+    edge_non_reuse_count: numberAt(json, [
+      'timing',
+      'detail',
+      'resolve',
+      'work',
+      'edge_non_reuse_count',
     ]),
     node_allocated_count: numberAt(json, [
       'timing',
@@ -449,6 +582,7 @@ function summaryMarkdown(summary) {
     'edge_reuse_count',
     'edge_reuse_range_count',
     'edge_reuse_exact_count',
+    'edge_non_reuse_count',
     'node_allocated_count',
     'child_edge_enqueued_count',
     'peer_requirement_count',
