@@ -484,7 +484,7 @@ async fn fetch_full_metadata_for_policy(
 pub(super) struct MetadataFetchCompletion<'a> {
     pub(super) shared_cache: &'a SharedCache,
     pub(super) route_table: &'a RouteTable,
-    pub(super) counted_metadata_misses: &'a mut AHashSet<CanonicalKey>,
+    pub(super) counted_metadata_edge_misses: &'a mut AHashSet<CanonicalKey>,
     spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     pub(super) tarball_dispatched_count: &'a mut u64,
     pub(super) parked: &'a mut AHashMap<CanonicalKey, Vec<Edge>>,
@@ -495,7 +495,7 @@ impl<'a> MetadataFetchCompletion<'a> {
     pub(super) fn new(
         shared_cache: &'a SharedCache,
         route_table: &'a RouteTable,
-        counted_metadata_misses: &'a mut AHashSet<CanonicalKey>,
+        counted_metadata_edge_misses: &'a mut AHashSet<CanonicalKey>,
         spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
         tarball_dispatched_count: &'a mut u64,
         parked: &'a mut AHashMap<CanonicalKey, Vec<Edge>>,
@@ -504,7 +504,7 @@ impl<'a> MetadataFetchCompletion<'a> {
         Self {
             shared_cache,
             route_table,
-            counted_metadata_misses,
+            counted_metadata_edge_misses,
             spec_tx,
             tarball_dispatched_count,
             parked,
@@ -518,7 +518,7 @@ pub(super) fn complete_metadata_fetch(
     result: FetchResult,
     completion: &mut MetadataFetchCompletion<'_>,
 ) -> Result<(), ResolveError> {
-    let count_latest_for_miss = completion.counted_metadata_misses.remove(&canonical);
+    let count_latest_for_miss = completion.counted_metadata_edge_misses.remove(&canonical);
     match result {
         Ok(fetched) => {
             let FetchedMetadata {
@@ -533,14 +533,17 @@ pub(super) fn complete_metadata_fetch(
             }
             if let Some(mut edges) = completion.parked.remove(&canonical) {
                 if count_latest_for_miss && let Some(edge) = edges.first() {
-                    completion.state.work_stats.record_metadata_miss_latest(
-                        &canonical,
-                        &edge.range,
-                        &info,
-                        latest_version.as_ref(),
-                        completion.route_table,
-                        &completion.state.policy,
-                    );
+                    completion
+                        .state
+                        .work_stats
+                        .record_metadata_edge_miss_latest(
+                            &canonical,
+                            &edge.range,
+                            &info,
+                            latest_version.as_ref(),
+                            completion.route_table,
+                            &completion.state.policy,
+                        );
                 }
                 edges.sort_by(|a, b| {
                     (a.parent, a.local_name.as_str()).cmp(&(b.parent, b.local_name.as_str()))

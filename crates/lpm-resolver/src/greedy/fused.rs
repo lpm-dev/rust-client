@@ -498,7 +498,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     // through. Slight over-allocation is cheaper than rehashing.
     let mut inflight: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
     let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
-    let mut counted_metadata_misses: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
+    let mut counted_metadata_edge_misses: AHashSet<CanonicalKey> =
+        AHashSet::with_capacity(npm_fanout);
     let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
         tokio::task::JoinSet::new();
 
@@ -548,8 +549,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             if new_fetch {
                 state
                     .work_stats
-                    .record_metadata_miss(&canonical, &edge.range, &route_table);
-                counted_metadata_misses.insert(canonical.clone());
+                    .record_metadata_edge_miss(&canonical, &edge.range, &route_table);
+                counted_metadata_edge_misses.insert(canonical.clone());
             }
             parked.entry(canonical.clone()).or_default().push(edge);
             if new_fetch {
@@ -606,7 +607,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         let mut completion = MetadataFetchCompletion::new(
                             &shared_cache,
                             &route_table,
-                            &mut counted_metadata_misses,
+                            &mut counted_metadata_edge_misses,
                             spec_tx.as_ref(),
                             &mut tarball_dispatched_count,
                             &mut parked,
@@ -806,7 +807,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             let mut completion = MetadataFetchCompletion::new(
                 &shared_cache,
                 &route_table,
-                &mut counted_metadata_misses,
+                &mut counted_metadata_edge_misses,
                 spec_tx.as_ref(),
                 &mut tarball_dispatched_count,
                 &mut parked,
@@ -885,35 +886,37 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             work_node_allocated_count: work_stats.node_allocated_count,
             work_child_edge_enqueued_count: work_stats.child_edge_enqueued_count,
             work_peer_requirement_count: work_stats.peer_requirement_count,
-            work_metadata_miss_count: work_stats.metadata_miss_count,
-            work_metadata_miss_direct_count: work_stats.metadata_miss_direct_count,
-            work_metadata_miss_latest_known_count: work_stats.metadata_miss_latest_known_count,
-            work_metadata_miss_latest_known_direct_count: work_stats
-                .metadata_miss_latest_known_direct_count,
-            work_metadata_miss_latest_satisfies_count: work_stats
-                .metadata_miss_latest_satisfies_count,
-            work_metadata_miss_latest_satisfies_direct_count: work_stats
-                .metadata_miss_latest_satisfies_direct_count,
-            work_metadata_miss_latest_matches_pick_count: work_stats
-                .metadata_miss_latest_matches_pick_count,
-            work_metadata_miss_latest_matches_pick_direct_count: work_stats
-                .metadata_miss_latest_matches_pick_direct_count,
-            work_metadata_miss_version_doc_policy_eligible_count: work_stats
-                .metadata_miss_version_doc_policy_eligible_count,
-            work_metadata_miss_version_doc_policy_eligible_direct_count: work_stats
-                .metadata_miss_version_doc_policy_eligible_direct_count,
-            work_metadata_miss_latest_matches_pick_version_doc_policy_eligible_count: work_stats
-                .metadata_miss_latest_matches_pick_version_doc_policy_eligible_count,
-            work_metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count:
+            work_metadata_edge_miss_count: work_stats.metadata_edge_miss_count,
+            work_metadata_edge_miss_direct_count: work_stats.metadata_edge_miss_direct_count,
+            work_metadata_edge_miss_latest_known_count: work_stats
+                .metadata_edge_miss_latest_known_count,
+            work_metadata_edge_miss_latest_known_direct_count: work_stats
+                .metadata_edge_miss_latest_known_direct_count,
+            work_metadata_edge_miss_latest_satisfies_count: work_stats
+                .metadata_edge_miss_latest_satisfies_count,
+            work_metadata_edge_miss_latest_satisfies_direct_count: work_stats
+                .metadata_edge_miss_latest_satisfies_direct_count,
+            work_metadata_edge_miss_latest_matches_pick_count: work_stats
+                .metadata_edge_miss_latest_matches_pick_count,
+            work_metadata_edge_miss_latest_matches_pick_direct_count: work_stats
+                .metadata_edge_miss_latest_matches_pick_direct_count,
+            work_metadata_edge_miss_version_doc_policy_eligible_count: work_stats
+                .metadata_edge_miss_version_doc_policy_eligible_count,
+            work_metadata_edge_miss_version_doc_policy_eligible_direct_count: work_stats
+                .metadata_edge_miss_version_doc_policy_eligible_direct_count,
+            work_metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count:
+                work_stats.metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count,
+            work_metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count:
                 work_stats
-                    .metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count,
-            work_metadata_miss_exact_count: work_stats.metadata_miss_exact_count,
-            work_metadata_miss_star_count: work_stats.metadata_miss_star_count,
-            work_metadata_miss_caret_count: work_stats.metadata_miss_caret_count,
-            work_metadata_miss_tilde_count: work_stats.metadata_miss_tilde_count,
-            work_metadata_miss_comparator_count: work_stats.metadata_miss_comparator_count,
-            work_metadata_miss_complex_count: work_stats.metadata_miss_complex_count,
-            work_metadata_miss_other_count: work_stats.metadata_miss_other_count,
+                    .metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count,
+            work_metadata_edge_miss_exact_count: work_stats.metadata_edge_miss_exact_count,
+            work_metadata_edge_miss_star_count: work_stats.metadata_edge_miss_star_count,
+            work_metadata_edge_miss_caret_count: work_stats.metadata_edge_miss_caret_count,
+            work_metadata_edge_miss_tilde_count: work_stats.metadata_edge_miss_tilde_count,
+            work_metadata_edge_miss_comparator_count: work_stats
+                .metadata_edge_miss_comparator_count,
+            work_metadata_edge_miss_complex_count: work_stats.metadata_edge_miss_complex_count,
+            work_metadata_edge_miss_other_count: work_stats.metadata_edge_miss_other_count,
             selected_package_count,
             selected_unique_canonical_count,
             selected_duplicate_canonical_count,

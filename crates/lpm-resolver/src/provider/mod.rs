@@ -26,7 +26,10 @@ pub(crate) use parse::{
 #[cfg(test)]
 pub(crate) use platform::Platform;
 pub use platform::is_platform_compatible;
-pub(crate) use policy::{release_age_status_for_version, trust_downgrade_violation};
+pub(crate) use policy::{
+    release_age_status_for_version, release_age_status_for_version_unprofiled,
+    trust_downgrade_violation, trust_downgrade_violation_unprofiled,
+};
 pub(crate) use types::LpmDependencyProvider;
 pub use types::{
     CachedDistInfo, CachedPackageInfo, NotifyMap, PlatformMeta, SharedCache, StreamingBfsMetrics,
@@ -47,7 +50,8 @@ mod prelude {
     };
     #[allow(unused_imports)]
     pub(super) use super::policy::{
-        release_age_status_for_version, trust_downgrade_violation, version_allowed_by_policy,
+        release_age_status_for_version, release_age_status_for_version_unprofiled,
+        trust_downgrade_violation, trust_downgrade_violation_unprofiled, version_allowed_by_policy,
     };
     #[allow(unused_imports)]
     pub(super) use super::pubgrub_impl::deep_followup_enabled;

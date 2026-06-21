@@ -848,6 +848,27 @@ fn find_best_version_blocks_exact_trust_downgrade() {
 }
 
 #[test]
+fn find_best_version_unprofiled_does_not_record_policy_checks() {
+    let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
+    set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
+    info.dist.get_mut("1.0.0").unwrap().trust_evidence =
+        Some(crate::policy::TrustEvidence::TrustedPublisher);
+    set_published_at(&mut info, "1.1.0", "2025-01-02T00:00:00.000Z");
+    let policy = ResolverPolicy::new(0, crate::policy::TrustPolicyMode::NoDowngrade);
+    let range = NpmRange::parse("1.1.0").unwrap();
+
+    crate::profile::reset_all();
+
+    assert!(matches!(
+        find_best_version_with_policy_unprofiled(&CanonicalKey::Root, &info, &range, &policy),
+        VersionPick::BlockedByTrustPolicy { .. }
+    ));
+    let policy_summary = crate::profile::policy_summary();
+    assert_eq!(policy_summary.release_age.checked_count, 0);
+    assert_eq!(policy_summary.trust_policy.checked_count, 0);
+}
+
+#[test]
 fn seed_root_edges_orders_deterministically() {
     let mut deps = HashMap::new();
     deps.insert("zebra".to_string(), "^1.0.0".to_string());

@@ -2,7 +2,7 @@ use super::peer::{CachedPeerResolution, PeerResolutionCacheKey};
 use super::prelude::*;
 use super::types::{DepBehavior, Edge, NodeId, PeerConflictReport, PeerRequirement};
 use super::version::is_workspace_specifier;
-use super::version::{VersionPick, find_best_version_with_policy};
+use super::version::{VersionPick, find_best_version_with_policy_unprofiled};
 use crate::resolve::SelectedPackageEvent;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -14,71 +14,77 @@ pub(super) struct ResolveWorkStats {
     pub(super) node_allocated_count: u64,
     pub(super) child_edge_enqueued_count: u64,
     pub(super) peer_requirement_count: u64,
-    pub(super) metadata_miss_count: u64,
-    pub(super) metadata_miss_direct_count: u64,
-    pub(super) metadata_miss_latest_known_count: u64,
-    pub(super) metadata_miss_latest_known_direct_count: u64,
-    pub(super) metadata_miss_latest_satisfies_count: u64,
-    pub(super) metadata_miss_latest_satisfies_direct_count: u64,
-    pub(super) metadata_miss_latest_matches_pick_count: u64,
-    pub(super) metadata_miss_latest_matches_pick_direct_count: u64,
-    pub(super) metadata_miss_version_doc_policy_eligible_count: u64,
-    pub(super) metadata_miss_version_doc_policy_eligible_direct_count: u64,
-    pub(super) metadata_miss_latest_matches_pick_version_doc_policy_eligible_count: u64,
-    pub(super) metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count: u64,
-    pub(super) metadata_miss_exact_count: u64,
-    pub(super) metadata_miss_star_count: u64,
-    pub(super) metadata_miss_caret_count: u64,
-    pub(super) metadata_miss_tilde_count: u64,
-    pub(super) metadata_miss_comparator_count: u64,
-    pub(super) metadata_miss_complex_count: u64,
-    pub(super) metadata_miss_other_count: u64,
+    pub(super) metadata_edge_miss_count: u64,
+    pub(super) metadata_edge_miss_direct_count: u64,
+    pub(super) metadata_edge_miss_latest_known_count: u64,
+    pub(super) metadata_edge_miss_latest_known_direct_count: u64,
+    pub(super) metadata_edge_miss_latest_satisfies_count: u64,
+    pub(super) metadata_edge_miss_latest_satisfies_direct_count: u64,
+    pub(super) metadata_edge_miss_latest_matches_pick_count: u64,
+    pub(super) metadata_edge_miss_latest_matches_pick_direct_count: u64,
+    pub(super) metadata_edge_miss_version_doc_policy_eligible_count: u64,
+    pub(super) metadata_edge_miss_version_doc_policy_eligible_direct_count: u64,
+    pub(super) metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count: u64,
+    pub(super) metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count: u64,
+    pub(super) metadata_edge_miss_exact_count: u64,
+    pub(super) metadata_edge_miss_star_count: u64,
+    pub(super) metadata_edge_miss_caret_count: u64,
+    pub(super) metadata_edge_miss_tilde_count: u64,
+    pub(super) metadata_edge_miss_comparator_count: u64,
+    pub(super) metadata_edge_miss_complex_count: u64,
+    pub(super) metadata_edge_miss_other_count: u64,
 }
 
 impl ResolveWorkStats {
-    pub(super) fn record_metadata_miss(
+    pub(super) fn record_metadata_edge_miss(
         &mut self,
         canonical: &CanonicalKey,
         range: &NpmRange,
         route_table: &RouteTable,
     ) {
-        self.metadata_miss_count = self.metadata_miss_count.saturating_add(1);
+        self.metadata_edge_miss_count = self.metadata_edge_miss_count.saturating_add(1);
         if matches!(
             canonical,
             CanonicalKey::Npm { name }
                 if matches!(route_table.route_for_package(name), UpstreamRoute::NpmDirect)
         ) {
-            self.metadata_miss_direct_count = self.metadata_miss_direct_count.saturating_add(1);
+            self.metadata_edge_miss_direct_count =
+                self.metadata_edge_miss_direct_count.saturating_add(1);
         }
 
-        match metadata_miss_range_shape(range) {
-            MetadataMissRangeShape::Exact => {
-                self.metadata_miss_exact_count = self.metadata_miss_exact_count.saturating_add(1);
+        match metadata_edge_miss_range_shape(range) {
+            MetadataEdgeMissRangeShape::Exact => {
+                self.metadata_edge_miss_exact_count =
+                    self.metadata_edge_miss_exact_count.saturating_add(1);
             }
-            MetadataMissRangeShape::Star => {
-                self.metadata_miss_star_count = self.metadata_miss_star_count.saturating_add(1);
+            MetadataEdgeMissRangeShape::Star => {
+                self.metadata_edge_miss_star_count =
+                    self.metadata_edge_miss_star_count.saturating_add(1);
             }
-            MetadataMissRangeShape::Caret => {
-                self.metadata_miss_caret_count = self.metadata_miss_caret_count.saturating_add(1);
+            MetadataEdgeMissRangeShape::Caret => {
+                self.metadata_edge_miss_caret_count =
+                    self.metadata_edge_miss_caret_count.saturating_add(1);
             }
-            MetadataMissRangeShape::Tilde => {
-                self.metadata_miss_tilde_count = self.metadata_miss_tilde_count.saturating_add(1);
+            MetadataEdgeMissRangeShape::Tilde => {
+                self.metadata_edge_miss_tilde_count =
+                    self.metadata_edge_miss_tilde_count.saturating_add(1);
             }
-            MetadataMissRangeShape::Comparator => {
-                self.metadata_miss_comparator_count =
-                    self.metadata_miss_comparator_count.saturating_add(1);
+            MetadataEdgeMissRangeShape::Comparator => {
+                self.metadata_edge_miss_comparator_count =
+                    self.metadata_edge_miss_comparator_count.saturating_add(1);
             }
-            MetadataMissRangeShape::Complex => {
-                self.metadata_miss_complex_count =
-                    self.metadata_miss_complex_count.saturating_add(1);
+            MetadataEdgeMissRangeShape::Complex => {
+                self.metadata_edge_miss_complex_count =
+                    self.metadata_edge_miss_complex_count.saturating_add(1);
             }
-            MetadataMissRangeShape::Other => {
-                self.metadata_miss_other_count = self.metadata_miss_other_count.saturating_add(1);
+            MetadataEdgeMissRangeShape::Other => {
+                self.metadata_edge_miss_other_count =
+                    self.metadata_edge_miss_other_count.saturating_add(1);
             }
         }
     }
 
-    pub(super) fn record_metadata_miss_latest(
+    pub(super) fn record_metadata_edge_miss_latest(
         &mut self,
         canonical: &CanonicalKey,
         range: &NpmRange,
@@ -90,58 +96,59 @@ impl ResolveWorkStats {
         let Some(latest_version) = latest_version else {
             return;
         };
-        self.metadata_miss_latest_known_count =
-            self.metadata_miss_latest_known_count.saturating_add(1);
+        self.metadata_edge_miss_latest_known_count =
+            self.metadata_edge_miss_latest_known_count.saturating_add(1);
         let direct = matches!(
             canonical,
             CanonicalKey::Npm { name }
                 if matches!(route_table.route_for_package(name), UpstreamRoute::NpmDirect)
         );
         if direct {
-            self.metadata_miss_latest_known_direct_count = self
-                .metadata_miss_latest_known_direct_count
+            self.metadata_edge_miss_latest_known_direct_count = self
+                .metadata_edge_miss_latest_known_direct_count
                 .saturating_add(1);
         }
         let version_doc_policy_eligible =
             !policy.release_age_applies_to_package(canonical) && !policy.requires_trust_history();
         if version_doc_policy_eligible {
-            self.metadata_miss_version_doc_policy_eligible_count = self
-                .metadata_miss_version_doc_policy_eligible_count
+            self.metadata_edge_miss_version_doc_policy_eligible_count = self
+                .metadata_edge_miss_version_doc_policy_eligible_count
                 .saturating_add(1);
             if direct {
-                self.metadata_miss_version_doc_policy_eligible_direct_count = self
-                    .metadata_miss_version_doc_policy_eligible_direct_count
+                self.metadata_edge_miss_version_doc_policy_eligible_direct_count = self
+                    .metadata_edge_miss_version_doc_policy_eligible_direct_count
                     .saturating_add(1);
             }
         }
         if range.satisfies(latest_version) {
-            self.metadata_miss_latest_satisfies_count =
-                self.metadata_miss_latest_satisfies_count.saturating_add(1);
+            self.metadata_edge_miss_latest_satisfies_count = self
+                .metadata_edge_miss_latest_satisfies_count
+                .saturating_add(1);
             if direct {
-                self.metadata_miss_latest_satisfies_direct_count = self
-                    .metadata_miss_latest_satisfies_direct_count
+                self.metadata_edge_miss_latest_satisfies_direct_count = self
+                    .metadata_edge_miss_latest_satisfies_direct_count
                     .saturating_add(1);
             }
         }
         if matches!(
-            find_best_version_with_policy(canonical, info, range, policy),
+            find_best_version_with_policy_unprofiled(canonical, info, range, policy),
             VersionPick::Picked(best) if &best == latest_version
         ) {
-            self.metadata_miss_latest_matches_pick_count = self
-                .metadata_miss_latest_matches_pick_count
+            self.metadata_edge_miss_latest_matches_pick_count = self
+                .metadata_edge_miss_latest_matches_pick_count
                 .saturating_add(1);
             if direct {
-                self.metadata_miss_latest_matches_pick_direct_count = self
-                    .metadata_miss_latest_matches_pick_direct_count
+                self.metadata_edge_miss_latest_matches_pick_direct_count = self
+                    .metadata_edge_miss_latest_matches_pick_direct_count
                     .saturating_add(1);
             }
             if version_doc_policy_eligible {
-                self.metadata_miss_latest_matches_pick_version_doc_policy_eligible_count = self
-                    .metadata_miss_latest_matches_pick_version_doc_policy_eligible_count
-                    .saturating_add(1);
+                self.metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count =
+                    self.metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count
+                        .saturating_add(1);
                 if direct {
-                    self.metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count =
-                        self.metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count
+                    self.metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count =
+                        self.metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count
                             .saturating_add(1);
                 }
             }
@@ -150,7 +157,7 @@ impl ResolveWorkStats {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MetadataMissRangeShape {
+enum MetadataEdgeMissRangeShape {
     Exact,
     Star,
     Caret,
@@ -160,30 +167,30 @@ enum MetadataMissRangeShape {
     Other,
 }
 
-fn metadata_miss_range_shape(range: &NpmRange) -> MetadataMissRangeShape {
+fn metadata_edge_miss_range_shape(range: &NpmRange) -> MetadataEdgeMissRangeShape {
     let raw = range.raw().trim();
     if raw == "*" {
-        return MetadataMissRangeShape::Star;
+        return MetadataEdgeMissRangeShape::Star;
     }
     if NpmVersion::parse(raw).is_ok() {
-        return MetadataMissRangeShape::Exact;
+        return MetadataEdgeMissRangeShape::Exact;
     }
     if raw.contains("||") || raw.contains(" - ") {
-        return MetadataMissRangeShape::Complex;
-    }
-    if raw.starts_with('^') {
-        return MetadataMissRangeShape::Caret;
-    }
-    if raw.starts_with('~') {
-        return MetadataMissRangeShape::Tilde;
-    }
-    if raw.starts_with('<') || raw.starts_with('>') || raw.starts_with('=') {
-        return MetadataMissRangeShape::Comparator;
+        return MetadataEdgeMissRangeShape::Complex;
     }
     if raw.contains(' ') || raw.contains(',') {
-        return MetadataMissRangeShape::Complex;
+        return MetadataEdgeMissRangeShape::Complex;
     }
-    MetadataMissRangeShape::Other
+    if raw.starts_with('^') {
+        return MetadataEdgeMissRangeShape::Caret;
+    }
+    if raw.starts_with('~') {
+        return MetadataEdgeMissRangeShape::Tilde;
+    }
+    if raw.starts_with('<') || raw.starts_with('>') || raw.starts_with('=') {
+        return MetadataEdgeMissRangeShape::Comparator;
+    }
+    MetadataEdgeMissRangeShape::Other
 }
 
 /// Carrier for the per-pass mutable state. Keeps the dispatch loop
@@ -645,25 +652,29 @@ fn canonical_to_resolver_package(key: &CanonicalKey) -> ResolverPackage {
 mod tests {
     use super::*;
 
-    fn shape(raw: &str) -> MetadataMissRangeShape {
-        metadata_miss_range_shape(&NpmRange::parse(raw).expect("valid test range"))
+    fn shape(raw: &str) -> MetadataEdgeMissRangeShape {
+        metadata_edge_miss_range_shape(&NpmRange::parse(raw).expect("valid test range"))
     }
 
     #[test]
-    fn metadata_miss_range_shape_classifies_exact_versions() {
-        assert_eq!(shape("1.2.3"), MetadataMissRangeShape::Exact);
+    fn metadata_edge_miss_range_shape_classifies_exact_versions() {
+        assert_eq!(shape("1.2.3"), MetadataEdgeMissRangeShape::Exact);
     }
 
     #[test]
-    fn metadata_miss_range_shape_classifies_latest_as_star() {
-        assert_eq!(shape("latest"), MetadataMissRangeShape::Star);
+    fn metadata_edge_miss_range_shape_classifies_latest_as_star() {
+        assert_eq!(shape("latest"), MetadataEdgeMissRangeShape::Star);
     }
 
     #[test]
-    fn metadata_miss_range_shape_classifies_common_range_operators() {
-        assert_eq!(shape("^1.2.3"), MetadataMissRangeShape::Caret);
-        assert_eq!(shape("~1.2.3"), MetadataMissRangeShape::Tilde);
-        assert_eq!(shape(">=1.2.3"), MetadataMissRangeShape::Comparator);
-        assert_eq!(shape("^1.0.0 || ^2.0.0"), MetadataMissRangeShape::Complex);
+    fn metadata_edge_miss_range_shape_classifies_common_range_operators() {
+        assert_eq!(shape("^1.2.3"), MetadataEdgeMissRangeShape::Caret);
+        assert_eq!(shape("~1.2.3"), MetadataEdgeMissRangeShape::Tilde);
+        assert_eq!(shape(">=1.2.3"), MetadataEdgeMissRangeShape::Comparator);
+        assert_eq!(shape(">=1.0.0 <2.0.0"), MetadataEdgeMissRangeShape::Complex);
+        assert_eq!(
+            shape("^1.0.0 || ^2.0.0"),
+            MetadataEdgeMissRangeShape::Complex
+        );
     }
 }

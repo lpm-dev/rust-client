@@ -1103,35 +1103,35 @@ pub(super) fn resolve_detail_json(
             "node_allocated_count": stage.work_node_allocated_count,
             "child_edge_enqueued_count": stage.work_child_edge_enqueued_count,
             "peer_requirement_count": stage.work_peer_requirement_count,
-            "metadata_miss_count": stage.work_metadata_miss_count,
-            "metadata_miss_direct_count": stage.work_metadata_miss_direct_count,
-            "metadata_miss_latest_known_count": stage.work_metadata_miss_latest_known_count,
-            "metadata_miss_latest_known_direct_count": stage
-                .work_metadata_miss_latest_known_direct_count,
-            "metadata_miss_latest_satisfies_count": stage
-                .work_metadata_miss_latest_satisfies_count,
-            "metadata_miss_latest_satisfies_direct_count": stage
-                .work_metadata_miss_latest_satisfies_direct_count,
-            "metadata_miss_latest_matches_pick_count": stage
-                .work_metadata_miss_latest_matches_pick_count,
-            "metadata_miss_latest_matches_pick_direct_count": stage
-                .work_metadata_miss_latest_matches_pick_direct_count,
-            "metadata_miss_version_doc_policy_eligible_count": stage
-                .work_metadata_miss_version_doc_policy_eligible_count,
-            "metadata_miss_version_doc_policy_eligible_direct_count": stage
-                .work_metadata_miss_version_doc_policy_eligible_direct_count,
-            "metadata_miss_latest_matches_pick_version_doc_policy_eligible_count": stage
-                .work_metadata_miss_latest_matches_pick_version_doc_policy_eligible_count,
-            "metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count": stage
-                .work_metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count,
-            "metadata_miss_range_shapes": {
-                "exact": stage.work_metadata_miss_exact_count,
-                "star": stage.work_metadata_miss_star_count,
-                "caret": stage.work_metadata_miss_caret_count,
-                "tilde": stage.work_metadata_miss_tilde_count,
-                "comparator": stage.work_metadata_miss_comparator_count,
-                "complex": stage.work_metadata_miss_complex_count,
-                "other": stage.work_metadata_miss_other_count,
+            "metadata_edge_miss_count": stage.work_metadata_edge_miss_count,
+            "metadata_edge_miss_direct_count": stage.work_metadata_edge_miss_direct_count,
+            "metadata_edge_miss_latest_known_count": stage.work_metadata_edge_miss_latest_known_count,
+            "metadata_edge_miss_latest_known_direct_count": stage
+                .work_metadata_edge_miss_latest_known_direct_count,
+            "metadata_edge_miss_latest_satisfies_count": stage
+                .work_metadata_edge_miss_latest_satisfies_count,
+            "metadata_edge_miss_latest_satisfies_direct_count": stage
+                .work_metadata_edge_miss_latest_satisfies_direct_count,
+            "metadata_edge_miss_latest_matches_pick_count": stage
+                .work_metadata_edge_miss_latest_matches_pick_count,
+            "metadata_edge_miss_latest_matches_pick_direct_count": stage
+                .work_metadata_edge_miss_latest_matches_pick_direct_count,
+            "metadata_edge_miss_version_doc_policy_eligible_count": stage
+                .work_metadata_edge_miss_version_doc_policy_eligible_count,
+            "metadata_edge_miss_version_doc_policy_eligible_direct_count": stage
+                .work_metadata_edge_miss_version_doc_policy_eligible_direct_count,
+            "metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count": stage
+                .work_metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count,
+            "metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count": stage
+                .work_metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count,
+            "metadata_edge_miss_range_shapes": {
+                "exact": stage.work_metadata_edge_miss_exact_count,
+                "star": stage.work_metadata_edge_miss_star_count,
+                "caret": stage.work_metadata_edge_miss_caret_count,
+                "tilde": stage.work_metadata_edge_miss_tilde_count,
+                "comparator": stage.work_metadata_edge_miss_comparator_count,
+                "complex": stage.work_metadata_edge_miss_complex_count,
+                "other": stage.work_metadata_edge_miss_other_count,
             },
             "selected_package_count": stage.selected_package_count,
             "selected_unique_canonical_count": stage.selected_unique_canonical_count,
@@ -1400,25 +1400,25 @@ mod tests {
             work_node_allocated_count: 5,
             work_child_edge_enqueued_count: 8,
             work_peer_requirement_count: 2,
-            work_metadata_miss_count: 7,
-            work_metadata_miss_direct_count: 6,
-            work_metadata_miss_latest_known_count: 5,
-            work_metadata_miss_latest_known_direct_count: 4,
-            work_metadata_miss_latest_satisfies_count: 3,
-            work_metadata_miss_latest_satisfies_direct_count: 2,
-            work_metadata_miss_latest_matches_pick_count: 2,
-            work_metadata_miss_latest_matches_pick_direct_count: 1,
-            work_metadata_miss_version_doc_policy_eligible_count: 4,
-            work_metadata_miss_version_doc_policy_eligible_direct_count: 3,
-            work_metadata_miss_latest_matches_pick_version_doc_policy_eligible_count: 2,
-            work_metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count: 1,
-            work_metadata_miss_exact_count: 1,
-            work_metadata_miss_star_count: 2,
-            work_metadata_miss_caret_count: 3,
-            work_metadata_miss_tilde_count: 4,
-            work_metadata_miss_comparator_count: 5,
-            work_metadata_miss_complex_count: 6,
-            work_metadata_miss_other_count: 7,
+            work_metadata_edge_miss_count: 7,
+            work_metadata_edge_miss_direct_count: 6,
+            work_metadata_edge_miss_latest_known_count: 5,
+            work_metadata_edge_miss_latest_known_direct_count: 4,
+            work_metadata_edge_miss_latest_satisfies_count: 3,
+            work_metadata_edge_miss_latest_satisfies_direct_count: 2,
+            work_metadata_edge_miss_latest_matches_pick_count: 2,
+            work_metadata_edge_miss_latest_matches_pick_direct_count: 1,
+            work_metadata_edge_miss_version_doc_policy_eligible_count: 4,
+            work_metadata_edge_miss_version_doc_policy_eligible_direct_count: 3,
+            work_metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count: 2,
+            work_metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count: 1,
+            work_metadata_edge_miss_exact_count: 1,
+            work_metadata_edge_miss_star_count: 2,
+            work_metadata_edge_miss_caret_count: 3,
+            work_metadata_edge_miss_tilde_count: 4,
+            work_metadata_edge_miss_comparator_count: 5,
+            work_metadata_edge_miss_complex_count: 6,
+            work_metadata_edge_miss_other_count: 7,
             selected_package_count: 6,
             selected_unique_canonical_count: 5,
             selected_duplicate_canonical_count: 1,
@@ -1435,43 +1435,55 @@ mod tests {
         assert_eq!(json["work"]["node_allocated_count"], 5);
         assert_eq!(json["work"]["child_edge_enqueued_count"], 8);
         assert_eq!(json["work"]["peer_requirement_count"], 2);
-        assert_eq!(json["work"]["metadata_miss_count"], 7);
-        assert_eq!(json["work"]["metadata_miss_direct_count"], 6);
-        assert_eq!(json["work"]["metadata_miss_latest_known_count"], 5);
-        assert_eq!(json["work"]["metadata_miss_latest_known_direct_count"], 4);
-        assert_eq!(json["work"]["metadata_miss_latest_satisfies_count"], 3);
+        assert_eq!(json["work"]["metadata_edge_miss_count"], 7);
+        assert_eq!(json["work"]["metadata_edge_miss_direct_count"], 6);
+        assert_eq!(json["work"]["metadata_edge_miss_latest_known_count"], 5);
         assert_eq!(
-            json["work"]["metadata_miss_latest_satisfies_direct_count"],
+            json["work"]["metadata_edge_miss_latest_known_direct_count"],
+            4
+        );
+        assert_eq!(json["work"]["metadata_edge_miss_latest_satisfies_count"], 3);
+        assert_eq!(
+            json["work"]["metadata_edge_miss_latest_satisfies_direct_count"],
             2
         );
-        assert_eq!(json["work"]["metadata_miss_latest_matches_pick_count"], 2);
         assert_eq!(
-            json["work"]["metadata_miss_latest_matches_pick_direct_count"],
+            json["work"]["metadata_edge_miss_latest_matches_pick_count"],
+            2
+        );
+        assert_eq!(
+            json["work"]["metadata_edge_miss_latest_matches_pick_direct_count"],
             1
         );
         assert_eq!(
-            json["work"]["metadata_miss_version_doc_policy_eligible_count"],
+            json["work"]["metadata_edge_miss_version_doc_policy_eligible_count"],
             4
         );
         assert_eq!(
-            json["work"]["metadata_miss_version_doc_policy_eligible_direct_count"],
+            json["work"]["metadata_edge_miss_version_doc_policy_eligible_direct_count"],
             3
         );
         assert_eq!(
-            json["work"]["metadata_miss_latest_matches_pick_version_doc_policy_eligible_count"],
+            json["work"]["metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count"],
             2
         );
         assert_eq!(
-            json["work"]["metadata_miss_latest_matches_pick_version_doc_policy_eligible_direct_count"],
+            json["work"]["metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count"],
             1
         );
-        assert_eq!(json["work"]["metadata_miss_range_shapes"]["exact"], 1);
-        assert_eq!(json["work"]["metadata_miss_range_shapes"]["star"], 2);
-        assert_eq!(json["work"]["metadata_miss_range_shapes"]["caret"], 3);
-        assert_eq!(json["work"]["metadata_miss_range_shapes"]["tilde"], 4);
-        assert_eq!(json["work"]["metadata_miss_range_shapes"]["comparator"], 5);
-        assert_eq!(json["work"]["metadata_miss_range_shapes"]["complex"], 6);
-        assert_eq!(json["work"]["metadata_miss_range_shapes"]["other"], 7);
+        assert_eq!(json["work"]["metadata_edge_miss_range_shapes"]["exact"], 1);
+        assert_eq!(json["work"]["metadata_edge_miss_range_shapes"]["star"], 2);
+        assert_eq!(json["work"]["metadata_edge_miss_range_shapes"]["caret"], 3);
+        assert_eq!(json["work"]["metadata_edge_miss_range_shapes"]["tilde"], 4);
+        assert_eq!(
+            json["work"]["metadata_edge_miss_range_shapes"]["comparator"],
+            5
+        );
+        assert_eq!(
+            json["work"]["metadata_edge_miss_range_shapes"]["complex"],
+            6
+        );
+        assert_eq!(json["work"]["metadata_edge_miss_range_shapes"]["other"], 7);
         assert_eq!(json["work"]["selected_package_count"], 6);
         assert_eq!(json["work"]["selected_unique_canonical_count"], 5);
         assert_eq!(json["work"]["selected_duplicate_canonical_count"], 1);
