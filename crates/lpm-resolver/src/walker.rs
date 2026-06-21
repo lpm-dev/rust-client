@@ -60,19 +60,10 @@ const MAX_WALK_DEPTH: u32 = 16;
 /// walker). Callers can override via [`BfsWalker::with_npm_fanout`] or the
 /// `LPM_NPM_FANOUT` env var (read in [`BfsWalker::run`]).
 ///
-/// Default npm fan-out. Empirically set via n=10 cold bench on
-/// `bench/fixture-large` (stream walker + greedy resolver):
-///
-///   fanout= 50  median=4816 ms  stdev= 972 ms  ← prior default
-///   fanout=128  median=4403 ms  stdev=1578 ms  (noisy, t=0.59 not sig.)
-///   fanout=256  median=4124 ms  stdev= 253 ms  (t=3.49 SIGNIFICANT)
-///
-/// 256 on a single HTTP/2 connection saves ~700 ms median wall (−14.4 %)
-/// AND collapses stdev by ~74 % (972 → 253). The registry doesn't enforce
-/// the "most CDNs cap at 100" limit some hypotheses warned about.
-///
-/// The remaining 4-sec gap to bun is per-connection h2 flow control;
-/// bun uses separate HTTP/1.1 sockets to bypass that.
+/// Default npm fan-out. Kept high for the legacy walker path, where
+/// metadata production is separate from the greedy-fusion cold fetch
+/// overlap scheduler. Current install defaults can choose a narrower
+/// fused-path cap without changing this exported walker default.
 pub const DEFAULT_NPM_FANOUT: usize = 256;
 
 async fn fetch_walker_metadata_with_trace(
@@ -373,7 +364,7 @@ impl BfsWalker {
         }
     }
 
-    /// Override the npm parallel-fetch concurrency (default 50).
+    /// Override the npm parallel-fetch concurrency.
     pub fn with_npm_fanout(mut self, fanout: usize) -> Self {
         self.npm_fanout = fanout;
         self
