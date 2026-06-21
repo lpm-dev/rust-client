@@ -2,7 +2,7 @@ use super::edge::process_edge_with_preferred;
 use super::manifest::{ensure_manifest, propagate_fetch_error};
 use super::peer::drain_peer_requirements_one_pass;
 use super::prelude::*;
-use super::state::ResolveState;
+use super::state::{ResolveState, selected_package_cardinality};
 use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version};
 
 struct WalkerTreeProvider<'a> {
@@ -297,7 +297,13 @@ pub async fn resolve_greedy_with_options_and_policy(
     // (package, raw_key), matching the pubgrub arm's contract for
     // `applied_overrides` ordering on `--json` output.
     let applied_overrides = state.overrides.take_hits();
+    let work_stats = state.work_stats;
     let packages = state.into_resolved_packages(&cache);
+    let (
+        selected_package_count,
+        selected_unique_canonical_count,
+        selected_duplicate_canonical_count,
+    ) = selected_package_cardinality(&packages);
 
     let snap = lpm_registry::timing::snapshot();
     let policy_snap = crate::profile::policy_summary();
@@ -318,6 +324,16 @@ pub async fn resolve_greedy_with_options_and_policy(
             pubgrub_ms: resolver_ms,
             walker_rpc_count: snap.walker_rpc_count,
             escape_hatch_rpc_count: snap.escape_hatch_rpc_count,
+            work_edge_process_count: work_stats.edge_process_count,
+            work_edge_reuse_count: work_stats.edge_reuse_count,
+            work_edge_reuse_range_count: work_stats.edge_reuse_range_count,
+            work_edge_reuse_exact_count: work_stats.edge_reuse_exact_count,
+            work_node_allocated_count: work_stats.node_allocated_count,
+            work_child_edge_enqueued_count: work_stats.child_edge_enqueued_count,
+            work_peer_requirement_count: work_stats.peer_requirement_count,
+            selected_package_count,
+            selected_unique_canonical_count,
+            selected_duplicate_canonical_count,
             policy_release_age_ms: policy_snap.release_age.elapsed.as_millis() as u64,
             policy_release_age_checked_count: policy_snap.release_age.checked_count,
             policy_release_age_rejected_count: policy_snap.release_age.rejected_count,

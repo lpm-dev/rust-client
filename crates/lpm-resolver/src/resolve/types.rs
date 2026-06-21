@@ -277,6 +277,30 @@ pub struct StageTiming {
     /// the walker arm is the legacy opt-out and not a performance
     /// target).
     pub peer_prefetch_count: u64,
+    /// Number of dependency edges processed by the greedy resolver.
+    pub work_edge_process_count: u64,
+    /// Edges that reused an existing selected node rather than allocating
+    /// a new `(canonical, version)` node.
+    pub work_edge_reuse_count: u64,
+    /// Reuse count where the existing node only needed to satisfy the
+    /// requested range.
+    pub work_edge_reuse_range_count: u64,
+    /// Reuse count where root deps, overrides, or split-targeted packages
+    /// required an exact-version match.
+    pub work_edge_reuse_exact_count: u64,
+    /// Number of selected nodes allocated by the greedy resolver.
+    pub work_node_allocated_count: u64,
+    /// Regular dependency edges enqueued from selected package manifests.
+    pub work_child_edge_enqueued_count: u64,
+    /// Peer requirements collected from selected package manifests.
+    pub work_peer_requirement_count: u64,
+    /// Final selected package rows emitted to the install pipeline.
+    pub selected_package_count: u64,
+    /// Distinct canonical packages in the final selected package rows.
+    pub selected_unique_canonical_count: u64,
+    /// Extra selected rows caused by multiple versions of the same canonical
+    /// package being present in the graph.
+    pub selected_duplicate_canonical_count: u64,
     /// CPU time spent evaluating minimum-release-age policy checks.
     /// Counts every candidate check, including cached metadata paths
     /// where no network request was needed.

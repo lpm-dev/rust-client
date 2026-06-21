@@ -283,6 +283,24 @@ pub fn record_metadata_fetch_detail(record: MetadataFetchDetailRecord) {
     metadata_fetch_detail().record(record);
 }
 
+pub fn record_metadata_cache_info_parse_detail(
+    package: impl Into<String>,
+    route: &'static str,
+    cache_info_parse_ms: u128,
+    version_count: u64,
+) {
+    if cache_info_parse_ms == 0 {
+        return;
+    }
+    metadata_fetch_detail().record_cache_info_parse(MetadataFetchDetailRecord {
+        package: package.into(),
+        route,
+        cache_info_parse_ms,
+        version_count,
+        ..MetadataFetchDetailRecord::default()
+    });
+}
+
 /// Snapshot package-metadata response protocol counters.
 pub fn snapshot_metadata_http_versions() -> HttpVersionCounts {
     HttpVersionCounts {
@@ -598,6 +616,16 @@ impl MetadataFetchDetailCounters {
         });
     }
 
+    fn record_cache_info_parse(&self, record: MetadataFetchDetailRecord) {
+        self.cache_info_parse_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.cache_info_parse_ms),
+            Ordering::Relaxed,
+        );
+        Self::record_slow(&self.slow_by_cache_info_parse, &record, |entry| {
+            entry.cache_info_parse_ms
+        });
+    }
+
     fn record_sum_max(sum: &AtomicU64, max: &AtomicU64, ms: u128) {
         let ms = u128_to_u64_saturating(ms);
         sum.fetch_add(ms, Ordering::Relaxed);
@@ -852,6 +880,28 @@ mod tests {
                 .by_total
                 .is_empty()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_info_parse_detail_does_not_increment_fetch_call_count() {
+        let _guard = metadata_fetch_detail_test_lock().lock().await;
+        let _env = ScopedEnv::set("LPM_TIMING_DETAIL", "trace");
+        reset_metadata_detail();
+
+        record_metadata_cache_info_parse_detail("parse-heavy", "npm_direct", 11, 123);
+        let snapshot = snapshot_metadata_fetch_detail();
+
+        assert_eq!(snapshot.calls, 0);
+        assert_eq!(snapshot.attribution.cache_info_parse_sum_ms, 11);
+        assert_eq!(
+            snapshot.top_slow_packages.by_cache_info_parse[0].package,
+            "parse-heavy"
+        );
+        assert_eq!(
+            snapshot.top_slow_packages.by_cache_info_parse[0].version_count,
+            123
+        );
+        reset_metadata_detail();
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -4,6 +4,17 @@ use super::types::{DepBehavior, Edge, NodeId, PeerConflictReport, PeerRequiremen
 use super::version::is_workspace_specifier;
 use crate::resolve::SelectedPackageEvent;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ResolveWorkStats {
+    pub(super) edge_process_count: u64,
+    pub(super) edge_reuse_count: u64,
+    pub(super) edge_reuse_range_count: u64,
+    pub(super) edge_reuse_exact_count: u64,
+    pub(super) node_allocated_count: u64,
+    pub(super) child_edge_enqueued_count: u64,
+    pub(super) peer_requirement_count: u64,
+}
+
 /// Carrier for the per-pass mutable state. Keeps the dispatch loop
 /// readable by bundling the four coupled collections into one place.
 pub(super) struct ResolveState {
@@ -82,6 +93,7 @@ pub(super) struct ResolveState {
         dashmap::DashMap<PeerResolutionCacheKey, CachedPeerResolution>,
     pub(super) include_optional_dependencies: bool,
     pub(super) policy: ResolverPolicy,
+    pub(super) work_stats: ResolveWorkStats,
     selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
 }
 
@@ -144,6 +156,7 @@ impl ResolveState {
             peer_resolution_cache: dashmap::DashMap::with_capacity(64),
             include_optional_dependencies,
             policy,
+            work_stats: ResolveWorkStats::default(),
             selected_package_tx: None,
         }
     }
@@ -422,6 +435,20 @@ impl ResolveState {
             _ => Some(format!("{}@{}", parent.canonical, parent.version)),
         }
     }
+}
+
+pub(super) fn selected_package_cardinality(packages: &[ResolvedPackage]) -> (u64, u64, u64) {
+    let mut unique = HashSet::with_capacity(packages.len());
+    for package in packages {
+        unique.insert(package.package.to_string());
+    }
+    let selected = packages.len() as u64;
+    let unique_count = unique.len() as u64;
+    (
+        selected,
+        unique_count,
+        selected.saturating_sub(unique_count),
+    )
 }
 
 /// Convert a `CanonicalKey` back to a `ResolverPackage` for the

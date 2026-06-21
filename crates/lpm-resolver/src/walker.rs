@@ -601,7 +601,6 @@ impl BfsWalker {
             {
                 match res {
                     Ok(meta) => {
-                        let is_npm = !name.starts_with("@lpm.dev/");
                         // `commit_manifest` returns the `CachedPackageInfo`
                         // it parsed + inserted so we can expand deps
                         // from it without re-parsing. Expansion uses the
@@ -612,7 +611,6 @@ impl BfsWalker {
                             .commit_manifest(
                                 &name,
                                 &meta,
-                                is_npm,
                                 &root_keys,
                                 &mut roots_inserted,
                                 &mut summary,
@@ -771,10 +769,9 @@ impl BfsWalker {
                     }
                     match result {
                         Ok(meta) => {
-                            let is_npm = !name.starts_with("@lpm.dev/");
                             let info = self
                                 .commit_manifest(
-                                    &name, &meta, is_npm,
+                                    &name, &meta,
                                     &root_keys, &mut roots_inserted, &mut summary,
                                 )
                                 .await;
@@ -878,7 +875,6 @@ impl BfsWalker {
         &mut self,
         name: &str,
         meta: &PackageMetadata,
-        is_npm: bool,
         root_keys: &HashSet<CanonicalKey>,
         roots_inserted: &mut HashSet<CanonicalKey>,
         summary: &mut WalkerSummary,
@@ -888,8 +884,16 @@ impl BfsWalker {
         // (1) Insert into shared cache. Keep the Arc to return so the
         // caller can drive dep expansion without re-parsing or looking
         // the entry back out of the DashMap.
+        let parse_start = lpm_registry::timing::metadata_fetch_detail_enabled().then(Instant::now);
         let info = Arc::new(parse_metadata_to_cache_info(meta));
-        let _ = is_npm; // 2026-05-07: prerelease filter removed; param retained on caller for future use
+        if let Some(start) = parse_start {
+            lpm_registry::timing::record_metadata_cache_info_parse_detail(
+                name,
+                self.metadata_route_label(name),
+                start.elapsed().as_millis(),
+                info.versions.len() as u64,
+            );
+        }
         self.shared_cache.insert(key.clone(), info.clone());
 
         // (2) Fire per-canonical waiters.
@@ -917,6 +921,17 @@ impl BfsWalker {
         summary.spec_tx_send_wait_ms += send_start.elapsed().as_millis();
 
         info
+    }
+
+    fn metadata_route_label(&self, name: &str) -> &'static str {
+        if name.starts_with("@lpm.dev/") {
+            return "lpm";
+        }
+        match self.route_table.route_for_package(name) {
+            UpstreamRoute::NpmDirect => "npm_direct",
+            UpstreamRoute::LpmWorker => "lpm_worker",
+            UpstreamRoute::Custom { .. } => "custom",
+        }
     }
 
     fn maybe_fire_roots_ready(
