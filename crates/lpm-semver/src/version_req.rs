@@ -37,34 +37,7 @@ impl VersionReq {
     /// ```
     pub fn parse(input: &str) -> Result<Self, LpmError> {
         let trimmed = input.trim();
-        if !contains_only_range_characters(trimmed) {
-            return Err(LpmError::InvalidVersionRange(format!(
-                "{input}: contains unsupported semver range characters"
-            )));
-        }
-        if has_invalid_range_token(trimmed) {
-            return Err(LpmError::InvalidVersionRange(format!(
-                "{input}: invalid range token"
-            )));
-        }
-        if has_embedded_wildcard_range_operator(trimmed) {
-            return Err(LpmError::InvalidVersionRange(format!(
-                "{input}: invalid wildcard range"
-            )));
-        }
-        if has_malformed_wildcard_range_operator(trimmed) {
-            return Err(LpmError::InvalidVersionRange(format!(
-                "{input}: invalid wildcard range"
-            )));
-        }
-        if has_malformed_wildcard_comparator(trimmed) {
-            return Err(LpmError::InvalidVersionRange(format!(
-                "{input}: invalid wildcard comparator"
-            )));
-        }
-        let parse_input = normalize_range_input(trimmed);
-        let inner = node_semver::Range::parse(parse_input.as_ref())
-            .map_err(|e| LpmError::InvalidVersionRange(format!("{input}: {e}")))?;
+        let inner = parse_node_semver_range(input)?;
         Ok(VersionReq {
             inner,
             original: trimmed.to_string(),
@@ -82,34 +55,54 @@ impl VersionReq {
     }
 }
 
+/// Parse an npm semver range through LPM's defensive wrapper around `node-semver`.
+pub fn parse_node_semver_range(input: &str) -> Result<node_semver::Range, LpmError> {
+    let trimmed = input.trim();
+    if !contains_only_range_characters(trimmed) {
+        return Err(LpmError::InvalidVersionRange(format!(
+            "{input}: contains unsupported semver range characters"
+        )));
+    }
+    if has_invalid_range_token(trimmed) {
+        return Err(LpmError::InvalidVersionRange(format!(
+            "{input}: invalid range token"
+        )));
+    }
+    if has_malformed_wildcard_range_operator(trimmed) {
+        return Err(LpmError::InvalidVersionRange(format!(
+            "{input}: invalid wildcard range"
+        )));
+    }
+    if has_malformed_wildcard_comparator(trimmed) {
+        return Err(LpmError::InvalidVersionRange(format!(
+            "{input}: invalid wildcard comparator"
+        )));
+    }
+    let parse_input = normalize_range_input(trimmed);
+    parse_normalized_node_semver_range(input, parse_input.as_ref())
+}
+
+fn parse_normalized_node_semver_range(
+    original: &str,
+    normalized: &str,
+) -> Result<node_semver::Range, LpmError> {
+    let parsed = std::panic::catch_unwind(|| node_semver::Range::parse(normalized))
+        .map_err(|_| LpmError::InvalidVersionRange(format!("{original}: invalid range")))?;
+    parsed.map_err(|e| LpmError::InvalidVersionRange(format!("{original}: {e}")))
+}
+
 fn normalize_range_input(input: &str) -> Cow<'_, str> {
     // The Rust node_semver crate has rough edges around npm wildcard
     // operators; normalize those forms before they reach the parser.
-    if is_tilde_wildcard(input) || is_caret_wildcard(input) {
-        Cow::Borrowed("*")
-    } else if let Some(normalized) = normalize_wildcard_hyphen(input) {
+    if let Some(normalized) = normalize_wildcard_hyphen(input) {
         Cow::Owned(normalized)
     } else if let Some(normalized) = normalize_wildcard_comparator(input) {
+        Cow::Owned(normalized)
+    } else if let Some(normalized) = normalize_wildcard_range_operators(input) {
         Cow::Owned(normalized)
     } else {
         Cow::Borrowed(input)
     }
-}
-
-fn is_tilde_wildcard(input: &str) -> bool {
-    let Some(rest) = input.strip_prefix("~>").or_else(|| input.strip_prefix('~')) else {
-        return false;
-    };
-
-    matches!(rest.trim_start(), "x" | "X" | "*")
-}
-
-fn is_caret_wildcard(input: &str) -> bool {
-    let Some(rest) = input.strip_prefix('^') else {
-        return false;
-    };
-
-    matches!(rest.trim_start(), "x" | "X" | "*")
 }
 
 #[derive(Clone, Copy)]
@@ -204,27 +197,12 @@ fn has_invalid_range_token(input: &str) -> bool {
         })
 }
 
-fn has_embedded_wildcard_range_operator(input: &str) -> bool {
-    let has_disjunction = input.contains("||");
-    input.split("||").any(|disjunct| {
-        let mut tokens = disjunct.split_whitespace();
-        let Some(_first) = tokens.next() else {
-            return false;
-        };
-        let has_multiple_tokens = tokens.next().is_some();
-        (has_disjunction || has_multiple_tokens)
-            && disjunct
-                .split_whitespace()
-                .any(|token| is_tilde_wildcard(token) || is_caret_wildcard(token))
-    })
-}
-
 fn has_malformed_wildcard_range_operator(input: &str) -> bool {
     for disjunct in input.split("||") {
         let mut pending_range_operator = false;
         for token in disjunct.split_whitespace() {
             if pending_range_operator {
-                if starts_like_wildcard(token) {
+                if is_malformed_wildcard_operand(token) {
                     return true;
                 }
                 pending_range_operator = false;
@@ -243,6 +221,64 @@ fn has_malformed_wildcard_range_operator(input: &str) -> bool {
         }
     }
     false
+}
+
+fn normalize_wildcard_range_operators(input: &str) -> Option<String> {
+    let mut changed = false;
+    let mut disjuncts = Vec::new();
+    for disjunct in input.split("||") {
+        disjuncts.push(normalize_wildcard_operator_disjunct(
+            disjunct.trim(),
+            &mut changed,
+        ));
+    }
+    if !changed {
+        return None;
+    }
+    if disjuncts.iter().any(|disjunct| disjunct == "*") {
+        Some("*".to_string())
+    } else {
+        Some(disjuncts.join(" || "))
+    }
+}
+
+fn normalize_wildcard_operator_disjunct(disjunct: &str, changed: &mut bool) -> String {
+    let mut local_changed = false;
+    let mut normalized = Vec::new();
+    let mut tokens = disjunct.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        if is_range_operator_token(token)
+            && tokens
+                .peek()
+                .is_some_and(|operand| is_valid_wildcard_operand(operand))
+        {
+            tokens.next();
+            local_changed = true;
+            normalized.push("*".to_string());
+            continue;
+        }
+        if range_operator_operand(token).is_some_and(is_valid_wildcard_operand) {
+            local_changed = true;
+            normalized.push("*".to_string());
+            continue;
+        }
+        normalized.push(token.to_string());
+    }
+    if !local_changed {
+        return disjunct.to_string();
+    }
+
+    *changed = true;
+    normalized.retain(|token| token != "*");
+    if normalized.is_empty() {
+        "*".to_string()
+    } else {
+        normalized.join(" ")
+    }
+}
+
+fn is_range_operator_token(token: &str) -> bool {
+    matches!(token, "^" | "~" | "~>")
 }
 
 fn range_operator_operand(token: &str) -> Option<&str> {
@@ -290,6 +326,10 @@ fn strip_range_operator(token: &str) -> &str {
 
 fn is_malformed_wildcard_operand(input: &str) -> bool {
     starts_like_wildcard(input) && parse_wildcard_partial(input).is_none()
+}
+
+fn is_valid_wildcard_operand(input: &str) -> bool {
+    starts_like_wildcard(input) && parse_wildcard_partial(input).is_some()
 }
 
 fn starts_like_wildcard(input: &str) -> bool {
@@ -533,6 +573,30 @@ mod tests {
         assert!(range.matches(&v("0.0.9")));
         assert!(range.matches(&v("1.2.3")));
         assert_eq!(range.original(), "^x");
+    }
+
+    #[test]
+    fn wildcard_range_operators_are_valid_in_compound_ranges() {
+        let or_with_caret_wildcard = r("^x || ^1.0.0");
+        assert!(or_with_caret_wildcard.matches(&v("0.0.9")));
+        assert!(or_with_caret_wildcard.matches(&v("4.2.0")));
+
+        let or_with_tilde_wildcard = r("~x || 1.0.0");
+        assert!(or_with_tilde_wildcard.matches(&v("0.0.9")));
+        assert!(or_with_tilde_wildcard.matches(&v("4.2.0")));
+
+        let compound_with_wildcard_identity = r(">=1.0.0 ~x");
+        assert!(!compound_with_wildcard_identity.matches(&v("0.9.9")));
+        assert!(compound_with_wildcard_identity.matches(&v("1.0.0")));
+        assert!(compound_with_wildcard_identity.matches(&v("4.2.0")));
+
+        let spaced_tilde_wildcard = r("~ x");
+        assert!(spaced_tilde_wildcard.matches(&v("0.0.9")));
+        assert!(spaced_tilde_wildcard.matches(&v("4.2.0")));
+
+        let spaced_caret_wildcard = r("^ x");
+        assert!(spaced_caret_wildcard.matches(&v("0.0.9")));
+        assert!(spaced_caret_wildcard.matches(&v("4.2.0")));
     }
 
     // --- Comparison operators ---

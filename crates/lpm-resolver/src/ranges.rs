@@ -36,7 +36,7 @@ impl NpmRange {
                 parsed: node_semver::Range::any(),
             });
         }
-        let parsed = node_semver::Range::parse(trimmed)
+        let parsed = lpm_semver::parse_node_semver_range(trimmed)
             .map_err(|e| format!("invalid range '{input}': {e}"))?;
         Ok(NpmRange {
             raw: trimmed.to_string(),
@@ -276,6 +276,25 @@ mod tests {
     fn latest_is_wildcard() {
         let r = NpmRange::parse("latest").unwrap();
         assert!(r.satisfies(&v("1.0.0")));
+    }
+
+    #[test]
+    fn malformed_wildcard_range_returns_error() {
+        assert!(NpmRange::parse("=xx").is_err());
+        assert!(NpmRange::parse("^1.0.0 ||=*3").is_err());
+        assert!(NpmRange::parse("~X0^.00").is_err());
+    }
+
+    #[test]
+    fn wildcard_range_operators_are_valid_in_compound_ranges() {
+        let or_with_caret_wildcard = NpmRange::parse("^x || ^1.0.0").unwrap();
+        assert!(or_with_caret_wildcard.satisfies(&v("0.0.9")));
+        assert!(or_with_caret_wildcard.satisfies(&v("4.2.0")));
+
+        let compound_with_wildcard_identity = NpmRange::parse(">=1.0.0 ~x").unwrap();
+        assert!(!compound_with_wildcard_identity.satisfies(&v("0.9.9")));
+        assert!(compound_with_wildcard_identity.satisfies(&v("1.0.0")));
+        assert!(compound_with_wildcard_identity.satisfies(&v("4.2.0")));
     }
 
     // === npm alias parsing ===
