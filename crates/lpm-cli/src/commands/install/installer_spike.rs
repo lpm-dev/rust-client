@@ -1348,7 +1348,7 @@ async fn compute_parity_if_requested(
             seed_workspace_resolver_cache(&shared_cache, all_workspace_members);
             let npm_fanout = positive_usize_env_or_default(
                 "LPM_NPM_FANOUT",
-                default_fusion_npm_fanout_for_policy(0),
+                default_fusion_npm_fanout(false, 0),
             );
             let resolve_result = lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy(
                 client,

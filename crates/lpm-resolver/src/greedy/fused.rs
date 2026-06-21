@@ -497,8 +497,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     // For bench/fixture-large (266 transitive packages) the default-
     // sized HashMap rehashes ~5-7 times growing from 0 → 266; samply
     // surfaced `hashbrown::reserve_rehash` at ~6.7 % of cold-install
-    // CPU. `npm_fanout` (the metadata-semaphore size, default 256)
-    // is the closest proxy for "how many manifests this resolver might
+    // CPU. `npm_fanout` (the metadata-semaphore size) is the closest
+    // proxy for "how many manifests this resolver might
     // track simultaneously" without threading a dependency-count estimate
     // through. Slight over-allocation is cheaper than rehashing.
     let mut inflight: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);

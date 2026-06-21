@@ -2625,9 +2625,14 @@ async fn run_with_options_under_store_lock(
                     u128,
                 ) = if fusion_enabled_local {
                     // ── FUSION PATH ─────────────────────────────────────
+                    let fetch_overlap_enabled_local =
+                        fetch_overlap_enabled(fusion_enabled_local, force, omit_policy.dev);
                     let npm_fanout = positive_usize_env_or_default(
                         "LPM_NPM_FANOUT",
-                        default_fusion_npm_fanout_for_policy(resolver_min_age_secs),
+                        default_fusion_npm_fanout(
+                            fetch_overlap_enabled_local,
+                            resolver_min_age_secs,
+                        ),
                     );
                     let speculation_permits = positive_usize_env_or_default(
                         ENV_FUSION_SPECULATION_PERMITS,
@@ -2651,27 +2656,26 @@ async fn run_with_options_under_store_lock(
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
                     );
-                    let selected_package_tx =
-                        if fetch_overlap_enabled(fusion_enabled_local, force, omit_policy.dev) {
-                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                            fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
-                                rx,
-                                arc_client.clone(),
-                                route_table.clone(),
-                                store.clone(),
-                                store_v2_handle.clone(),
-                                fetch_semaphore.clone(),
-                                fetch_coord.clone(),
-                                project_dir.to_path_buf(),
-                                gate_stats.clone(),
-                                fetch_extract_limiter.clone(),
-                                streaming_fetch,
-                                fetch_overlap_min_selected(),
-                            ));
-                            Some(tx)
-                        } else {
-                            None
-                        };
+                    let selected_package_tx = if fetch_overlap_enabled_local {
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
+                            rx,
+                            arc_client.clone(),
+                            route_table.clone(),
+                            store.clone(),
+                            store_v2_handle.clone(),
+                            fetch_semaphore.clone(),
+                            fetch_coord.clone(),
+                            project_dir.to_path_buf(),
+                            gate_stats.clone(),
+                            fetch_extract_limiter.clone(),
+                            streaming_fetch,
+                            fetch_overlap_min_selected(),
+                        ));
+                        Some(tx)
+                    } else {
+                        None
+                    };
                     let res = lpm_resolver::resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         arc_client.clone(),
                         deps.clone(),

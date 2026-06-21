@@ -293,12 +293,20 @@ impl SpeculativeKeyTracker {
 /// speculation doesn't ask for manifests the worker won't send.
 pub(super) const SPECULATION_MAX_DEPTH: u32 = 5;
 pub(super) const DEFAULT_FUSION_NPM_FANOUT: usize = lpm_resolver::DEFAULT_NPM_FANOUT;
+pub(super) const DEFAULT_FUSION_OVERLAP_NPM_FANOUT: usize = 32;
 pub(super) const DEFAULT_FUSION_SPECULATION_PERMITS: usize = DEFAULT_MAX_CONCURRENT_DOWNLOADS;
 pub(super) const ENV_FUSION_SPECULATION_PERMITS: &str = "LPM_FUSION_SPECULATION_PERMITS";
 pub(super) const ENV_VERIFY_REGISTRY_SIGNATURES: &str = "LPM_VERIFY_REGISTRY_SIGNATURES";
 
-pub(super) fn default_fusion_npm_fanout_for_policy(_minimum_release_age_secs: u64) -> usize {
-    DEFAULT_FUSION_NPM_FANOUT
+pub(super) fn default_fusion_npm_fanout(
+    fetch_overlap_enabled: bool,
+    _minimum_release_age_secs: u64,
+) -> usize {
+    if fetch_overlap_enabled {
+        DEFAULT_FUSION_OVERLAP_NPM_FANOUT
+    } else {
+        DEFAULT_FUSION_NPM_FANOUT
+    }
 }
 
 pub(super) fn parse_positive_usize_or_default(value: &str, default: usize) -> usize {
@@ -1167,17 +1175,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_fusion_npm_fanout_for_policy_keeps_abbreviated_fast_path_wide() {
+    fn default_fusion_npm_fanout_uses_overlap_scheduling_cap_when_overlap_enabled() {
+        assert_eq!(default_fusion_npm_fanout(true, 0), 32);
+    }
+
+    #[test]
+    fn default_fusion_npm_fanout_uses_overlap_scheduling_cap_with_release_age() {
+        assert_eq!(default_fusion_npm_fanout(true, 86_400), 32);
+    }
+
+    #[test]
+    fn default_fusion_npm_fanout_uses_wide_default_when_overlap_disabled() {
         assert_eq!(
-            default_fusion_npm_fanout_for_policy(0),
+            default_fusion_npm_fanout(false, 0),
             DEFAULT_FUSION_NPM_FANOUT
         );
     }
 
     #[test]
-    fn default_fusion_npm_fanout_for_policy_keeps_release_age_fast_path_wide() {
+    fn default_fusion_npm_fanout_uses_wide_default_when_release_age_overlap_disabled() {
         assert_eq!(
-            default_fusion_npm_fanout_for_policy(86_400),
+            default_fusion_npm_fanout(false, 86_400),
             DEFAULT_FUSION_NPM_FANOUT
         );
     }
