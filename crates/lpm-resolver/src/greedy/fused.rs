@@ -1,6 +1,6 @@
 use super::edge::process_edge_with_preferred;
 use super::manifest::{
-    FetchResult, FetchedMetadata, complete_metadata_fetch,
+    FetchResult, FetchedMetadata, MetadataFetchCompletion, complete_metadata_fetch,
     ensure_policy_metadata_for_cached_manifest, fetch_metadata_for_resolver_with_trace_detail,
     parse_fetched_metadata,
 };
@@ -75,6 +75,7 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
             let FetchedMetadata {
                 speculation,
                 info: info_arc,
+                ..
             } = fetched;
             self.shared_cache
                 .insert(canonical.clone(), info_arc.clone());
@@ -137,8 +138,14 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                         ) {
                             continue;
                         }
-                        let fetched = parse_fetched_metadata(meta, self.spec_tx.is_some());
-                        let FetchedMetadata { speculation, info } = fetched;
+                        let fetched = parse_fetched_metadata(
+                            meta,
+                            self.spec_tx.is_some(),
+                            self.trace_metadata_fetches,
+                        );
+                        let FetchedMetadata {
+                            speculation, info, ..
+                        } = fetched;
                         self.shared_cache.insert(canonical.clone(), info);
                         if let (Some(tx), Some(speculation)) = (self.spec_tx, speculation)
                             && tx.try_send((canonical.to_string(), speculation)).is_ok()
@@ -463,8 +470,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                     ) {
                         continue;
                     }
-                    let fetched = parse_fetched_metadata(meta, spec_tx.is_some());
-                    let FetchedMetadata { speculation, info } = fetched;
+                    let fetched =
+                        parse_fetched_metadata(meta, spec_tx.is_some(), trace_metadata_fetches);
+                    let FetchedMetadata {
+                        speculation, info, ..
+                    } = fetched;
                     shared_cache.insert(canonical.clone(), info);
                     if let (Some(tx), Some(speculation)) = (spec_tx.as_ref(), speculation)
                         && tx.try_send((canonical.to_string(), speculation)).is_ok()
@@ -493,6 +503,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     // through. Slight over-allocation is cheaper than rehashing.
     let mut inflight: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
     let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
+    let mut counted_metadata_edge_misses =
+        trace_metadata_fetches.then(|| AHashSet::with_capacity(npm_fanout));
     let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
         tokio::task::JoinSet::new();
 
@@ -538,8 +550,17 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             // drain are grouped into one batch below; direct/custom
             // routes keep the existing per-package fetch path.
             let canonical = edge.canonical.clone();
+            let new_fetch = inflight.insert(canonical.clone());
+            if new_fetch && trace_metadata_fetches {
+                state
+                    .work_stats
+                    .record_metadata_edge_miss(&canonical, &edge.range, &route_table);
+                if let Some(counted_metadata_edge_misses) = counted_metadata_edge_misses.as_mut() {
+                    counted_metadata_edge_misses.insert(canonical.clone());
+                }
+            }
             parked.entry(canonical.clone()).or_default().push(edge);
-            if inflight.insert(canonical.clone()) {
+            if new_fetch {
                 let include_speculation = spec_tx.is_some();
                 let worker_name = match &canonical {
                     CanonicalKey::Npm { name }
@@ -589,16 +610,19 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         }
                         returned.insert(canonical.clone());
                         inflight.remove(&canonical);
-                        let fetched = parse_fetched_metadata(meta, spec_tx.is_some());
-                        complete_metadata_fetch(
-                            canonical,
-                            Ok(fetched),
-                            &shared_cache,
-                            spec_tx.as_ref(),
-                            &mut tarball_dispatched_count,
-                            &mut parked,
-                            &mut state,
-                        )?;
+                        let fetched =
+                            parse_fetched_metadata(meta, spec_tx.is_some(), trace_metadata_fetches);
+                        let mut completion = MetadataFetchCompletion {
+                            shared_cache: &shared_cache,
+                            route_table: &route_table,
+                            counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
+                            trace_metadata_fetches,
+                            spec_tx: spec_tx.as_ref(),
+                            tarball_dispatched_count: &mut tarball_dispatched_count,
+                            parked: &mut parked,
+                            state: &mut state,
+                        };
+                        complete_metadata_fetch(canonical, Ok(fetched), &mut completion)?;
                     }
 
                     for (canonical, _) in worker_batch_candidates {
@@ -789,15 +813,17 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             let (canonical, result) = joined
                 .map_err(|e| ResolveError::Internal(format!("metadata join failure: {e}")))?;
             inflight.remove(&canonical);
-            complete_metadata_fetch(
-                canonical,
-                result,
-                &shared_cache,
-                spec_tx.as_ref(),
-                &mut tarball_dispatched_count,
-                &mut parked,
-                &mut state,
-            )?;
+            let mut completion = MetadataFetchCompletion {
+                shared_cache: &shared_cache,
+                route_table: &route_table,
+                counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
+                trace_metadata_fetches,
+                spec_tx: spec_tx.as_ref(),
+                tarball_dispatched_count: &mut tarball_dispatched_count,
+                parked: &mut parked,
+                state: &mut state,
+            };
+            complete_metadata_fetch(canonical, result, &mut completion)?;
         }
     }
 
@@ -870,6 +896,37 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             work_node_allocated_count: work_stats.node_allocated_count,
             work_child_edge_enqueued_count: work_stats.child_edge_enqueued_count,
             work_peer_requirement_count: work_stats.peer_requirement_count,
+            work_metadata_edge_miss_count: work_stats.metadata_edge_miss_count,
+            work_metadata_edge_miss_direct_count: work_stats.metadata_edge_miss_direct_count,
+            work_metadata_edge_miss_latest_known_count: work_stats
+                .metadata_edge_miss_latest_known_count,
+            work_metadata_edge_miss_latest_known_direct_count: work_stats
+                .metadata_edge_miss_latest_known_direct_count,
+            work_metadata_edge_miss_latest_satisfies_count: work_stats
+                .metadata_edge_miss_latest_satisfies_count,
+            work_metadata_edge_miss_latest_satisfies_direct_count: work_stats
+                .metadata_edge_miss_latest_satisfies_direct_count,
+            work_metadata_edge_miss_latest_matches_pick_count: work_stats
+                .metadata_edge_miss_latest_matches_pick_count,
+            work_metadata_edge_miss_latest_matches_pick_direct_count: work_stats
+                .metadata_edge_miss_latest_matches_pick_direct_count,
+            work_metadata_edge_miss_version_doc_policy_eligible_count: work_stats
+                .metadata_edge_miss_version_doc_policy_eligible_count,
+            work_metadata_edge_miss_version_doc_policy_eligible_direct_count: work_stats
+                .metadata_edge_miss_version_doc_policy_eligible_direct_count,
+            work_metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count:
+                work_stats.metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count,
+            work_metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count:
+                work_stats
+                    .metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count,
+            work_metadata_edge_miss_exact_count: work_stats.metadata_edge_miss_exact_count,
+            work_metadata_edge_miss_star_count: work_stats.metadata_edge_miss_star_count,
+            work_metadata_edge_miss_caret_count: work_stats.metadata_edge_miss_caret_count,
+            work_metadata_edge_miss_tilde_count: work_stats.metadata_edge_miss_tilde_count,
+            work_metadata_edge_miss_comparator_count: work_stats
+                .metadata_edge_miss_comparator_count,
+            work_metadata_edge_miss_complex_count: work_stats.metadata_edge_miss_complex_count,
+            work_metadata_edge_miss_other_count: work_stats.metadata_edge_miss_other_count,
             selected_package_count,
             selected_unique_canonical_count,
             selected_duplicate_canonical_count,

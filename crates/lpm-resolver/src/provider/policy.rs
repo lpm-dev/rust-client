@@ -7,7 +7,7 @@ pub(crate) fn release_age_status_for_version(
     policy: &ResolverPolicy,
 ) -> ReleaseTimeStatus {
     let start = std::time::Instant::now();
-    let status = release_age_status_for_version_inner(package, info, version, policy);
+    let status = release_age_status_for_version_unprofiled(package, info, version, policy);
     crate::profile::record_release_age_check(
         start.elapsed(),
         !matches!(status, ReleaseTimeStatus::Allowed),
@@ -16,7 +16,7 @@ pub(crate) fn release_age_status_for_version(
     status
 }
 
-fn release_age_status_for_version_inner(
+pub(crate) fn release_age_status_for_version_unprofiled(
     package: &CanonicalKey,
     info: &CachedPackageInfo,
     version: &NpmVersion,
@@ -43,12 +43,12 @@ pub(crate) fn trust_downgrade_violation(
     version: &NpmVersion,
 ) -> Option<String> {
     let start = std::time::Instant::now();
-    let violation = trust_downgrade_violation_inner(info, version);
+    let violation = trust_downgrade_violation_unprofiled(info, version);
     crate::profile::record_trust_policy_check(start.elapsed(), violation.is_some());
     violation
 }
 
-fn trust_downgrade_violation_inner(
+pub(crate) fn trust_downgrade_violation_unprofiled(
     info: &CachedPackageInfo,
     version: &NpmVersion,
 ) -> Option<String> {

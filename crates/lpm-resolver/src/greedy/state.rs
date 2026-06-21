@@ -2,6 +2,7 @@ use super::peer::{CachedPeerResolution, PeerResolutionCacheKey};
 use super::prelude::*;
 use super::types::{DepBehavior, Edge, NodeId, PeerConflictReport, PeerRequirement};
 use super::version::is_workspace_specifier;
+use super::version::{VersionPick, find_best_version_with_policy_unprofiled};
 use crate::resolve::SelectedPackageEvent;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -13,6 +14,194 @@ pub(super) struct ResolveWorkStats {
     pub(super) node_allocated_count: u64,
     pub(super) child_edge_enqueued_count: u64,
     pub(super) peer_requirement_count: u64,
+    pub(super) metadata_edge_miss_count: u64,
+    pub(super) metadata_edge_miss_direct_count: u64,
+    pub(super) metadata_edge_miss_latest_known_count: u64,
+    pub(super) metadata_edge_miss_latest_known_direct_count: u64,
+    pub(super) metadata_edge_miss_latest_satisfies_count: u64,
+    pub(super) metadata_edge_miss_latest_satisfies_direct_count: u64,
+    pub(super) metadata_edge_miss_latest_matches_pick_count: u64,
+    pub(super) metadata_edge_miss_latest_matches_pick_direct_count: u64,
+    pub(super) metadata_edge_miss_version_doc_policy_eligible_count: u64,
+    pub(super) metadata_edge_miss_version_doc_policy_eligible_direct_count: u64,
+    pub(super) metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count: u64,
+    pub(super) metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count: u64,
+    pub(super) metadata_edge_miss_exact_count: u64,
+    pub(super) metadata_edge_miss_star_count: u64,
+    pub(super) metadata_edge_miss_caret_count: u64,
+    pub(super) metadata_edge_miss_tilde_count: u64,
+    pub(super) metadata_edge_miss_comparator_count: u64,
+    pub(super) metadata_edge_miss_complex_count: u64,
+    pub(super) metadata_edge_miss_other_count: u64,
+}
+
+impl ResolveWorkStats {
+    pub(super) fn record_metadata_edge_miss(
+        &mut self,
+        canonical: &CanonicalKey,
+        range: &NpmRange,
+        route_table: &RouteTable,
+    ) {
+        self.metadata_edge_miss_count = self.metadata_edge_miss_count.saturating_add(1);
+        if matches!(
+            canonical,
+            CanonicalKey::Npm { name }
+                if matches!(route_table.route_for_package(name), UpstreamRoute::NpmDirect)
+        ) {
+            self.metadata_edge_miss_direct_count =
+                self.metadata_edge_miss_direct_count.saturating_add(1);
+        }
+
+        match metadata_edge_miss_range_shape(range) {
+            MetadataEdgeMissRangeShape::Exact => {
+                self.metadata_edge_miss_exact_count =
+                    self.metadata_edge_miss_exact_count.saturating_add(1);
+            }
+            MetadataEdgeMissRangeShape::Star => {
+                self.metadata_edge_miss_star_count =
+                    self.metadata_edge_miss_star_count.saturating_add(1);
+            }
+            MetadataEdgeMissRangeShape::Caret => {
+                self.metadata_edge_miss_caret_count =
+                    self.metadata_edge_miss_caret_count.saturating_add(1);
+            }
+            MetadataEdgeMissRangeShape::Tilde => {
+                self.metadata_edge_miss_tilde_count =
+                    self.metadata_edge_miss_tilde_count.saturating_add(1);
+            }
+            MetadataEdgeMissRangeShape::Comparator => {
+                self.metadata_edge_miss_comparator_count =
+                    self.metadata_edge_miss_comparator_count.saturating_add(1);
+            }
+            MetadataEdgeMissRangeShape::Complex => {
+                self.metadata_edge_miss_complex_count =
+                    self.metadata_edge_miss_complex_count.saturating_add(1);
+            }
+            MetadataEdgeMissRangeShape::Other => {
+                self.metadata_edge_miss_other_count =
+                    self.metadata_edge_miss_other_count.saturating_add(1);
+            }
+        }
+    }
+
+    pub(super) fn record_metadata_edge_miss_latest(&mut self, miss: MetadataEdgeMissLatest<'_>) {
+        let direct = matches!(
+            miss.canonical,
+            CanonicalKey::Npm { name }
+                if matches!(miss.route_table.route_for_package(name), UpstreamRoute::NpmDirect)
+        );
+        let version_doc_policy_eligible =
+            !miss.policy.release_age_applies_to_package(miss.canonical)
+                && !miss.policy.requires_trust_history();
+        if version_doc_policy_eligible {
+            self.metadata_edge_miss_version_doc_policy_eligible_count = self
+                .metadata_edge_miss_version_doc_policy_eligible_count
+                .saturating_add(1);
+            if direct {
+                self.metadata_edge_miss_version_doc_policy_eligible_direct_count = self
+                    .metadata_edge_miss_version_doc_policy_eligible_direct_count
+                    .saturating_add(1);
+            }
+        }
+
+        let Some(latest_version) = miss.latest_version else {
+            return;
+        };
+        self.metadata_edge_miss_latest_known_count =
+            self.metadata_edge_miss_latest_known_count.saturating_add(1);
+        if direct {
+            self.metadata_edge_miss_latest_known_direct_count = self
+                .metadata_edge_miss_latest_known_direct_count
+                .saturating_add(1);
+        }
+        if miss.range.satisfies(latest_version) {
+            self.metadata_edge_miss_latest_satisfies_count = self
+                .metadata_edge_miss_latest_satisfies_count
+                .saturating_add(1);
+            if direct {
+                self.metadata_edge_miss_latest_satisfies_direct_count = self
+                    .metadata_edge_miss_latest_satisfies_direct_count
+                    .saturating_add(1);
+            }
+        }
+        if miss.compare_policy_pick
+            && matches!(
+                find_best_version_with_policy_unprofiled(
+                    miss.canonical,
+                    miss.info,
+                    miss.range,
+                    miss.policy
+                ),
+                VersionPick::Picked(best) if &best == latest_version
+            )
+        {
+            self.metadata_edge_miss_latest_matches_pick_count = self
+                .metadata_edge_miss_latest_matches_pick_count
+                .saturating_add(1);
+            if direct {
+                self.metadata_edge_miss_latest_matches_pick_direct_count = self
+                    .metadata_edge_miss_latest_matches_pick_direct_count
+                    .saturating_add(1);
+            }
+            if version_doc_policy_eligible {
+                self.metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count =
+                    self.metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_count
+                        .saturating_add(1);
+                if direct {
+                    self.metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count =
+                        self.metadata_edge_miss_latest_matches_pick_version_doc_policy_eligible_direct_count
+                            .saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
+pub(super) struct MetadataEdgeMissLatest<'a> {
+    pub(super) canonical: &'a CanonicalKey,
+    pub(super) range: &'a NpmRange,
+    pub(super) info: &'a CachedPackageInfo,
+    pub(super) latest_version: Option<&'a NpmVersion>,
+    pub(super) route_table: &'a RouteTable,
+    pub(super) policy: &'a ResolverPolicy,
+    pub(super) compare_policy_pick: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataEdgeMissRangeShape {
+    Exact,
+    Star,
+    Caret,
+    Tilde,
+    Comparator,
+    Complex,
+    Other,
+}
+
+fn metadata_edge_miss_range_shape(range: &NpmRange) -> MetadataEdgeMissRangeShape {
+    let raw = range.raw().trim();
+    if raw == "*" {
+        return MetadataEdgeMissRangeShape::Star;
+    }
+    if NpmVersion::parse(raw).is_ok() {
+        return MetadataEdgeMissRangeShape::Exact;
+    }
+    if raw.contains("||") || raw.contains(" - ") {
+        return MetadataEdgeMissRangeShape::Complex;
+    }
+    if raw.contains(' ') || raw.contains(',') {
+        return MetadataEdgeMissRangeShape::Complex;
+    }
+    if raw.starts_with('^') {
+        return MetadataEdgeMissRangeShape::Caret;
+    }
+    if raw.starts_with('~') {
+        return MetadataEdgeMissRangeShape::Tilde;
+    }
+    if raw.starts_with('<') || raw.starts_with('>') || raw.starts_with('=') {
+        return MetadataEdgeMissRangeShape::Comparator;
+    }
+    MetadataEdgeMissRangeShape::Other
 }
 
 /// Carrier for the per-pass mutable state. Keeps the dispatch loop
@@ -467,5 +656,108 @@ fn canonical_to_resolver_package(key: &CanonicalKey) -> ResolverPackage {
             name: name.clone(),
             context: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_info() -> CachedPackageInfo {
+        CachedPackageInfo {
+            modified: None,
+            modified_unix: None,
+            trust_metadata_complete: false,
+            versions: vec![NpmVersion::parse("1.0.0").expect("valid version")],
+            deps: HashMap::new(),
+            peer_deps: HashMap::new(),
+            optional_dep_names: HashMap::new(),
+            optional_peer_names: HashMap::new(),
+            bundled_dep_names: HashMap::new(),
+            platform: HashMap::new(),
+            dist: HashMap::new(),
+            aliases: HashMap::new(),
+        }
+    }
+
+    fn shape(raw: &str) -> MetadataEdgeMissRangeShape {
+        metadata_edge_miss_range_shape(&NpmRange::parse(raw).expect("valid test range"))
+    }
+
+    #[test]
+    fn metadata_edge_miss_range_shape_classifies_exact_versions() {
+        assert_eq!(shape("1.2.3"), MetadataEdgeMissRangeShape::Exact);
+    }
+
+    #[test]
+    fn metadata_edge_miss_range_shape_classifies_latest_as_star() {
+        assert_eq!(shape("latest"), MetadataEdgeMissRangeShape::Star);
+    }
+
+    #[test]
+    fn metadata_edge_miss_range_shape_classifies_common_range_operators() {
+        assert_eq!(shape("^1.2.3"), MetadataEdgeMissRangeShape::Caret);
+        assert_eq!(shape("~1.2.3"), MetadataEdgeMissRangeShape::Tilde);
+        assert_eq!(shape(">=1.2.3"), MetadataEdgeMissRangeShape::Comparator);
+        assert_eq!(shape(">=1.0.0 <2.0.0"), MetadataEdgeMissRangeShape::Complex);
+        assert_eq!(
+            shape("^1.0.0 || ^2.0.0"),
+            MetadataEdgeMissRangeShape::Complex
+        );
+    }
+
+    #[test]
+    fn metadata_edge_miss_latest_records_version_doc_policy_eligibility_without_latest_tag() {
+        let mut stats = ResolveWorkStats::default();
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let canonical = CanonicalKey::npm("left-pad");
+        let range = NpmRange::parse("1.0.0").expect("valid range");
+        let info = empty_info();
+
+        let policy = ResolverPolicy::default();
+        stats.record_metadata_edge_miss_latest(MetadataEdgeMissLatest {
+            canonical: &canonical,
+            range: &range,
+            info: &info,
+            latest_version: None,
+            route_table: &route_table,
+            policy: &policy,
+            compare_policy_pick: true,
+        });
+
+        assert_eq!(
+            stats.metadata_edge_miss_version_doc_policy_eligible_count,
+            1
+        );
+        assert_eq!(
+            stats.metadata_edge_miss_version_doc_policy_eligible_direct_count,
+            1
+        );
+        assert_eq!(stats.metadata_edge_miss_latest_known_count, 0);
+    }
+
+    #[test]
+    fn metadata_edge_miss_latest_skips_policy_pick_match_when_comparison_disabled() {
+        let mut stats = ResolveWorkStats::default();
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let canonical = CanonicalKey::npm("left-pad");
+        let range = NpmRange::parse("^1.0.0").expect("valid range");
+        let info = empty_info();
+        let latest = NpmVersion::parse("1.0.0").expect("valid version");
+
+        let policy = ResolverPolicy::default();
+        stats.record_metadata_edge_miss_latest(MetadataEdgeMissLatest {
+            canonical: &canonical,
+            range: &range,
+            info: &info,
+            latest_version: Some(&latest),
+            route_table: &route_table,
+            policy: &policy,
+            compare_policy_pick: false,
+        });
+
+        assert_eq!(stats.metadata_edge_miss_latest_known_count, 1);
+        assert_eq!(stats.metadata_edge_miss_latest_satisfies_count, 1);
+        assert_eq!(stats.metadata_edge_miss_latest_matches_pick_count, 0);
     }
 }

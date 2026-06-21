@@ -43,12 +43,36 @@ pub(super) fn find_best_version_with_policy(
     range: &NpmRange,
     policy: &ResolverPolicy,
 ) -> VersionPick {
+    find_best_version_with_policy_impl(canonical, info, range, policy, true)
+}
+
+pub(super) fn find_best_version_with_policy_unprofiled(
+    canonical: &CanonicalKey,
+    info: &CachedPackageInfo,
+    range: &NpmRange,
+    policy: &ResolverPolicy,
+) -> VersionPick {
+    find_best_version_with_policy_impl(canonical, info, range, policy, false)
+}
+
+fn find_best_version_with_policy_impl(
+    canonical: &CanonicalKey,
+    info: &CachedPackageInfo,
+    range: &NpmRange,
+    policy: &ResolverPolicy,
+    record_policy_profile: bool,
+) -> VersionPick {
     let mut first_policy_block: Option<VersionPick> = None;
     for v in &info.versions {
         if !range.satisfies(v) {
             continue;
         }
-        match release_age_status_for_version(canonical, info, v, policy) {
+        let release_age_status = if record_policy_profile {
+            release_age_status_for_version(canonical, info, v, policy)
+        } else {
+            release_age_status_for_version_unprofiled(canonical, info, v, policy)
+        };
+        match release_age_status {
             ReleaseTimeStatus::Allowed => {}
             ReleaseTimeStatus::Missing => {
                 return VersionPick::BlockedByReleaseAge {
@@ -69,7 +93,11 @@ pub(super) fn find_best_version_with_policy(
             }
         }
         if policy.trust_policy().is_no_downgrade()
-            && let Some(reason) = trust_downgrade_violation(info, v)
+            && let Some(reason) = if record_policy_profile {
+                trust_downgrade_violation(info, v)
+            } else {
+                trust_downgrade_violation_unprofiled(info, v)
+            }
         {
             if first_policy_block.is_none() {
                 first_policy_block = Some(VersionPick::BlockedByTrustPolicy {

@@ -96,7 +96,7 @@ fn parse_fetched_metadata_omits_speculation_when_disabled() {
     let metadata = serde_json::from_value(metadata_json("spec-skip", &[("left-pad", "^1.0.0")]))
         .expect("fixture metadata should parse");
 
-    let fetched = parse_fetched_metadata(metadata, false);
+    let fetched = parse_fetched_metadata(metadata, false, false);
 
     assert!(fetched.speculation.is_none());
     assert_eq!(fetched.info.versions.len(), 1);
@@ -107,7 +107,7 @@ fn parse_fetched_metadata_preserves_speculation_when_enabled() {
     let metadata = serde_json::from_value(metadata_json("spec-keep", &[("left-pad", "^1.0.0")]))
         .expect("fixture metadata should parse");
 
-    let fetched = parse_fetched_metadata(metadata, true);
+    let fetched = parse_fetched_metadata(metadata, true, false);
 
     let speculation = fetched
         .speculation
@@ -845,6 +845,27 @@ fn find_best_version_blocks_exact_trust_downgrade() {
         find_best_version_with_policy(&CanonicalKey::Root, &info, &range, &policy),
         VersionPick::BlockedByTrustPolicy { .. }
     ));
+}
+
+#[test]
+fn find_best_version_unprofiled_does_not_record_policy_checks() {
+    let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
+    set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
+    info.dist.get_mut("1.0.0").unwrap().trust_evidence =
+        Some(crate::policy::TrustEvidence::TrustedPublisher);
+    set_published_at(&mut info, "1.1.0", "2025-01-02T00:00:00.000Z");
+    let policy = ResolverPolicy::new(0, crate::policy::TrustPolicyMode::NoDowngrade);
+    let range = NpmRange::parse("1.1.0").unwrap();
+
+    crate::profile::reset_all();
+
+    assert!(matches!(
+        find_best_version_with_policy_unprofiled(&CanonicalKey::Root, &info, &range, &policy),
+        VersionPick::BlockedByTrustPolicy { .. }
+    ));
+    let policy_summary = crate::profile::policy_summary();
+    assert_eq!(policy_summary.release_age.checked_count, 0);
+    assert_eq!(policy_summary.trust_policy.checked_count, 0);
 }
 
 #[test]
