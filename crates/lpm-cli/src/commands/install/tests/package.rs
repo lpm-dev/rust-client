@@ -71,17 +71,21 @@ async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
     assert!(prevalidation.concurrency >= 1);
     assert_eq!(prevalidation.validation_timings.checked_count, 1);
     assert_eq!(prevalidation.validation_timings.hit_count, 1);
-    assert_eq!(prevalidation.validation_timings.snapshot_hit_count, 1);
+    assert_eq!(
+        prevalidation.validation_timings.object_sidecar_read_count,
+        1
+    );
+    assert_eq!(prevalidation.validation_timings.snapshot_hit_count, 0);
     let hit = prevalidation
         .hits
         .get(&key)
         .expect("prevalidation must return the v2 object hit");
     assert_eq!(hit.path, object_dir);
-    assert!(hit.tree_integrity.as_str().starts_with("sha256-"));
+    assert!(hit.object_integrity.as_str().starts_with("sha256-"));
 }
 
 #[tokio::test]
-async fn prevalidate_v2_reusable_objects_removes_tampered_registry_objects() {
+async fn prevalidate_v2_reusable_objects_source_policy_trusts_tampered_registry_objects() {
     let dir = tempfile::tempdir().unwrap();
     let store = lpm_store::v2::Store::at(dir.path().join("store"));
     let tarball = build_minimal_tarball_with_pkg("tampered", "1.0.0");
@@ -100,13 +104,44 @@ async fn prevalidate_v2_reusable_objects_removes_tampered_registry_objects() {
         .unwrap();
 
     assert_eq!(prevalidation.candidate_count, 1);
+    assert_eq!(prevalidation.hits.len(), 1);
+    assert_eq!(prevalidation.validation_timings.checked_count, 1);
+    assert_eq!(prevalidation.validation_timings.hit_count, 1);
+    assert_eq!(prevalidation.validation_timings.removed_count, 0);
+    assert!(object_dir.exists());
+}
+
+#[tokio::test]
+async fn prevalidate_v2_reusable_objects_tree_policy_removes_tampered_registry_objects() {
+    let _env = crate::test_env::ScopedEnv::set([(
+        "LPM_V2_OBJECT_INTEGRITY",
+        std::ffi::OsString::from("tree"),
+    )]);
+    let dir = tempfile::tempdir().unwrap();
+    let store = lpm_store::v2::Store::at(dir.path().join("store"));
+    let tarball = build_minimal_tarball_with_pkg("tampered-tree", "1.0.0");
+    let (object_dir, sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+    std::fs::write(
+        object_dir.join("package.json"),
+        br#"{"name":"tampered-tree","version":"1.0.0","changed":true}"#,
+    )
+    .unwrap();
+
+    let mut pkg = fake_pkg("tampered-tree", "1.0.0", true);
+    pkg.integrity = Some(sri);
+
+    let prevalidation = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
+        .await
+        .unwrap();
+
+    assert_eq!(prevalidation.candidate_count, 1);
     assert!(prevalidation.hits.is_empty());
     assert_eq!(prevalidation.validation_timings.checked_count, 1);
     assert_eq!(prevalidation.validation_timings.miss_count, 1);
     assert_eq!(prevalidation.validation_timings.removed_count, 1);
     assert!(
         !object_dir.exists(),
-        "tampered v2 objects must still be removed before cache reuse"
+        "tree policy must remove tampered v2 objects before cache reuse"
     );
 }
 

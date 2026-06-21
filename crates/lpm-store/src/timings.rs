@@ -25,9 +25,8 @@ pub struct StageTimings {
     /// finalization work starts. Zero unless the v2 finalize limiter is
     /// enabled by environment.
     pub finalize_permit_wait_ms: u128,
-    /// Time spent computing and writing the v2 object tree integrity
-    /// sidecars. Zero for store implementations that do not have an
-    /// object-tree sidecar.
+    /// Time spent computing and writing the v2 object-integrity sidecar.
+    /// The JSON field keeps its historical name for compatibility.
     pub finalize_tree_integrity_ms: u128,
     /// Time spent writing the package SRI sidecar.
     pub finalize_integrity_write_ms: u128,
@@ -36,17 +35,15 @@ pub struct StageTimings {
     /// Time spent recovering from an atomic rename collision after a
     /// sibling task won the same object/package publication race.
     pub finalize_collision_recovery_ms: u128,
-    /// Regular files observed while already walking the extracted object
-    /// tree for integrity. Zero when the store path does not provide this
-    /// count without an extra traversal.
+    /// Regular files observed during extraction or integrity collection.
+    /// Zero when the store path does not provide this count cheaply.
     pub file_count: u64,
-    /// Directories observed while already walking the extracted object tree
-    /// for integrity. The object root itself is not counted.
+    /// Directories observed during extraction or integrity collection. The
+    /// object root itself is not counted.
     pub dir_count: u64,
-    /// Symlinks observed while already walking the extracted object tree
-    /// for integrity.
+    /// Symlinks observed during extraction or integrity collection.
     pub symlink_count: u64,
-    /// Sum of regular-file byte sizes observed during the object-tree
-    /// integrity walk.
+    /// Sum of regular-file byte sizes observed during extraction or
+    /// integrity collection.
     pub unpacked_bytes: u64,
 }
