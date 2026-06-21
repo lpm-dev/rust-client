@@ -79,6 +79,9 @@ fn unsupported_admission_reasons(
     benchmark_only: bool,
 ) -> Vec<&'static str> {
     let mut reasons = Vec::new();
+    if graph_source == InstallerSpikeGraphSource::Invalid {
+        reasons.push("set LPM_INSTALLER_SPIKE_GRAPH=resolve-worklist or lockfile");
+    }
     if !benchmark_only {
         reasons.push("set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1");
     }
@@ -862,6 +865,11 @@ pub(super) async fn run(
             stats.inserted_nodes = install_packages.len() as u64;
             install_packages
         }
+        InstallerSpikeGraphSource::Invalid => {
+            return Err(LpmError::Registry(
+                "invalid experimental installer spike graph".to_string(),
+            ));
+        }
     };
     let mut platform_skipped = filter_platform_packages(&mut install_packages)?;
     if graph_source == InstallerSpikeGraphSource::Lockfile {
@@ -1131,6 +1139,7 @@ fn installer_spike_metadata_concurrency() -> usize {
 enum InstallerSpikeGraphSource {
     ResolveWorklist,
     Lockfile,
+    Invalid,
 }
 
 impl InstallerSpikeGraphSource {
@@ -1140,8 +1149,10 @@ impl InstallerSpikeGraphSource {
 
     fn from_value(value: Option<&str>) -> Self {
         match value {
+            None => Self::ResolveWorklist,
+            Some("resolve" | "resolve-worklist" | "live" | "live-resolve") => Self::ResolveWorklist,
             Some("lock" | "lockfile" | "seed-lock") => Self::Lockfile,
-            Some(_) | None => Self::ResolveWorklist,
+            Some(_) => Self::Invalid,
         }
     }
 
@@ -1149,6 +1160,7 @@ impl InstallerSpikeGraphSource {
         match self {
             Self::ResolveWorklist => "resolve-worklist",
             Self::Lockfile => "lockfile",
+            Self::Invalid => "invalid",
         }
     }
 
@@ -2663,10 +2675,26 @@ mod tests {
     }
 
     #[test]
-    fn graph_source_defaults_to_resolve_worklist_for_unknown_value() {
+    fn graph_source_defaults_to_resolve_worklist_when_unset() {
+        assert_eq!(
+            InstallerSpikeGraphSource::from_value(None),
+            InstallerSpikeGraphSource::ResolveWorklist
+        );
+    }
+
+    #[test]
+    fn graph_source_parses_explicit_resolve_worklist_without_environment_mutation() {
+        assert_eq!(
+            InstallerSpikeGraphSource::from_value(Some("resolve-worklist")),
+            InstallerSpikeGraphSource::ResolveWorklist
+        );
+    }
+
+    #[test]
+    fn graph_source_rejects_unknown_explicit_value() {
         assert_eq!(
             InstallerSpikeGraphSource::from_value(Some("unexpected")),
-            InstallerSpikeGraphSource::ResolveWorklist
+            InstallerSpikeGraphSource::Invalid
         );
     }
 
@@ -2695,6 +2723,21 @@ mod tests {
         );
 
         assert!(reasons.is_empty(), "unexpected reasons: {reasons:?}");
+    }
+
+    #[test]
+    fn admission_rejects_unknown_explicit_graph_value() {
+        let reasons = unsupported_admission_reasons(
+            benchmark_admission(),
+            InstallerSpikeGraphSource::Invalid,
+            InstallerSpikeParityMode::FreshResolve { deny: true },
+            true,
+        );
+
+        assert_eq!(
+            reasons,
+            vec!["set LPM_INSTALLER_SPIKE_GRAPH=resolve-worklist or lockfile"]
+        );
     }
 
     #[test]

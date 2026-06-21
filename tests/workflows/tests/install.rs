@@ -1856,12 +1856,12 @@ async fn install_experimental_spike_replays_frozen_lockfile_and_emits_json() {
 }
 
 #[tokio::test]
-async fn install_experimental_spike_rejects_unsupported_env_shape() {
+async fn install_experimental_spike_live_graph_requires_benchmark_ack() {
     let mock = MockRegistry::start().await;
     mount_ms_2_1_3(&mock).await;
 
     let project = TempProject::empty(
-        r#"{"name":"spike-env-rejected","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+        r#"{"name":"spike-live-env-rejected","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
 
     let output = lpm_with_registry(&project, &mock.url())
@@ -1887,11 +1887,57 @@ async fn install_experimental_spike_rejects_unsupported_env_shape() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}\n{stderr}");
     assert!(
-        combined.contains(
-            "experimental installer spike is limited to frozen lockfile benchmark installs"
-        ) && combined.contains("set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1")
-            && combined.contains("set LPM_INSTALLER_SPIKE_GRAPH=lockfile"),
-        "unsupported experimental shape must report the missing benchmark gates; got:\n{combined}"
+        combined.contains("experimental installer spike is limited to benchmark installs")
+            && combined.contains("set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1")
+            && !combined.contains("set LPM_INSTALLER_SPIKE_GRAPH=lockfile")
+            && !combined.contains("use a frozen lockfile install"),
+        "unsupported live experimental shape must report only the missing live benchmark gate; got:\n{combined}"
+    );
+    assert!(
+        !project.file_exists("node_modules/ms/package.json"),
+        "unsupported experimental shape must not silently perform a normal install"
+    );
+}
+
+#[tokio::test]
+async fn install_experimental_spike_lockfile_graph_requires_lockfile_gates() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"spike-lockfile-env-rejected","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_GRAPH", "lockfile")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run unsupported experimental installer spike");
+
+    assert!(
+        !output.status.success(),
+        "unsupported experimental lockfile shape must fail instead of falling back to normal install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.contains("experimental installer spike is limited to benchmark installs")
+            && combined.contains("set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1")
+            && combined.contains("use lockfile parity or disable parity")
+            && combined.contains("use a frozen lockfile install"),
+        "unsupported lockfile experimental shape must report lockfile-specific gates; got:\n{combined}"
     );
     assert!(
         !project.file_exists("node_modules/ms/package.json"),
