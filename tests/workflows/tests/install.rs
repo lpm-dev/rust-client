@@ -2030,6 +2030,77 @@ async fn install_experimental_spike_live_graph_does_not_write_install_hash() {
 }
 
 #[tokio::test]
+async fn install_experimental_spike_live_graph_accepts_overrides_with_parity_deny() {
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "lodash",
+        "4.17.21",
+        &[
+            (
+                "4.17.20",
+                serde_json::json!({}),
+                Some(make_tarball("lodash", "4.17.20")),
+            ),
+            (
+                "4.17.21",
+                serde_json::json!({}),
+                Some(make_tarball("lodash", "4.17.21")),
+            ),
+        ],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "spike-live-overrides",
+            "version": "1.0.0",
+            "dependencies": { "lodash": "^4.0.0" },
+            "lpm": { "overrides": { "lodash": "4.17.20" } }
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run experimental installer spike");
+
+    assert!(
+        output.status.success(),
+        "experimental live install with overrides should succeed under parity deny\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let installed_package_json = project.read_file("node_modules/lodash/package.json");
+    let installed_package: serde_json::Value = serde_json::from_str(&installed_package_json)
+        .expect("installed lodash package.json must parse");
+    assert_eq!(
+        installed_package["version"],
+        serde_json::json!("4.17.20"),
+        "override must force the selected version instead of latest satisfying"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("experimental install --json must emit valid JSON: {e}\n---\n{stdout}")
+    });
+    let parity = &envelope["timing"]["experimental_installer_spike"]["parity"];
+    assert_eq!(parity["enabled"], serde_json::json!(true));
+    assert_eq!(parity["matches"], serde_json::json!(true));
+    assert_eq!(parity["candidate_count"], serde_json::json!(1));
+    assert_eq!(parity["baseline_count"], serde_json::json!(1));
+}
+
+#[tokio::test]
 async fn install_experimental_spike_live_graph_rejects_frozen_lockfile_invocation() {
     let mock = MockRegistry::start().await;
     mount_ms_2_1_3(&mock).await;

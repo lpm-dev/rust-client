@@ -2314,8 +2314,6 @@ async fn run_with_options_under_store_lock(
             || !v2_workspace_root_pre_resolve
                 .additional_workspace_links
                 .is_empty(),
-        has_overrides: !override_set.is_empty(),
-        overrides_changed,
         has_patches: !current_patches.is_empty(),
         patches_changed,
         verify_registry_signatures,
