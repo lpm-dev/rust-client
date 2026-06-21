@@ -75,6 +75,123 @@ const MAX_WALK_DEPTH: u32 = 16;
 /// bun uses separate HTTP/1.1 sockets to bypass that.
 pub const DEFAULT_NPM_FANOUT: usize = 256;
 
+async fn fetch_walker_metadata_with_trace(
+    client: Arc<RegistryClient>,
+    name: String,
+    route: UpstreamRoute,
+) -> Result<PackageMetadata, lpm_common::LpmError> {
+    if !lpm_registry::timing::metadata_fetch_detail_enabled() {
+        return fetch_walker_metadata(client, &name, route).await;
+    }
+
+    let total_start = Instant::now();
+    match route {
+        UpstreamRoute::NpmDirect => client
+            .get_npm_metadata_direct_with_timings(&name)
+            .await
+            .map(|timed| {
+                let timings = timed.timings;
+                let version_count = timed.metadata.versions.len() as u64;
+                let total_ms = total_start.elapsed().as_millis();
+                lpm_registry::timing::record_metadata_fetch_detail(
+                    lpm_registry::timing::MetadataFetchDetailRecord {
+                        package: name,
+                        route: "npm_direct",
+                        total_ms,
+                        raw_fetch_ms: total_ms,
+                        cache_read_ms: timings.cache_read_ms,
+                        validator_read_ms: timings.validator_read_ms,
+                        http_ms: timings.http_ms,
+                        body_read_ms: timings.body_read_ms,
+                        json_decode_ms: timings.json_decode_ms,
+                        cache_after_304_ms: timings.cache_after_304_ms,
+                        cache_write_dispatch_ms: timings.cache_write_dispatch_ms,
+                        body_bytes: timings.body_bytes,
+                        version_count,
+                        cache_hit: timings.cache_hit,
+                        not_modified: timings.not_modified,
+                        ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+                    },
+                );
+                timed.metadata
+            }),
+        UpstreamRoute::LpmWorker => {
+            let result = if name.starts_with("@lpm.dev/") {
+                match lpm_common::PackageName::parse(&name) {
+                    Ok(pkg_name) => client.get_package_metadata(&pkg_name).await,
+                    Err(e) => Err(lpm_common::LpmError::Registry(format!(
+                        "invalid lpm name {name}: {e}"
+                    ))),
+                }
+            } else {
+                client.get_npm_package_metadata(&name).await
+            };
+            result.inspect(|metadata| {
+                let total_ms = total_start.elapsed().as_millis();
+                lpm_registry::timing::record_metadata_fetch_detail(
+                    lpm_registry::timing::MetadataFetchDetailRecord {
+                        package: name.clone(),
+                        route: if name.starts_with("@lpm.dev/") {
+                            "lpm"
+                        } else {
+                            "lpm_worker"
+                        },
+                        total_ms,
+                        raw_fetch_ms: total_ms,
+                        version_count: metadata.versions.len() as u64,
+                        ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+                    },
+                );
+            })
+        }
+        UpstreamRoute::Custom { target, auth } => {
+            let result = client
+                .get_npm_metadata_from(&target.base_url, &name, auth.as_ref())
+                .await;
+            result.inspect(|metadata| {
+                let total_ms = total_start.elapsed().as_millis();
+                lpm_registry::timing::record_metadata_fetch_detail(
+                    lpm_registry::timing::MetadataFetchDetailRecord {
+                        package: name.clone(),
+                        route: "custom",
+                        total_ms,
+                        raw_fetch_ms: total_ms,
+                        version_count: metadata.versions.len() as u64,
+                        ..lpm_registry::timing::MetadataFetchDetailRecord::default()
+                    },
+                );
+            })
+        }
+    }
+}
+
+async fn fetch_walker_metadata(
+    client: Arc<RegistryClient>,
+    name: &str,
+    route: UpstreamRoute,
+) -> Result<PackageMetadata, lpm_common::LpmError> {
+    match route {
+        UpstreamRoute::NpmDirect => client.get_npm_metadata_direct(name).await,
+        UpstreamRoute::LpmWorker => {
+            if name.starts_with("@lpm.dev/") {
+                match lpm_common::PackageName::parse(name) {
+                    Ok(pkg_name) => client.get_package_metadata(&pkg_name).await,
+                    Err(e) => Err(lpm_common::LpmError::Registry(format!(
+                        "invalid lpm name {name}: {e}"
+                    ))),
+                }
+            } else {
+                client.get_npm_package_metadata(name).await
+            }
+        }
+        UpstreamRoute::Custom { target, auth } => {
+            client
+                .get_npm_metadata_from(&target.base_url, name, auth.as_ref())
+                .await
+        }
+    }
+}
+
 /// Per-walk statistics, folded into the `timing.resolve.streaming_bfs`
 /// JSON sub-object by the install.rs orchestration.
 #[derive(Debug, Clone, Default)]
@@ -452,9 +569,10 @@ impl BfsWalker {
                                 .acquire_owned()
                                 .await
                                 .expect("custom-fetch semaphore must outlive its batch");
-                            let r = client_inner
-                                .get_npm_metadata_from(&target.base_url, &name, auth.as_ref())
-                                .await;
+                            let route = UpstreamRoute::Custom { target, auth };
+                            let r =
+                                fetch_walker_metadata_with_trace(client_inner, name.clone(), route)
+                                    .await;
                             (name, r)
                         });
                     }
@@ -725,37 +843,9 @@ impl BfsWalker {
                                 );
                             }
                         };
-                        let result = match route {
-                            UpstreamRoute::NpmDirect => {
-                                client.get_npm_metadata_direct(&name_owned).await
-                            }
-                            UpstreamRoute::LpmWorker => {
-                                if name_owned.starts_with("@lpm.dev/") {
-                                    match lpm_common::PackageName::parse(&name_owned) {
-                                        Ok(pkg_name) => {
-                                            client.get_package_metadata(&pkg_name).await
-                                        }
-                                        Err(e) => Err(lpm_common::LpmError::Registry(
-                                            format!("invalid lpm name {name_owned}: {e}"),
-                                        )),
-                                    }
-                                } else {
-                                    client.get_npm_package_metadata(&name_owned).await
-                                }
-                            }
-                            UpstreamRoute::Custom { target, auth } => {
-                                // `.npmrc`-declared custom registry, fetched
-                                // via the origin-verified path with auth
-                                // re-checked at the request site.
-                                client
-                                    .get_npm_metadata_from(
-                                        &target.base_url,
-                                        &name_owned,
-                                        auth.as_ref(),
-                                    )
-                                    .await
-                            }
-                        };
+                        let result =
+                            fetch_walker_metadata_with_trace(client, name_owned.clone(), route)
+                                .await;
                         // Count as walker-driven regardless of success/error.
                         // The stream walker fans out one HTTP call per package
                         // (no batch_metadata path, unlike `run_bfs`), so each

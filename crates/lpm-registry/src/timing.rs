@@ -38,6 +38,10 @@ static METADATA_HTTP_11_COUNT: AtomicU32 = AtomicU32::new(0);
 static METADATA_HTTP_2_COUNT: AtomicU32 = AtomicU32::new(0);
 static METADATA_HTTP_3_COUNT: AtomicU32 = AtomicU32::new(0);
 static METADATA_HTTP_UNKNOWN_COUNT: AtomicU32 = AtomicU32::new(0);
+static METADATA_FETCH_DETAIL: OnceLock<MetadataFetchDetailCounters> = OnceLock::new();
+#[cfg(test)]
+static METADATA_FETCH_DETAIL_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+const TOP_METADATA_FETCH_DETAIL_LIMIT: usize = 10;
 
 tokio::task_local! {
     static METADATA_PURPOSE: Cell<MetadataPurpose>;
@@ -122,6 +126,15 @@ fn metadata_request_counts() -> &'static Mutex<HashMap<(MetadataPurpose, String)
     COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn metadata_fetch_detail() -> &'static MetadataFetchDetailCounters {
+    METADATA_FETCH_DETAIL.get_or_init(MetadataFetchDetailCounters::default)
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_fetch_detail_test_lock() -> &'static tokio::sync::Mutex<()> {
+    METADATA_FETCH_DETAIL_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn current_metadata_purpose() -> MetadataPurpose {
     METADATA_PURPOSE
         .try_with(Cell::get)
@@ -156,6 +169,11 @@ pub fn reset() {
     METADATA_RPC_COUNT.store(0, Ordering::Relaxed);
     PARSE_NDJSON_NS.store(0, Ordering::Relaxed);
     WALKER_RPC_COUNT.store(0, Ordering::Relaxed);
+    if metadata_fetch_detail_enabled()
+        && let Some(detail) = METADATA_FETCH_DETAIL.get()
+    {
+        detail.reset();
+    }
 }
 
 pub fn reset_metadata_detail() {
@@ -164,6 +182,9 @@ pub fn reset_metadata_detail() {
     }
     if let Ok(mut counts) = metadata_request_counts().lock() {
         counts.clear();
+    }
+    if let Some(detail) = METADATA_FETCH_DETAIL.get() {
+        detail.reset();
     }
 }
 
@@ -250,6 +271,16 @@ pub fn record_metadata_cache_miss() {
     purpose_counters(current_metadata_purpose())
         .cache_miss_count
         .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn metadata_fetch_detail_enabled() -> bool {
+    std::env::var("LPM_TIMING_DETAIL")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("trace"))
+}
+
+pub fn record_metadata_fetch_detail(record: MetadataFetchDetailRecord) {
+    metadata_fetch_detail().record(record);
 }
 
 /// Snapshot package-metadata response protocol counters.
@@ -379,6 +410,324 @@ pub fn snapshot_metadata_detail() -> Vec<MetadataPurposeSnapshot> {
         .collect()
 }
 
+pub fn snapshot_metadata_fetch_detail() -> MetadataFetchDetailSnapshot {
+    metadata_fetch_detail().snapshot()
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataFetchDetailRecord {
+    pub package: String,
+    pub route: &'static str,
+    pub total_ms: u128,
+    pub raw_fetch_ms: u128,
+    pub cache_read_ms: u128,
+    pub validator_read_ms: u128,
+    pub http_ms: u128,
+    pub body_read_ms: u128,
+    pub json_decode_ms: u128,
+    pub cache_after_304_ms: u128,
+    pub cache_write_dispatch_ms: u128,
+    pub cache_info_parse_ms: u128,
+    pub policy_release_time_ms: u128,
+    pub policy_full_metadata_ms: u128,
+    pub body_bytes: u64,
+    pub version_count: u64,
+    pub cache_hit: bool,
+    pub not_modified: bool,
+}
+
+#[derive(Default)]
+struct MetadataFetchDetailCounters {
+    calls: AtomicU64,
+    cache_hit_count: AtomicU64,
+    not_modified_count: AtomicU64,
+    body_bytes_sum: AtomicU64,
+    version_count_sum: AtomicU64,
+    route_npm_direct_count: AtomicU64,
+    route_lpm_worker_count: AtomicU64,
+    route_custom_count: AtomicU64,
+    route_lpm_count: AtomicU64,
+    route_unknown_count: AtomicU64,
+    total_sum_ms: AtomicU64,
+    total_max_ms: AtomicU64,
+    raw_fetch_sum_ms: AtomicU64,
+    raw_fetch_max_ms: AtomicU64,
+    cache_read_sum_ms: AtomicU64,
+    validator_read_sum_ms: AtomicU64,
+    http_sum_ms: AtomicU64,
+    body_read_sum_ms: AtomicU64,
+    json_decode_sum_ms: AtomicU64,
+    cache_after_304_sum_ms: AtomicU64,
+    cache_write_dispatch_sum_ms: AtomicU64,
+    cache_info_parse_sum_ms: AtomicU64,
+    policy_release_time_sum_ms: AtomicU64,
+    policy_full_metadata_sum_ms: AtomicU64,
+    slow_by_total: Mutex<Vec<MetadataFetchDetailRecord>>,
+    slow_by_raw_fetch: Mutex<Vec<MetadataFetchDetailRecord>>,
+    slow_by_http: Mutex<Vec<MetadataFetchDetailRecord>>,
+    slow_by_body_read: Mutex<Vec<MetadataFetchDetailRecord>>,
+    slow_by_json_decode: Mutex<Vec<MetadataFetchDetailRecord>>,
+    slow_by_cache_info_parse: Mutex<Vec<MetadataFetchDetailRecord>>,
+    slow_by_policy_release_time: Mutex<Vec<MetadataFetchDetailRecord>>,
+    slow_by_policy_full_metadata: Mutex<Vec<MetadataFetchDetailRecord>>,
+}
+
+impl MetadataFetchDetailCounters {
+    fn reset(&self) {
+        self.calls.store(0, Ordering::Relaxed);
+        self.cache_hit_count.store(0, Ordering::Relaxed);
+        self.not_modified_count.store(0, Ordering::Relaxed);
+        self.body_bytes_sum.store(0, Ordering::Relaxed);
+        self.version_count_sum.store(0, Ordering::Relaxed);
+        self.route_npm_direct_count.store(0, Ordering::Relaxed);
+        self.route_lpm_worker_count.store(0, Ordering::Relaxed);
+        self.route_custom_count.store(0, Ordering::Relaxed);
+        self.route_lpm_count.store(0, Ordering::Relaxed);
+        self.route_unknown_count.store(0, Ordering::Relaxed);
+        self.total_sum_ms.store(0, Ordering::Relaxed);
+        self.total_max_ms.store(0, Ordering::Relaxed);
+        self.raw_fetch_sum_ms.store(0, Ordering::Relaxed);
+        self.raw_fetch_max_ms.store(0, Ordering::Relaxed);
+        self.cache_read_sum_ms.store(0, Ordering::Relaxed);
+        self.validator_read_sum_ms.store(0, Ordering::Relaxed);
+        self.http_sum_ms.store(0, Ordering::Relaxed);
+        self.body_read_sum_ms.store(0, Ordering::Relaxed);
+        self.json_decode_sum_ms.store(0, Ordering::Relaxed);
+        self.cache_after_304_sum_ms.store(0, Ordering::Relaxed);
+        self.cache_write_dispatch_sum_ms.store(0, Ordering::Relaxed);
+        self.cache_info_parse_sum_ms.store(0, Ordering::Relaxed);
+        self.policy_release_time_sum_ms.store(0, Ordering::Relaxed);
+        self.policy_full_metadata_sum_ms.store(0, Ordering::Relaxed);
+        Self::clear_bucket(&self.slow_by_total);
+        Self::clear_bucket(&self.slow_by_raw_fetch);
+        Self::clear_bucket(&self.slow_by_http);
+        Self::clear_bucket(&self.slow_by_body_read);
+        Self::clear_bucket(&self.slow_by_json_decode);
+        Self::clear_bucket(&self.slow_by_cache_info_parse);
+        Self::clear_bucket(&self.slow_by_policy_release_time);
+        Self::clear_bucket(&self.slow_by_policy_full_metadata);
+    }
+
+    fn clear_bucket(bucket: &Mutex<Vec<MetadataFetchDetailRecord>>) {
+        if let Ok(mut bucket) = bucket.lock() {
+            bucket.clear();
+        }
+    }
+
+    fn record(&self, record: MetadataFetchDetailRecord) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if record.cache_hit {
+            self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if record.not_modified {
+            self.not_modified_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.body_bytes_sum
+            .fetch_add(record.body_bytes, Ordering::Relaxed);
+        self.version_count_sum
+            .fetch_add(record.version_count, Ordering::Relaxed);
+        match record.route {
+            "npm_direct" => &self.route_npm_direct_count,
+            "lpm_worker" => &self.route_lpm_worker_count,
+            "custom" => &self.route_custom_count,
+            "lpm" => &self.route_lpm_count,
+            _ => &self.route_unknown_count,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+
+        Self::record_sum_max(&self.total_sum_ms, &self.total_max_ms, record.total_ms);
+        Self::record_sum_max(
+            &self.raw_fetch_sum_ms,
+            &self.raw_fetch_max_ms,
+            record.raw_fetch_ms,
+        );
+        self.cache_read_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.cache_read_ms),
+            Ordering::Relaxed,
+        );
+        self.validator_read_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.validator_read_ms),
+            Ordering::Relaxed,
+        );
+        self.http_sum_ms
+            .fetch_add(u128_to_u64_saturating(record.http_ms), Ordering::Relaxed);
+        self.body_read_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.body_read_ms),
+            Ordering::Relaxed,
+        );
+        self.json_decode_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.json_decode_ms),
+            Ordering::Relaxed,
+        );
+        self.cache_after_304_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.cache_after_304_ms),
+            Ordering::Relaxed,
+        );
+        self.cache_write_dispatch_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.cache_write_dispatch_ms),
+            Ordering::Relaxed,
+        );
+        self.cache_info_parse_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.cache_info_parse_ms),
+            Ordering::Relaxed,
+        );
+        self.policy_release_time_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.policy_release_time_ms),
+            Ordering::Relaxed,
+        );
+        self.policy_full_metadata_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.policy_full_metadata_ms),
+            Ordering::Relaxed,
+        );
+
+        Self::record_slow(&self.slow_by_total, &record, |entry| entry.total_ms);
+        Self::record_slow(&self.slow_by_raw_fetch, &record, |entry| entry.raw_fetch_ms);
+        Self::record_slow(&self.slow_by_http, &record, |entry| entry.http_ms);
+        Self::record_slow(&self.slow_by_body_read, &record, |entry| entry.body_read_ms);
+        Self::record_slow(&self.slow_by_json_decode, &record, |entry| {
+            entry.json_decode_ms
+        });
+        Self::record_slow(&self.slow_by_cache_info_parse, &record, |entry| {
+            entry.cache_info_parse_ms
+        });
+        Self::record_slow(&self.slow_by_policy_release_time, &record, |entry| {
+            entry.policy_release_time_ms
+        });
+        Self::record_slow(&self.slow_by_policy_full_metadata, &record, |entry| {
+            entry.policy_full_metadata_ms
+        });
+    }
+
+    fn record_sum_max(sum: &AtomicU64, max: &AtomicU64, ms: u128) {
+        let ms = u128_to_u64_saturating(ms);
+        sum.fetch_add(ms, Ordering::Relaxed);
+        max.fetch_max(ms, Ordering::Relaxed);
+    }
+
+    fn record_slow(
+        bucket: &Mutex<Vec<MetadataFetchDetailRecord>>,
+        record: &MetadataFetchDetailRecord,
+        rank_ms: impl Fn(&MetadataFetchDetailRecord) -> u128 + Copy,
+    ) {
+        if rank_ms(record) == 0 {
+            return;
+        }
+        let Ok(mut bucket) = bucket.lock() else {
+            return;
+        };
+        bucket.push(record.clone());
+        bucket.sort_unstable_by(|a, b| {
+            rank_ms(b)
+                .cmp(&rank_ms(a))
+                .then_with(|| a.package.cmp(&b.package))
+        });
+        bucket.truncate(TOP_METADATA_FETCH_DETAIL_LIMIT);
+    }
+
+    fn snapshot(&self) -> MetadataFetchDetailSnapshot {
+        MetadataFetchDetailSnapshot {
+            calls: self.calls.load(Ordering::Relaxed),
+            cache_hit_count: self.cache_hit_count.load(Ordering::Relaxed),
+            not_modified_count: self.not_modified_count.load(Ordering::Relaxed),
+            body_bytes_sum: self.body_bytes_sum.load(Ordering::Relaxed),
+            version_count_sum: self.version_count_sum.load(Ordering::Relaxed),
+            route_npm_direct_count: self.route_npm_direct_count.load(Ordering::Relaxed),
+            route_lpm_worker_count: self.route_lpm_worker_count.load(Ordering::Relaxed),
+            route_custom_count: self.route_custom_count.load(Ordering::Relaxed),
+            route_lpm_count: self.route_lpm_count.load(Ordering::Relaxed),
+            route_unknown_count: self.route_unknown_count.load(Ordering::Relaxed),
+            attribution: MetadataFetchAttributionSnapshot {
+                total_sum_ms: self.total_sum_ms.load(Ordering::Relaxed),
+                total_max_ms: self.total_max_ms.load(Ordering::Relaxed),
+                raw_fetch_sum_ms: self.raw_fetch_sum_ms.load(Ordering::Relaxed),
+                raw_fetch_max_ms: self.raw_fetch_max_ms.load(Ordering::Relaxed),
+                cache_read_sum_ms: self.cache_read_sum_ms.load(Ordering::Relaxed),
+                validator_read_sum_ms: self.validator_read_sum_ms.load(Ordering::Relaxed),
+                http_sum_ms: self.http_sum_ms.load(Ordering::Relaxed),
+                body_read_sum_ms: self.body_read_sum_ms.load(Ordering::Relaxed),
+                json_decode_sum_ms: self.json_decode_sum_ms.load(Ordering::Relaxed),
+                cache_after_304_sum_ms: self.cache_after_304_sum_ms.load(Ordering::Relaxed),
+                cache_write_dispatch_sum_ms: self
+                    .cache_write_dispatch_sum_ms
+                    .load(Ordering::Relaxed),
+                cache_info_parse_sum_ms: self.cache_info_parse_sum_ms.load(Ordering::Relaxed),
+                policy_release_time_sum_ms: self.policy_release_time_sum_ms.load(Ordering::Relaxed),
+                policy_full_metadata_sum_ms: self
+                    .policy_full_metadata_sum_ms
+                    .load(Ordering::Relaxed),
+            },
+            top_slow_packages: MetadataFetchSlowSnapshot {
+                by_total: Self::snapshot_bucket(&self.slow_by_total),
+                by_raw_fetch: Self::snapshot_bucket(&self.slow_by_raw_fetch),
+                by_http: Self::snapshot_bucket(&self.slow_by_http),
+                by_body_read: Self::snapshot_bucket(&self.slow_by_body_read),
+                by_json_decode: Self::snapshot_bucket(&self.slow_by_json_decode),
+                by_cache_info_parse: Self::snapshot_bucket(&self.slow_by_cache_info_parse),
+                by_policy_release_time: Self::snapshot_bucket(&self.slow_by_policy_release_time),
+                by_policy_full_metadata: Self::snapshot_bucket(&self.slow_by_policy_full_metadata),
+            },
+        }
+    }
+
+    fn snapshot_bucket(
+        bucket: &Mutex<Vec<MetadataFetchDetailRecord>>,
+    ) -> Vec<MetadataFetchDetailRecord> {
+        bucket
+            .lock()
+            .map_or_else(|_| Vec::new(), |bucket| bucket.clone())
+    }
+}
+
+fn u128_to_u64_saturating(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataFetchDetailSnapshot {
+    pub calls: u64,
+    pub cache_hit_count: u64,
+    pub not_modified_count: u64,
+    pub body_bytes_sum: u64,
+    pub version_count_sum: u64,
+    pub route_npm_direct_count: u64,
+    pub route_lpm_worker_count: u64,
+    pub route_custom_count: u64,
+    pub route_lpm_count: u64,
+    pub route_unknown_count: u64,
+    pub attribution: MetadataFetchAttributionSnapshot,
+    pub top_slow_packages: MetadataFetchSlowSnapshot,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataFetchAttributionSnapshot {
+    pub total_sum_ms: u64,
+    pub total_max_ms: u64,
+    pub raw_fetch_sum_ms: u64,
+    pub raw_fetch_max_ms: u64,
+    pub cache_read_sum_ms: u64,
+    pub validator_read_sum_ms: u64,
+    pub http_sum_ms: u64,
+    pub body_read_sum_ms: u64,
+    pub json_decode_sum_ms: u64,
+    pub cache_after_304_sum_ms: u64,
+    pub cache_write_dispatch_sum_ms: u64,
+    pub cache_info_parse_sum_ms: u64,
+    pub policy_release_time_sum_ms: u64,
+    pub policy_full_metadata_sum_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataFetchSlowSnapshot {
+    pub by_total: Vec<MetadataFetchDetailRecord>,
+    pub by_raw_fetch: Vec<MetadataFetchDetailRecord>,
+    pub by_http: Vec<MetadataFetchDetailRecord>,
+    pub by_body_read: Vec<MetadataFetchDetailRecord>,
+    pub by_json_decode: Vec<MetadataFetchDetailRecord>,
+    pub by_cache_info_parse: Vec<MetadataFetchDetailRecord>,
+    pub by_policy_release_time: Vec<MetadataFetchDetailRecord>,
+    pub by_policy_full_metadata: Vec<MetadataFetchDetailRecord>,
+}
+
 /// Counts of package-metadata HTTP responses by negotiated protocol version.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct HttpVersionCounts {
@@ -388,4 +737,138 @@ pub struct HttpVersionCounts {
     pub http_2: u32,
     pub http_3: u32,
     pub unknown: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ScopedEnv {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: timing tests that mutate process env are serialized by
+            // `metadata_fetch_detail_test_lock`.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: timing tests that mutate process env are serialized by
+            // `metadata_fetch_detail_test_lock`.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: timing tests that mutate process env are serialized by
+            // `metadata_fetch_detail_test_lock`.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metadata_fetch_detail_counters_rank_slow_packages_and_reset() {
+        let _guard = metadata_fetch_detail_test_lock().lock().await;
+        let counters = MetadataFetchDetailCounters::default();
+
+        counters.record(MetadataFetchDetailRecord {
+            package: "fast".to_string(),
+            route: "npm_direct",
+            total_ms: 5,
+            raw_fetch_ms: 4,
+            http_ms: 2,
+            body_bytes: 100,
+            version_count: 3,
+            ..MetadataFetchDetailRecord::default()
+        });
+        counters.record(MetadataFetchDetailRecord {
+            package: "slow".to_string(),
+            route: "npm_direct",
+            total_ms: 12,
+            raw_fetch_ms: 10,
+            http_ms: 9,
+            body_read_ms: 6,
+            json_decode_ms: 4,
+            cache_info_parse_ms: 3,
+            body_bytes: 900,
+            version_count: 7,
+            cache_hit: true,
+            ..MetadataFetchDetailRecord::default()
+        });
+
+        let snapshot = counters.snapshot();
+
+        assert_eq!(snapshot.calls, 2);
+        assert_eq!(snapshot.cache_hit_count, 1);
+        assert_eq!(snapshot.route_npm_direct_count, 2);
+        assert_eq!(snapshot.body_bytes_sum, 1000);
+        assert_eq!(snapshot.version_count_sum, 10);
+        assert_eq!(snapshot.attribution.total_sum_ms, 17);
+        assert_eq!(snapshot.attribution.total_max_ms, 12);
+        assert_eq!(snapshot.attribution.http_sum_ms, 11);
+        assert_eq!(snapshot.top_slow_packages.by_total[0].package, "slow");
+        assert_eq!(snapshot.top_slow_packages.by_http[0].package, "slow");
+
+        counters.reset();
+        let snapshot = counters.snapshot();
+
+        assert_eq!(snapshot.calls, 0);
+        assert!(snapshot.top_slow_packages.by_total.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_clears_existing_metadata_fetch_detail_collector() {
+        let _guard = metadata_fetch_detail_test_lock().lock().await;
+        let _env = ScopedEnv::set("LPM_TIMING_DETAIL", "trace");
+        reset_metadata_detail();
+        record_metadata_fetch_detail(MetadataFetchDetailRecord {
+            package: "stale".to_string(),
+            route: "npm_direct",
+            total_ms: 9,
+            ..MetadataFetchDetailRecord::default()
+        });
+        assert_eq!(snapshot_metadata_fetch_detail().calls, 1);
+
+        reset();
+
+        assert_eq!(snapshot_metadata_fetch_detail().calls, 0);
+        assert!(
+            snapshot_metadata_fetch_detail()
+                .top_slow_packages
+                .by_total
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_preserves_metadata_fetch_detail_collector_when_trace_disabled() {
+        let _guard = metadata_fetch_detail_test_lock().lock().await;
+        let _env = ScopedEnv::remove("LPM_TIMING_DETAIL");
+        reset_metadata_detail();
+        record_metadata_fetch_detail(MetadataFetchDetailRecord {
+            package: "trace-only".to_string(),
+            route: "npm_direct",
+            total_ms: 9,
+            ..MetadataFetchDetailRecord::default()
+        });
+
+        reset();
+
+        assert_eq!(snapshot_metadata_fetch_detail().calls, 1);
+        reset_metadata_detail();
+    }
 }

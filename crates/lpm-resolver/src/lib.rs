@@ -19,6 +19,12 @@ pub mod specifier;
 mod speculation;
 mod walker;
 
+#[cfg(test)]
+pub(crate) fn metadata_fetch_detail_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 pub use greedy::PeerConflictReport;
 pub use greedy::{
     ExperimentalMetadataFetchTimings, ExperimentalVersionSelection,

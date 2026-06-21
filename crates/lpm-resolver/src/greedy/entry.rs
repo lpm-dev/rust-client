@@ -14,6 +14,7 @@ struct WalkerTreeProvider<'a> {
     fetch_wait_timeout: Duration,
     metrics: &'a StreamingBfsMetrics,
     policy: &'a ResolverPolicy,
+    trace_metadata_fetches: bool,
 }
 
 impl TreeManifestProvider for WalkerTreeProvider<'_> {
@@ -40,6 +41,7 @@ impl TreeManifestProvider for WalkerTreeProvider<'_> {
                 self.fetch_wait_timeout,
                 self.metrics,
                 self.policy,
+                self.trace_metadata_fetches,
             )
             .await
         })
@@ -143,6 +145,7 @@ pub async fn resolve_greedy_with_options_and_policy(
     // field semantically means "resolver wall-clock".
     crate::profile::reset_all();
     lpm_registry::timing::reset();
+    let trace_metadata_fetches = lpm_registry::timing::metadata_fetch_detail_enabled();
 
     let mut state = ResolveState::new_with_options_and_policy(
         dependencies,
@@ -160,6 +163,7 @@ pub async fn resolve_greedy_with_options_and_policy(
         fetch_wait_timeout,
         metrics: &metrics,
         policy: &policy,
+        trace_metadata_fetches,
     };
 
     // ── Main task_queue + peer-drain fixed-point loop ──────────────
@@ -184,6 +188,7 @@ pub async fn resolve_greedy_with_options_and_policy(
                 fetch_wait_timeout,
                 &metrics,
                 &policy,
+                trace_metadata_fetches,
             )
             .await
             {
@@ -236,6 +241,7 @@ pub async fn resolve_greedy_with_options_and_policy(
                         fetch_wait_timeout,
                         &metrics,
                         &policy,
+                        trace_metadata_fetches,
                     )
                     .await
                 }

@@ -5925,6 +5925,7 @@ async fn run_with_options_under_store_lock(
                     initial_batch_ms,
                     &resolver_stage_timing,
                     metadata_snapshots,
+                    timing_detail_mode,
                 ),
                 "fetch": fetch_stage_timings.to_json(
                     fetch_wall_ms,

@@ -1617,6 +1617,10 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         "detail.resolve.metadata must summarize resolve metadata counters; got {detail:#?}"
     );
     assert!(
+        detail["resolve"].get("metadata_fetch").is_none(),
+        "trace-only metadata fetch package attribution must stay out of LPM_TIMING_DETAIL=1"
+    );
+    assert!(
         detail["resolve"]["scheduler"].is_object(),
         "detail.resolve.scheduler must expose resolver wait/fanout counters; got {detail:#?}"
     );
@@ -1903,6 +1907,7 @@ async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
     let project = TempProject::empty(
         r#"{"name":"timing-trace-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TIMING_DETAIL", "trace")
         .args([
@@ -1991,6 +1996,59 @@ async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
             .all(|entry| entry["top_duplicate_packages"].is_array()),
         "LPM_TIMING_DETAIL=trace must emit duplicate metadata package buckets; got {metadata:#?}"
     );
+    let metadata_fetch = &envelope["timing"]["detail"]["resolve"]["metadata_fetch"];
+    assert!(
+        metadata_fetch.is_object(),
+        "LPM_TIMING_DETAIL=trace must emit per-package metadata fetch attribution; got {envelope:#}"
+    );
+    assert_eq!(
+        metadata_fetch["scope"], "per_package_metadata_fetches",
+        "metadata_fetch scope must make batch exclusion explicit; got {metadata_fetch:#}"
+    );
+    assert_eq!(
+        metadata_fetch["batch_fetches_included"], false,
+        "metadata_fetch must make batch exclusion explicit; got {metadata_fetch:#}"
+    );
+    assert!(
+        metadata_fetch["calls"]
+            .as_u64()
+            .is_some_and(|calls| calls > 0),
+        "metadata_fetch.calls must count traced metadata fetches; got {metadata_fetch:#}"
+    );
+    assert!(
+        ["npm_direct", "lpm_worker", "custom", "lpm"]
+            .iter()
+            .any(|route| metadata_fetch["routes"][route]
+                .as_u64()
+                .is_some_and(|calls| calls > 0)),
+        "metadata_fetch.routes must count at least one traced metadata fetch route; got {metadata_fetch:#}"
+    );
+    let by_total = metadata_fetch["top_slow_packages"]["by_total"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "metadata_fetch.top_slow_packages.by_total must be an array; got {metadata_fetch:#}"
+            )
+        });
+    if let Some(row) = by_total.first() {
+        for field in [
+            "package",
+            "route",
+            "total_ms",
+            "raw_fetch_ms",
+            "http_ms",
+            "body_read_ms",
+            "json_decode_ms",
+            "cache_info_parse_ms",
+            "body_bytes",
+            "version_count",
+        ] {
+            assert!(
+                row.get(field).is_some(),
+                "metadata fetch trace row must include {field}; got {row:#}"
+            );
+        }
+    }
 }
 
 // ─── Lockfile Content Snapshot ───────────────────────────────────

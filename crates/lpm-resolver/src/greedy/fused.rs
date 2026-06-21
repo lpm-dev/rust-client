@@ -1,7 +1,7 @@
 use super::edge::process_edge_with_preferred;
 use super::manifest::{
     FetchResult, FetchedMetadata, complete_metadata_fetch,
-    ensure_policy_metadata_for_cached_manifest, fetch_metadata_for_resolver,
+    ensure_policy_metadata_for_cached_manifest, fetch_metadata_for_resolver_with_trace_detail,
     parse_fetched_metadata,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
@@ -20,6 +20,15 @@ struct FusedTreeProvider<'a> {
     dispatcher_rpc_count: Cell<u64>,
     tarball_dispatched_count: Cell<u64>,
     worker_batch_disabled: &'a Cell<bool>,
+    trace_metadata_fetches: bool,
+}
+
+struct MetadataFetchDispatch<'a> {
+    metadata_sem: &'a Arc<tokio::sync::Semaphore>,
+    client: &'a Arc<RegistryClient>,
+    route_table: &'a RouteTable,
+    policy: &'a ResolverPolicy,
+    trace_metadata_fetches: bool,
 }
 
 impl TreeManifestProvider for FusedTreeProvider<'_> {
@@ -48,16 +57,18 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                     self.route_table,
                     self.shared_cache,
                     self.policy,
+                    self.trace_metadata_fetches,
                 )
                 .await;
             }
 
-            let fetched = fetch_metadata_for_resolver(
+            let fetched = fetch_metadata_for_resolver_with_trace_detail(
                 self.client,
                 self.route_table,
                 canonical,
                 self.policy,
                 self.spec_tx.is_some(),
+                self.trace_metadata_fetches,
             )
             .await?;
             let FetchedMetadata {
@@ -151,28 +162,27 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
 
 fn spawn_metadata_fetch_job(
     metadata_jobs: &mut tokio::task::JoinSet<(CanonicalKey, FetchResult)>,
-    metadata_sem: &Arc<tokio::sync::Semaphore>,
-    client: &Arc<RegistryClient>,
-    route_table: &RouteTable,
-    policy: &ResolverPolicy,
+    dispatch: &MetadataFetchDispatch<'_>,
     canonical: CanonicalKey,
     include_speculation: bool,
 ) {
-    let client_c = client.clone();
-    let permit = metadata_sem.clone();
-    let route_table_c = route_table.clone();
-    let policy_c = policy.clone();
+    let client_c = dispatch.client.clone();
+    let permit = Arc::clone(dispatch.metadata_sem);
+    let route_table_c = dispatch.route_table.clone();
+    let policy_c = dispatch.policy.clone();
+    let trace_metadata_fetches = dispatch.trace_metadata_fetches;
     metadata_jobs.spawn(async move {
         let _p = permit
             .acquire_owned()
             .await
             .expect("metadata semaphore must outlive the resolver");
-        let result = fetch_metadata_for_resolver(
+        let result = fetch_metadata_for_resolver_with_trace_detail(
             &client_c,
             &route_table_c,
             &canonical,
             &policy_c,
             include_speculation,
+            trace_metadata_fetches,
         )
         .await;
         (canonical, result)
@@ -323,6 +333,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
     // harnesses do it).
     crate::profile::reset_all();
     lpm_registry::timing::reset();
+    let trace_metadata_fetches = lpm_registry::timing::metadata_fetch_detail_enabled();
 
     let mut state = ResolveState::new_with_options_and_policy(
         dependencies,
@@ -341,6 +352,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
         dispatcher_rpc_count: Cell::new(0),
         tarball_dispatched_count: Cell::new(0),
         worker_batch_disabled: &worker_batch_disabled,
+        trace_metadata_fetches,
     };
     let tree_status_cache = super::tree_policy::TreeStatusCache::default();
 
@@ -349,6 +361,13 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
     // boundaries — only the spawn closures own clones of the
     // canonicals they're fetching.
     let metadata_sem = Arc::new(tokio::sync::Semaphore::new(npm_fanout));
+    let metadata_dispatch = MetadataFetchDispatch {
+        metadata_sem: &metadata_sem,
+        client: &client,
+        route_table: &route_table,
+        policy: &policy,
+        trace_metadata_fetches,
+    };
 
     // Counters. Declared here so the lpm.dev pre-batch below can
     // increment them before the main loop starts.
@@ -468,6 +487,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                     &route_table,
                     &shared_cache,
                     &policy,
+                    trace_metadata_fetches,
                 )
                 .await?;
                 let preferred = preferred_tree_compatible_version(
@@ -506,10 +526,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                 } else {
                     spawn_metadata_fetch_job(
                         &mut metadata_jobs,
-                        &metadata_sem,
-                        &client,
-                        &route_table,
-                        &policy,
+                        &metadata_dispatch,
                         canonical,
                         include_speculation,
                     );
@@ -558,10 +575,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                         }
                         spawn_metadata_fetch_job(
                             &mut metadata_jobs,
-                            &metadata_sem,
-                            &client,
-                            &route_table,
-                            &policy,
+                            &metadata_dispatch,
                             canonical,
                             spec_tx.is_some(),
                         );
@@ -579,10 +593,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                     for (canonical, _) in worker_batch_candidates {
                         spawn_metadata_fetch_job(
                             &mut metadata_jobs,
-                            &metadata_sem,
-                            &client,
-                            &route_table,
-                            &policy,
+                            &metadata_dispatch,
                             canonical,
                             spec_tx.is_some(),
                         );
@@ -626,10 +637,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                 let include_speculation = spec_tx.is_some();
                 spawn_metadata_fetch_job(
                     &mut metadata_jobs,
-                    &metadata_sem,
-                    &client,
-                    &route_table,
-                    &policy,
+                    &metadata_dispatch,
                     canonical,
                     include_speculation,
                 );
@@ -697,6 +705,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                                 &route_table,
                                 &shared_cache,
                                 &policy,
+                                trace_metadata_fetches,
                             )
                             .await;
                         }
@@ -706,12 +715,13 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
                         // direct dep), so the serial fetch here is
                         // bounded by the count of unmet-peer canonicals
                         // — usually 0–3.
-                        let fetched = fetch_metadata_for_resolver(
+                        let fetched = fetch_metadata_for_resolver_with_trace_detail(
                             &client,
                             &route_table,
                             &canonical,
                             &policy,
                             false,
+                            trace_metadata_fetches,
                         )
                         .await?;
                         let info_arc = fetched.info;

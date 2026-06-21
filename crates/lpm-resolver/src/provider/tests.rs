@@ -1324,6 +1324,103 @@ fn direct_fetch_uses_direct_full_when_worker_full_omits_release_time() {
 }
 
 #[test]
+fn ensure_policy_metadata_trace_records_cached_full_policy_hydration() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _timing_guard = rt.block_on(crate::metadata_fetch_detail_test_lock().lock());
+    lpm_registry::timing::reset_metadata_detail();
+
+    let tmp = tempfile::tempdir().expect("cache temp dir");
+    let (npm_server, full_metadata) = rt.block_on(async {
+        let npm_server = MockServer::start().await;
+        let full_metadata = serde_json::json!({
+            "name": "cached-policy-hydration",
+            "modified": "2025-01-03T00:00:00.000Z",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "cached-policy-hydration",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://example.invalid/cached-policy-hydration.tgz",
+                        "integrity": "sha512-policy"
+                    },
+                    "dependencies": {}
+                }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/cached-policy-hydration"))
+            .and(header("Accept", "application/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(full_metadata.clone())
+                    .set_delay(Duration::from_millis(5)),
+            )
+            .expect(1)
+            .mount(&npm_server)
+            .await;
+
+        (npm_server, full_metadata)
+    });
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(npm_server.uri())
+            .with_cache_dir(Some(tmp.path().to_path_buf())),
+    );
+    let policy = ResolverPolicy::with_cutoff_unix(
+        86_400,
+        parse_npm_time_unix("2025-01-02T00:00:00.000Z").unwrap(),
+        TrustPolicyMode::Off,
+    );
+    let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+        .with_policy(policy)
+        .with_route_mode(RouteMode::Direct);
+    let pkg = ResolverPackage::npm("cached-policy-hydration");
+    let key = CanonicalKey::from(&pkg);
+    let mut cached = make_info(&["1.0.0"], vec![], vec![], vec![]);
+    cached.modified = Some("2025-01-03T00:00:00.000Z".to_string());
+    cached.modified_unix = parse_npm_time_unix("2025-01-03T00:00:00.000Z");
+    provider.cache.insert(key.clone(), Arc::new(cached));
+
+    provider
+        .ensure_policy_metadata_with_trace(&pkg, &key, true)
+        .expect("cached abbreviated metadata should hydrate full policy metadata");
+
+    let snapshot = lpm_registry::timing::snapshot_metadata_fetch_detail();
+    lpm_registry::timing::reset_metadata_detail();
+    drop(full_metadata);
+
+    assert_eq!(snapshot.calls, 1);
+    assert_eq!(snapshot.route_npm_direct_count, 1);
+    assert!(snapshot.attribution.policy_full_metadata_sum_ms > 0);
+    assert!(
+        snapshot
+            .top_slow_packages
+            .by_policy_full_metadata
+            .iter()
+            .any(|row| row.package == key.to_string()
+                && row.route == "npm_direct"
+                && row.policy_full_metadata_ms > 0)
+    );
+    let hydrated = provider.cache.get(&key).expect("hydrated cache entry");
+    assert_eq!(
+        hydrated
+            .dist
+            .get("1.0.0")
+            .and_then(|dist| dist.published_at.as_deref()),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}
+
+#[test]
 fn release_age_package_scope_skips_unlisted_transitive_metadata_hydration() {
     let transitive = CanonicalKey::npm("transitive");
     let direct = CanonicalKey::npm("direct");
