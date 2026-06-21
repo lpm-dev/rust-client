@@ -988,7 +988,15 @@ pub(super) async fn fetch_and_store_legacy(
     gate_stats: &Arc<GateStats>,
     permit: tokio::sync::OwnedSemaphorePermit,
     fetch_extract_limiter: &FetchExtractLimiter,
-) -> Result<(String, TaskTimings, String), LpmError> {
+) -> Result<
+    (
+        String,
+        TaskTimings,
+        String,
+        Option<lpm_store::v2::ExtractedObject>,
+    ),
+    LpmError,
+> {
     use std::sync::atomic::Ordering;
 
     // — explicit URL resolution + download so we can
@@ -1151,7 +1159,7 @@ pub(super) async fn fetch_and_store_legacy(
     let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
     let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
 
-    let stage = if let Some(store_v2) = store_v2 {
+    let (stage, fresh_object, result_sri) = if let Some(store_v2) = store_v2 {
         // — v2 path. Read the on-disk tarball into
         // memory and route through `extract_object_from_bytes`. The
         // legacy fetch path's whole point is to spool the download
@@ -1165,9 +1173,9 @@ pub(super) async fn fetch_and_store_legacy(
                 downloaded.file.path().display()
             ))
         })?;
-        let (_obj_dir, _sri, timings) =
-            store_v2.extract_object_from_bytes(&bytes, p.integrity.as_deref())?;
-        timings
+        let (object, sri, timings) = store_v2
+            .extract_object_from_bytes_with_fresh_integrity(&bytes, p.integrity.as_deref())?;
+        (timings, Some(object), sri)
     } else {
         let (_, stage) = store.store_package_from_file_timed(
             &p.name,
@@ -1175,11 +1183,11 @@ pub(super) async fn fetch_and_store_legacy(
             downloaded.file.path(),
             &computed_sri,
         )?;
-        stage
+        (stage, None, computed_sri)
     };
 
     Ok((
-        computed_sri,
+        result_sri,
         TaskTimings::from_stage(
             queue_wait_ms,
             url_lookup_ms,
@@ -1189,6 +1197,7 @@ pub(super) async fn fetch_and_store_legacy(
             stage,
         ),
         final_url,
+        fresh_object,
     ))
 }
 
@@ -1225,7 +1234,15 @@ pub(super) async fn fetch_and_store_tarball_url(
     queue_wait_ms: u128,
     permit: tokio::sync::OwnedSemaphorePermit,
     fetch_extract_limiter: &FetchExtractLimiter,
-) -> Result<(String, TaskTimings, String), LpmError> {
+) -> Result<
+    (
+        String,
+        TaskTimings,
+        String,
+        Option<lpm_store::v2::ExtractedObject>,
+    ),
+    LpmError,
+> {
     // The dispatch site only routes here when source_kind() returned
     // Source::Tarball, so this unwrap is contract-protected. A
     // missing URL at this point is a programmer error in the
@@ -1255,22 +1272,26 @@ pub(super) async fn fetch_and_store_tarball_url(
     let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
     let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
 
-    let stage = if let Some(store_v2) = store_v2 {
+    let (stage, fresh_object, result_sri) = if let Some(store_v2) = store_v2 {
         // — v2 path. The Source::Tarball case
         // already has bytes + SRI in hand; route them straight into
-        // `extract_object_from_bytes`. Re-verification through the
-        // expected_integrity arg is a no-op (caller passes the same
-        // SRI download_tarball_with_integrity already produced).
-        let (_obj_dir, _sri, stage) =
-            store_v2.extract_object_from_bytes(&data, Some(&computed_sri))?;
-        stage
+        // `extract_object_from_bytes`. The downloader returns the
+        // declaration's algorithm when one was supplied, while v2
+        // objects are keyed by the extractor's canonical sha512 SRI.
+        let (object, sri, stage) =
+            store_v2.extract_object_from_bytes_with_fresh_integrity(&data, Some(&computed_sri))?;
+        (stage, Some(object), sri)
     } else {
         let extract_start = std::time::Instant::now();
         let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
-        lpm_store::StageTimings {
-            extract_ms: extract_start.elapsed().as_millis(),
-            ..Default::default()
-        }
+        (
+            lpm_store::StageTimings {
+                extract_ms: extract_start.elapsed().as_millis(),
+                ..Default::default()
+            },
+            None,
+            computed_sri,
+        )
     };
 
     let timings = TaskTimings::from_stage(
@@ -1282,7 +1303,7 @@ pub(super) async fn fetch_and_store_tarball_url(
         stage,
     );
 
-    Ok((computed_sri, timings, url.to_string()))
+    Ok((result_sri, timings, url.to_string(), fresh_object))
 }
 
 /// streaming fetch path — bytes flow from reqwest directly
@@ -1312,7 +1333,15 @@ pub(super) async fn fetch_and_store_streaming(
     gate_stats: &Arc<GateStats>,
     permit: tokio::sync::OwnedSemaphorePermit,
     fetch_extract_limiter: &FetchExtractLimiter,
-) -> Result<(String, TaskTimings, String), LpmError> {
+) -> Result<
+    (
+        String,
+        TaskTimings,
+        String,
+        Option<lpm_store::v2::ExtractedObject>,
+    ),
+    LpmError,
+> {
     use std::sync::atomic::Ordering;
 
     // URL resolution — times this into `url_lookup_ms` and
@@ -1465,8 +1494,15 @@ pub(super) async fn fetch_and_store_streaming(
     // Everything below runs on the blocking pool — frees the tokio async
     // workers to keep driving network reads. No download permit is held.
     let extract_start = std::time::Instant::now();
-    let (computed_sri, stage) = tokio::task::spawn_blocking(
-        move || -> Result<(String, lpm_store::StageTimings), LpmError> {
+    let (computed_sri, stage, fresh_object) = tokio::task::spawn_blocking(
+        move || -> Result<
+            (
+                String,
+                lpm_store::StageTimings,
+                Option<lpm_store::v2::ExtractedObject>,
+            ),
+            LpmError,
+        > {
             if let Some(store_v2) = store_v2_owned {
                 // — v2 path. Bytes flow through
                 // `extract_object_from_bytes`: SHA-512 hash → integrity
@@ -1476,9 +1512,12 @@ pub(super) async fn fetch_and_store_streaming(
                 // Content-Length check (same as the v1 streaming path's
                 // `SizeLimitedReader`), so the buffered `body` is
                 // already bounded.
-                let (_obj_dir, sri, timings) =
-                    store_v2.extract_object_from_bytes(&body, expected_integrity.as_deref())?;
-                Ok((sri, timings))
+                let (object, sri, timings) = store_v2
+                    .extract_object_from_bytes_with_fresh_integrity(
+                        &body,
+                        expected_integrity.as_deref(),
+                    )?;
+                Ok((sri, timings, Some(object)))
             } else {
                 let cursor = std::io::Cursor::new(body);
                 store_owned
@@ -1489,7 +1528,7 @@ pub(super) async fn fetch_and_store_streaming(
                         expected_integrity.as_deref(),
                         lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
                     )
-                    .map(|(_path, sri, timings)| (sri, timings))
+                    .map(|(_path, sri, timings)| (sri, timings, None))
             }
         },
     )
@@ -1513,5 +1552,6 @@ pub(super) async fn fetch_and_store_streaming(
             stage,
         ),
         final_url,
+        fresh_object,
     ))
 }

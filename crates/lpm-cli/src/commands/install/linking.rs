@@ -117,6 +117,7 @@ pub(super) fn build_v2_targets(
             target: target.clone(),
             source_sri: sri,
             verified_object_tree_integrity: None,
+            fresh_object: None,
         });
     }
 

@@ -3222,6 +3222,7 @@ async fn run_with_options_under_store_lock(
                         target: lt.clone(),
                         source_sri: sri.to_string(),
                         verified_object_tree_integrity: None,
+                        fresh_object: None,
                     }),
                     None => {
                         all_have_sri = false;
@@ -3233,6 +3234,7 @@ async fn run_with_options_under_store_lock(
                         target: lt.clone(),
                         source_sri: local_source_sri_for_target(lt),
                         verified_object_tree_integrity: None,
+                        fresh_object: None,
                     });
                 }
             }
@@ -3315,6 +3317,7 @@ async fn run_with_options_under_store_lock(
                             target: lt.clone(),
                             source_sri: sri,
                             verified_object_tree_integrity: None,
+                            fresh_object: None,
                         },
                     ))
                 })
@@ -4517,7 +4520,7 @@ async fn run_with_options_under_store_lock(
                 let is_tarball_source =
                     matches!(p.source_kind(), Ok(lpm_lockfile::Source::Tarball { .. }));
                 let store_v2_arg = store_v2_ref.as_deref();
-                let (computed_sri, task_timings, final_url) = if is_tarball_source {
+                let (computed_sri, task_timings, final_url, fresh_object) = if is_tarball_source {
                     fetch_and_store_tarball_url(
                         &client,
                         &store_ref,
@@ -4580,7 +4583,11 @@ async fn run_with_options_under_store_lock(
                         store_v2_ref.as_ref(),
                     ) {
                         let plan_c = std::sync::Arc::clone(plan);
-                        let target_c = target.clone();
+                        let mut target_c = target.clone();
+                        if let Some(object) = fresh_object {
+                            target_c.source_sri = computed_sri.clone();
+                            target_c.fresh_object = Some(object);
+                        }
                         let store_c = std::sync::Arc::clone(store_v2);
                         Some(spawn_v2_link_task(
                             plan_c,
