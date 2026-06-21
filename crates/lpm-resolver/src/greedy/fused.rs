@@ -138,7 +138,11 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                         ) {
                             continue;
                         }
-                        let fetched = parse_fetched_metadata(meta, self.spec_tx.is_some());
+                        let fetched = parse_fetched_metadata(
+                            meta,
+                            self.spec_tx.is_some(),
+                            self.trace_metadata_fetches,
+                        );
                         let FetchedMetadata {
                             speculation, info, ..
                         } = fetched;
@@ -466,7 +470,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                     ) {
                         continue;
                     }
-                    let fetched = parse_fetched_metadata(meta, spec_tx.is_some());
+                    let fetched =
+                        parse_fetched_metadata(meta, spec_tx.is_some(), trace_metadata_fetches);
                     let FetchedMetadata {
                         speculation, info, ..
                     } = fetched;
@@ -498,8 +503,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     // through. Slight over-allocation is cheaper than rehashing.
     let mut inflight: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
     let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
-    let mut counted_metadata_edge_misses: AHashSet<CanonicalKey> =
-        AHashSet::with_capacity(npm_fanout);
+    let mut counted_metadata_edge_misses =
+        trace_metadata_fetches.then(|| AHashSet::with_capacity(npm_fanout));
     let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
         tokio::task::JoinSet::new();
 
@@ -550,7 +555,9 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                 state
                     .work_stats
                     .record_metadata_edge_miss(&canonical, &edge.range, &route_table);
-                counted_metadata_edge_misses.insert(canonical.clone());
+                if let Some(counted_metadata_edge_misses) = counted_metadata_edge_misses.as_mut() {
+                    counted_metadata_edge_misses.insert(canonical.clone());
+                }
             }
             parked.entry(canonical.clone()).or_default().push(edge);
             if new_fetch {
@@ -603,11 +610,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         }
                         returned.insert(canonical.clone());
                         inflight.remove(&canonical);
-                        let fetched = parse_fetched_metadata(meta, spec_tx.is_some());
+                        let fetched =
+                            parse_fetched_metadata(meta, spec_tx.is_some(), trace_metadata_fetches);
                         let mut completion = MetadataFetchCompletion {
                             shared_cache: &shared_cache,
                             route_table: &route_table,
-                            counted_metadata_edge_misses: &mut counted_metadata_edge_misses,
+                            counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
                             trace_metadata_fetches,
                             spec_tx: spec_tx.as_ref(),
                             tarball_dispatched_count: &mut tarball_dispatched_count,
@@ -808,7 +816,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             let mut completion = MetadataFetchCompletion {
                 shared_cache: &shared_cache,
                 route_table: &route_table,
-                counted_metadata_edge_misses: &mut counted_metadata_edge_misses,
+                counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
                 trace_metadata_fetches,
                 spec_tx: spec_tx.as_ref(),
                 tarball_dispatched_count: &mut tarball_dispatched_count,

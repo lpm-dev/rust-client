@@ -96,7 +96,7 @@ fn parse_fetched_metadata_omits_speculation_when_disabled() {
     let metadata = serde_json::from_value(metadata_json("spec-skip", &[("left-pad", "^1.0.0")]))
         .expect("fixture metadata should parse");
 
-    let fetched = parse_fetched_metadata(metadata, false);
+    let fetched = parse_fetched_metadata(metadata, false, false);
 
     assert!(fetched.speculation.is_none());
     assert_eq!(fetched.info.versions.len(), 1);
@@ -107,7 +107,7 @@ fn parse_fetched_metadata_preserves_speculation_when_enabled() {
     let metadata = serde_json::from_value(metadata_json("spec-keep", &[("left-pad", "^1.0.0")]))
         .expect("fixture metadata should parse");
 
-    let fetched = parse_fetched_metadata(metadata, true);
+    let fetched = parse_fetched_metadata(metadata, true, false);
 
     let speculation = fetched
         .speculation

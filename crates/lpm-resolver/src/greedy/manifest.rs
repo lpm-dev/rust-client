@@ -142,7 +142,6 @@ pub(super) async fn fetch_metadata_for_resolver(
     include_speculation: bool,
 ) -> Result<FetchedMetadata, ResolveError> {
     let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
-    let latest_version = latest_version_from_metadata(&metadata);
     let dist_tags = metadata.dist_tags.clone();
     let mut info = parse_metadata_to_cache_info(&metadata);
     if info.needs_trust_metadata(policy) {
@@ -152,6 +151,7 @@ pub(super) async fn fetch_metadata_for_resolver(
             canonical,
             policy,
             include_speculation,
+            false,
         )
         .await;
     }
@@ -159,7 +159,7 @@ pub(super) async fn fetch_metadata_for_resolver(
         fetch_release_times_for_policy(client, route_table, canonical, &mut info).await?;
     }
     Ok(fetched_metadata_from_info(
-        latest_version,
+        None,
         dist_tags,
         info,
         include_speculation,
@@ -209,6 +209,7 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
             canonical,
             policy,
             include_speculation,
+            true,
         )
         .await?;
         timings.policy_full_metadata_ms = policy_start.elapsed().as_millis();
@@ -284,8 +285,11 @@ fn metadata_fetch_detail_record(
 pub(super) fn parse_fetched_metadata(
     metadata: lpm_registry::PackageMetadata,
     include_speculation: bool,
+    include_latest_version: bool,
 ) -> FetchedMetadata {
-    let latest_version = latest_version_from_metadata(&metadata);
+    let latest_version = include_latest_version
+        .then(|| latest_version_from_metadata(&metadata))
+        .flatten();
     let info = Arc::new(parse_metadata_to_cache_info(&metadata));
     let speculation = include_speculation.then(|| {
         SpeculativePackageMetadata::from_dist_tags_and_info(metadata.dist_tags, info.clone())
@@ -300,9 +304,12 @@ pub(super) fn parse_fetched_metadata(
 pub(super) fn parse_full_fetched_metadata(
     metadata: lpm_registry::PackageMetadata,
     include_speculation: bool,
+    include_latest_version: bool,
 ) -> FetchedMetadata {
     fetched_metadata_from_info(
-        latest_version_from_metadata(&metadata),
+        include_latest_version
+            .then(|| latest_version_from_metadata(&metadata))
+            .flatten(),
         metadata.dist_tags.clone(),
         parse_full_metadata_to_cache_info(&metadata),
         include_speculation,
@@ -369,7 +376,8 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
     }
     let policy_start = trace_metadata_fetches.then(Instant::now);
     let fetched =
-        fetch_full_metadata_for_policy(client, route_table, canonical, policy, false).await?;
+        fetch_full_metadata_for_policy(client, route_table, canonical, policy, false, false)
+            .await?;
     let full_info = fetched.info;
     if let Some(start) = policy_start {
         let elapsed = start.elapsed().as_millis();
@@ -447,9 +455,10 @@ async fn fetch_full_metadata_for_policy(
     canonical: &CanonicalKey,
     policy: &ResolverPolicy,
     include_speculation: bool,
+    include_latest_version: bool,
 ) -> Result<FetchedMetadata, ResolveError> {
     let full = fetch_full_metadata_raw(client, route_table, canonical).await?;
-    let fetched = parse_full_fetched_metadata(full, include_speculation);
+    let fetched = parse_full_fetched_metadata(full, include_speculation, include_latest_version);
     if !fetched.info.needs_policy_metadata(canonical, policy) {
         return Ok(fetched);
     }
@@ -478,13 +487,14 @@ async fn fetch_full_metadata_for_policy(
     Ok(parse_full_fetched_metadata(
         direct_full,
         include_speculation,
+        include_latest_version,
     ))
 }
 
 pub(super) struct MetadataFetchCompletion<'a> {
     pub(super) shared_cache: &'a SharedCache,
     pub(super) route_table: &'a RouteTable,
-    pub(super) counted_metadata_edge_misses: &'a mut AHashSet<CanonicalKey>,
+    pub(super) counted_metadata_edge_misses: Option<&'a mut AHashSet<CanonicalKey>>,
     pub(super) trace_metadata_fetches: bool,
     pub(super) spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     pub(super) tarball_dispatched_count: &'a mut u64,
@@ -497,7 +507,10 @@ pub(super) fn complete_metadata_fetch(
     result: FetchResult,
     completion: &mut MetadataFetchCompletion<'_>,
 ) -> Result<(), ResolveError> {
-    let count_latest_for_miss = completion.counted_metadata_edge_misses.remove(&canonical);
+    let count_latest_for_miss = match completion.counted_metadata_edge_misses.as_mut() {
+        Some(misses) => misses.remove(&canonical),
+        None => false,
+    };
     match result {
         Ok(fetched) => {
             let FetchedMetadata {
