@@ -1946,6 +1946,108 @@ async fn install_experimental_spike_lockfile_graph_requires_lockfile_gates() {
 }
 
 #[tokio::test]
+async fn install_experimental_spike_live_graph_does_not_write_install_hash() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"spike-live-no-install-hash","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run experimental installer spike");
+
+    assert!(
+        output.status.success(),
+        "experimental live install should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.file_exists("node_modules/ms/package.json"),
+        "experimental live install must install package contents"
+    );
+    assert!(
+        !project.file_exists(".lpm/install-hash"),
+        "experimental benchmark-only install must not seed the normal freshness cache"
+    );
+}
+
+#[tokio::test]
+async fn install_experimental_spike_live_graph_rejects_frozen_lockfile_invocation() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"spike-live-frozen-rejected","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let lockfile_output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to seed lockfile before frozen experimental rejection");
+    assert!(
+        lockfile_output.status.success(),
+        "lockfile seed install should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&lockfile_output.stdout),
+        String::from_utf8_lossy(&lockfile_output.stderr)
+    );
+    assertions::assert_lockfile_exists(project.path());
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before frozen live graph rejection");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .args([
+            "install",
+            "--json",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run unsupported experimental installer spike");
+
+    assert!(
+        !output.status.success(),
+        "frozen live experimental shape must fail instead of fresh-resolving\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.contains("set LPM_INSTALLER_SPIKE_GRAPH=lockfile for frozen installs"),
+        "unsupported frozen live experimental shape must report the graph mismatch; got:\n{combined}"
+    );
+    assert!(
+        !project.file_exists("node_modules/ms/package.json"),
+        "unsupported experimental shape must not silently perform a normal install"
+    );
+}
+
+#[tokio::test]
 async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
     let mock = MockRegistry::start().await;
     mount_ms_2_1_3(&mock).await;

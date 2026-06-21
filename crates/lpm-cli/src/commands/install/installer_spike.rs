@@ -92,6 +92,11 @@ fn unsupported_admission_reasons(
     if lockfile_graph && !admission.frozen_lockfile_active {
         reasons.push("use a frozen lockfile install");
     }
+    if graph_source == InstallerSpikeGraphSource::ResolveWorklist
+        && admission.frozen_lockfile_active
+    {
+        reasons.push("set LPM_INSTALLER_SPIKE_GRAPH=lockfile for frozen installs");
+    }
     if !admission.json_output {
         reasons.push("use --json");
     }
@@ -1026,8 +1031,6 @@ pub(super) async fn run(
     let link_result = link_outcome.result;
     let link_ms = link_start.elapsed().as_millis();
     let total_ms = start.elapsed().as_millis();
-
-    write_post_install_v6_hash(project_dir, linker_mode);
 
     if json_output {
         let package_json: Vec<serde_json::Value> = install_packages
@@ -2737,6 +2740,21 @@ mod tests {
         assert_eq!(
             reasons,
             vec!["set LPM_INSTALLER_SPIKE_GRAPH=resolve-worklist or lockfile"]
+        );
+    }
+
+    #[test]
+    fn admission_rejects_live_resolve_worklist_for_frozen_installs() {
+        let reasons = unsupported_admission_reasons(
+            benchmark_admission(),
+            InstallerSpikeGraphSource::ResolveWorklist,
+            InstallerSpikeParityMode::FreshResolve { deny: true },
+            true,
+        );
+
+        assert_eq!(
+            reasons,
+            vec!["set LPM_INSTALLER_SPIKE_GRAPH=lockfile for frozen installs"]
         );
     }
 
