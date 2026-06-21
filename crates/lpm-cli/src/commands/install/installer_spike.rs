@@ -67,7 +67,7 @@ pub(super) fn should_run(admission: InstallerSpikeAdmission) -> Result<bool, Lpm
         return Ok(true);
     }
     Err(LpmError::Registry(format!(
-        "experimental installer spike is limited to frozen lockfile benchmark installs; unsupported for this invocation: {}",
+        "experimental installer spike is limited to benchmark installs; unsupported for this invocation: {}",
         reasons.join("; ")
     )))
 }
@@ -79,17 +79,23 @@ fn unsupported_admission_reasons(
     benchmark_only: bool,
 ) -> Vec<&'static str> {
     let mut reasons = Vec::new();
+    if graph_source == InstallerSpikeGraphSource::Invalid {
+        reasons.push("set LPM_INSTALLER_SPIKE_GRAPH=resolve-worklist or lockfile");
+    }
     if !benchmark_only {
         reasons.push("set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1");
     }
-    if !graph_source.uses_lockfile() {
-        reasons.push("set LPM_INSTALLER_SPIKE_GRAPH=lockfile");
-    }
-    if matches!(parity_mode, InstallerSpikeParityMode::FreshResolve { .. }) {
+    let lockfile_graph = graph_source.uses_lockfile();
+    if lockfile_graph && matches!(parity_mode, InstallerSpikeParityMode::FreshResolve { .. }) {
         reasons.push("use lockfile parity or disable parity");
     }
-    if !admission.frozen_lockfile_active {
+    if lockfile_graph && !admission.frozen_lockfile_active {
         reasons.push("use a frozen lockfile install");
+    }
+    if graph_source == InstallerSpikeGraphSource::ResolveWorklist
+        && admission.frozen_lockfile_active
+    {
+        reasons.push("set LPM_INSTALLER_SPIKE_GRAPH=lockfile for frozen installs");
     }
     if !admission.json_output {
         reasons.push("use --json");
@@ -864,6 +870,11 @@ pub(super) async fn run(
             stats.inserted_nodes = install_packages.len() as u64;
             install_packages
         }
+        InstallerSpikeGraphSource::Invalid => {
+            return Err(LpmError::Registry(
+                "invalid experimental installer spike graph".to_string(),
+            ));
+        }
     };
     let mut platform_skipped = filter_platform_packages(&mut install_packages)?;
     if graph_source == InstallerSpikeGraphSource::Lockfile {
@@ -1021,8 +1032,6 @@ pub(super) async fn run(
     let link_ms = link_start.elapsed().as_millis();
     let total_ms = start.elapsed().as_millis();
 
-    write_post_install_v6_hash(project_dir, linker_mode);
-
     if json_output {
         let package_json: Vec<serde_json::Value> = install_packages
             .iter()
@@ -1133,6 +1142,7 @@ fn installer_spike_metadata_concurrency() -> usize {
 enum InstallerSpikeGraphSource {
     ResolveWorklist,
     Lockfile,
+    Invalid,
 }
 
 impl InstallerSpikeGraphSource {
@@ -1142,8 +1152,10 @@ impl InstallerSpikeGraphSource {
 
     fn from_value(value: Option<&str>) -> Self {
         match value {
+            None => Self::ResolveWorklist,
+            Some("resolve" | "resolve-worklist" | "live" | "live-resolve") => Self::ResolveWorklist,
             Some("lock" | "lockfile" | "seed-lock") => Self::Lockfile,
-            Some(_) | None => Self::ResolveWorklist,
+            Some(_) => Self::Invalid,
         }
     }
 
@@ -1151,6 +1163,7 @@ impl InstallerSpikeGraphSource {
         match self {
             Self::ResolveWorklist => "resolve-worklist",
             Self::Lockfile => "lockfile",
+            Self::Invalid => "invalid",
         }
     }
 
@@ -2665,10 +2678,26 @@ mod tests {
     }
 
     #[test]
-    fn graph_source_defaults_to_resolve_worklist_for_unknown_value() {
+    fn graph_source_defaults_to_resolve_worklist_when_unset() {
+        assert_eq!(
+            InstallerSpikeGraphSource::from_value(None),
+            InstallerSpikeGraphSource::ResolveWorklist
+        );
+    }
+
+    #[test]
+    fn graph_source_parses_explicit_resolve_worklist_without_environment_mutation() {
+        assert_eq!(
+            InstallerSpikeGraphSource::from_value(Some("resolve-worklist")),
+            InstallerSpikeGraphSource::ResolveWorklist
+        );
+    }
+
+    #[test]
+    fn graph_source_rejects_unknown_explicit_value() {
         assert_eq!(
             InstallerSpikeGraphSource::from_value(Some("unexpected")),
-            InstallerSpikeGraphSource::ResolveWorklist
+            InstallerSpikeGraphSource::Invalid
         );
     }
 
@@ -2685,19 +2714,63 @@ mod tests {
     }
 
     #[test]
-    fn admission_requires_benchmark_ack_frozen_lockfile_and_lockfile_graph() {
+    fn admission_accepts_live_resolve_worklist_benchmark_shape() {
         let mut admission = benchmark_admission();
         admission.frozen_lockfile_active = false;
 
         let reasons = unsupported_admission_reasons(
             admission,
             InstallerSpikeGraphSource::ResolveWorklist,
+            InstallerSpikeParityMode::FreshResolve { deny: true },
+            true,
+        );
+
+        assert!(reasons.is_empty(), "unexpected reasons: {reasons:?}");
+    }
+
+    #[test]
+    fn admission_rejects_unknown_explicit_graph_value() {
+        let reasons = unsupported_admission_reasons(
+            benchmark_admission(),
+            InstallerSpikeGraphSource::Invalid,
+            InstallerSpikeParityMode::FreshResolve { deny: true },
+            true,
+        );
+
+        assert_eq!(
+            reasons,
+            vec!["set LPM_INSTALLER_SPIKE_GRAPH=resolve-worklist or lockfile"]
+        );
+    }
+
+    #[test]
+    fn admission_rejects_live_resolve_worklist_for_frozen_installs() {
+        let reasons = unsupported_admission_reasons(
+            benchmark_admission(),
+            InstallerSpikeGraphSource::ResolveWorklist,
+            InstallerSpikeParityMode::FreshResolve { deny: true },
+            true,
+        );
+
+        assert_eq!(
+            reasons,
+            vec!["set LPM_INSTALLER_SPIKE_GRAPH=lockfile for frozen installs"]
+        );
+    }
+
+    #[test]
+    fn admission_requires_benchmark_ack_and_frozen_lockfile_for_lockfile_graph() {
+        let mut admission = benchmark_admission();
+        admission.frozen_lockfile_active = false;
+
+        let reasons = unsupported_admission_reasons(
+            admission,
+            InstallerSpikeGraphSource::Lockfile,
             InstallerSpikeParityMode::FreshResolve { deny: false },
             false,
         );
 
         assert!(reasons.contains(&"set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1"));
-        assert!(reasons.contains(&"set LPM_INSTALLER_SPIKE_GRAPH=lockfile"));
         assert!(reasons.contains(&"use lockfile parity or disable parity"));
         assert!(reasons.contains(&"use a frozen lockfile install"));
     }
