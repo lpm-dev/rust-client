@@ -53,6 +53,19 @@ pub struct ResolvedPackage {
     pub optional: bool,
 }
 
+/// Concrete package selected by the greedy-fusion resolver before the final
+/// resolved graph is materialized.
+#[derive(Debug, Clone)]
+pub struct SelectedPackageEvent {
+    pub name: String,
+    pub version: String,
+    pub is_lpm: bool,
+    pub tarball_url: Option<String>,
+    pub integrity: Option<String>,
+    pub platform: Option<PlatformMeta>,
+    pub optional: bool,
+}
+
 /// Internal type for PubGrub result + provider (to extract cache).
 pub(super) type PubGrubResult = Result<
     (

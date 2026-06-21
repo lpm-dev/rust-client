@@ -1657,6 +1657,36 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         fetch["v2_reusable_validation"].is_object(),
         "detail.fetch.v2_reusable_validation must expose reusable-object validation counters; got {fetch:#?}"
     );
+    assert!(
+        fetch["overlap"].is_object(),
+        "detail.fetch.overlap must expose early fetch overlap counters; got {fetch:#?}"
+    );
+    for field in [
+        "selected_count",
+        "dispatched_count",
+        "completed_count",
+        "cache_hit_count",
+        "failed_count",
+        "skipped_platform_count",
+        "task_sum_ms",
+        "task_max_ms",
+        "drain_ms",
+    ] {
+        assert!(
+            fetch["overlap"][field].is_number(),
+            "detail.fetch.overlap.{field} must be numeric; got {fetch:#?}"
+        );
+    }
+    assert!(
+        fetch["overlap"]["breakdown"].is_object(),
+        "detail.fetch.overlap.breakdown must expose early fetch task attribution; got {fetch:#?}"
+    );
+    for field in ["task_count", "task_sum_ms", "task_max_ms"] {
+        assert!(
+            fetch["overlap"]["breakdown"][field].is_number(),
+            "detail.fetch.overlap.breakdown.{field} must be numeric; got {fetch:#?}"
+        );
+    }
     for field in ["task_count", "task_sum_ms", "task_max_ms"] {
         assert!(
             fetch["breakdown"][field].is_number(),
@@ -1783,6 +1813,96 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
             "timing.speculative.{field} must be numeric; got {speculative:#?}"
         );
     }
+}
+
+#[tokio::test]
+async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"fetch-overlap-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_TIMING_DETAIL", "1")
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install --json failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        project.file_exists("node_modules/ms/package.json"),
+        "install output must still be driven by the final resolved package graph"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
+    let overlap = envelope["timing"]["detail"]["fetch"]["overlap"]
+        .as_object()
+        .unwrap_or_else(|| panic!("timing.detail.fetch.overlap missing; got {envelope:#}"));
+    assert!(
+        overlap["selected_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "forced overlap admission should observe at least one resolver selection; got {overlap:#?}"
+    );
+    assert!(
+        overlap["dispatched_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "forced overlap admission should dispatch at least one early fetch; got {overlap:#?}"
+    );
+    assert_eq!(
+        overlap["failed_count"].as_u64(),
+        Some(0),
+        "early fetch overlap must fall back cleanly without task failures; got {overlap:#?}"
+    );
+
+    let downloaded = envelope["downloaded"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("downloaded must be numeric; got {envelope:#}"));
+    let cached = envelope["cached"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("cached must be numeric; got {envelope:#}"));
+    let package_count = envelope["count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("count must be numeric; got {envelope:#}"));
+    let fetch_breakdown = &envelope["timing"]["fetch_breakdown"];
+    let detail_breakdown = &envelope["timing"]["detail"]["fetch"]["breakdown"];
+    let overlap_breakdown = &envelope["timing"]["detail"]["fetch"]["overlap"]["breakdown"];
+    assert_eq!(
+        cached + downloaded,
+        package_count,
+        "cache/download counts must partition final install graph; got {envelope:#}"
+    );
+    assert_eq!(
+        fetch_breakdown["task_count"].as_u64(),
+        Some(downloaded),
+        "top-level fetch breakdown must describe authoritative fetch tasks only; got {envelope:#}"
+    );
+    assert_eq!(
+        detail_breakdown["task_count"].as_u64(),
+        Some(downloaded),
+        "detail fetch breakdown must mirror authoritative fetch task count; got {envelope:#}"
+    );
+    assert_eq!(
+        overlap_breakdown["task_count"].as_u64(),
+        overlap["completed_count"].as_u64(),
+        "overlap breakdown must carry early fetch task timings separately; got {envelope:#}"
+    );
 }
 
 #[tokio::test]
@@ -6028,6 +6148,86 @@ async fn install_prod_omits_dev_dependencies_from_disk_but_keeps_lockfile_entrie
     assert!(
         !project.path().join("node_modules/dev-only").exists(),
         "warm offline omit dev must not relink the dev dependency"
+    );
+}
+
+#[tokio::test]
+async fn install_omit_dev_does_not_prefetch_dev_only_packages() {
+    let mock = MockRegistry::start().await;
+    let dev_tarball = make_tarball("dev-only", "1.0.0");
+    mock.with_package("dev-only", "1.0.0", &dev_tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "omit-dev-overlap",
+        "version": "1.0.0",
+        "devDependencies": { "dev-only": "1.0.0" }
+    }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_TIMING_DETAIL", "1")
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .args([
+            "install",
+            "--omit=dev",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install --json --omit=dev");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "omit dev install failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !project.path().join("node_modules/dev-only").exists(),
+        "dev-only package must not be linked into an omit-dev install"
+    );
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("name = \"dev-only\""),
+        "omit dev should still resolve dev-only for lockfile parity:\n{lockfile}"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
+    assert_eq!(envelope["count"].as_u64(), Some(0), "got {envelope:#}");
+    assert_eq!(envelope["downloaded"].as_u64(), Some(0), "got {envelope:#}");
+    assert_eq!(envelope["cached"].as_u64(), Some(0), "got {envelope:#}");
+    let overlap = &envelope["timing"]["detail"]["fetch"]["overlap"];
+    assert_eq!(
+        overlap["dispatched_count"].as_u64(),
+        Some(0),
+        "omit-dev installs must not overlap-fetch packages later removed from the final graph; got {envelope:#}"
+    );
+    let speculative = &envelope["timing"]["speculative"];
+    assert_eq!(
+        speculative["dispatched"].as_u64(),
+        Some(0),
+        "omit-dev installs must not speculatively fetch packages later removed from the final graph; got {envelope:#}"
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let dev_tarball_path = MockRegistry::tarball_path("dev-only", "1.0.0");
+    let dev_tarball_hits: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == dev_tarball_path)
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert!(
+        dev_tarball_hits.is_empty(),
+        "omit-dev install must not prefetch dev-only tarballs; hits={dev_tarball_hits:?}\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
 
