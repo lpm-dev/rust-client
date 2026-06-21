@@ -2477,6 +2477,14 @@ async fn run_with_options_under_store_lock(
     // stats — filled by the speculation dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
     let spec_tracker = SpeculativeKeyTracker::default();
+    let speculation_deps: HashMap<String, String> = if omit_policy.dev {
+        deps.iter()
+            .filter(|(name, _)| production_dependency_names.contains(*name))
+            .map(|(name, range)| (name.clone(), range.clone()))
+            .collect()
+    } else {
+        deps.clone()
+    };
 
     //: shared fetch coordinator — serializes per-key fetch
     // work across the speculative dispatcher and the real fetch loop
@@ -2638,32 +2646,32 @@ async fn run_with_options_under_store_lock(
                         fetch_semaphore.clone(),
                         Some(Arc::new(Semaphore::new(speculation_permits))),
                         fetch_coord.clone(),
-                        deps.clone(),
+                        speculation_deps.clone(),
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
                     );
-                    let selected_package_tx = if fetch_overlap_enabled(fusion_enabled_local, force)
-                    {
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                        fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
-                            rx,
-                            arc_client.clone(),
-                            route_table.clone(),
-                            store.clone(),
-                            store_v2_handle.clone(),
-                            fetch_semaphore.clone(),
-                            fetch_coord.clone(),
-                            project_dir.to_path_buf(),
-                            gate_stats.clone(),
-                            fetch_extract_limiter.clone(),
-                            streaming_fetch,
-                            fetch_overlap_min_selected(),
-                        ));
-                        Some(tx)
-                    } else {
-                        None
-                    };
+                    let selected_package_tx =
+                        if fetch_overlap_enabled(fusion_enabled_local, force, omit_policy.dev) {
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                            fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
+                                rx,
+                                arc_client.clone(),
+                                route_table.clone(),
+                                store.clone(),
+                                store_v2_handle.clone(),
+                                fetch_semaphore.clone(),
+                                fetch_coord.clone(),
+                                project_dir.to_path_buf(),
+                                gate_stats.clone(),
+                                fetch_extract_limiter.clone(),
+                                streaming_fetch,
+                                fetch_overlap_min_selected(),
+                            ));
+                            Some(tx)
+                        } else {
+                            None
+                        };
                     let res = lpm_resolver::resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         arc_client.clone(),
                         deps.clone(),
@@ -2773,7 +2781,7 @@ async fn run_with_options_under_store_lock(
                         fetch_semaphore.clone(),
                         None,
                         fetch_coord.clone(),
-                        deps.clone(),
+                        speculation_deps.clone(),
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),

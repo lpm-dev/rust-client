@@ -6151,6 +6151,86 @@ async fn install_prod_omits_dev_dependencies_from_disk_but_keeps_lockfile_entrie
     );
 }
 
+#[tokio::test]
+async fn install_omit_dev_does_not_prefetch_dev_only_packages() {
+    let mock = MockRegistry::start().await;
+    let dev_tarball = make_tarball("dev-only", "1.0.0");
+    mock.with_package("dev-only", "1.0.0", &dev_tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "omit-dev-overlap",
+        "version": "1.0.0",
+        "devDependencies": { "dev-only": "1.0.0" }
+    }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_TIMING_DETAIL", "1")
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .args([
+            "install",
+            "--omit=dev",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install --json --omit=dev");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "omit dev install failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !project.path().join("node_modules/dev-only").exists(),
+        "dev-only package must not be linked into an omit-dev install"
+    );
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("name = \"dev-only\""),
+        "omit dev should still resolve dev-only for lockfile parity:\n{lockfile}"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
+    assert_eq!(envelope["count"].as_u64(), Some(0), "got {envelope:#}");
+    assert_eq!(envelope["downloaded"].as_u64(), Some(0), "got {envelope:#}");
+    assert_eq!(envelope["cached"].as_u64(), Some(0), "got {envelope:#}");
+    let overlap = &envelope["timing"]["detail"]["fetch"]["overlap"];
+    assert_eq!(
+        overlap["dispatched_count"].as_u64(),
+        Some(0),
+        "omit-dev installs must not overlap-fetch packages later removed from the final graph; got {envelope:#}"
+    );
+    let speculative = &envelope["timing"]["speculative"];
+    assert_eq!(
+        speculative["dispatched"].as_u64(),
+        Some(0),
+        "omit-dev installs must not speculatively fetch packages later removed from the final graph; got {envelope:#}"
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let dev_tarball_path = MockRegistry::tarball_path("dev-only", "1.0.0");
+    let dev_tarball_hits: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == dev_tarball_path)
+        .map(|request| request.url.path().to_string())
+        .collect();
+    assert!(
+        dev_tarball_hits.is_empty(),
+        "omit-dev install must not prefetch dev-only tarballs; hits={dev_tarball_hits:?}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
 /// End-to-end integrity verification: the SRI claim recorded in the
 /// lockfile, the SRI persisted in the global store's `.integrity` file,
 /// and a fresh recomputation from the original tarball bytes must all

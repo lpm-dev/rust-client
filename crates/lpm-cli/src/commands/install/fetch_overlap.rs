@@ -52,16 +52,25 @@ impl Drop for FetchOverlapJoin {
     }
 }
 
-pub(super) fn fetch_overlap_enabled(fusion_enabled: bool, force: bool) -> bool {
+pub(super) fn fetch_overlap_enabled(fusion_enabled: bool, force: bool, omit_dev: bool) -> bool {
     fetch_overlap_enabled_from_value(
         fusion_enabled,
         force,
+        omit_dev,
         std::env::var(ENV_FETCH_OVERLAP).ok().as_deref(),
     )
 }
 
-fn fetch_overlap_enabled_from_value(fusion_enabled: bool, force: bool, raw: Option<&str>) -> bool {
-    fusion_enabled && !force && raw.is_none_or(|value| parse_bool_env_value(value, true))
+fn fetch_overlap_enabled_from_value(
+    fusion_enabled: bool,
+    force: bool,
+    omit_dev: bool,
+    raw: Option<&str>,
+) -> bool {
+    fusion_enabled
+        && !force
+        && !omit_dev
+        && raw.is_none_or(|value| parse_bool_env_value(value, true))
 }
 
 pub(super) fn fetch_overlap_min_selected() -> usize {
@@ -346,18 +355,28 @@ mod tests {
 
     #[test]
     fn fetch_overlap_defaults_on_for_fresh_fusion_installs() {
-        assert!(fetch_overlap_enabled_from_value(true, false, None));
+        assert!(fetch_overlap_enabled_from_value(true, false, false, None));
     }
 
     #[test]
     fn fetch_overlap_can_be_disabled_by_environment_value() {
-        assert!(!fetch_overlap_enabled_from_value(true, false, Some("0")));
+        assert!(!fetch_overlap_enabled_from_value(
+            true,
+            false,
+            false,
+            Some("0")
+        ));
     }
 
     #[test]
     fn fetch_overlap_stays_off_outside_fusion_or_force_installs() {
-        assert!(!fetch_overlap_enabled_from_value(false, false, None));
-        assert!(!fetch_overlap_enabled_from_value(true, true, None));
+        assert!(!fetch_overlap_enabled_from_value(false, false, false, None));
+        assert!(!fetch_overlap_enabled_from_value(true, true, false, None));
+    }
+
+    #[test]
+    fn fetch_overlap_stays_off_when_dev_dependencies_are_omitted() {
+        assert!(!fetch_overlap_enabled_from_value(true, false, true, None));
     }
 
     #[test]
