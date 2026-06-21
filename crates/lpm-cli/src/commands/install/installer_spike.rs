@@ -67,7 +67,7 @@ pub(super) fn should_run(admission: InstallerSpikeAdmission) -> Result<bool, Lpm
         return Ok(true);
     }
     Err(LpmError::Registry(format!(
-        "experimental installer spike is limited to frozen lockfile benchmark installs; unsupported for this invocation: {}",
+        "experimental installer spike is limited to benchmark installs; unsupported for this invocation: {}",
         reasons.join("; ")
     )))
 }
@@ -82,13 +82,11 @@ fn unsupported_admission_reasons(
     if !benchmark_only {
         reasons.push("set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1");
     }
-    if !graph_source.uses_lockfile() {
-        reasons.push("set LPM_INSTALLER_SPIKE_GRAPH=lockfile");
-    }
-    if matches!(parity_mode, InstallerSpikeParityMode::FreshResolve { .. }) {
+    let lockfile_graph = graph_source.uses_lockfile();
+    if lockfile_graph && matches!(parity_mode, InstallerSpikeParityMode::FreshResolve { .. }) {
         reasons.push("use lockfile parity or disable parity");
     }
-    if !admission.frozen_lockfile_active {
+    if lockfile_graph && !admission.frozen_lockfile_active {
         reasons.push("use a frozen lockfile install");
     }
     if !admission.json_output {
@@ -2685,19 +2683,33 @@ mod tests {
     }
 
     #[test]
-    fn admission_requires_benchmark_ack_frozen_lockfile_and_lockfile_graph() {
+    fn admission_accepts_live_resolve_worklist_benchmark_shape() {
         let mut admission = benchmark_admission();
         admission.frozen_lockfile_active = false;
 
         let reasons = unsupported_admission_reasons(
             admission,
             InstallerSpikeGraphSource::ResolveWorklist,
+            InstallerSpikeParityMode::FreshResolve { deny: true },
+            true,
+        );
+
+        assert!(reasons.is_empty(), "unexpected reasons: {reasons:?}");
+    }
+
+    #[test]
+    fn admission_requires_benchmark_ack_and_frozen_lockfile_for_lockfile_graph() {
+        let mut admission = benchmark_admission();
+        admission.frozen_lockfile_active = false;
+
+        let reasons = unsupported_admission_reasons(
+            admission,
+            InstallerSpikeGraphSource::Lockfile,
             InstallerSpikeParityMode::FreshResolve { deny: false },
             false,
         );
 
         assert!(reasons.contains(&"set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1"));
-        assert!(reasons.contains(&"set LPM_INSTALLER_SPIKE_GRAPH=lockfile"));
         assert!(reasons.contains(&"use lockfile parity or disable parity"));
         assert!(reasons.contains(&"use a frozen lockfile install"));
     }
