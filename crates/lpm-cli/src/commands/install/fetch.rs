@@ -5,7 +5,7 @@ pub(super) type FetchExtractLimiter = Option<Arc<tokio::sync::Semaphore>>;
 
 const ENV_FETCH_EXTRACT_PERMITS: &str = "LPM_FETCH_EXTRACT_PERMITS";
 const ENV_EXPERIMENTAL_INSTALLER_SPIKE: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE";
-const DEFAULT_EXPERIMENTAL_FETCH_EXTRACT_PERMITS: usize = 10;
+const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 10;
 
 #[derive(Default)]
 pub(super) struct FetchCoordinator {
@@ -61,22 +61,31 @@ fn parse_fetch_extract_permits(value: &str) -> Option<usize> {
 fn configured_fetch_extract_permits(
     explicit_permits: Option<&str>,
     experimental_installer_spike: Option<&str>,
+    v2_store_active: bool,
 ) -> Option<usize> {
     match explicit_permits {
         Some(value) => parse_fetch_extract_permits(value),
         None if experimental_installer_spike == Some("1") => {
-            Some(DEFAULT_EXPERIMENTAL_FETCH_EXTRACT_PERMITS)
+            Some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS)
         }
-        None => None,
+        None => platform_default_fetch_extract_permits(v2_store_active, cfg!(target_os = "macos")),
     }
 }
 
-pub(super) fn configured_fetch_extract_limiter() -> FetchExtractLimiter {
+fn platform_default_fetch_extract_permits(
+    v2_store_active: bool,
+    target_is_macos: bool,
+) -> Option<usize> {
+    (target_is_macos && v2_store_active).then_some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS)
+}
+
+pub(super) fn configured_fetch_extract_limiter(v2_store_active: bool) -> FetchExtractLimiter {
     let explicit_permits = std::env::var(ENV_FETCH_EXTRACT_PERMITS).ok();
     let experimental_installer_spike = std::env::var(ENV_EXPERIMENTAL_INSTALLER_SPIKE).ok();
     configured_fetch_extract_permits(
         explicit_permits.as_deref(),
         experimental_installer_spike.as_deref(),
+        v2_store_active,
     )
     .map(tokio::sync::Semaphore::new)
     .map(Arc::new)
@@ -108,28 +117,49 @@ mod tests {
 
     #[test]
     fn fetch_extract_permits_stay_unbounded_when_unset_without_experimental_installer() {
-        assert_eq!(configured_fetch_extract_permits(None, None), None);
+        assert_eq!(configured_fetch_extract_permits(None, None, false), None);
     }
 
     #[test]
-    fn fetch_extract_permits_default_to_measured_value_for_experimental_installer() {
+    fn fetch_extract_permits_default_to_bounded_value_for_experimental_installer() {
         assert_eq!(
-            configured_fetch_extract_permits(None, Some("1")),
-            Some(DEFAULT_EXPERIMENTAL_FETCH_EXTRACT_PERMITS)
+            configured_fetch_extract_permits(None, Some("1"), false),
+            Some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS)
         );
     }
 
     #[test]
     fn fetch_extract_permits_explicit_value_overrides_experimental_default() {
         assert_eq!(
-            configured_fetch_extract_permits(Some("8"), Some("1")),
+            configured_fetch_extract_permits(Some("8"), Some("1"), true),
             Some(8)
         );
     }
 
     #[test]
     fn fetch_extract_permits_invalid_explicit_value_keeps_existing_unbounded_escape_hatch() {
-        assert_eq!(configured_fetch_extract_permits(Some("0"), Some("1")), None);
+        assert_eq!(
+            configured_fetch_extract_permits(Some("0"), Some("1"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn fetch_extract_permits_default_to_bounded_value_for_macos_v2_installs() {
+        assert_eq!(
+            platform_default_fetch_extract_permits(true, true),
+            Some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS)
+        );
+    }
+
+    #[test]
+    fn fetch_extract_permits_stay_unbounded_for_macos_v1_installs() {
+        assert_eq!(platform_default_fetch_extract_permits(false, true), None);
+    }
+
+    #[test]
+    fn fetch_extract_permits_stay_unbounded_for_non_macos_v2_installs() {
+        assert_eq!(platform_default_fetch_extract_permits(true, false), None);
     }
 }
 
