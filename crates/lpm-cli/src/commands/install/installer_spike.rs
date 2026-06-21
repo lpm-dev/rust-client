@@ -28,8 +28,6 @@ pub(super) struct InstallerSpikeAdmission {
     pub(super) omit_policy: InstallOmitPolicy,
     pub(super) has_workspace_member_deps: bool,
     pub(super) has_v2_workspace_member_deps: bool,
-    pub(super) has_overrides: bool,
-    pub(super) overrides_changed: bool,
     pub(super) has_patches: bool,
     pub(super) patches_changed: bool,
     pub(super) verify_registry_signatures: bool,
@@ -119,9 +117,6 @@ fn unsupported_admission_reasons(
     }
     if admission.has_workspace_member_deps || admission.has_v2_workspace_member_deps {
         reasons.push("workspace member links are not supported");
-    }
-    if admission.has_overrides || admission.overrides_changed {
-        reasons.push("overrides are not supported");
     }
     if admission.has_patches || admission.patches_changed {
         reasons.push("patches are not supported");
@@ -2769,8 +2764,6 @@ mod tests {
             omit_policy: InstallOmitPolicy::default(),
             has_workspace_member_deps: false,
             has_v2_workspace_member_deps: false,
-            has_overrides: false,
-            overrides_changed: false,
             has_patches: false,
             patches_changed: false,
             verify_registry_signatures: false,
@@ -2991,6 +2984,7 @@ mod tests {
 
         assert!(reasons.contains(&"--prod/--omit=dev is not supported"));
         assert!(reasons.contains(&"workspace member links are not supported"));
+        assert!(!reasons.contains(&"overrides are not supported"));
         assert!(reasons.contains(&"patches are not supported"));
         assert!(reasons.contains(&"registry signature verification is not supported"));
         assert!(reasons.contains(&"audit-after-install is not supported"));
