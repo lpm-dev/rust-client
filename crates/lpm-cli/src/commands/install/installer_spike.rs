@@ -2713,6 +2713,7 @@ fn maybe_spawn_fetch(
             &package,
             queue_wait_ms,
             &project_dir,
+            TarballNotFoundRecovery::DeleteProjectLockfiles,
             &gate_stats,
             permit,
             &fetch_extract_limiter,

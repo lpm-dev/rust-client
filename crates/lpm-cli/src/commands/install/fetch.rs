@@ -7,6 +7,12 @@ const ENV_FETCH_EXTRACT_PERMITS: &str = "LPM_FETCH_EXTRACT_PERMITS";
 const ENV_EXPERIMENTAL_INSTALLER_SPIKE: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE";
 const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 10;
 
+#[derive(Clone, Copy)]
+pub(super) enum TarballNotFoundRecovery {
+    DeleteProjectLockfiles,
+    PreserveProjectLockfiles,
+}
+
 #[derive(Default)]
 pub(super) struct FetchCoordinator {
     pub(super) locks: AsyncMutex<HashMap<String, FetchLock>>,
@@ -924,39 +930,29 @@ pub(super) fn invalidate_metadata_routed(
     }
 }
 
-/// Shared 404-handling: when a tarball URL 404s and the same-run
-/// retry can't recover it either, the metadata cache is stale —
-/// nuke the lockfiles so the next `lpm install` re-resolves and
-/// re-fetches from fresh metadata. Returns the user-facing error
-/// message the caller should surface.
+/// Shared 404-handling: invalidate stale metadata and return the user-facing
+/// error message the caller should surface. Authoritative fetches also remove
+/// lockfiles so the next `lpm install` re-resolves; best-effort overlap fetches
+/// preserve project state.
 ///
-/// takes `project_dir` and resolves lockfile
-/// paths via `project_dir.join(...)` instead of `Path::new(...)`
-/// (which was CWD-relative). A programmatic caller running install
-/// from a nested directory previously left the actual project
-/// lockfiles untouched, leaking stale state on retry.
-pub(super) fn handle_tarball_not_found(
+/// `project_dir` is the project root, not necessarily the current process CWD.
+pub(super) fn handle_tarball_not_found_with_recovery(
     client: &Arc<RegistryClient>,
     name: &str,
     version: &str,
     project_dir: &Path,
+    recovery: TarballNotFoundRecovery,
 ) -> LpmError {
-    // : name-only invalidation here is best-effort —
-    // it nukes the npm.org / `@lpm.dev/` cache entries but cannot
-    // reach `.npmrc`-declared custom-registry entries (those need
-    // `invalidate_custom_metadata_cache(base_url, name, auth)`).
-    // Acceptable here because the surrounding hard-fail path also
-    // deletes the lockfiles, forcing the next install to re-resolve
-    // from scratch — the stale custom-registry cache entry will then
-    // be repopulated under the freshly-resolved key.
     client.invalidate_metadata_cache(name);
-    let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if lock_path.exists() {
-        let _ = std::fs::remove_file(&lock_path);
-    }
-    let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
-    if lockb_path.exists() {
-        let _ = std::fs::remove_file(&lockb_path);
+    if matches!(recovery, TarballNotFoundRecovery::DeleteProjectLockfiles) {
+        let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+        if lock_path.exists() {
+            let _ = std::fs::remove_file(&lock_path);
+        }
+        let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+        if lockb_path.exists() {
+            let _ = std::fs::remove_file(&lockb_path);
+        }
     }
     LpmError::NotFound(format!(
         "{name}@{version} tarball not found (possibly unpublished). \
@@ -988,6 +984,7 @@ pub(super) async fn fetch_and_store_legacy(
     p: &InstallPackage,
     queue_wait_ms: u128,
     project_dir: &Path,
+    not_found_recovery: TarballNotFoundRecovery,
     gate_stats: &Arc<GateStats>,
     permit: tokio::sync::OwnedSemaphorePermit,
     fetch_extract_limiter: &FetchExtractLimiter,
@@ -1018,11 +1015,12 @@ pub(super) async fn fetch_and_store_legacy(
         Err(LpmError::NotFound(_)) => {
             // Metadata 404 — package/version genuinely gone.
             // Nothing to retry.
-            return Err(handle_tarball_not_found(
+            return Err(handle_tarball_not_found_with_recovery(
                 client,
                 &p.name,
                 &p.version,
                 project_dir,
+                not_found_recovery,
             ));
         }
         Err(e) => return Err(e),
@@ -1057,11 +1055,12 @@ pub(super) async fn fetch_and_store_legacy(
                 Ok(u) => u,
                 Err(_) => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                    return Err(handle_tarball_not_found(
+                    return Err(handle_tarball_not_found_with_recovery(
                         client,
                         &p.name,
                         &p.version,
                         project_dir,
+                        not_found_recovery,
                     ));
                 }
             };
@@ -1071,11 +1070,12 @@ pub(super) async fn fetch_and_store_legacy(
                 // Loop guard — metadata still points at the same
                 // stale URL. Tarball is really gone, not just moved.
                 gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                return Err(handle_tarball_not_found(
+                return Err(handle_tarball_not_found_with_recovery(
                     client,
                     &p.name,
                     &p.version,
                     project_dir,
+                    not_found_recovery,
                 ));
             }
             match client
@@ -1089,11 +1089,12 @@ pub(super) async fn fetch_and_store_legacy(
                 }
                 Err(LpmError::NotFound(_)) => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                    return Err(handle_tarball_not_found(
+                    return Err(handle_tarball_not_found_with_recovery(
                         client,
                         &p.name,
                         &p.version,
                         project_dir,
+                        not_found_recovery,
                     ));
                 }
                 Err(e) => return Err(e),
@@ -1101,11 +1102,12 @@ pub(super) async fn fetch_and_store_legacy(
         }
         Err(LpmError::NotFound(_)) => {
             // On-demand path (no stored URL) 404 — really gone.
-            return Err(handle_tarball_not_found(
+            return Err(handle_tarball_not_found_with_recovery(
                 client,
                 &p.name,
                 &p.version,
                 project_dir,
+                not_found_recovery,
             ));
         }
         Err(e) => return Err(e),
@@ -1306,6 +1308,7 @@ pub(super) async fn fetch_and_store_streaming(
     p: &InstallPackage,
     queue_wait_ms: u128,
     project_dir: &Path,
+    not_found_recovery: TarballNotFoundRecovery,
     gate_stats: &Arc<GateStats>,
     permit: tokio::sync::OwnedSemaphorePermit,
     fetch_extract_limiter: &FetchExtractLimiter,
@@ -1329,11 +1332,12 @@ pub(super) async fn fetch_and_store_streaming(
     {
         Ok(u) => u,
         Err(LpmError::NotFound(_)) => {
-            return Err(handle_tarball_not_found(
+            return Err(handle_tarball_not_found_with_recovery(
                 client,
                 &p.name,
                 &p.version,
                 project_dir,
+                not_found_recovery,
             ));
         }
         Err(e) => return Err(e),
@@ -1368,11 +1372,12 @@ pub(super) async fn fetch_and_store_streaming(
                 Ok(u) => u,
                 Err(_) => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                    return Err(handle_tarball_not_found(
+                    return Err(handle_tarball_not_found_with_recovery(
                         client,
                         &p.name,
                         &p.version,
                         project_dir,
+                        not_found_recovery,
                     ));
                 }
             };
@@ -1380,11 +1385,12 @@ pub(super) async fn fetch_and_store_streaming(
             let fresh_url = fresh_resolution.url.clone();
             if fresh_url == initial_url {
                 gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                return Err(handle_tarball_not_found(
+                return Err(handle_tarball_not_found_with_recovery(
                     client,
                     &p.name,
                     &p.version,
                     project_dir,
+                    not_found_recovery,
                 ));
             }
             match client
@@ -1398,22 +1404,24 @@ pub(super) async fn fetch_and_store_streaming(
                 }
                 Err(LpmError::NotFound(_)) => {
                     gate_stats.stale_hard_fail.fetch_add(1, Ordering::Relaxed);
-                    return Err(handle_tarball_not_found(
+                    return Err(handle_tarball_not_found_with_recovery(
                         client,
                         &p.name,
                         &p.version,
                         project_dir,
+                        not_found_recovery,
                     ));
                 }
                 Err(e) => return Err(e),
             }
         }
         Err(LpmError::NotFound(_)) => {
-            return Err(handle_tarball_not_found(
+            return Err(handle_tarball_not_found_with_recovery(
                 client,
                 &p.name,
                 &p.version,
                 project_dir,
+                not_found_recovery,
             ));
         }
         Err(e) => return Err(e),

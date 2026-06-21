@@ -193,6 +193,10 @@ fn dispatch_selected_event(
     if !seen.insert(key) {
         return;
     }
+    if fetch_overlap_should_skip_auth(&package.name, route_table) {
+        stats.skipped_auth_count = stats.skipped_auth_count.saturating_add(1);
+        return;
+    }
     stats.dispatched_count = stats.dispatched_count.saturating_add(1);
     tasks.spawn(fetch_selected_package(
         package,
@@ -233,6 +237,13 @@ fn record_overlap_task(
         }
         None => {}
     }
+}
+
+fn fetch_overlap_should_skip_auth(name: &str, route_table: &RouteTable) -> bool {
+    matches!(
+        route_table.route_for_package(name),
+        UpstreamRoute::Custom { auth: Some(_), .. }
+    )
 }
 
 fn install_package_from_selected_event(
@@ -304,6 +315,7 @@ async fn fetch_selected_package(
                 &package,
                 queue_wait_ms,
                 &project_dir,
+                TarballNotFoundRecovery::PreserveProjectLockfiles,
                 &gate_stats,
                 permit,
                 &fetch_extract_limiter,
@@ -318,6 +330,7 @@ async fn fetch_selected_package(
                 &package,
                 queue_wait_ms,
                 &project_dir,
+                TarballNotFoundRecovery::PreserveProjectLockfiles,
                 &gate_stats,
                 permit,
                 &fetch_extract_limiter,
