@@ -1677,6 +1677,16 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
             "detail.fetch.overlap.{field} must be numeric; got {fetch:#?}"
         );
     }
+    assert!(
+        fetch["overlap"]["breakdown"].is_object(),
+        "detail.fetch.overlap.breakdown must expose early fetch task attribution; got {fetch:#?}"
+    );
+    for field in ["task_count", "task_sum_ms", "task_max_ms"] {
+        assert!(
+            fetch["overlap"]["breakdown"][field].is_number(),
+            "detail.fetch.overlap.breakdown.{field} must be numeric; got {fetch:#?}"
+        );
+    }
     for field in ["task_count", "task_sum_ms", "task_max_ms"] {
         assert!(
             fetch["breakdown"][field].is_number(),
@@ -1859,6 +1869,39 @@ async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative(
         overlap["failed_count"].as_u64(),
         Some(0),
         "early fetch overlap must fall back cleanly without task failures; got {overlap:#?}"
+    );
+
+    let downloaded = envelope["downloaded"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("downloaded must be numeric; got {envelope:#}"));
+    let cached = envelope["cached"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("cached must be numeric; got {envelope:#}"));
+    let package_count = envelope["count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("count must be numeric; got {envelope:#}"));
+    let fetch_breakdown = &envelope["timing"]["fetch_breakdown"];
+    let detail_breakdown = &envelope["timing"]["detail"]["fetch"]["breakdown"];
+    let overlap_breakdown = &envelope["timing"]["detail"]["fetch"]["overlap"]["breakdown"];
+    assert_eq!(
+        cached + downloaded,
+        package_count,
+        "cache/download counts must partition final install graph; got {envelope:#}"
+    );
+    assert_eq!(
+        fetch_breakdown["task_count"].as_u64(),
+        Some(downloaded),
+        "top-level fetch breakdown must describe authoritative fetch tasks only; got {envelope:#}"
+    );
+    assert_eq!(
+        detail_breakdown["task_count"].as_u64(),
+        Some(downloaded),
+        "detail fetch breakdown must mirror authoritative fetch task count; got {envelope:#}"
+    );
+    assert_eq!(
+        overlap_breakdown["task_count"].as_u64(),
+        overlap["completed_count"].as_u64(),
+        "overlap breakdown must carry early fetch task timings separately; got {envelope:#}"
     );
 }
 

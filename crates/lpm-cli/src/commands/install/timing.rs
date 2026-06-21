@@ -392,16 +392,13 @@ pub(super) struct FetchOverlapStats {
     pub(super) cache_hit_count: u64,
     pub(super) failed_count: u64,
     pub(super) skipped_platform_count: u64,
-    pub(super) task_sum_ms: u128,
-    pub(super) task_max_ms: u128,
+    pub(super) breakdown: FetchBreakdown,
     pub(super) drain_ms: u128,
 }
 
 impl FetchOverlapStats {
     pub(super) fn record_task(&mut self, timings: TaskTimings) {
-        let task_ms = timings.total_ms();
-        self.task_sum_ms = self.task_sum_ms.saturating_add(task_ms);
-        self.task_max_ms = self.task_max_ms.max(task_ms);
+        self.breakdown.record(timings);
     }
 
     pub(super) fn to_json(self) -> serde_json::Value {
@@ -412,8 +409,9 @@ impl FetchOverlapStats {
             "cache_hit_count": self.cache_hit_count,
             "failed_count": self.failed_count,
             "skipped_platform_count": self.skipped_platform_count,
-            "task_sum_ms": self.task_sum_ms,
-            "task_max_ms": self.task_max_ms,
+            "task_sum_ms": self.breakdown.task_sum_ms,
+            "task_max_ms": self.breakdown.task_max_ms,
+            "breakdown": self.breakdown.to_json(),
             "drain_ms": self.drain_ms,
         })
     }

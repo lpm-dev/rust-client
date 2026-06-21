@@ -4634,7 +4634,6 @@ async fn run_with_options_under_store_lock(
                 integrity_map.entry(outcome.key.clone()).or_insert(sri);
             }
             if let Some(timings) = outcome.timings {
-                fetch_breakdown.record(timings);
                 slow_package_timings.record_fetch(&outcome.package_display, timings);
             }
             if let Some(url) = outcome.final_url {
