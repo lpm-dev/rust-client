@@ -2477,14 +2477,6 @@ async fn run_with_options_under_store_lock(
     // stats — filled by the speculation dispatcher drain.
     let mut spec_stats = SpeculativeStats::default();
     let spec_tracker = SpeculativeKeyTracker::default();
-    let speculation_deps: HashMap<String, String> = if omit_policy.dev {
-        deps.iter()
-            .filter(|(name, _)| production_dependency_names.contains(*name))
-            .map(|(name, range)| (name.clone(), range.clone()))
-            .collect()
-    } else {
-        deps.clone()
-    };
 
     //: shared fetch coordinator — serializes per-key fetch
     // work across the speculative dispatcher and the real fetch loop
@@ -2619,6 +2611,14 @@ async fn run_with_options_under_store_lock(
                 } else {
                     "greedy-fusion"
                 };
+                let speculation_deps: HashMap<String, String> = if omit_policy.dev {
+                    deps.iter()
+                        .filter(|(name, _)| production_dependency_names.contains(*name))
+                        .map(|(name, range)| (name.clone(), range.clone()))
+                        .collect()
+                } else {
+                    deps.clone()
+                };
 
                 let (resolve_res, initial_batch_ms_measured): (
                     Result<lpm_resolver::ResolveResult, LpmError>,
@@ -2646,7 +2646,7 @@ async fn run_with_options_under_store_lock(
                         fetch_semaphore.clone(),
                         Some(Arc::new(Semaphore::new(speculation_permits))),
                         fetch_coord.clone(),
-                        speculation_deps.clone(),
+                        speculation_deps,
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
@@ -2781,7 +2781,7 @@ async fn run_with_options_under_store_lock(
                         fetch_semaphore.clone(),
                         None,
                         fetch_coord.clone(),
-                        speculation_deps.clone(),
+                        speculation_deps,
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
