@@ -1867,6 +1867,7 @@ async fn install_experimental_spike_live_graph_requires_benchmark_ack() {
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
         .args([
             "install",
             "--json",
@@ -1889,9 +1890,52 @@ async fn install_experimental_spike_live_graph_requires_benchmark_ack() {
     assert!(
         combined.contains("experimental installer spike is limited to benchmark installs")
             && combined.contains("set LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1")
+            && !combined.contains("set LPM_INSTALLER_SPIKE_PARITY=deny")
             && !combined.contains("set LPM_INSTALLER_SPIKE_GRAPH=lockfile")
             && !combined.contains("use a frozen lockfile install"),
         "unsupported live experimental shape must report only the missing live benchmark gate; got:\n{combined}"
+    );
+    assert!(
+        !project.file_exists("node_modules/ms/package.json"),
+        "unsupported experimental shape must not silently perform a normal install"
+    );
+}
+
+#[tokio::test]
+async fn install_experimental_spike_live_graph_requires_parity_deny() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"spike-live-parity-rejected","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run unsupported experimental installer spike");
+
+    assert!(
+        !output.status.success(),
+        "live experimental shape without parity deny must fail instead of benchmarking an unchecked graph\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.contains("set LPM_INSTALLER_SPIKE_PARITY=deny for live graph parity"),
+        "unsupported live experimental shape must report the missing parity gate; got:\n{combined}"
     );
     assert!(
         !project.file_exists("node_modules/ms/package.json"),
@@ -1958,6 +2002,7 @@ async fn install_experimental_spike_live_graph_does_not_write_install_hash() {
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
         .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
         .args([
             "install",
             "--json",
@@ -2017,6 +2062,7 @@ async fn install_experimental_spike_live_graph_rejects_frozen_lockfile_invocatio
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
         .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
         .args([
             "install",
             "--json",

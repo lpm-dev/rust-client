@@ -97,6 +97,11 @@ fn unsupported_admission_reasons(
     {
         reasons.push("set LPM_INSTALLER_SPIKE_GRAPH=lockfile for frozen installs");
     }
+    if graph_source == InstallerSpikeGraphSource::ResolveWorklist
+        && parity_mode != (InstallerSpikeParityMode::FreshResolve { deny: true })
+    {
+        reasons.push("set LPM_INSTALLER_SPIKE_PARITY=deny for live graph parity");
+    }
     if !admission.json_output {
         reasons.push("use --json");
     }
@@ -2726,6 +2731,24 @@ mod tests {
         );
 
         assert!(reasons.is_empty(), "unexpected reasons: {reasons:?}");
+    }
+
+    #[test]
+    fn admission_rejects_live_resolve_worklist_without_deny_parity() {
+        let mut admission = benchmark_admission();
+        admission.frozen_lockfile_active = false;
+
+        let reasons = unsupported_admission_reasons(
+            admission,
+            InstallerSpikeGraphSource::ResolveWorklist,
+            InstallerSpikeParityMode::Disabled,
+            true,
+        );
+
+        assert_eq!(
+            reasons,
+            vec!["set LPM_INSTALLER_SPIKE_PARITY=deny for live graph parity"]
+        );
     }
 
     #[test]
