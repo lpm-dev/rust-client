@@ -30,7 +30,7 @@ pub use peers::{
     validate_allowed_versions_selector,
 };
 #[allow(unused_imports)]
-pub use types::{ResolveResult, ResolvedPackage, StageTiming};
+pub use types::{ResolveResult, ResolvedPackage, SelectedPackageEvent, StageTiming};
 
 mod prelude {
     #[allow(unused_imports)]
@@ -58,7 +58,9 @@ mod prelude {
         validate_allowed_versions_selector,
     };
     #[allow(unused_imports)]
-    pub(super) use super::types::{PubGrubResult, ResolveResult, ResolvedPackage, StageTiming};
+    pub(super) use super::types::{
+        PubGrubResult, ResolveResult, ResolvedPackage, SelectedPackageEvent, StageTiming,
+    };
     #[allow(unused_imports)]
     pub(super) use crate::npm_version::NpmVersion;
     #[allow(unused_imports)]

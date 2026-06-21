@@ -1657,6 +1657,26 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         fetch["v2_reusable_validation"].is_object(),
         "detail.fetch.v2_reusable_validation must expose reusable-object validation counters; got {fetch:#?}"
     );
+    assert!(
+        fetch["overlap"].is_object(),
+        "detail.fetch.overlap must expose early fetch overlap counters; got {fetch:#?}"
+    );
+    for field in [
+        "selected_count",
+        "dispatched_count",
+        "completed_count",
+        "cache_hit_count",
+        "failed_count",
+        "skipped_platform_count",
+        "task_sum_ms",
+        "task_max_ms",
+        "drain_ms",
+    ] {
+        assert!(
+            fetch["overlap"][field].is_number(),
+            "detail.fetch.overlap.{field} must be numeric; got {fetch:#?}"
+        );
+    }
     for field in ["task_count", "task_sum_ms", "task_max_ms"] {
         assert!(
             fetch["breakdown"][field].is_number(),
@@ -1783,6 +1803,63 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
             "timing.speculative.{field} must be numeric; got {speculative:#?}"
         );
     }
+}
+
+#[tokio::test]
+async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"fetch-overlap-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_TIMING_DETAIL", "1")
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install --json failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        project.file_exists("node_modules/ms/package.json"),
+        "install output must still be driven by the final resolved package graph"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
+    let overlap = envelope["timing"]["detail"]["fetch"]["overlap"]
+        .as_object()
+        .unwrap_or_else(|| panic!("timing.detail.fetch.overlap missing; got {envelope:#}"));
+    assert!(
+        overlap["selected_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "forced overlap admission should observe at least one resolver selection; got {overlap:#?}"
+    );
+    assert!(
+        overlap["dispatched_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "forced overlap admission should dispatch at least one early fetch; got {overlap:#?}"
+    );
+    assert_eq!(
+        overlap["failed_count"].as_u64(),
+        Some(0),
+        "early fetch overlap must fall back cleanly without task failures; got {overlap:#?}"
+    );
 }
 
 #[tokio::test]

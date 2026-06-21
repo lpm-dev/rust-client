@@ -9,6 +9,7 @@ use super::prelude::*;
 use super::state::ResolveState;
 use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version};
 use super::types::Edge;
+use crate::resolve::SelectedPackageEvent;
 use std::cell::Cell;
 
 struct FusedTreeProvider<'a> {
@@ -320,6 +321,36 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
     include_optional_dependencies: bool,
     policy: ResolverPolicy,
 ) -> Result<ResolveResult, ResolveError> {
+    resolve_greedy_fused_with_cache_options_policy_and_selected_events(
+        client,
+        dependencies,
+        overrides,
+        route_table,
+        npm_fanout,
+        spec_tx,
+        shared_cache,
+        auto_install_peers,
+        include_optional_dependencies,
+        policy,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
+    client: Arc<RegistryClient>,
+    dependencies: HashMap<String, String>,
+    overrides: OverrideSet,
+    route_table: RouteTable,
+    npm_fanout: usize,
+    spec_tx: Option<tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
+    shared_cache: SharedCache,
+    auto_install_peers: bool,
+    include_optional_dependencies: bool,
+    policy: ResolverPolicy,
+    selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
+) -> Result<ResolveResult, ResolveError> {
     let _span = tracing::debug_span!(
         "resolve_greedy_fused",
         n_deps = dependencies.len(),
@@ -341,6 +372,7 @@ pub async fn resolve_greedy_fused_with_cache_options_and_policy(
         include_optional_dependencies,
         policy.clone(),
     );
+    state.set_selected_package_tx(selected_package_tx);
     state.seed_root_edges()?;
     let worker_batch_disabled = Cell::new(false);
     let tree_provider = FusedTreeProvider {

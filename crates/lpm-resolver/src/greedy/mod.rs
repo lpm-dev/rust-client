@@ -88,6 +88,7 @@ pub use entry::resolve_greedy_with_options_and_policy;
 pub use fused::{
     resolve_greedy_fused, resolve_greedy_fused_with_cache, resolve_greedy_fused_with_cache_options,
     resolve_greedy_fused_with_cache_options_and_policy,
+    resolve_greedy_fused_with_cache_options_policy_and_selected_events,
 };
 pub use types::PeerConflictReport;
 

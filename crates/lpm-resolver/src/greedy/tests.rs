@@ -998,6 +998,57 @@ fn process_edge_reuses_node_when_existing_version_satisfies_new_range() {
 }
 
 #[test]
+fn process_edge_emits_selected_package_event_only_for_new_nodes() {
+    let info = mk_info(&["4.17.21"], &[]);
+    let mut deps = HashMap::new();
+    deps.insert("lodash".to_string(), "^4.0.0".to_string());
+    let mut state = ResolveState::new(deps, OverrideSet::empty());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    state.set_selected_package_tx(Some(tx));
+    state.seed_root_edges().unwrap();
+
+    let root_edge = state.task_queue.pop_front().unwrap();
+    process_edge(&root_edge, &info, &mut state).unwrap();
+
+    let event = rx.try_recv().expect("new node should emit selection event");
+    assert_eq!(event.name, "lodash");
+    assert_eq!(event.version, "4.17.21");
+    assert_eq!(
+        event.tarball_url.as_deref(),
+        Some("https://example.invalid/4.17.21.tgz")
+    );
+    assert_eq!(event.integrity.as_deref(), Some("sha512-fake-4.17.21"));
+
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("react"),
+        version: NpmVersion::parse("18.0.0").unwrap(),
+        optional: false,
+        children: Vec::new(),
+    });
+    state.resolved.insert(
+        CanonicalKey::npm("react"),
+        vec![(NpmVersion::parse("18.0.0").unwrap(), 1)],
+    );
+    let reuse_edge = Edge {
+        parent: 1,
+        local_name: "lodash".to_string(),
+        canonical: CanonicalKey::npm("lodash"),
+        range: NpmRange::parse("^4.10.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    process_edge(&reuse_edge, &info, &mut state).unwrap();
+
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
 fn process_edge_allocates_second_version_on_incompatible_range() {
     // Two parents wanting INCOMPATIBLE ranges of the same canonical
     // (^4.0.0 picks 4.17.21; ^3.0.0 cannot reuse 4.17.21 → must

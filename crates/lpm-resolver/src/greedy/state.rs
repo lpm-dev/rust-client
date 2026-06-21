@@ -2,6 +2,7 @@ use super::peer::{CachedPeerResolution, PeerResolutionCacheKey};
 use super::prelude::*;
 use super::types::{DepBehavior, Edge, NodeId, PeerConflictReport, PeerRequirement};
 use super::version::is_workspace_specifier;
+use crate::resolve::SelectedPackageEvent;
 
 /// Carrier for the per-pass mutable state. Keeps the dispatch loop
 /// readable by bundling the four coupled collections into one place.
@@ -81,6 +82,7 @@ pub(super) struct ResolveState {
         dashmap::DashMap<PeerResolutionCacheKey, CachedPeerResolution>,
     pub(super) include_optional_dependencies: bool,
     pub(super) policy: ResolverPolicy,
+    selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -142,7 +144,44 @@ impl ResolveState {
             peer_resolution_cache: dashmap::DashMap::with_capacity(64),
             include_optional_dependencies,
             policy,
+            selected_package_tx: None,
         }
+    }
+
+    pub(super) fn set_selected_package_tx(
+        &mut self,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
+    ) {
+        self.selected_package_tx = tx;
+    }
+
+    pub(super) fn emit_selected_package(
+        &self,
+        canonical: &CanonicalKey,
+        version: &NpmVersion,
+        info: &CachedPackageInfo,
+        optional: bool,
+    ) {
+        let Some(tx) = &self.selected_package_tx else {
+            return;
+        };
+        let version = version.to_string();
+        let event = SelectedPackageEvent {
+            name: canonical.to_string(),
+            version: version.clone(),
+            is_lpm: matches!(canonical, CanonicalKey::Lpm { .. }),
+            tarball_url: info
+                .dist
+                .get(&version)
+                .and_then(|dist| dist.tarball_url.clone()),
+            integrity: info
+                .dist
+                .get(&version)
+                .and_then(|dist| dist.integrity.clone()),
+            platform: info.platform.get(&version).cloned(),
+            optional,
+        };
+        let _ = tx.send(event);
     }
 
     /// Seed the queue with one Edge per root dependency. The pseudo-node

@@ -33,6 +33,7 @@ pub use greedy::{
     experimental_select_version_with_policy, experimental_select_version_with_policy_and_overrides,
     resolve_greedy_fused, resolve_greedy_fused_with_cache, resolve_greedy_fused_with_cache_options,
     resolve_greedy_fused_with_cache_options_and_policy,
+    resolve_greedy_fused_with_cache_options_policy_and_selected_events,
 };
 pub use npm_version::NpmVersion;
 pub use overrides::{
@@ -45,9 +46,9 @@ pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta, is_platform_
 pub use provider::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 pub use ranges::NpmRange;
 pub use resolve::{
-    CompiledPeerRules, PeerWarning, ResolveError, ResolveResult, ResolvedPackage, StageTiming,
-    check_unmet_peers, resolve_dependencies, resolve_dependencies_routed,
-    resolve_dependencies_with_overrides, resolve_with_shared_cache,
+    CompiledPeerRules, PeerWarning, ResolveError, ResolveResult, ResolvedPackage,
+    SelectedPackageEvent, StageTiming, check_unmet_peers, resolve_dependencies,
+    resolve_dependencies_routed, resolve_dependencies_with_overrides, resolve_with_shared_cache,
     resolve_with_shared_cache_options, resolve_with_shared_cache_options_and_policy,
     validate_allowed_versions_range, validate_allowed_versions_selector,
 };

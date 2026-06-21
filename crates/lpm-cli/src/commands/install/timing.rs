@@ -385,6 +385,41 @@ impl FetchBreakdown {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+pub(super) struct FetchOverlapStats {
+    pub(super) selected_count: u64,
+    pub(super) dispatched_count: u64,
+    pub(super) completed_count: u64,
+    pub(super) cache_hit_count: u64,
+    pub(super) failed_count: u64,
+    pub(super) skipped_platform_count: u64,
+    pub(super) task_sum_ms: u128,
+    pub(super) task_max_ms: u128,
+    pub(super) drain_ms: u128,
+}
+
+impl FetchOverlapStats {
+    pub(super) fn record_task(&mut self, timings: TaskTimings) {
+        let task_ms = timings.total_ms();
+        self.task_sum_ms = self.task_sum_ms.saturating_add(task_ms);
+        self.task_max_ms = self.task_max_ms.max(task_ms);
+    }
+
+    pub(super) fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "selected_count": self.selected_count,
+            "dispatched_count": self.dispatched_count,
+            "completed_count": self.completed_count,
+            "cache_hit_count": self.cache_hit_count,
+            "failed_count": self.failed_count,
+            "skipped_platform_count": self.skipped_platform_count,
+            "task_sum_ms": self.task_sum_ms,
+            "task_max_ms": self.task_max_ms,
+            "drain_ms": self.drain_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub(super) struct V2ReusableValidationTimings {
     pub(super) checked_count: u64,
     pub(super) hit_count: u64,
@@ -528,6 +563,7 @@ pub(super) struct FetchStageTimings {
     pub(super) v1_cache_hit_count: u64,
     pub(super) link_dispatch_count: u64,
     pub(super) v2_reusable_validation: V2ReusableValidationTimings,
+    pub(super) overlap: FetchOverlapStats,
 }
 
 impl FetchStageTimings {
@@ -583,6 +619,7 @@ impl FetchStageTimings {
                 "link_dispatch_count": self.link_dispatch_count,
             },
             "v2_reusable_validation": self.v2_reusable_validation.to_json(),
+            "overlap": self.overlap.to_json(),
             "breakdown": breakdown.to_json(),
         })
     }

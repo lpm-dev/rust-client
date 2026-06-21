@@ -26,6 +26,7 @@ use tokio::sync::Semaphore;
 
 mod catalog;
 mod fetch;
+mod fetch_overlap;
 mod gitignore;
 mod installer_spike;
 mod lifecycle;
@@ -46,6 +47,7 @@ mod workspace;
 
 use catalog::*;
 use fetch::*;
+use fetch_overlap::*;
 use gitignore::*;
 pub use gitignore::{
     ensure_lpm_hoisted_gitignore, ensure_lpm_wrappers_gitignore, ensure_skills_gitignore,
@@ -2219,6 +2221,9 @@ async fn run_with_options_under_store_lock(
     // used first by speculation, then drained by real fetch.
     let fetch_semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
     let fetch_extract_limiter = configured_fetch_extract_limiter(requested_v2_mode);
+    // `LPM_STREAM_FETCH=0` falls back to the temp-file spool path for both
+    // early overlap fetches and the post-resolve fetch loop.
+    let streaming_fetch = std::env::var("LPM_STREAM_FETCH").map_or(true, |v| v != "0");
     //: also hoist the `PackageStore` so the speculative
     // dispatcher can write tarballs into the real store during the
     // resolve phase. Post-resolve, the fetch loop rebinds to the same
@@ -2482,6 +2487,7 @@ async fn run_with_options_under_store_lock(
     // the main task drains them after the real fetch loop. Awaiting
     // the dispatcher early removes the resolve/fetch overlap.
     let mut speculation_join: Option<SpeculationJoin> = None;
+    let mut fetch_overlap_join: Option<FetchOverlapJoin> = None;
     // Post-lockfile metadata: which resolver actually ran.
     // Stamped into `lpm.lock`'s `resolved-with` field at the cold-
     // write site below. Defaults to the greedy-fusion install default
@@ -2637,7 +2643,28 @@ async fn run_with_options_under_store_lock(
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
                     );
-                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options_and_policy(
+                    let selected_package_tx = if fetch_overlap_enabled(fusion_enabled_local, force)
+                    {
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
+                            rx,
+                            arc_client.clone(),
+                            route_table.clone(),
+                            store.clone(),
+                            store_v2_handle.clone(),
+                            fetch_semaphore.clone(),
+                            fetch_coord.clone(),
+                            project_dir.to_path_buf(),
+                            gate_stats.clone(),
+                            fetch_extract_limiter.clone(),
+                            streaming_fetch,
+                            fetch_overlap_min_selected(),
+                        ));
+                        Some(tx)
+                    } else {
+                        None
+                    };
+                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         arc_client.clone(),
                         deps.clone(),
                         override_set.clone(),
@@ -2648,6 +2675,7 @@ async fn run_with_options_under_store_lock(
                         auto_install_peers,
                         !omit_policy.optional,
                         resolver_policy.clone(),
+                        selected_package_tx,
                     )
                     .await
                     .map_err(crate::resolver_error::resolver_error_to_lpm);
@@ -3058,6 +3086,8 @@ async fn run_with_options_under_store_lock(
     // clobber each other's writeback URL. Pre-used a
     // (name, version) tuple key.
     let mut fresh_urls: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut integrity_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
     // Pre-compute the per-target
@@ -4187,13 +4217,6 @@ async fn run_with_options_under_store_lock(
     // can emit a proper fetch-stage breakdown in `lpm install --json`. Empty
     // breakdown on the cached-everything path; filled in below when work runs.
     let mut fetch_breakdown = FetchBreakdown::default();
-    //: streaming fetch fast path — bytes flow from reqwest
-    // through a `StreamReader` + `SyncIoBridge` into a sync hash+extract
-    // pipeline in `spawn_blocking`, no temp file. Default on since
-    //; set `LPM_STREAM_FETCH=0` to fall back to the legacy
-    // temp-file spool (kept as an escape hatch for debugging fetch
-    // regressions or non-sha512 integrity edge cases).
-    let streaming_fetch = std::env::var("LPM_STREAM_FETCH").map_or(true, |v| v != "0");
     spec_stats.completed_before_fetch = spec_tracker.completed_count();
     if !to_download.is_empty() {
         let download_wall_start = Instant::now();
@@ -4576,8 +4599,6 @@ async fn run_with_options_under_store_lock(
         // from the stored lockfile URL (stale-URL recovery) or from
         // `None` (origin-mismatch rebase that on-demand-resolved a
         // fresh URL).
-        let mut integrity_map: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
         for handle in handles {
             let (pkg_key, package_display, sri, timings, link_h, v2_link_h, final_url) = handle
                 .await
@@ -4601,23 +4622,40 @@ async fn run_with_options_under_store_lock(
             }
         }
 
-        let apply_fetch_writebacks = |packages: &mut [InstallPackage]| {
-            for p in packages {
-                let key = install_pkg_key(p);
-                if let Some(sri) = integrity_map.get(&key) {
-                    p.integrity = Some(sri.clone());
-                }
-                if let Some(url) = fresh_urls.get(&key) {
-                    p.tarball_url = Some(url.clone());
-                }
-            }
-        };
-        apply_fetch_writebacks(&mut packages);
-        apply_fetch_writebacks(&mut packages_for_lockfile);
-
         overall.finish_and_clear();
         fetch_stage_timings.download_wall_ms = download_wall_start.elapsed().as_millis();
     }
+
+    if let Some(join) = fetch_overlap_join.take() {
+        let drain = join.drain().await?;
+        fetch_stage_timings.overlap = drain.stats;
+        for outcome in drain.outcomes {
+            if let Some(sri) = outcome.computed_sri {
+                integrity_map.entry(outcome.key.clone()).or_insert(sri);
+            }
+            if let Some(timings) = outcome.timings {
+                fetch_breakdown.record(timings);
+                slow_package_timings.record_fetch(&outcome.package_display, timings);
+            }
+            if let Some(url) = outcome.final_url {
+                fresh_urls.entry(outcome.key).or_insert(url);
+            }
+        }
+    }
+
+    let apply_fetch_writebacks = |packages: &mut [InstallPackage]| {
+        for p in packages {
+            let key = install_pkg_key(p);
+            if let Some(sri) = integrity_map.get(&key) {
+                p.integrity = Some(sri.clone());
+            }
+            if let Some(url) = fresh_urls.get(&key) {
+                p.tarball_url = Some(url.clone());
+            }
+        }
+    };
+    apply_fetch_writebacks(&mut packages);
+    apply_fetch_writebacks(&mut packages_for_lockfile);
 
     let fetch_ms = fetch_start.elapsed().as_millis();
     let wf_fetch_end_ms = start.elapsed().as_millis();
