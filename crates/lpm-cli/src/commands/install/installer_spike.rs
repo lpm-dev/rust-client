@@ -1,7 +1,7 @@
 use super::*;
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -846,6 +846,21 @@ pub(super) async fn run(
             stats.metadata_cache_hits = metadata_stats.ready_hits.load(Ordering::Relaxed);
 
             let package_graph_start = Instant::now();
+            normalize_draft_optional_reachability(&mut packages);
+            spawn_missing_fetches_for_drafts(
+                &packages,
+                &store,
+                store_v2_handle.clone(),
+                project_dir,
+                &client,
+                &route_table,
+                &fetch_queue,
+                Arc::clone(&gate_stats),
+                force,
+                fetch_extract_limiter.clone(),
+                &mut fetch_handles,
+                &mut stats,
+            )?;
             attach_peer_edges_to_drafts(&mut packages);
             let mut install_packages: Vec<InstallPackage> =
                 packages.into_values().map(|draft| draft.package).collect();
@@ -1263,7 +1278,7 @@ async fn compute_parity_if_requested(
             .await
             .map_err(crate::resolver_error::resolver_error_to_lpm)?;
 
-            resolved_to_install_packages_with_workspace_members(
+            let mut packages = resolved_to_install_packages_with_workspace_members(
                 &resolve_result.packages,
                 deps,
                 &resolve_result.root_aliases,
@@ -1272,7 +1287,14 @@ async fn compute_parity_if_requested(
                 &route_table,
                 all_workspace_members,
                 project_dir,
-            )
+            );
+            let optional_dependency_names =
+                optional_dependency_names_from_resolver_cache(&packages, &resolve_result.cache);
+            normalize_install_package_optional_reachability(
+                &mut packages,
+                &optional_dependency_names,
+            );
+            packages
         }
         InstallerSpikeParityMode::Lockfile { .. } => {
             let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
@@ -2325,6 +2347,116 @@ fn ensure_package_can_materialize(package: &InstallPackage) -> Result<(), LpmErr
     )))
 }
 
+fn normalize_draft_optional_reachability(packages: &mut HashMap<PackageIdentity, PackageDraft>) {
+    if packages.is_empty() {
+        return;
+    }
+
+    let optional_dependency_names = optional_dependency_names_from_drafts(packages);
+    let mut install_packages: Vec<InstallPackage> = packages
+        .values()
+        .map(|draft| draft.package.clone())
+        .collect();
+    normalize_install_package_optional_reachability(
+        &mut install_packages,
+        &optional_dependency_names,
+    );
+    for package in install_packages {
+        let identity = (package.name.clone(), package.version.clone());
+        if let Some(draft) = packages.get_mut(&identity) {
+            draft.package.optional = package.optional;
+        }
+    }
+}
+
+fn optional_dependency_names_from_drafts(
+    packages: &HashMap<PackageIdentity, PackageDraft>,
+) -> HashMap<PackageIdentity, HashSet<String>> {
+    packages
+        .iter()
+        .filter_map(|(identity, draft)| {
+            draft
+                .info
+                .optional_dep_names
+                .get(&draft.package.version)
+                .cloned()
+                .map(|names| (identity.clone(), names))
+        })
+        .collect()
+}
+
+fn optional_dependency_names_from_resolver_cache(
+    packages: &[InstallPackage],
+    resolver_cache: &HashMap<lpm_resolver::CanonicalKey, Arc<lpm_resolver::CachedPackageInfo>>,
+) -> HashMap<PackageIdentity, HashSet<String>> {
+    packages
+        .iter()
+        .filter_map(|package| {
+            let canonical = lpm_resolver::CanonicalKey::from_dep_name(&package.name);
+            resolver_cache
+                .get(&canonical)
+                .and_then(|info| info.optional_dep_names.get(&package.version))
+                .cloned()
+                .map(|names| ((package.name.clone(), package.version.clone()), names))
+        })
+        .collect()
+}
+
+fn normalize_install_package_optional_reachability(
+    packages: &mut [InstallPackage],
+    optional_dependency_names: &HashMap<PackageIdentity, HashSet<String>>,
+) {
+    if packages.is_empty() {
+        return;
+    }
+
+    let mut by_identity: HashMap<PackageIdentity, Vec<usize>> =
+        HashMap::with_capacity(packages.len());
+    for (idx, package) in packages.iter().enumerate() {
+        by_identity
+            .entry((package.name.clone(), package.version.clone()))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut required: HashSet<PackageIdentity> = HashSet::new();
+    let mut queue = VecDeque::new();
+    for package in packages.iter() {
+        if package.root_link_names.is_some() || package.is_direct {
+            let identity = (package.name.clone(), package.version.clone());
+            required.insert(identity.clone());
+            queue.push_back(identity);
+        }
+    }
+
+    while let Some(identity) = queue.pop_front() {
+        if let Some(indices) = by_identity.get(&identity) {
+            for &idx in indices {
+                let package = &packages[idx];
+                let optional_names = optional_dependency_names.get(&identity);
+                for (local_name, version) in &package.dependencies {
+                    if optional_names.is_some_and(|names| names.contains(local_name)) {
+                        continue;
+                    }
+                    let target_name = package
+                        .aliases
+                        .get(local_name)
+                        .unwrap_or(local_name)
+                        .clone();
+                    let next = (target_name, version.clone());
+                    if by_identity.contains_key(&next) && required.insert(next.clone()) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+    }
+
+    for package in packages {
+        package.optional = !required.contains(&(package.name.clone(), package.version.clone()));
+    }
+}
+
 fn lockfile_fetch_schedule(packages: &[InstallPackage]) -> Vec<InstallPackage> {
     let mut scheduled = packages.to_vec();
     scheduled.sort_by(|a, b| {
@@ -2336,6 +2468,46 @@ fn lockfile_fetch_schedule(packages: &[InstallPackage]) -> Vec<InstallPackage> {
             .then_with(|| a.version.cmp(&b.version))
     });
     scheduled
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_missing_fetches_for_drafts(
+    packages: &HashMap<PackageIdentity, PackageDraft>,
+    store: &PackageStore,
+    store_v2_handle: Option<Arc<lpm_store::v2::Store>>,
+    project_dir: &Path,
+    client: &Arc<RegistryClient>,
+    route_table: &RouteTable,
+    fetch_queue: &Arc<Semaphore>,
+    gate_stats: Arc<GateStats>,
+    force: bool,
+    fetch_extract_limiter: FetchExtractLimiter,
+    fetch_handles: &mut HashMap<String, FetchHandle>,
+    stats: &mut InstallerSpikeStats,
+) -> Result<(), LpmError> {
+    for draft in packages.values() {
+        let package = &draft.package;
+        if fetch_handles.contains_key(&install_pkg_key(package)) {
+            continue;
+        }
+        if package_should_materialize(package)? {
+            maybe_spawn_fetch(
+                package.clone(),
+                store,
+                store_v2_handle.clone(),
+                project_dir,
+                Arc::clone(client),
+                route_table.clone(),
+                Arc::clone(fetch_queue),
+                Arc::clone(&gate_stats),
+                force,
+                fetch_extract_limiter.clone(),
+                fetch_handles,
+                stats,
+            );
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3030,6 +3202,92 @@ mod tests {
         };
 
         assert!(!inline_reuse_can_preserve_optional_state(&packages, &request, "1.2.3").unwrap());
+    }
+
+    #[test]
+    fn optional_reachability_marks_reused_optional_descendants_required() {
+        let mut packages = HashMap::new();
+        let mut required_parent = fake_draft("required-parent", "1.0.0", &[("shared", "1.0.0")]);
+        required_parent.package.root_link_names = Some(vec!["required-parent".to_string()]);
+
+        let mut optional_parent = fake_draft("optional-parent", "1.0.0", &[("shared", "1.0.0")]);
+        optional_parent.package.root_link_names = Some(vec!["optional-parent".to_string()]);
+        let mut optional_parent_info = empty_info_value();
+        optional_parent_info
+            .optional_dep_names
+            .insert("1.0.0".to_string(), HashSet::from(["shared".to_string()]));
+        optional_parent.info = Arc::new(optional_parent_info);
+
+        let mut shared = fake_draft("shared", "1.0.0", &[("leaf", "1.0.0")]);
+        shared.package.optional = true;
+        let mut leaf = fake_draft("leaf", "1.0.0", &[]);
+        leaf.package.optional = true;
+
+        packages.insert(
+            ("required-parent".to_string(), "1.0.0".to_string()),
+            required_parent,
+        );
+        packages.insert(
+            ("optional-parent".to_string(), "1.0.0".to_string()),
+            optional_parent,
+        );
+        packages.insert(("shared".to_string(), "1.0.0".to_string()), shared);
+        packages.insert(("leaf".to_string(), "1.0.0".to_string()), leaf);
+
+        normalize_draft_optional_reachability(&mut packages);
+
+        assert!(
+            !packages
+                .get(&("shared".to_string(), "1.0.0".to_string()))
+                .unwrap()
+                .package
+                .optional
+        );
+        assert!(
+            !packages
+                .get(&("leaf".to_string(), "1.0.0".to_string()))
+                .unwrap()
+                .package
+                .optional
+        );
+    }
+
+    #[test]
+    fn optional_reachability_keeps_optional_only_subtree_optional() {
+        let mut packages = HashMap::new();
+        let mut parent = fake_draft("parent", "1.0.0", &[("child", "1.0.0")]);
+        parent.package.root_link_names = Some(vec!["parent".to_string()]);
+        let mut parent_info = empty_info_value();
+        parent_info
+            .optional_dep_names
+            .insert("1.0.0".to_string(), HashSet::from(["child".to_string()]));
+        parent.info = Arc::new(parent_info);
+
+        let mut child = fake_draft("child", "1.0.0", &[("leaf", "1.0.0")]);
+        child.package.optional = false;
+        let mut leaf = fake_draft("leaf", "1.0.0", &[]);
+        leaf.package.optional = false;
+
+        packages.insert(("parent".to_string(), "1.0.0".to_string()), parent);
+        packages.insert(("child".to_string(), "1.0.0".to_string()), child);
+        packages.insert(("leaf".to_string(), "1.0.0".to_string()), leaf);
+
+        normalize_draft_optional_reachability(&mut packages);
+
+        assert!(
+            packages
+                .get(&("child".to_string(), "1.0.0".to_string()))
+                .unwrap()
+                .package
+                .optional
+        );
+        assert!(
+            packages
+                .get(&("leaf".to_string(), "1.0.0".to_string()))
+                .unwrap()
+                .package
+                .optional
+        );
     }
 
     #[test]
