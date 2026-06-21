@@ -1093,6 +1093,20 @@ pub(super) fn resolve_detail_json(
             "pubgrub_ms": stage.pubgrub_ms,
             "pubgrub_core_estimate_ms": pubgrub_core_estimate_ms,
         },
+        "work": {
+            "edge_process_count": stage.work_edge_process_count,
+            "edge_reuse_count": stage.work_edge_reuse_count,
+            "edge_reuse_range_count": stage.work_edge_reuse_range_count,
+            "edge_reuse_exact_count": stage.work_edge_reuse_exact_count,
+            "edge_allocating_count": stage.work_edge_process_count
+                .saturating_sub(stage.work_edge_reuse_count),
+            "node_allocated_count": stage.work_node_allocated_count,
+            "child_edge_enqueued_count": stage.work_child_edge_enqueued_count,
+            "peer_requirement_count": stage.work_peer_requirement_count,
+            "selected_package_count": stage.selected_package_count,
+            "selected_unique_canonical_count": stage.selected_unique_canonical_count,
+            "selected_duplicate_canonical_count": stage.selected_duplicate_canonical_count,
+        },
         "policy": {
             "release_age": {
                 "ms": stage.policy_release_age_ms,
@@ -1344,6 +1358,37 @@ mod tests {
         assert_eq!(row["version_count"], 42);
         assert!(row["cache_hit"].as_bool().unwrap_or(false));
         assert!(row["not_modified"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn resolve_detail_reports_greedy_work_counters() {
+        let stage = lpm_resolver::StageTiming {
+            work_edge_process_count: 9,
+            work_edge_reuse_count: 4,
+            work_edge_reuse_range_count: 3,
+            work_edge_reuse_exact_count: 1,
+            work_node_allocated_count: 5,
+            work_child_edge_enqueued_count: 8,
+            work_peer_requirement_count: 2,
+            selected_package_count: 6,
+            selected_unique_canonical_count: 5,
+            selected_duplicate_canonical_count: 1,
+            ..lpm_resolver::StageTiming::default()
+        };
+
+        let json = resolve_detail_json(10, 1, &stage, &[], TimingDetailMode::Detail);
+
+        assert_eq!(json["work"]["edge_process_count"], 9);
+        assert_eq!(json["work"]["edge_reuse_count"], 4);
+        assert_eq!(json["work"]["edge_reuse_range_count"], 3);
+        assert_eq!(json["work"]["edge_reuse_exact_count"], 1);
+        assert_eq!(json["work"]["edge_allocating_count"], 5);
+        assert_eq!(json["work"]["node_allocated_count"], 5);
+        assert_eq!(json["work"]["child_edge_enqueued_count"], 8);
+        assert_eq!(json["work"]["peer_requirement_count"], 2);
+        assert_eq!(json["work"]["selected_package_count"], 6);
+        assert_eq!(json["work"]["selected_unique_canonical_count"], 5);
+        assert_eq!(json["work"]["selected_duplicate_canonical_count"], 1);
     }
 
     #[test]

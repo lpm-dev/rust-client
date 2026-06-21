@@ -6,7 +6,7 @@ use super::manifest::{
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
-use super::state::ResolveState;
+use super::state::{ResolveState, selected_package_cardinality};
 use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version};
 use super::types::Edge;
 use crate::resolve::SelectedPackageEvent;
@@ -826,7 +826,13 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     // Drain the override apply trace before `state` is moved by
     // `into_resolved_packages`. Same shape + order contract as the walker arm.
     let applied_overrides = state.overrides.take_hits();
+    let work_stats = state.work_stats;
     let packages = state.into_resolved_packages(&cache);
+    let (
+        selected_package_count,
+        selected_unique_canonical_count,
+        selected_duplicate_canonical_count,
+    ) = selected_package_cardinality(&packages);
 
     let snap = lpm_registry::timing::snapshot();
     let policy_snap = crate::profile::policy_summary();
@@ -857,6 +863,16 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             tarball_dispatched_count: tarball_dispatched_count
                 + tree_provider.tarball_dispatched_count.get(),
             peer_prefetch_count,
+            work_edge_process_count: work_stats.edge_process_count,
+            work_edge_reuse_count: work_stats.edge_reuse_count,
+            work_edge_reuse_range_count: work_stats.edge_reuse_range_count,
+            work_edge_reuse_exact_count: work_stats.edge_reuse_exact_count,
+            work_node_allocated_count: work_stats.node_allocated_count,
+            work_child_edge_enqueued_count: work_stats.child_edge_enqueued_count,
+            work_peer_requirement_count: work_stats.peer_requirement_count,
+            selected_package_count,
+            selected_unique_canonical_count,
+            selected_duplicate_canonical_count,
             policy_release_age_ms: policy_snap.release_age.elapsed.as_millis() as u64,
             policy_release_age_checked_count: policy_snap.release_age.checked_count,
             policy_release_age_rejected_count: policy_snap.release_age.rejected_count,

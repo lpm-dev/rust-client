@@ -998,6 +998,97 @@ fn process_edge_reuses_node_when_existing_version_satisfies_new_range() {
 }
 
 #[test]
+fn process_edge_records_work_stats_for_allocation_and_reuse() {
+    let info = mk_info(&["4.17.21"], &[]);
+    let mut deps = HashMap::new();
+    deps.insert("lodash".to_string(), "^4.0.0".to_string());
+    let mut state = ResolveState::new(deps, OverrideSet::empty());
+    state.seed_root_edges().unwrap();
+
+    let root_edge = state.task_queue.pop_front().unwrap();
+    process_edge(&root_edge, &info, &mut state).unwrap();
+
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("react"),
+        version: NpmVersion::parse("18.0.0").unwrap(),
+        optional: false,
+        children: Vec::new(),
+    });
+    state.resolved.insert(
+        CanonicalKey::npm("react"),
+        vec![(NpmVersion::parse("18.0.0").unwrap(), 1)],
+    );
+    let reuse_edge = Edge {
+        parent: 1,
+        local_name: "lodash".to_string(),
+        canonical: CanonicalKey::npm("lodash"),
+        range: NpmRange::parse("^4.10.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+    process_edge(&reuse_edge, &info, &mut state).unwrap();
+
+    assert_eq!(state.work_stats.edge_process_count, 2);
+    assert_eq!(state.work_stats.node_allocated_count, 1);
+    assert_eq!(state.work_stats.edge_reuse_count, 1);
+    assert_eq!(state.work_stats.edge_reuse_range_count, 1);
+    assert_eq!(state.work_stats.edge_reuse_exact_count, 0);
+}
+
+#[test]
+fn selected_package_cardinality_counts_duplicate_canonicals() {
+    let packages = vec![
+        ResolvedPackage {
+            package: ResolverPackage::Npm {
+                name: "debug".to_string(),
+                context: None,
+            },
+            version: NpmVersion::parse("2.6.9").unwrap(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            optional: false,
+        },
+        ResolvedPackage {
+            package: ResolverPackage::Npm {
+                name: "debug".to_string(),
+                context: None,
+            },
+            version: NpmVersion::parse("4.4.3").unwrap(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            optional: false,
+        },
+        ResolvedPackage {
+            package: ResolverPackage::Npm {
+                name: "ms".to_string(),
+                context: None,
+            },
+            version: NpmVersion::parse("2.1.3").unwrap(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            peers: Vec::new(),
+            tarball_url: None,
+            integrity: None,
+            platform: None,
+            optional: false,
+        },
+    ];
+
+    assert_eq!(selected_package_cardinality(&packages), (3, 2, 1));
+}
+
+#[test]
 fn process_edge_emits_selected_package_event_only_for_new_nodes() {
     let info = mk_info(&["4.17.21"], &[]);
     let mut deps = HashMap::new();

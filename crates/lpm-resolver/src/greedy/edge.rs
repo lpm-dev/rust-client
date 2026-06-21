@@ -190,6 +190,7 @@ fn process_edge_inner(
     forced: Option<(NpmVersion, Option<(NpmVersion, OverrideHit)>)>,
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
+    state.work_stats.edge_process_count = state.work_stats.edge_process_count.saturating_add(1);
     let is_root_edge = edge.parent == 0;
 
     // Determine the target version for THIS edge. Non-root edges on
@@ -215,6 +216,10 @@ fn process_edge_inner(
                     if !edge_is_optional_in_context(edge, state) {
                         mark_node_required_closure(state, id);
                     }
+                    state.work_stats.edge_reuse_count =
+                        state.work_stats.edge_reuse_count.saturating_add(1);
+                    state.work_stats.edge_reuse_range_count =
+                        state.work_stats.edge_reuse_range_count.saturating_add(1);
                     state.nodes[edge.parent as usize]
                         .children
                         .push((edge.local_name.clone(), id));
@@ -339,11 +344,21 @@ fn process_edge_inner(
             if !edge_is_optional_in_context(edge, state) {
                 mark_node_required_closure(state, id);
             }
+            state.work_stats.edge_reuse_count = state.work_stats.edge_reuse_count.saturating_add(1);
+            if must_exact_match {
+                state.work_stats.edge_reuse_exact_count =
+                    state.work_stats.edge_reuse_exact_count.saturating_add(1);
+            } else {
+                state.work_stats.edge_reuse_range_count =
+                    state.work_stats.edge_reuse_range_count.saturating_add(1);
+            }
             id
         }
         None => {
             let new_id = state.nodes.len() as NodeId;
             let incoming_optional = edge_is_optional_in_context(edge, state);
+            state.work_stats.node_allocated_count =
+                state.work_stats.node_allocated_count.saturating_add(1);
             state.nodes.push(ResolvedNodeBuilder {
                 canonical: edge.canonical.clone(),
                 version: target_version.clone(),

@@ -104,6 +104,8 @@ pub(super) fn enqueue_child_deps(
                     optional,
                 },
             });
+            state.work_stats.child_edge_enqueued_count =
+                state.work_stats.child_edge_enqueued_count.saturating_add(1);
         }
     }
 
@@ -172,6 +174,8 @@ pub(super) fn enqueue_child_deps(
                 range,
                 optional,
             });
+            state.work_stats.peer_requirement_count =
+                state.work_stats.peer_requirement_count.saturating_add(1);
         }
     }
 }
