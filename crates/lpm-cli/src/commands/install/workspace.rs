@@ -400,6 +400,24 @@ pub(super) fn append_workspace_links_from_local_packages(
     }
 }
 
+pub(super) fn merge_workspace_member_links(
+    workspace_member_deps: &mut Vec<WorkspaceMemberLink>,
+    links: impl IntoIterator<Item = WorkspaceMemberLink>,
+) {
+    let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut seen: HashSet<(String, PathBuf)> = workspace_member_deps
+        .iter()
+        .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
+        .collect();
+
+    for entry in links {
+        let key = (entry.name.clone(), canonicalize_path(&entry.source_dir));
+        if seen.insert(key) {
+            workspace_member_deps.push(entry);
+        }
+    }
+}
+
 ///
 ///
 /// Walk root deps for `file:` / `link:` specs whose target realpaths

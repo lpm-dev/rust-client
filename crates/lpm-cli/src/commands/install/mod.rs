@@ -2056,23 +2056,13 @@ async fn run_with_options_under_store_lock(
         // already populated `workspace_member_deps` with file:/link:
         // deps that match members, so the BFS seed set already
         // includes those.)
-        let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        if !v2_workspace_root_pre_resolve
-            .additional_workspace_links
-            .is_empty()
-        {
-            let existing: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
+        merge_workspace_member_links(
+            &mut workspace_member_deps,
+            v2_workspace_root_pre_resolve
+                .additional_workspace_links
                 .iter()
-                .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
-                .collect();
-            let mut seen = existing;
-            for entry in &v2_workspace_root_pre_resolve.additional_workspace_links {
-                let key = (entry.name.clone(), canonicalize_path(&entry.source_dir));
-                if seen.insert(key) {
-                    workspace_member_deps.push(entry.clone());
-                }
-            }
-        }
+                .cloned(),
+        );
         expand_workspace_member_deps_with_transitives(
             &mut workspace_member_deps,
             &all_workspace_members,
@@ -2314,6 +2304,7 @@ async fn run_with_options_under_store_lock(
             || !v2_workspace_root_pre_resolve
                 .additional_workspace_links
                 .is_empty(),
+        has_tarball_source_deps: installer_spike::has_tarball_source_deps(project_dir, &deps),
         has_patches: !current_patches.is_empty(),
         patches_changed,
         verify_registry_signatures,
@@ -2347,6 +2338,42 @@ async fn run_with_options_under_store_lock(
             crate::provenance_fetch::SkipPolicy::None
         ),
     })? {
+        let NonRegistryPreResolveResult {
+            install_pkgs: mut spike_pre_resolved_install_pkgs,
+            source_deps: mut spike_pre_resolved_source_deps,
+            additional_workspace_links,
+        } = pre_resolve_non_registry_deps(
+            &arc_client,
+            &store,
+            project_dir,
+            &mut deps,
+            json_output,
+            strict_integrity,
+            &all_workspace_members,
+        )
+        .await?;
+
+        merge_workspace_member_links(
+            &mut workspace_member_deps,
+            additional_workspace_links.into_iter().chain(
+                v2_workspace_root_pre_resolve
+                    .additional_workspace_links
+                    .iter()
+                    .cloned(),
+            ),
+        );
+        expand_workspace_member_deps_with_transitives(
+            &mut workspace_member_deps,
+            &all_workspace_members,
+        )?;
+        spike_pre_resolved_install_pkgs
+            .extend(v2_workspace_root_pre_resolve.install_pkgs.iter().cloned());
+        for (source, deps) in &v2_workspace_root_pre_resolve.source_deps {
+            spike_pre_resolved_source_deps
+                .entry(source.clone())
+                .or_insert_with(|| deps.clone());
+        }
+
         return installer_spike::run(
             arc_client.clone(),
             project_dir,
@@ -2364,6 +2391,9 @@ async fn run_with_options_under_store_lock(
             resolver_policy.clone(),
             auto_install_peers,
             !omit_policy.optional,
+            &spike_pre_resolved_install_pkgs,
+            &spike_pre_resolved_source_deps,
+            &workspace_member_deps,
             &all_workspace_members,
             &catalog_resolutions,
         )
@@ -2415,29 +2445,15 @@ async fn run_with_options_under_store_lock(
     // own `node_modules/<name>` symlink. (`workspace_member_deps` is
     // mutable from its declaration site; the invariant hoisted the
     // pre-pass before the offline/online dispatch.)
-    let canonicalize_path = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let all_additional_workspace_links: Vec<WorkspaceMemberLink> = additional_workspace_links
-        .into_iter()
-        .chain(
+    merge_workspace_member_links(
+        &mut workspace_member_deps,
+        additional_workspace_links.into_iter().chain(
             v2_workspace_root_pre_resolve
                 .additional_workspace_links
                 .iter()
                 .cloned(),
-        )
-        .collect();
-    if !all_additional_workspace_links.is_empty() {
-        let existing: std::collections::HashSet<(String, PathBuf)> = workspace_member_deps
-            .iter()
-            .map(|m| (m.name.clone(), canonicalize_path(&m.source_dir)))
-            .collect();
-        let mut seen = existing;
-        for entry in all_additional_workspace_links {
-            let key = (entry.name.clone(), canonicalize_path(&entry.source_dir));
-            if seen.insert(key) {
-                workspace_member_deps.push(entry);
-            }
-        }
-    }
+        ),
+    );
 
     // **Invariant invariant — factor BFS into helper.** The
     // the invariant BFS lived inline here, which left the offline branch
