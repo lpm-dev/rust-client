@@ -119,7 +119,7 @@ async fn tarball_url_install_trust_on_first_use_lands_in_cas_path() {
     let client = Arc::new(RegistryClient::new());
     let pkg = install_package_for_tarball(&url, None);
 
-    let (computed_sri, timings, final_url) = fetch_and_store_tarball_url(
+    let (computed_sri, timings, final_url, fresh_object) = fetch_and_store_tarball_url(
         &client,
         &store,
         None,
@@ -130,6 +130,10 @@ async fn tarball_url_install_trust_on_first_use_lands_in_cas_path() {
     )
     .await
     .expect("tarball install must succeed");
+    assert!(
+        fresh_object.is_none(),
+        "v1 tarball install must not report a v2 fresh object"
+    );
 
     // Returned SRI matches an independent SHA-512 of the bytes.
     assert_eq!(computed_sri, expected_sri);
@@ -169,7 +173,7 @@ async fn tarball_url_install_match_succeeds() {
     let client = Arc::new(RegistryClient::new());
     let pkg = install_package_for_tarball(&url, Some(&expected_sri));
 
-    let (computed_sri, _, _) = fetch_and_store_tarball_url(
+    let (computed_sri, _, _, _) = fetch_and_store_tarball_url(
         &client,
         &store,
         None,
@@ -213,7 +217,7 @@ async fn tarball_url_install_v2_extracts_object() {
         .try_acquire_owned()
         .expect("permit must be available in test setup");
 
-    let (computed_sri, _, _) =
+    let (computed_sri, _, _, fresh_object) =
         fetch_and_store_tarball_url(&client, &store, Some(&store_v2), &pkg, 0, permit, &None)
             .await
             .expect("v2 tarball install must succeed");
@@ -226,7 +230,62 @@ async fn tarball_url_install_v2_extracts_object() {
             .is_some(),
         "v2 tarball install must populate the object store"
     );
+    assert!(
+        fresh_object.is_some(),
+        "v2 tarball install must return the freshly extracted object"
+    );
     assert_eq!(semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn tarball_url_install_v2_returns_canonical_sri_for_sha256_declaration() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let body = build_test_tarball();
+    let declared_sri = Integrity::from_bytes(HashAlgorithm::Sha256, &body).to_string();
+    let canonical_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/foo.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+    let url = format!("{}/foo.tgz", server.uri());
+
+    let store_root = tempfile::tempdir().unwrap();
+    let store_v2_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(store_v2_root.path());
+    let client = Arc::new(RegistryClient::new());
+    let pkg = install_package_for_tarball(&url, Some(&declared_sri));
+
+    let (computed_sri, _, _, fresh_object) = fetch_and_store_tarball_url(
+        &client,
+        &store,
+        Some(&store_v2),
+        &pkg,
+        0,
+        install_pkg_acquire_permit(),
+        &None,
+    )
+    .await
+    .expect("v2 tarball install must accept matching sha256 declarations");
+
+    assert_eq!(computed_sri, canonical_sri);
+    assert!(
+        store_v2
+            .reusable_object_dir(&computed_sri)
+            .unwrap()
+            .is_some(),
+        "v2 object lookups must use the canonical sha512 SRI"
+    );
+    assert!(
+        fresh_object.is_some(),
+        "v2 sha256-declared tarballs must still produce a fresh object for event-driven linking"
+    );
 }
 
 #[tokio::test]
@@ -318,7 +377,7 @@ async fn tarball_url_install_cache_hit_skips_redundant_download() {
     let client = Arc::new(RegistryClient::new());
     let pkg = install_package_for_tarball(&url, None);
 
-    let (sri1, _, _) = fetch_and_store_tarball_url(
+    let (sri1, _, _, _) = fetch_and_store_tarball_url(
         &client,
         &store,
         None,
@@ -335,7 +394,7 @@ async fn tarball_url_install_cache_hit_skips_redundant_download() {
         .modified()
         .unwrap();
 
-    let (sri2, _, _) = fetch_and_store_tarball_url(
+    let (sri2, _, _, _) = fetch_and_store_tarball_url(
         &client,
         &store,
         None,
@@ -504,7 +563,7 @@ async fn tarball_url_install_handles_301_redirect() {
     let client = Arc::new(RegistryClient::new());
     let pkg = install_package_for_tarball(&declared_url, None);
 
-    let (computed_sri, _, final_url) = fetch_and_store_tarball_url(
+    let (computed_sri, _, final_url, _) = fetch_and_store_tarball_url(
         &client,
         &store,
         None,

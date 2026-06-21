@@ -306,7 +306,7 @@ async fn fetch_selected_package(
             .await
             .map_err(|_| LpmError::Registry("fetch overlap semaphore closed".into()))?;
         let queue_wait_ms = queue_start.elapsed().as_millis();
-        let (computed_sri, timings, final_url) = if streaming_fetch {
+        let (computed_sri, timings, final_url, _) = if streaming_fetch {
             fetch_and_store_streaming(
                 &client,
                 &route_table,

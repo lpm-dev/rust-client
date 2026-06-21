@@ -450,11 +450,40 @@ impl VerifiedObjectTreeIntegrity {
     }
 }
 
+/// Object-tree digest produced by the extraction path for immediate link populate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshObjectTreeIntegrity(VerifiedObjectTreeIntegrity);
+
+impl FreshObjectTreeIntegrity {
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    #[inline]
+    fn new(digest: VerifiedObjectTreeIntegrity) -> Self {
+        Self(digest)
+    }
+
+    #[inline]
+    fn as_verified(&self) -> &VerifiedObjectTreeIntegrity {
+        &self.0
+    }
+}
+
 /// Object directory that is complete and has a verified tree digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReusableObject {
     pub path: PathBuf,
     pub tree_integrity: VerifiedObjectTreeIntegrity,
+}
+
+/// Object directory just produced or validated by an extraction call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedObject {
+    path: PathBuf,
+    source_sri: String,
+    tree_integrity: FreshObjectTreeIntegrity,
 }
 
 /// Timing and path counters for one reusable-object validation check.
@@ -688,6 +717,20 @@ impl Store {
         tarball_data: &[u8],
     ) -> Result<(PathBuf, StageTimings), LpmError> {
         self.extract_object_with_timings_and_policy(sri, tarball_data, object_integrity_policy())
+            .map(|(object, timings)| (object.path, timings))
+    }
+
+    /// Same as [`Self::extract_object_with_timings`], but returns the
+    /// fresh object handle produced by this extraction. Install's
+    /// event-driven v2 linker uses this only for the immediate fresh
+    /// link-entry populate, avoiding a second object-tree validation
+    /// pass over bytes the extraction task just hashed.
+    pub fn extract_object_with_timings_and_fresh_integrity(
+        &self,
+        sri: &str,
+        tarball_data: &[u8],
+    ) -> Result<(ExtractedObject, StageTimings), LpmError> {
+        self.extract_object_with_timings_and_policy(sri, tarball_data, object_integrity_policy())
     }
 
     fn extract_object_with_timings_and_policy(
@@ -695,7 +738,7 @@ impl Store {
         sri: &str,
         tarball_data: &[u8],
         policy: ObjectIntegrityPolicy,
-    ) -> Result<(PathBuf, StageTimings), LpmError> {
+    ) -> Result<(ExtractedObject, StageTimings), LpmError> {
         let object_dir = self.paths.object_dir(sri)?;
         let mut timings = StageTimings::default();
 
@@ -706,13 +749,21 @@ impl Store {
         // half-populated object dir and downstream link entries inherit
         // the corruption.
         if object_dir.exists()
-            && object_dir_is_reusable_or_remove(&object_dir, "before re-extract", policy)?
+            && let Some(tree_integrity) =
+                object_tree_integrity_or_remove(&object_dir, "before re-extract", policy)?
         {
             tracing::debug!(
                 target = %object_dir.display(),
                 "v2 store: object hit"
             );
-            return Ok((object_dir, timings));
+            return Ok((
+                ExtractedObject {
+                    path: object_dir,
+                    source_sri: sri.to_string(),
+                    tree_integrity: FreshObjectTreeIntegrity::new(tree_integrity),
+                },
+                timings,
+            ));
         }
 
         if let Some(parent) = object_dir.parent() {
@@ -796,6 +847,8 @@ impl Store {
         timings.dir_count = integrities.stats.dir_count;
         timings.symlink_count = integrities.stats.symlink_count;
         timings.unpacked_bytes = integrities.stats.unpacked_bytes;
+        let tree_integrity =
+            FreshObjectTreeIntegrity::new(VerifiedObjectTreeIntegrity::new(integrities.content));
 
         let integrity_write_start = std::time::Instant::now();
         let integrity_result = std::fs::write(tmp_dir.join(".integrity"), sri);
@@ -811,7 +864,11 @@ impl Store {
         let rename_result = std::fs::rename(&tmp_dir, &object_dir);
         timings.finalize_rename_ms = rename_start.elapsed().as_millis();
         let result = match rename_result {
-            Ok(()) => Ok(object_dir),
+            Ok(()) => Ok(ExtractedObject {
+                path: object_dir,
+                source_sri: sri.to_string(),
+                tree_integrity,
+            }),
             Err(e) => {
                 let collision_start = std::time::Instant::now();
                 let result = finish_object_rename_after_collision(
@@ -822,12 +879,28 @@ impl Store {
                     policy,
                 );
                 timings.finalize_collision_recovery_ms = collision_start.elapsed().as_millis();
-                result
+                let object_dir = result?;
+                let tree_integrity = object_tree_integrity_or_remove(
+                    &object_dir,
+                    "after v2 extract collision",
+                    policy,
+                )?
+                .ok_or_else(|| {
+                    LpmError::Store(format!(
+                        "v2 extract collision left no reusable object at {}",
+                        object_dir.display()
+                    ))
+                })?;
+                Ok(ExtractedObject {
+                    path: object_dir,
+                    source_sri: sri.to_string(),
+                    tree_integrity: FreshObjectTreeIntegrity::new(tree_integrity),
+                })
             }
         };
         timings.finalize_ms = finalize_start.elapsed().as_millis();
 
-        result.map(|dir| (dir, timings))
+        result.map(|object| (object, timings))
     }
 
     /// Extract from a buffered byte slice when the SRI isn't known
@@ -850,6 +923,17 @@ impl Store {
         tarball_data: &[u8],
         expected_integrity: Option<&str>,
     ) -> Result<(PathBuf, String, StageTimings), LpmError> {
+        self.extract_object_from_bytes_with_fresh_integrity(tarball_data, expected_integrity)
+            .map(|(object, sri, timings)| (object.path, sri, timings))
+    }
+
+    /// Same as [`Self::extract_object_from_bytes`], but returns the
+    /// fresh object handle for same-task link-entry population.
+    pub fn extract_object_from_bytes_with_fresh_integrity(
+        &self,
+        tarball_data: &[u8],
+        expected_integrity: Option<&str>,
+    ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
         self.extract_object_from_bytes_with_policy(
             tarball_data,
             expected_integrity,
@@ -862,7 +946,7 @@ impl Store {
         tarball_data: &[u8],
         expected_integrity: Option<&str>,
         policy: ObjectIntegrityPolicy,
-    ) -> Result<(PathBuf, String, StageTimings), LpmError> {
+    ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
         let computed_sri = crate::compute_sri_hash(tarball_data);
 
         // M18: verify against the algorithm declared in `expected`.
@@ -898,9 +982,9 @@ impl Store {
             }
         }
 
-        let (object_dir, timings) =
+        let (object, timings) =
             self.extract_object_with_timings_and_policy(&computed_sri, tarball_data, policy)?;
-        Ok((object_dir, computed_sri, timings))
+        Ok((object, computed_sri, timings))
     }
 
     /// Populate `links/<graph-key>/` with the package bytes, sibling
@@ -919,7 +1003,7 @@ impl Store {
     /// - On any error mid-way, the tmp dir is cleaned up before
     ///   returning.
     pub fn populate_link_entry(&self, request: LinkEntryRequest) -> Result<LinkEntry, LpmError> {
-        self.populate_link_entry_inner(request, None, object_integrity_policy())
+        self.populate_link_entry_inner(request, None, None, object_integrity_policy())
     }
 
     /// Populate a link entry using a previously verified object-tree digest.
@@ -931,6 +1015,45 @@ impl Store {
         self.populate_link_entry_inner(
             request,
             Some(verified_object_tree_integrity),
+            None,
+            object_integrity_policy(),
+        )
+    }
+
+    /// Populate a link entry immediately after this install extracted
+    /// the object and computed its tree digest.
+    pub fn populate_link_entry_with_fresh_object(
+        &self,
+        request: LinkEntryRequest,
+        fresh_object: &ExtractedObject,
+    ) -> Result<LinkEntry, LpmError> {
+        if fresh_object.source_sri != request.source_sri {
+            return Err(LpmError::Store(format!(
+                "fresh v2 link extracted object SRI mismatch: fresh {}, request {}",
+                fresh_object.source_sri, request.source_sri
+            )));
+        }
+        let expected_object_dir = self.paths.object_dir(&request.source_sri)?;
+        if request.object_dir != expected_object_dir {
+            return Err(LpmError::Store(format!(
+                "fresh v2 link request object path mismatch for {}: request {}, expected {}",
+                request.source_sri,
+                request.object_dir.display(),
+                expected_object_dir.display()
+            )));
+        }
+        if fresh_object.path != expected_object_dir {
+            return Err(LpmError::Store(format!(
+                "fresh v2 link extracted object path mismatch for {}: fresh {}, expected {}",
+                request.source_sri,
+                fresh_object.path.display(),
+                expected_object_dir.display()
+            )));
+        }
+        self.populate_link_entry_inner(
+            request,
+            Some(fresh_object.tree_integrity.as_verified()),
+            Some(&fresh_object.tree_integrity),
             object_integrity_policy(),
         )
     }
@@ -939,6 +1062,7 @@ impl Store {
         &self,
         request: LinkEntryRequest,
         verified_object_tree_digest: Option<&VerifiedObjectTreeIntegrity>,
+        fresh_object_tree_digest: Option<&FreshObjectTreeIntegrity>,
         policy: ObjectIntegrityPolicy,
     ) -> Result<LinkEntry, LpmError> {
         let LinkEntryRequest {
@@ -1022,6 +1146,7 @@ impl Store {
                 source_sri: &source_sri,
                 sidecar_relpath: &sidecar_dir_relpath,
                 policy,
+                fresh_object_tree_integrity: fresh_object_tree_digest,
             },
             &deps,
             &platform,
@@ -1488,6 +1613,7 @@ struct PopulateObject<'a> {
     source_sri: &'a str,
     sidecar_relpath: &'a str,
     policy: ObjectIntegrityPolicy,
+    fresh_object_tree_integrity: Option<&'a FreshObjectTreeIntegrity>,
 }
 
 fn populate_into(
@@ -1508,7 +1634,10 @@ fn populate_into(
     // Materialize the package itself from the verified object directory.
     // Link entries must not share hardlink inodes with objects: writes
     // through executable package bytes must never mutate the object store.
-    let object_integrity = object_integrity_for_link(object.dir, object.policy)?;
+    let object_integrity = match object.fresh_object_tree_integrity {
+        Some(digest) => Cow::Borrowed(digest.as_str()),
+        None => Cow::Owned(object_integrity_for_link(object.dir, object.policy)?),
+    };
     let pkg_dir = node_modules.join(graph_key.name());
     if let Some(parent) = pkg_dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -1523,7 +1652,7 @@ fn populate_into(
     write_tree_snapshot(
         tmp_dir,
         &TreeIntegrities {
-            content: object_integrity,
+            content: object_integrity.into_owned(),
             metadata: package_metadata_integrity,
             stats: ObjectTreeStats::default(),
         },
@@ -3875,6 +4004,155 @@ mod tests {
     }
 
     #[test]
+    fn populate_link_entry_with_verified_object_revalidates_tampered_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let sri = synthetic_sri(b"populate_link_entry_with_verified_object_revalidates_object");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[
+                ("package.json", b"{\"name\":\"verified-object\"}"),
+                ("index.js", b"module.exports = {};"),
+            ],
+        );
+        let verified = store.reusable_object(&sri).unwrap().unwrap().tree_integrity;
+        std::fs::write(object_dir.join("index.js"), b"module.exports = 'tampered';").unwrap();
+
+        let key = arc_key("verified-object", "1.0.0");
+        let err = store
+            .populate_link_entry_with_verified_object(
+                LinkEntryRequest {
+                    graph_key: Arc::clone(&key),
+                    source_sri: sri,
+                    object_dir,
+                    deps: vec![],
+                    platform: Arc::new(sample_meta_platform()),
+                },
+                &verified,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("v2 object integrity mismatch"),
+            "verified-object warm path must revalidate the object before materializing it, got: {err}"
+        );
+        assert!(
+            !store.paths().link_dir(&key).exists(),
+            "failed verified-object population must clean up its staging dir"
+        );
+    }
+
+    #[test]
+    fn populate_link_entry_with_fresh_object_rejects_mismatched_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let tarball_a = build_test_tarball(&[
+            (
+                "package.json",
+                b"{\"name\":\"fresh-a\",\"version\":\"1.0.0\"}",
+            ),
+            ("index.js", b"module.exports = 'a';"),
+        ]);
+        let tarball_b = build_test_tarball(&[
+            (
+                "package.json",
+                b"{\"name\":\"fresh-b\",\"version\":\"1.0.0\"}",
+            ),
+            ("index.js", b"module.exports = 'b';"),
+        ]);
+        let (fresh_a, _, _) = store
+            .extract_object_from_bytes_with_fresh_integrity(&tarball_a, None)
+            .unwrap();
+        let (fresh_b, sri_b, _) = store
+            .extract_object_from_bytes_with_fresh_integrity(&tarball_b, None)
+            .unwrap();
+
+        let key = arc_key("fresh-b", "1.0.0");
+        let err = store
+            .populate_link_entry_with_fresh_object(
+                LinkEntryRequest {
+                    graph_key: Arc::clone(&key),
+                    source_sri: sri_b,
+                    object_dir: fresh_b.path,
+                    deps: vec![],
+                    platform: Arc::new(sample_meta_platform()),
+                },
+                &fresh_a,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("fresh v2 link extracted object SRI mismatch"),
+            "fresh-object populate must reject a digest/path from another object, got: {err}"
+        );
+        assert!(
+            !store.paths().link_dir(&key).exists(),
+            "mismatched fresh-object population must not create a link entry"
+        );
+    }
+
+    #[test]
+    fn populate_link_entry_with_fresh_object_rejects_digest_transplant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+
+        let tarball_a = build_test_tarball(&[
+            (
+                "package.json",
+                b"{\"name\":\"fresh-a\",\"version\":\"1.0.0\"}",
+            ),
+            ("index.js", b"module.exports = 'a';"),
+        ]);
+        let tarball_b = build_test_tarball(&[
+            (
+                "package.json",
+                b"{\"name\":\"fresh-b\",\"version\":\"1.0.0\"}",
+            ),
+            ("index.js", b"module.exports = 'b';"),
+        ]);
+        let (fresh_a, _, _) = store
+            .extract_object_from_bytes_with_fresh_integrity(&tarball_a, None)
+            .unwrap();
+        let (fresh_b, sri_b, _) = store
+            .extract_object_from_bytes_with_fresh_integrity(&tarball_b, None)
+            .unwrap();
+        let forged = ExtractedObject {
+            path: fresh_b.path.clone(),
+            source_sri: fresh_a.source_sri.clone(),
+            tree_integrity: fresh_a.tree_integrity.clone(),
+        };
+        assert!(!fresh_a.tree_integrity.as_str().is_empty());
+
+        let key = arc_key("fresh-b", "1.0.0");
+        let err = store
+            .populate_link_entry_with_fresh_object(
+                LinkEntryRequest {
+                    graph_key: Arc::clone(&key),
+                    source_sri: sri_b,
+                    object_dir: fresh_b.path,
+                    deps: vec![],
+                    platform: Arc::new(sample_meta_platform()),
+                },
+                &forged,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("fresh v2 link extracted object SRI mismatch"),
+            "fresh-object populate must reject a cloned digest paired with another object path, got: {err}"
+        );
+        assert!(
+            !store.paths().link_dir(&key).exists(),
+            "digest-transplant fresh-object population must not create a link entry"
+        );
+    }
+
+    #[test]
     fn populate_writes_sibling_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
@@ -4500,12 +4778,12 @@ mod tests {
             ("lib/index.js", b"module.exports = 1;\n"),
         ]);
 
-        let (object_dir, sri, timings) = store
+        let (object, sri, timings) = store
             .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
             .unwrap();
 
         assert_eq!(
-            read_object_tree_integrity(&object_dir).unwrap(),
+            read_object_tree_integrity(&object.path).unwrap(),
             source_object_integrity(&sri)
         );
         assert_eq!(timings.file_count, 0);
@@ -4521,17 +4799,17 @@ mod tests {
             ("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}"),
             ("index.js", b"module.exports = 1;\n"),
         ]);
-        let (object_dir, sri, _) = store
+        let (object, sri, _) = store
             .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
             .unwrap();
-        std::fs::write(object_dir.join("index.js"), b"module.exports = 2;\n").unwrap();
+        std::fs::write(object.path.join("index.js"), b"module.exports = 2;\n").unwrap();
 
         let reusable = store
             .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
             .unwrap()
             .unwrap();
 
-        assert_eq!(reusable.path, object_dir);
+        assert_eq!(reusable.path, object.path);
         assert_eq!(
             reusable.tree_integrity.as_str(),
             source_object_integrity(&sri)
@@ -4546,7 +4824,7 @@ mod tests {
             ("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}"),
             ("index.js", b"module.exports = 1;\n"),
         ]);
-        let (object_dir, sri, _) = store
+        let (object, sri, _) = store
             .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
             .unwrap();
 
@@ -4555,7 +4833,7 @@ mod tests {
             .unwrap();
 
         assert!(reusable.is_none());
-        assert!(!object_dir.exists());
+        assert!(!object.path.exists());
     }
 
     #[test]
@@ -4564,7 +4842,7 @@ mod tests {
         let store = Store::at(dir.path());
         let tarball =
             build_test_tarball(&[("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}")]);
-        let (object_dir, sri, _) = store
+        let (object, sri, _) = store
             .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
             .unwrap();
         let key = arc_key("x", "1.0.0");
@@ -4574,10 +4852,11 @@ mod tests {
                 LinkEntryRequest {
                     graph_key: Arc::clone(&key),
                     source_sri: sri.clone(),
-                    object_dir,
+                    object_dir: object.path,
                     deps: vec![],
                     platform: Arc::new(sample_meta_platform()),
                 },
+                None,
                 None,
                 ObjectIntegrityPolicy::Source,
             )

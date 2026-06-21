@@ -2705,7 +2705,7 @@ fn maybe_spawn_fetch(
             .await
             .map_err(|_| LpmError::Registry("experimental installer queue closed".into()))?;
         let queue_wait_ms = queue_start.elapsed().as_millis();
-        let (computed_sri, timings, _) = fetch_and_store_streaming(
+        let (computed_sri, timings, _, _) = fetch_and_store_streaming(
             &client,
             &route_table,
             &store,

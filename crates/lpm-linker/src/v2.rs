@@ -67,8 +67,8 @@ use lpm_common::symlink::create_dir_symlink_or_junction;
 #[cfg(target_os = "macos")]
 use lpm_store::v2::CompatIslandKeyEntry;
 use lpm_store::v2::{
-    DepLink, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple, Store,
-    VerifiedObjectTreeIntegrity,
+    DepLink, ExtractedObject, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag,
+    PlatformTuple, Store, VerifiedObjectTreeIntegrity,
 };
 
 use crate::materialize::link_dir_recursive;
@@ -93,6 +93,10 @@ pub struct V2Target {
     pub source_sri: String,
     /// Verified object-tree digest available on warm cache hits.
     pub verified_object_tree_integrity: Option<VerifiedObjectTreeIntegrity>,
+    /// Object produced by the extraction path for immediate link-populate.
+    /// Warm cache paths cannot construct this value, so they leave it empty
+    /// and use populate-time object validation.
+    pub fresh_object: Option<ExtractedObject>,
 }
 
 /// Pre-computed plan handed across the three-phase v2 link API
@@ -844,9 +848,13 @@ fn populate_one(
         deps,
         platform: Arc::clone(meta_platform),
     };
-    let entry = match v2t.verified_object_tree_integrity.as_ref() {
-        Some(digest) => store.populate_link_entry_with_verified_object(request, digest)?,
-        None => store.populate_link_entry(request)?,
+    let entry = match (
+        v2t.fresh_object.as_ref(),
+        v2t.verified_object_tree_integrity.as_ref(),
+    ) {
+        (Some(object), _) => store.populate_link_entry_with_fresh_object(request, object)?,
+        (None, Some(digest)) => store.populate_link_entry_with_verified_object(request, digest)?,
+        (None, None) => store.populate_link_entry(request)?,
     };
     Ok(PopulatedEntry {
         key,
@@ -3176,6 +3184,7 @@ mod tests {
             },
             source_sri: sri.into(),
             verified_object_tree_integrity: None,
+            fresh_object: None,
         }
     }
 
