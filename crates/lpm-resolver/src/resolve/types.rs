@@ -295,9 +295,10 @@ pub struct StageTiming {
     /// Peer requirements collected from selected package manifests.
     pub work_peer_requirement_count: u64,
     /// Distinct canonical metadata misses from dependency edges in the greedy
-    /// task queue. Tree-policy lookahead and peer-prefetch fetches are tracked
-    /// by dispatcher counters, but do not have a single triggering range for
-    /// the edge-shape attribution below.
+    /// task queue. Populated only when metadata trace detail is enabled.
+    /// Tree-policy lookahead and peer-prefetch fetches are tracked by
+    /// dispatcher counters, but do not have a single triggering range for the
+    /// edge-shape attribution below.
     pub work_metadata_edge_miss_count: u64,
     /// Task-queue edge metadata misses whose canonical routed directly to npm.
     pub work_metadata_edge_miss_direct_count: u64,

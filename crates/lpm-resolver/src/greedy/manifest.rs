@@ -1,7 +1,7 @@
 use super::ExperimentalMetadataFetchTimings;
 use super::metrics::{metrics_incr_cache_wait, metrics_incr_escape_hatch, metrics_incr_timeout};
 use super::prelude::*;
-use super::state::ResolveState;
+use super::state::{MetadataEdgeMissLatest, ResolveState};
 use super::types::Edge;
 
 /// Fast cache hit, then short-lived per-canonical wait, then escape-hatch
@@ -485,32 +485,11 @@ pub(super) struct MetadataFetchCompletion<'a> {
     pub(super) shared_cache: &'a SharedCache,
     pub(super) route_table: &'a RouteTable,
     pub(super) counted_metadata_edge_misses: &'a mut AHashSet<CanonicalKey>,
-    spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
+    pub(super) trace_metadata_fetches: bool,
+    pub(super) spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     pub(super) tarball_dispatched_count: &'a mut u64,
     pub(super) parked: &'a mut AHashMap<CanonicalKey, Vec<Edge>>,
     pub(super) state: &'a mut ResolveState,
-}
-
-impl<'a> MetadataFetchCompletion<'a> {
-    pub(super) fn new(
-        shared_cache: &'a SharedCache,
-        route_table: &'a RouteTable,
-        counted_metadata_edge_misses: &'a mut AHashSet<CanonicalKey>,
-        spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
-        tarball_dispatched_count: &'a mut u64,
-        parked: &'a mut AHashMap<CanonicalKey, Vec<Edge>>,
-        state: &'a mut ResolveState,
-    ) -> Self {
-        Self {
-            shared_cache,
-            route_table,
-            counted_metadata_edge_misses,
-            spec_tx,
-            tarball_dispatched_count,
-            parked,
-            state,
-        }
-    }
 }
 
 pub(super) fn complete_metadata_fetch(
@@ -536,14 +515,15 @@ pub(super) fn complete_metadata_fetch(
                     completion
                         .state
                         .work_stats
-                        .record_metadata_edge_miss_latest(
-                            &canonical,
-                            &edge.range,
-                            &info,
-                            latest_version.as_ref(),
-                            completion.route_table,
-                            &completion.state.policy,
-                        );
+                        .record_metadata_edge_miss_latest(MetadataEdgeMissLatest {
+                            canonical: &canonical,
+                            range: &edge.range,
+                            info: &info,
+                            latest_version: latest_version.as_ref(),
+                            route_table: completion.route_table,
+                            policy: &completion.state.policy,
+                            compare_policy_pick: completion.trace_metadata_fetches,
+                        });
                 }
                 edges.sort_by(|a, b| {
                     (a.parent, a.local_name.as_str()).cmp(&(b.parent, b.local_name.as_str()))

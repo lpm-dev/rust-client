@@ -546,7 +546,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             // routes keep the existing per-package fetch path.
             let canonical = edge.canonical.clone();
             let new_fetch = inflight.insert(canonical.clone());
-            if new_fetch {
+            if new_fetch && trace_metadata_fetches {
                 state
                     .work_stats
                     .record_metadata_edge_miss(&canonical, &edge.range, &route_table);
@@ -604,15 +604,16 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         returned.insert(canonical.clone());
                         inflight.remove(&canonical);
                         let fetched = parse_fetched_metadata(meta, spec_tx.is_some());
-                        let mut completion = MetadataFetchCompletion::new(
-                            &shared_cache,
-                            &route_table,
-                            &mut counted_metadata_edge_misses,
-                            spec_tx.as_ref(),
-                            &mut tarball_dispatched_count,
-                            &mut parked,
-                            &mut state,
-                        );
+                        let mut completion = MetadataFetchCompletion {
+                            shared_cache: &shared_cache,
+                            route_table: &route_table,
+                            counted_metadata_edge_misses: &mut counted_metadata_edge_misses,
+                            trace_metadata_fetches,
+                            spec_tx: spec_tx.as_ref(),
+                            tarball_dispatched_count: &mut tarball_dispatched_count,
+                            parked: &mut parked,
+                            state: &mut state,
+                        };
                         complete_metadata_fetch(canonical, Ok(fetched), &mut completion)?;
                     }
 
@@ -804,15 +805,16 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             let (canonical, result) = joined
                 .map_err(|e| ResolveError::Internal(format!("metadata join failure: {e}")))?;
             inflight.remove(&canonical);
-            let mut completion = MetadataFetchCompletion::new(
-                &shared_cache,
-                &route_table,
-                &mut counted_metadata_edge_misses,
-                spec_tx.as_ref(),
-                &mut tarball_dispatched_count,
-                &mut parked,
-                &mut state,
-            );
+            let mut completion = MetadataFetchCompletion {
+                shared_cache: &shared_cache,
+                route_table: &route_table,
+                counted_metadata_edge_misses: &mut counted_metadata_edge_misses,
+                trace_metadata_fetches,
+                spec_tx: spec_tx.as_ref(),
+                tarball_dispatched_count: &mut tarball_dispatched_count,
+                parked: &mut parked,
+                state: &mut state,
+            };
             complete_metadata_fetch(canonical, result, &mut completion)?;
         }
     }

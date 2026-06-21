@@ -84,32 +84,15 @@ impl ResolveWorkStats {
         }
     }
 
-    pub(super) fn record_metadata_edge_miss_latest(
-        &mut self,
-        canonical: &CanonicalKey,
-        range: &NpmRange,
-        info: &CachedPackageInfo,
-        latest_version: Option<&NpmVersion>,
-        route_table: &RouteTable,
-        policy: &ResolverPolicy,
-    ) {
-        let Some(latest_version) = latest_version else {
-            return;
-        };
-        self.metadata_edge_miss_latest_known_count =
-            self.metadata_edge_miss_latest_known_count.saturating_add(1);
+    pub(super) fn record_metadata_edge_miss_latest(&mut self, miss: MetadataEdgeMissLatest<'_>) {
         let direct = matches!(
-            canonical,
+            miss.canonical,
             CanonicalKey::Npm { name }
-                if matches!(route_table.route_for_package(name), UpstreamRoute::NpmDirect)
+                if matches!(miss.route_table.route_for_package(name), UpstreamRoute::NpmDirect)
         );
-        if direct {
-            self.metadata_edge_miss_latest_known_direct_count = self
-                .metadata_edge_miss_latest_known_direct_count
-                .saturating_add(1);
-        }
         let version_doc_policy_eligible =
-            !policy.release_age_applies_to_package(canonical) && !policy.requires_trust_history();
+            !miss.policy.release_age_applies_to_package(miss.canonical)
+                && !miss.policy.requires_trust_history();
         if version_doc_policy_eligible {
             self.metadata_edge_miss_version_doc_policy_eligible_count = self
                 .metadata_edge_miss_version_doc_policy_eligible_count
@@ -120,7 +103,18 @@ impl ResolveWorkStats {
                     .saturating_add(1);
             }
         }
-        if range.satisfies(latest_version) {
+
+        let Some(latest_version) = miss.latest_version else {
+            return;
+        };
+        self.metadata_edge_miss_latest_known_count =
+            self.metadata_edge_miss_latest_known_count.saturating_add(1);
+        if direct {
+            self.metadata_edge_miss_latest_known_direct_count = self
+                .metadata_edge_miss_latest_known_direct_count
+                .saturating_add(1);
+        }
+        if miss.range.satisfies(latest_version) {
             self.metadata_edge_miss_latest_satisfies_count = self
                 .metadata_edge_miss_latest_satisfies_count
                 .saturating_add(1);
@@ -130,10 +124,17 @@ impl ResolveWorkStats {
                     .saturating_add(1);
             }
         }
-        if matches!(
-            find_best_version_with_policy_unprofiled(canonical, info, range, policy),
-            VersionPick::Picked(best) if &best == latest_version
-        ) {
+        if miss.compare_policy_pick
+            && matches!(
+                find_best_version_with_policy_unprofiled(
+                    miss.canonical,
+                    miss.info,
+                    miss.range,
+                    miss.policy
+                ),
+                VersionPick::Picked(best) if &best == latest_version
+            )
+        {
             self.metadata_edge_miss_latest_matches_pick_count = self
                 .metadata_edge_miss_latest_matches_pick_count
                 .saturating_add(1);
@@ -154,6 +155,16 @@ impl ResolveWorkStats {
             }
         }
     }
+}
+
+pub(super) struct MetadataEdgeMissLatest<'a> {
+    pub(super) canonical: &'a CanonicalKey,
+    pub(super) range: &'a NpmRange,
+    pub(super) info: &'a CachedPackageInfo,
+    pub(super) latest_version: Option<&'a NpmVersion>,
+    pub(super) route_table: &'a RouteTable,
+    pub(super) policy: &'a ResolverPolicy,
+    pub(super) compare_policy_pick: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -652,6 +663,23 @@ fn canonical_to_resolver_package(key: &CanonicalKey) -> ResolverPackage {
 mod tests {
     use super::*;
 
+    fn empty_info() -> CachedPackageInfo {
+        CachedPackageInfo {
+            modified: None,
+            modified_unix: None,
+            trust_metadata_complete: false,
+            versions: vec![NpmVersion::parse("1.0.0").expect("valid version")],
+            deps: HashMap::new(),
+            peer_deps: HashMap::new(),
+            optional_dep_names: HashMap::new(),
+            optional_peer_names: HashMap::new(),
+            bundled_dep_names: HashMap::new(),
+            platform: HashMap::new(),
+            dist: HashMap::new(),
+            aliases: HashMap::new(),
+        }
+    }
+
     fn shape(raw: &str) -> MetadataEdgeMissRangeShape {
         metadata_edge_miss_range_shape(&NpmRange::parse(raw).expect("valid test range"))
     }
@@ -676,5 +704,60 @@ mod tests {
             shape("^1.0.0 || ^2.0.0"),
             MetadataEdgeMissRangeShape::Complex
         );
+    }
+
+    #[test]
+    fn metadata_edge_miss_latest_records_version_doc_policy_eligibility_without_latest_tag() {
+        let mut stats = ResolveWorkStats::default();
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let canonical = CanonicalKey::npm("left-pad");
+        let range = NpmRange::parse("1.0.0").expect("valid range");
+        let info = empty_info();
+
+        let policy = ResolverPolicy::default();
+        stats.record_metadata_edge_miss_latest(MetadataEdgeMissLatest {
+            canonical: &canonical,
+            range: &range,
+            info: &info,
+            latest_version: None,
+            route_table: &route_table,
+            policy: &policy,
+            compare_policy_pick: true,
+        });
+
+        assert_eq!(
+            stats.metadata_edge_miss_version_doc_policy_eligible_count,
+            1
+        );
+        assert_eq!(
+            stats.metadata_edge_miss_version_doc_policy_eligible_direct_count,
+            1
+        );
+        assert_eq!(stats.metadata_edge_miss_latest_known_count, 0);
+    }
+
+    #[test]
+    fn metadata_edge_miss_latest_skips_policy_pick_match_when_comparison_disabled() {
+        let mut stats = ResolveWorkStats::default();
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let canonical = CanonicalKey::npm("left-pad");
+        let range = NpmRange::parse("^1.0.0").expect("valid range");
+        let info = empty_info();
+        let latest = NpmVersion::parse("1.0.0").expect("valid version");
+
+        let policy = ResolverPolicy::default();
+        stats.record_metadata_edge_miss_latest(MetadataEdgeMissLatest {
+            canonical: &canonical,
+            range: &range,
+            info: &info,
+            latest_version: Some(&latest),
+            route_table: &route_table,
+            policy: &policy,
+            compare_policy_pick: false,
+        });
+
+        assert_eq!(stats.metadata_edge_miss_latest_known_count, 1);
+        assert_eq!(stats.metadata_edge_miss_latest_satisfies_count, 1);
+        assert_eq!(stats.metadata_edge_miss_latest_matches_pick_count, 0);
     }
 }
