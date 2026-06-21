@@ -797,23 +797,22 @@ pub(super) async fn run(
                                     &mut fetch_handles,
                                     &mut stats,
                                 );
-
-                                enqueue_dependencies(
-                                    &node,
-                                    &mut packages,
-                                    &mut pending,
-                                    &client,
-                                    &route_table,
-                                    &metadata_cache,
-                                    &metadata_queue,
-                                    &metadata_stats,
-                                    &resolver_policy,
-                                    include_optional_dependencies,
-                                    &mut stats,
-                                )?;
                             } else {
                                 stats.platform_pre_skipped += 1;
                             }
+                            enqueue_dependencies(
+                                &node,
+                                &mut packages,
+                                &mut pending,
+                                &client,
+                                &route_table,
+                                &metadata_cache,
+                                &metadata_queue,
+                                &metadata_stats,
+                                &resolver_policy,
+                                include_optional_dependencies,
+                                &mut stats,
+                            )?;
                         } else {
                             stats.duplicate_nodes += 1;
                         }
@@ -2254,22 +2253,22 @@ async fn drain_ambient_peer_installs(
                         fetch_handles,
                         stats,
                     );
-                    enqueue_dependencies(
-                        &node,
-                        packages,
-                        &mut pending,
-                        client,
-                        route_table,
-                        metadata_cache,
-                        metadata_queue,
-                        metadata_stats,
-                        resolver_policy,
-                        include_optional_dependencies,
-                        stats,
-                    )?;
                 } else {
                     stats.platform_pre_skipped += 1;
                 }
+                enqueue_dependencies(
+                    &node,
+                    packages,
+                    &mut pending,
+                    client,
+                    route_table,
+                    metadata_cache,
+                    metadata_queue,
+                    metadata_stats,
+                    resolver_policy,
+                    include_optional_dependencies,
+                    stats,
+                )?;
             } else {
                 stats.duplicate_nodes += 1;
             }
