@@ -1668,6 +1668,7 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         "cache_hit_count",
         "failed_count",
         "skipped_platform_count",
+        "skipped_auth_count",
         "task_sum_ms",
         "task_max_ms",
         "drain_ms",
@@ -6228,6 +6229,88 @@ async fn install_omit_dev_does_not_prefetch_dev_only_packages() {
     assert!(
         dev_tarball_hits.is_empty(),
         "omit-dev install must not prefetch dev-only tarballs; hits={dev_tarball_hits:?}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn install_fetch_overlap_skips_auth_bearing_custom_registry_tarballs() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("private-pkg", "1.0.0");
+    mock.with_package("private-pkg", "1.0.0", &tarball).await;
+
+    let registry_url = mock.url();
+    let registry_host = registry_url
+        .strip_prefix("http://")
+        .or_else(|| registry_url.strip_prefix("https://"))
+        .expect("mock registry URL must include a scheme");
+    let project = TempProject::empty(
+        r#"{
+        "name": "auth-overlap",
+        "version": "1.0.0",
+        "dependencies": { "private-pkg": "1.0.0" }
+    }"#,
+    );
+    project.write_file(
+        ".npmrc",
+        &format!(
+            "registry={registry_url}/\n//{registry_host}/:_authToken=test-token\nalways-auth=true\n"
+        ),
+    );
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_TIMING_DETAIL", "1")
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "auth custom-registry install failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
+    let overlap = &envelope["timing"]["detail"]["fetch"]["overlap"];
+    assert!(
+        overlap["selected_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "forced overlap admission should observe the selected private package; got {envelope:#}"
+    );
+    assert_eq!(
+        overlap["dispatched_count"].as_u64(),
+        Some(0),
+        "auth-bearing custom registries must not dispatch credentialed early fetch tasks; got {envelope:#}"
+    );
+    assert_eq!(
+        overlap["skipped_auth_count"].as_u64(),
+        Some(1),
+        "auth-bearing custom registry selections must be attributed as overlap auth skips; got {envelope:#}"
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let tarball_path = MockRegistry::tarball_path("private-pkg", "1.0.0");
+    let tarball_hits = requests
+        .iter()
+        .filter(|request| request.url.path() == tarball_path)
+        .count();
+    assert_eq!(
+        tarball_hits, 1,
+        "only the authoritative fetch should request the private tarball; stdout: {stdout}\nstderr: {stderr}"
     );
 }
 

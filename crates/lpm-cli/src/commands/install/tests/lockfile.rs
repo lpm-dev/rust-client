@@ -482,7 +482,13 @@ fn tarball_not_found_error_honors_project_dir() {
     // Construct a real client — we only care that
     // `invalidate_metadata_cache` + file-delete run. No network.
     let client = Arc::new(RegistryClient::new());
-    let err = handle_tarball_not_found(&client, "some-pkg", "1.0.0", project_dir);
+    let err = handle_tarball_not_found_with_recovery(
+        &client,
+        "some-pkg",
+        "1.0.0",
+        project_dir,
+        TarballNotFoundRecovery::DeleteProjectLockfiles,
+    );
 
     // Lockfiles in the PROJECT directory are gone.
     assert!(!lock_path.exists(), "project_dir/lpm.lock must be deleted");
@@ -492,6 +498,30 @@ fn tarball_not_found_error_honors_project_dir() {
     );
     // Error message references the package for user diagnostics.
     assert!(matches!(err, LpmError::NotFound(ref msg) if msg.contains("some-pkg@1.0.0")));
+}
+
+#[test]
+fn tarball_not_found_overlap_recovery_preserves_project_lockfiles() {
+    let proj = tempfile::tempdir().unwrap();
+    let project_dir = proj.path();
+
+    let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    std::fs::write(&lock_path, "# existing lockfile").unwrap();
+    std::fs::write(&lockb_path, b"LPMBfake").unwrap();
+
+    let client = Arc::new(RegistryClient::new());
+    let err = handle_tarball_not_found_with_recovery(
+        &client,
+        "overlap-pkg",
+        "1.0.0",
+        project_dir,
+        TarballNotFoundRecovery::PreserveProjectLockfiles,
+    );
+
+    assert!(lock_path.exists(), "overlap fetch must preserve lpm.lock");
+    assert!(lockb_path.exists(), "overlap fetch must preserve lpm.lockb");
+    assert!(matches!(err, LpmError::NotFound(ref msg) if msg.contains("overlap-pkg@1.0.0")));
 }
 
 /// The fast-path writeback trigger fires on v1 → v2 binary migration
