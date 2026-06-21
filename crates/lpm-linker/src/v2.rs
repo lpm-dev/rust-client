@@ -509,6 +509,36 @@ pub fn link_v2_one(
     Ok((mat, entry.freshly_populated))
 }
 
+/// Return a materialized package for an already-valid link entry.
+///
+/// This is a warm-relink fast path for callers that can use an existing
+/// `links/<graph-key>/` entry directly. It never populates from the object
+/// tree; `Ok(None)` means the caller should use [`link_v2_one`], which keeps
+/// the full object-validation and rebuild behavior.
+pub fn reuse_v2_one_if_valid(
+    plan: &LinkPlanV2,
+    target: &V2Target,
+    store: &Store,
+) -> Result<Option<(MaterializedPackage, VerifiedObjectTreeIntegrity)>, LpmError> {
+    let key = plan.key_map.get_for(&target.target).ok_or_else(|| {
+        LpmError::Store(format!(
+            "v2 linker: missing graph key for {}@{} (key map pre-pass failed)",
+            target.target.name, target.target.version
+        ))
+    })?;
+    let Some(entry) = store.reusable_link_entry_from_snapshots(key, &target.source_sri)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        MaterializedPackage {
+            name: target.target.name.clone(),
+            version: target.target.version.clone(),
+            destination: entry.package_dir,
+        },
+        entry.tree_integrity,
+    )))
+}
+
 /// Result handle for [`link_v2_finalize`] — separated from
 /// [`LinkResult`] so the caller assembles the final result with its
 /// own `linked` / `materialized` counts (which the per-package phase

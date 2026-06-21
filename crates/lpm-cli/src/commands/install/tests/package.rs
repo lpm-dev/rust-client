@@ -62,12 +62,14 @@ async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
     pkg.integrity = Some(sri);
     let key = install_pkg_key(&pkg);
 
-    let prevalidation = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
-        .await
-        .unwrap();
+    let prevalidation =
+        prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store), None, &HashMap::new())
+            .await
+            .unwrap();
 
     assert_eq!(prevalidation.candidate_count, 1);
     assert_eq!(prevalidation.hits.len(), 1);
+    assert!(prevalidation.ready_links.is_empty());
     assert!(prevalidation.concurrency >= 1);
     assert_eq!(prevalidation.validation_timings.checked_count, 1);
     assert_eq!(prevalidation.validation_timings.hit_count, 1);
@@ -78,6 +80,66 @@ async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
         .expect("prevalidation must return the v2 object hit");
     assert_eq!(hit.path, object_dir);
     assert!(hit.tree_integrity.as_str().starts_with("sha256-"));
+}
+
+#[tokio::test]
+async fn prevalidate_v2_reusable_objects_returns_ready_links_for_valid_link_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let store = lpm_store::v2::Store::at(dir.path().join("store"));
+    let tarball = build_minimal_tarball_with_pkg("ready-link", "1.0.0");
+    let (_, sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+    let target = lpm_linker::v2::V2Target {
+        target: LinkTarget {
+            name: "ready-link".to_string(),
+            version: "1.0.0".to_string(),
+            store_path: PathBuf::new(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            is_direct: true,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: lpm_linker::Materialization::CasBacked,
+            peers: Vec::new(),
+            patch_fingerprint: None,
+        },
+        source_sri: sri.clone(),
+        verified_object_tree_integrity: None,
+    };
+    let plan = std::sync::Arc::new(
+        lpm_linker::v2::link_v2_prepare(
+            &project_dir,
+            vec![target.clone()],
+            &store,
+            lpm_linker::LinkerMode::Isolated,
+        )
+        .unwrap(),
+    );
+    lpm_linker::v2::link_v2_one(&plan, &target, &store).unwrap();
+
+    let mut pkg = fake_pkg("ready-link", "1.0.0", true);
+    pkg.integrity = Some(sri);
+    let key = install_pkg_key(&pkg);
+    let mut targets = HashMap::new();
+    targets.insert(key.clone(), target);
+
+    let prevalidation =
+        prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store), Some(plan), &targets)
+            .await
+            .unwrap();
+
+    assert_eq!(prevalidation.candidate_count, 1);
+    assert!(prevalidation.hits.is_empty());
+    assert_eq!(prevalidation.ready_links.len(), 1);
+    assert_eq!(prevalidation.validation_timings.checked_count, 1);
+    assert_eq!(prevalidation.validation_timings.hit_count, 1);
+    let ready = prevalidation
+        .ready_links
+        .get(&key)
+        .expect("valid existing link entry must be returned as ready");
+    assert_eq!(ready.materialized.name, "ready-link");
+    assert!(!ready.freshly_populated);
 }
 
 #[tokio::test]
@@ -95,12 +157,14 @@ async fn prevalidate_v2_reusable_objects_removes_tampered_registry_objects() {
     let mut pkg = fake_pkg("tampered", "1.0.0", true);
     pkg.integrity = Some(sri);
 
-    let prevalidation = prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store))
-        .await
-        .unwrap();
+    let prevalidation =
+        prevalidate_v2_reusable_objects(&[pkg], std::sync::Arc::new(store), None, &HashMap::new())
+            .await
+            .unwrap();
 
     assert_eq!(prevalidation.candidate_count, 1);
     assert!(prevalidation.hits.is_empty());
+    assert!(prevalidation.ready_links.is_empty());
     assert_eq!(prevalidation.validation_timings.checked_count, 1);
     assert_eq!(prevalidation.validation_timings.miss_count, 1);
     assert_eq!(prevalidation.validation_timings.removed_count, 1);

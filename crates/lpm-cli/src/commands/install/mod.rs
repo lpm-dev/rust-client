@@ -171,6 +171,7 @@ fn record_timing_detail_ms(bucket: &mut u128, start: Option<Instant>) {
 
 struct V2ReusablePrevalidation {
     hits: HashMap<String, lpm_store::v2::ReusableObject>,
+    ready_links: HashMap<String, V2LinkTaskResult>,
     candidate_count: usize,
     concurrency: usize,
     validation_timings: V2ReusableValidationTimings,
@@ -183,6 +184,13 @@ struct V2LinkTaskResult {
 }
 
 type V2LinkHandle = tokio::task::JoinHandle<Result<V2LinkTaskResult, LpmError>>;
+
+struct V2PrevalidationCandidate {
+    key: String,
+    sri: String,
+    link_reuse_plan: Option<Arc<lpm_linker::v2::LinkPlanV2>>,
+    link_reuse_target: Option<lpm_linker::v2::V2Target>,
+}
 
 fn spawn_v2_link_task(
     plan: std::sync::Arc<lpm_linker::v2::LinkPlanV2>,
@@ -213,8 +221,10 @@ fn spawn_v2_link_task(
 async fn prevalidate_v2_reusable_objects(
     packages: &[InstallPackage],
     store_v2: Arc<lpm_store::v2::Store>,
+    link_reuse_plan: Option<Arc<lpm_linker::v2::LinkPlanV2>>,
+    link_reuse_targets: &HashMap<String, lpm_linker::v2::V2Target>,
 ) -> Result<V2ReusablePrevalidation, LpmError> {
-    let candidates: Vec<(String, String)> = packages
+    let candidates: Vec<V2PrevalidationCandidate> = packages
         .iter()
         .filter(|package| {
             !matches!(
@@ -223,16 +233,21 @@ async fn prevalidate_v2_reusable_objects(
             )
         })
         .filter_map(|package| {
-            Some((
-                install_pkg_key(package),
-                package.integrity.as_ref()?.clone(),
-            ))
+            let key = install_pkg_key(package);
+            let target = link_reuse_targets.get(&key).cloned();
+            Some(V2PrevalidationCandidate {
+                key,
+                sri: package.integrity.as_ref()?.clone(),
+                link_reuse_plan: link_reuse_plan.clone(),
+                link_reuse_target: target,
+            })
         })
         .collect();
 
     if candidates.is_empty() {
         return Ok(V2ReusablePrevalidation {
             hits: HashMap::new(),
+            ready_links: HashMap::new(),
             candidate_count: 0,
             concurrency: 0,
             validation_timings: V2ReusableValidationTimings::default(),
@@ -241,32 +256,78 @@ async fn prevalidate_v2_reusable_objects(
 
     let candidate_count = candidates.len();
     let concurrency = v2_cache_check_concurrency(candidate_count);
-    let mut checks = futures::stream::iter(candidates.into_iter().map(|(key, sri)| {
+    let mut checks = futures::stream::iter(candidates.into_iter().map(|candidate| {
         let store_v2 = Arc::clone(&store_v2);
         tokio::task::spawn_blocking(move || {
-            store_v2
-                .reusable_object_with_timings(&sri)
-                .map(|(hit, timings)| (key, hit, timings))
+            let (hit, timings) = store_v2.reusable_object_with_timings(&candidate.sri)?;
+            if let (Some(_), Some(plan), Some(target)) = (
+                hit.as_ref(),
+                candidate.link_reuse_plan.as_ref(),
+                candidate.link_reuse_target.as_ref(),
+            ) {
+                let start = Instant::now();
+                if let Some((materialized, _tree_integrity)) =
+                    lpm_linker::v2::reuse_v2_one_if_valid(plan, target, &store_v2)?
+                {
+                    return Ok::<V2PrevalidationCheck, LpmError>(V2PrevalidationCheck::ReadyLink {
+                        key: candidate.key,
+                        task: V2LinkTaskResult {
+                            materialized,
+                            freshly_populated: false,
+                            ms: start.elapsed().as_millis(),
+                        },
+                        timings,
+                    });
+                }
+            }
+            Ok::<V2PrevalidationCheck, LpmError>(V2PrevalidationCheck::Object {
+                key: candidate.key,
+                hit,
+                timings,
+            })
         })
     }))
     .buffer_unordered(concurrency);
 
     let mut hits = HashMap::with_capacity(candidate_count);
+    let mut ready_links = HashMap::new();
     let mut validation_timings = V2ReusableValidationTimings::default();
     while let Some(result) = checks.next().await {
-        let (key, hit, timings) = result
-            .map_err(|e| LpmError::Registry(format!("v2 cache check task panicked: {e}")))??;
-        validation_timings.record(timings, hit.is_some());
-        if let Some(hit) = hit {
-            hits.insert(key, hit);
+        match result
+            .map_err(|e| LpmError::Registry(format!("v2 cache check task panicked: {e}")))??
+        {
+            V2PrevalidationCheck::ReadyLink { key, task, timings } => {
+                validation_timings.record(timings, true);
+                ready_links.insert(key, task);
+            }
+            V2PrevalidationCheck::Object { key, hit, timings } => {
+                validation_timings.record(timings, hit.is_some());
+                if let Some(hit) = hit {
+                    hits.insert(key, hit);
+                }
+            }
         }
     }
     Ok(V2ReusablePrevalidation {
         hits,
+        ready_links,
         candidate_count,
         concurrency,
         validation_timings,
     })
+}
+
+enum V2PrevalidationCheck {
+    ReadyLink {
+        key: String,
+        task: V2LinkTaskResult,
+        timings: lpm_store::v2::ReusableObjectCheckTimings,
+    },
+    Object {
+        key: String,
+        hit: Option<lpm_store::v2::ReusableObject>,
+        timings: lpm_store::v2::ReusableObjectCheckTimings,
+    },
 }
 
 fn btree_from_hash_map(map: &HashMap<String, String>) -> BTreeMap<String, String> {
@@ -3326,15 +3387,23 @@ async fn run_with_options_under_store_lock(
         v2_target_by_key.len(),
     )));
     let mut v2_event_link_handles: Vec<V2LinkHandle> = Vec::new();
+    let mut v2_event_completed_link_results: Vec<V2LinkTaskResult> = Vec::new();
     fetch_stage_timings.plan_ms = fetch_plan_start.elapsed().as_millis();
     let v2_prevalidate_start = Instant::now();
     let v2_reusable_prevalidation = if !force && v2_mode {
         match store_v2_handle.as_ref() {
             Some(store_v2) => {
-                prevalidate_v2_reusable_objects(&packages, std::sync::Arc::clone(store_v2)).await?
+                prevalidate_v2_reusable_objects(
+                    &packages,
+                    std::sync::Arc::clone(store_v2),
+                    v2_plan.as_ref().map(std::sync::Arc::clone),
+                    &v2_target_by_key,
+                )
+                .await?
             }
             None => V2ReusablePrevalidation {
                 hits: HashMap::new(),
+                ready_links: HashMap::new(),
                 candidate_count: 0,
                 concurrency: 0,
                 validation_timings: V2ReusableValidationTimings::default(),
@@ -3343,6 +3412,7 @@ async fn run_with_options_under_store_lock(
     } else {
         V2ReusablePrevalidation {
             hits: HashMap::new(),
+            ready_links: HashMap::new(),
             candidate_count: 0,
             concurrency: 0,
             validation_timings: V2ReusableValidationTimings::default(),
@@ -3352,8 +3422,13 @@ async fn run_with_options_under_store_lock(
     fetch_stage_timings.v2_reusable_candidate_count =
         v2_reusable_prevalidation.candidate_count as u64;
     fetch_stage_timings.v2_reusable_concurrency = v2_reusable_prevalidation.concurrency as u64;
-    fetch_stage_timings.v2_reusable_hit_count = v2_reusable_prevalidation.hits.len() as u64;
+    fetch_stage_timings.v2_reusable_hit_count = v2_reusable_prevalidation
+        .hits
+        .len()
+        .saturating_add(v2_reusable_prevalidation.ready_links.len())
+        as u64;
     fetch_stage_timings.v2_reusable_validation = v2_reusable_prevalidation.validation_timings;
+    let mut v2_ready_link_results = v2_reusable_prevalidation.ready_links;
     let v2_reusable_objects = v2_reusable_prevalidation.hits;
 
     //b: stale-entry cleanup runs once, up front — must
@@ -3455,6 +3530,21 @@ async fn run_with_options_under_store_lock(
         // being a no-op (pre-4d drain) and broke under the wired-up
         // 4d spec path because every package was downloaded twice.
         let package_key = install_pkg_key(p);
+        if !force
+            && v2_mode
+            && !is_local_source
+            && let Some(task) = v2_ready_link_results.remove(&package_key)
+        {
+            let classification_start = timing_detail_start(fetch_detail_timing_enabled);
+            cached += 1;
+            v2_event_completed_link_results.push(task);
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_v2_reusable_hit_ms,
+                classification_start,
+            );
+            continue;
+        }
+
         if !force
             && v2_mode
             && !is_local_source
@@ -4773,9 +4863,25 @@ async fn run_with_options_under_store_lock(
             let plan = v2_plan
                 .as_ref()
                 .expect("v2_event_driven implies v2_plan is Some");
-            let mut materialized_all: Vec<MaterializedPackage> =
-                Vec::with_capacity(v2_event_link_handles.len());
+            let mut materialized_all: Vec<MaterializedPackage> = Vec::with_capacity(
+                v2_event_completed_link_results
+                    .len()
+                    .saturating_add(v2_event_link_handles.len()),
+            );
             let mut linked_count = 0usize;
+            for task in v2_event_completed_link_results.drain(..) {
+                let package_display = timing_detail_mode
+                    .trace()
+                    .then(|| format!("{}@{}", task.materialized.name, task.materialized.version));
+                v2_link_task_timings.record(task.ms, task.freshly_populated);
+                if let Some(package_display) = package_display.as_deref() {
+                    slow_package_timings.record_link_v2_one(package_display, task.ms);
+                }
+                if task.freshly_populated {
+                    linked_count += 1;
+                }
+                materialized_all.push(task.materialized);
+            }
             let link_await_start = Instant::now();
             for h in v2_event_link_handles.drain(..) {
                 let task = h
