@@ -42,6 +42,26 @@ impl VersionReq {
                 "{input}: contains unsupported semver range characters"
             )));
         }
+        if has_invalid_range_token(trimmed) {
+            return Err(LpmError::InvalidVersionRange(format!(
+                "{input}: invalid range token"
+            )));
+        }
+        if has_embedded_wildcard_range_operator(trimmed) {
+            return Err(LpmError::InvalidVersionRange(format!(
+                "{input}: invalid wildcard range"
+            )));
+        }
+        if has_malformed_wildcard_range_operator(trimmed) {
+            return Err(LpmError::InvalidVersionRange(format!(
+                "{input}: invalid wildcard range"
+            )));
+        }
+        if has_malformed_wildcard_comparator(trimmed) {
+            return Err(LpmError::InvalidVersionRange(format!(
+                "{input}: invalid wildcard comparator"
+            )));
+        }
         let parse_input = normalize_range_input(trimmed);
         let inner = node_semver::Range::parse(parse_input.as_ref())
             .map_err(|e| LpmError::InvalidVersionRange(format!("{input}: {e}")))?;
@@ -170,6 +190,112 @@ fn split_comparator(input: &str) -> (&'static str, &str) {
     ("", trimmed)
 }
 
+fn has_invalid_range_token(input: &str) -> bool {
+    input
+        .split("||")
+        .flat_map(str::split_whitespace)
+        .map(strip_range_operator)
+        .map(|token| split_comparator(token).1)
+        .filter(|operand| !operand.is_empty() && *operand != "-")
+        .any(|operand| {
+            operand
+                .bytes()
+                .all(|byte| !byte.is_ascii_alphanumeric() && byte != b'*')
+        })
+}
+
+fn has_embedded_wildcard_range_operator(input: &str) -> bool {
+    let has_disjunction = input.contains("||");
+    input.split("||").any(|disjunct| {
+        let mut tokens = disjunct.split_whitespace();
+        let Some(_first) = tokens.next() else {
+            return false;
+        };
+        let has_multiple_tokens = tokens.next().is_some();
+        (has_disjunction || has_multiple_tokens)
+            && disjunct
+                .split_whitespace()
+                .any(|token| is_tilde_wildcard(token) || is_caret_wildcard(token))
+    })
+}
+
+fn has_malformed_wildcard_range_operator(input: &str) -> bool {
+    for disjunct in input.split("||") {
+        let mut pending_range_operator = false;
+        for token in disjunct.split_whitespace() {
+            if pending_range_operator {
+                if starts_like_wildcard(token) {
+                    return true;
+                }
+                pending_range_operator = false;
+                continue;
+            }
+            let Some(operand) = range_operator_operand(token) else {
+                continue;
+            };
+            if operand.is_empty() {
+                pending_range_operator = true;
+                continue;
+            }
+            if is_malformed_wildcard_operand(operand) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn range_operator_operand(token: &str) -> Option<&str> {
+    token
+        .strip_prefix("~>")
+        .or_else(|| token.strip_prefix('^'))
+        .or_else(|| token.strip_prefix('~'))
+}
+
+fn has_malformed_wildcard_comparator(input: &str) -> bool {
+    for disjunct in input.split("||") {
+        let mut pending_operator = false;
+        for token in disjunct.split_whitespace() {
+            let token = strip_range_operator(token);
+            if pending_operator {
+                if is_malformed_wildcard_operand(token) {
+                    return true;
+                }
+                pending_operator = false;
+                continue;
+            }
+            let (operator, operand) = split_comparator(token);
+            if operator.is_empty() {
+                continue;
+            }
+            if operand.is_empty() {
+                pending_operator = true;
+                continue;
+            }
+            if is_malformed_wildcard_operand(operand) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn strip_range_operator(token: &str) -> &str {
+    let token = token.strip_prefix("~>").unwrap_or(token);
+    token
+        .strip_prefix('^')
+        .or_else(|| token.strip_prefix('~'))
+        .unwrap_or(token)
+}
+
+fn is_malformed_wildcard_operand(input: &str) -> bool {
+    starts_like_wildcard(input) && parse_wildcard_partial(input).is_none()
+}
+
+fn starts_like_wildcard(input: &str) -> bool {
+    matches!(input.as_bytes().first(), Some(b'*' | b'x' | b'X'))
+}
+
 struct WildcardPartial {
     major: WildcardPart,
     minor: Option<WildcardPart>,
@@ -250,12 +376,30 @@ fn parse_wildcard_partial(input: &str) -> Option<WildcardPartial> {
     if parts.next().is_some() {
         return None;
     }
+    if !wildcard_hierarchy_is_valid(major, minor, patch) {
+        return None;
+    }
 
     Some(WildcardPartial {
         major,
         minor,
         patch,
     })
+}
+
+fn wildcard_hierarchy_is_valid(
+    major: WildcardPart,
+    minor: Option<WildcardPart>,
+    patch: Option<WildcardPart>,
+) -> bool {
+    if matches!(major, WildcardPart::Wildcard) {
+        return minor.is_none_or(|part| matches!(part, WildcardPart::Wildcard))
+            && patch.is_none_or(|part| matches!(part, WildcardPart::Wildcard));
+    }
+    if matches!(minor, Some(WildcardPart::Wildcard)) {
+        return patch.is_none_or(|part| matches!(part, WildcardPart::Wildcard));
+    }
+    true
 }
 
 fn parse_wildcard_part(part: &str) -> Option<WildcardPart> {
@@ -532,6 +676,16 @@ mod tests {
     #[test]
     fn reject_invalid_range() {
         assert!(VersionReq::parse("not a range at all!!!").is_err());
+    }
+
+    #[test]
+    fn malformed_wildcard_range_returns_error() {
+        assert!(VersionReq::parse("=xx").is_err());
+        assert!(VersionReq::parse("^1.0.0 ||=*3").is_err());
+        assert!(VersionReq::parse("=x.1.00 .00 1 1").is_err());
+        assert!(VersionReq::parse(". ~x\n").is_err());
+        assert!(VersionReq::parse("~X0^.00").is_err());
+        assert!(VersionReq::parse("~\tx~x\n\n").is_err());
     }
 
     // --- Display ---
