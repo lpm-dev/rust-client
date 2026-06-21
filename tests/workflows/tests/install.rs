@@ -2030,6 +2030,104 @@ async fn install_experimental_spike_live_graph_does_not_write_install_hash() {
 }
 
 #[tokio::test]
+async fn install_experimental_spike_live_graph_preserves_platform_skipped_optional_descendants() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-platform-parent",
+            "version": "1.0.0",
+            "optionalDependencies": {
+                "optional-wasm-child": "1.0.0"
+            }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-wasm-child",
+            "version": "1.0.0",
+            "cpu": ["wasm32"],
+            "dependencies": {
+                "optional-runtime": "1.0.0"
+            }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-runtime",
+            "version": "1.0.0",
+            "dependencies": {
+                "tslib": "1.0.0"
+            }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "tslib",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "spike-live-platform-skipped-optional-descendants",
+            "version": "1.0.0",
+            "dependencies": {
+                "optional-platform-parent": "1.0.0"
+            }
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run experimental installer spike");
+
+    assert!(
+        output.status.success(),
+        "experimental live install must preserve descendants of platform-skipped optional packages under parity deny\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("experimental install --json must emit valid JSON: {e}\n---\n{stdout}")
+    });
+    let parity = &envelope["timing"]["experimental_installer_spike"]["parity"];
+    assert_eq!(parity["matches"], serde_json::json!(true));
+    assert_eq!(parity["candidate_count"], serde_json::json!(3));
+    assert_eq!(parity["baseline_count"], serde_json::json!(3));
+
+    let package_names: std::collections::HashSet<&str> = envelope["packages"]
+        .as_array()
+        .expect("packages must be an array")
+        .iter()
+        .filter_map(|package| package["name"].as_str())
+        .collect();
+    assert!(package_names.contains("optional-platform-parent"));
+    assert!(package_names.contains("optional-runtime"));
+    assert!(package_names.contains("tslib"));
+    assert!(!package_names.contains("optional-wasm-child"));
+}
+
+#[tokio::test]
 async fn install_experimental_spike_live_graph_accepts_overrides_with_parity_deny() {
     let mock = MockRegistry::start().await;
     mock.with_full_package_metadata(
