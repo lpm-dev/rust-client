@@ -187,9 +187,54 @@ struct ResolveRequest {
     target_name: String,
     range: String,
     parent: Option<PackageIdentity>,
+    root_ancestor: String,
+    depth: u16,
     optional: bool,
     root: bool,
     direct: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MetadataRequestContext {
+    package: String,
+    parent: Option<String>,
+    root_ancestor: String,
+    depth: u16,
+    optional: bool,
+    direct: bool,
+    root: bool,
+    reason: &'static str,
+}
+
+impl MetadataRequestContext {
+    fn from_request(request: &ResolveRequest) -> Self {
+        Self {
+            package: request.target_name.clone(),
+            parent: request
+                .parent
+                .as_ref()
+                .map(|(name, version)| format!("{name}@{version}")),
+            root_ancestor: request.root_ancestor.clone(),
+            depth: request.depth,
+            optional: request.optional,
+            direct: request.direct,
+            root: request.root,
+            reason: "resolve",
+        }
+    }
+
+    fn peer_plan(package: &str) -> Self {
+        Self {
+            package: package.to_string(),
+            parent: None,
+            root_ancestor: package.to_string(),
+            depth: 0,
+            optional: false,
+            direct: false,
+            root: true,
+            reason: "peer-plan",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -261,8 +306,26 @@ struct InstallerSpikeStats {
     fetch_dispatched: u64,
 }
 
+#[derive(Debug, Clone)]
+struct MetadataTraceRecord {
+    context: MetadataRequestContext,
+    timings: lpm_resolver::ExperimentalMetadataFetchTimings,
+    queued_at_ms: u128,
+    completed_at_ms: u128,
+}
+
 #[derive(Debug, Default)]
+struct MetadataWaveStats {
+    initial_fetches: u64,
+    fetch_sum_ms: u64,
+    fetch_max_ms: u64,
+    completed_max_ms: u64,
+    body_bytes: u64,
+}
+
+#[derive(Debug)]
 struct MetadataStats {
+    started_at: Instant,
     calls: AtomicU64,
     ready_hits: AtomicU64,
     initial_fetches: AtomicU64,
@@ -290,25 +353,68 @@ struct MetadataStats {
     route_lpm_worker: AtomicU64,
     route_custom: AtomicU64,
     route_lpm: AtomicU64,
-    slow_metadata_by_total: std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
-    slow_metadata_by_raw_fetch:
-        std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
-    slow_metadata_by_cache_read:
-        std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
-    slow_metadata_by_http: std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
-    slow_metadata_by_body_read:
-        std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
-    slow_metadata_by_json_decode:
-        std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
-    slow_metadata_by_cache_write:
-        std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
-    slow_metadata_by_cache_info_parse:
-        std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
-    slow_metadata_by_policy_release_time:
-        std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
+    waves_by_depth: std::sync::Mutex<BTreeMap<u16, MetadataWaveStats>>,
+    slow_metadata_by_total: std::sync::Mutex<Vec<MetadataTraceRecord>>,
+    slow_metadata_by_completed_at: std::sync::Mutex<Vec<MetadataTraceRecord>>,
+    slow_metadata_by_raw_fetch: std::sync::Mutex<Vec<MetadataTraceRecord>>,
+    slow_metadata_by_cache_read: std::sync::Mutex<Vec<MetadataTraceRecord>>,
+    slow_metadata_by_http: std::sync::Mutex<Vec<MetadataTraceRecord>>,
+    slow_metadata_by_body_read: std::sync::Mutex<Vec<MetadataTraceRecord>>,
+    slow_metadata_by_json_decode: std::sync::Mutex<Vec<MetadataTraceRecord>>,
+    slow_metadata_by_cache_write: std::sync::Mutex<Vec<MetadataTraceRecord>>,
+    slow_metadata_by_cache_info_parse: std::sync::Mutex<Vec<MetadataTraceRecord>>,
+    slow_metadata_by_policy_release_time: std::sync::Mutex<Vec<MetadataTraceRecord>>,
 }
 
 impl MetadataStats {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            calls: AtomicU64::new(0),
+            ready_hits: AtomicU64::new(0),
+            initial_fetches: AtomicU64::new(0),
+            queue_wait_sum_ms: AtomicU64::new(0),
+            queue_wait_max_ms: AtomicU64::new(0),
+            fetch_sum_ms: AtomicU64::new(0),
+            fetch_max_ms: AtomicU64::new(0),
+            raw_fetch_sum_ms: AtomicU64::new(0),
+            raw_fetch_max_ms: AtomicU64::new(0),
+            cache_read_sum_ms: AtomicU64::new(0),
+            validator_read_sum_ms: AtomicU64::new(0),
+            http_sum_ms: AtomicU64::new(0),
+            body_read_sum_ms: AtomicU64::new(0),
+            json_decode_sum_ms: AtomicU64::new(0),
+            cache_after_304_sum_ms: AtomicU64::new(0),
+            cache_write_dispatch_sum_ms: AtomicU64::new(0),
+            cache_info_parse_sum_ms: AtomicU64::new(0),
+            policy_release_time_sum_ms: AtomicU64::new(0),
+            policy_full_metadata_sum_ms: AtomicU64::new(0),
+            body_bytes_sum: AtomicU64::new(0),
+            version_count_sum: AtomicU64::new(0),
+            registry_cache_hits: AtomicU64::new(0),
+            registry_not_modified: AtomicU64::new(0),
+            route_npm_direct: AtomicU64::new(0),
+            route_lpm_worker: AtomicU64::new(0),
+            route_custom: AtomicU64::new(0),
+            route_lpm: AtomicU64::new(0),
+            waves_by_depth: std::sync::Mutex::new(BTreeMap::new()),
+            slow_metadata_by_total: std::sync::Mutex::new(Vec::new()),
+            slow_metadata_by_completed_at: std::sync::Mutex::new(Vec::new()),
+            slow_metadata_by_raw_fetch: std::sync::Mutex::new(Vec::new()),
+            slow_metadata_by_cache_read: std::sync::Mutex::new(Vec::new()),
+            slow_metadata_by_http: std::sync::Mutex::new(Vec::new()),
+            slow_metadata_by_body_read: std::sync::Mutex::new(Vec::new()),
+            slow_metadata_by_json_decode: std::sync::Mutex::new(Vec::new()),
+            slow_metadata_by_cache_write: std::sync::Mutex::new(Vec::new()),
+            slow_metadata_by_cache_info_parse: std::sync::Mutex::new(Vec::new()),
+            slow_metadata_by_policy_release_time: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started_at.elapsed().as_millis()
+    }
+
     fn record_queue_wait(&self, ms: u128) {
         let ms = u128_to_u64_saturating(ms);
         self.queue_wait_sum_ms.fetch_add(ms, Ordering::Relaxed);
@@ -321,7 +427,14 @@ impl MetadataStats {
         atomic_max(&self.fetch_max_ms, ms);
     }
 
-    fn record_detail(&self, timings: lpm_resolver::ExperimentalMetadataFetchTimings, trace: bool) {
+    fn record_detail(
+        &self,
+        context: MetadataRequestContext,
+        timings: lpm_resolver::ExperimentalMetadataFetchTimings,
+        queued_at_ms: u128,
+        completed_at_ms: u128,
+        trace: bool,
+    ) {
         self.raw_fetch_sum_ms.fetch_add(
             u128_to_u64_saturating(timings.raw_fetch_ms),
             Ordering::Relaxed,
@@ -386,57 +499,88 @@ impl MetadataStats {
             _ => 0,
         };
 
+        self.record_wave(&context, &timings, completed_at_ms);
         if trace {
-            Self::record_slow_metadata(&self.slow_metadata_by_total, &timings, |entry| {
-                entry.total_ms
+            let record = MetadataTraceRecord {
+                context,
+                timings,
+                queued_at_ms,
+                completed_at_ms,
+            };
+            Self::record_slow_metadata(&self.slow_metadata_by_total, &record, |entry| {
+                entry.timings.total_ms
             });
-            Self::record_slow_metadata(&self.slow_metadata_by_raw_fetch, &timings, |entry| {
-                entry.raw_fetch_ms
+            Self::record_slow_metadata(&self.slow_metadata_by_completed_at, &record, |entry| {
+                entry.completed_at_ms
             });
-            Self::record_slow_metadata(&self.slow_metadata_by_cache_read, &timings, |entry| {
-                entry.cache_read_ms
+            Self::record_slow_metadata(&self.slow_metadata_by_raw_fetch, &record, |entry| {
+                entry.timings.raw_fetch_ms
             });
-            Self::record_slow_metadata(&self.slow_metadata_by_http, &timings, |entry| {
-                entry.http_ms
+            Self::record_slow_metadata(&self.slow_metadata_by_cache_read, &record, |entry| {
+                entry.timings.cache_read_ms
             });
-            Self::record_slow_metadata(&self.slow_metadata_by_body_read, &timings, |entry| {
-                entry.body_read_ms
+            Self::record_slow_metadata(&self.slow_metadata_by_http, &record, |entry| {
+                entry.timings.http_ms
             });
-            Self::record_slow_metadata(&self.slow_metadata_by_json_decode, &timings, |entry| {
-                entry.json_decode_ms
+            Self::record_slow_metadata(&self.slow_metadata_by_body_read, &record, |entry| {
+                entry.timings.body_read_ms
             });
-            Self::record_slow_metadata(&self.slow_metadata_by_cache_write, &timings, |entry| {
-                entry.cache_write_dispatch_ms
+            Self::record_slow_metadata(&self.slow_metadata_by_json_decode, &record, |entry| {
+                entry.timings.json_decode_ms
             });
-            Self::record_slow_metadata(
-                &self.slow_metadata_by_cache_info_parse,
-                &timings,
-                |entry| entry.cache_info_parse_ms,
-            );
+            Self::record_slow_metadata(&self.slow_metadata_by_cache_write, &record, |entry| {
+                entry.timings.cache_write_dispatch_ms
+            });
+            Self::record_slow_metadata(&self.slow_metadata_by_cache_info_parse, &record, |entry| {
+                entry.timings.cache_info_parse_ms
+            });
             Self::record_slow_metadata(
                 &self.slow_metadata_by_policy_release_time,
-                &timings,
-                |entry| entry.policy_release_time_ms,
+                &record,
+                |entry| entry.timings.policy_release_time_ms,
             );
         }
     }
 
-    fn record_slow_metadata(
-        bucket: &std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
+    fn record_wave(
+        &self,
+        context: &MetadataRequestContext,
         timings: &lpm_resolver::ExperimentalMetadataFetchTimings,
-        rank_ms: impl Fn(&lpm_resolver::ExperimentalMetadataFetchTimings) -> u128 + Copy,
+        completed_at_ms: u128,
     ) {
-        if rank_ms(timings) == 0 {
+        let Ok(mut waves) = self.waves_by_depth.lock() else {
+            return;
+        };
+        let wave = waves.entry(context.depth).or_default();
+        wave.initial_fetches = wave.initial_fetches.saturating_add(1);
+        wave.fetch_sum_ms = wave
+            .fetch_sum_ms
+            .saturating_add(u128_to_u64_saturating(timings.total_ms));
+        wave.fetch_max_ms = wave
+            .fetch_max_ms
+            .max(u128_to_u64_saturating(timings.total_ms));
+        wave.completed_max_ms = wave
+            .completed_max_ms
+            .max(u128_to_u64_saturating(completed_at_ms));
+        wave.body_bytes = wave.body_bytes.saturating_add(timings.body_bytes);
+    }
+
+    fn record_slow_metadata(
+        bucket: &std::sync::Mutex<Vec<MetadataTraceRecord>>,
+        record: &MetadataTraceRecord,
+        rank_ms: impl Fn(&MetadataTraceRecord) -> u128 + Copy,
+    ) {
+        if rank_ms(record) == 0 {
             return;
         }
         let Ok(mut bucket) = bucket.lock() else {
             return;
         };
-        bucket.push(timings.clone());
+        bucket.push(record.clone());
         bucket.sort_unstable_by(|a, b| {
             rank_ms(b)
                 .cmp(&rank_ms(a))
-                .then_with(|| a.package.cmp(&b.package))
+                .then_with(|| a.timings.package.cmp(&b.timings.package))
         });
         bucket.truncate(10);
     }
@@ -458,6 +602,7 @@ impl MetadataStats {
                 "sum_ms": self.fetch_sum_ms.load(Ordering::Relaxed),
                 "max_ms": self.fetch_max_ms.load(Ordering::Relaxed),
             },
+            "waves_by_depth": Self::waves_json(&self.waves_by_depth),
             "attribution": {
                 "raw_fetch_sum_ms": self.raw_fetch_sum_ms.load(Ordering::Relaxed),
                 "raw_fetch_max_ms": self.raw_fetch_max_ms.load(Ordering::Relaxed),
@@ -486,6 +631,7 @@ impl MetadataStats {
         if trace {
             json["slow_metadata"] = serde_json::json!({
                 "by_total": Self::slow_metadata_json(&self.slow_metadata_by_total),
+                "by_completed_at": Self::slow_metadata_json(&self.slow_metadata_by_completed_at),
                 "by_raw_fetch": Self::slow_metadata_json(&self.slow_metadata_by_raw_fetch),
                 "by_cache_read": Self::slow_metadata_json(&self.slow_metadata_by_cache_read),
                 "by_http": Self::slow_metadata_json(&self.slow_metadata_by_http),
@@ -499,8 +645,31 @@ impl MetadataStats {
         json
     }
 
+    fn waves_json(
+        bucket: &std::sync::Mutex<BTreeMap<u16, MetadataWaveStats>>,
+    ) -> serde_json::Value {
+        let Ok(bucket) = bucket.lock() else {
+            return serde_json::Value::Array(Vec::new());
+        };
+        serde_json::Value::Array(
+            bucket
+                .iter()
+                .map(|(depth, stats)| {
+                    serde_json::json!({
+                        "depth": depth,
+                        "initial_fetches": stats.initial_fetches,
+                        "fetch_sum_ms": stats.fetch_sum_ms,
+                        "fetch_max_ms": stats.fetch_max_ms,
+                        "completed_max_ms": stats.completed_max_ms,
+                        "body_bytes": stats.body_bytes,
+                    })
+                })
+                .collect(),
+        )
+    }
+
     fn slow_metadata_json(
-        bucket: &std::sync::Mutex<Vec<lpm_resolver::ExperimentalMetadataFetchTimings>>,
+        bucket: &std::sync::Mutex<Vec<MetadataTraceRecord>>,
     ) -> serde_json::Value {
         let Ok(bucket) = bucket.lock() else {
             return serde_json::Value::Array(Vec::new());
@@ -509,25 +678,35 @@ impl MetadataStats {
             bucket
                 .iter()
                 .map(|entry| {
+                    let timings = &entry.timings;
                     serde_json::json!({
-                        "package": entry.package,
-                        "route": entry.route,
-                        "total_ms": entry.total_ms,
-                        "raw_fetch_ms": entry.raw_fetch_ms,
-                        "cache_read_ms": entry.cache_read_ms,
-                        "validator_read_ms": entry.validator_read_ms,
-                        "http_ms": entry.http_ms,
-                        "body_read_ms": entry.body_read_ms,
-                        "json_decode_ms": entry.json_decode_ms,
-                        "cache_after_304_ms": entry.cache_after_304_ms,
-                        "cache_write_dispatch_ms": entry.cache_write_dispatch_ms,
-                        "cache_info_parse_ms": entry.cache_info_parse_ms,
-                        "policy_release_time_ms": entry.policy_release_time_ms,
-                        "policy_full_metadata_ms": entry.policy_full_metadata_ms,
-                        "body_bytes": entry.body_bytes,
-                        "version_count": entry.version_count,
-                        "cache_hit": entry.cache_hit,
-                        "not_modified": entry.not_modified,
+                        "package": timings.package,
+                        "route": timings.route,
+                        "total_ms": timings.total_ms,
+                        "raw_fetch_ms": timings.raw_fetch_ms,
+                        "cache_read_ms": timings.cache_read_ms,
+                        "validator_read_ms": timings.validator_read_ms,
+                        "http_ms": timings.http_ms,
+                        "body_read_ms": timings.body_read_ms,
+                        "json_decode_ms": timings.json_decode_ms,
+                        "cache_after_304_ms": timings.cache_after_304_ms,
+                        "cache_write_dispatch_ms": timings.cache_write_dispatch_ms,
+                        "cache_info_parse_ms": timings.cache_info_parse_ms,
+                        "policy_release_time_ms": timings.policy_release_time_ms,
+                        "policy_full_metadata_ms": timings.policy_full_metadata_ms,
+                        "body_bytes": timings.body_bytes,
+                        "version_count": timings.version_count,
+                        "cache_hit": timings.cache_hit,
+                        "not_modified": timings.not_modified,
+                        "queued_at_ms": entry.queued_at_ms,
+                        "completed_at_ms": entry.completed_at_ms,
+                        "depth": entry.context.depth,
+                        "root_ancestor": entry.context.root_ancestor,
+                        "parent": entry.context.parent,
+                        "optional": entry.context.optional,
+                        "direct": entry.context.direct,
+                        "root": entry.context.root,
+                        "reason": entry.context.reason,
                     })
                 })
                 .collect(),
@@ -701,12 +880,12 @@ pub(super) async fn run(
     let fetch_extract_limiter = configured_fetch_extract_limiter(store_v2_handle.is_some());
     let metadata_queue = Arc::new(Semaphore::new(metadata_concurrency));
     let metadata_cache: MetadataCache = Arc::new(dashmap::DashMap::new());
-    let metadata_stats = Arc::new(MetadataStats::default());
     let store = PackageStore::from_root(lpm_root);
     let gate_stats = Arc::new(GateStats::default());
 
     let setup_ms = start.elapsed().as_millis();
     let resolve_start = Instant::now();
+    let metadata_stats = Arc::new(MetadataStats::new(resolve_start));
     let mut stats = InstallerSpikeStats::default();
     let mut stage_timings = InstallerSpikeStageTimings::default();
     let mut fetch_handles: HashMap<String, FetchHandle> = HashMap::new();
@@ -1596,9 +1775,11 @@ fn root_resolve_requests(deps: &HashMap<String, String>) -> Vec<ResolveRequest> 
         let (target_name, range) = parse_alias_target(local_name, range);
         requests.push(ResolveRequest {
             local_name: local_name.clone(),
+            root_ancestor: target_name.clone(),
             target_name,
             range,
             parent: None,
+            depth: 0,
             optional: false,
             root: true,
             direct: true,
@@ -1623,8 +1804,9 @@ async fn resolve_node(
     metadata_stats: Arc<MetadataStats>,
     resolver_policy: lpm_resolver::ResolverPolicy,
 ) -> Result<NodeResolution, LpmError> {
+    let context = MetadataRequestContext::from_request(&request);
     let info = metadata_for_package(
-        &request.target_name,
+        context,
         client,
         route_table,
         metadata_cache,
@@ -1637,7 +1819,7 @@ async fn resolve_node(
 }
 
 async fn metadata_for_package(
-    name: &str,
+    context: MetadataRequestContext,
     client: Arc<RegistryClient>,
     route_table: RouteTable,
     metadata_cache: MetadataCache,
@@ -1646,15 +1828,17 @@ async fn metadata_for_package(
     resolver_policy: lpm_resolver::ResolverPolicy,
 ) -> Result<Arc<lpm_resolver::CachedPackageInfo>, LpmError> {
     metadata_stats.calls.fetch_add(1, Ordering::Relaxed);
+    let queued_at_ms = metadata_stats.elapsed_ms();
+    let name = context.package.clone();
     let cell = metadata_cache
-        .entry(name.to_string())
+        .entry(name.clone())
         .or_insert_with(|| Arc::new(OnceCell::new()))
         .clone();
     if cell.get().is_some() {
         metadata_stats.ready_hits.fetch_add(1, Ordering::Relaxed);
     }
-    let name = name.to_string();
     let metadata_stats_for_init = Arc::clone(&metadata_stats);
+    let trace = TimingDetailMode::from_env().trace();
     cell.get_or_try_init(|| async move {
         metadata_stats_for_init
             .initial_fetches
@@ -1677,7 +1861,14 @@ async fn metadata_for_package(
             .await
             .map_err(crate::resolver_error::resolver_error_to_lpm)?;
         metadata_stats_for_init.record_fetch(fetch_start.elapsed().as_millis());
-        metadata_stats_for_init.record_detail(timings, TimingDetailMode::from_env().trace());
+        let completed_at_ms = metadata_stats_for_init.elapsed_ms();
+        metadata_stats_for_init.record_detail(
+            context,
+            timings,
+            queued_at_ms,
+            completed_at_ms,
+            trace,
+        );
         Ok(info)
     })
     .await
@@ -2028,9 +2219,11 @@ fn enqueue_dependencies(
         }
         let request = ResolveRequest {
             local_name: local_name.clone(),
+            root_ancestor: node.request.root_ancestor.clone(),
             target_name,
             range: range.clone(),
             parent: parent.clone(),
+            depth: node.request.depth.saturating_add(1),
             optional,
             root: false,
             direct: false,
@@ -2181,9 +2374,11 @@ async fn drain_ambient_peer_installs(
             pending.push(Box::pin(resolve_node(
                 ResolveRequest {
                     local_name: plan.target_name.clone(),
+                    root_ancestor: plan.target_name.clone(),
                     target_name: plan.target_name,
                     range: plan.version,
                     parent: None,
+                    depth: 0,
                     optional: false,
                     root: true,
                     direct: false,
@@ -2306,7 +2501,7 @@ async fn ambient_peer_plans(
             continue;
         }
         let info = metadata_for_package(
-            &target_name,
+            MetadataRequestContext::peer_plan(&target_name),
             Arc::clone(client),
             route_table.clone(),
             Arc::clone(metadata_cache),
@@ -3215,6 +3410,31 @@ mod tests {
         }
     }
 
+    fn resolve_request_for_test(
+        name: &str,
+        range: &str,
+        parent: Option<PackageIdentity>,
+        root: bool,
+        direct: bool,
+    ) -> ResolveRequest {
+        let depth = if root { 0 } else { 1 };
+        let root_ancestor = parent
+            .as_ref()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| name.to_string());
+        ResolveRequest {
+            local_name: name.to_string(),
+            target_name: name.to_string(),
+            range: range.to_string(),
+            parent,
+            root_ancestor,
+            depth,
+            optional: false,
+            root,
+            direct,
+        }
+    }
+
     fn package_set_for_completion_order(
         requests: Vec<ResolveRequest>,
         info: Arc<lpm_resolver::CachedPackageInfo>,
@@ -3290,9 +3510,21 @@ mod tests {
 
     #[test]
     fn metadata_stats_reports_attribution_sums_and_trace_rows() {
-        let stats = MetadataStats::default();
-        stats.record_detail(fake_metadata_timing("fast", 10, 8, 5, 1, 2), true);
-        stats.record_detail(fake_metadata_timing("slow", 40, 30, 20, 7, 11), true);
+        let stats = MetadataStats::new(Instant::now());
+        stats.record_detail(
+            MetadataRequestContext::peer_plan("fast"),
+            fake_metadata_timing("fast", 10, 8, 5, 1, 2),
+            1,
+            11,
+            true,
+        );
+        stats.record_detail(
+            MetadataRequestContext::peer_plan("slow"),
+            fake_metadata_timing("slow", 40, 30, 20, 7, 11),
+            12,
+            55,
+            true,
+        );
 
         let json = stats.to_json(true);
 
@@ -3311,6 +3543,14 @@ mod tests {
             Some("slow")
         );
         assert_eq!(
+            json["slow_metadata"]["by_completed_at"][0]["completed_at_ms"].as_u64(),
+            Some(55)
+        );
+        assert_eq!(
+            json["slow_metadata"]["by_total"][0]["root_ancestor"].as_str(),
+            Some("slow")
+        );
+        assert_eq!(
             json["slow_metadata"]["by_cache_info_parse"][0]["package"].as_str(),
             Some("slow")
         );
@@ -3322,8 +3562,14 @@ mod tests {
 
     #[test]
     fn metadata_stats_omits_slow_rows_without_trace() {
-        let stats = MetadataStats::default();
-        stats.record_detail(fake_metadata_timing("slow", 40, 30, 20, 7, 11), false);
+        let stats = MetadataStats::new(Instant::now());
+        stats.record_detail(
+            MetadataRequestContext::peer_plan("slow"),
+            fake_metadata_timing("slow", 40, 30, 20, 7, 11),
+            0,
+            40,
+            false,
+        );
 
         let json = stats.to_json(false);
 
@@ -3342,15 +3588,13 @@ mod tests {
             ("child".to_string(), "1.2.3".to_string()),
             fake_draft("child", "1.2.3", &[]),
         );
-        let request = ResolveRequest {
-            local_name: "child".to_string(),
-            target_name: "child".to_string(),
-            range: "^1.0.0".to_string(),
-            parent: Some(("parent".to_string(), "1.0.0".to_string())),
-            optional: false,
-            root: false,
-            direct: false,
-        };
+        let request = resolve_request_for_test(
+            "child",
+            "^1.0.0",
+            Some(("parent".to_string(), "1.0.0".to_string())),
+            false,
+            false,
+        );
 
         attach_reused_dependency_edge(&mut packages, &request, "1.2.3").unwrap();
 
@@ -3370,15 +3614,13 @@ mod tests {
         let mut child = fake_draft("child", "1.2.3", &[]);
         child.package.optional = true;
         packages.insert(("child".to_string(), "1.2.3".to_string()), child);
-        let request = ResolveRequest {
-            local_name: "child".to_string(),
-            target_name: "child".to_string(),
-            range: "^1.0.0".to_string(),
-            parent: Some(("parent".to_string(), "1.0.0".to_string())),
-            optional: false,
-            root: false,
-            direct: false,
-        };
+        let request = resolve_request_for_test(
+            "child",
+            "^1.0.0",
+            Some(("parent".to_string(), "1.0.0".to_string())),
+            false,
+            false,
+        );
 
         assert!(!inline_reuse_can_preserve_optional_state(&packages, &request, "1.2.3").unwrap());
     }
@@ -3518,24 +3760,20 @@ mod tests {
     #[test]
     fn package_parity_catches_completion_order_dependent_reuse() {
         let info = Arc::new(info_with_versions(&["1.9.0", "1.0.5", "1.0.0"]));
-        let narrow = ResolveRequest {
-            local_name: "shared".to_string(),
-            target_name: "shared".to_string(),
-            range: "~1.0.0".to_string(),
-            parent: Some(("narrow-parent".to_string(), "1.0.0".to_string())),
-            optional: false,
-            root: false,
-            direct: false,
-        };
-        let broad = ResolveRequest {
-            local_name: "shared".to_string(),
-            target_name: "shared".to_string(),
-            range: "^1.0.0".to_string(),
-            parent: Some(("broad-parent".to_string(), "1.0.0".to_string())),
-            optional: false,
-            root: false,
-            direct: false,
-        };
+        let narrow = resolve_request_for_test(
+            "shared",
+            "~1.0.0",
+            Some(("narrow-parent".to_string(), "1.0.0".to_string())),
+            false,
+            false,
+        );
+        let broad = resolve_request_for_test(
+            "shared",
+            "^1.0.0",
+            Some(("broad-parent".to_string(), "1.0.0".to_string())),
+            false,
+            false,
+        );
 
         let narrow_first = package_set_for_completion_order(
             vec![narrow.clone(), broad.clone()],
@@ -3568,15 +3806,13 @@ mod tests {
             ("dep".to_string(), "2.0.0".to_string()),
             fake_draft("dep", "2.0.0", &[]),
         );
-        let request = ResolveRequest {
-            local_name: "dep".to_string(),
-            target_name: "dep".to_string(),
-            range: "^1.0.0".to_string(),
-            parent: Some(("parent".to_string(), "1.0.0".to_string())),
-            optional: false,
-            root: false,
-            direct: false,
-        };
+        let request = resolve_request_for_test(
+            "dep",
+            "^1.0.0",
+            Some(("parent".to_string(), "1.0.0".to_string())),
+            false,
+            false,
+        );
 
         let selected = reusable_existing_version(&request, &packages).unwrap();
 
@@ -3590,15 +3826,7 @@ mod tests {
             ("dep".to_string(), "1.0.0".to_string()),
             fake_draft("dep", "1.0.0", &[]),
         );
-        let request = ResolveRequest {
-            local_name: "dep".to_string(),
-            target_name: "dep".to_string(),
-            range: "^1.0.0".to_string(),
-            parent: None,
-            optional: false,
-            root: true,
-            direct: true,
-        };
+        let request = resolve_request_for_test("dep", "^1.0.0", None, true, true);
 
         let selected = reusable_existing_version(&request, &packages).unwrap();
 
@@ -3616,15 +3844,13 @@ mod tests {
             ("dep".to_string(), "1.5.0".to_string()),
             fake_draft("dep", "1.5.0", &[]),
         );
-        let request = ResolveRequest {
-            local_name: "dep".to_string(),
-            target_name: "dep".to_string(),
-            range: "^1.0.0".to_string(),
-            parent: Some(("parent".to_string(), "1.0.0".to_string())),
-            optional: false,
-            root: false,
-            direct: false,
-        };
+        let request = resolve_request_for_test(
+            "dep",
+            "^1.0.0",
+            Some(("parent".to_string(), "1.0.0".to_string())),
+            false,
+            false,
+        );
         let info = Arc::new(info_with_versions(&["1.5.0", "1.0.0"]));
         let overrides = override_set("dep", "1.5.0");
 
@@ -3650,15 +3876,13 @@ mod tests {
             ("ajv".to_string(), "8.20.0".to_string()),
             fake_draft("ajv", "8.20.0", &[]),
         );
-        let request = ResolveRequest {
-            local_name: "ajv".to_string(),
-            target_name: "ajv".to_string(),
-            range: "^8.0.0".to_string(),
-            parent: Some(("schema-utils".to_string(), "4.3.3".to_string())),
-            optional: false,
-            root: false,
-            direct: false,
-        };
+        let request = resolve_request_for_test(
+            "ajv",
+            "^8.0.0",
+            Some(("schema-utils".to_string(), "4.3.3".to_string())),
+            false,
+            false,
+        );
         let info = Arc::new(info_with_versions(&["8.20.0", "8.18.0"]));
         let overrides = override_set("schema-utils>ajv", "8.18.0");
 
