@@ -102,8 +102,10 @@ pub type VerifyLinkEntry = (PathBuf, Result<LinkMeta, LpmError>);
 /// `node_modules/` sub-name inside each `links/<graph-key>/` entry.
 const LINK_NODE_MODULES: &str = "node_modules";
 
-/// Marker file written into synthetic local-source objects.
-const LOCAL_SOURCE_OBJECT_SENTINEL: &str = ".lpm-local-source";
+/// Store-owned metadata namespace for object attributes that must not
+/// collide with package contents.
+const OBJECT_METADATA_DIR: &str = ".lpm-object-meta";
+const LOCAL_SOURCE_OBJECT_SENTINEL: &str = "local-source";
 
 /// Object identity sidecar. `.integrity` records the source tarball SRI;
 /// this file records the policy-specific digest used for object and link
@@ -1602,7 +1604,7 @@ impl Store {
             return Err(e);
         }
 
-        replace_local_source_object(&tmp_dir, &object_dir)?;
+        replace_local_source_object(&tmp_dir, &object_dir, &canonical_source)?;
         Ok(object_dir)
     }
 
@@ -1961,8 +1963,31 @@ fn is_regular_file_no_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn object_metadata_dir(dir: &Path) -> Result<PathBuf, LpmError> {
+    let parent = dir.parent().ok_or_else(|| {
+        LpmError::Store(format!(
+            "v2 object dir has no parent for metadata path: {}",
+            dir.display()
+        ))
+    })?;
+    let name = dir.file_name().ok_or_else(|| {
+        LpmError::Store(format!(
+            "v2 object dir has no filename for metadata path: {}",
+            dir.display()
+        ))
+    })?;
+    Ok(parent.join(OBJECT_METADATA_DIR).join(name))
+}
+
+fn local_source_sentinel_path(dir: &Path) -> Result<PathBuf, LpmError> {
+    Ok(object_metadata_dir(dir)?.join(LOCAL_SOURCE_OBJECT_SENTINEL))
+}
+
 fn has_local_source_sentinel(dir: &Path) -> bool {
-    is_regular_file_no_symlink(&dir.join(LOCAL_SOURCE_OBJECT_SENTINEL))
+    match local_source_sentinel_path(dir) {
+        Ok(path) => is_regular_file_no_symlink(&path),
+        Err(_) => false,
+    }
 }
 
 fn source_policy_uses_source_integrity(dir: &Path, policy: ObjectIntegrityPolicy) -> bool {
@@ -2092,7 +2117,9 @@ fn remove_unusable_object_dir(dir: &Path, context: &str) -> Result<(), LpmError>
             "failed to remove incomplete or unverifiable v2 object at {} {context}: {e}",
             dir.display()
         ))
-    })
+    })?;
+    remove_object_metadata_dir_best_effort(dir);
+    Ok(())
 }
 
 fn claim_unusable_object_dir(dir: &Path, context: &str) -> Result<Option<PathBuf>, LpmError> {
@@ -2769,11 +2796,7 @@ fn is_object_metadata_sidecar_name(root: &Path, dir: &Path, name: &OsStr) -> boo
     };
     matches!(
         name,
-        ".integrity"
-            | ".lpm-security.json"
-            | OBJECT_INTEGRITY_FILENAME
-            | TREE_SNAPSHOT_FILENAME
-            | LOCAL_SOURCE_OBJECT_SENTINEL
+        ".integrity" | ".lpm-security.json" | OBJECT_INTEGRITY_FILENAME | TREE_SNAPSHOT_FILENAME
     ) || name.starts_with(".lpm-tree-snapshot.json.tmp.")
         || name.starts_with("..lpm-tree-snapshot.json.tmp.")
 }
@@ -2782,10 +2805,40 @@ fn is_complete_local_source_object_dir(dir: &Path) -> bool {
     is_complete_object_dir(dir) && has_local_source_sentinel(dir)
 }
 
-fn replace_local_source_object(tmp_dir: &Path, object_dir: &Path) -> Result<(), LpmError> {
-    if !object_dir.exists() {
-        return finish_local_source_object_rename(tmp_dir, object_dir);
+fn write_local_source_sentinel(object_dir: &Path, source_root: &Path) -> Result<(), LpmError> {
+    let path = local_source_sentinel_path(object_dir)?;
+    if let Some(parent) = path.parent() {
+        ensure_store_tier_dir_locked(parent).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to create v2 local-source metadata dir at {}: {e}",
+                parent.display()
+            ))
+        })?;
     }
+    std::fs::write(&path, source_root.display().to_string()).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to write v2 local-source sentinel at {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn remove_object_metadata_dir_best_effort(object_dir: &Path) {
+    if let Ok(metadata_dir) = object_metadata_dir(object_dir) {
+        let _ = std::fs::remove_dir_all(metadata_dir);
+    }
+}
+
+fn replace_local_source_object(
+    tmp_dir: &Path,
+    object_dir: &Path,
+    source_root: &Path,
+) -> Result<(), LpmError> {
+    if !object_dir.exists() {
+        return finish_local_source_object_rename(tmp_dir, object_dir, source_root);
+    }
+
+    write_local_source_sentinel(object_dir, source_root)?;
 
     let backup_dir = tmp_sibling(object_dir);
     if backup_dir.exists() {
@@ -2795,7 +2848,7 @@ fn replace_local_source_object(tmp_dir: &Path, object_dir: &Path) -> Result<(), 
     match std::fs::rename(object_dir, &backup_dir) {
         Ok(()) => {}
         Err(_) if !object_dir.exists() => {
-            return finish_local_source_object_rename(tmp_dir, object_dir);
+            return finish_local_source_object_rename(tmp_dir, object_dir, source_root);
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(tmp_dir);
@@ -2840,7 +2893,12 @@ fn replace_local_source_object(tmp_dir: &Path, object_dir: &Path) -> Result<(), 
     }
 }
 
-fn finish_local_source_object_rename(tmp_dir: &Path, object_dir: &Path) -> Result<(), LpmError> {
+fn finish_local_source_object_rename(
+    tmp_dir: &Path,
+    object_dir: &Path,
+    source_root: &Path,
+) -> Result<(), LpmError> {
+    write_local_source_sentinel(object_dir, source_root)?;
     match std::fs::rename(tmp_dir, object_dir) {
         Ok(()) => Ok(()),
         Err(_) if is_complete_local_source_object_dir(object_dir) => {
@@ -2849,6 +2907,7 @@ fn finish_local_source_object_rename(tmp_dir: &Path, object_dir: &Path) -> Resul
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(tmp_dir);
+            remove_object_metadata_dir_best_effort(object_dir);
             Err(LpmError::Store(format!(
                 "failed to atomically install v2 local-source object: {e}"
             )))
@@ -2908,17 +2967,6 @@ fn populate_local_source_object_into(
             tmp_dir.display()
         ))
     })?;
-    std::fs::write(
-        tmp_dir.join(LOCAL_SOURCE_OBJECT_SENTINEL),
-        source_root.display().to_string(),
-    )
-    .map_err(|e| {
-        LpmError::Store(format!(
-            "failed to write v2 local-source sentinel at {}: {e}",
-            tmp_dir.display()
-        ))
-    })?;
-
     Ok(())
 }
 
@@ -3114,7 +3162,7 @@ use lpm_common::symlink::create_symlink as create_fs_symlink;
 /// filesystem reflinks without sharing hardlink inodes between the object
 /// store and executable link entries.
 fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
-    let allow_source_symlinks = src.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file();
+    let allow_source_symlinks = has_local_source_sentinel(src);
     materialize_into_inner(src, src, dst, allow_source_symlinks)
 }
 
@@ -3147,9 +3195,6 @@ fn materialize_into_inner(
     })? {
         let entry = entry
             .map_err(|e| LpmError::Store(format!("failed to enumerate v2 source dir: {e}")))?;
-        if allow_source_symlinks && entry.file_name() == LOCAL_SOURCE_OBJECT_SENTINEL {
-            continue;
-        }
         let src_path = entry.path();
         if is_object_metadata_sidecar(root, &src_path) {
             continue;
@@ -3211,7 +3256,6 @@ fn remove_materialized_object_sidecars(dst: &Path) -> Result<(), LpmError> {
         ".integrity",
         ".lpm-security.json",
         OBJECT_INTEGRITY_FILENAME,
-        LOCAL_SOURCE_OBJECT_SENTINEL,
     ] {
         let path = dst.join(name);
         if path.exists() {
@@ -3979,6 +4023,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(source.join("index.js"), b"module.exports = 'before';\n").unwrap();
+        std::fs::write(source.join(".lpm-local-source"), b"package-owned marker\n").unwrap();
         std::fs::write(source.join("node_modules/ignored.js"), b"ignored\n").unwrap();
 
         let sri = synthetic_sri(b"populate_object_from_local_source");
@@ -3986,7 +4031,11 @@ mod tests {
             .populate_object_from_local_source(&source, &sri)
             .unwrap();
 
-        assert!(object_dir.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file());
+        assert!(has_local_source_sentinel(&object_dir));
+        assert_eq!(
+            std::fs::read(object_dir.join(".lpm-local-source")).unwrap(),
+            b"package-owned marker\n"
+        );
         assert!(
             !object_dir
                 .join("package.json")
@@ -5025,6 +5074,69 @@ mod tests {
         assert_eq!(
             std::fs::read(reused_object.path.join("index.js")).unwrap(),
             b"module.exports = 99;\n"
+        );
+    }
+
+    #[test]
+    fn registry_object_preserves_local_source_filename_under_source_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[
+            (
+                "package.json",
+                b"{\"name\":\"sentinel-file\",\"version\":\"1.0.0\"}",
+            ),
+            (".lpm-local-source", b"registry package content\n"),
+        ]);
+
+        let (object, sri, _) = store
+            .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+            .unwrap();
+
+        assert!(!has_local_source_sentinel(&object.path));
+        assert_eq!(
+            std::fs::read(object.path.join(".lpm-local-source")).unwrap(),
+            b"registry package content\n"
+        );
+
+        let reusable = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reusable.path, object.path);
+
+        let key = arc_key("sentinel-file", "1.0.0");
+        let entry = store
+            .populate_link_entry_inner(
+                LinkEntryRequest {
+                    graph_key: Arc::clone(&key),
+                    source_sri: sri.clone(),
+                    object_dir: object.path,
+                    deps: vec![],
+                    platform: Arc::new(sample_meta_platform()),
+                },
+                None,
+                None,
+                ObjectIntegrityPolicy::Source,
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(
+                entry
+                    .link_dir
+                    .join(LINK_NODE_MODULES)
+                    .join(key.name())
+                    .join(".lpm-local-source")
+            )
+            .unwrap(),
+            b"registry package content\n"
+        );
+        assert_eq!(
+            read_tree_snapshot(&entry.link_dir)
+                .unwrap()
+                .content_integrity,
+            source_object_integrity(&sri)
         );
     }
 
