@@ -1,5 +1,5 @@
 use super::*;
-use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
@@ -712,14 +712,14 @@ pub(super) async fn run(
     let mut fetch_handles: HashMap<String, FetchHandle> = HashMap::new();
     let mut install_packages = match graph_source {
         InstallerSpikeGraphSource::ResolveWorklist => {
-            let mut pending: FuturesOrdered<ResolveFuture> = FuturesOrdered::new();
+            let mut pending: FuturesUnordered<ResolveFuture> = FuturesUnordered::new();
             let mut packages: HashMap<PackageIdentity, PackageDraft> =
                 HashMap::with_capacity(deps.len().saturating_mul(4).max(32));
             let root_requests = root_resolve_requests(deps);
             stats.root_requests = root_requests.len() as u64;
 
             for request in root_requests {
-                pending.push_back(Box::pin(resolve_node(
+                pending.push(Box::pin(resolve_node(
                     request,
                     Arc::clone(&client),
                     route_table.clone(),
@@ -1994,7 +1994,7 @@ fn upsert_dependency(
 fn enqueue_dependencies(
     node: &ResolvedNode,
     packages: &mut HashMap<PackageIdentity, PackageDraft>,
-    pending: &mut FuturesOrdered<ResolveFuture>,
+    pending: &mut FuturesUnordered<ResolveFuture>,
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     metadata_cache: &MetadataCache,
@@ -2045,7 +2045,7 @@ fn enqueue_dependencies(
             stats.inline_reuse_deferred_promotions += 1;
         }
         stats.dependency_requests_enqueued += 1;
-        pending.push_back(Box::pin(resolve_node(
+        pending.push(Box::pin(resolve_node(
             request,
             Arc::clone(client),
             route_table.clone(),
@@ -2174,11 +2174,11 @@ async fn drain_ambient_peer_installs(
             return Ok(());
         }
 
-        let mut pending: FuturesOrdered<ResolveFuture> = FuturesOrdered::new();
+        let mut pending: FuturesUnordered<ResolveFuture> = FuturesUnordered::new();
         for plan in plans {
             stats.peer_requests_enqueued += 1;
             ambient_done.insert(plan.target_name.clone());
-            pending.push_back(Box::pin(resolve_node(
+            pending.push(Box::pin(resolve_node(
                 ResolveRequest {
                     local_name: plan.target_name.clone(),
                     target_name: plan.target_name,
@@ -3215,6 +3215,34 @@ mod tests {
         }
     }
 
+    fn package_set_for_completion_order(
+        requests: Vec<ResolveRequest>,
+        info: Arc<lpm_resolver::CachedPackageInfo>,
+    ) -> Vec<InstallPackage> {
+        let mut packages = HashMap::new();
+        for request in requests {
+            let node = select_or_reuse_node(
+                request,
+                Arc::clone(&info),
+                &mut packages,
+                &OverrideSet::empty(),
+                &lpm_resolver::ResolverPolicy::default(),
+            )
+            .unwrap()
+            .unwrap();
+            if node.reused_existing {
+                continue;
+            }
+            packages.insert(
+                (node.request.target_name.clone(), node.version.clone()),
+                fake_draft(&node.request.target_name, &node.version, &[]),
+            );
+        }
+        let mut packages: Vec<_> = packages.into_values().map(|draft| draft.package).collect();
+        packages.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
+        packages
+    }
+
     fn info_with_versions(versions: &[&str]) -> lpm_resolver::CachedPackageInfo {
         let mut info = empty_info_value();
         info.versions = versions
@@ -3485,6 +3513,44 @@ mod tests {
             parity.fingerprint_mismatches[0].baseline.dependencies,
             vec![("right".to_string(), "1.0.0".to_string())]
         );
+    }
+
+    #[test]
+    fn package_parity_catches_completion_order_dependent_reuse() {
+        let info = Arc::new(info_with_versions(&["1.9.0", "1.0.5", "1.0.0"]));
+        let narrow = ResolveRequest {
+            local_name: "shared".to_string(),
+            target_name: "shared".to_string(),
+            range: "~1.0.0".to_string(),
+            parent: Some(("narrow-parent".to_string(), "1.0.0".to_string())),
+            optional: false,
+            root: false,
+            direct: false,
+        };
+        let broad = ResolveRequest {
+            local_name: "shared".to_string(),
+            target_name: "shared".to_string(),
+            range: "^1.0.0".to_string(),
+            parent: Some(("broad-parent".to_string(), "1.0.0".to_string())),
+            optional: false,
+            root: false,
+            direct: false,
+        };
+
+        let narrow_first = package_set_for_completion_order(
+            vec![narrow.clone(), broad.clone()],
+            Arc::clone(&info),
+        );
+        let broad_first = package_set_for_completion_order(vec![broad, narrow], info);
+
+        let parity =
+            compare_package_parity_with_baseline(&narrow_first, &broad_first, "completion-order");
+
+        assert!(!parity.matches);
+        assert_eq!(parity.candidate_count, 1);
+        assert_eq!(parity.baseline_count, 2);
+        assert_eq!(parity.missing_count, 1);
+        assert!(parity.missing[0].contains("shared@1.9.0"));
     }
 
     #[test]
