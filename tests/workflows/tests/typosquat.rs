@@ -86,6 +86,43 @@ fn install_json_rejects_manifest_direct_typosquat_before_lockfile_write() {
 }
 
 #[tokio::test]
+async fn install_json_env_can_disable_manifest_typosquat_analysis() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("axois", "1.0.0");
+    mock.with_package("axois", "1.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-env-disabled",
+            "version":"1.0.0",
+            "dependencies":{"axois":"^1.0.0"}
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TYPOSQUAT_GUARD", "0")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        output.status.success(),
+        "env-disabled typosquat analysis should allow install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert!(project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
 async fn install_ci_replay_allows_suspicious_direct_dependency_already_locked() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("axois", "1.0.0");

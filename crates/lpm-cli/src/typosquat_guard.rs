@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use lpm_common::{LpmError, TyposquatErrorContext, TyposquatErrorFinding};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
 
+const ENV_TYPOSQUAT_GUARD: &str = "LPM_TYPOSQUAT_GUARD";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TyposquatSource<'a> {
     CliArg,
@@ -43,6 +45,11 @@ pub(crate) fn guard_explicit_package_specs(
     json_output: bool,
 ) -> Result<GuardedPackageSpecs, LpmError> {
     let package_names = parse_package_names(packages)?;
+    if typosquat_guard_disabled() {
+        return Ok(GuardedPackageSpecs {
+            specs: packages.to_vec(),
+        });
+    }
     let policy = TyposquatPolicy::load(project_dir)?;
     let locked_direct_by_root: Vec<BTreeSet<String>> = install_roots
         .iter()
@@ -79,8 +86,6 @@ pub(crate) fn guard_manifest_direct_dependencies(
     pkg: &lpm_workspace::PackageJson,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let policy = TyposquatPolicy::load(project_dir)?;
-    let locked_direct = locked_direct_names(project_dir);
     let mut direct_names = BTreeSet::new();
     direct_names.extend(pkg.dependencies.keys().cloned());
     direct_names.extend(pkg.dev_dependencies.keys().cloned());
@@ -90,6 +95,15 @@ pub(crate) fn guard_manifest_direct_dependencies(
     let mut findings = Vec::new();
     for name in &direct_names {
         validate_package_name(name)?;
+    }
+
+    if typosquat_guard_disabled() {
+        return Ok(());
+    }
+
+    let policy = TyposquatPolicy::load(project_dir)?;
+    let locked_direct = locked_direct_names(project_dir);
+    for name in &direct_names {
         if locked_direct.contains(name) {
             continue;
         }
@@ -175,6 +189,19 @@ fn can_prompt(json_output: bool, yes: bool) -> bool {
         && !yes
         && !crate::install_state::ci_env_is_truthy()
         && std::io::stdin().is_terminal()
+}
+
+fn typosquat_guard_disabled() -> bool {
+    typosquat_guard_disabled_from_env_value(std::env::var(ENV_TYPOSQUAT_GUARD).ok().as_deref())
+}
+
+fn typosquat_guard_disabled_from_env_value(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "disabled"
+        )
+    })
 }
 
 fn analyze_name(name: &str, source: TyposquatSource<'_>) -> Option<GuardFinding> {
@@ -589,6 +616,18 @@ mod tests {
     }
 
     #[test]
+    fn typosquat_guard_env_values_disable_only_when_explicitly_off() {
+        assert!(typosquat_guard_disabled_from_env_value(Some("0")));
+        assert!(typosquat_guard_disabled_from_env_value(Some("false")));
+        assert!(typosquat_guard_disabled_from_env_value(Some("off")));
+        assert!(typosquat_guard_disabled_from_env_value(Some("disabled")));
+        assert!(!typosquat_guard_disabled_from_env_value(None));
+        assert!(!typosquat_guard_disabled_from_env_value(Some("")));
+        assert!(!typosquat_guard_disabled_from_env_value(Some("1")));
+        assert!(!typosquat_guard_disabled_from_env_value(Some("true")));
+    }
+
+    #[test]
     fn policy_requires_reason_for_allow_entries() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -750,6 +789,42 @@ mod tests {
     }
 
     #[test]
+    fn explicit_guard_env_disable_skips_suspicious_name_analysis() {
+        let _env = crate::test_env::ScopedEnv::set([(ENV_TYPOSQUAT_GUARD, "0".into())]);
+        let dir = tempfile::tempdir().unwrap();
+        let specs = vec!["axois".to_string()];
+
+        let guarded = guard_explicit_package_specs(
+            dir.path(),
+            &specs,
+            &[dir.path().to_path_buf()],
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(guarded.specs, specs);
+    }
+
+    #[test]
+    fn explicit_guard_env_disable_preserves_package_name_validation() {
+        let _env = crate::test_env::ScopedEnv::set([(ENV_TYPOSQUAT_GUARD, "0".into())]);
+        let dir = tempfile::tempdir().unwrap();
+        let specs = vec!["--legacy-peer-deps".to_string()];
+
+        let err = guard_explicit_package_specs(
+            dir.path(),
+            &specs,
+            &[dir.path().to_path_buf()],
+            false,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, LpmError::InvalidPackageName(_)));
+    }
+
+    #[test]
     fn manifest_guard_skips_direct_dependency_already_in_lockfile() {
         let dir = tempfile::tempdir().unwrap();
         let mut lockfile = lpm_lockfile::Lockfile::new();
@@ -763,6 +838,43 @@ mod tests {
         lockfile
             .write_to_file(&dir.path().join(lpm_lockfile::LOCKFILE_NAME))
             .unwrap();
+        let pkg = lpm_workspace::PackageJson {
+            dependencies: HashMap::from([("axois".to_string(), "^1.0.0".to_string())]),
+            ..Default::default()
+        };
+
+        guard_manifest_direct_dependencies(
+            dir.path(),
+            &dir.path().join("package.json"),
+            &pkg,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn manifest_guard_env_disable_skips_suspicious_name_analysis() {
+        let _env = crate::test_env::ScopedEnv::set([(ENV_TYPOSQUAT_GUARD, "0".into())]);
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = lpm_workspace::PackageJson {
+            dependencies: HashMap::from([("axois".to_string(), "^1.0.0".to_string())]),
+            ..Default::default()
+        };
+
+        guard_manifest_direct_dependencies(
+            dir.path(),
+            &dir.path().join("package.json"),
+            &pkg,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn manifest_guard_env_disable_skips_typosquat_policy_loading() {
+        let _env = crate::test_env::ScopedEnv::set([(ENV_TYPOSQUAT_GUARD, "0".into())]);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lpm.toml"), "[policy.typosquat.allow]\n").unwrap();
         let pkg = lpm_workspace::PackageJson {
             dependencies: HashMap::from([("axois".to_string(), "^1.0.0".to_string())]),
             ..Default::default()
