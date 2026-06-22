@@ -1,7 +1,7 @@
 use super::*;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -197,6 +197,9 @@ struct ResolveRequest {
 #[derive(Debug, Clone)]
 struct MetadataRequestContext {
     package: String,
+    range: Option<String>,
+    range_shape: MetadataRangeShape,
+    version_doc_eligible: bool,
     parent: Option<String>,
     root_ancestor: String,
     depth: u16,
@@ -208,8 +211,12 @@ struct MetadataRequestContext {
 
 impl MetadataRequestContext {
     fn from_request(request: &ResolveRequest) -> Self {
+        let range_shape = MetadataRangeShape::from_range(Some(&request.range));
         Self {
             package: request.target_name.clone(),
+            range: Some(request.range.clone()),
+            range_shape,
+            version_doc_eligible: false,
             parent: request
                 .parent
                 .as_ref()
@@ -226,6 +233,9 @@ impl MetadataRequestContext {
     fn peer_plan(package: &str) -> Self {
         Self {
             package: package.to_string(),
+            range: None,
+            range_shape: MetadataRangeShape::Unknown,
+            version_doc_eligible: false,
             parent: None,
             root_ancestor: package.to_string(),
             depth: 0,
@@ -234,6 +244,213 @@ impl MetadataRequestContext {
             root: true,
             reason: "peer-plan",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataRangeShape {
+    Exact,
+    Star,
+    Caret,
+    Tilde,
+    Comparator,
+    Complex,
+    Other,
+    Unknown,
+}
+
+impl MetadataRangeShape {
+    fn from_range(range: Option<&str>) -> Self {
+        let Some(raw) = range.map(str::trim) else {
+            return Self::Unknown;
+        };
+        if raw.is_empty() || raw == "*" || raw == "latest" {
+            return Self::Star;
+        }
+        if exact_pin_version(raw).is_some() {
+            return Self::Exact;
+        }
+        if raw.contains("||") || raw.contains(" - ") || raw.contains(' ') || raw.contains(',') {
+            return Self::Complex;
+        }
+        if raw.starts_with('^') {
+            return Self::Caret;
+        }
+        if raw.starts_with('~') {
+            return Self::Tilde;
+        }
+        if raw.starts_with('<') || raw.starts_with('>') || raw.starts_with('=') {
+            return Self::Comparator;
+        }
+        Self::Other
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Star => "star",
+            Self::Caret => "caret",
+            Self::Tilde => "tilde",
+            Self::Comparator => "comparator",
+            Self::Complex => "complex",
+            Self::Other => "other",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+fn exact_pin_version(range: &str) -> Option<String> {
+    let raw = range.trim();
+    let raw = raw.strip_prefix('=').unwrap_or(raw).trim();
+    if lpm_resolver::NpmVersion::parse(raw).is_ok() {
+        Some(raw.to_string())
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetadataRangeShapeCounters {
+    exact: AtomicU64,
+    star: AtomicU64,
+    caret: AtomicU64,
+    tilde: AtomicU64,
+    comparator: AtomicU64,
+    complex: AtomicU64,
+    other: AtomicU64,
+    unknown: AtomicU64,
+}
+
+impl MetadataRangeShapeCounters {
+    fn record(&self, shape: MetadataRangeShape) {
+        match shape {
+            MetadataRangeShape::Exact => &self.exact,
+            MetadataRangeShape::Star => &self.star,
+            MetadataRangeShape::Caret => &self.caret,
+            MetadataRangeShape::Tilde => &self.tilde,
+            MetadataRangeShape::Comparator => &self.comparator,
+            MetadataRangeShape::Complex => &self.complex,
+            MetadataRangeShape::Other => &self.other,
+            MetadataRangeShape::Unknown => &self.unknown,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "exact": self.exact.load(Ordering::Relaxed),
+            "star": self.star.load(Ordering::Relaxed),
+            "caret": self.caret.load(Ordering::Relaxed),
+            "tilde": self.tilde.load(Ordering::Relaxed),
+            "comparator": self.comparator.load(Ordering::Relaxed),
+            "complex": self.complex.load(Ordering::Relaxed),
+            "other": self.other.load(Ordering::Relaxed),
+            "unknown": self.unknown.load(Ordering::Relaxed),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetadataPackageRangeStats {
+    calls: u64,
+    exact_calls: u64,
+    version_doc_eligible_exact_calls: u64,
+    exact_versions: BTreeSet<String>,
+}
+
+impl MetadataPackageRangeStats {
+    fn record(&mut self, context: &MetadataRequestContext) {
+        self.calls = self.calls.saturating_add(1);
+        if context.range_shape != MetadataRangeShape::Exact {
+            return;
+        }
+        self.exact_calls = self.exact_calls.saturating_add(1);
+        if context.version_doc_eligible {
+            self.version_doc_eligible_exact_calls =
+                self.version_doc_eligible_exact_calls.saturating_add(1);
+        }
+        if let Some(version) = context.range.as_deref().and_then(exact_pin_version) {
+            self.exact_versions.insert(version);
+        }
+    }
+
+    fn has_exact_and_non_exact(&self) -> bool {
+        self.exact_calls > 0 && self.exact_calls < self.calls
+    }
+
+    fn exact_only(&self) -> bool {
+        self.calls > 0 && self.exact_calls == self.calls
+    }
+
+    fn version_doc_eligible_exact_only(&self) -> bool {
+        self.calls > 0 && self.version_doc_eligible_exact_calls == self.calls
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetadataPackageRangeSummary {
+    seen: u64,
+    exact_only: u64,
+    exact_only_single_version: u64,
+    exact_only_multiple_versions: u64,
+    mixed_exact_and_non_exact: u64,
+    non_exact_only: u64,
+    version_doc_eligible_exact_only: u64,
+    version_doc_eligible_exact_only_single_version: u64,
+    version_doc_eligible_exact_only_multiple_versions: u64,
+}
+
+impl MetadataPackageRangeSummary {
+    fn record(&mut self, stats: &MetadataPackageRangeStats) {
+        self.seen = self.seen.saturating_add(1);
+        if stats.exact_only() {
+            self.exact_only = self.exact_only.saturating_add(1);
+            match stats.exact_versions.len() {
+                0 | 1 => {
+                    self.exact_only_single_version =
+                        self.exact_only_single_version.saturating_add(1);
+                }
+                _ => {
+                    self.exact_only_multiple_versions =
+                        self.exact_only_multiple_versions.saturating_add(1);
+                }
+            }
+        } else if stats.has_exact_and_non_exact() {
+            self.mixed_exact_and_non_exact = self.mixed_exact_and_non_exact.saturating_add(1);
+        } else {
+            self.non_exact_only = self.non_exact_only.saturating_add(1);
+        }
+
+        if stats.version_doc_eligible_exact_only() {
+            self.version_doc_eligible_exact_only =
+                self.version_doc_eligible_exact_only.saturating_add(1);
+            match stats.exact_versions.len() {
+                0 | 1 => {
+                    self.version_doc_eligible_exact_only_single_version = self
+                        .version_doc_eligible_exact_only_single_version
+                        .saturating_add(1);
+                }
+                _ => {
+                    self.version_doc_eligible_exact_only_multiple_versions = self
+                        .version_doc_eligible_exact_only_multiple_versions
+                        .saturating_add(1);
+                }
+            }
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "seen": self.seen,
+            "exact_only": self.exact_only,
+            "exact_only_single_version": self.exact_only_single_version,
+            "exact_only_multiple_versions": self.exact_only_multiple_versions,
+            "mixed_exact_and_non_exact": self.mixed_exact_and_non_exact,
+            "non_exact_only": self.non_exact_only,
+            "version_doc_eligible_exact_only": self.version_doc_eligible_exact_only,
+            "version_doc_eligible_exact_only_single_version": self.version_doc_eligible_exact_only_single_version,
+            "version_doc_eligible_exact_only_multiple_versions": self.version_doc_eligible_exact_only_multiple_versions,
+        })
     }
 }
 
@@ -349,6 +566,11 @@ struct MetadataStats {
     version_count_sum: AtomicU64,
     registry_cache_hits: AtomicU64,
     registry_not_modified: AtomicU64,
+    range_shape_calls: MetadataRangeShapeCounters,
+    range_shape_initial_fetches: MetadataRangeShapeCounters,
+    version_doc_eligible_calls: AtomicU64,
+    version_doc_eligible_initial_fetches: AtomicU64,
+    range_shapes_by_package: std::sync::Mutex<BTreeMap<String, MetadataPackageRangeStats>>,
     route_npm_direct: AtomicU64,
     route_lpm_worker: AtomicU64,
     route_custom: AtomicU64,
@@ -393,6 +615,11 @@ impl MetadataStats {
             version_count_sum: AtomicU64::new(0),
             registry_cache_hits: AtomicU64::new(0),
             registry_not_modified: AtomicU64::new(0),
+            range_shape_calls: MetadataRangeShapeCounters::default(),
+            range_shape_initial_fetches: MetadataRangeShapeCounters::default(),
+            version_doc_eligible_calls: AtomicU64::new(0),
+            version_doc_eligible_initial_fetches: AtomicU64::new(0),
+            range_shapes_by_package: std::sync::Mutex::new(BTreeMap::new()),
             route_npm_direct: AtomicU64::new(0),
             route_lpm_worker: AtomicU64::new(0),
             route_custom: AtomicU64::new(0),
@@ -425,6 +652,28 @@ impl MetadataStats {
         let ms = u128_to_u64_saturating(ms);
         self.fetch_sum_ms.fetch_add(ms, Ordering::Relaxed);
         atomic_max(&self.fetch_max_ms, ms);
+    }
+
+    fn record_range_call(&self, context: &MetadataRequestContext) {
+        self.range_shape_calls.record(context.range_shape);
+        if context.version_doc_eligible {
+            self.version_doc_eligible_calls
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if let Ok(mut packages) = self.range_shapes_by_package.lock() {
+            packages
+                .entry(context.package.clone())
+                .or_default()
+                .record(context);
+        }
+    }
+
+    fn record_range_initial_fetch(&self, context: &MetadataRequestContext) {
+        self.range_shape_initial_fetches.record(context.range_shape);
+        if context.version_doc_eligible {
+            self.version_doc_eligible_initial_fetches
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn record_detail(
@@ -619,6 +868,13 @@ impl MetadataStats {
                 "version_count_sum": self.version_count_sum.load(Ordering::Relaxed),
                 "registry_cache_hit_count": self.registry_cache_hits.load(Ordering::Relaxed),
                 "registry_not_modified_count": self.registry_not_modified.load(Ordering::Relaxed),
+                "range_shapes": {
+                    "calls": self.range_shape_calls.to_json(),
+                    "package_first_fetches": self.range_shape_initial_fetches.to_json(),
+                    "version_doc_eligible_calls": self.version_doc_eligible_calls.load(Ordering::Relaxed),
+                    "version_doc_eligible_package_first_fetches": self.version_doc_eligible_initial_fetches.load(Ordering::Relaxed),
+                    "packages": self.range_shape_package_summary_json(),
+                },
                 "routes": {
                     "npm_direct": self.route_npm_direct.load(Ordering::Relaxed),
                     "lpm_worker": self.route_lpm_worker.load(Ordering::Relaxed),
@@ -668,6 +924,17 @@ impl MetadataStats {
         )
     }
 
+    fn range_shape_package_summary_json(&self) -> serde_json::Value {
+        let Ok(packages) = self.range_shapes_by_package.lock() else {
+            return serde_json::Value::Object(serde_json::Map::new());
+        };
+        let mut summary = MetadataPackageRangeSummary::default();
+        for stats in packages.values() {
+            summary.record(stats);
+        }
+        summary.to_json()
+    }
+
     fn slow_metadata_json(
         bucket: &std::sync::Mutex<Vec<MetadataTraceRecord>>,
     ) -> serde_json::Value {
@@ -702,6 +969,9 @@ impl MetadataStats {
                         "completed_at_ms": entry.completed_at_ms,
                         "depth": entry.context.depth,
                         "root_ancestor": entry.context.root_ancestor,
+                        "range": entry.context.range,
+                        "range_shape": entry.context.range_shape.as_str(),
+                        "version_doc_eligible": entry.context.version_doc_eligible,
                         "parent": entry.context.parent,
                         "optional": entry.context.optional,
                         "direct": entry.context.direct,
@@ -1819,7 +2089,7 @@ async fn resolve_node(
 }
 
 async fn metadata_for_package(
-    context: MetadataRequestContext,
+    mut context: MetadataRequestContext,
     client: Arc<RegistryClient>,
     route_table: RouteTable,
     metadata_cache: MetadataCache,
@@ -1830,6 +2100,16 @@ async fn metadata_for_package(
     metadata_stats.calls.fetch_add(1, Ordering::Relaxed);
     let queued_at_ms = metadata_stats.elapsed_ms();
     let name = context.package.clone();
+    let canonical = lpm_resolver::CanonicalKey::from_dep_name(&name);
+    let version_doc_policy_eligible = !resolver_policy.release_age_applies_to_package(&canonical)
+        && !resolver_policy.requires_trust_history();
+    let version_doc_eligible = matches!(
+        route_table.route_for_package(&name),
+        lpm_registry::UpstreamRoute::NpmDirect
+    ) && matches!(context.range_shape, MetadataRangeShape::Exact)
+        && version_doc_policy_eligible;
+    context.version_doc_eligible = version_doc_eligible;
+    metadata_stats.record_range_call(&context);
     let cell = metadata_cache
         .entry(name.clone())
         .or_insert_with(|| Arc::new(OnceCell::new()))
@@ -1843,6 +2123,7 @@ async fn metadata_for_package(
         metadata_stats_for_init
             .initial_fetches
             .fetch_add(1, Ordering::Relaxed);
+        metadata_stats_for_init.record_range_initial_fetch(&context);
         let queue_start = Instant::now();
         let _permit = metadata_queue
             .acquire()
@@ -3510,15 +3791,24 @@ mod tests {
     #[test]
     fn metadata_stats_reports_attribution_sums_and_trace_rows() {
         let stats = MetadataStats::new(Instant::now());
+        let first_request = resolve_request_for_test("fast", "^1.0.0", None, true, true);
+        let first_context = MetadataRequestContext::from_request(&first_request);
+        stats.record_range_call(&first_context);
+        stats.record_range_initial_fetch(&first_context);
         stats.record_detail(
-            MetadataRequestContext::peer_plan("fast"),
+            first_context,
             fake_metadata_timing("fast", 10, 8, 5, 1, 2),
             1,
             11,
             true,
         );
+        let second_request = resolve_request_for_test("slow", "2.0.0", None, true, true);
+        let mut second_context = MetadataRequestContext::from_request(&second_request);
+        second_context.version_doc_eligible = true;
+        stats.record_range_call(&second_context);
+        stats.record_range_initial_fetch(&second_context);
         stats.record_detail(
-            MetadataRequestContext::peer_plan("slow"),
+            second_context,
             fake_metadata_timing("slow", 40, 30, 20, 7, 11),
             12,
             55,
@@ -3536,6 +3826,28 @@ mod tests {
         assert_eq!(
             json["attribution"]["routes"]["npm_direct"].as_u64(),
             Some(2)
+        );
+        assert_eq!(
+            json["attribution"]["range_shapes"]["package_first_fetches"]["caret"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            json["attribution"]["range_shapes"]["package_first_fetches"]["exact"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            json["attribution"]["range_shapes"]["version_doc_eligible_package_first_fetches"]
+                .as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            json["attribution"]["range_shapes"]["packages"]["seen"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            json["attribution"]["range_shapes"]["packages"]["version_doc_eligible_exact_only"]
+                .as_u64(),
+            Some(1)
         );
         assert_eq!(
             json["slow_metadata"]["by_total"][0]["package"].as_str(),
@@ -3557,6 +3869,18 @@ mod tests {
             json["slow_metadata"]["by_cache_read"][0]["route"].as_str(),
             Some("npm_direct")
         );
+        assert_eq!(
+            json["slow_metadata"]["by_total"][0]["range"].as_str(),
+            Some("2.0.0")
+        );
+        assert_eq!(
+            json["slow_metadata"]["by_total"][0]["range_shape"].as_str(),
+            Some("exact")
+        );
+        assert_eq!(
+            json["slow_metadata"]["by_total"][0]["version_doc_eligible"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]
@@ -3575,6 +3899,72 @@ mod tests {
         assert!(json.get("slow_metadata").is_none());
         assert!(json.get("waves_by_depth").is_none());
         assert_eq!(json["attribution"]["raw_fetch_sum_ms"].as_u64(), Some(30));
+    }
+
+    #[test]
+    fn metadata_range_shape_classifies_common_npm_ranges() {
+        assert_eq!(
+            MetadataRangeShape::from_range(Some("1.2.3")),
+            MetadataRangeShape::Exact
+        );
+        assert_eq!(
+            MetadataRangeShape::from_range(Some("=1.2.3")),
+            MetadataRangeShape::Exact
+        );
+        assert_eq!(
+            MetadataRangeShape::from_range(Some("^1.2.3")),
+            MetadataRangeShape::Caret
+        );
+        assert_eq!(
+            MetadataRangeShape::from_range(Some("~1.2.3")),
+            MetadataRangeShape::Tilde
+        );
+        assert_eq!(
+            MetadataRangeShape::from_range(Some(">=1.2.3")),
+            MetadataRangeShape::Comparator
+        );
+        assert_eq!(
+            MetadataRangeShape::from_range(Some("^1.0.0 || ^2.0.0")),
+            MetadataRangeShape::Complex
+        );
+        assert_eq!(
+            MetadataRangeShape::from_range(None),
+            MetadataRangeShape::Unknown
+        );
+    }
+
+    #[test]
+    fn metadata_package_range_summary_separates_mixed_exact_and_broad_packages() {
+        let stats = MetadataStats::new(Instant::now());
+
+        let mut exact_only = MetadataRequestContext::from_request(&resolve_request_for_test(
+            "exact-only",
+            "=1.2.3",
+            None,
+            true,
+            true,
+        ));
+        exact_only.version_doc_eligible = true;
+        stats.record_range_call(&exact_only);
+
+        let mut mixed_exact = MetadataRequestContext::from_request(&resolve_request_for_test(
+            "mixed", "2.0.0", None, true, true,
+        ));
+        mixed_exact.version_doc_eligible = true;
+        stats.record_range_call(&mixed_exact);
+        let mixed_broad = MetadataRequestContext::from_request(&resolve_request_for_test(
+            "mixed", "^2.0.0", None, true, true,
+        ));
+        stats.record_range_call(&mixed_broad);
+
+        let packages = &stats.to_json(false)["attribution"]["range_shapes"]["packages"];
+
+        assert_eq!(packages["seen"].as_u64(), Some(2));
+        assert_eq!(
+            packages["version_doc_eligible_exact_only_single_version"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(packages["mixed_exact_and_non_exact"].as_u64(), Some(1));
     }
 
     #[test]
