@@ -897,6 +897,123 @@ impl RegistryClient {
         finish!(Ok(TimedPackageMetadata { metadata, timings }))
     }
 
+    pub async fn get_npm_version_metadata_direct_with_timings(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<TimedPackageMetadata, LpmError> {
+        crate::timing::record_metadata_request(name);
+        let cache_key = format!("npm-version:{name}@{version}");
+        let mut timings = PackageMetadataFetchTimings::default();
+
+        let cache_read_start = std::time::Instant::now();
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+            if package_metadata_matches_version_doc(name, version, &cached) {
+                timings.cache_hit = true;
+                crate::timing::record_metadata_cache_hit();
+                tracing::debug!("metadata cache hit (direct version): npm:{name}@{version}");
+                return Ok(TimedPackageMetadata {
+                    metadata: cached,
+                    timings,
+                });
+            }
+            tracing::debug!(
+                "metadata cache mismatch (direct version): npm:{name}@{version}; refetching"
+            );
+        }
+        timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+        crate::timing::record_metadata_cache_miss();
+
+        let rpc_start = std::time::Instant::now();
+        macro_rules! finish {
+            ($expr:expr) => {{
+                let r = $expr;
+                crate::timing::record_rpc(rpc_start.elapsed());
+                r
+            }};
+        }
+
+        let validator_start = std::time::Instant::now();
+        let cache_validator = self.read_cache_validator(&cache_key);
+        timings.validator_read_ms = validator_start.elapsed().as_millis();
+
+        let npm_url = format!("{}/{}/{}", self.npm_registry_url, name, version);
+        tracing::debug!("fetching {name}@{version} direct from npm registry");
+        let req = self
+            .http
+            .for_url(&npm_url)
+            .await?
+            .get(&npm_url)
+            .header("Accept", "application/json");
+        let req = Self::apply_cached_etag(req, cache_validator.as_ref());
+        let http_start = std::time::Instant::now();
+        let mut response = match self.send_package_metadata_request(req).await {
+            Ok(r) => {
+                timings.http_ms = timings
+                    .http_ms
+                    .saturating_add(http_start.elapsed().as_millis());
+                r
+            }
+            Err(e) => return finish!(Err(e)),
+        };
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            timings.not_modified = true;
+            let cache_304_start = std::time::Instant::now();
+            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+                timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+                if package_metadata_matches_version_doc(name, version, &metadata) {
+                    tracing::debug!(
+                        "metadata cache revalidated (direct version 304): npm:{name}@{version}"
+                    );
+                    return finish!(Ok(TimedPackageMetadata { metadata, timings }));
+                }
+                tracing::debug!(
+                    "metadata cache mismatch after direct version 304: npm:{name}@{version}; refetching"
+                );
+            }
+            timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+            let req = self
+                .http
+                .for_url(&npm_url)
+                .await?
+                .get(&npm_url)
+                .header("Accept", "application/json");
+            let retry_http_start = std::time::Instant::now();
+            response = match self.send_package_metadata_request(req).await {
+                Ok(r) => {
+                    timings.http_ms = timings
+                        .http_ms
+                        .saturating_add(retry_http_start.elapsed().as_millis());
+                    r
+                }
+                Err(e) => return finish!(Err(e)),
+            };
+        }
+        let etag = Self::response_etag(&response);
+        let (version_metadata, body_timings) =
+            match parse_capped_metadata_with_timing::<VersionMetadata>(
+                response,
+                &format!("get_npm_version_metadata_direct {name}@{version}"),
+            )
+            .await
+            {
+                Ok(parsed) => parsed,
+                Err(e) => return finish!(Err(e)),
+            };
+        timings.body_read_ms = body_timings.body_read_ms;
+        timings.json_decode_ms = body_timings.json_parse_ms;
+        timings.body_bytes = body_timings.body_bytes;
+        let metadata = match package_metadata_from_version_doc(name, version, version_metadata) {
+            Ok(metadata) => metadata,
+            Err(e) => return finish!(Err(e)),
+        };
+        let cache_write_start = std::time::Instant::now();
+        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
+        finish!(Ok(TimedPackageMetadata { metadata, timings }))
+    }
+
     /// Fetch a full npm packument through the proxy/direct fallback chain.
     ///
     /// Kept separate from [`Self::get_npm_package_metadata`] so installs that
@@ -2171,4 +2288,47 @@ impl RegistryClient {
         };
         (out, stats)
     }
+}
+
+fn package_metadata_from_version_doc(
+    expected_name: &str,
+    expected_version: &str,
+    version_metadata: VersionMetadata,
+) -> Result<PackageMetadata, LpmError> {
+    if version_metadata.name != expected_name || version_metadata.version != expected_version {
+        return Err(LpmError::Registry(format!(
+            "npm version metadata returned {}@{} when requesting {expected_name}@{expected_version}",
+            version_metadata.name, version_metadata.version
+        )));
+    }
+
+    let mut versions = std::collections::HashMap::with_capacity(1);
+    versions.insert(expected_version.to_string(), version_metadata);
+    Ok(PackageMetadata {
+        name: expected_name.to_string(),
+        description: None,
+        modified: None,
+        dist_tags: std::collections::HashMap::new(),
+        versions,
+        time: std::collections::HashMap::new(),
+        downloads: None,
+        distribution_mode: None,
+        package_type: None,
+        latest_version: None,
+        ecosystem: None,
+    })
+}
+
+fn package_metadata_matches_version_doc(
+    expected_name: &str,
+    expected_version: &str,
+    metadata: &PackageMetadata,
+) -> bool {
+    if metadata.name != expected_name || metadata.versions.len() != 1 {
+        return false;
+    }
+    metadata
+        .versions
+        .get(expected_version)
+        .is_some_and(|version| version.name == expected_name && version.version == expected_version)
 }

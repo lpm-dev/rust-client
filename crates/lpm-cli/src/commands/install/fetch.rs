@@ -919,6 +919,7 @@ pub(super) fn invalidate_metadata_routed(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     name: &str,
+    version: &str,
 ) {
     match route_table.route_for_package(name) {
         UpstreamRoute::Custom { target, auth } => {
@@ -926,6 +927,7 @@ pub(super) fn invalidate_metadata_routed(
         }
         _ => {
             client.invalidate_metadata_cache(name);
+            client.invalidate_npm_version_metadata_cache(name, version);
         }
     }
 }
@@ -944,6 +946,7 @@ pub(super) fn handle_tarball_not_found_with_recovery(
     recovery: TarballNotFoundRecovery,
 ) -> LpmError {
     client.invalidate_metadata_cache(name);
+    client.invalidate_npm_version_metadata_cache(name, version);
     if matches!(recovery, TarballNotFoundRecovery::DeleteProjectLockfiles) {
         let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
         if lock_path.exists() {
@@ -1047,7 +1050,7 @@ pub(super) async fn fetch_and_store_legacy(
             // Stored URL went stale — package was republished, or
             // upstream migrated paths. Invalidate metadata + retry
             // ONCE with a freshly-resolved URL.
-            invalidate_metadata_routed(client, route_table, &p.name);
+            invalidate_metadata_routed(client, route_table, &p.name, &p.version);
             let retry_lookup_start = std::time::Instant::now();
             let fresh_resolution = match resolve_tarball_url(
                 client,
@@ -1385,7 +1388,7 @@ pub(super) async fn fetch_and_store_streaming(
             // See `fetch_and_store_legacy` for the full semantics;
             // this branch mirrors that retry logic byte-for-byte
             // (minus the streaming-specific response handling).
-            invalidate_metadata_routed(client, route_table, &p.name);
+            invalidate_metadata_routed(client, route_table, &p.name, &p.version);
             let retry_lookup_start = std::time::Instant::now();
             let fresh_resolution = match resolve_tarball_url(
                 client,

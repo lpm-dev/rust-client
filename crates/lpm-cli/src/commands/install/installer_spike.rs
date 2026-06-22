@@ -13,6 +13,7 @@ const ENV_INSTALLER_SPIKE_METADATA_CONCURRENCY: &str = "LPM_INSTALLER_SPIKE_META
 const ENV_INSTALLER_SPIKE_GRAPH: &str = "LPM_INSTALLER_SPIKE_GRAPH";
 const ENV_INSTALLER_SPIKE_PARITY: &str = "LPM_INSTALLER_SPIKE_PARITY";
 const ENV_INSTALLER_SPIKE_BENCHMARK_ONLY: &str = "LPM_INSTALLER_SPIKE_BENCHMARK_ONLY";
+const ENV_INSTALLER_SPIKE_EXACT_DOC: &str = "LPM_INSTALLER_SPIKE_EXACT_DOC";
 const DEFAULT_INSTALLER_SPIKE_CONCURRENCY: usize = 64;
 const DEFAULT_INSTALLER_SPIKE_METADATA_CONCURRENCY: usize = 192;
 const PARITY_SAMPLE_LIMIT: usize = 25;
@@ -172,6 +173,7 @@ fn unsupported_admission_reasons(
 
 type MetadataCell = Arc<OnceCell<Arc<lpm_resolver::CachedPackageInfo>>>;
 type MetadataCache = Arc<dashmap::DashMap<String, MetadataCell>>;
+type ExactVersionMetadataCache = Arc<dashmap::DashMap<ExactVersionMetadataKey, MetadataCell>>;
 type PackageIdentity = (String, String);
 type SelectedVersion = (
     String,
@@ -180,6 +182,31 @@ type SelectedVersion = (
 );
 type FetchHandle = tokio::task::JoinHandle<Result<FetchOutcome, LpmError>>;
 type ResolveFuture = Pin<Box<dyn Future<Output = Result<NodeResolution, LpmError>> + Send>>;
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct ExactVersionMetadataKey {
+    name: String,
+    version: String,
+}
+
+#[derive(Debug, Clone)]
+struct MetadataCaches {
+    full: MetadataCache,
+    exact_version: ExactVersionMetadataCache,
+}
+
+impl MetadataCaches {
+    fn new() -> Self {
+        Self {
+            full: Arc::new(dashmap::DashMap::new()),
+            exact_version: Arc::new(dashmap::DashMap::new()),
+        }
+    }
+
+    fn request_count(&self) -> usize {
+        self.full.len().saturating_add(self.exact_version.len())
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ResolveRequest {
@@ -570,8 +597,12 @@ struct MetadataStats {
     range_shape_initial_fetches: MetadataRangeShapeCounters,
     version_doc_eligible_calls: AtomicU64,
     version_doc_eligible_initial_fetches: AtomicU64,
+    version_doc_attempts: AtomicU64,
+    version_doc_hits: AtomicU64,
+    version_doc_fallbacks: AtomicU64,
     range_shapes_by_package: std::sync::Mutex<BTreeMap<String, MetadataPackageRangeStats>>,
     route_npm_direct: AtomicU64,
+    route_npm_direct_version_doc: AtomicU64,
     route_lpm_worker: AtomicU64,
     route_custom: AtomicU64,
     route_lpm: AtomicU64,
@@ -619,8 +650,12 @@ impl MetadataStats {
             range_shape_initial_fetches: MetadataRangeShapeCounters::default(),
             version_doc_eligible_calls: AtomicU64::new(0),
             version_doc_eligible_initial_fetches: AtomicU64::new(0),
+            version_doc_attempts: AtomicU64::new(0),
+            version_doc_hits: AtomicU64::new(0),
+            version_doc_fallbacks: AtomicU64::new(0),
             range_shapes_by_package: std::sync::Mutex::new(BTreeMap::new()),
             route_npm_direct: AtomicU64::new(0),
+            route_npm_direct_version_doc: AtomicU64::new(0),
             route_lpm_worker: AtomicU64::new(0),
             route_custom: AtomicU64::new(0),
             route_lpm: AtomicU64::new(0),
@@ -674,6 +709,18 @@ impl MetadataStats {
             self.version_doc_eligible_initial_fetches
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn record_version_doc_attempt(&self) {
+        self.version_doc_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_version_doc_hit(&self) {
+        self.version_doc_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_version_doc_fallback(&self) {
+        self.version_doc_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_detail(
@@ -742,6 +789,9 @@ impl MetadataStats {
         }
         match timings.route {
             "npm_direct" => self.route_npm_direct.fetch_add(1, Ordering::Relaxed),
+            "npm_direct_version_doc" => self
+                .route_npm_direct_version_doc
+                .fetch_add(1, Ordering::Relaxed),
             "lpm_worker" => self.route_lpm_worker.fetch_add(1, Ordering::Relaxed),
             "custom" => self.route_custom.fetch_add(1, Ordering::Relaxed),
             "lpm" => self.route_lpm.fetch_add(1, Ordering::Relaxed),
@@ -875,8 +925,14 @@ impl MetadataStats {
                     "version_doc_eligible_package_first_fetches": self.version_doc_eligible_initial_fetches.load(Ordering::Relaxed),
                     "packages": self.range_shape_package_summary_json(),
                 },
+                "version_docs": {
+                    "attempts": self.version_doc_attempts.load(Ordering::Relaxed),
+                    "hits": self.version_doc_hits.load(Ordering::Relaxed),
+                    "fallbacks": self.version_doc_fallbacks.load(Ordering::Relaxed),
+                },
                 "routes": {
                     "npm_direct": self.route_npm_direct.load(Ordering::Relaxed),
+                    "npm_direct_version_doc": self.route_npm_direct_version_doc.load(Ordering::Relaxed),
                     "lpm_worker": self.route_lpm_worker.load(Ordering::Relaxed),
                     "custom": self.route_custom.load(Ordering::Relaxed),
                     "lpm": self.route_lpm.load(Ordering::Relaxed),
@@ -1149,7 +1205,7 @@ pub(super) async fn run(
     let fetch_queue = Arc::new(Semaphore::new(fetch_concurrency));
     let fetch_extract_limiter = configured_fetch_extract_limiter(store_v2_handle.is_some());
     let metadata_queue = Arc::new(Semaphore::new(metadata_concurrency));
-    let metadata_cache: MetadataCache = Arc::new(dashmap::DashMap::new());
+    let metadata_caches = MetadataCaches::new();
     let store = PackageStore::from_root(lpm_root);
     let gate_stats = Arc::new(GateStats::default());
 
@@ -1172,7 +1228,7 @@ pub(super) async fn run(
                     request,
                     Arc::clone(&client),
                     route_table.clone(),
-                    Arc::clone(&metadata_cache),
+                    metadata_caches.clone(),
                     Arc::clone(&metadata_queue),
                     Arc::clone(&metadata_stats),
                     resolver_policy.clone(),
@@ -1255,7 +1311,7 @@ pub(super) async fn run(
                                 &mut pending,
                                 &client,
                                 &route_table,
-                                &metadata_cache,
+                                &metadata_caches,
                                 &metadata_queue,
                                 &metadata_stats,
                                 &resolver_policy,
@@ -1275,7 +1331,7 @@ pub(super) async fn run(
                 &mut packages,
                 &client,
                 &route_table,
-                &metadata_cache,
+                &metadata_caches,
                 &metadata_queue,
                 &fetch_queue,
                 &metadata_stats,
@@ -1294,7 +1350,7 @@ pub(super) async fn run(
             )
             .await?;
             stage_timings.peer_drain_ms = peer_drain_start.elapsed().as_millis();
-            stats.metadata_requests = metadata_cache.len() as u64;
+            stats.metadata_requests = metadata_caches.request_count() as u64;
             stats.metadata_cache_hits = metadata_stats.ready_hits.load(Ordering::Relaxed);
 
             let package_graph_start = Instant::now();
@@ -1644,6 +1700,10 @@ fn installer_spike_metadata_concurrency() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| (1..=256).contains(value))
         .unwrap_or(DEFAULT_INSTALLER_SPIKE_METADATA_CONCURRENCY)
+}
+
+fn installer_spike_exact_doc_enabled() -> bool {
+    std::env::var(ENV_INSTALLER_SPIKE_EXACT_DOC).as_deref() == Ok("1")
 }
 
 pub(super) fn has_tarball_source_deps(project_dir: &Path, deps: &HashMap<String, String>) -> bool {
@@ -2069,7 +2129,7 @@ async fn resolve_node(
     request: ResolveRequest,
     client: Arc<RegistryClient>,
     route_table: RouteTable,
-    metadata_cache: MetadataCache,
+    metadata_caches: MetadataCaches,
     metadata_queue: Arc<Semaphore>,
     metadata_stats: Arc<MetadataStats>,
     resolver_policy: lpm_resolver::ResolverPolicy,
@@ -2079,7 +2139,7 @@ async fn resolve_node(
         context,
         client,
         route_table,
-        metadata_cache,
+        metadata_caches,
         metadata_queue,
         metadata_stats,
         resolver_policy,
@@ -2092,7 +2152,7 @@ async fn metadata_for_package(
     mut context: MetadataRequestContext,
     client: Arc<RegistryClient>,
     route_table: RouteTable,
-    metadata_cache: MetadataCache,
+    metadata_caches: MetadataCaches,
     metadata_queue: Arc<Semaphore>,
     metadata_stats: Arc<MetadataStats>,
     resolver_policy: lpm_resolver::ResolverPolicy,
@@ -2110,7 +2170,55 @@ async fn metadata_for_package(
         && version_doc_policy_eligible;
     context.version_doc_eligible = version_doc_eligible;
     metadata_stats.record_range_call(&context);
-    let cell = metadata_cache
+
+    if installer_spike_exact_doc_enabled()
+        && version_doc_eligible
+        && !metadata_caches.full.contains_key(&name)
+        && let Some(version) = context.range.as_deref().and_then(exact_pin_version)
+    {
+        return metadata_for_exact_version(
+            context,
+            name,
+            version,
+            client,
+            route_table,
+            metadata_caches,
+            metadata_queue,
+            metadata_stats,
+            resolver_policy,
+            queued_at_ms,
+        )
+        .await;
+    }
+
+    metadata_for_full_package(
+        context,
+        name,
+        client,
+        route_table,
+        metadata_caches,
+        metadata_queue,
+        metadata_stats,
+        resolver_policy,
+        queued_at_ms,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn metadata_for_full_package(
+    context: MetadataRequestContext,
+    name: String,
+    client: Arc<RegistryClient>,
+    route_table: RouteTable,
+    metadata_caches: MetadataCaches,
+    metadata_queue: Arc<Semaphore>,
+    metadata_stats: Arc<MetadataStats>,
+    resolver_policy: lpm_resolver::ResolverPolicy,
+    queued_at_ms: u128,
+) -> Result<Arc<lpm_resolver::CachedPackageInfo>, LpmError> {
+    let cell = metadata_caches
+        .full
         .entry(name.clone())
         .or_insert_with(|| Arc::new(OnceCell::new()))
         .clone();
@@ -2151,6 +2259,92 @@ async fn metadata_for_package(
             trace,
         );
         Ok(info)
+    })
+    .await
+    .cloned()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn metadata_for_exact_version(
+    context: MetadataRequestContext,
+    name: String,
+    version: String,
+    client: Arc<RegistryClient>,
+    route_table: RouteTable,
+    metadata_caches: MetadataCaches,
+    metadata_queue: Arc<Semaphore>,
+    metadata_stats: Arc<MetadataStats>,
+    resolver_policy: lpm_resolver::ResolverPolicy,
+    queued_at_ms: u128,
+) -> Result<Arc<lpm_resolver::CachedPackageInfo>, LpmError> {
+    let key = ExactVersionMetadataKey {
+        name: name.clone(),
+        version: version.clone(),
+    };
+    let cell = metadata_caches
+        .exact_version
+        .entry(key)
+        .or_insert_with(|| Arc::new(OnceCell::new()))
+        .clone();
+    if cell.get().is_some() {
+        metadata_stats.ready_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    let metadata_stats_for_init = Arc::clone(&metadata_stats);
+    let trace = TimingDetailMode::from_env().trace();
+    cell.get_or_try_init(|| async move {
+        metadata_stats_for_init
+            .initial_fetches
+            .fetch_add(1, Ordering::Relaxed);
+        metadata_stats_for_init.record_range_initial_fetch(&context);
+        metadata_stats_for_init.record_version_doc_attempt();
+        let queue_start = Instant::now();
+        let permit = metadata_queue
+            .acquire()
+            .await
+            .map_err(|_| LpmError::Registry("experimental installer queue closed".into()))?;
+        metadata_stats_for_init.record_queue_wait(queue_start.elapsed().as_millis());
+        let fetch_start = Instant::now();
+        let canonical = lpm_resolver::CanonicalKey::from_dep_name(&name);
+        let exact_result =
+            lpm_resolver::experimental_fetch_exact_cached_package_info_with_policy_and_timings(
+                &client,
+                &route_table,
+                &canonical,
+                &version,
+                &resolver_policy,
+            )
+            .await;
+        metadata_stats_for_init.record_fetch(fetch_start.elapsed().as_millis());
+        drop(permit);
+        match exact_result {
+            Ok((info, timings)) => {
+                metadata_stats_for_init.record_version_doc_hit();
+                let completed_at_ms = metadata_stats_for_init.elapsed_ms();
+                metadata_stats_for_init.record_detail(
+                    context,
+                    timings,
+                    queued_at_ms,
+                    completed_at_ms,
+                    trace,
+                );
+                Ok(info)
+            }
+            Err(_) => {
+                metadata_stats_for_init.record_version_doc_fallback();
+                metadata_for_full_package(
+                    context,
+                    name,
+                    client,
+                    route_table,
+                    metadata_caches,
+                    metadata_queue,
+                    metadata_stats_for_init,
+                    resolver_policy,
+                    queued_at_ms,
+                )
+                .await
+            }
+        }
     })
     .await
     .cloned()
@@ -2469,7 +2663,7 @@ fn enqueue_dependencies(
     pending: &mut FuturesUnordered<ResolveFuture>,
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
-    metadata_cache: &MetadataCache,
+    metadata_caches: &MetadataCaches,
     metadata_queue: &Arc<Semaphore>,
     metadata_stats: &Arc<MetadataStats>,
     resolver_policy: &lpm_resolver::ResolverPolicy,
@@ -2523,7 +2717,7 @@ fn enqueue_dependencies(
             request,
             Arc::clone(client),
             route_table.clone(),
-            Arc::clone(metadata_cache),
+            metadata_caches.clone(),
             Arc::clone(metadata_queue),
             Arc::clone(metadata_stats),
             resolver_policy.clone(),
@@ -2610,7 +2804,7 @@ async fn drain_ambient_peer_installs(
     packages: &mut HashMap<PackageIdentity, PackageDraft>,
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
-    metadata_cache: &MetadataCache,
+    metadata_caches: &MetadataCaches,
     metadata_queue: &Arc<Semaphore>,
     fetch_queue: &Arc<Semaphore>,
     metadata_stats: &Arc<MetadataStats>,
@@ -2637,7 +2831,7 @@ async fn drain_ambient_peer_installs(
             packages,
             client,
             route_table,
-            metadata_cache,
+            metadata_caches,
             metadata_queue,
             metadata_stats,
             resolver_policy,
@@ -2666,7 +2860,7 @@ async fn drain_ambient_peer_installs(
                 },
                 Arc::clone(client),
                 route_table.clone(),
-                Arc::clone(metadata_cache),
+                metadata_caches.clone(),
                 Arc::clone(metadata_queue),
                 Arc::clone(metadata_stats),
                 resolver_policy.clone(),
@@ -2740,7 +2934,7 @@ async fn drain_ambient_peer_installs(
                     &mut pending,
                     client,
                     route_table,
-                    metadata_cache,
+                    metadata_caches,
                     metadata_queue,
                     metadata_stats,
                     resolver_policy,
@@ -2759,7 +2953,7 @@ async fn ambient_peer_plans(
     packages: &HashMap<PackageIdentity, PackageDraft>,
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
-    metadata_cache: &MetadataCache,
+    metadata_caches: &MetadataCaches,
     metadata_queue: &Arc<Semaphore>,
     metadata_stats: &Arc<MetadataStats>,
     resolver_policy: &lpm_resolver::ResolverPolicy,
@@ -2785,7 +2979,7 @@ async fn ambient_peer_plans(
             MetadataRequestContext::peer_plan(&target_name),
             Arc::clone(client),
             route_table.clone(),
-            Arc::clone(metadata_cache),
+            metadata_caches.clone(),
             Arc::clone(metadata_queue),
             Arc::clone(metadata_stats),
             resolver_policy.clone(),
@@ -3965,6 +4159,227 @@ mod tests {
             Some(1)
         );
         assert_eq!(packages["mixed_exact_and_non_exact"].as_u64(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn exact_version_metadata_cache_does_not_satisfy_broad_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let name = "cache-split";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}/1.0.0")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.com/cache-split-1.0.0.tgz",
+                    "integrity": "sha512-one"
+                },
+                "dependencies": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": "2.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": name,
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": "https://example.com/cache-split-1.0.0.tgz",
+                            "integrity": "sha512-one"
+                        },
+                        "dependencies": {}
+                    },
+                    "2.0.0": {
+                        "name": name,
+                        "version": "2.0.0",
+                        "dist": {
+                            "tarball": "https://example.com/cache-split-2.0.0.tgz",
+                            "integrity": "sha512-two"
+                        },
+                        "dependencies": {}
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let registry = RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(Some(tmp.path().to_path_buf()));
+        let client = Arc::new(registry);
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let caches = MetadataCaches::new();
+        let queue = Arc::new(Semaphore::new(4));
+        let stats = Arc::new(MetadataStats::new(Instant::now()));
+        let policy = lpm_resolver::ResolverPolicy::default();
+
+        let mut exact_context = MetadataRequestContext::from_request(&resolve_request_for_test(
+            name, "1.0.0", None, true, true,
+        ));
+        exact_context.version_doc_eligible = true;
+        let exact_info = metadata_for_exact_version(
+            exact_context,
+            name.to_string(),
+            "1.0.0".to_string(),
+            Arc::clone(&client),
+            route_table.clone(),
+            caches.clone(),
+            Arc::clone(&queue),
+            Arc::clone(&stats),
+            policy.clone(),
+            0,
+        )
+        .await
+        .expect("exact version metadata should resolve");
+
+        let full_info = metadata_for_full_package(
+            MetadataRequestContext::from_request(&resolve_request_for_test(
+                name, "^1.0.0", None, true, true,
+            )),
+            name.to_string(),
+            client,
+            route_table,
+            caches.clone(),
+            queue,
+            stats,
+            policy,
+            0,
+        )
+        .await
+        .expect("broad metadata should resolve through full packument cache");
+
+        assert_eq!(exact_info.versions.len(), 1);
+        assert_eq!(full_info.versions.len(), 2);
+        assert_eq!(caches.exact_version.len(), 1);
+        assert_eq!(caches.full.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_version_metadata_fallback_populates_full_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = crate::test_env::ScopedEnv::set([(
+            ENV_INSTALLER_SPIKE_EXACT_DOC,
+            std::ffi::OsString::from("1"),
+        )]);
+        let server = MockServer::start().await;
+        let name = "cache-fallback";
+
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}/1.0.0")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "wrong-package",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.com/wrong-package-1.0.0.tgz",
+                    "integrity": "sha512-wrong"
+                },
+                "dependencies": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": "2.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": name,
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": "https://example.com/cache-fallback-1.0.0.tgz",
+                            "integrity": "sha512-one"
+                        },
+                        "dependencies": {}
+                    },
+                    "2.0.0": {
+                        "name": name,
+                        "version": "2.0.0",
+                        "dist": {
+                            "tarball": "https://example.com/cache-fallback-2.0.0.tgz",
+                            "integrity": "sha512-two"
+                        },
+                        "dependencies": {}
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let registry = RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(Some(tmp.path().to_path_buf()));
+        let client = Arc::new(registry);
+        let route_table = lpm_registry::RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let caches = MetadataCaches::new();
+        let queue = Arc::new(Semaphore::new(1));
+        let stats = Arc::new(MetadataStats::new(Instant::now()));
+        let policy = lpm_resolver::ResolverPolicy::default();
+
+        let exact_info = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            metadata_for_package(
+                MetadataRequestContext::from_request(&resolve_request_for_test(
+                    name, "1.0.0", None, true, true,
+                )),
+                Arc::clone(&client),
+                route_table.clone(),
+                caches.clone(),
+                Arc::clone(&queue),
+                Arc::clone(&stats),
+                policy.clone(),
+            ),
+        )
+        .await
+        .expect("fallback must not deadlock while metadata concurrency is one")
+        .expect("exact-doc fallback should resolve through full metadata");
+        let broad_info = metadata_for_package(
+            MetadataRequestContext::from_request(&resolve_request_for_test(
+                name, "^1.0.0", None, true, true,
+            )),
+            client,
+            route_table,
+            caches.clone(),
+            queue,
+            Arc::clone(&stats),
+            policy,
+        )
+        .await
+        .expect("broad request should reuse the populated full cache");
+
+        assert_eq!(exact_info.versions.len(), 2);
+        assert_eq!(broad_info.versions.len(), 2);
+        assert_eq!(caches.exact_version.len(), 1);
+        assert_eq!(caches.full.len(), 1);
+        let json = stats.to_json(false);
+        assert_eq!(
+            json["attribution"]["version_docs"]["attempts"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            json["attribution"]["version_docs"]["fallbacks"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            json["attribution"]["version_docs"]["hits"].as_u64(),
+            Some(0)
+        );
     }
 
     #[test]

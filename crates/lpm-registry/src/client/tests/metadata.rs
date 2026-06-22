@@ -1065,6 +1065,187 @@ async fn get_npm_metadata_direct_skips_proxy_tier_entirely() {
 }
 
 #[tokio::test]
+async fn get_npm_version_metadata_direct_fetches_and_caches_version_document() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm_server = MockServer::start().await;
+    let pkg = "exact-doc-pkg";
+    let version = "1.2.3";
+    let body = serde_json::json!({
+        "name": pkg,
+        "version": version,
+        "dist": {
+            "tarball": "https://example.com/exact-doc-pkg-1.2.3.tgz",
+            "integrity": "sha512-test"
+        },
+        "dependencies": {
+            "left-pad": "^1.3.0"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}/{version}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let first = client
+        .get_npm_version_metadata_direct_with_timings(pkg, version)
+        .await
+        .expect("version document fetch should succeed");
+    let second = client
+        .get_npm_version_metadata_direct_with_timings(pkg, version)
+        .await
+        .expect("cached version document should succeed");
+
+    assert!(first.metadata.versions.contains_key(version));
+    assert!(second.timings.cache_hit);
+    assert_eq!(
+        second
+            .metadata
+            .versions
+            .get(version)
+            .and_then(|metadata| metadata.dependencies.get("left-pad"))
+            .map(String::as_str),
+        Some("^1.3.0")
+    );
+    assert!(
+        client
+            .read_metadata_cache(&format!("npm-version:{pkg}@{version}"))
+            .is_some(),
+        "version document should use a cache key separate from npm:{pkg}"
+    );
+}
+
+#[tokio::test]
+async fn get_npm_version_metadata_direct_rejects_wrong_network_version_document() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm_server = MockServer::start().await;
+    let pkg = "exact-doc-network-wrong";
+    let version = "1.2.3";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}/{version}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "some-other-package",
+            "version": version,
+            "dist": {
+                "tarball": "https://example.com/some-other-package-1.2.3.tgz",
+                "integrity": "sha512-test"
+            },
+            "dependencies": {}
+        })))
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let client = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()));
+    let err = client
+        .get_npm_version_metadata_direct_with_timings(pkg, version)
+        .await
+        .expect_err("wrong network version document should fail validation");
+
+    assert!(
+        err.to_string().contains("some-other-package")
+            && err.to_string().contains(pkg)
+            && err.to_string().contains(version),
+        "error should name expected and actual package/version, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn get_npm_version_metadata_direct_uses_scoped_package_path() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm_server = MockServer::start().await;
+    let pkg = "@scope/exact-doc-pkg";
+    let version = "2.0.0";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}/{version}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": pkg,
+            "version": version,
+            "dist": {
+                "tarball": "https://example.com/scope-exact-doc-pkg-2.0.0.tgz",
+                "integrity": "sha512-test"
+            },
+            "dependencies": {}
+        })))
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let got = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()))
+        .get_npm_version_metadata_direct_with_timings(pkg, version)
+        .await
+        .expect("scoped package exact document fetch should succeed");
+
+    assert!(got.metadata.versions.contains_key(version));
+}
+
+#[tokio::test]
+async fn get_npm_version_metadata_direct_refetches_wrong_cached_version_document() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm_server = MockServer::start().await;
+    let pkg = "exact-doc-refetch";
+    let version = "3.2.1";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}/{version}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": pkg,
+            "version": version,
+            "dist": {
+                "tarball": "https://example.com/exact-doc-refetch-3.2.1.tgz",
+                "integrity": "sha512-test"
+            },
+            "dependencies": {}
+        })))
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    client.write_metadata_cache(
+        &format!("npm-version:{pkg}@{version}"),
+        &test_metadata("some-other-package"),
+        None,
+    );
+
+    let fetched = client
+        .get_npm_version_metadata_direct_with_timings(pkg, version)
+        .await
+        .expect("wrong cached version document should be refetched");
+
+    assert!(!fetched.timings.cache_hit);
+    assert!(fetched.metadata.versions.contains_key(version));
+}
+
+#[tokio::test]
 async fn parallel_fetch_preserves_input_order_across_varying_latencies() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

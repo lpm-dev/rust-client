@@ -1817,3 +1817,35 @@ async fn invalidate_custom_metadata_cache_removes_authed_entry() {
         .await
         .unwrap();
 }
+
+#[test]
+fn invalidate_npm_version_metadata_cache_removes_exact_doc_entry() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let client = RegistryClient::new().with_cache_dir(Some(tmp.path().to_path_buf()));
+    let package_name = "exact-doc-stale";
+    let version = "1.2.3";
+    let metadata: PackageMetadata =
+        serde_json::from_str(&test_metadata_json(package_name)).expect("parse test metadata");
+
+    client.write_metadata_cache(&format!("npm:{package_name}"), &metadata, None);
+    client.write_metadata_cache(
+        &format!("npm-version:{package_name}@{version}"),
+        &metadata,
+        None,
+    );
+
+    client.invalidate_npm_version_metadata_cache(package_name, version);
+
+    assert!(
+        client
+            .read_metadata_cache(&format!("npm-version:{package_name}@{version}"))
+            .is_none(),
+        "exact version metadata cache entry should be removed"
+    );
+    assert!(
+        client
+            .read_metadata_cache(&format!("npm:{package_name}"))
+            .is_some(),
+        "package metadata cache entry should remain separate"
+    );
+}
