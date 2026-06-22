@@ -1205,6 +1205,7 @@ pub(super) async fn run(
     let metadata_queue = Arc::new(Semaphore::new(metadata_concurrency));
     let metadata_caches = MetadataCaches::new();
     let store = PackageStore::from_root(lpm_root);
+    let patch_fingerprints = compute_patch_fingerprints(current_patches, project_dir)?;
     let gate_stats = Arc::new(GateStats::default());
 
     let setup_ms = start.elapsed().as_millis();
@@ -1469,7 +1470,6 @@ pub(super) async fn run(
     stage_timings.parity_ms = parity_start.elapsed().as_millis();
 
     let link_targets_start = Instant::now();
-    let patch_fingerprints = compute_patch_fingerprints(current_patches, project_dir)?;
     let link_targets = build_experimental_link_targets(
         project_dir,
         &store,
