@@ -27,6 +27,12 @@ Build lpm first:
 cargo build --release --locked -p lpm-cli --bin lpm-rs
 ```
 
+Run the harness self-test after changing warning or summary logic:
+
+```bash
+node bench/scripts/run-install-readiness.mjs --self-test
+```
+
 Capture the current lpm cold/warm reference first:
 
 ```bash
