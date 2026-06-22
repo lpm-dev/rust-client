@@ -408,10 +408,18 @@ function installCommand(manager, policy) {
 
 function extractLpmMetrics(json) {
   const experimental = at(json, ['timing', 'experimental_installer_spike']);
-  const metadata = experimental?.metadata;
-  const metadataAttribution = metadata?.attribution;
+  const { metadata, attribution: metadataAttribution, routes: metadataRoutes, versionDocs } =
+    lpmMetadataMetrics(json);
   const fetchBreakdown = at(json, ['timing', 'fetch_breakdown']);
   const parity = experimental?.parity;
+  const metadataBodyBytesSum = firstFinite(
+    metadata?.body_bytes_sum,
+    metadataAttribution?.body_bytes_sum,
+  );
+  const metadataVersionCountSum = firstFinite(
+    metadata?.version_count_sum,
+    metadataAttribution?.version_count_sum,
+  );
 
   return {
     duration_ms: numberAt(json, ['duration_ms']),
@@ -437,9 +445,9 @@ function extractLpmMetrics(json) {
     metadata_calls: finiteNumber(metadata?.calls),
     metadata_initial_fetches: finiteNumber(metadata?.initial_fetches),
     metadata_ready_hits: finiteNumber(metadata?.ready_hits),
-    metadata_body_bytes_sum: finiteNumber(metadataAttribution?.body_bytes_sum),
-    metadata_body_mb_sum: bytesToMb(metadataAttribution?.body_bytes_sum),
-    metadata_version_count_sum: finiteNumber(metadataAttribution?.version_count_sum),
+    metadata_body_bytes_sum: metadataBodyBytesSum,
+    metadata_body_mb_sum: bytesToMb(metadataBodyBytesSum),
+    metadata_version_count_sum: metadataVersionCountSum,
     metadata_raw_fetch_sum_ms: finiteNumber(metadataAttribution?.raw_fetch_sum_ms),
     metadata_http_sum_ms: finiteNumber(metadataAttribution?.http_sum_ms),
     metadata_body_read_sum_ms: finiteNumber(metadataAttribution?.body_read_sum_ms),
@@ -451,14 +459,44 @@ function extractLpmMetrics(json) {
     metadata_policy_full_metadata_sum_ms: finiteNumber(
       metadataAttribution?.policy_full_metadata_sum_ms,
     ),
-    metadata_version_doc_attempts: finiteNumber(metadataAttribution?.version_docs?.attempts),
-    metadata_version_doc_hits: finiteNumber(metadataAttribution?.version_docs?.hits),
-    metadata_version_doc_fallbacks: finiteNumber(metadataAttribution?.version_docs?.fallbacks),
-    metadata_route_npm_direct: finiteNumber(metadataAttribution?.routes?.npm_direct),
+    metadata_version_doc_attempts: finiteNumber(versionDocs?.attempts),
+    metadata_version_doc_hits: finiteNumber(versionDocs?.hits),
+    metadata_version_doc_fallbacks: finiteNumber(versionDocs?.fallbacks),
+    metadata_route_npm_direct: finiteNumber(metadataRoutes?.npm_direct),
     metadata_route_npm_direct_version_doc: finiteNumber(
-      metadataAttribution?.routes?.npm_direct_version_doc,
+      metadataRoutes?.npm_direct_version_doc,
     ),
   };
+}
+
+function lpmMetadataMetrics(json) {
+  const current = at(json, ['timing', 'detail', 'resolve', 'metadata_fetch']);
+  if (current && typeof current === 'object') {
+    return {
+      metadata: current,
+      attribution: current.attribution,
+      routes: current.routes ?? current.attribution?.routes,
+      versionDocs: current.version_docs ?? current.attribution?.version_docs,
+    };
+  }
+
+  const experimental = at(json, ['timing', 'experimental_installer_spike', 'metadata']);
+  return {
+    metadata: experimental,
+    attribution: experimental?.attribution,
+    routes: experimental?.routes ?? experimental?.attribution?.routes,
+    versionDocs: experimental?.version_docs ?? experimental?.attribution?.version_docs,
+  };
+}
+
+function firstFinite(...values) {
+  for (const value of values) {
+    const number = finiteNumber(value);
+    if (number !== undefined) {
+      return number;
+    }
+  }
+  return undefined;
 }
 
 function buildRunSpecs(managers, cells, routes) {
@@ -1252,6 +1290,67 @@ function runSelfTests() {
   });
   assert.equal(stderrWarning.warning_count, 1);
   assert.equal(stderrWarning.expected_warnings[0]?.id, 'husky-git-missing');
+
+  const currentMetadataMetrics = extractLpmMetrics({
+    count: 2,
+    timing: {
+      detail: {
+        resolve: {
+          metadata_fetch: {
+            calls: 2,
+            body_bytes_sum: 5 * 1024 * 1024,
+            version_count_sum: 7,
+            routes: {
+              npm_direct: 2,
+            },
+            attribution: {
+              raw_fetch_sum_ms: 12,
+              http_sum_ms: 11,
+              body_read_sum_ms: 3,
+              json_decode_sum_ms: 1,
+              cache_info_parse_sum_ms: 1,
+              policy_release_time_sum_ms: 0,
+              policy_full_metadata_sum_ms: 0,
+            },
+          },
+        },
+      },
+    },
+  });
+  assert.equal(currentMetadataMetrics.metadata_calls, 2);
+  assert.equal(currentMetadataMetrics.metadata_body_mb_sum, 5);
+  assert.equal(currentMetadataMetrics.metadata_version_count_sum, 7);
+  assert.equal(currentMetadataMetrics.metadata_http_sum_ms, 11);
+  assert.equal(currentMetadataMetrics.metadata_route_npm_direct, 2);
+
+  const experimentalMetadataMetrics = extractLpmMetrics({
+    timing: {
+      experimental_installer_spike: {
+        metadata: {
+          calls: 3,
+          attribution: {
+            body_bytes_sum: 1024 * 1024,
+            version_count_sum: 9,
+            http_sum_ms: 4,
+            routes: {
+              npm_direct_version_doc: 2,
+            },
+            version_docs: {
+              attempts: 3,
+              hits: 2,
+              fallbacks: 1,
+            },
+          },
+        },
+      },
+    },
+  });
+  assert.equal(experimentalMetadataMetrics.metadata_calls, 3);
+  assert.equal(experimentalMetadataMetrics.metadata_body_mb_sum, 1);
+  assert.equal(experimentalMetadataMetrics.metadata_version_doc_attempts, 3);
+  assert.equal(experimentalMetadataMetrics.metadata_version_doc_hits, 2);
+  assert.equal(experimentalMetadataMetrics.metadata_version_doc_fallbacks, 1);
+  assert.equal(experimentalMetadataMetrics.metadata_route_npm_direct_version_doc, 2);
 
   console.log('run-install-readiness self-test passed');
 }
