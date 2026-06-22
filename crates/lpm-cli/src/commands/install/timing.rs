@@ -401,11 +401,25 @@ pub(super) struct FetchOverlapStats {
     pub(super) failed_count: u64,
     pub(super) skipped_platform_count: u64,
     pub(super) skipped_auth_count: u64,
+    pub(super) buffered_count: u64,
+    pub(super) buffered_dispatch_count: u64,
+    pub(super) buffer_wait_sum_ms: u128,
+    pub(super) buffer_wait_max_ms: u128,
     pub(super) breakdown: FetchBreakdown,
     pub(super) drain_ms: u128,
 }
 
 impl FetchOverlapStats {
+    pub(super) fn record_buffered_event(&mut self) {
+        self.buffered_count = self.buffered_count.saturating_add(1);
+    }
+
+    pub(super) fn record_buffered_dispatch(&mut self, wait_ms: u128) {
+        self.buffered_dispatch_count = self.buffered_dispatch_count.saturating_add(1);
+        self.buffer_wait_sum_ms = self.buffer_wait_sum_ms.saturating_add(wait_ms);
+        self.buffer_wait_max_ms = self.buffer_wait_max_ms.max(wait_ms);
+    }
+
     pub(super) fn record_task(&mut self, timings: TaskTimings) {
         self.breakdown.record(timings);
     }
@@ -419,6 +433,13 @@ impl FetchOverlapStats {
             "failed_count": self.failed_count,
             "skipped_platform_count": self.skipped_platform_count,
             "skipped_auth_count": self.skipped_auth_count,
+            "buffered_count": self.buffered_count,
+            "buffered_dispatch_count": self.buffered_dispatch_count,
+            "buffered_undispatched_count": self.buffered_count.saturating_sub(self.buffered_dispatch_count),
+            "buffer_wait": {
+                "sum_ms": self.buffer_wait_sum_ms,
+                "max_ms": self.buffer_wait_max_ms,
+            },
             "task_sum_ms": self.breakdown.task_sum_ms,
             "task_max_ms": self.breakdown.task_max_ms,
             "breakdown": self.breakdown.to_json(),
@@ -1044,6 +1065,30 @@ fn metadata_fetch_detail_json_from_snapshot(
             "cache_write_dispatch_sum_ms": snapshot.attribution.cache_write_dispatch_sum_ms,
             "cache_info_parse_sum_ms": snapshot.attribution.cache_info_parse_sum_ms,
             "policy_release_time_sum_ms": snapshot.attribution.policy_release_time_sum_ms,
+            "policy_release_time_fetch": {
+                "total_sum_ms": snapshot.attribution.policy_release_time_fetch_sum_ms,
+                "cache_read_sum_ms": snapshot.attribution.policy_release_time_cache_read_sum_ms,
+                "validator_read_sum_ms": snapshot
+                    .attribution
+                    .policy_release_time_validator_read_sum_ms,
+                "http_sum_ms": snapshot.attribution.policy_release_time_http_sum_ms,
+                "body_read_sum_ms": snapshot.attribution.policy_release_time_body_read_sum_ms,
+                "json_decode_sum_ms": snapshot
+                    .attribution
+                    .policy_release_time_json_decode_sum_ms,
+                "cache_after_304_sum_ms": snapshot
+                    .attribution
+                    .policy_release_time_cache_after_304_sum_ms,
+                "cache_write_dispatch_sum_ms": snapshot
+                    .attribution
+                    .policy_release_time_cache_write_dispatch_sum_ms,
+                "body_bytes_sum": snapshot.attribution.policy_release_time_body_bytes_sum,
+                "version_count_sum": snapshot.attribution.policy_release_time_version_count_sum,
+                "cache_hit_count": snapshot.attribution.policy_release_time_cache_hit_count,
+                "not_modified_count": snapshot
+                    .attribution
+                    .policy_release_time_not_modified_count,
+            },
             "policy_full_metadata_sum_ms": snapshot.attribution.policy_full_metadata_sum_ms,
         },
     });
@@ -1053,6 +1098,7 @@ fn metadata_fetch_detail_json_from_snapshot(
             "by_raw_fetch": metadata_fetch_bucket_json(&snapshot.top_slow_packages.by_raw_fetch),
             "by_http": metadata_fetch_bucket_json(&snapshot.top_slow_packages.by_http),
             "by_body_read": metadata_fetch_bucket_json(&snapshot.top_slow_packages.by_body_read),
+            "by_body_bytes": metadata_fetch_bucket_json(&snapshot.top_slow_packages.by_body_bytes),
             "by_json_decode": metadata_fetch_bucket_json(
                 &snapshot.top_slow_packages.by_json_decode,
             ),
@@ -1062,8 +1108,25 @@ fn metadata_fetch_detail_json_from_snapshot(
             "by_policy_release_time": metadata_fetch_bucket_json(
                 &snapshot.top_slow_packages.by_policy_release_time,
             ),
+            "by_policy_release_time_fetch": metadata_fetch_bucket_json(
+                &snapshot.top_slow_packages.by_policy_release_time_fetch,
+            ),
             "by_policy_full_metadata": metadata_fetch_bucket_json(
                 &snapshot.top_slow_packages.by_policy_full_metadata,
+            ),
+        });
+        json["top_direct_packuments"] = serde_json::json!({
+            "by_http": metadata_fetch_bucket_json(&snapshot.top_direct_packuments.by_http),
+            "by_body_bytes": metadata_fetch_bucket_json(
+                &snapshot.top_direct_packuments.by_body_bytes,
+            ),
+            "by_policy_release_time_fetch": metadata_fetch_bucket_json(
+                &snapshot.top_direct_packuments.by_policy_release_time_fetch,
+            ),
+            "by_policy_release_time_body_bytes": metadata_fetch_bucket_json(
+                &snapshot
+                    .top_direct_packuments
+                    .by_policy_release_time_body_bytes,
             ),
         });
     }
@@ -1091,6 +1154,21 @@ fn metadata_fetch_bucket_json(
                     "cache_write_dispatch_ms": record.cache_write_dispatch_ms,
                     "cache_info_parse_ms": record.cache_info_parse_ms,
                     "policy_release_time_ms": record.policy_release_time_ms,
+                    "policy_release_time_fetch": {
+                        "total_ms": record.policy_release_time_fetch_ms,
+                        "cache_read_ms": record.policy_release_time_cache_read_ms,
+                        "validator_read_ms": record.policy_release_time_validator_read_ms,
+                        "http_ms": record.policy_release_time_http_ms,
+                        "body_read_ms": record.policy_release_time_body_read_ms,
+                        "json_decode_ms": record.policy_release_time_json_decode_ms,
+                        "cache_after_304_ms": record.policy_release_time_cache_after_304_ms,
+                        "cache_write_dispatch_ms": record
+                            .policy_release_time_cache_write_dispatch_ms,
+                        "body_bytes": record.policy_release_time_body_bytes,
+                        "version_count": record.policy_release_time_version_count,
+                        "cache_hit": record.policy_release_time_cache_hit,
+                        "not_modified": record.policy_release_time_not_modified,
+                    },
                     "policy_full_metadata_ms": record.policy_full_metadata_ms,
                     "body_bytes": record.body_bytes,
                     "version_count": record.version_count,
@@ -1425,6 +1503,18 @@ mod tests {
             cache_write_dispatch_ms: 6,
             cache_info_parse_ms: 7,
             policy_release_time_ms: 8,
+            policy_release_time_fetch_ms: 10,
+            policy_release_time_cache_read_ms: 11,
+            policy_release_time_validator_read_ms: 12,
+            policy_release_time_http_ms: 13,
+            policy_release_time_body_read_ms: 14,
+            policy_release_time_json_decode_ms: 15,
+            policy_release_time_cache_after_304_ms: 16,
+            policy_release_time_cache_write_dispatch_ms: 17,
+            policy_release_time_body_bytes: 2048,
+            policy_release_time_version_count: 43,
+            policy_release_time_cache_hit: true,
+            policy_release_time_not_modified: true,
             policy_full_metadata_ms: 9,
             body_bytes: 1024,
             version_count: 42,
@@ -1452,23 +1542,58 @@ mod tests {
                 cache_write_dispatch_sum_ms: 6,
                 cache_info_parse_sum_ms: 7,
                 policy_release_time_sum_ms: 8,
+                policy_release_time_fetch_sum_ms: 10,
+                policy_release_time_cache_read_sum_ms: 11,
+                policy_release_time_validator_read_sum_ms: 12,
+                policy_release_time_http_sum_ms: 13,
+                policy_release_time_body_read_sum_ms: 14,
+                policy_release_time_json_decode_sum_ms: 15,
+                policy_release_time_cache_after_304_sum_ms: 16,
+                policy_release_time_cache_write_dispatch_sum_ms: 17,
+                policy_release_time_body_bytes_sum: 2048,
+                policy_release_time_version_count_sum: 43,
+                policy_release_time_cache_hit_count: 1,
+                policy_release_time_not_modified_count: 1,
                 policy_full_metadata_sum_ms: 9,
             },
             top_slow_packages: lpm_registry::timing::MetadataFetchSlowSnapshot {
-                by_total: vec![record],
+                by_total: vec![record.clone()],
+                by_body_bytes: vec![record.clone()],
                 ..lpm_registry::timing::MetadataFetchSlowSnapshot::default()
+            },
+            top_direct_packuments: lpm_registry::timing::MetadataFetchDirectPackumentSnapshot {
+                by_http: vec![record.clone()],
+                by_body_bytes: vec![record],
+                ..lpm_registry::timing::MetadataFetchDirectPackumentSnapshot::default()
             },
             ..lpm_registry::timing::MetadataFetchDetailSnapshot::default()
         };
 
         let json = metadata_fetch_detail_json_from_snapshot(&snapshot, TimingDetailMode::Trace);
         let row = &json["top_slow_packages"]["by_total"][0];
+        let direct_row = &json["top_direct_packuments"]["by_body_bytes"][0];
 
         assert_eq!(json["calls"], 1);
         assert_eq!(json["scope"], "per_package_metadata_fetches");
         assert_eq!(json["batch_fetches_included"], false);
         assert_eq!(json["routes"]["npm_direct"], 1);
         assert_eq!(json["attribution"]["http_sum_ms"], 12);
+        assert_eq!(
+            json["attribution"]["policy_release_time_fetch"]["total_sum_ms"],
+            10
+        );
+        assert_eq!(
+            json["attribution"]["policy_release_time_fetch"]["body_bytes_sum"],
+            2048
+        );
+        assert_eq!(
+            json["attribution"]["policy_release_time_fetch"]["version_count_sum"],
+            43
+        );
+        assert_eq!(
+            json["attribution"]["policy_release_time_fetch"]["cache_hit_count"],
+            1
+        );
         assert_eq!(row["package"], "left-pad");
         assert_eq!(row["route"], "npm_direct");
         assert_eq!(row["total_ms"], 21);
@@ -1482,11 +1607,44 @@ mod tests {
         assert_eq!(row["cache_write_dispatch_ms"], 6);
         assert_eq!(row["cache_info_parse_ms"], 7);
         assert_eq!(row["policy_release_time_ms"], 8);
+        assert_eq!(row["policy_release_time_fetch"]["total_ms"], 10);
+        assert_eq!(row["policy_release_time_fetch"]["cache_read_ms"], 11);
+        assert_eq!(row["policy_release_time_fetch"]["validator_read_ms"], 12);
+        assert_eq!(row["policy_release_time_fetch"]["http_ms"], 13);
+        assert_eq!(row["policy_release_time_fetch"]["body_read_ms"], 14);
+        assert_eq!(row["policy_release_time_fetch"]["json_decode_ms"], 15);
+        assert_eq!(row["policy_release_time_fetch"]["cache_after_304_ms"], 16);
+        assert_eq!(
+            row["policy_release_time_fetch"]["cache_write_dispatch_ms"],
+            17
+        );
+        assert_eq!(row["policy_release_time_fetch"]["body_bytes"], 2048);
+        assert_eq!(row["policy_release_time_fetch"]["version_count"], 43);
+        assert!(
+            row["policy_release_time_fetch"]["cache_hit"]
+                .as_bool()
+                .unwrap_or(false)
+        );
+        assert!(
+            row["policy_release_time_fetch"]["not_modified"]
+                .as_bool()
+                .unwrap_or(false)
+        );
         assert_eq!(row["policy_full_metadata_ms"], 9);
         assert_eq!(row["body_bytes"], 1024);
         assert_eq!(row["version_count"], 42);
         assert!(row["cache_hit"].as_bool().unwrap_or(false));
         assert!(row["not_modified"].as_bool().unwrap_or(false));
+        assert_eq!(
+            json["top_slow_packages"]["by_body_bytes"][0]["package"],
+            "left-pad"
+        );
+        assert_eq!(
+            json["top_direct_packuments"]["by_http"][0]["package"],
+            "left-pad"
+        );
+        assert_eq!(direct_row["package"], "left-pad");
+        assert_eq!(direct_row["body_bytes"], 1024);
     }
 
     #[test]
@@ -1622,6 +1780,22 @@ mod tests {
         assert_eq!(json["duplicated_with_fetch"], 1);
         assert_eq!(json["failed"], 4);
         assert_eq!(json["wasted"], 5);
+    }
+
+    #[test]
+    fn fetch_overlap_stats_json_reports_buffer_wait_before_dispatch() {
+        let mut stats = FetchOverlapStats::default();
+        stats.record_buffered_event();
+        stats.record_buffered_event();
+        stats.record_buffered_dispatch(7);
+
+        let json = stats.to_json();
+
+        assert_eq!(json["buffered_count"], 2);
+        assert_eq!(json["buffered_dispatch_count"], 1);
+        assert_eq!(json["buffered_undispatched_count"], 1);
+        assert_eq!(json["buffer_wait"]["sum_ms"], 7);
+        assert_eq!(json["buffer_wait"]["max_ms"], 7);
     }
 
     #[test]

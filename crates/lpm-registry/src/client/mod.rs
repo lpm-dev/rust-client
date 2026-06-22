@@ -32,7 +32,7 @@ pub use self::auth::AuthPosture;
 pub use self::body::parse_capped_api_json;
 pub use self::state::{
     DownloadedTarball, FanOutStats, HttpClients, PackageMetadataFetchTimings, RegistryClient,
-    TimedPackageMetadata,
+    TimedPackageMetadata, TimedReleaseTimeMetadata,
 };
 pub use self::tarball::MAX_COMPRESSED_TARBALL_SIZE;
 pub use self::url_gate::{

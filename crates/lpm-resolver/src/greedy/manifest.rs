@@ -156,7 +156,7 @@ pub(super) async fn fetch_metadata_for_resolver(
         .await;
     }
     if info.needs_release_time_metadata(canonical, policy) {
-        fetch_release_times_for_policy(client, route_table, canonical, &mut info).await?;
+        fetch_release_times_for_policy(client, route_table, canonical, &mut info, false).await?;
     }
     Ok(fetched_metadata_from_info(
         None,
@@ -218,7 +218,13 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
     }
     if info.needs_release_time_metadata(canonical, policy) {
         let policy_start = Instant::now();
-        fetch_release_times_for_policy(client, route_table, canonical, &mut info).await?;
+        if let Some(detail) =
+            fetch_release_times_for_policy(client, route_table, canonical, &mut info, true).await?
+        {
+            timings.policy_release_time_fetch_ms = detail.total_ms;
+            timings.policy_release_time_fetch = Some(detail.timings);
+            timings.policy_release_time_version_count = detail.version_count;
+        }
         timings.policy_release_time_ms = policy_start.elapsed().as_millis();
     }
     let fetched = fetched_metadata_from_info(latest_version, dist_tags, info, include_speculation);
@@ -358,6 +364,38 @@ fn metadata_fetch_detail_record(
         cache_write_dispatch_ms: timings.cache_write_dispatch_ms,
         cache_info_parse_ms: timings.cache_info_parse_ms,
         policy_release_time_ms: timings.policy_release_time_ms,
+        policy_release_time_fetch_ms: timings.policy_release_time_fetch_ms,
+        policy_release_time_cache_read_ms: timings
+            .policy_release_time_fetch
+            .map_or(0, |fetch| fetch.cache_read_ms),
+        policy_release_time_validator_read_ms: timings
+            .policy_release_time_fetch
+            .map_or(0, |fetch| fetch.validator_read_ms),
+        policy_release_time_http_ms: timings
+            .policy_release_time_fetch
+            .map_or(0, |fetch| fetch.http_ms),
+        policy_release_time_body_read_ms: timings
+            .policy_release_time_fetch
+            .map_or(0, |fetch| fetch.body_read_ms),
+        policy_release_time_json_decode_ms: timings
+            .policy_release_time_fetch
+            .map_or(0, |fetch| fetch.json_decode_ms),
+        policy_release_time_cache_after_304_ms: timings
+            .policy_release_time_fetch
+            .map_or(0, |fetch| fetch.cache_after_304_ms),
+        policy_release_time_cache_write_dispatch_ms: timings
+            .policy_release_time_fetch
+            .map_or(0, |fetch| fetch.cache_write_dispatch_ms),
+        policy_release_time_body_bytes: timings
+            .policy_release_time_fetch
+            .map_or(0, |fetch| fetch.body_bytes),
+        policy_release_time_version_count: timings.policy_release_time_version_count,
+        policy_release_time_cache_hit: timings
+            .policy_release_time_fetch
+            .is_some_and(|fetch| fetch.cache_hit),
+        policy_release_time_not_modified: timings
+            .policy_release_time_fetch
+            .is_some_and(|fetch| fetch.not_modified),
         policy_full_metadata_ms: timings.policy_full_metadata_ms,
         body_bytes: timings.body_bytes,
         version_count: timings.version_count,
@@ -440,7 +478,14 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
     if !info.needs_trust_metadata(policy) && info.needs_release_time_metadata(canonical, policy) {
         let mut merged = (*info).clone();
         let policy_start = trace_metadata_fetches.then(Instant::now);
-        fetch_release_times_for_policy(client, route_table, canonical, &mut merged).await?;
+        let detail = fetch_release_times_for_policy(
+            client,
+            route_table,
+            canonical,
+            &mut merged,
+            trace_metadata_fetches,
+        )
+        .await?;
         if let Some(start) = policy_start {
             let elapsed = start.elapsed().as_millis();
             lpm_registry::timing::record_metadata_fetch_detail(
@@ -451,6 +496,7 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
                     elapsed,
                     0,
                     merged.versions.len() as u64,
+                    detail,
                 ),
             );
         }
@@ -473,6 +519,7 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
                 0,
                 elapsed,
                 full_info.versions.len() as u64,
+                None,
             ),
         );
     }
@@ -487,12 +534,36 @@ fn cached_policy_metadata_fetch_detail_record(
     policy_release_time_ms: u128,
     policy_full_metadata_ms: u128,
     version_count: u64,
+    release_time_detail: Option<ReleaseTimeFetchDetail>,
 ) -> lpm_registry::timing::MetadataFetchDetailRecord {
+    let release_time_fetch = release_time_detail.as_ref().map(|detail| detail.timings);
     lpm_registry::timing::MetadataFetchDetailRecord {
         package: canonical.to_string(),
         route: route_label_for_canonical(route_table, canonical),
         total_ms,
         policy_release_time_ms,
+        policy_release_time_fetch_ms: release_time_detail
+            .as_ref()
+            .map_or(0, |detail| detail.total_ms),
+        policy_release_time_cache_read_ms: release_time_fetch
+            .map_or(0, |fetch| fetch.cache_read_ms),
+        policy_release_time_validator_read_ms: release_time_fetch
+            .map_or(0, |fetch| fetch.validator_read_ms),
+        policy_release_time_http_ms: release_time_fetch.map_or(0, |fetch| fetch.http_ms),
+        policy_release_time_body_read_ms: release_time_fetch.map_or(0, |fetch| fetch.body_read_ms),
+        policy_release_time_json_decode_ms: release_time_fetch
+            .map_or(0, |fetch| fetch.json_decode_ms),
+        policy_release_time_cache_after_304_ms: release_time_fetch
+            .map_or(0, |fetch| fetch.cache_after_304_ms),
+        policy_release_time_cache_write_dispatch_ms: release_time_fetch
+            .map_or(0, |fetch| fetch.cache_write_dispatch_ms),
+        policy_release_time_body_bytes: release_time_fetch.map_or(0, |fetch| fetch.body_bytes),
+        policy_release_time_version_count: release_time_detail
+            .as_ref()
+            .map_or(0, |detail| detail.version_count),
+        policy_release_time_cache_hit: release_time_fetch.is_some_and(|fetch| fetch.cache_hit),
+        policy_release_time_not_modified: release_time_fetch
+            .is_some_and(|fetch| fetch.not_modified),
         policy_full_metadata_ms,
         version_count,
         ..lpm_registry::timing::MetadataFetchDetailRecord::default()
@@ -516,21 +587,48 @@ async fn fetch_release_times_for_policy(
     route_table: &RouteTable,
     canonical: &CanonicalKey,
     info: &mut CachedPackageInfo,
-) -> Result<(), ResolveError> {
+    capture_timings: bool,
+) -> Result<Option<ReleaseTimeFetchDetail>, ResolveError> {
     let CanonicalKey::Npm { name } = canonical else {
-        return Ok(());
+        return Ok(None);
     };
     let route = route_table.route_for_package(name);
-    let release_times = client
-        .get_npm_release_times_routed_full(name, route)
-        .await
-        .map_err(|e| ResolveError::DependencyFetch {
-            package: canonical.to_string(),
-            version: "*".to_string(),
-            detail: e.to_string(),
-        })?;
+    let release_times = if capture_timings {
+        let start = Instant::now();
+        let timed = client
+            .get_npm_release_times_routed_full_with_timings(name, route)
+            .await
+            .map_err(|e| ResolveError::DependencyFetch {
+                package: canonical.to_string(),
+                version: "*".to_string(),
+                detail: e.to_string(),
+            })?;
+        let detail = ReleaseTimeFetchDetail {
+            total_ms: start.elapsed().as_millis(),
+            timings: timed.timings,
+            version_count: timed.metadata.time.len() as u64,
+        };
+        merge_release_times_into_cache_info(info, &timed.metadata);
+        return Ok(Some(detail));
+    } else {
+        client
+            .get_npm_release_times_routed_full(name, route)
+            .await
+            .map_err(|e| ResolveError::DependencyFetch {
+                package: canonical.to_string(),
+                version: "*".to_string(),
+                detail: e.to_string(),
+            })?
+    };
     merge_release_times_into_cache_info(info, &release_times);
-    Ok(())
+    Ok(None)
+}
+
+#[derive(Clone, Copy)]
+struct ReleaseTimeFetchDetail {
+    total_ms: u128,
+    timings: lpm_registry::PackageMetadataFetchTimings,
+    version_count: u64,
 }
 
 async fn fetch_full_metadata_for_policy(

@@ -30,6 +30,11 @@ pub(super) struct FetchOverlapJoin {
     handle: Option<tokio::task::JoinHandle<FetchOverlapDrain>>,
 }
 
+struct BufferedSelectedPackage {
+    event: lpm_resolver::SelectedPackageEvent,
+    selected_at: Instant,
+}
+
 impl FetchOverlapJoin {
     pub(super) async fn drain(mut self) -> Result<FetchOverlapDrain, LpmError> {
         let start = Instant::now();
@@ -112,12 +117,19 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
                     };
                     stats.selected_count = stats.selected_count.saturating_add(1);
                     if !dispatching {
-                        buffered.push(event);
+                        buffered.push(BufferedSelectedPackage {
+                            event,
+                            selected_at: Instant::now(),
+                        });
+                        stats.record_buffered_event();
                         if stats.selected_count as usize >= min_selected {
                             dispatching = true;
-                            for event in buffered.drain(..) {
+                            for buffered_event in buffered.drain(..) {
+                                stats.record_buffered_dispatch(
+                                    buffered_event.selected_at.elapsed().as_millis(),
+                                );
                                 dispatch_selected_event(
-                                    event,
+                                    buffered_event.event,
                                     &route_table,
                                     &client,
                                     &store,

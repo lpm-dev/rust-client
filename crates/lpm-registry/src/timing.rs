@@ -447,6 +447,18 @@ pub struct MetadataFetchDetailRecord {
     pub cache_write_dispatch_ms: u128,
     pub cache_info_parse_ms: u128,
     pub policy_release_time_ms: u128,
+    pub policy_release_time_fetch_ms: u128,
+    pub policy_release_time_cache_read_ms: u128,
+    pub policy_release_time_validator_read_ms: u128,
+    pub policy_release_time_http_ms: u128,
+    pub policy_release_time_body_read_ms: u128,
+    pub policy_release_time_json_decode_ms: u128,
+    pub policy_release_time_cache_after_304_ms: u128,
+    pub policy_release_time_cache_write_dispatch_ms: u128,
+    pub policy_release_time_body_bytes: u64,
+    pub policy_release_time_version_count: u64,
+    pub policy_release_time_cache_hit: bool,
+    pub policy_release_time_not_modified: bool,
     pub policy_full_metadata_ms: u128,
     pub body_bytes: u64,
     pub version_count: u64,
@@ -479,15 +491,33 @@ struct MetadataFetchDetailCounters {
     cache_write_dispatch_sum_ms: AtomicU64,
     cache_info_parse_sum_ms: AtomicU64,
     policy_release_time_sum_ms: AtomicU64,
+    policy_release_time_fetch_sum_ms: AtomicU64,
+    policy_release_time_cache_read_sum_ms: AtomicU64,
+    policy_release_time_validator_read_sum_ms: AtomicU64,
+    policy_release_time_http_sum_ms: AtomicU64,
+    policy_release_time_body_read_sum_ms: AtomicU64,
+    policy_release_time_json_decode_sum_ms: AtomicU64,
+    policy_release_time_cache_after_304_sum_ms: AtomicU64,
+    policy_release_time_cache_write_dispatch_sum_ms: AtomicU64,
+    policy_release_time_body_bytes_sum: AtomicU64,
+    policy_release_time_version_count_sum: AtomicU64,
+    policy_release_time_cache_hit_count: AtomicU64,
+    policy_release_time_not_modified_count: AtomicU64,
     policy_full_metadata_sum_ms: AtomicU64,
     slow_by_total: Mutex<Vec<MetadataFetchDetailRecord>>,
     slow_by_raw_fetch: Mutex<Vec<MetadataFetchDetailRecord>>,
     slow_by_http: Mutex<Vec<MetadataFetchDetailRecord>>,
     slow_by_body_read: Mutex<Vec<MetadataFetchDetailRecord>>,
+    slow_by_body_bytes: Mutex<Vec<MetadataFetchDetailRecord>>,
     slow_by_json_decode: Mutex<Vec<MetadataFetchDetailRecord>>,
     slow_by_cache_info_parse: Mutex<Vec<MetadataFetchDetailRecord>>,
     slow_by_policy_release_time: Mutex<Vec<MetadataFetchDetailRecord>>,
+    slow_by_policy_release_time_fetch: Mutex<Vec<MetadataFetchDetailRecord>>,
     slow_by_policy_full_metadata: Mutex<Vec<MetadataFetchDetailRecord>>,
+    direct_packuments_by_http: Mutex<Vec<MetadataFetchDetailRecord>>,
+    direct_packuments_by_body_bytes: Mutex<Vec<MetadataFetchDetailRecord>>,
+    direct_packuments_by_policy_release_time_fetch: Mutex<Vec<MetadataFetchDetailRecord>>,
+    direct_packuments_by_policy_release_time_body_bytes: Mutex<Vec<MetadataFetchDetailRecord>>,
 }
 
 impl MetadataFetchDetailCounters {
@@ -515,15 +545,45 @@ impl MetadataFetchDetailCounters {
         self.cache_write_dispatch_sum_ms.store(0, Ordering::Relaxed);
         self.cache_info_parse_sum_ms.store(0, Ordering::Relaxed);
         self.policy_release_time_sum_ms.store(0, Ordering::Relaxed);
+        self.policy_release_time_fetch_sum_ms
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_cache_read_sum_ms
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_validator_read_sum_ms
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_http_sum_ms
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_body_read_sum_ms
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_json_decode_sum_ms
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_cache_after_304_sum_ms
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_cache_write_dispatch_sum_ms
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_body_bytes_sum
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_version_count_sum
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_cache_hit_count
+            .store(0, Ordering::Relaxed);
+        self.policy_release_time_not_modified_count
+            .store(0, Ordering::Relaxed);
         self.policy_full_metadata_sum_ms.store(0, Ordering::Relaxed);
         Self::clear_bucket(&self.slow_by_total);
         Self::clear_bucket(&self.slow_by_raw_fetch);
         Self::clear_bucket(&self.slow_by_http);
         Self::clear_bucket(&self.slow_by_body_read);
+        Self::clear_bucket(&self.slow_by_body_bytes);
         Self::clear_bucket(&self.slow_by_json_decode);
         Self::clear_bucket(&self.slow_by_cache_info_parse);
         Self::clear_bucket(&self.slow_by_policy_release_time);
+        Self::clear_bucket(&self.slow_by_policy_release_time_fetch);
         Self::clear_bucket(&self.slow_by_policy_full_metadata);
+        Self::clear_bucket(&self.direct_packuments_by_http);
+        Self::clear_bucket(&self.direct_packuments_by_body_bytes);
+        Self::clear_bucket(&self.direct_packuments_by_policy_release_time_fetch);
+        Self::clear_bucket(&self.direct_packuments_by_policy_release_time_body_bytes);
     }
 
     fn clear_bucket(bucket: &Mutex<Vec<MetadataFetchDetailRecord>>) {
@@ -593,6 +653,51 @@ impl MetadataFetchDetailCounters {
             u128_to_u64_saturating(record.policy_release_time_ms),
             Ordering::Relaxed,
         );
+        self.policy_release_time_fetch_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.policy_release_time_fetch_ms),
+            Ordering::Relaxed,
+        );
+        self.policy_release_time_cache_read_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.policy_release_time_cache_read_ms),
+            Ordering::Relaxed,
+        );
+        self.policy_release_time_validator_read_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.policy_release_time_validator_read_ms),
+            Ordering::Relaxed,
+        );
+        self.policy_release_time_http_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.policy_release_time_http_ms),
+            Ordering::Relaxed,
+        );
+        self.policy_release_time_body_read_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.policy_release_time_body_read_ms),
+            Ordering::Relaxed,
+        );
+        self.policy_release_time_json_decode_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.policy_release_time_json_decode_ms),
+            Ordering::Relaxed,
+        );
+        self.policy_release_time_cache_after_304_sum_ms.fetch_add(
+            u128_to_u64_saturating(record.policy_release_time_cache_after_304_ms),
+            Ordering::Relaxed,
+        );
+        self.policy_release_time_cache_write_dispatch_sum_ms
+            .fetch_add(
+                u128_to_u64_saturating(record.policy_release_time_cache_write_dispatch_ms),
+                Ordering::Relaxed,
+            );
+        self.policy_release_time_body_bytes_sum
+            .fetch_add(record.policy_release_time_body_bytes, Ordering::Relaxed);
+        self.policy_release_time_version_count_sum
+            .fetch_add(record.policy_release_time_version_count, Ordering::Relaxed);
+        if record.policy_release_time_cache_hit {
+            self.policy_release_time_cache_hit_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if record.policy_release_time_not_modified {
+            self.policy_release_time_not_modified_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.policy_full_metadata_sum_ms.fetch_add(
             u128_to_u64_saturating(record.policy_full_metadata_ms),
             Ordering::Relaxed,
@@ -602,6 +707,9 @@ impl MetadataFetchDetailCounters {
         Self::record_slow(&self.slow_by_raw_fetch, &record, |entry| entry.raw_fetch_ms);
         Self::record_slow(&self.slow_by_http, &record, |entry| entry.http_ms);
         Self::record_slow(&self.slow_by_body_read, &record, |entry| entry.body_read_ms);
+        Self::record_slow(&self.slow_by_body_bytes, &record, |entry| {
+            u128::from(entry.body_bytes)
+        });
         Self::record_slow(&self.slow_by_json_decode, &record, |entry| {
             entry.json_decode_ms
         });
@@ -611,9 +719,30 @@ impl MetadataFetchDetailCounters {
         Self::record_slow(&self.slow_by_policy_release_time, &record, |entry| {
             entry.policy_release_time_ms
         });
+        Self::record_slow(&self.slow_by_policy_release_time_fetch, &record, |entry| {
+            entry.policy_release_time_fetch_ms
+        });
         Self::record_slow(&self.slow_by_policy_full_metadata, &record, |entry| {
             entry.policy_full_metadata_ms
         });
+        if record.route == "npm_direct" {
+            Self::record_slow(&self.direct_packuments_by_http, &record, |entry| {
+                entry.http_ms
+            });
+            Self::record_slow(&self.direct_packuments_by_body_bytes, &record, |entry| {
+                u128::from(entry.body_bytes)
+            });
+            Self::record_slow(
+                &self.direct_packuments_by_policy_release_time_fetch,
+                &record,
+                |entry| entry.policy_release_time_fetch_ms,
+            );
+            Self::record_slow(
+                &self.direct_packuments_by_policy_release_time_body_bytes,
+                &record,
+                |entry| u128::from(entry.policy_release_time_body_bytes),
+            );
+        }
     }
 
     fn record_cache_info_parse(&self, record: MetadataFetchDetailRecord) {
@@ -680,6 +809,42 @@ impl MetadataFetchDetailCounters {
                     .load(Ordering::Relaxed),
                 cache_info_parse_sum_ms: self.cache_info_parse_sum_ms.load(Ordering::Relaxed),
                 policy_release_time_sum_ms: self.policy_release_time_sum_ms.load(Ordering::Relaxed),
+                policy_release_time_fetch_sum_ms: self
+                    .policy_release_time_fetch_sum_ms
+                    .load(Ordering::Relaxed),
+                policy_release_time_cache_read_sum_ms: self
+                    .policy_release_time_cache_read_sum_ms
+                    .load(Ordering::Relaxed),
+                policy_release_time_validator_read_sum_ms: self
+                    .policy_release_time_validator_read_sum_ms
+                    .load(Ordering::Relaxed),
+                policy_release_time_http_sum_ms: self
+                    .policy_release_time_http_sum_ms
+                    .load(Ordering::Relaxed),
+                policy_release_time_body_read_sum_ms: self
+                    .policy_release_time_body_read_sum_ms
+                    .load(Ordering::Relaxed),
+                policy_release_time_json_decode_sum_ms: self
+                    .policy_release_time_json_decode_sum_ms
+                    .load(Ordering::Relaxed),
+                policy_release_time_cache_after_304_sum_ms: self
+                    .policy_release_time_cache_after_304_sum_ms
+                    .load(Ordering::Relaxed),
+                policy_release_time_cache_write_dispatch_sum_ms: self
+                    .policy_release_time_cache_write_dispatch_sum_ms
+                    .load(Ordering::Relaxed),
+                policy_release_time_body_bytes_sum: self
+                    .policy_release_time_body_bytes_sum
+                    .load(Ordering::Relaxed),
+                policy_release_time_version_count_sum: self
+                    .policy_release_time_version_count_sum
+                    .load(Ordering::Relaxed),
+                policy_release_time_cache_hit_count: self
+                    .policy_release_time_cache_hit_count
+                    .load(Ordering::Relaxed),
+                policy_release_time_not_modified_count: self
+                    .policy_release_time_not_modified_count
+                    .load(Ordering::Relaxed),
                 policy_full_metadata_sum_ms: self
                     .policy_full_metadata_sum_ms
                     .load(Ordering::Relaxed),
@@ -689,10 +854,24 @@ impl MetadataFetchDetailCounters {
                 by_raw_fetch: Self::snapshot_bucket(&self.slow_by_raw_fetch),
                 by_http: Self::snapshot_bucket(&self.slow_by_http),
                 by_body_read: Self::snapshot_bucket(&self.slow_by_body_read),
+                by_body_bytes: Self::snapshot_bucket(&self.slow_by_body_bytes),
                 by_json_decode: Self::snapshot_bucket(&self.slow_by_json_decode),
                 by_cache_info_parse: Self::snapshot_bucket(&self.slow_by_cache_info_parse),
                 by_policy_release_time: Self::snapshot_bucket(&self.slow_by_policy_release_time),
+                by_policy_release_time_fetch: Self::snapshot_bucket(
+                    &self.slow_by_policy_release_time_fetch,
+                ),
                 by_policy_full_metadata: Self::snapshot_bucket(&self.slow_by_policy_full_metadata),
+            },
+            top_direct_packuments: MetadataFetchDirectPackumentSnapshot {
+                by_http: Self::snapshot_bucket(&self.direct_packuments_by_http),
+                by_body_bytes: Self::snapshot_bucket(&self.direct_packuments_by_body_bytes),
+                by_policy_release_time_fetch: Self::snapshot_bucket(
+                    &self.direct_packuments_by_policy_release_time_fetch,
+                ),
+                by_policy_release_time_body_bytes: Self::snapshot_bucket(
+                    &self.direct_packuments_by_policy_release_time_body_bytes,
+                ),
             },
         }
     }
@@ -724,6 +903,7 @@ pub struct MetadataFetchDetailSnapshot {
     pub route_unknown_count: u64,
     pub attribution: MetadataFetchAttributionSnapshot,
     pub top_slow_packages: MetadataFetchSlowSnapshot,
+    pub top_direct_packuments: MetadataFetchDirectPackumentSnapshot,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -741,6 +921,18 @@ pub struct MetadataFetchAttributionSnapshot {
     pub cache_write_dispatch_sum_ms: u64,
     pub cache_info_parse_sum_ms: u64,
     pub policy_release_time_sum_ms: u64,
+    pub policy_release_time_fetch_sum_ms: u64,
+    pub policy_release_time_cache_read_sum_ms: u64,
+    pub policy_release_time_validator_read_sum_ms: u64,
+    pub policy_release_time_http_sum_ms: u64,
+    pub policy_release_time_body_read_sum_ms: u64,
+    pub policy_release_time_json_decode_sum_ms: u64,
+    pub policy_release_time_cache_after_304_sum_ms: u64,
+    pub policy_release_time_cache_write_dispatch_sum_ms: u64,
+    pub policy_release_time_body_bytes_sum: u64,
+    pub policy_release_time_version_count_sum: u64,
+    pub policy_release_time_cache_hit_count: u64,
+    pub policy_release_time_not_modified_count: u64,
     pub policy_full_metadata_sum_ms: u64,
 }
 
@@ -750,10 +942,20 @@ pub struct MetadataFetchSlowSnapshot {
     pub by_raw_fetch: Vec<MetadataFetchDetailRecord>,
     pub by_http: Vec<MetadataFetchDetailRecord>,
     pub by_body_read: Vec<MetadataFetchDetailRecord>,
+    pub by_body_bytes: Vec<MetadataFetchDetailRecord>,
     pub by_json_decode: Vec<MetadataFetchDetailRecord>,
     pub by_cache_info_parse: Vec<MetadataFetchDetailRecord>,
     pub by_policy_release_time: Vec<MetadataFetchDetailRecord>,
+    pub by_policy_release_time_fetch: Vec<MetadataFetchDetailRecord>,
     pub by_policy_full_metadata: Vec<MetadataFetchDetailRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetadataFetchDirectPackumentSnapshot {
+    pub by_http: Vec<MetadataFetchDetailRecord>,
+    pub by_body_bytes: Vec<MetadataFetchDetailRecord>,
+    pub by_policy_release_time_fetch: Vec<MetadataFetchDetailRecord>,
+    pub by_policy_release_time_body_bytes: Vec<MetadataFetchDetailRecord>,
 }
 
 /// Counts of package-metadata HTTP responses by negotiated protocol version.
@@ -832,30 +1034,66 @@ mod tests {
             body_read_ms: 6,
             json_decode_ms: 4,
             cache_info_parse_ms: 3,
+            policy_release_time_fetch_ms: 8,
+            policy_release_time_body_bytes: 700,
             body_bytes: 900,
             version_count: 7,
             cache_hit: true,
             ..MetadataFetchDetailRecord::default()
         });
+        counters.record(MetadataFetchDetailRecord {
+            package: "version-doc".to_string(),
+            route: "npm_direct_version_doc",
+            total_ms: 50,
+            http_ms: 40,
+            body_bytes: 2_000,
+            policy_release_time_fetch_ms: 30,
+            policy_release_time_body_bytes: 1_500,
+            ..MetadataFetchDetailRecord::default()
+        });
 
         let snapshot = counters.snapshot();
 
-        assert_eq!(snapshot.calls, 2);
+        assert_eq!(snapshot.calls, 3);
         assert_eq!(snapshot.cache_hit_count, 1);
         assert_eq!(snapshot.route_npm_direct_count, 2);
-        assert_eq!(snapshot.body_bytes_sum, 1000);
+        assert_eq!(snapshot.route_unknown_count, 1);
+        assert_eq!(snapshot.body_bytes_sum, 3000);
         assert_eq!(snapshot.version_count_sum, 10);
-        assert_eq!(snapshot.attribution.total_sum_ms, 17);
-        assert_eq!(snapshot.attribution.total_max_ms, 12);
-        assert_eq!(snapshot.attribution.http_sum_ms, 11);
-        assert_eq!(snapshot.top_slow_packages.by_total[0].package, "slow");
-        assert_eq!(snapshot.top_slow_packages.by_http[0].package, "slow");
+        assert_eq!(snapshot.attribution.total_sum_ms, 67);
+        assert_eq!(snapshot.attribution.total_max_ms, 50);
+        assert_eq!(snapshot.attribution.http_sum_ms, 51);
+        assert_eq!(
+            snapshot.top_slow_packages.by_total[0].package,
+            "version-doc"
+        );
+        assert_eq!(
+            snapshot.top_slow_packages.by_body_bytes[0].package,
+            "version-doc"
+        );
+        assert_eq!(snapshot.top_direct_packuments.by_http[0].package, "slow");
+        assert_eq!(
+            snapshot.top_direct_packuments.by_body_bytes[0].package,
+            "slow"
+        );
+        assert_eq!(
+            snapshot.top_direct_packuments.by_policy_release_time_fetch[0].package,
+            "slow"
+        );
+        assert_eq!(
+            snapshot
+                .top_direct_packuments
+                .by_policy_release_time_body_bytes[0]
+                .package,
+            "slow"
+        );
 
         counters.reset();
         let snapshot = counters.snapshot();
 
         assert_eq!(snapshot.calls, 0);
         assert!(snapshot.top_slow_packages.by_total.is_empty());
+        assert!(snapshot.top_direct_packuments.by_http.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -878,6 +1116,12 @@ mod tests {
             snapshot_metadata_fetch_detail()
                 .top_slow_packages
                 .by_total
+                .is_empty()
+        );
+        assert!(
+            snapshot_metadata_fetch_detail()
+                .top_direct_packuments
+                .by_http
                 .is_empty()
         );
     }
