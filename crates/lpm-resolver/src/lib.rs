@@ -30,6 +30,7 @@ pub use greedy::{
     ExperimentalMetadataFetchTimings, ExperimentalVersionSelection,
     experimental_fetch_cached_package_info_with_policy,
     experimental_fetch_cached_package_info_with_policy_and_timings,
+    experimental_fetch_exact_cached_package_info_with_policy_and_timings,
     experimental_select_version_with_policy, experimental_select_version_with_policy_and_overrides,
     resolve_greedy_fused, resolve_greedy_fused_with_cache, resolve_greedy_fused_with_cache_options,
     resolve_greedy_fused_with_cache_options_and_policy,

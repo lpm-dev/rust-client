@@ -71,6 +71,22 @@ impl RegistryClient {
         }
     }
 
+    /// Invalidate a direct-npm exact-version metadata document.
+    ///
+    /// Exact version documents are cached separately from packuments so they
+    /// cannot satisfy broad ranges. Stale tarball recovery knows the concrete
+    /// version that failed and clears this cache alongside the package-level
+    /// metadata cache.
+    pub fn invalidate_npm_version_metadata_cache(&self, package_name: &str, version: &str) {
+        let cache_key = format!("npm-version:{package_name}@{version}");
+        if let Some(path) = self.cache_path(&cache_key)
+            && path.exists()
+        {
+            let _ = std::fs::remove_file(&path);
+            tracing::debug!("invalidated npm version metadata cache for {package_name}@{version}");
+        }
+    }
+
     /// Invalidate a cached custom-registry metadata entry.
     ///
     /// `base_url` and `auth` MUST match exactly the values that were

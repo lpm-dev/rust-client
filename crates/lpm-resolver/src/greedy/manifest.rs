@@ -226,6 +226,90 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
     Ok((fetched, timings))
 }
 
+pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    version: &str,
+    policy: &ResolverPolicy,
+    include_speculation: bool,
+) -> Result<(FetchedMetadata, ExperimentalMetadataFetchTimings), ResolveError> {
+    let CanonicalKey::Npm { name } = canonical else {
+        return fetch_metadata_for_resolver_with_timings(
+            client,
+            route_table,
+            canonical,
+            policy,
+            include_speculation,
+        )
+        .await;
+    };
+    if !matches!(
+        route_table.route_for_package(name),
+        UpstreamRoute::NpmDirect
+    ) {
+        return fetch_metadata_for_resolver_with_timings(
+            client,
+            route_table,
+            canonical,
+            policy,
+            include_speculation,
+        )
+        .await;
+    }
+
+    let total_start = Instant::now();
+    let mut timings = ExperimentalMetadataFetchTimings {
+        package: canonical.to_string(),
+        route: "npm_direct_version_doc",
+        ..ExperimentalMetadataFetchTimings::default()
+    };
+    let raw_start = Instant::now();
+    let raw = client
+        .get_npm_version_metadata_direct_with_timings(name, version)
+        .await
+        .map_err(|e| ResolveError::DependencyFetch {
+            package: canonical.to_string(),
+            version: version.to_string(),
+            detail: e.to_string(),
+        })?;
+    timings.raw_fetch_ms = raw_start.elapsed().as_millis();
+    timings.version_count = raw.metadata.versions.len() as u64;
+    timings.cache_hit = raw.timings.cache_hit;
+    timings.not_modified = raw.timings.not_modified;
+    timings.cache_read_ms = raw.timings.cache_read_ms;
+    timings.validator_read_ms = raw.timings.validator_read_ms;
+    timings.http_ms = raw.timings.http_ms;
+    timings.body_read_ms = raw.timings.body_read_ms;
+    timings.json_decode_ms = raw.timings.json_decode_ms;
+    timings.cache_after_304_ms = raw.timings.cache_after_304_ms;
+    timings.cache_write_dispatch_ms = raw.timings.cache_write_dispatch_ms;
+    timings.body_bytes = raw.timings.body_bytes;
+
+    let parse_start = Instant::now();
+    let info = parse_metadata_to_cache_info(&raw.metadata);
+    timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
+    if info.needs_policy_metadata(canonical, policy) {
+        let policy_start = Instant::now();
+        let fetched = fetch_metadata_for_resolver(
+            client,
+            route_table,
+            canonical,
+            policy,
+            include_speculation,
+        )
+        .await?;
+        timings.policy_full_metadata_ms = policy_start.elapsed().as_millis();
+        timings.total_ms = total_start.elapsed().as_millis();
+        return Ok((fetched, timings));
+    }
+
+    let fetched =
+        fetched_metadata_from_info(None, raw.metadata.dist_tags, info, include_speculation);
+    timings.total_ms = total_start.elapsed().as_millis();
+    Ok((fetched, timings))
+}
+
 pub(super) async fn fetch_metadata_for_resolver_with_trace_detail(
     client: &RegistryClient,
     route_table: &RouteTable,

@@ -233,6 +233,26 @@ pub async fn experimental_fetch_cached_package_info_with_policy_and_timings(
     .map(|(fetched, timings)| (fetched.info, timings))
 }
 
+#[doc(hidden)]
+pub async fn experimental_fetch_exact_cached_package_info_with_policy_and_timings(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    version: &str,
+    policy: &ResolverPolicy,
+) -> Result<(Arc<CachedPackageInfo>, ExperimentalMetadataFetchTimings), ResolveError> {
+    manifest::fetch_exact_metadata_for_resolver_with_timings(
+        client,
+        route_table,
+        canonical,
+        version,
+        policy,
+        false,
+    )
+    .await
+    .map(|(fetched, timings)| (fetched.info, timings))
+}
+
 mod prelude {
     pub(super) use crate::npm_version::NpmVersion;
     pub(super) use crate::overrides::{OverrideHit, OverrideSet, OverrideTarget};
