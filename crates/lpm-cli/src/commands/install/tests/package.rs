@@ -53,6 +53,7 @@ fn build_minimal_tarball_with_pkg(name: &str, version: &str) -> Vec<u8> {
 
 #[tokio::test]
 async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
+    let _env = crate::test_env::ScopedEnv::update([("LPM_V2_OBJECT_INTEGRITY", None)]);
     let dir = tempfile::tempdir().unwrap();
     let store = lpm_store::v2::Store::at(dir.path().join("store"));
     let tarball = build_minimal_tarball_with_pkg("cache-hit", "1.0.0");
@@ -86,6 +87,7 @@ async fn prevalidate_v2_reusable_objects_returns_verified_registry_hits() {
 
 #[tokio::test]
 async fn prevalidate_v2_reusable_objects_source_policy_trusts_tampered_registry_objects() {
+    let _env = crate::test_env::ScopedEnv::update([("LPM_V2_OBJECT_INTEGRITY", None)]);
     let dir = tempfile::tempdir().unwrap();
     let store = lpm_store::v2::Store::at(dir.path().join("store"));
     let tarball = build_minimal_tarball_with_pkg("tampered", "1.0.0");
