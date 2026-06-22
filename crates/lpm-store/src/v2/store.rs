@@ -607,6 +607,7 @@ pub struct LinkEntryTimings {
     pub symlink_ms: u128,
     pub sidecar_ms: u128,
     pub rename_ms: u128,
+    pub collision_recovery_ms: u128,
 }
 
 /// I/O front-end for the v2 store.
@@ -1234,20 +1235,20 @@ impl Store {
         };
 
         let rename_start = std::time::Instant::now();
-        match std::fs::rename(&tmp_dir, &final_dir) {
-            Ok(()) => {
-                timings.rename_ms = rename_start.elapsed().as_millis();
-                Ok(LinkEntry {
-                    link_dir: final_dir,
-                    freshly_populated: true,
-                    sidecar: Some(sidecar),
-                    timings: LinkEntryTimings {
-                        total_ms: total_start.elapsed().as_millis(),
-                        ..timings
-                    },
-                })
-            }
-            Err(_)
+        let rename_result = std::fs::rename(&tmp_dir, &final_dir);
+        timings.rename_ms = rename_start.elapsed().as_millis();
+        match rename_result {
+            Ok(()) => Ok(LinkEntry {
+                link_dir: final_dir,
+                freshly_populated: true,
+                sidecar: Some(sidecar),
+                timings: LinkEntryTimings {
+                    total_ms: total_start.elapsed().as_millis(),
+                    ..timings
+                },
+            }),
+            Err(e) => {
+                let recovery_start = std::time::Instant::now();
                 if link_entry_is_reusable(
                     &final_dir,
                     &graph_key,
@@ -1255,61 +1256,68 @@ impl Store {
                     &source_sri,
                     verified_object_digest,
                     policy,
-                )? =>
-            {
-                // Concurrent install beat us — discard our stage and
-                // refresh the existing sidecar's mtime.
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                let sidecar_path = final_dir.join(LINK_META_FILENAME);
-                if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
-                    tracing::debug!("v2 store: race-loss touch failed: {e}");
-                }
-                Ok(LinkEntry {
-                    link_dir: final_dir,
-                    freshly_populated: false,
-                    sidecar: None,
-                    timings: LinkEntryTimings {
-                        rename_ms: rename_start.elapsed().as_millis(),
-                        total_ms: total_start.elapsed().as_millis(),
-                        ..timings
-                    },
-                })
-            }
-            Err(_) if final_dir.exists() => {
-                // Final dir exists but is incomplete or stale. Remove the
-                // leftover and retry the rename once; a third attempt won't
-                // change filesystem-level failures such as permission errors.
-                tracing::warn!(
-                    target = %final_dir.display(),
-                    "v2 store: rename hit incomplete or stale leftover; removing and retrying once"
-                );
-                if let Err(e) = std::fs::remove_dir_all(&final_dir) {
+                )? {
+                    // Concurrent install beat us — discard our stage and
+                    // refresh the existing sidecar's mtime.
                     let _ = std::fs::remove_dir_all(&tmp_dir);
-                    return Err(LpmError::Store(format!(
-                        "failed to remove incomplete or stale v2 link entry during retry at {}: {e}",
-                        final_dir.display()
-                    )));
-                }
-                match std::fs::rename(&tmp_dir, &final_dir) {
-                    Ok(()) => Ok(LinkEntry {
+                    let sidecar_path = final_dir.join(LINK_META_FILENAME);
+                    if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
+                        tracing::debug!("v2 store: race-loss touch failed: {e}");
+                    }
+                    timings.collision_recovery_ms = timings
+                        .collision_recovery_ms
+                        .saturating_add(recovery_start.elapsed().as_millis());
+                    return Ok(LinkEntry {
                         link_dir: final_dir,
-                        freshly_populated: true,
-                        sidecar: Some(sidecar),
+                        freshly_populated: false,
+                        sidecar: None,
                         timings: LinkEntryTimings {
-                            rename_ms: rename_start.elapsed().as_millis(),
                             total_ms: total_start.elapsed().as_millis(),
                             ..timings
                         },
-                    }),
-                    Err(e) => {
-                        let _ = std::fs::remove_dir_all(&tmp_dir);
-                        Err(LpmError::Store(format!(
-                            "failed to atomically install v2 link entry on retry: {e}"
-                        )))
-                    }
+                    });
                 }
-            }
-            Err(e) => {
+                if final_dir.exists() {
+                    // Final dir exists but is incomplete or stale. Remove the
+                    // leftover and retry the rename once; a third attempt won't
+                    // change filesystem-level failures such as permission errors.
+                    tracing::warn!(
+                        target = %final_dir.display(),
+                        "v2 store: rename hit incomplete or stale leftover; removing and retrying once"
+                    );
+                    if let Err(e) = std::fs::remove_dir_all(&final_dir) {
+                        let _ = std::fs::remove_dir_all(&tmp_dir);
+                        return Err(LpmError::Store(format!(
+                            "failed to remove incomplete or stale v2 link entry during retry at {}: {e}",
+                            final_dir.display()
+                        )));
+                    }
+                    timings.collision_recovery_ms = timings
+                        .collision_recovery_ms
+                        .saturating_add(recovery_start.elapsed().as_millis());
+                    let retry_rename_start = std::time::Instant::now();
+                    let retry_rename_result = std::fs::rename(&tmp_dir, &final_dir);
+                    timings.rename_ms = timings
+                        .rename_ms
+                        .saturating_add(retry_rename_start.elapsed().as_millis());
+                    return match retry_rename_result {
+                        Ok(()) => Ok(LinkEntry {
+                            link_dir: final_dir,
+                            freshly_populated: true,
+                            sidecar: Some(sidecar),
+                            timings: LinkEntryTimings {
+                                total_ms: total_start.elapsed().as_millis(),
+                                ..timings
+                            },
+                        }),
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&tmp_dir);
+                            Err(LpmError::Store(format!(
+                                "failed to atomically install v2 link entry on retry: {e}"
+                            )))
+                        }
+                    };
+                }
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 Err(LpmError::Store(format!(
                     "failed to atomically install v2 link entry: {e}"

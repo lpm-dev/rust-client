@@ -899,6 +899,7 @@ impl SlowPackageTimings {
                         "symlink_ms": entry.timings.symlink_ms,
                         "sidecar_ms": entry.timings.sidecar_ms,
                         "rename_ms": entry.timings.rename_ms,
+                        "collision_recovery_ms": entry.timings.collision_recovery_ms,
                     })
                 })
                 .collect(),
@@ -1382,6 +1383,7 @@ mod tests {
                 materialize_ms: 11,
                 snapshot_ms: 7,
                 sidecar_ms: 2,
+                collision_recovery_ms: 5,
                 ..lpm_store::v2::LinkEntryTimings::default()
             },
         );
@@ -1402,6 +1404,7 @@ mod tests {
         assert_eq!(json["link_v2_one"][0]["materialize_ms"], 11);
         assert_eq!(json["link_v2_one"][0]["snapshot_ms"], 7);
         assert_eq!(json["link_v2_one"][0]["sidecar_ms"], 2);
+        assert_eq!(json["link_v2_one"][0]["collision_recovery_ms"], 5);
         assert_eq!(json["link_v2_one"][1]["package"], "fast@1.0.0");
         assert_eq!(json["link_v2_one"][1]["ms"], 3);
     }
