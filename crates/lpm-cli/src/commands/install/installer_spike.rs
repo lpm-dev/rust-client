@@ -3420,8 +3420,7 @@ mod tests {
         let depth = if root { 0 } else { 1 };
         let root_ancestor = parent
             .as_ref()
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| name.to_string());
+            .map_or_else(|| name.to_string(), |(name, _)| name.clone());
         ResolveRequest {
             local_name: name.to_string(),
             target_name: name.to_string(),
