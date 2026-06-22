@@ -499,8 +499,8 @@ impl MetadataStats {
             _ => 0,
         };
 
-        self.record_wave(&context, &timings, completed_at_ms);
         if trace {
+            self.record_wave(&context, &timings, completed_at_ms);
             let record = MetadataTraceRecord {
                 context,
                 timings,
@@ -602,7 +602,6 @@ impl MetadataStats {
                 "sum_ms": self.fetch_sum_ms.load(Ordering::Relaxed),
                 "max_ms": self.fetch_max_ms.load(Ordering::Relaxed),
             },
-            "waves_by_depth": Self::waves_json(&self.waves_by_depth),
             "attribution": {
                 "raw_fetch_sum_ms": self.raw_fetch_sum_ms.load(Ordering::Relaxed),
                 "raw_fetch_max_ms": self.raw_fetch_max_ms.load(Ordering::Relaxed),
@@ -629,6 +628,7 @@ impl MetadataStats {
             },
         });
         if trace {
+            json["waves_by_depth"] = Self::waves_json(&self.waves_by_depth);
             json["slow_metadata"] = serde_json::json!({
                 "by_total": Self::slow_metadata_json(&self.slow_metadata_by_total),
                 "by_completed_at": Self::slow_metadata_json(&self.slow_metadata_by_completed_at),
@@ -3574,6 +3574,7 @@ mod tests {
         let json = stats.to_json(false);
 
         assert!(json.get("slow_metadata").is_none());
+        assert!(json.get("waves_by_depth").is_none());
         assert_eq!(json["attribution"]["raw_fetch_sum_ms"].as_u64(), Some(30));
     }
 
