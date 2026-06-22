@@ -726,7 +726,7 @@ pub(super) struct SlowPackageTimings {
     fetch_tasks_by_extract: Vec<FetchTaskTiming>,
     fetch_tasks_by_security: Vec<FetchTaskTiming>,
     fetch_tasks_by_finalize: Vec<FetchTaskTiming>,
-    link_v2_one: Vec<PackageTiming>,
+    link_v2_one: Vec<LinkV2OneTiming>,
 }
 
 #[derive(Debug, Clone)]
@@ -740,6 +740,13 @@ struct FetchTaskTiming {
     package: String,
     timings: TaskTimings,
     task_total_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+struct LinkV2OneTiming {
+    package: String,
+    ms: u128,
+    timings: lpm_store::v2::LinkEntryTimings,
 }
 
 impl SlowPackageTimings {
@@ -767,8 +774,23 @@ impl SlowPackageTimings {
         });
     }
 
-    pub(super) fn record_link_v2_one(&mut self, package: &str, ms: u128) {
-        Self::record(&mut self.link_v2_one, package, ms);
+    pub(super) fn record_link_v2_one(
+        &mut self,
+        package: &str,
+        ms: u128,
+        timings: lpm_store::v2::LinkEntryTimings,
+    ) {
+        if ms == 0 {
+            return;
+        }
+        self.link_v2_one.push(LinkV2OneTiming {
+            package: package.to_string(),
+            ms,
+            timings,
+        });
+        self.link_v2_one
+            .sort_unstable_by(|a, b| b.ms.cmp(&a.ms).then_with(|| a.package.cmp(&b.package)));
+        self.link_v2_one.truncate(10);
     }
 
     fn record(bucket: &mut Vec<PackageTiming>, package: &str, ms: u128) {
@@ -812,7 +834,7 @@ impl SlowPackageTimings {
                 "by_security": Self::fetch_task_bucket_json(&self.fetch_tasks_by_security),
                 "by_finalize": Self::fetch_task_bucket_json(&self.fetch_tasks_by_finalize),
             },
-            "link_v2_one": Self::bucket_json(&self.link_v2_one),
+            "link_v2_one": Self::link_v2_one_bucket_json(&self.link_v2_one),
         })
     }
 
@@ -856,6 +878,28 @@ impl SlowPackageTimings {
                         "dir_count": timings.dir_count,
                         "symlink_count": timings.symlink_count,
                         "unpacked_bytes": timings.unpacked_bytes,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn link_v2_one_bucket_json(bucket: &[LinkV2OneTiming]) -> serde_json::Value {
+        serde_json::Value::Array(
+            bucket
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "package": entry.package,
+                        "ms": entry.ms,
+                        "reuse_check_ms": entry.timings.reuse_check_ms,
+                        "object_integrity_ms": entry.timings.object_integrity_ms,
+                        "materialize_ms": entry.timings.materialize_ms,
+                        "snapshot_ms": entry.timings.snapshot_ms,
+                        "symlink_ms": entry.timings.symlink_ms,
+                        "sidecar_ms": entry.timings.sidecar_ms,
+                        "rename_ms": entry.timings.rename_ms,
+                        "collision_recovery_ms": entry.timings.collision_recovery_ms,
                     })
                 })
                 .collect(),
@@ -1326,6 +1370,43 @@ mod tests {
         assert_eq!(row["dir_count"], 14);
         assert_eq!(row["symlink_count"], 15);
         assert_eq!(row["unpacked_bytes"], 16);
+    }
+
+    #[test]
+    fn slow_package_trace_reports_v2_link_task_rows() {
+        let mut slow_packages = SlowPackageTimings::default();
+
+        slow_packages.record_link_v2_one(
+            "slow@1.0.0",
+            23,
+            lpm_store::v2::LinkEntryTimings {
+                materialize_ms: 11,
+                snapshot_ms: 7,
+                sidecar_ms: 2,
+                collision_recovery_ms: 5,
+                ..lpm_store::v2::LinkEntryTimings::default()
+            },
+        );
+        slow_packages.record_link_v2_one(
+            "fast@1.0.0",
+            3,
+            lpm_store::v2::LinkEntryTimings {
+                materialize_ms: 1,
+                snapshot_ms: 1,
+                ..lpm_store::v2::LinkEntryTimings::default()
+            },
+        );
+
+        let json = slow_packages.to_json();
+
+        assert_eq!(json["link_v2_one"][0]["package"], "slow@1.0.0");
+        assert_eq!(json["link_v2_one"][0]["ms"], 23);
+        assert_eq!(json["link_v2_one"][0]["materialize_ms"], 11);
+        assert_eq!(json["link_v2_one"][0]["snapshot_ms"], 7);
+        assert_eq!(json["link_v2_one"][0]["sidecar_ms"], 2);
+        assert_eq!(json["link_v2_one"][0]["collision_recovery_ms"], 5);
+        assert_eq!(json["link_v2_one"][1]["package"], "fast@1.0.0");
+        assert_eq!(json["link_v2_one"][1]["ms"], 3);
     }
 
     #[test]

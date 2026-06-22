@@ -593,6 +593,21 @@ pub struct LinkEntry {
     /// — eager read+parse here would cost a JSON round-trip per
     /// package on warm installs (~30 µs × 256 packages adds up).
     pub sidecar: Option<LinkMeta>,
+    /// Best-effort wall-clock attribution for this populate call.
+    pub timings: LinkEntryTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkEntryTimings {
+    pub total_ms: u128,
+    pub reuse_check_ms: u128,
+    pub object_integrity_ms: u128,
+    pub materialize_ms: u128,
+    pub snapshot_ms: u128,
+    pub symlink_ms: u128,
+    pub sidecar_ms: u128,
+    pub rename_ms: u128,
+    pub collision_recovery_ms: u128,
 }
 
 /// I/O front-end for the v2 store.
@@ -1107,6 +1122,8 @@ impl Store {
         fresh_object_digest: Option<&FreshObjectIntegrity>,
         policy: ObjectIntegrityPolicy,
     ) -> Result<LinkEntry, LpmError> {
+        let total_start = std::time::Instant::now();
+        let mut timings = LinkEntryTimings::default();
         let LinkEntryRequest {
             graph_key,
             source_sri,
@@ -1125,6 +1142,7 @@ impl Store {
         // package dir got truncated) or causes the subsequent rename
         // to hard-fail with ENOTEMPTY against a non-empty leftover.
         if final_dir.exists() {
+            let reuse_check_start = std::time::Instant::now();
             if link_entry_is_reusable(
                 &final_dir,
                 &graph_key,
@@ -1133,6 +1151,7 @@ impl Store {
                 verified_object_digest,
                 policy,
             )? {
+                timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
                 // Refresh the sidecar's "last referenced" via a single
                 // set_modified() call instead of read+touch+write+rename.
                 // On a 256-package warm install that's 256 fewer JSON
@@ -1150,8 +1169,13 @@ impl Store {
                     link_dir: final_dir,
                     freshly_populated: false,
                     sidecar: None,
+                    timings: LinkEntryTimings {
+                        total_ms: total_start.elapsed().as_millis(),
+                        ..timings
+                    },
                 });
             }
+            timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
 
             tracing::warn!(
                 target = %final_dir.display(),
@@ -1196,20 +1220,35 @@ impl Store {
         );
 
         let sidecar = match result {
-            Ok(sidecar) => sidecar,
+            Ok(populated) => {
+                timings.object_integrity_ms = populated.timings.object_integrity_ms;
+                timings.materialize_ms = populated.timings.materialize_ms;
+                timings.snapshot_ms = populated.timings.snapshot_ms;
+                timings.symlink_ms = populated.timings.symlink_ms;
+                timings.sidecar_ms = populated.timings.sidecar_ms;
+                populated.sidecar
+            }
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 return Err(e);
             }
         };
 
-        match std::fs::rename(&tmp_dir, &final_dir) {
+        let rename_start = std::time::Instant::now();
+        let rename_result = std::fs::rename(&tmp_dir, &final_dir);
+        timings.rename_ms = rename_start.elapsed().as_millis();
+        match rename_result {
             Ok(()) => Ok(LinkEntry {
                 link_dir: final_dir,
                 freshly_populated: true,
                 sidecar: Some(sidecar),
+                timings: LinkEntryTimings {
+                    total_ms: total_start.elapsed().as_millis(),
+                    ..timings
+                },
             }),
-            Err(_)
+            Err(e) => {
+                let recovery_start = std::time::Instant::now();
                 if link_entry_is_reusable(
                     &final_dir,
                     &graph_key,
@@ -1217,51 +1256,68 @@ impl Store {
                     &source_sri,
                     verified_object_digest,
                     policy,
-                )? =>
-            {
-                // Concurrent install beat us — discard our stage and
-                // refresh the existing sidecar's mtime.
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                let sidecar_path = final_dir.join(LINK_META_FILENAME);
-                if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
-                    tracing::debug!("v2 store: race-loss touch failed: {e}");
-                }
-                Ok(LinkEntry {
-                    link_dir: final_dir,
-                    freshly_populated: false,
-                    sidecar: None,
-                })
-            }
-            Err(_) if final_dir.exists() => {
-                // Final dir exists but is incomplete or stale. Remove the
-                // leftover and retry the rename once; a third attempt won't
-                // change filesystem-level failures such as permission errors.
-                tracing::warn!(
-                    target = %final_dir.display(),
-                    "v2 store: rename hit incomplete or stale leftover; removing and retrying once"
-                );
-                if let Err(e) = std::fs::remove_dir_all(&final_dir) {
+                )? {
+                    // Concurrent install beat us — discard our stage and
+                    // refresh the existing sidecar's mtime.
                     let _ = std::fs::remove_dir_all(&tmp_dir);
-                    return Err(LpmError::Store(format!(
-                        "failed to remove incomplete or stale v2 link entry during retry at {}: {e}",
-                        final_dir.display()
-                    )));
-                }
-                match std::fs::rename(&tmp_dir, &final_dir) {
-                    Ok(()) => Ok(LinkEntry {
-                        link_dir: final_dir,
-                        freshly_populated: true,
-                        sidecar: Some(sidecar),
-                    }),
-                    Err(e) => {
-                        let _ = std::fs::remove_dir_all(&tmp_dir);
-                        Err(LpmError::Store(format!(
-                            "failed to atomically install v2 link entry on retry: {e}"
-                        )))
+                    let sidecar_path = final_dir.join(LINK_META_FILENAME);
+                    if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
+                        tracing::debug!("v2 store: race-loss touch failed: {e}");
                     }
+                    timings.collision_recovery_ms = timings
+                        .collision_recovery_ms
+                        .saturating_add(recovery_start.elapsed().as_millis());
+                    return Ok(LinkEntry {
+                        link_dir: final_dir,
+                        freshly_populated: false,
+                        sidecar: None,
+                        timings: LinkEntryTimings {
+                            total_ms: total_start.elapsed().as_millis(),
+                            ..timings
+                        },
+                    });
                 }
-            }
-            Err(e) => {
+                if final_dir.exists() {
+                    // Final dir exists but is incomplete or stale. Remove the
+                    // leftover and retry the rename once; a third attempt won't
+                    // change filesystem-level failures such as permission errors.
+                    tracing::warn!(
+                        target = %final_dir.display(),
+                        "v2 store: rename hit incomplete or stale leftover; removing and retrying once"
+                    );
+                    if let Err(e) = std::fs::remove_dir_all(&final_dir) {
+                        let _ = std::fs::remove_dir_all(&tmp_dir);
+                        return Err(LpmError::Store(format!(
+                            "failed to remove incomplete or stale v2 link entry during retry at {}: {e}",
+                            final_dir.display()
+                        )));
+                    }
+                    timings.collision_recovery_ms = timings
+                        .collision_recovery_ms
+                        .saturating_add(recovery_start.elapsed().as_millis());
+                    let retry_rename_start = std::time::Instant::now();
+                    let retry_rename_result = std::fs::rename(&tmp_dir, &final_dir);
+                    timings.rename_ms = timings
+                        .rename_ms
+                        .saturating_add(retry_rename_start.elapsed().as_millis());
+                    return match retry_rename_result {
+                        Ok(()) => Ok(LinkEntry {
+                            link_dir: final_dir,
+                            freshly_populated: true,
+                            sidecar: Some(sidecar),
+                            timings: LinkEntryTimings {
+                                total_ms: total_start.elapsed().as_millis(),
+                                ..timings
+                            },
+                        }),
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&tmp_dir);
+                            Err(LpmError::Store(format!(
+                                "failed to atomically install v2 link entry on retry: {e}"
+                            )))
+                        }
+                    };
+                }
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 Err(LpmError::Store(format!(
                     "failed to atomically install v2 link entry: {e}"
@@ -1689,13 +1745,19 @@ struct PopulateObject<'a> {
     fresh_object_integrity: Option<&'a FreshObjectIntegrity>,
 }
 
+struct PopulateIntoResult {
+    sidecar: LinkMeta,
+    timings: LinkEntryTimings,
+}
+
 fn populate_into(
     tmp_dir: &Path,
     graph_key: &GraphKey,
     object: PopulateObject<'_>,
     deps: &[DepLink],
     platform: &Arc<LinkMetaPlatform>,
-) -> Result<LinkMeta, LpmError> {
+) -> Result<PopulateIntoResult, LpmError> {
+    let mut timings = LinkEntryTimings::default();
     let node_modules = tmp_dir.join(LINK_NODE_MODULES);
     std::fs::create_dir_all(&node_modules).map_err(|e| {
         LpmError::Store(format!(
@@ -1707,6 +1769,7 @@ fn populate_into(
     // Materialize the package itself from the verified object directory.
     // Link entries must not share hardlink inodes with objects: writes
     // through executable package bytes must never mutate the object store.
+    let object_integrity_start = std::time::Instant::now();
     let object_integrity = match object.fresh_object_integrity {
         Some(digest) => Cow::Borrowed(digest.as_str()),
         None => Cow::Owned(object_integrity_for_link(
@@ -1715,6 +1778,7 @@ fn populate_into(
             object.policy,
         )?),
     };
+    timings.object_integrity_ms = object_integrity_start.elapsed().as_millis();
     let pkg_dir = node_modules.join(graph_key.name());
     if let Some(parent) = pkg_dir.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -1724,7 +1788,10 @@ fn populate_into(
             ))
         })?;
     }
+    let materialize_start = std::time::Instant::now();
     materialize_into(object.dir, &pkg_dir)?;
+    timings.materialize_ms = materialize_start.elapsed().as_millis();
+    let snapshot_start = std::time::Instant::now();
     let package_metadata_integrity = compute_tree_metadata_integrity(&pkg_dir)?;
     write_tree_snapshot(
         tmp_dir,
@@ -1734,13 +1801,16 @@ fn populate_into(
             stats: ObjectTreeStats::default(),
         },
     )?;
+    timings.snapshot_ms = snapshot_start.elapsed().as_millis();
 
     // Sibling-dep symlinks. Each lives next to the package (siblings
     // under the wrapper-level node_modules) — same shape as the
     // existing isolated linker contract.
+    let symlink_start = std::time::Instant::now();
     for dep in deps {
         create_sibling_symlink(&node_modules, dep, graph_key)?;
     }
+    timings.symlink_ms = symlink_start.elapsed().as_millis();
 
     // Stage the sidecar BEFORE the rename so the published entry is
     // never observable without its metadata.
@@ -1759,9 +1829,11 @@ fn populate_into(
     // `populate_link_entry` is the visibility boundary, so we can skip the
     // tmp+rename dance and write the sidecar straight in. See
     // [`LinkMeta::write_to_unpublished`] for the atomicity contract.
+    let sidecar_start = std::time::Instant::now();
     sidecar.write_to_unpublished(tmp_dir)?;
+    timings.sidecar_ms = sidecar_start.elapsed().as_millis();
 
-    Ok(sidecar)
+    Ok(PopulateIntoResult { sidecar, timings })
 }
 
 fn create_sibling_symlink(

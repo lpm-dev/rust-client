@@ -1057,6 +1057,8 @@ pub(super) async fn run(
             store_v2,
             v2_link_handles,
             pkg.name.as_deref(),
+            timing_detail_mode,
+            &mut slow_package_timings,
         )
         .await?
     } else {
@@ -2836,6 +2838,8 @@ async fn finish_v2_event_driven_link(
     store_v2: &lpm_store::v2::Store,
     mut v2_link_handles: Vec<V2LinkHandle>,
     self_package_name: Option<&str>,
+    timing_detail_mode: TimingDetailMode,
+    slow_package_timings: &mut SlowPackageTimings,
 ) -> Result<LinkOutcomeWithTimings, LpmError> {
     let await_start = Instant::now();
     let mut materialized = Vec::with_capacity(v2_link_handles.len());
@@ -2844,6 +2848,11 @@ async fn finish_v2_event_driven_link(
         let task = handle.await.map_err(|e| {
             LpmError::Registry(format!("experimental v2 link task panicked: {e}"))
         })??;
+        if timing_detail_mode.trace() {
+            let package_display =
+                format!("{}@{}", task.materialized.name, task.materialized.version);
+            slow_package_timings.record_link_v2_one(&package_display, task.ms, task.timings);
+        }
         if task.freshly_populated {
             linked += 1;
         }
