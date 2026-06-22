@@ -1416,6 +1416,14 @@ impl Store {
 
     /// Return the current content digest for a populated link entry.
     pub fn link_entry_content_integrity(&self, key: &GraphKey) -> Result<String, LpmError> {
+        self.link_entry_content_integrity_with_policy(key, object_integrity_policy())
+    }
+
+    fn link_entry_content_integrity_with_policy(
+        &self,
+        key: &GraphKey,
+        policy: ObjectIntegrityPolicy,
+    ) -> Result<String, LpmError> {
         let link_dir = self.paths.link_dir(key);
         if let Some(snapshot) = read_tree_snapshot(&link_dir) {
             return Ok(snapshot.content_integrity);
@@ -1429,7 +1437,7 @@ impl Store {
         let package_dir = link_entry_package_dir(&link_dir, key);
         let meta = LinkMeta::read_from(&link_dir)?;
         let object_dir = self.paths.object_dir(&meta.source_sri)?;
-        if source_policy_uses_source_integrity(&object_dir, object_integrity_policy()) {
+        if source_policy_uses_source_integrity(&object_dir, policy) {
             let content = source_object_integrity(&meta.source_sri);
             let metadata = compute_tree_metadata_integrity(&package_dir)?;
             write_tree_snapshot(
@@ -3427,6 +3435,40 @@ mod tests {
         dir
     }
 
+    fn extract_object_source(
+        store: &Store,
+        sri: &str,
+        tarball_data: &[u8],
+    ) -> Result<PathBuf, LpmError> {
+        store
+            .extract_object_with_timings_and_policy(
+                sri,
+                tarball_data,
+                ObjectIntegrityPolicy::Source,
+            )
+            .map(|(object, _)| object.path)
+    }
+
+    fn populate_link_entry_source(
+        store: &Store,
+        request: LinkEntryRequest,
+    ) -> Result<LinkEntry, LpmError> {
+        store.populate_link_entry_inner(request, None, None, ObjectIntegrityPolicy::Source)
+    }
+
+    fn populate_link_entry_with_verified_object_source(
+        store: &Store,
+        request: LinkEntryRequest,
+        verified_object_integrity: &VerifiedObjectIntegrity,
+    ) -> Result<LinkEntry, LpmError> {
+        store.populate_link_entry_inner(
+            request,
+            Some(verified_object_integrity),
+            None,
+            ObjectIntegrityPolicy::Source,
+        )
+    }
+
     #[test]
     fn reusable_object_tree_policy_recreates_missing_tree_snapshot() {
         let dir = tempfile::tempdir().unwrap();
@@ -3632,19 +3674,23 @@ mod tests {
             ],
         );
         let key = arc_key("snapshot-link", "1.0.0");
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key.clone(),
                 source_sri: sri.clone(),
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let snapshot_path = entry.link_dir.join(TREE_SNAPSHOT_FILENAME);
         std::fs::remove_file(&snapshot_path).unwrap();
 
-        let integrity = store.link_entry_content_integrity(&key).unwrap();
+        let integrity = store
+            .link_entry_content_integrity_with_policy(&key, ObjectIntegrityPolicy::Source)
+            .unwrap();
 
         assert_eq!(integrity, source_object_integrity(&sri));
         assert!(
@@ -3701,15 +3747,17 @@ mod tests {
         );
 
         let key = arc_key("a", "1.0.0");
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key,
                 source_sri: sri.clone(),
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert!(entry.freshly_populated);
         assert!(entry.link_dir.is_dir());
@@ -4091,7 +4139,7 @@ mod tests {
             platform: Arc::new(sample_meta_platform()),
         };
 
-        let first = store.populate_link_entry(req()).unwrap();
+        let first = populate_link_entry_source(&store, req()).unwrap();
         assert!(first.freshly_populated);
         assert!(first.sidecar.is_some(), "fresh population returns sidecar");
         let first_sidecar = first.sidecar.unwrap();
@@ -4107,7 +4155,7 @@ mod tests {
         // is the conservative floor.
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        let second = store.populate_link_entry(req()).unwrap();
+        let second = populate_link_entry_source(&store, req()).unwrap();
         assert!(!second.freshly_populated);
         assert_eq!(second.link_dir, first.link_dir);
         // Cache-hit returns no sidecar; the touch is observable via
@@ -4149,15 +4197,17 @@ mod tests {
         );
         let key = arc_key("copy-safe", "1.0.0");
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key,
                 source_sri: sri,
                 object_dir: object_dir.clone(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let link_index = entry.link_dir.join("node_modules/copy-safe/index.js");
 
         std::fs::write(object_dir.join("index.js"), b"module.exports = 'tampered';").unwrap();
@@ -4192,11 +4242,11 @@ mod tests {
             platform: Arc::new(sample_meta_platform()),
         };
 
-        let first = store.populate_link_entry(request()).unwrap();
+        let first = populate_link_entry_source(&store, request()).unwrap();
         let link_index = first.link_dir.join("node_modules/stale-link/index.js");
         std::fs::write(&link_index, b"module.exports = 'stale';").unwrap();
 
-        let second = store.populate_link_entry(request()).unwrap();
+        let second = populate_link_entry_source(&store, request()).unwrap();
 
         assert!(second.freshly_populated);
         assert_eq!(
@@ -4221,7 +4271,7 @@ mod tests {
             ],
         );
         let verified = store
-            .reusable_object(&sri)
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
             .unwrap()
             .unwrap()
             .object_integrity;
@@ -4234,17 +4284,15 @@ mod tests {
             platform: Arc::new(sample_meta_platform()),
         };
 
-        let first = store
-            .populate_link_entry_with_verified_object(request(), &verified)
-            .unwrap();
+        let first =
+            populate_link_entry_with_verified_object_source(&store, request(), &verified).unwrap();
         let link_index = first
             .link_dir
             .join("node_modules/verified-stale-link/index.js");
         std::fs::write(&link_index, b"module.exports = 'stale';").unwrap();
 
-        let second = store
-            .populate_link_entry_with_verified_object(request(), &verified)
-            .unwrap();
+        let second =
+            populate_link_entry_with_verified_object_source(&store, request(), &verified).unwrap();
 
         assert!(second.freshly_populated);
         assert_eq!(
@@ -4426,18 +4474,21 @@ mod tests {
         // Materialize the dep first so its link dir exists for the
         // symlink target. The store doesn't enforce ordering (caller's
         // responsibility) — we exercise the realistic path here.
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: dep_key.clone(),
                 source_sri: dep_sri.clone(),
                 object_dir: store.paths().object_dir(&dep_sri).unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: pkg_key,
                 source_sri: pkg_sri,
                 object_dir: pkg_obj,
@@ -4446,8 +4497,9 @@ mod tests {
                     target: dep_key.clone(),
                 }],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let sibling = entry.link_dir.join("node_modules").join("debug");
         let target = std::fs::read_link(&sibling).unwrap();
@@ -4479,18 +4531,21 @@ mod tests {
 
         let pkg_key = arc_key("consumer", "1.0.0");
         let dep_key = arc_key("debug", "4.3.4");
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: dep_key.clone(),
                 source_sri: dep_sri.clone(),
                 object_dir: store.paths().object_dir(&dep_sri).unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        let err = store
-            .populate_link_entry(LinkEntryRequest {
+        let err = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: pkg_key.clone(),
                 source_sri: pkg_sri,
                 object_dir: pkg_obj,
@@ -4499,8 +4554,9 @@ mod tests {
                     target: dep_key,
                 }],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
 
         assert!(
             format!("{err}").contains("unsafe dependency local name"),
@@ -4528,18 +4584,21 @@ mod tests {
         let pkg_key = arc_key("consumer", "1.0.0");
         let dep_key = arc_key("@types/node", "20.10.0");
 
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: dep_key.clone(),
                 source_sri: dep_sri.clone(),
                 object_dir: store.paths().object_dir(&dep_sri).unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: pkg_key,
                 source_sri: pkg_sri,
                 object_dir: pkg_obj,
@@ -4548,8 +4607,9 @@ mod tests {
                     target: dep_key.clone(),
                 }],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let sibling = entry
             .link_dir
@@ -4590,18 +4650,21 @@ mod tests {
         let pkg_key = arc_key("@scope/pkg", "2.0.0");
         let dep_key = arc_key("@scope/pkg", "1.0.0");
 
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: dep_key.clone(),
                 source_sri: dep_sri.clone(),
                 object_dir: store.paths().object_dir(&dep_sri).unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: pkg_key,
                 source_sri: pkg_sri,
                 object_dir: pkg_obj,
@@ -4610,8 +4673,9 @@ mod tests {
                     target: dep_key.clone(),
                 }],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let nested = entry
             .link_dir
@@ -4648,7 +4712,7 @@ mod tests {
         let object_dir = write_object(&store, &sri, &[("package.json", b"{}")]);
 
         // extract_object on already-populated SRI must short-circuit.
-        let returned = store.extract_object(&sri, b"unused-because-hit").unwrap();
+        let returned = extract_object_source(&store, &sri, b"unused-because-hit").unwrap();
         assert_eq!(returned, object_dir);
     }
 
@@ -4662,15 +4726,17 @@ mod tests {
         let nonexistent_object = store.paths().object_dir(&sri).unwrap();
         let key = arc_key("missing", "0.0.1");
 
-        let err = store
-            .populate_link_entry(LinkEntryRequest {
+        let err = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key.clone(),
                 source_sri: sri,
                 object_dir: nonexistent_object,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("v2"));
 
         // No `links/<dir>` should exist (final or tmp).
@@ -4722,15 +4788,17 @@ mod tests {
         );
         stub.write_to(&final_dir).unwrap();
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key,
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert!(
             entry.freshly_populated,
@@ -4777,7 +4845,7 @@ mod tests {
 
         // Now the short-circuit hit path should return without
         // touching the disk further.
-        let returned = store.extract_object(&sri, b"unused").unwrap();
+        let returned = extract_object_source(&store, &sri, b"unused").unwrap();
         assert_eq!(returned, object_dir);
     }
 
@@ -4807,15 +4875,17 @@ mod tests {
         std::fs::create_dir_all(&final_dir).unwrap();
         assert!(!is_complete_link_entry(&final_dir, &key));
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key.clone(),
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert!(entry.freshly_populated);
         assert!(is_complete_link_entry(&entry.link_dir, &key));
@@ -5269,8 +5339,9 @@ mod tests {
 
         let key_a = arc_key("a", "1.0.0");
         let key_b = arc_key("b", "2.0.0");
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key_a,
                 source_sri: sri_a,
                 object_dir: store
@@ -5279,10 +5350,12 @@ mod tests {
                     .unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
-        store
-            .populate_link_entry(LinkEntryRequest {
+            },
+        )
+        .unwrap();
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key_b,
                 source_sri: sri_b,
                 object_dir: store
@@ -5291,8 +5364,9 @@ mod tests {
                     .unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let mut names: Vec<String> = store
             .iter_link_entries()
@@ -5335,15 +5409,17 @@ mod tests {
                 b"{\"name\":\"legit\",\"version\":\"1.0.0\"}",
             )],
         );
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: arc_key("legit", "1.0.0"),
                 source_sri: sri.clone(),
                 object_dir: store.paths().object_dir(&sri).unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let outside = dir.path().join("outside-of-store");
         std::fs::create_dir_all(&outside).unwrap();
@@ -5391,15 +5467,17 @@ mod tests {
             &[("package.json", b"{\"name\":\"c\",\"version\":\"3.1.4\"}")],
         );
         let key = arc_key("c", "3.1.4");
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key.clone(),
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let resolved = store.find_link_package_dir("c", "3.1.4").unwrap();
         assert!(resolved.is_some(), "must locate populated entry");
@@ -5510,15 +5588,17 @@ mod tests {
             &[("package.json", b"{\"name\":\"d\",\"version\":\"1.0.0\"}")],
         );
         let key = arc_key("d", "1.0.0");
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key.clone(),
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Direct probe.
         assert!(store.path_lives_in_store(&entry.link_dir));
