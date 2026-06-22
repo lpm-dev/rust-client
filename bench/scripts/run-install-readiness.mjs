@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const repoRoot = path.resolve(new URL('../..', import.meta.url).pathname);
+const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
 const BUILTIN_FIXTURES = new Map([
   [
@@ -82,6 +83,8 @@ validateManagers(managers);
 validateScriptPolicy(scriptPolicy);
 
 const runSpecs = buildRunSpecs(managers, lpmCells, lpmRoutes);
+validateUniqueKeys('fixture', fixtures, (fixture) => fixture.name);
+validateUniqueKeys('run spec', runSpecs, (spec) => spec.id);
 const plan = {
   samples,
   fixtures: fixtures.map((fixture) => fixture.source),
@@ -128,7 +131,7 @@ fs.writeFileSync(path.join(outputDir, 'summary.md'), `${summaryMd}\n`);
 console.log(`\n[summary] ${outputDir}`);
 console.log(summaryMd);
 
-if (!allowFailures && rows.some((row) => row.exit_code !== 0 || row.parse_error)) {
+if (!allowFailures && rows.some(runFailed)) {
   process.exitCode = 1;
 }
 
@@ -214,7 +217,7 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
       }
     }
   } finally {
-    if (!keepProjects && !(keepFailedProjects && rowsForSpec.some((row) => row.exit_code !== 0))) {
+    if (!keepProjects && !(keepFailedProjects && rowsForSpec.some(runFailed))) {
       removeTree(tmpRoot);
     }
   }
@@ -822,6 +825,17 @@ function validateScriptPolicy(policy) {
   }
 }
 
+function validateUniqueKeys(label, values, keyFor) {
+  const seen = new Map();
+  for (const value of values) {
+    const key = keyFor(value);
+    if (seen.has(key)) {
+      throw new Error(`duplicate ${label} name after sanitization: ${key}`);
+    }
+    seen.set(key, value);
+  }
+}
+
 function parseList(raw, flag) {
   const values = raw
     .split(',')
@@ -924,6 +938,10 @@ function medianMin(rows, key) {
         : (values[values.length / 2 - 1] + values[values.length / 2]) / 2,
     min: values[0],
   };
+}
+
+function runFailed(row) {
+  return row.exit_code !== 0 || Boolean(row.parse_error) || Boolean(row.skipped);
 }
 
 function stat(value) {
