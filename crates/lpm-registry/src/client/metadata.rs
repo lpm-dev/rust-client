@@ -1398,6 +1398,26 @@ impl RegistryClient {
         }
     }
 
+    pub async fn get_npm_release_times_routed_full_with_timings(
+        &self,
+        name: &str,
+        route: crate::UpstreamRoute,
+    ) -> Result<TimedReleaseTimeMetadata, LpmError> {
+        match route {
+            crate::UpstreamRoute::NpmDirect => {
+                self.get_npm_release_times_direct_full_inner_with_timings(name, true)
+                    .await
+            }
+            route => {
+                let metadata = self.get_npm_release_times_routed_full(name, route).await?;
+                Ok(TimedReleaseTimeMetadata {
+                    metadata,
+                    timings: PackageMetadataFetchTimings::default(),
+                })
+            }
+        }
+    }
+
     async fn get_npm_package_release_times_full(
         &self,
         name: &str,
@@ -1492,16 +1512,34 @@ impl RegistryClient {
         name: &str,
         use_cache: bool,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
+        Ok(self
+            .get_npm_release_times_direct_full_inner_with_timings(name, use_cache)
+            .await?
+            .metadata)
+    }
+
+    async fn get_npm_release_times_direct_full_inner_with_timings(
+        &self,
+        name: &str,
+        use_cache: bool,
+    ) -> Result<TimedReleaseTimeMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
         let cache_key = format!("npm-release-times:{name}");
+        let mut timings = PackageMetadataFetchTimings::default();
         if use_cache {
+            let cache_read_start = std::time::Instant::now();
             if let Some((cached, _etag)) = self
                 .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
                 .await
                 && cached.matches_package(name)
             {
+                timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+                timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
-                return Ok(cached);
+                return Ok(TimedReleaseTimeMetadata {
+                    metadata: cached,
+                    timings,
+                });
             }
             let full_cache_key = format!("npm-full:{name}");
             if let Some((cached, _etag)) = self
@@ -1510,15 +1548,23 @@ impl RegistryClient {
                 && cached.matches_package(name)
                 && !cached.time.is_empty()
             {
+                timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+                timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
-                return Ok(cached);
+                return Ok(TimedReleaseTimeMetadata {
+                    metadata: cached,
+                    timings,
+                });
             }
+            timings.cache_read_ms = cache_read_start.elapsed().as_millis();
         }
         crate::timing::record_metadata_cache_miss();
 
+        let validator_start = std::time::Instant::now();
         let cache_validator = use_cache
             .then(|| self.read_cache_validator(&cache_key))
             .flatten();
+        timings.validator_read_ms = validator_start.elapsed().as_millis();
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
             ($expr:expr) => {{
@@ -1536,18 +1582,29 @@ impl RegistryClient {
             .get(&npm_url)
             .header("Accept", "application/json");
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
+        let http_start = std::time::Instant::now();
         let mut response = match self.send_package_metadata_request(req).await {
-            Ok(response) => response,
+            Ok(response) => {
+                timings.http_ms = timings
+                    .http_ms
+                    .saturating_add(http_start.elapsed().as_millis());
+                response
+            }
             Err(err) => return finish!(Err(err)),
         };
         if use_cache && response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            timings.not_modified = true;
+            let cache_304_start = std::time::Instant::now();
             if let Some(metadata) = self
                 .cached_metadata_after_304_as::<ReleaseTimeMetadata>(&cache_key)
                 .await
                 && metadata.matches_package(name)
             {
-                return finish!(Ok(metadata));
+                timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+                return finish!(Ok(TimedReleaseTimeMetadata { metadata, timings }));
             }
+            timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+            let retry_http_start = std::time::Instant::now();
             response = match self
                 .send_package_metadata_request(
                     self.http
@@ -1558,26 +1615,37 @@ impl RegistryClient {
                 )
                 .await
             {
-                Ok(response) => response,
+                Ok(response) => {
+                    timings.http_ms = timings
+                        .http_ms
+                        .saturating_add(retry_http_start.elapsed().as_millis());
+                    response
+                }
                 Err(err) => return finish!(Err(err)),
             };
         }
         let etag = Self::response_etag(&response);
-        let metadata = match parse_capped_metadata::<ReleaseTimeMetadata>(
-            response,
-            &format!("get_npm_release_times_direct_full {name}"),
-        )
-        .await
-        {
-            Ok(metadata) => metadata,
-            Err(err) => return finish!(Err(err)),
-        };
+        let (metadata, body_timings) =
+            match parse_capped_metadata_with_timing::<ReleaseTimeMetadata>(
+                response,
+                &format!("get_npm_release_times_direct_full {name}"),
+            )
+            .await
+            {
+                Ok(parsed) => parsed,
+                Err(err) => return finish!(Err(err)),
+            };
+        timings.body_read_ms = body_timings.body_read_ms;
+        timings.json_decode_ms = body_timings.json_parse_ms;
+        timings.body_bytes = body_timings.body_bytes;
         let metadata = match Self::validate_release_time_metadata(name, metadata) {
             Ok(metadata) => metadata,
             Err(err) => return finish!(Err(err)),
         };
+        let cache_write_start = std::time::Instant::now();
         self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-        finish!(Ok(metadata))
+        timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
+        finish!(Ok(TimedReleaseTimeMetadata { metadata, timings }))
     }
 
     pub async fn get_npm_release_times_from_full(

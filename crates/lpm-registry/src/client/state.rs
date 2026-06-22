@@ -32,6 +32,12 @@ pub struct TimedPackageMetadata {
     pub timings: PackageMetadataFetchTimings,
 }
 
+#[derive(Debug)]
+pub struct TimedReleaseTimeMetadata {
+    pub metadata: ReleaseTimeMetadata,
+    pub timings: PackageMetadataFetchTimings,
+}
+
 /// Magic-verified cache content: ETag + raw data bytes ready for deserialization.
 pub(super) struct CacheContent {
     #[cfg(test)]
