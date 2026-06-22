@@ -3221,7 +3221,7 @@ async fn run_with_options_under_store_lock(
                     Some(sri) => acc.push(lpm_linker::v2::V2Target {
                         target: lt.clone(),
                         source_sri: sri.to_string(),
-                        verified_object_tree_integrity: None,
+                        verified_object_integrity: None,
                         fresh_object: None,
                     }),
                     None => {
@@ -3233,7 +3233,7 @@ async fn run_with_options_under_store_lock(
                     acc.push(lpm_linker::v2::V2Target {
                         target: lt.clone(),
                         source_sri: local_source_sri_for_target(lt),
-                        verified_object_tree_integrity: None,
+                        verified_object_integrity: None,
                         fresh_object: None,
                     });
                 }
@@ -3316,7 +3316,7 @@ async fn run_with_options_under_store_lock(
                         lpm_linker::v2::V2Target {
                             target: lt.clone(),
                             source_sri: sri,
-                            verified_object_tree_integrity: None,
+                            verified_object_integrity: None,
                             fresh_object: None,
                         },
                     ))
@@ -3480,8 +3480,7 @@ async fn run_with_options_under_store_lock(
             {
                 let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
                 let mut target = target;
-                target.verified_object_tree_integrity =
-                    Some(reusable_object.tree_integrity.clone());
+                target.verified_object_integrity = Some(reusable_object.object_integrity.clone());
                 let plan_arc = std::sync::Arc::clone(plan);
                 let store_arc = std::sync::Arc::clone(
                     store_v2_handle
@@ -4397,8 +4396,8 @@ async fn run_with_options_under_store_lock(
                             ) {
                                 let plan_c = std::sync::Arc::clone(plan);
                                 let mut target_c = target.clone();
-                                target_c.verified_object_tree_integrity =
-                                    Some(reusable_object.tree_integrity);
+                                target_c.verified_object_integrity =
+                                    Some(reusable_object.object_integrity);
                                 let store_c = std::sync::Arc::clone(store_v2);
                                 Some(spawn_v2_link_task(
                                     plan_c,

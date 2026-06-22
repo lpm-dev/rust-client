@@ -37,7 +37,7 @@ fn install(project: &TempProject, registry: &FaultRegistry) -> std::process::Out
         .expect("failed to run lpm install")
 }
 
-fn install_with_store_version(
+fn install_with_tree_integrity_store_version(
     project: &TempProject,
     registry_url: &str,
     store_version: &str,
@@ -46,6 +46,7 @@ fn install_with_store_version(
     let mut cmd = lpm_with_registry(project, registry_url);
     cmd.env("LPM_GREEDY_FUSION", "0")
         .env("LPM_STORE_VERSION", store_version)
+        .env("LPM_V2_OBJECT_INTEGRITY", "tree")
         .args(INSTALL_ARGS)
         .args(extra_args)
         .output()
@@ -267,7 +268,7 @@ async fn install_rejects_tarball_bytes_that_change_after_resolution() {
 }
 
 #[tokio::test]
-async fn offline_v2_install_fails_cleanly_when_cached_object_is_corrupted() {
+async fn offline_v2_tree_integrity_install_fails_cleanly_when_cached_object_is_corrupted() {
     let registry = FaultRegistry::start().await;
     let package_name = "fault-corrupted-cache";
     let version = "1.0.0";
@@ -285,7 +286,7 @@ async fn offline_v2_install_fails_cleanly_when_cached_object_is_corrupted() {
         .await;
 
     let project = project_with_dep("fault-corrupted-cache-app", package_name, version);
-    let online = install_with_store_version(&project, &registry.url(), "v2", &[]);
+    let online = install_with_tree_integrity_store_version(&project, &registry.url(), "v2", &[]);
     assert!(
         online.status.success(),
         "online v2 install must warm the cache\nstdout:\n{}\nstderr:\n{}",
@@ -306,7 +307,12 @@ async fn offline_v2_install_fails_cleanly_when_cached_object_is_corrupted() {
     std::fs::remove_dir_all(project.path().join("node_modules"))
         .expect("remove node_modules before offline reinstall");
 
-    let offline = install_with_store_version(&project, "http://127.0.0.1:1", "v2", &["--offline"]);
+    let offline = install_with_tree_integrity_store_version(
+        &project,
+        "http://127.0.0.1:1",
+        "v2",
+        &["--offline"],
+    );
     assert!(
         !offline.status.success(),
         "offline reinstall must fail when the only cached object is corrupted\nstdout:\n{}\nstderr:\n{}",

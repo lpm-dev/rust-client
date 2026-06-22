@@ -102,13 +102,15 @@ pub type VerifyLinkEntry = (PathBuf, Result<LinkMeta, LpmError>);
 /// `node_modules/` sub-name inside each `links/<graph-key>/` entry.
 const LINK_NODE_MODULES: &str = "node_modules";
 
-/// Marker file written into synthetic local-source objects.
-const LOCAL_SOURCE_OBJECT_SENTINEL: &str = ".lpm-local-source";
+/// Store-owned metadata namespace for object attributes that must not
+/// collide with package contents.
+const OBJECT_METADATA_DIR: &str = ".lpm-object-meta";
+const LOCAL_SOURCE_OBJECT_SENTINEL: &str = "local-source";
 
-/// Deterministic digest over the extracted package tree. `.integrity`
-/// records the source tarball SRI; this records the bytes lpm links
-/// from cache on later installs.
-const OBJECT_TREE_INTEGRITY_FILENAME: &str = ".lpm-object-integrity";
+/// Object identity sidecar. `.integrity` records the source tarball SRI;
+/// this file records the policy-specific digest used for object and link
+/// reuse.
+const OBJECT_INTEGRITY_FILENAME: &str = ".lpm-object-integrity";
 const TREE_SNAPSHOT_FILENAME: &str = ".lpm-tree-snapshot.json";
 const TREE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const TREE_SNAPSHOT_MAX_BYTES: u64 = 4096;
@@ -201,6 +203,7 @@ enum ObjectIntegrityPolicy {
 impl ObjectIntegrityPolicy {
     fn from_env_value(value: Option<&str>) -> Self {
         match value.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("tree") => Self::Tree,
             Some(value)
                 if value.eq_ignore_ascii_case("source")
                     || value.eq_ignore_ascii_case("sri")
@@ -208,6 +211,7 @@ impl ObjectIntegrityPolicy {
             {
                 Self::Source
             }
+            None | Some("") => Self::Source,
             _ => Self::Tree,
         }
     }
@@ -236,6 +240,33 @@ struct ObjectTreeStats {
     dir_count: u64,
     symlink_count: u64,
     unpacked_bytes: u64,
+}
+
+#[derive(Default)]
+struct ExtractedObjectStats {
+    stats: ObjectTreeStats,
+    dirs: std::collections::HashSet<PathBuf>,
+}
+
+impl ExtractedObjectStats {
+    fn record_file(&mut self, relative_path: &Path, size: u64) {
+        self.stats.file_count = self.stats.file_count.saturating_add(1);
+        self.stats.unpacked_bytes = self.stats.unpacked_bytes.saturating_add(size);
+
+        let mut parent = relative_path.parent();
+        while let Some(dir) = parent {
+            if dir.as_os_str().is_empty() {
+                break;
+            }
+            self.dirs.insert(dir.to_path_buf());
+            parent = dir.parent();
+        }
+    }
+
+    fn finish(mut self) -> ObjectTreeStats {
+        self.stats.dir_count = self.dirs.len() as u64;
+        self.stats
+    }
 }
 
 /// Pure path helper for the v2 store layout.
@@ -434,11 +465,11 @@ pub struct LinkEntryRequest {
     pub platform: Arc<LinkMetaPlatform>,
 }
 
-/// Object-tree digest that has been checked against the object bytes.
+/// Object digest validated according to the active integrity policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedObjectTreeIntegrity(String);
+pub struct VerifiedObjectIntegrity(String);
 
-impl VerifiedObjectTreeIntegrity {
+impl VerifiedObjectIntegrity {
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -450,32 +481,32 @@ impl VerifiedObjectTreeIntegrity {
     }
 }
 
-/// Object-tree digest produced by the extraction path for immediate link populate.
+/// Object digest produced by the extraction path for immediate link populate.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FreshObjectTreeIntegrity(VerifiedObjectTreeIntegrity);
+pub struct FreshObjectIntegrity(VerifiedObjectIntegrity);
 
-impl FreshObjectTreeIntegrity {
+impl FreshObjectIntegrity {
     #[inline]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
     #[inline]
-    fn new(digest: VerifiedObjectTreeIntegrity) -> Self {
+    fn new(digest: VerifiedObjectIntegrity) -> Self {
         Self(digest)
     }
 
     #[inline]
-    fn as_verified(&self) -> &VerifiedObjectTreeIntegrity {
+    fn as_verified(&self) -> &VerifiedObjectIntegrity {
         &self.0
     }
 }
 
-/// Object directory that is complete and has a verified tree digest.
+/// Object directory that is complete and has verified object identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReusableObject {
     pub path: PathBuf,
-    pub tree_integrity: VerifiedObjectTreeIntegrity,
+    pub object_integrity: VerifiedObjectIntegrity,
 }
 
 /// Object directory just produced or validated by an extraction call.
@@ -483,7 +514,7 @@ pub struct ReusableObject {
 pub struct ExtractedObject {
     path: PathBuf,
     source_sri: String,
-    tree_integrity: FreshObjectTreeIntegrity,
+    object_integrity: FreshObjectIntegrity,
 }
 
 /// Timing and path counters for one reusable-object validation check.
@@ -607,14 +638,14 @@ impl Store {
     }
 
     /// Return the object directory when `sri` is already present and
-    /// its extracted-tree digest still matches. Incomplete or stale
+    /// its object identity is reusable. Incomplete or stale
     /// objects are removed so callers can safely refetch before
     /// linking.
     pub fn reusable_object_dir(&self, sri: &str) -> Result<Option<PathBuf>, LpmError> {
         Ok(self.reusable_object(sri)?.map(|object| object.path))
     }
 
-    /// Return the object directory plus the verified object-tree digest.
+    /// Return the object directory plus the verified object digest.
     pub fn reusable_object(&self, sri: &str) -> Result<Option<ReusableObject>, LpmError> {
         self.reusable_object_with_policy(sri, object_integrity_policy())
     }
@@ -628,14 +659,14 @@ impl Store {
         if !object_dir.exists() {
             return Ok(None);
         }
-        let Some(tree_integrity) =
-            object_tree_integrity_or_remove(&object_dir, "before cache reuse", policy)?
+        let Some(object_integrity) =
+            object_integrity_or_remove(&object_dir, "before cache reuse", sri, policy)?
         else {
             return Ok(None);
         };
         Ok(Some(ReusableObject {
             path: object_dir,
-            tree_integrity,
+            object_integrity,
         }))
     }
 
@@ -660,9 +691,10 @@ impl Store {
             timings.total_ms = total_start.elapsed().as_millis();
             return Ok((None, timings));
         }
-        let Some(tree_integrity) = object_tree_integrity_or_remove_with_timings(
+        let Some(object_integrity) = object_integrity_or_remove_with_timings(
             &object_dir,
             "before cache reuse",
+            sri,
             &mut timings,
             policy,
         )?
@@ -674,7 +706,7 @@ impl Store {
         Ok((
             Some(ReusableObject {
                 path: object_dir,
-                tree_integrity,
+                object_integrity,
             }),
             timings,
         ))
@@ -723,8 +755,7 @@ impl Store {
     /// Same as [`Self::extract_object_with_timings`], but returns the
     /// fresh object handle produced by this extraction. Install's
     /// event-driven v2 linker uses this only for the immediate fresh
-    /// link-entry populate, avoiding a second object-tree validation
-    /// pass over bytes the extraction task just hashed.
+    /// link-entry populate, avoiding a second object validation pass.
     pub fn extract_object_with_timings_and_fresh_integrity(
         &self,
         sri: &str,
@@ -749,8 +780,8 @@ impl Store {
         // half-populated object dir and downstream link entries inherit
         // the corruption.
         if object_dir.exists()
-            && let Some(tree_integrity) =
-                object_tree_integrity_or_remove(&object_dir, "before re-extract", policy)?
+            && let Some(object_integrity) =
+                object_integrity_or_remove(&object_dir, "before re-extract", sri, policy)?
         {
             tracing::debug!(
                 target = %object_dir.display(),
@@ -760,7 +791,7 @@ impl Store {
                 ExtractedObject {
                     path: object_dir,
                     source_sri: sri.to_string(),
-                    tree_integrity: FreshObjectTreeIntegrity::new(tree_integrity),
+                    object_integrity: FreshObjectIntegrity::new(object_integrity),
                 },
                 timings,
             ));
@@ -788,11 +819,15 @@ impl Store {
         // it without exclusive borrows escaping the call site.
         let extract_start = std::time::Instant::now();
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
+        let extracted_stats = std::cell::RefCell::new(ExtractedObjectStats::default());
         let extract_result = lpm_extractor::extract_tarball_from_reader_with_inspector(
             tarball_data,
             &tmp_dir,
             lpm_security::behavioral::PackageAnalyzer::should_buffer_source,
             |entry| {
+                extracted_stats
+                    .borrow_mut()
+                    .record_file(entry.relative_path, entry.size);
                 if let Some(bytes) = entry.bytes {
                     analyzer.borrow_mut().feed(entry.relative_path, bytes);
                 } else {
@@ -834,7 +869,7 @@ impl Store {
         // mixed-v1/v2 environments. Also load-bearing for
         // [`is_complete_object_dir`]'s incompleteness probe.
         let finalize_start = std::time::Instant::now();
-        let tree_integrity_start = std::time::Instant::now();
+        let object_integrity_start = std::time::Instant::now();
         let integrities = match write_object_integrity_for_policy(&tmp_dir, sri, policy) {
             Ok(integrities) => integrities,
             Err(e) => {
@@ -842,13 +877,18 @@ impl Store {
                 return Err(e);
             }
         };
-        timings.finalize_tree_integrity_ms = tree_integrity_start.elapsed().as_millis();
-        timings.file_count = integrities.stats.file_count;
-        timings.dir_count = integrities.stats.dir_count;
-        timings.symlink_count = integrities.stats.symlink_count;
-        timings.unpacked_bytes = integrities.stats.unpacked_bytes;
-        let tree_integrity =
-            FreshObjectTreeIntegrity::new(VerifiedObjectTreeIntegrity::new(integrities.content));
+        timings.finalize_tree_integrity_ms = object_integrity_start.elapsed().as_millis();
+        let stats = if matches!(policy, ObjectIntegrityPolicy::Source) {
+            extracted_stats.into_inner().finish()
+        } else {
+            integrities.stats
+        };
+        timings.file_count = stats.file_count;
+        timings.dir_count = stats.dir_count;
+        timings.symlink_count = stats.symlink_count;
+        timings.unpacked_bytes = stats.unpacked_bytes;
+        let object_integrity =
+            FreshObjectIntegrity::new(VerifiedObjectIntegrity::new(integrities.content));
 
         let integrity_write_start = std::time::Instant::now();
         let integrity_result = std::fs::write(tmp_dir.join(".integrity"), sri);
@@ -867,22 +907,24 @@ impl Store {
             Ok(()) => Ok(ExtractedObject {
                 path: object_dir,
                 source_sri: sri.to_string(),
-                tree_integrity,
+                object_integrity,
             }),
             Err(e) => {
                 let collision_start = std::time::Instant::now();
                 let result = finish_object_rename_after_collision(
                     &tmp_dir,
                     &object_dir,
+                    sri,
                     "v2 extract",
                     e,
                     policy,
                 );
                 timings.finalize_collision_recovery_ms = collision_start.elapsed().as_millis();
                 let object_dir = result?;
-                let tree_integrity = object_tree_integrity_or_remove(
+                let object_integrity = object_integrity_or_remove(
                     &object_dir,
                     "after v2 extract collision",
+                    sri,
                     policy,
                 )?
                 .ok_or_else(|| {
@@ -894,7 +936,7 @@ impl Store {
                 Ok(ExtractedObject {
                     path: object_dir,
                     source_sri: sri.to_string(),
-                    tree_integrity: FreshObjectTreeIntegrity::new(tree_integrity),
+                    object_integrity: FreshObjectIntegrity::new(object_integrity),
                 })
             }
         };
@@ -990,7 +1032,7 @@ impl Store {
     /// Populate `links/<graph-key>/` with the package bytes, sibling
     /// symlinks, and sidecar metadata. Idempotent: if the entry is
     /// already complete and its package tree still matches the source
-    /// object digest, refreshes [`LinkMeta::last_referenced_at`] and
+    /// object identity, refreshes [`LinkMeta::last_referenced_at`] and
     /// short-circuits.
     ///
     /// Atomicity contract:
@@ -1006,22 +1048,22 @@ impl Store {
         self.populate_link_entry_inner(request, None, None, object_integrity_policy())
     }
 
-    /// Populate a link entry using a previously verified object-tree digest.
+    /// Populate a link entry using a previously verified object digest.
     pub fn populate_link_entry_with_verified_object(
         &self,
         request: LinkEntryRequest,
-        verified_object_tree_integrity: &VerifiedObjectTreeIntegrity,
+        verified_object_integrity: &VerifiedObjectIntegrity,
     ) -> Result<LinkEntry, LpmError> {
         self.populate_link_entry_inner(
             request,
-            Some(verified_object_tree_integrity),
+            Some(verified_object_integrity),
             None,
             object_integrity_policy(),
         )
     }
 
     /// Populate a link entry immediately after this install extracted
-    /// the object and computed its tree digest.
+    /// the object and computed its object digest.
     pub fn populate_link_entry_with_fresh_object(
         &self,
         request: LinkEntryRequest,
@@ -1052,8 +1094,8 @@ impl Store {
         }
         self.populate_link_entry_inner(
             request,
-            Some(fresh_object.tree_integrity.as_verified()),
-            Some(&fresh_object.tree_integrity),
+            Some(fresh_object.object_integrity.as_verified()),
+            Some(&fresh_object.object_integrity),
             object_integrity_policy(),
         )
     }
@@ -1061,8 +1103,8 @@ impl Store {
     fn populate_link_entry_inner(
         &self,
         request: LinkEntryRequest,
-        verified_object_tree_digest: Option<&VerifiedObjectTreeIntegrity>,
-        fresh_object_tree_digest: Option<&FreshObjectTreeIntegrity>,
+        verified_object_digest: Option<&VerifiedObjectIntegrity>,
+        fresh_object_digest: Option<&FreshObjectIntegrity>,
         policy: ObjectIntegrityPolicy,
     ) -> Result<LinkEntry, LpmError> {
         let LinkEntryRequest {
@@ -1087,7 +1129,8 @@ impl Store {
                 &final_dir,
                 &graph_key,
                 &object_dir,
-                verified_object_tree_digest,
+                &source_sri,
+                verified_object_digest,
                 policy,
             )? {
                 // Refresh the sidecar's "last referenced" via a single
@@ -1146,7 +1189,7 @@ impl Store {
                 source_sri: &source_sri,
                 sidecar_relpath: &sidecar_dir_relpath,
                 policy,
-                fresh_object_tree_integrity: fresh_object_tree_digest,
+                fresh_object_integrity: fresh_object_digest,
             },
             &deps,
             &platform,
@@ -1171,7 +1214,8 @@ impl Store {
                     &final_dir,
                     &graph_key,
                     &object_dir,
-                    verified_object_tree_digest,
+                    &source_sri,
+                    verified_object_digest,
                     policy,
                 )? =>
             {
@@ -1374,6 +1418,14 @@ impl Store {
 
     /// Return the current content digest for a populated link entry.
     pub fn link_entry_content_integrity(&self, key: &GraphKey) -> Result<String, LpmError> {
+        self.link_entry_content_integrity_with_policy(key, object_integrity_policy())
+    }
+
+    fn link_entry_content_integrity_with_policy(
+        &self,
+        key: &GraphKey,
+        policy: ObjectIntegrityPolicy,
+    ) -> Result<String, LpmError> {
         let link_dir = self.paths.link_dir(key);
         if let Some(snapshot) = read_tree_snapshot(&link_dir) {
             return Ok(snapshot.content_integrity);
@@ -1385,6 +1437,21 @@ impl Store {
             )));
         }
         let package_dir = link_entry_package_dir(&link_dir, key);
+        let meta = LinkMeta::read_from(&link_dir)?;
+        let object_dir = self.paths.object_dir(&meta.source_sri)?;
+        if source_policy_uses_source_integrity(&object_dir, policy) {
+            let content = source_object_integrity(&meta.source_sri);
+            let metadata = compute_tree_metadata_integrity(&package_dir)?;
+            write_tree_snapshot(
+                &link_dir,
+                &TreeIntegrities {
+                    content: content.clone(),
+                    metadata,
+                    stats: ObjectTreeStats::default(),
+                },
+            )?;
+            return Ok(content);
+        }
         let actual = compute_object_tree_integrities(&package_dir)?;
         write_tree_snapshot_best_effort(&link_dir, &actual);
         Ok(actual.content)
@@ -1431,7 +1498,12 @@ impl Store {
         let policy = object_integrity_policy();
         let object_dir = self.paths.object_dir(sri)?;
         if object_dir.exists()
-            && object_dir_is_reusable_or_remove(&object_dir, "before v1 to v2 translation", policy)?
+            && object_dir_is_reusable_or_remove(
+                &object_dir,
+                "before v1 to v2 translation",
+                sri,
+                policy,
+            )?
         {
             return Ok(object_dir);
         }
@@ -1488,6 +1560,7 @@ impl Store {
                 finish_object_rename_after_collision(
                     &tmp_dir,
                     &object_dir,
+                    sri,
                     "v1 to v2 translation",
                     e,
                     policy,
@@ -1531,7 +1604,7 @@ impl Store {
             return Err(e);
         }
 
-        replace_local_source_object(&tmp_dir, &object_dir)?;
+        replace_local_source_object(&tmp_dir, &object_dir, &canonical_source)?;
         Ok(object_dir)
     }
 
@@ -1613,7 +1686,7 @@ struct PopulateObject<'a> {
     source_sri: &'a str,
     sidecar_relpath: &'a str,
     policy: ObjectIntegrityPolicy,
-    fresh_object_tree_integrity: Option<&'a FreshObjectTreeIntegrity>,
+    fresh_object_integrity: Option<&'a FreshObjectIntegrity>,
 }
 
 fn populate_into(
@@ -1634,9 +1707,13 @@ fn populate_into(
     // Materialize the package itself from the verified object directory.
     // Link entries must not share hardlink inodes with objects: writes
     // through executable package bytes must never mutate the object store.
-    let object_integrity = match object.fresh_object_tree_integrity {
+    let object_integrity = match object.fresh_object_integrity {
         Some(digest) => Cow::Borrowed(digest.as_str()),
-        None => Cow::Owned(object_integrity_for_link(object.dir, object.policy)?),
+        None => Cow::Owned(object_integrity_for_link(
+            object.dir,
+            object.source_sri,
+            object.policy,
+        )?),
     };
     let pkg_dir = node_modules.join(graph_key.name());
     if let Some(parent) = pkg_dir.parent() {
@@ -1837,15 +1914,16 @@ fn link_entry_is_reusable(
     dir: &Path,
     key: &GraphKey,
     object_dir: &Path,
-    verified_object_tree_digest: Option<&VerifiedObjectTreeIntegrity>,
+    source_sri: &str,
+    verified_object_digest: Option<&VerifiedObjectIntegrity>,
     policy: ObjectIntegrityPolicy,
 ) -> Result<bool, LpmError> {
     if !is_complete_link_entry(dir, key) {
         return Ok(false);
     }
-    let expected = match verified_object_tree_digest {
+    let expected = match verified_object_digest {
         Some(digest) => Cow::Borrowed(digest.as_str()),
-        None => Cow::Owned(object_integrity_for_link(object_dir, policy)?),
+        None => Cow::Owned(object_integrity_for_link(object_dir, source_sri, policy)?),
     };
     let package_dir = link_entry_package_dir(dir, key);
     if tree_snapshot_matches(dir, &package_dir, expected.as_ref())? {
@@ -1868,15 +1946,15 @@ fn link_entry_package_dir(dir: &Path, key: &GraphKey) -> PathBuf {
     path
 }
 
-/// Object dir is complete iff the package root and both object
-/// integrity sidecars are present. This is a cheap crash-recovery
-/// predicate; callers that will reuse the object must also verify the
-/// tree digest.
+/// Object dir is complete iff the package root and both object identity
+/// sidecars are present. This is a cheap crash-recovery predicate;
+/// callers that will reuse the object must also validate the active
+/// integrity policy.
 fn is_complete_object_dir(dir: &Path) -> bool {
     dir.is_dir()
         && is_regular_file_no_symlink(&dir.join("package.json"))
         && is_regular_file_no_symlink(&dir.join(".integrity"))
-        && is_regular_file_no_symlink(&dir.join(OBJECT_TREE_INTEGRITY_FILENAME))
+        && is_regular_file_no_symlink(&dir.join(OBJECT_INTEGRITY_FILENAME))
 }
 
 fn is_regular_file_no_symlink(path: &Path) -> bool {
@@ -1885,20 +1963,53 @@ fn is_regular_file_no_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn object_metadata_dir(dir: &Path) -> Result<PathBuf, LpmError> {
+    let parent = dir.parent().ok_or_else(|| {
+        LpmError::Store(format!(
+            "v2 object dir has no parent for metadata path: {}",
+            dir.display()
+        ))
+    })?;
+    let name = dir.file_name().ok_or_else(|| {
+        LpmError::Store(format!(
+            "v2 object dir has no filename for metadata path: {}",
+            dir.display()
+        ))
+    })?;
+    Ok(parent.join(OBJECT_METADATA_DIR).join(name))
+}
+
+fn local_source_sentinel_path(dir: &Path) -> Result<PathBuf, LpmError> {
+    Ok(object_metadata_dir(dir)?.join(LOCAL_SOURCE_OBJECT_SENTINEL))
+}
+
+fn has_local_source_sentinel(dir: &Path) -> bool {
+    match local_source_sentinel_path(dir) {
+        Ok(path) => is_regular_file_no_symlink(&path),
+        Err(_) => false,
+    }
+}
+
+fn source_policy_uses_source_integrity(dir: &Path, policy: ObjectIntegrityPolicy) -> bool {
+    matches!(policy, ObjectIntegrityPolicy::Source) && !has_local_source_sentinel(dir)
+}
+
 fn object_dir_is_reusable_or_remove(
     dir: &Path,
     context: &str,
+    source_sri: &str,
     policy: ObjectIntegrityPolicy,
 ) -> Result<bool, LpmError> {
-    Ok(object_tree_integrity_or_remove(dir, context, policy)?.is_some())
+    Ok(object_integrity_or_remove(dir, context, source_sri, policy)?.is_some())
 }
 
-fn object_tree_integrity_or_remove_with_timings(
+fn object_integrity_or_remove_with_timings(
     dir: &Path,
     context: &str,
+    source_sri: &str,
     timings: &mut ReusableObjectCheckTimings,
     policy: ObjectIntegrityPolicy,
-) -> Result<Option<VerifiedObjectTreeIntegrity>, LpmError> {
+) -> Result<Option<VerifiedObjectIntegrity>, LpmError> {
     let complete_check_start = std::time::Instant::now();
     let complete = is_complete_object_dir(dir);
     timings.complete_check_ms = timings
@@ -1913,10 +2024,11 @@ fn object_tree_integrity_or_remove_with_timings(
             .saturating_add(remove_start.elapsed().as_millis());
         return Ok(None);
     }
-    if matches!(policy, ObjectIntegrityPolicy::Source) {
+    if source_policy_uses_source_integrity(dir, policy) {
         timings.object_sidecar_read_count = timings.object_sidecar_read_count.saturating_add(1);
         let sidecar_start = std::time::Instant::now();
-        let result = read_object_tree_integrity(dir).map(VerifiedObjectTreeIntegrity::new);
+        let result =
+            verified_source_object_integrity(dir, source_sri).map(VerifiedObjectIntegrity::new);
         timings.object_sidecar_read_ms = timings
             .object_sidecar_read_ms
             .saturating_add(sidecar_start.elapsed().as_millis());
@@ -1937,8 +2049,8 @@ fn object_tree_integrity_or_remove_with_timings(
             }
         };
     }
-    match verified_object_tree_integrity_with_timings(dir, timings) {
-        Ok(digest) => Ok(Some(VerifiedObjectTreeIntegrity::new(digest))),
+    match verified_tree_object_integrity_with_timings(dir, timings) {
+        Ok(digest) => Ok(Some(VerifiedObjectIntegrity::new(digest))),
         Err(err) => {
             tracing::warn!(
                 target = %dir.display(),
@@ -1955,18 +2067,19 @@ fn object_tree_integrity_or_remove_with_timings(
     }
 }
 
-fn object_tree_integrity_or_remove(
+fn object_integrity_or_remove(
     dir: &Path,
     context: &str,
+    source_sri: &str,
     policy: ObjectIntegrityPolicy,
-) -> Result<Option<VerifiedObjectTreeIntegrity>, LpmError> {
+) -> Result<Option<VerifiedObjectIntegrity>, LpmError> {
     if !is_complete_object_dir(dir) {
         remove_unusable_object_dir(dir, context)?;
         return Ok(None);
     }
-    if matches!(policy, ObjectIntegrityPolicy::Source) {
-        return match read_object_tree_integrity(dir) {
-            Ok(digest) => Ok(Some(VerifiedObjectTreeIntegrity::new(digest))),
+    if source_policy_uses_source_integrity(dir, policy) {
+        return match verified_source_object_integrity(dir, source_sri) {
+            Ok(digest) => Ok(Some(VerifiedObjectIntegrity::new(digest))),
             Err(err) => {
                 tracing::warn!(
                     target = %dir.display(),
@@ -1977,8 +2090,8 @@ fn object_tree_integrity_or_remove(
             }
         };
     }
-    match verified_object_tree_integrity(dir) {
-        Ok(digest) => Ok(Some(VerifiedObjectTreeIntegrity::new(digest))),
+    match verified_tree_object_integrity(dir) {
+        Ok(digest) => Ok(Some(VerifiedObjectIntegrity::new(digest))),
         Err(err) => {
             tracing::warn!(
                 target = %dir.display(),
@@ -2004,7 +2117,9 @@ fn remove_unusable_object_dir(dir: &Path, context: &str) -> Result<(), LpmError>
             "failed to remove incomplete or unverifiable v2 object at {} {context}: {e}",
             dir.display()
         ))
-    })
+    })?;
+    remove_object_metadata_dir_best_effort(dir);
+    Ok(())
 }
 
 fn claim_unusable_object_dir(dir: &Path, context: &str) -> Result<Option<PathBuf>, LpmError> {
@@ -2031,12 +2146,13 @@ fn claim_unusable_object_dir(dir: &Path, context: &str) -> Result<Option<PathBuf
 fn finish_object_rename_after_collision(
     tmp_dir: &Path,
     object_dir: &Path,
+    source_sri: &str,
     context: &str,
     original_error: std::io::Error,
     policy: ObjectIntegrityPolicy,
 ) -> Result<PathBuf, LpmError> {
     if object_dir.exists() {
-        match is_verified_object_dir(object_dir, policy) {
+        match is_verified_object_dir(object_dir, source_sri, policy) {
             Ok(true) => {
                 let _ = std::fs::remove_dir_all(tmp_dir);
                 return Ok(object_dir.to_path_buf());
@@ -2066,24 +2182,40 @@ fn finish_object_rename_after_collision(
     )))
 }
 
-fn is_verified_object_dir(dir: &Path, policy: ObjectIntegrityPolicy) -> Result<bool, LpmError> {
+fn is_verified_object_dir(
+    dir: &Path,
+    source_sri: &str,
+    policy: ObjectIntegrityPolicy,
+) -> Result<bool, LpmError> {
     if !is_complete_object_dir(dir) {
         return Ok(false);
     }
-    if matches!(policy, ObjectIntegrityPolicy::Source) {
-        return read_object_tree_integrity(dir).map(|_| true);
+    if source_policy_uses_source_integrity(dir, policy) {
+        return verified_source_object_integrity(dir, source_sri).map(|_| true);
     }
-    object_tree_integrity_matches(dir)
+    tree_object_integrity_matches(dir)
 }
 
-fn object_tree_integrity_matches(dir: &Path) -> Result<bool, LpmError> {
-    let expected = read_object_tree_integrity(dir)?;
+fn tree_object_integrity_matches(dir: &Path) -> Result<bool, LpmError> {
+    let expected = read_object_integrity(dir)?;
     let actual = compute_object_tree_integrity(dir)?;
     Ok(expected == actual)
 }
 
-fn verified_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
-    let expected = read_object_tree_integrity(dir)?;
+fn verified_source_object_integrity(dir: &Path, source_sri: &str) -> Result<String, LpmError> {
+    let expected = source_object_integrity(source_sri);
+    let actual = read_object_integrity(dir)?;
+    if actual == expected {
+        return Ok(actual);
+    }
+    Err(LpmError::Store(format!(
+        "v2 object source integrity mismatch at {}: expected {expected}, actual {actual}",
+        dir.display()
+    )))
+}
+
+fn verified_tree_object_integrity(dir: &Path) -> Result<String, LpmError> {
+    let expected = read_object_integrity(dir)?;
     if tree_snapshot_matches(dir, dir, &expected)? {
         return Ok(expected);
     }
@@ -2101,21 +2233,23 @@ fn verified_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
 
 fn object_integrity_for_link(
     dir: &Path,
+    source_sri: &str,
     policy: ObjectIntegrityPolicy,
 ) -> Result<String, LpmError> {
-    match policy {
-        ObjectIntegrityPolicy::Tree => verified_object_tree_integrity(dir),
-        ObjectIntegrityPolicy::Source => read_object_tree_integrity(dir),
+    if source_policy_uses_source_integrity(dir, policy) {
+        verified_source_object_integrity(dir, source_sri)
+    } else {
+        verified_tree_object_integrity(dir)
     }
 }
 
-fn verified_object_tree_integrity_with_timings(
+fn verified_tree_object_integrity_with_timings(
     dir: &Path,
     timings: &mut ReusableObjectCheckTimings,
 ) -> Result<String, LpmError> {
     timings.object_sidecar_read_count = timings.object_sidecar_read_count.saturating_add(1);
     let sidecar_start = std::time::Instant::now();
-    let expected = read_object_tree_integrity(dir)?;
+    let expected = read_object_integrity(dir)?;
     timings.object_sidecar_read_ms = timings
         .object_sidecar_read_ms
         .saturating_add(sidecar_start.elapsed().as_millis());
@@ -2279,8 +2413,8 @@ fn write_tree_snapshot(dir: &Path, integrities: &TreeIntegrities) -> Result<(), 
     })
 }
 
-fn read_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
-    let path = dir.join(OBJECT_TREE_INTEGRITY_FILENAME);
+fn read_object_integrity(dir: &Path) -> Result<String, LpmError> {
+    let path = dir.join(OBJECT_INTEGRITY_FILENAME);
     if !is_regular_file_no_symlink(&path) {
         return Err(LpmError::Store(format!(
             "v2 object integrity sidecar is missing or not a regular file at {}",
@@ -2309,10 +2443,10 @@ fn read_object_tree_integrity(dir: &Path) -> Result<String, LpmError> {
     Ok(digest.to_string())
 }
 
-fn write_object_tree_integrity(dir: &Path) -> Result<TreeIntegrities, LpmError> {
+fn write_tree_object_integrity(dir: &Path) -> Result<TreeIntegrities, LpmError> {
     let integrities = compute_object_tree_integrities(dir)?;
     std::fs::write(
-        dir.join(OBJECT_TREE_INTEGRITY_FILENAME),
+        dir.join(OBJECT_INTEGRITY_FILENAME),
         format!("{}\n", integrities.content),
     )
     .map_err(|e| LpmError::Store(format!("failed to write v2 object integrity sidecar: {e}")))?;
@@ -2326,7 +2460,7 @@ fn write_object_integrity_for_policy(
     policy: ObjectIntegrityPolicy,
 ) -> Result<TreeIntegrities, LpmError> {
     match policy {
-        ObjectIntegrityPolicy::Tree => write_object_tree_integrity(dir),
+        ObjectIntegrityPolicy::Tree => write_tree_object_integrity(dir),
         ObjectIntegrityPolicy::Source => write_source_object_integrity(dir, source_sri),
     }
 }
@@ -2336,11 +2470,9 @@ fn write_source_object_integrity(
     source_sri: &str,
 ) -> Result<TreeIntegrities, LpmError> {
     let content = source_object_integrity(source_sri);
-    std::fs::write(
-        dir.join(OBJECT_TREE_INTEGRITY_FILENAME),
-        format!("{content}\n"),
-    )
-    .map_err(|e| LpmError::Store(format!("failed to write v2 object integrity sidecar: {e}")))?;
+    std::fs::write(dir.join(OBJECT_INTEGRITY_FILENAME), format!("{content}\n")).map_err(|e| {
+        LpmError::Store(format!("failed to write v2 object integrity sidecar: {e}"))
+    })?;
     Ok(TreeIntegrities {
         content,
         metadata: String::new(),
@@ -2664,23 +2796,49 @@ fn is_object_metadata_sidecar_name(root: &Path, dir: &Path, name: &OsStr) -> boo
     };
     matches!(
         name,
-        ".integrity"
-            | ".lpm-security.json"
-            | OBJECT_TREE_INTEGRITY_FILENAME
-            | TREE_SNAPSHOT_FILENAME
-            | LOCAL_SOURCE_OBJECT_SENTINEL
+        ".integrity" | ".lpm-security.json" | OBJECT_INTEGRITY_FILENAME | TREE_SNAPSHOT_FILENAME
     ) || name.starts_with(".lpm-tree-snapshot.json.tmp.")
         || name.starts_with("..lpm-tree-snapshot.json.tmp.")
 }
 
 fn is_complete_local_source_object_dir(dir: &Path) -> bool {
-    is_complete_object_dir(dir) && dir.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file()
+    is_complete_object_dir(dir) && has_local_source_sentinel(dir)
 }
 
-fn replace_local_source_object(tmp_dir: &Path, object_dir: &Path) -> Result<(), LpmError> {
-    if !object_dir.exists() {
-        return finish_local_source_object_rename(tmp_dir, object_dir);
+fn write_local_source_sentinel(object_dir: &Path, source_root: &Path) -> Result<(), LpmError> {
+    let path = local_source_sentinel_path(object_dir)?;
+    if let Some(parent) = path.parent() {
+        ensure_store_tier_dir_locked(parent).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to create v2 local-source metadata dir at {}: {e}",
+                parent.display()
+            ))
+        })?;
     }
+    std::fs::write(&path, source_root.display().to_string()).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to write v2 local-source sentinel at {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn remove_object_metadata_dir_best_effort(object_dir: &Path) {
+    if let Ok(metadata_dir) = object_metadata_dir(object_dir) {
+        let _ = std::fs::remove_dir_all(metadata_dir);
+    }
+}
+
+fn replace_local_source_object(
+    tmp_dir: &Path,
+    object_dir: &Path,
+    source_root: &Path,
+) -> Result<(), LpmError> {
+    if !object_dir.exists() {
+        return finish_local_source_object_rename(tmp_dir, object_dir, source_root);
+    }
+
+    write_local_source_sentinel(object_dir, source_root)?;
 
     let backup_dir = tmp_sibling(object_dir);
     if backup_dir.exists() {
@@ -2690,7 +2848,7 @@ fn replace_local_source_object(tmp_dir: &Path, object_dir: &Path) -> Result<(), 
     match std::fs::rename(object_dir, &backup_dir) {
         Ok(()) => {}
         Err(_) if !object_dir.exists() => {
-            return finish_local_source_object_rename(tmp_dir, object_dir);
+            return finish_local_source_object_rename(tmp_dir, object_dir, source_root);
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(tmp_dir);
@@ -2735,7 +2893,12 @@ fn replace_local_source_object(tmp_dir: &Path, object_dir: &Path) -> Result<(), 
     }
 }
 
-fn finish_local_source_object_rename(tmp_dir: &Path, object_dir: &Path) -> Result<(), LpmError> {
+fn finish_local_source_object_rename(
+    tmp_dir: &Path,
+    object_dir: &Path,
+    source_root: &Path,
+) -> Result<(), LpmError> {
+    write_local_source_sentinel(object_dir, source_root)?;
     match std::fs::rename(tmp_dir, object_dir) {
         Ok(()) => Ok(()),
         Err(_) if is_complete_local_source_object_dir(object_dir) => {
@@ -2744,6 +2907,7 @@ fn finish_local_source_object_rename(tmp_dir: &Path, object_dir: &Path) -> Resul
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(tmp_dir);
+            remove_object_metadata_dir_best_effort(object_dir);
             Err(LpmError::Store(format!(
                 "failed to atomically install v2 local-source object: {e}"
             )))
@@ -2796,24 +2960,13 @@ fn populate_local_source_object_into(
         tracing::warn!("v2 local-source object: failed to write .lpm-security.json: {e}");
     }
 
-    write_object_tree_integrity(tmp_dir)?;
+    write_tree_object_integrity(tmp_dir)?;
     std::fs::write(tmp_dir.join(".integrity"), sri).map_err(|e| {
         LpmError::Store(format!(
             "failed to write v2 local-source .integrity at {}: {e}",
             tmp_dir.display()
         ))
     })?;
-    std::fs::write(
-        tmp_dir.join(LOCAL_SOURCE_OBJECT_SENTINEL),
-        source_root.display().to_string(),
-    )
-    .map_err(|e| {
-        LpmError::Store(format!(
-            "failed to write v2 local-source sentinel at {}: {e}",
-            tmp_dir.display()
-        ))
-    })?;
-
     Ok(())
 }
 
@@ -3009,7 +3162,7 @@ use lpm_common::symlink::create_symlink as create_fs_symlink;
 /// filesystem reflinks without sharing hardlink inodes between the object
 /// store and executable link entries.
 fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
-    let allow_source_symlinks = src.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file();
+    let allow_source_symlinks = has_local_source_sentinel(src);
     materialize_into_inner(src, src, dst, allow_source_symlinks)
 }
 
@@ -3042,9 +3195,6 @@ fn materialize_into_inner(
     })? {
         let entry = entry
             .map_err(|e| LpmError::Store(format!("failed to enumerate v2 source dir: {e}")))?;
-        if allow_source_symlinks && entry.file_name() == LOCAL_SOURCE_OBJECT_SENTINEL {
-            continue;
-        }
         let src_path = entry.path();
         if is_object_metadata_sidecar(root, &src_path) {
             continue;
@@ -3105,8 +3255,7 @@ fn remove_materialized_object_sidecars(dst: &Path) -> Result<(), LpmError> {
     for name in [
         ".integrity",
         ".lpm-security.json",
-        OBJECT_TREE_INTEGRITY_FILENAME,
-        LOCAL_SOURCE_OBJECT_SENTINEL,
+        OBJECT_INTEGRITY_FILENAME,
     ] {
         let path = dst.join(name);
         if path.exists() {
@@ -3210,15 +3359,19 @@ mod tests {
     }
 
     #[test]
-    fn object_integrity_policy_env_parser_defaults_to_tree() {
+    fn object_integrity_policy_env_parser_defaults_to_source() {
         assert_eq!(
             ObjectIntegrityPolicy::from_env_value(None),
-            ObjectIntegrityPolicy::Tree
+            ObjectIntegrityPolicy::Source
         );
         assert_eq!(
             ObjectIntegrityPolicy::from_env_value(Some("")),
-            ObjectIntegrityPolicy::Tree
+            ObjectIntegrityPolicy::Source
         );
+    }
+
+    #[test]
+    fn object_integrity_policy_env_parser_accepts_tree_strict_mode() {
         assert_eq!(
             ObjectIntegrityPolicy::from_env_value(Some("tree")),
             ObjectIntegrityPolicy::Tree
@@ -3305,7 +3458,7 @@ mod tests {
         );
     }
 
-    fn write_object(store: &Store, sri: &str, files: &[(&str, &[u8])]) -> PathBuf {
+    fn write_tree_object(store: &Store, sri: &str, files: &[(&str, &[u8])]) -> PathBuf {
         let dir = store.paths().object_dir(sri).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         for (name, contents) in files {
@@ -3315,17 +3468,57 @@ mod tests {
             }
             std::fs::write(path, contents).unwrap();
         }
-        write_object_tree_integrity(&dir).unwrap();
+        write_tree_object_integrity(&dir).unwrap();
         std::fs::write(dir.join(".integrity"), sri).unwrap();
         dir
     }
 
+    fn write_object(store: &Store, sri: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        let dir = write_tree_object(store, sri, files);
+        write_source_object_integrity(&dir, sri).unwrap();
+        dir
+    }
+
+    fn extract_object_source(
+        store: &Store,
+        sri: &str,
+        tarball_data: &[u8],
+    ) -> Result<PathBuf, LpmError> {
+        store
+            .extract_object_with_timings_and_policy(
+                sri,
+                tarball_data,
+                ObjectIntegrityPolicy::Source,
+            )
+            .map(|(object, _)| object.path)
+    }
+
+    fn populate_link_entry_source(
+        store: &Store,
+        request: LinkEntryRequest,
+    ) -> Result<LinkEntry, LpmError> {
+        store.populate_link_entry_inner(request, None, None, ObjectIntegrityPolicy::Source)
+    }
+
+    fn populate_link_entry_with_verified_object_source(
+        store: &Store,
+        request: LinkEntryRequest,
+        verified_object_integrity: &VerifiedObjectIntegrity,
+    ) -> Result<LinkEntry, LpmError> {
+        store.populate_link_entry_inner(
+            request,
+            Some(verified_object_integrity),
+            None,
+            ObjectIntegrityPolicy::Source,
+        )
+    }
+
     #[test]
-    fn reusable_object_recreates_missing_tree_snapshot() {
+    fn reusable_object_tree_policy_recreates_missing_tree_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let sri = synthetic_sri(b"reusable_object_recreates_missing_tree_snapshot");
-        let object_dir = write_object(
+        let sri = synthetic_sri(b"reusable_object_tree_policy_recreates_missing_tree_snapshot");
+        let object_dir = write_tree_object(
             &store,
             &sri,
             &[
@@ -3337,7 +3530,10 @@ mod tests {
         assert!(snapshot_path.is_file());
 
         std::fs::remove_file(&snapshot_path).unwrap();
-        let reusable = store.reusable_object(&sri).unwrap().unwrap();
+        let reusable = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Tree)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(reusable.path, object_dir);
         assert!(
@@ -3347,11 +3543,12 @@ mod tests {
     }
 
     #[test]
-    fn reusable_object_with_timings_reports_snapshot_fast_path() {
+    fn reusable_object_with_timings_tree_policy_reports_snapshot_fast_path() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let sri = synthetic_sri(b"reusable_object_with_timings_reports_snapshot_fast_path");
-        let object_dir = write_object(
+        let sri =
+            synthetic_sri(b"reusable_object_with_timings_tree_policy_reports_snapshot_fast_path");
+        let object_dir = write_tree_object(
             &store,
             &sri,
             &[
@@ -3360,7 +3557,9 @@ mod tests {
             ],
         );
 
-        let (reusable, timings) = store.reusable_object_with_timings(&sri).unwrap();
+        let (reusable, timings) = store
+            .reusable_object_with_timings_and_policy(&sri, ObjectIntegrityPolicy::Tree)
+            .unwrap();
 
         assert_eq!(reusable.unwrap().path, object_dir);
         assert_eq!(timings.object_sidecar_read_count, 1);
@@ -3372,11 +3571,12 @@ mod tests {
     }
 
     #[test]
-    fn reusable_object_with_timings_reports_full_hash_fallback() {
+    fn reusable_object_with_timings_tree_policy_reports_full_hash_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let sri = synthetic_sri(b"reusable_object_with_timings_reports_full_hash_fallback");
-        let object_dir = write_object(
+        let sri =
+            synthetic_sri(b"reusable_object_with_timings_tree_policy_reports_full_hash_fallback");
+        let object_dir = write_tree_object(
             &store,
             &sri,
             &[
@@ -3387,7 +3587,9 @@ mod tests {
         let snapshot_path = object_dir.join(TREE_SNAPSHOT_FILENAME);
         std::fs::remove_file(&snapshot_path).unwrap();
 
-        let (reusable, timings) = store.reusable_object_with_timings(&sri).unwrap();
+        let (reusable, timings) = store
+            .reusable_object_with_timings_and_policy(&sri, ObjectIntegrityPolicy::Tree)
+            .unwrap();
 
         assert_eq!(reusable.unwrap().path, object_dir);
         assert_eq!(timings.snapshot_hit_count, 0);
@@ -3416,7 +3618,10 @@ mod tests {
         )
         .unwrap();
 
-        let reusable = store.reusable_object(&sri).unwrap().unwrap();
+        let reusable = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(reusable.path, object_dir);
     }
@@ -3428,7 +3633,7 @@ mod tests {
         let sri = synthetic_sri(
             b"compute_tree_metadata_integrity_ignores_vanished_atomic_tree_snapshot_tmp_files",
         );
-        let object_dir = write_object(
+        let object_dir = write_tree_object(
             &store,
             &sri,
             &[
@@ -3464,7 +3669,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
         let sri = synthetic_sri(b"populate_link_entry_refreshes_missing_tree_snapshot_on_reuse");
-        let object_dir = write_object(
+        let object_dir = write_tree_object(
             &store,
             &sri,
             &[
@@ -3481,12 +3686,16 @@ mod tests {
             platform: Arc::new(sample_meta_platform()),
         };
 
-        let first = store.populate_link_entry(request()).unwrap();
+        let first = store
+            .populate_link_entry_inner(request(), None, None, ObjectIntegrityPolicy::Tree)
+            .unwrap();
         let snapshot_path = first.link_dir.join(TREE_SNAPSHOT_FILENAME);
         assert!(snapshot_path.is_file());
 
         std::fs::remove_file(&snapshot_path).unwrap();
-        let second = store.populate_link_entry(request()).unwrap();
+        let second = store
+            .populate_link_entry_inner(request(), None, None, ObjectIntegrityPolicy::Tree)
+            .unwrap();
 
         assert!(!second.freshly_populated);
         assert!(
@@ -3509,21 +3718,25 @@ mod tests {
             ],
         );
         let key = arc_key("snapshot-link", "1.0.0");
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key.clone(),
-                source_sri: sri,
+                source_sri: sri.clone(),
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let snapshot_path = entry.link_dir.join(TREE_SNAPSHOT_FILENAME);
         std::fs::remove_file(&snapshot_path).unwrap();
 
-        let integrity = store.link_entry_content_integrity(&key).unwrap();
+        let integrity = store
+            .link_entry_content_integrity_with_policy(&key, ObjectIntegrityPolicy::Source)
+            .unwrap();
 
-        assert!(integrity.starts_with("sha256-"));
+        assert_eq!(integrity, source_object_integrity(&sri));
         assert!(
             snapshot_path.is_file(),
             "compat island keying should repair legacy link entries missing the digest snapshot"
@@ -3578,15 +3791,17 @@ mod tests {
         );
 
         let key = arc_key("a", "1.0.0");
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key,
                 source_sri: sri.clone(),
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert!(entry.freshly_populated);
         assert!(entry.link_dir.is_dir());
@@ -3609,18 +3824,20 @@ mod tests {
     }
 
     #[test]
-    fn reusable_object_dir_removes_tampered_object_tree() {
+    fn reusable_object_tree_policy_removes_tampered_object_tree() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let sri = synthetic_sri(b"reusable_object_dir_removes_tampered_object_tree");
-        let object_dir = write_object(
+        let sri = synthetic_sri(b"reusable_object_tree_policy_removes_tampered_object_tree");
+        let object_dir = write_tree_object(
             &store,
             &sri,
             &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
         );
         std::fs::write(object_dir.join("index.js"), b"//tampered").unwrap();
 
-        let reusable = store.reusable_object_dir(&sri).unwrap();
+        let reusable = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Tree)
+            .unwrap();
 
         assert!(reusable.is_none());
         assert!(
@@ -3634,13 +3851,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
         let sri = synthetic_sri(b"reusable_object_dir_removes_malformed_object_tree_sidecar");
-        let object_dir = write_object(
+        let object_dir = write_tree_object(
             &store,
             &sri,
             &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
         );
         std::fs::write(
-            object_dir.join(OBJECT_TREE_INTEGRITY_FILENAME),
+            object_dir.join(OBJECT_INTEGRITY_FILENAME),
             b"sha256-not-hex\n",
         )
         .unwrap();
@@ -3655,22 +3872,25 @@ mod tests {
     }
 
     #[test]
-    fn reusable_object_returns_verified_tree_integrity() {
+    fn reusable_object_returns_verified_object_integrity() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let sri = synthetic_sri(b"reusable_object_returns_verified_tree_integrity");
+        let sri = synthetic_sri(b"reusable_object_returns_verified_object_integrity");
         let object_dir = write_object(
             &store,
             &sri,
             &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
         );
 
-        let reusable = store.reusable_object(&sri).unwrap().unwrap();
+        let reusable = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(reusable.path, object_dir);
         assert_eq!(
-            reusable.tree_integrity.as_str(),
-            read_object_tree_integrity(&reusable.path).unwrap()
+            reusable.object_integrity.as_str(),
+            read_object_integrity(&reusable.path).unwrap()
         );
     }
 
@@ -3683,10 +3903,12 @@ mod tests {
     }
 
     #[test]
-    fn populate_link_entry_rejects_object_tree_integrity_mismatch() {
+    fn populate_link_entry_tree_policy_rejects_object_tree_integrity_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let sri = synthetic_sri(b"populate_link_entry_rejects_object_tree_integrity_mismatch");
+        let sri = synthetic_sri(
+            b"populate_link_entry_tree_policy_rejects_object_tree_integrity_mismatch",
+        );
         let object_dir = write_object(
             &store,
             &sri,
@@ -3696,13 +3918,18 @@ mod tests {
 
         let key = arc_key("a", "1.0.0");
         let err = store
-            .populate_link_entry(LinkEntryRequest {
-                graph_key: Arc::clone(&key),
-                source_sri: sri,
-                object_dir,
-                deps: vec![],
-                platform: Arc::new(sample_meta_platform()),
-            })
+            .populate_link_entry_inner(
+                LinkEntryRequest {
+                    graph_key: Arc::clone(&key),
+                    source_sri: sri,
+                    object_dir,
+                    deps: vec![],
+                    platform: Arc::new(sample_meta_platform()),
+                },
+                None,
+                None,
+                ObjectIntegrityPolicy::Tree,
+            )
             .unwrap_err();
 
         assert!(
@@ -3712,6 +3939,74 @@ mod tests {
         assert!(
             !store.paths().link_dir(&key).exists(),
             "failed link population must clean up its staging dir"
+        );
+    }
+
+    #[test]
+    fn populate_link_entry_source_policy_trusts_matching_source_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"populate_link_entry_source_policy_trusts_matching_sidecar");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
+        );
+        std::fs::write(object_dir.join("index.js"), b"//tampered").unwrap();
+
+        let key = arc_key("a", "1.0.0");
+        let entry = store
+            .populate_link_entry_inner(
+                LinkEntryRequest {
+                    graph_key: Arc::clone(&key),
+                    source_sri: sri,
+                    object_dir,
+                    deps: vec![],
+                    platform: Arc::new(sample_meta_platform()),
+                },
+                None,
+                None,
+                ObjectIntegrityPolicy::Source,
+            )
+            .unwrap();
+
+        assert!(entry.freshly_populated);
+        assert!(store.paths().link_dir(&key).is_dir());
+    }
+
+    #[test]
+    fn populate_link_entry_source_policy_rejects_wrong_source_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let sri = synthetic_sri(b"populate_link_entry_source_policy_rejects_wrong_sidecar");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
+        );
+        let wrong_sri = synthetic_sri(b"different source");
+        write_source_object_integrity(&object_dir, &wrong_sri).unwrap();
+
+        let key = arc_key("a", "1.0.0");
+        let err = store
+            .populate_link_entry_inner(
+                LinkEntryRequest {
+                    graph_key: Arc::clone(&key),
+                    source_sri: sri,
+                    object_dir,
+                    deps: vec![],
+                    platform: Arc::new(sample_meta_platform()),
+                },
+                None,
+                None,
+                ObjectIntegrityPolicy::Source,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("v2 object source integrity mismatch"),
+            "source policy must reject source sidecars derived from another SRI, got: {err}"
         );
     }
 
@@ -3728,6 +4023,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(source.join("index.js"), b"module.exports = 'before';\n").unwrap();
+        std::fs::write(source.join(".lpm-local-source"), b"package-owned marker\n").unwrap();
         std::fs::write(source.join("node_modules/ignored.js"), b"ignored\n").unwrap();
 
         let sri = synthetic_sri(b"populate_object_from_local_source");
@@ -3735,7 +4031,11 @@ mod tests {
             .populate_object_from_local_source(&source, &sri)
             .unwrap();
 
-        assert!(object_dir.join(LOCAL_SOURCE_OBJECT_SENTINEL).is_file());
+        assert!(has_local_source_sentinel(&object_dir));
+        assert_eq!(
+            std::fs::read(object_dir.join(".lpm-local-source")).unwrap(),
+            b"package-owned marker\n"
+        );
         assert!(
             !object_dir
                 .join("package.json")
@@ -3810,6 +4110,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn populate_link_entry_source_policy_keeps_local_source_tree_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("package.json"),
+            br#"{"name":"local-source","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("index.js"), b"module.exports = 1;\n").unwrap();
+        let sri = synthetic_sri(b"populate_link_entry_source_policy_keeps_local_source_tree");
+        let object_dir = store
+            .populate_object_from_local_source(&source, &sri)
+            .unwrap();
+        let tree_integrity = read_object_integrity(&object_dir).unwrap();
+        let key = arc_key("local-source", "1.0.0");
+
+        let entry = store
+            .populate_link_entry_inner(
+                LinkEntryRequest {
+                    graph_key: Arc::clone(&key),
+                    source_sri: sri.clone(),
+                    object_dir,
+                    deps: vec![],
+                    platform: Arc::new(sample_meta_platform()),
+                },
+                None,
+                None,
+                ObjectIntegrityPolicy::Source,
+            )
+            .unwrap();
+
+        assert_eq!(
+            read_tree_snapshot(&entry.link_dir)
+                .unwrap()
+                .content_integrity,
+            tree_integrity
+        );
+        assert_ne!(tree_integrity, source_object_integrity(&sri));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tree_metadata_integrity_ignores_symlink_target_file_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let object_dir = dir.path().join("object");
@@ -3844,7 +4188,7 @@ mod tests {
             platform: Arc::new(sample_meta_platform()),
         };
 
-        let first = store.populate_link_entry(req()).unwrap();
+        let first = populate_link_entry_source(&store, req()).unwrap();
         assert!(first.freshly_populated);
         assert!(first.sidecar.is_some(), "fresh population returns sidecar");
         let first_sidecar = first.sidecar.unwrap();
@@ -3860,7 +4204,7 @@ mod tests {
         // is the conservative floor.
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        let second = store.populate_link_entry(req()).unwrap();
+        let second = populate_link_entry_source(&store, req()).unwrap();
         assert!(!second.freshly_populated);
         assert_eq!(second.link_dir, first.link_dir);
         // Cache-hit returns no sidecar; the touch is observable via
@@ -3902,15 +4246,17 @@ mod tests {
         );
         let key = arc_key("copy-safe", "1.0.0");
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key,
                 source_sri: sri,
                 object_dir: object_dir.clone(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let link_index = entry.link_dir.join("node_modules/copy-safe/index.js");
 
         std::fs::write(object_dir.join("index.js"), b"module.exports = 'tampered';").unwrap();
@@ -3945,11 +4291,11 @@ mod tests {
             platform: Arc::new(sample_meta_platform()),
         };
 
-        let first = store.populate_link_entry(request()).unwrap();
+        let first = populate_link_entry_source(&store, request()).unwrap();
         let link_index = first.link_dir.join("node_modules/stale-link/index.js");
         std::fs::write(&link_index, b"module.exports = 'stale';").unwrap();
 
-        let second = store.populate_link_entry(request()).unwrap();
+        let second = populate_link_entry_source(&store, request()).unwrap();
 
         assert!(second.freshly_populated);
         assert_eq!(
@@ -3973,7 +4319,11 @@ mod tests {
                 ("index.js", b"module.exports = {};"),
             ],
         );
-        let verified = store.reusable_object(&sri).unwrap().unwrap().tree_integrity;
+        let verified = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+            .unwrap()
+            .unwrap()
+            .object_integrity;
         let key = arc_key("verified-stale-link", "1.0.0");
         let request = || LinkEntryRequest {
             graph_key: key.clone(),
@@ -3983,17 +4333,15 @@ mod tests {
             platform: Arc::new(sample_meta_platform()),
         };
 
-        let first = store
-            .populate_link_entry_with_verified_object(request(), &verified)
-            .unwrap();
+        let first =
+            populate_link_entry_with_verified_object_source(&store, request(), &verified).unwrap();
         let link_index = first
             .link_dir
             .join("node_modules/verified-stale-link/index.js");
         std::fs::write(&link_index, b"module.exports = 'stale';").unwrap();
 
-        let second = store
-            .populate_link_entry_with_verified_object(request(), &verified)
-            .unwrap();
+        let second =
+            populate_link_entry_with_verified_object_source(&store, request(), &verified).unwrap();
 
         assert!(second.freshly_populated);
         assert_eq!(
@@ -4004,12 +4352,12 @@ mod tests {
     }
 
     #[test]
-    fn populate_link_entry_with_verified_object_revalidates_tampered_object() {
+    fn populate_link_entry_with_tree_policy_revalidates_tampered_object() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
 
-        let sri = synthetic_sri(b"populate_link_entry_with_verified_object_revalidates_object");
-        let object_dir = write_object(
+        let sri = synthetic_sri(b"populate_link_entry_with_tree_policy_revalidates_object");
+        let object_dir = write_tree_object(
             &store,
             &sri,
             &[
@@ -4017,12 +4365,16 @@ mod tests {
                 ("index.js", b"module.exports = {};"),
             ],
         );
-        let verified = store.reusable_object(&sri).unwrap().unwrap().tree_integrity;
+        let verified = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Tree)
+            .unwrap()
+            .unwrap()
+            .object_integrity;
         std::fs::write(object_dir.join("index.js"), b"module.exports = 'tampered';").unwrap();
 
         let key = arc_key("verified-object", "1.0.0");
         let err = store
-            .populate_link_entry_with_verified_object(
+            .populate_link_entry_inner(
                 LinkEntryRequest {
                     graph_key: Arc::clone(&key),
                     source_sri: sri,
@@ -4030,7 +4382,9 @@ mod tests {
                     deps: vec![],
                     platform: Arc::new(sample_meta_platform()),
                 },
-                &verified,
+                Some(&verified),
+                None,
+                ObjectIntegrityPolicy::Tree,
             )
             .unwrap_err();
 
@@ -4123,9 +4477,9 @@ mod tests {
         let forged = ExtractedObject {
             path: fresh_b.path.clone(),
             source_sri: fresh_a.source_sri.clone(),
-            tree_integrity: fresh_a.tree_integrity.clone(),
+            object_integrity: fresh_a.object_integrity.clone(),
         };
-        assert!(!fresh_a.tree_integrity.as_str().is_empty());
+        assert!(!fresh_a.object_integrity.as_str().is_empty());
 
         let key = arc_key("fresh-b", "1.0.0");
         let err = store
@@ -4169,18 +4523,21 @@ mod tests {
         // Materialize the dep first so its link dir exists for the
         // symlink target. The store doesn't enforce ordering (caller's
         // responsibility) — we exercise the realistic path here.
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: dep_key.clone(),
                 source_sri: dep_sri.clone(),
                 object_dir: store.paths().object_dir(&dep_sri).unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: pkg_key,
                 source_sri: pkg_sri,
                 object_dir: pkg_obj,
@@ -4189,8 +4546,9 @@ mod tests {
                     target: dep_key.clone(),
                 }],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let sibling = entry.link_dir.join("node_modules").join("debug");
         let target = std::fs::read_link(&sibling).unwrap();
@@ -4222,18 +4580,21 @@ mod tests {
 
         let pkg_key = arc_key("consumer", "1.0.0");
         let dep_key = arc_key("debug", "4.3.4");
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: dep_key.clone(),
                 source_sri: dep_sri.clone(),
                 object_dir: store.paths().object_dir(&dep_sri).unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        let err = store
-            .populate_link_entry(LinkEntryRequest {
+        let err = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: pkg_key.clone(),
                 source_sri: pkg_sri,
                 object_dir: pkg_obj,
@@ -4242,8 +4603,9 @@ mod tests {
                     target: dep_key,
                 }],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
 
         assert!(
             format!("{err}").contains("unsafe dependency local name"),
@@ -4271,18 +4633,21 @@ mod tests {
         let pkg_key = arc_key("consumer", "1.0.0");
         let dep_key = arc_key("@types/node", "20.10.0");
 
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: dep_key.clone(),
                 source_sri: dep_sri.clone(),
                 object_dir: store.paths().object_dir(&dep_sri).unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: pkg_key,
                 source_sri: pkg_sri,
                 object_dir: pkg_obj,
@@ -4291,8 +4656,9 @@ mod tests {
                     target: dep_key.clone(),
                 }],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let sibling = entry
             .link_dir
@@ -4333,18 +4699,21 @@ mod tests {
         let pkg_key = arc_key("@scope/pkg", "2.0.0");
         let dep_key = arc_key("@scope/pkg", "1.0.0");
 
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: dep_key.clone(),
                 source_sri: dep_sri.clone(),
                 object_dir: store.paths().object_dir(&dep_sri).unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: pkg_key,
                 source_sri: pkg_sri,
                 object_dir: pkg_obj,
@@ -4353,8 +4722,9 @@ mod tests {
                     target: dep_key.clone(),
                 }],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let nested = entry
             .link_dir
@@ -4391,7 +4761,7 @@ mod tests {
         let object_dir = write_object(&store, &sri, &[("package.json", b"{}")]);
 
         // extract_object on already-populated SRI must short-circuit.
-        let returned = store.extract_object(&sri, b"unused-because-hit").unwrap();
+        let returned = extract_object_source(&store, &sri, b"unused-because-hit").unwrap();
         assert_eq!(returned, object_dir);
     }
 
@@ -4405,15 +4775,17 @@ mod tests {
         let nonexistent_object = store.paths().object_dir(&sri).unwrap();
         let key = arc_key("missing", "0.0.1");
 
-        let err = store
-            .populate_link_entry(LinkEntryRequest {
+        let err = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key.clone(),
                 source_sri: sri,
                 object_dir: nonexistent_object,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("v2"));
 
         // No `links/<dir>` should exist (final or tmp).
@@ -4465,15 +4837,17 @@ mod tests {
         );
         stub.write_to(&final_dir).unwrap();
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key,
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert!(
             entry.freshly_populated,
@@ -4520,7 +4894,7 @@ mod tests {
 
         // Now the short-circuit hit path should return without
         // touching the disk further.
-        let returned = store.extract_object(&sri, b"unused").unwrap();
+        let returned = extract_object_source(&store, &sri, b"unused").unwrap();
         assert_eq!(returned, object_dir);
     }
 
@@ -4550,15 +4924,17 @@ mod tests {
         std::fs::create_dir_all(&final_dir).unwrap();
         assert!(!is_complete_link_entry(&final_dir, &key));
 
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key.clone(),
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         assert!(entry.freshly_populated);
         assert!(is_complete_link_entry(&entry.link_dir, &key));
@@ -4639,7 +5015,7 @@ mod tests {
         assert!(obj_dir.is_dir());
         assert!(obj_dir.join("package.json").is_file());
         assert!(obj_dir.join(".integrity").is_file());
-        assert!(obj_dir.join(OBJECT_TREE_INTEGRITY_FILENAME).is_file());
+        assert!(obj_dir.join(OBJECT_INTEGRITY_FILENAME).is_file());
         // Security cache lives next to the object.
         assert!(
             obj_dir.join(".lpm-security.json").is_file(),
@@ -4648,7 +5024,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_object_from_bytes_repairs_tampered_hot_object() {
+    fn extract_object_from_bytes_tree_policy_repairs_tampered_hot_object() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
         let tarball = build_test_tarball(&[
@@ -4656,15 +5032,111 @@ mod tests {
             ("index.js", b"module.exports = 1;\n"),
         ]);
 
-        let (obj_dir, _sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+        let (object, _sri, _) = store
+            .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Tree)
+            .unwrap();
+        let obj_dir = object.path;
         std::fs::write(obj_dir.join("index.js"), b"module.exports = 99;\n").unwrap();
 
-        let (repaired_dir, _sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+        let (repaired_object, _sri, _) = store
+            .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Tree)
+            .unwrap();
+        let repaired_dir = repaired_object.path;
 
         assert_eq!(repaired_dir, obj_dir);
         assert_eq!(
             std::fs::read(repaired_dir.join("index.js")).unwrap(),
             b"module.exports = 1;\n"
+        );
+    }
+
+    #[test]
+    fn extract_object_from_bytes_source_policy_trusts_hot_object_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[
+            ("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}"),
+            ("index.js", b"module.exports = 1;\n"),
+        ]);
+
+        let (object, sri, _) = store
+            .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+            .unwrap();
+        std::fs::write(object.path.join("index.js"), b"module.exports = 99;\n").unwrap();
+
+        let (reused_object, reused_sri, timings) = store
+            .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+            .unwrap();
+
+        assert_eq!(reused_sri, sri);
+        assert_eq!(reused_object.path, object.path);
+        assert_eq!(timings.extract_ms, 0);
+        assert_eq!(
+            std::fs::read(reused_object.path.join("index.js")).unwrap(),
+            b"module.exports = 99;\n"
+        );
+    }
+
+    #[test]
+    fn registry_object_preserves_local_source_filename_under_source_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[
+            (
+                "package.json",
+                b"{\"name\":\"sentinel-file\",\"version\":\"1.0.0\"}",
+            ),
+            (".lpm-local-source", b"registry package content\n"),
+        ]);
+
+        let (object, sri, _) = store
+            .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+            .unwrap();
+
+        assert!(!has_local_source_sentinel(&object.path));
+        assert_eq!(
+            std::fs::read(object.path.join(".lpm-local-source")).unwrap(),
+            b"registry package content\n"
+        );
+
+        let reusable = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reusable.path, object.path);
+
+        let key = arc_key("sentinel-file", "1.0.0");
+        let entry = store
+            .populate_link_entry_inner(
+                LinkEntryRequest {
+                    graph_key: Arc::clone(&key),
+                    source_sri: sri.clone(),
+                    object_dir: object.path,
+                    deps: vec![],
+                    platform: Arc::new(sample_meta_platform()),
+                },
+                None,
+                None,
+                ObjectIntegrityPolicy::Source,
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(
+                entry
+                    .link_dir
+                    .join(LINK_NODE_MODULES)
+                    .join(key.name())
+                    .join(".lpm-local-source")
+            )
+            .unwrap(),
+            b"registry package content\n"
+        );
+        assert_eq!(
+            read_tree_snapshot(&entry.link_dir)
+                .unwrap()
+                .content_integrity,
+            source_object_integrity(&sri)
         );
     }
 
@@ -4678,17 +5150,13 @@ mod tests {
         ]);
 
         let (obj_dir, _sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
-        std::fs::write(
-            obj_dir.join(OBJECT_TREE_INTEGRITY_FILENAME),
-            b"sha256-not-hex\n",
-        )
-        .unwrap();
+        std::fs::write(obj_dir.join(OBJECT_INTEGRITY_FILENAME), b"sha256-not-hex\n").unwrap();
 
         let (repaired_dir, _sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
 
         assert_eq!(repaired_dir, obj_dir);
         assert_eq!(
-            std::fs::read_to_string(repaired_dir.join(OBJECT_TREE_INTEGRITY_FILENAME))
+            std::fs::read_to_string(repaired_dir.join(OBJECT_INTEGRITY_FILENAME))
                 .unwrap()
                 .trim()
                 .len(),
@@ -4750,7 +5218,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_object_from_bytes_reports_tree_stats_on_cold_path() {
+    fn extract_object_from_bytes_reports_extracted_stats_on_cold_path() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
         let package_json = b"{\"name\":\"x\",\"version\":\"1.0.0\"}";
@@ -4773,22 +5241,25 @@ mod tests {
     fn extract_object_from_bytes_source_policy_writes_source_integrity() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path());
-        let tarball = build_test_tarball(&[
-            ("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}"),
-            ("lib/index.js", b"module.exports = 1;\n"),
-        ]);
+        let package_json = b"{\"name\":\"x\",\"version\":\"1.0.0\"}";
+        let index_js = b"module.exports = 1;\n";
+        let tarball =
+            build_test_tarball(&[("package.json", package_json), ("lib/index.js", index_js)]);
 
         let (object, sri, timings) = store
             .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
             .unwrap();
 
         assert_eq!(
-            read_object_tree_integrity(&object.path).unwrap(),
+            read_object_integrity(&object.path).unwrap(),
             source_object_integrity(&sri)
         );
-        assert_eq!(timings.file_count, 0);
-        assert_eq!(timings.dir_count, 0);
-        assert_eq!(timings.unpacked_bytes, 0);
+        assert_eq!(timings.file_count, 2);
+        assert_eq!(timings.dir_count, 1);
+        assert_eq!(
+            timings.unpacked_bytes,
+            (package_json.len() + index_js.len()) as u64
+        );
     }
 
     #[test]
@@ -4811,9 +5282,31 @@ mod tests {
 
         assert_eq!(reusable.path, object.path);
         assert_eq!(
-            reusable.tree_integrity.as_str(),
+            reusable.object_integrity.as_str(),
             source_object_integrity(&sri)
         );
+    }
+
+    #[test]
+    fn reusable_object_source_policy_removes_wrong_source_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[
+            ("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}"),
+            ("index.js", b"module.exports = 1;\n"),
+        ]);
+        let (object, sri, _) = store
+            .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Source)
+            .unwrap();
+        let wrong_sri = synthetic_sri(b"wrong registry object source");
+        write_source_object_integrity(&object.path, &wrong_sri).unwrap();
+
+        let reusable = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+            .unwrap();
+
+        assert!(reusable.is_none());
+        assert!(!object.path.exists());
     }
 
     #[test]
@@ -4958,8 +5451,9 @@ mod tests {
 
         let key_a = arc_key("a", "1.0.0");
         let key_b = arc_key("b", "2.0.0");
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key_a,
                 source_sri: sri_a,
                 object_dir: store
@@ -4968,10 +5462,12 @@ mod tests {
                     .unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
-        store
-            .populate_link_entry(LinkEntryRequest {
+            },
+        )
+        .unwrap();
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key_b,
                 source_sri: sri_b,
                 object_dir: store
@@ -4980,8 +5476,9 @@ mod tests {
                     .unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let mut names: Vec<String> = store
             .iter_link_entries()
@@ -5024,15 +5521,17 @@ mod tests {
                 b"{\"name\":\"legit\",\"version\":\"1.0.0\"}",
             )],
         );
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: arc_key("legit", "1.0.0"),
                 source_sri: sri.clone(),
                 object_dir: store.paths().object_dir(&sri).unwrap(),
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let outside = dir.path().join("outside-of-store");
         std::fs::create_dir_all(&outside).unwrap();
@@ -5080,15 +5579,17 @@ mod tests {
             &[("package.json", b"{\"name\":\"c\",\"version\":\"3.1.4\"}")],
         );
         let key = arc_key("c", "3.1.4");
-        store
-            .populate_link_entry(LinkEntryRequest {
+        populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key.clone(),
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         let resolved = store.find_link_package_dir("c", "3.1.4").unwrap();
         assert!(resolved.is_some(), "must locate populated entry");
@@ -5199,15 +5700,17 @@ mod tests {
             &[("package.json", b"{\"name\":\"d\",\"version\":\"1.0.0\"}")],
         );
         let key = arc_key("d", "1.0.0");
-        let entry = store
-            .populate_link_entry(LinkEntryRequest {
+        let entry = populate_link_entry_source(
+            &store,
+            LinkEntryRequest {
                 graph_key: key.clone(),
                 source_sri: sri,
                 object_dir,
                 deps: vec![],
                 platform: Arc::new(sample_meta_platform()),
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
 
         // Direct probe.
         assert!(store.path_lives_in_store(&entry.link_dir));

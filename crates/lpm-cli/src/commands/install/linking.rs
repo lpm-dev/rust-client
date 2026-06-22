@@ -116,7 +116,7 @@ pub(super) fn build_v2_targets(
         v2_targets.push(lpm_linker::v2::V2Target {
             target: target.clone(),
             source_sri: sri,
-            verified_object_tree_integrity: None,
+            verified_object_integrity: None,
             fresh_object: None,
         });
     }

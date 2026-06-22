@@ -3299,7 +3299,7 @@ async fn install_offline_with_v2_store_relinks_from_object_store() {
 }
 
 #[tokio::test]
-async fn install_v2_cache_hit_repairs_tampered_object_before_linking() {
+async fn install_v2_tree_integrity_cache_hit_repairs_tampered_object_before_linking() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("is-number", "7.0.0");
     mock.with_package("is-number", "7.0.0", &tarball).await;
@@ -3316,6 +3316,7 @@ async fn install_v2_cache_hit_repairs_tampered_object_before_linking() {
 
     let first = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_V2_OBJECT_INTEGRITY", "tree")
         .args([
             "install",
             "--no-security-summary",
@@ -3349,6 +3350,7 @@ async fn install_v2_cache_hit_repairs_tampered_object_before_linking() {
 
     let second = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_V2_OBJECT_INTEGRITY", "tree")
         .args([
             "install",
             "--no-security-summary",

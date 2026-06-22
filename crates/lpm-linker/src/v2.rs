@@ -68,7 +68,7 @@ use lpm_common::symlink::create_dir_symlink_or_junction;
 use lpm_store::v2::CompatIslandKeyEntry;
 use lpm_store::v2::{
     DepLink, ExtractedObject, GraphKey, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag,
-    PlatformTuple, Store, VerifiedObjectTreeIntegrity,
+    PlatformTuple, Store, VerifiedObjectIntegrity,
 };
 
 use crate::materialize::link_dir_recursive;
@@ -91,8 +91,8 @@ pub struct V2Target {
     /// SRI of the source tarball. Required to locate the object dir
     /// at `<HOME>/.lpm/store/v2/objects/<sri>/`.
     pub source_sri: String,
-    /// Verified object-tree digest available on warm cache hits.
-    pub verified_object_tree_integrity: Option<VerifiedObjectTreeIntegrity>,
+    /// Verified object digest available on warm cache hits.
+    pub verified_object_integrity: Option<VerifiedObjectIntegrity>,
     /// Object produced by the extraction path for immediate link-populate.
     /// Warm cache paths cannot construct this value, so they leave it empty
     /// and use populate-time object validation.
@@ -850,7 +850,7 @@ fn populate_one(
     };
     let entry = match (
         v2t.fresh_object.as_ref(),
-        v2t.verified_object_tree_integrity.as_ref(),
+        v2t.verified_object_integrity.as_ref(),
     ) {
         (Some(object), _) => store.populate_link_entry_with_fresh_object(request, object)?,
         (None, Some(digest)) => store.populate_link_entry_with_verified_object(request, digest)?,
@@ -3183,7 +3183,7 @@ mod tests {
                 patch_fingerprint: None,
             },
             source_sri: sri.into(),
-            verified_object_tree_integrity: None,
+            verified_object_integrity: None,
             fresh_object: None,
         }
     }
@@ -5152,9 +5152,13 @@ mod tests {
             let name = format!("deep-pkg-{i}");
             let sri = synthetic_sri(format!("warm-low-nofile/{name}").as_bytes());
             write_deep_object(&store, &sri, &name, TREE_DEPTH);
-            let verified = store.reusable_object(&sri).unwrap().unwrap().tree_integrity;
+            let verified = store
+                .reusable_object(&sri)
+                .unwrap()
+                .unwrap()
+                .object_integrity;
             let mut v2t = target(&name, "1.0.0", &sri, true);
-            v2t.verified_object_tree_integrity = Some(verified);
+            v2t.verified_object_integrity = Some(verified);
             targets.push(v2t);
         }
 
