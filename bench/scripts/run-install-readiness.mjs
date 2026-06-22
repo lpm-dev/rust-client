@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -76,6 +77,11 @@ const args = parseArgs(process.argv.slice(2));
 
 if (args.help) {
   printHelp();
+  process.exit(0);
+}
+
+if (args.selfTest) {
+  runSelfTests();
   process.exit(0);
 }
 
@@ -300,11 +306,6 @@ function measureInstall({
   if (result.error) {
     fs.writeFileSync(path.join(phaseDir, 'spawn-error.txt'), `${result.error.stack || result.error}\n`);
   }
-  const warningClassification = classifyInstallWarnings(result.stdout || '', result.stderr || '');
-  fs.writeFileSync(
-    path.join(phaseDir, 'warnings.json'),
-    `${JSON.stringify(warningClassification, null, 2)}\n`,
-  );
 
   let parsed = null;
   let parseError = null;
@@ -317,6 +318,15 @@ function measureInstall({
       fs.writeFileSync(path.join(phaseDir, 'parse-error.txt'), `${parseError}\n`);
     }
   }
+  const warningClassification = classifyInstallWarnings({
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+    parsedStdout: parsed,
+  });
+  fs.writeFileSync(
+    path.join(phaseDir, 'warnings.json'),
+    `${JSON.stringify(warningClassification, null, 2)}\n`,
+  );
 
   const row = {
     sample,
@@ -689,6 +699,10 @@ function parseArgs(argv) {
       parsed.dryRun = true;
       continue;
     }
+    if (arg === '--self-test') {
+      parsed.selfTest = true;
+      continue;
+    }
     if (arg === '--keep-projects') {
       parsed.keepProjects = true;
       continue;
@@ -1031,7 +1045,7 @@ function bytesToMb(value) {
   return Math.round((value / 1024 / 1024) * 10) / 10;
 }
 
-function classifyInstallWarnings(stdout, stderr) {
+function classifyInstallWarnings({ stdout = '', stderr = '', parsedStdout = null } = {}) {
   const expected = new Map(
     EXPECTED_WARNING_PATTERNS.map((entry) => [
       entry.id,
@@ -1042,7 +1056,11 @@ function classifyInstallWarnings(stdout, stderr) {
   let warningCount = 0;
   let expectedWarningCount = 0;
 
-  for (const rawLine of `${stdout}\n${stderr}`.split(/\r?\n/)) {
+  const lines =
+    parsedStdout === null
+      ? `${stdout}\n${stderr}`.split(/\r?\n/)
+      : [...warningLinesFromParsedJson(parsedStdout), ...stderr.split(/\r?\n/)];
+  for (const rawLine of lines) {
     const line = stripAnsi(rawLine).trim();
     if (!line) {
       continue;
@@ -1073,6 +1091,28 @@ function classifyInstallWarnings(stdout, stderr) {
     expected_warnings: [...expected.values()].filter((entry) => entry.count > 0),
     unexpected_warnings: unexpected,
   };
+}
+
+function warningLinesFromParsedJson(parsed) {
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.warnings)) {
+    return [];
+  }
+  return parsed.warnings.map(warningValueToLine).filter(Boolean);
+}
+
+function warningValueToLine(value) {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (!value || typeof value !== 'object') {
+    return '';
+  }
+  for (const key of ['message', 'warning', 'detail', 'description', 'title', 'code']) {
+    if (typeof value[key] === 'string' && value[key].trim()) {
+      return value[key];
+    }
+  }
+  return JSON.stringify(value);
 }
 
 function summarizeWarnings(rows) {
@@ -1173,6 +1213,47 @@ function isWarningLikeLine(line) {
     /\bdeprecation\b/i.test(line) ||
     /(?:can['’]?t|cannot) be found/i.test(line)
   );
+}
+
+function runSelfTests() {
+  const packageNameOnly = classifyInstallWarnings({
+    stdout: JSON.stringify(
+      {
+        dependencies: [{ name: 'process-warning' }],
+        warnings: [],
+      },
+      null,
+      2,
+    ),
+    parsedStdout: {
+      dependencies: [{ name: 'process-warning' }],
+      warnings: [],
+    },
+  });
+  assert.equal(packageNameOnly.warning_count, 0);
+  assert.equal(packageNameOnly.unexpected_warning_count, 0);
+
+  const structuredWarning = classifyInstallWarnings({
+    parsedStdout: {
+      warnings: [
+        {
+          message: 'package "npm" declares bin "npm" which shadows a common system binary',
+        },
+      ],
+    },
+  });
+  assert.equal(structuredWarning.warning_count, 1);
+  assert.equal(structuredWarning.expected_warning_count, 1);
+  assert.equal(structuredWarning.expected_warnings[0]?.id, 'npm-bin-shadow');
+
+  const stderrWarning = classifyInstallWarnings({
+    parsedStdout: { warnings: [] },
+    stderr: ".git can't be found",
+  });
+  assert.equal(stderrWarning.warning_count, 1);
+  assert.equal(stderrWarning.expected_warnings[0]?.id, 'husky-git-missing');
+
+  console.log('run-install-readiness self-test passed');
 }
 
 function stripAnsi(value) {
