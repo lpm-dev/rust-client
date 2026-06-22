@@ -14,6 +14,7 @@ It provides:
 - configurable sample count, fixtures, package managers, lpm routes, and lpm env cells
 - JSON, Markdown, stdout/stderr, resolved fixture source, and per-run metrics artifacts
 - expected/unexpected warning classification for known noisy installs
+- top-package sweeps from a package-name file with offset/limit chunking
 
 Warm mode first seeds the package-manager cache/store, then removes generated
 project install artifacts before the counted run. That means warm numbers are
@@ -82,6 +83,27 @@ node bench/scripts/run-install-readiness.mjs \
   --lpm-cell exact-doc:LPM_EXPERIMENTAL_INSTALLER_SPIKE=1,LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1,LPM_INSTALLER_SPIKE_GRAPH=resolve-worklist,LPM_INSTALLER_SPIKE_PARITY=deny,LPM_INSTALLER_SPIKE_EXACT_DOC=1
 ```
 
+Run a top-package correctness sweep in chunks:
+
+```bash
+node bench/scripts/run-install-readiness.mjs \
+  --samples 1 \
+  --top-npm-file bench/top-npm-audit/top-100.txt \
+  --top-npm-offset 0 \
+  --top-npm-limit 25 \
+  --managers lpm \
+  --modes cold \
+  --lpm-cell current \
+  --lpm-cell exact-doc:LPM_EXPERIMENTAL_INSTALLER_SPIKE=1,LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1,LPM_INSTALLER_SPIKE_GRAPH=resolve-worklist,LPM_INSTALLER_SPIKE_PARITY=deny,LPM_INSTALLER_SPIKE_EXACT_DOC=1 \
+  --allow-failures
+```
+
+When `--top-npm-file` is used, lpm runs default to
+`LPM_TYPOSQUAT_GUARD=0`. This sweep is meant to sample broad install
+correctness, package identity, parity mismatches, and warnings; typosquat
+policy can be audited separately without blocking the long-tail install
+surface. Pass `--lpm-typosquat-guard default` to keep the production guard on.
+
 Fixture names built in today:
 
 - `dogfood`
@@ -109,7 +131,8 @@ Rows include `expected_warnings` and `unexpected_warnings`. Expected warning
 families currently cover npm/npx bin-shadow notices from bundled npm fixtures,
 Husky's missing `.git` message in copied fixtures, and Vite's CJS API
 deprecation note. Unknown warning lines remain visible in `rows.json`,
-`metrics.json`, and the summary's `Warnings exp/unknown` column.
+`metrics.json`, per-run `warnings.json`, `warning-summary.json`,
+`warning-summary.md`, and the summary's `Warnings exp/unknown` column.
 
 ## Historical fusion scripts
 

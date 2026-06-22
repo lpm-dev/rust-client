@@ -80,11 +80,20 @@ if (args.help) {
 }
 
 const samples = positiveInt(args.samples, 5, '--samples');
-const fixtures = parseFixtures(args.fixtures ?? DEFAULT_FIXTURES.join(','));
+if (args.topNpmFile && args.fixtures) {
+  throw new Error('--top-npm-file and --fixtures are mutually exclusive');
+}
+const topNpmFile = args.topNpmFile ? path.resolve(repoRoot, args.topNpmFile) : null;
+const topNpmOffset = nonNegativeInt(args.topNpmOffset, 0, '--top-npm-offset');
+const topNpmLimit = optionalPositiveInt(args.topNpmLimit, '--top-npm-limit');
+const fixtures = topNpmFile
+  ? parseTopNpmFixtures(topNpmFile, topNpmOffset, topNpmLimit)
+  : parseFixtures(args.fixtures ?? DEFAULT_FIXTURES.join(','));
 const managers = parseList(args.managers ?? DEFAULT_MANAGERS.join(','), '--managers');
 const modes = parseModes(args.modes ?? DEFAULT_MODES.join(','));
 const lpmRoutes = parseLpmRoutes(args.lpmRoutes ?? DEFAULT_LPM_ROUTES.join(','));
 const lpmCells = parseLpmCells(args.lpmCells);
+const lpmTyposquatGuard = args.lpmTyposquatGuard ?? (topNpmFile ? 'off' : 'default');
 const scriptPolicy = args.scriptPolicy ?? 'ignore';
 const timeoutMs = positiveInt(args.timeoutMs, 10 * 60 * 1000, '--timeout-ms');
 const outputDir = path.resolve(
@@ -98,6 +107,7 @@ const dryRun = Boolean(args.dryRun);
 
 validateManagers(managers);
 validateScriptPolicy(scriptPolicy);
+validateLpmTyposquatGuard(lpmTyposquatGuard);
 
 const runSpecs = buildRunSpecs(managers, lpmCells, lpmRoutes);
 validateUniqueKeys('fixture', fixtures, (fixture) => fixture.name);
@@ -109,6 +119,15 @@ const plan = {
   modes,
   lpm_routes: lpmRoutes,
   lpm_cells: lpmCells.map((cell) => ({ name: cell.name, env: cell.env })),
+  lpm_typosquat_guard: lpmTyposquatGuard,
+  top_npm: topNpmFile
+    ? {
+        file: path.relative(repoRoot, topNpmFile) || topNpmFile,
+        absolute_file: topNpmFile,
+        offset: topNpmOffset,
+        limit: topNpmLimit,
+      }
+    : undefined,
   script_policy: scriptPolicy,
   timeout_ms: timeoutMs,
   output_dir: outputDir,
@@ -141,9 +160,18 @@ for (let sample = 1; sample <= samples; sample += 1) {
 
 const summary = summarize(rows);
 const summaryMd = renderSummaryMarkdown(summary);
+const warningSummary = summarizeWarnings(rows);
 fs.writeFileSync(path.join(outputDir, 'rows.json'), `${JSON.stringify(rows, null, 2)}\n`);
 fs.writeFileSync(path.join(outputDir, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`);
 fs.writeFileSync(path.join(outputDir, 'summary.md'), `${summaryMd}\n`);
+fs.writeFileSync(
+  path.join(outputDir, 'warning-summary.json'),
+  `${JSON.stringify(warningSummary, null, 2)}\n`,
+);
+fs.writeFileSync(
+  path.join(outputDir, 'warning-summary.md'),
+  `${renderWarningSummaryMarkdown(warningSummary)}\n`,
+);
 
 console.log(`\n[summary] ${outputDir}`);
 console.log(summaryMd);
@@ -273,6 +301,10 @@ function measureInstall({
     fs.writeFileSync(path.join(phaseDir, 'spawn-error.txt'), `${result.error.stack || result.error}\n`);
   }
   const warningClassification = classifyInstallWarnings(result.stdout || '', result.stderr || '');
+  fs.writeFileSync(
+    path.join(phaseDir, 'warnings.json'),
+    `${JSON.stringify(warningClassification, null, 2)}\n`,
+  );
 
   let parsed = null;
   let parseError = null;
@@ -498,6 +530,9 @@ function buildEnv({ homeDir, lpmHome, spec }) {
     env.LPM_HOME = lpmHome;
     env.LPM_STORE_VERSION = 'v2';
     env.LPM_TIMING_DETAIL = 'trace';
+    if (lpmTyposquatGuard === 'off') {
+      env.LPM_TYPOSQUAT_GUARD = '0';
+    }
     if (spec.route !== 'direct') {
       env.LPM_NPM_ROUTE = spec.route;
     }
@@ -670,9 +705,13 @@ function parseArgs(argv) {
       ['--samples', 'samples'],
       ['-n', 'samples'],
       ['--fixtures', 'fixtures'],
+      ['--top-npm-file', 'topNpmFile'],
+      ['--top-npm-offset', 'topNpmOffset'],
+      ['--top-npm-limit', 'topNpmLimit'],
       ['--managers', 'managers'],
       ['--modes', 'modes'],
       ['--lpm-routes', 'lpmRoutes'],
+      ['--lpm-typosquat-guard', 'lpmTyposquatGuard'],
       ['--output', 'output'],
       ['--lpm-bin', 'lpmBin'],
       ['--script-policy', 'scriptPolicy'],
@@ -730,6 +769,25 @@ function parseFixtures(raw) {
     }
     throw new Error(`unknown fixture: ${entry}`);
   });
+}
+
+function parseTopNpmFixtures(filePath, offset, limit) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`top npm file missing: ${filePath}`);
+  }
+  const specs = fs
+    .readFileSync(filePath, 'utf8')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/#.*/, '').trim())
+    .filter(Boolean);
+  if (offset > specs.length) {
+    throw new Error(`--top-npm-offset ${offset} is beyond ${specs.length} package(s)`);
+  }
+  const selected = specs.slice(offset, limit == null ? undefined : offset + limit);
+  if (selected.length === 0) {
+    throw new Error('top npm selection is empty');
+  }
+  return selected.map((spec) => fixtureFromPackageSpec(spec));
 }
 
 function fixtureFromPath(name, fixturePath) {
@@ -851,6 +909,12 @@ function validateScriptPolicy(policy) {
   }
 }
 
+function validateLpmTyposquatGuard(mode) {
+  if (!['default', 'off'].includes(mode)) {
+    throw new Error(`unsupported --lpm-typosquat-guard: ${mode}`);
+  }
+}
+
 function validateUniqueKeys(label, values, keyFor) {
   const seen = new Map();
   for (const value of values) {
@@ -880,6 +944,24 @@ function positiveInt(raw, fallback, flag) {
   const value = Number.parseInt(raw, 10);
   if (!Number.isInteger(value) || value <= 0) {
     throw new Error(`${flag} must be a positive integer`);
+  }
+  return value;
+}
+
+function optionalPositiveInt(raw, flag) {
+  if (raw == null) {
+    return null;
+  }
+  return positiveInt(raw, undefined, flag);
+}
+
+function nonNegativeInt(raw, fallback, flag) {
+  if (raw == null) {
+    return fallback;
+  }
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${flag} must be a non-negative integer`);
   }
   return value;
 }
@@ -993,6 +1075,97 @@ function classifyInstallWarnings(stdout, stderr) {
   };
 }
 
+function summarizeWarnings(rows) {
+  const expected = new Map();
+  const unexpected = new Map();
+
+  for (const row of rows.filter((entry) => entry.counted !== false)) {
+    const run = {
+      fixture: row.fixture,
+      spec: row.spec,
+      mode: row.mode,
+      sample: row.sample,
+      exit_code: row.exit_code,
+    };
+
+    for (const warning of row.expected_warnings ?? []) {
+      const key = warning.id;
+      const bucket =
+        expected.get(key) ??
+        {
+          id: warning.id,
+          label: warning.label,
+          count: 0,
+          samples: [],
+          runs: [],
+        };
+      bucket.count += warning.count;
+      for (const sample of warning.samples ?? []) {
+        if (bucket.samples.length < 10 && !bucket.samples.includes(sample)) {
+          bucket.samples.push(sample);
+        }
+      }
+      if (bucket.runs.length < 50) {
+        bucket.runs.push(run);
+      }
+      expected.set(key, bucket);
+    }
+
+    for (const line of row.unexpected_warnings ?? []) {
+      const bucket =
+        unexpected.get(line) ??
+        {
+          line,
+          count: 0,
+          runs: [],
+        };
+      bucket.count += 1;
+      if (bucket.runs.length < 50) {
+        bucket.runs.push(run);
+      }
+      unexpected.set(line, bucket);
+    }
+  }
+
+  return {
+    expected: [...expected.values()].sort((a, b) => b.count - a.count || a.id.localeCompare(b.id)),
+    unexpected: [...unexpected.values()].sort((a, b) => b.count - a.count || a.line.localeCompare(b.line)),
+  };
+}
+
+function renderWarningSummaryMarkdown(summary) {
+  const lines = ['# Warning Summary', ''];
+  lines.push('## Expected');
+  if (summary.expected.length === 0) {
+    lines.push('', 'None.');
+  } else {
+    lines.push('', '| Count | ID | Label | Example |', '| ---: | --- | --- | --- |');
+    for (const warning of summary.expected) {
+      lines.push(
+        `| ${warning.count} | ${warning.id} | ${warning.label} | ${markdownCell(warning.samples[0] ?? '')} |`,
+      );
+    }
+  }
+
+  lines.push('', '## Unexpected');
+  if (summary.unexpected.length === 0) {
+    lines.push('', 'None.');
+  } else {
+    lines.push('', '| Count | Warning | First run |', '| ---: | --- | --- |');
+    for (const warning of summary.unexpected) {
+      const firstRun = warning.runs[0]
+        ? `${warning.runs[0].fixture}/${warning.runs[0].spec}/${warning.runs[0].mode}/sample-${warning.runs[0].sample}`
+        : '';
+      lines.push(`| ${warning.count} | ${markdownCell(warning.line)} | ${firstRun} |`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function markdownCell(value) {
+  return String(value).replace(/\|/g, '\\|').replace(/\n/g, '<br>');
+}
+
 function isWarningLikeLine(line) {
   return (
     /\bwarn(?:ing)?\b/i.test(line) ||
@@ -1090,11 +1263,16 @@ Options:
       --fixtures LIST          Built-ins or paths (default: dogfood,nest,vitepress)
                                Built-ins: ${[...BUILTIN_FIXTURES.keys()].join(', ')}
                                Also supports name=/abs/path and pkg:<name>@<version>
+      --top-npm-file PATH      Use package list as one-root-per-package fixtures
+      --top-npm-offset N       Zero-based package offset for chunked top-N sweeps
+      --top-npm-limit N        Maximum packages from --top-npm-file
       --managers LIST          lpm,bun,pnpm,npm (default: lpm)
       --modes LIST             cold,warm (default: cold)
       --lpm-routes LIST        direct,proxy for lpm runs (default: direct)
       --lpm-cell NAME:ENV      Add an lpm env cell. Repeatable.
                                Example: --lpm-cell cap:LPM_V2_FINALIZE_PERMITS=2
+      --lpm-typosquat-guard MODE
+                               default or off. Defaults to off for --top-npm-file.
       --script-policy MODE     ignore or default for bun/pnpm/npm scripts (default: ignore)
       --timeout-ms N           Per-install timeout in milliseconds (default: 600000)
       --lpm-bin PATH           lpm binary path (default: target/release/lpm-rs)
@@ -1126,5 +1304,16 @@ Examples:
     --samples 5 \\
     --lpm-cell current \\
     --lpm-cell exact-doc:LPM_EXPERIMENTAL_INSTALLER_SPIKE=1,LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1,LPM_INSTALLER_SPIKE_GRAPH=resolve-worklist,LPM_INSTALLER_SPIKE_PARITY=deny,LPM_INSTALLER_SPIKE_EXACT_DOC=1
+
+  # Top-N package sweep, 25 roots at a time.
+  node bench/scripts/run-install-readiness.mjs \\
+    --samples 1 \\
+    --top-npm-file bench/top-npm-audit/top-100.txt \\
+    --top-npm-offset 0 \\
+    --top-npm-limit 25 \\
+    --managers lpm \\
+    --lpm-cell current \\
+    --lpm-cell exact-doc:LPM_EXPERIMENTAL_INSTALLER_SPIKE=1,LPM_INSTALLER_SPIKE_BENCHMARK_ONLY=1,LPM_INSTALLER_SPIKE_GRAPH=resolve-worklist,LPM_INSTALLER_SPIKE_PARITY=deny,LPM_INSTALLER_SPIKE_EXACT_DOC=1 \\
+    --allow-failures
 `);
 }
