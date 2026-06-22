@@ -30,8 +30,6 @@ pub(super) struct InstallerSpikeAdmission {
     pub(super) has_workspace_member_deps: bool,
     pub(super) has_v2_workspace_member_deps: bool,
     pub(super) has_tarball_source_deps: bool,
-    pub(super) has_patches: bool,
-    pub(super) patches_changed: bool,
     pub(super) verify_registry_signatures: bool,
     pub(super) strict_integrity: bool,
     pub(super) force_security_floor: bool,
@@ -124,9 +122,6 @@ fn unsupported_admission_reasons(
     }
     if admission.has_tarball_source_deps {
         reasons.push("tarball source deps are not supported");
-    }
-    if admission.has_patches || admission.patches_changed {
-        reasons.push("patches are not supported");
     }
     if admission.verify_registry_signatures {
         reasons.push("registry signature verification is not supported");
@@ -1193,6 +1188,9 @@ pub(super) async fn run(
     workspace_member_deps: &[WorkspaceMemberLink],
     all_workspace_members: &[WorkspaceMemberLink],
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    current_patches: &HashMap<String, PatchedDependencyEntry>,
+    prior_patch_state: &Option<patch_state::PatchState>,
+    current_patch_fingerprint: &str,
 ) -> Result<(), LpmError> {
     if !json_output {
         output::info("using experimental installer spike path");
@@ -1207,6 +1205,7 @@ pub(super) async fn run(
     let metadata_queue = Arc::new(Semaphore::new(metadata_concurrency));
     let metadata_caches = MetadataCaches::new();
     let store = PackageStore::from_root(lpm_root);
+    let patch_fingerprints = compute_patch_fingerprints(current_patches, project_dir)?;
     let gate_stats = Arc::new(GateStats::default());
 
     let setup_ms = start.elapsed().as_millis();
@@ -1471,7 +1470,12 @@ pub(super) async fn run(
     stage_timings.parity_ms = parity_start.elapsed().as_millis();
 
     let link_targets_start = Instant::now();
-    let link_targets = build_experimental_link_targets(project_dir, &store, &install_packages)?;
+    let link_targets = build_experimental_link_targets(
+        project_dir,
+        &store,
+        &install_packages,
+        &patch_fingerprints,
+    )?;
     stage_timings.link_targets_ms = link_targets_start.elapsed().as_millis();
     let v2_event_plan = match store_v2_handle.as_ref() {
         Some(store_v2) => {
@@ -1593,6 +1597,19 @@ pub(super) async fn run(
             workspace_links_created.to_string().bold()
         ));
     }
+    let applied_patches = apply_patches_for_install(
+        current_patches,
+        &link_result,
+        &store,
+        project_dir,
+        json_output,
+    )?;
+    persist_patch_state(
+        project_dir,
+        current_patches,
+        prior_patch_state,
+        &applied_patches,
+    );
     let link_ms = link_start.elapsed().as_millis();
     let total_ms = start.elapsed().as_millis();
 
@@ -1673,6 +1690,14 @@ pub(super) async fn run(
             "warnings": [],
             "errors": [],
         });
+        let applied_patches_summary: Vec<&patch_engine::AppliedPatch> = applied_patches
+            .iter()
+            .filter(|patch| patch.touched_anything())
+            .collect();
+        json["applied_patches"] = applied_patches_to_json(&applied_patches_summary, project_dir);
+        json["patches_count"] = serde_json::json!(current_patches.len());
+        json["patches_fingerprint"] =
+            fingerprint_json_value(current_patches.len(), current_patch_fingerprint);
         crate::security_floor::attach_security_posture(&mut json, false);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
@@ -3447,6 +3472,7 @@ fn build_experimental_link_targets(
     project_dir: &Path,
     store: &PackageStore,
     packages: &[InstallPackage],
+    patch_fingerprints: &HashMap<(String, String), String>,
 ) -> Result<Vec<LinkTarget>, LpmError> {
     let source_index = source_dependency_index(packages);
     packages
@@ -3463,7 +3489,9 @@ fn build_experimental_link_targets(
                 wrapper_id: package.wrapper_id_for_source(),
                 materialization: package.materialization_for_source(),
                 peers: package.peers.clone(),
-                patch_fingerprint: None,
+                patch_fingerprint: patch_fingerprints
+                    .get(&(package.name.clone(), package.version.clone()))
+                    .cloned(),
             })
         })
         .collect::<Result<_, _>>()
@@ -3559,8 +3587,6 @@ mod tests {
             has_workspace_member_deps: false,
             has_v2_workspace_member_deps: false,
             has_tarball_source_deps: false,
-            has_patches: false,
-            patches_changed: false,
             verify_registry_signatures: false,
             strict_integrity: false,
             force_security_floor: false,
@@ -3763,7 +3789,6 @@ mod tests {
         let mut admission = benchmark_admission();
         admission.omit_policy.dev = true;
         admission.has_workspace_member_deps = true;
-        admission.has_patches = true;
         admission.verify_registry_signatures = true;
         admission.audit_after_install = true;
         admission.script_policy_is_default = false;
@@ -3780,7 +3805,7 @@ mod tests {
         assert!(reasons.contains(&"--prod/--omit=dev is not supported"));
         assert!(reasons.contains(&"workspace member links require resolve-worklist graph mode"));
         assert!(!reasons.contains(&"overrides are not supported"));
-        assert!(reasons.contains(&"patches are not supported"));
+        assert!(!reasons.contains(&"patches are not supported"));
         assert!(reasons.contains(&"registry signature verification is not supported"));
         assert!(reasons.contains(&"audit-after-install is not supported"));
         assert!(reasons.contains(&"script policy/build execution options are not supported"));

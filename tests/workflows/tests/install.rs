@@ -2151,6 +2151,123 @@ async fn install_experimental_spike_live_graph_does_not_write_install_hash() {
 }
 
 #[tokio::test]
+async fn install_experimental_spike_live_graph_applies_patched_dependencies() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    let integrity = compute_integrity(&tarball);
+    mock.with_package("ms", "2.1.3", &tarball).await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "ms",
+        "dist-tags": { "latest": "2.1.3" },
+        "versions": {
+            "2.1.3": {
+                "name": "ms",
+                "version": "2.1.3",
+                "dist": {
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
+                    "integrity": &integrity,
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "2.1.3": "2025-01-01T00:00:00.000Z" }
+    })])
+    .await;
+
+    let project = TempProject::empty(
+        &serde_json::json!({
+            "name": "spike-live-patched-dependency",
+            "version": "1.0.0",
+            "dependencies": {
+                "ms": "2.1.3"
+            },
+            "lpm": {
+                "patchedDependencies": {
+                    "ms@2.1.3": {
+                        "path": "patches/ms@2.1.3.patch",
+                        "originalIntegrity": &integrity,
+                    }
+                }
+            }
+        })
+        .to_string(),
+    );
+    project.write_file(
+        "patches/ms@2.1.3.patch",
+        "diff --git a/lpm-patch-proof.js b/lpm-patch-proof.js\n\
+         new file mode 100644\n\
+         --- /dev/null\n\
+         +++ b/lpm-patch-proof.js\n\
+         @@ -0,0 +1 @@\n\
+         +module.exports = 'patched-by-spike-test';\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+        .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+        .env("LPM_INSTALLER_SPIKE_GRAPH", "resolve-worklist")
+        .env("LPM_INSTALLER_SPIKE_PARITY", "deny")
+        .env("LPM_INSTALLER_SPIKE_EXACT_DOC", "1")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run experimental installer spike");
+
+    assert!(
+        output.status.success(),
+        "experimental live install with patched dependency should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("experimental install --json must emit valid JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(
+        envelope["experimental"],
+        serde_json::json!("installer-spike")
+    );
+    assert_eq!(envelope["patches_count"], serde_json::json!(1));
+    assert_eq!(
+        envelope["timing"]["experimental_installer_spike"]["parity"]["matches"],
+        serde_json::json!(true)
+    );
+    let applied = envelope["applied_patches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("applied_patches must be an array; got {envelope:#}"));
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0]["name"], serde_json::json!("ms"));
+    assert_eq!(applied[0]["files_added"], serde_json::json!(1));
+    assert!(
+        project.file_exists(".lpm/patch-state.json"),
+        "patched spike install must persist patch-state.json"
+    );
+
+    let require_patch = std::process::Command::new("node")
+        .current_dir(project.path())
+        .arg("-e")
+        .arg("process.stdout.write(require('ms/lpm-patch-proof'))")
+        .output()
+        .expect("run patched dependency require");
+    assert!(
+        require_patch.status.success(),
+        "patched dependency require should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&require_patch.stdout),
+        String::from_utf8_lossy(&require_patch.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&require_patch.stdout),
+        "patched-by-spike-test"
+    );
+}
+
+#[tokio::test]
 async fn install_experimental_spike_live_graph_preserves_platform_skipped_optional_descendants() {
     let mock = MockRegistry::start().await;
     mock.with_manifest_package(

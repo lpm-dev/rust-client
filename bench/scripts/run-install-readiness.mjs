@@ -54,6 +54,23 @@ const DEFAULT_FIXTURES = ['dogfood', 'nest', 'vitepress'];
 const DEFAULT_MANAGERS = ['lpm'];
 const DEFAULT_MODES = ['cold'];
 const DEFAULT_LPM_ROUTES = ['direct'];
+const EXPECTED_WARNING_PATTERNS = [
+  {
+    id: 'npm-bin-shadow',
+    label: 'npm/npx binary shadow warning',
+    pattern: /package ["'`]npm["'`] declares bin ["'`](?:npm|npx)["'`] which shadows a common system binary/i,
+  },
+  {
+    id: 'husky-git-missing',
+    label: 'husky .git missing warning',
+    pattern: /\.git (?:can['’]?t|cannot) be found/i,
+  },
+  {
+    id: 'vite-cjs-api-deprecated',
+    label: 'Vite CJS API deprecation warning',
+    pattern: /CJS build of Vite.?s Node API is deprecated/i,
+  },
+];
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -255,6 +272,7 @@ function measureInstall({
   if (result.error) {
     fs.writeFileSync(path.join(phaseDir, 'spawn-error.txt'), `${result.error.stack || result.error}\n`);
   }
+  const warningClassification = classifyInstallWarnings(result.stdout || '', result.stderr || '');
 
   let parsed = null;
   let parseError = null;
@@ -285,6 +303,7 @@ function measureInstall({
     parse_error: parseError,
     stdout_tail: tail(result.stdout || ''),
     stderr_tail: tail(result.stderr || ''),
+    ...warningClassification,
     ...extractLpmMetrics(parsed),
   };
 
@@ -586,6 +605,9 @@ function summarizeMetrics(rows) {
     'parity_extra_count',
     'parity_missing_count',
     'parity_fingerprint_mismatch_count',
+    'warning_count',
+    'expected_warning_count',
+    'unexpected_warning_count',
   ];
   return Object.fromEntries(
     keys
@@ -596,8 +618,8 @@ function summarizeMetrics(rows) {
 
 function renderSummaryMarkdown(summary) {
   const lines = [
-    '| Fixture | Spec | Mode | OK | Wall med/min | Resolve med/min | Fetch med/min | Link med/min | Pkgs | Metadata MB | Version docs | Parity mismatches |',
-    '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    '| Fixture | Spec | Mode | OK | Wall med/min | Resolve med/min | Fetch med/min | Link med/min | Pkgs | Metadata MB | Version docs | Parity mismatches | Warnings exp/unknown |',
+    '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   ];
   for (const row of summary) {
     const m = row.metrics;
@@ -609,8 +631,12 @@ function renderSummaryMarkdown(summary) {
       m.parity_fingerprint_mismatch_count || m.parity_missing_count || m.parity_extra_count
         ? `${one(m.parity_fingerprint_mismatch_count)} fp, ${one(m.parity_missing_count)} missing, ${one(m.parity_extra_count)} extra`
         : 'n/a';
+    const warnings =
+      m.expected_warning_count || m.unexpected_warning_count
+        ? `${one(m.expected_warning_count)}/${one(m.unexpected_warning_count)}`
+        : '0/0';
     lines.push(
-      `| ${row.fixture} | ${row.spec} | ${row.mode} | ${row.successful_samples}/${row.samples} | ${stat(m.wall_ms)} | ${stat(m.resolve_ms)} | ${stat(m.fetch_ms)} | ${stat(m.link_ms)} | ${one(m.package_count)} | ${stat(m.metadata_body_mb_sum)} | ${versionDocs} | ${mismatches} |`,
+      `| ${row.fixture} | ${row.spec} | ${row.mode} | ${row.successful_samples}/${row.samples} | ${stat(m.wall_ms)} | ${stat(m.resolve_ms)} | ${stat(m.fetch_ms)} | ${stat(m.link_ms)} | ${one(m.package_count)} | ${stat(m.metadata_body_mb_sum)} | ${versionDocs} | ${mismatches} | ${warnings} |`,
     );
   }
   return lines.join('\n');
@@ -921,6 +947,63 @@ function bytesToMb(value) {
     return undefined;
   }
   return Math.round((value / 1024 / 1024) * 10) / 10;
+}
+
+function classifyInstallWarnings(stdout, stderr) {
+  const expected = new Map(
+    EXPECTED_WARNING_PATTERNS.map((entry) => [
+      entry.id,
+      { id: entry.id, label: entry.label, count: 0, samples: [] },
+    ]),
+  );
+  const unexpected = [];
+  let warningCount = 0;
+  let expectedWarningCount = 0;
+
+  for (const rawLine of `${stdout}\n${stderr}`.split(/\r?\n/)) {
+    const line = stripAnsi(rawLine).trim();
+    if (!line) {
+      continue;
+    }
+    const expectedPattern = EXPECTED_WARNING_PATTERNS.find((entry) => entry.pattern.test(line));
+    if (!expectedPattern && !isWarningLikeLine(line)) {
+      continue;
+    }
+    warningCount += 1;
+    if (expectedPattern) {
+      expectedWarningCount += 1;
+      const bucket = expected.get(expectedPattern.id);
+      bucket.count += 1;
+      if (bucket.samples.length < 3 && !bucket.samples.includes(line)) {
+        bucket.samples.push(line);
+      }
+      continue;
+    }
+    if (unexpected.length < 20 && !unexpected.includes(line)) {
+      unexpected.push(line);
+    }
+  }
+
+  return {
+    warning_count: warningCount,
+    expected_warning_count: expectedWarningCount,
+    unexpected_warning_count: warningCount - expectedWarningCount,
+    expected_warnings: [...expected.values()].filter((entry) => entry.count > 0),
+    unexpected_warnings: unexpected,
+  };
+}
+
+function isWarningLikeLine(line) {
+  return (
+    /\bwarn(?:ing)?\b/i.test(line) ||
+    /\bdeprecated\b/i.test(line) ||
+    /\bdeprecation\b/i.test(line) ||
+    /(?:can['’]?t|cannot) be found/i.test(line)
+  );
+}
+
+function stripAnsi(value) {
+  return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
 }
 
 function medianMin(rows, key) {

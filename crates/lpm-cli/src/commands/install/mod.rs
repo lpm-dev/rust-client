@@ -2320,8 +2320,6 @@ async fn run_with_options_under_store_lock(
                 .additional_workspace_links
                 .is_empty(),
         has_tarball_source_deps: installer_spike::has_tarball_source_deps(project_dir, &deps),
-        has_patches: !current_patches.is_empty(),
-        patches_changed,
         verify_registry_signatures,
         strict_integrity,
         force_security_floor,
@@ -2411,6 +2409,9 @@ async fn run_with_options_under_store_lock(
             &workspace_member_deps,
             &all_workspace_members,
             &catalog_resolutions,
+            &current_patches,
+            &prior_patch_state,
+            &current_patch_fingerprint,
         )
         .await;
     }
