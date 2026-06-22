@@ -3532,7 +3532,10 @@ mod tests {
         )
         .unwrap();
 
-        let reusable = store.reusable_object(&sri).unwrap().unwrap();
+        let reusable = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(reusable.path, object_dir);
     }
@@ -3787,7 +3790,10 @@ mod tests {
             &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
         );
 
-        let reusable = store.reusable_object(&sri).unwrap().unwrap();
+        let reusable = store
+            .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(reusable.path, object_dir);
         assert_eq!(
