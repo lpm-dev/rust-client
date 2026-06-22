@@ -13,6 +13,7 @@ It provides:
 - round-robin interleaving by sample to reduce live-network bias
 - configurable sample count, fixtures, package managers, lpm routes, and lpm env cells
 - JSON, Markdown, stdout/stderr, resolved fixture source, and per-run metrics artifacts
+- expected/unexpected warning classification for known noisy installs
 
 Warm mode first seeds the package-manager cache/store, then removes generated
 project install artifacts before the counted run. That means warm numbers are
@@ -103,6 +104,12 @@ candidate lpm cell, with 5+ samples and round-robin ordering.
 
 Every install subprocess has a timeout, defaulting to 10 minutes. Override it
 with `--timeout-ms` for top-package sweeps that need a different failure bound.
+
+Rows include `expected_warnings` and `unexpected_warnings`. Expected warning
+families currently cover npm/npx bin-shadow notices from bundled npm fixtures,
+Husky's missing `.git` message in copied fixtures, and Vite's CJS API
+deprecation note. Unknown warning lines remain visible in `rows.json`,
+`metrics.json`, and the summary's `Warnings exp/unknown` column.
 
 ## Historical fusion scripts
 
