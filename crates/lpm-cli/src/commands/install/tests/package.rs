@@ -149,10 +149,29 @@ async fn prevalidate_v2_reusable_objects_tree_policy_removes_tampered_registry_o
 
 #[test]
 fn v2_link_task_concurrency_caps_large_warm_relink_batches() {
+    let _env = crate::test_env::ScopedEnv::update([("LPM_V2_LINK_TASKS", None)]);
     let concurrency = v2_link_task_concurrency(1309);
 
     assert!(concurrency <= V2_LINK_TASK_MAX_CONCURRENCY);
     assert!(concurrency < 1309);
+}
+
+#[test]
+fn v2_link_task_concurrency_uses_positive_env_override() {
+    let _env = crate::test_env::ScopedEnv::set([("LPM_V2_LINK_TASKS", "4".into())]);
+
+    assert_eq!(v2_link_task_concurrency(1309), 4);
+    assert_eq!(v2_link_task_concurrency(2), 2);
+}
+
+#[test]
+fn v2_link_task_concurrency_ignores_invalid_env_override() {
+    let _env = crate::test_env::ScopedEnv::set([("LPM_V2_LINK_TASKS", "0".into())]);
+
+    let concurrency = v2_link_task_concurrency(1309);
+
+    assert!(concurrency <= V2_LINK_TASK_MAX_CONCURRENCY);
+    assert!(concurrency > 0);
 }
 
 #[test]

@@ -140,6 +140,7 @@ pub(crate) fn install_running_in_ci() -> bool {
 
 const V2_CACHE_CHECK_MAX_CONCURRENCY: usize = 16;
 const V2_LINK_TASK_MAX_CONCURRENCY: usize = 16;
+const ENV_V2_LINK_TASKS: &str = "LPM_V2_LINK_TASKS";
 
 fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
     let parallelism = std::thread::available_parallelism()
@@ -151,6 +152,13 @@ fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
 }
 
 fn v2_link_task_concurrency(target_count: usize) -> usize {
+    if let Some(configured) = std::env::var(ENV_V2_LINK_TASKS)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+    {
+        return configured.min(target_count.max(1));
+    }
     let parallelism = std::thread::available_parallelism()
         .map(|threads| threads.get())
         .unwrap_or(4);
@@ -180,6 +188,7 @@ struct V2LinkTaskResult {
     materialized: MaterializedPackage,
     freshly_populated: bool,
     ms: u128,
+    timings: lpm_store::v2::LinkEntryTimings,
 }
 
 type V2LinkHandle = tokio::task::JoinHandle<Result<V2LinkTaskResult, LpmError>>;
@@ -197,12 +206,13 @@ fn spawn_v2_link_task(
             .map_err(|_| LpmError::Registry("v2 link semaphore closed".into()))?;
         tokio::task::spawn_blocking(move || {
             let start = Instant::now();
-            let (materialized, freshly_populated) =
-                lpm_linker::v2::link_v2_one(&plan, &target, &store)?;
+            let (materialized, freshly_populated, timings) =
+                lpm_linker::v2::link_v2_one_with_timings(&plan, &target, &store)?;
             Ok(V2LinkTaskResult {
                 materialized,
                 freshly_populated,
                 ms: start.elapsed().as_millis(),
+                timings,
             })
         })
         .await
@@ -4798,7 +4808,7 @@ async fn run_with_options_under_store_lock(
                     .then(|| format!("{}@{}", task.materialized.name, task.materialized.version));
                 v2_link_task_timings.record(task.ms, task.freshly_populated);
                 if let Some(package_display) = package_display.as_deref() {
-                    slow_package_timings.record_link_v2_one(package_display, task.ms);
+                    slow_package_timings.record_link_v2_one(package_display, task.ms, task.timings);
                 }
                 if task.freshly_populated {
                     linked_count += 1;

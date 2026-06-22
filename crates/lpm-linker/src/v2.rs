@@ -496,6 +496,15 @@ pub fn link_v2_one(
     target: &V2Target,
     store: &Store,
 ) -> Result<(MaterializedPackage, bool), LpmError> {
+    link_v2_one_with_timings(plan, target, store)
+        .map(|(materialized, freshly_populated, _)| (materialized, freshly_populated))
+}
+
+pub fn link_v2_one_with_timings(
+    plan: &LinkPlanV2,
+    target: &V2Target,
+    store: &Store,
+) -> Result<(MaterializedPackage, bool, lpm_store::v2::LinkEntryTimings), LpmError> {
     // Per-package span. Records name+version so Tracy can attribute
     // time to specific slow packages.
     let _span = tracing::info_span!(
@@ -510,7 +519,7 @@ pub fn link_v2_one(
         version: target.target.version.clone(),
         destination: store.paths().link_package_dir(&entry.key),
     };
-    Ok((mat, entry.freshly_populated))
+    Ok((mat, entry.freshly_populated, entry.timings))
 }
 
 /// Result handle for [`link_v2_finalize`] — separated from
@@ -747,6 +756,7 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
 struct PopulatedEntry {
     key: Arc<GraphKey>,
     freshly_populated: bool,
+    timings: lpm_store::v2::LinkEntryTimings,
 }
 
 fn populate_one(
@@ -859,6 +869,7 @@ fn populate_one(
     Ok(PopulatedEntry {
         key,
         freshly_populated: entry.freshly_populated,
+        timings: entry.timings,
     })
 }
 
