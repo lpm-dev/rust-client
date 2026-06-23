@@ -35,6 +35,9 @@ const SIGSTORE_HTTP_TIMEOUT_SECS: u64 = 30;
 /// the cap in [`crate::provenance_bundle`] for consistency.
 const SIGSTORE_RESPONSE_CAP_BYTES: usize = 1024 * 1024;
 
+pub(crate) const SIGSTORE_BUNDLE_MEDIA_TYPE: &str =
+    "application/vnd.dev.sigstore.bundle+json;version=0.2";
+
 /// Sigstore service endpoints.
 ///
 /// Fields are intentionally private. Only [`Self::production`] (the
@@ -150,6 +153,10 @@ async fn read_response_body_capped(
 /// A complete Sigstore bundle ready to attach to a publish payload.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SigstoreBundle {
+    /// Sigstore bundle wire-format media type.
+    #[serde(rename = "mediaType")]
+    pub media_type: String,
+
     /// The DSSE envelope (signed statement).
     #[serde(rename = "dsseEnvelope")]
     pub dsse_envelope: DsseEnvelope,
@@ -432,12 +439,12 @@ pub async fn sign_and_record_with_endpoints(
     let payload_type = "application/vnd.in-toto+json";
     let payload_b64 = BASE64.encode(slsa_statement_json);
 
-    // Sign the PAE-encoded payload with ECDSA P-256.
-    // The signature is encoded as raw R||S bytes (64 bytes for P-256), NOT DER.
-    // Rekor accepts both raw and DER; raw is simpler and matches npm's format.
+    // Node's `crypto.sign` and sigstore-js emit DER ECDSA signatures.
+    // Matching that encoding keeps npm provenance attachments compatible
+    // while the verifier still accepts older raw bundles.
     let pae_bytes = crate::sigstore_verify::pae(payload_type, slsa_statement_json);
     let signature: p256::ecdsa::Signature = signing_key.sign(&pae_bytes);
-    let signature_b64 = BASE64.encode(signature.to_bytes().as_slice());
+    let signature_b64 = BASE64.encode(signature.to_der().as_bytes());
 
     let dsse_envelope = DsseEnvelope {
         payload_type: payload_type.into(),
@@ -465,6 +472,7 @@ pub async fn sign_and_record_with_endpoints(
     };
 
     Ok(SigstoreBundle {
+        media_type: SIGSTORE_BUNDLE_MEDIA_TYPE.to_string(),
         dsse_envelope,
         verification_material,
     })
@@ -529,8 +537,8 @@ async fn fulcio_get_certificate(
 
     tracing::debug!("Fulcio response content-type: {content_type}");
     tracing::debug!(
-        "Fulcio response body (first 500 chars): {}",
-        &response_text[..response_text.len().min(500)]
+        response_len = response_text.len(),
+        "Fulcio response received"
     );
 
     // Parse response — v2 returns JSON with PEM certs inside, v1 returns raw PEM.
@@ -1965,6 +1973,7 @@ mod tests {
     #[test]
     fn sigstore_bundle_serializes() {
         let bundle = SigstoreBundle {
+            media_type: SIGSTORE_BUNDLE_MEDIA_TYPE.to_string(),
             dsse_envelope: DsseEnvelope {
                 payload_type: "application/vnd.in-toto+json".into(),
                 payload: "dGVzdA==".into(),
@@ -1981,6 +1990,8 @@ mod tests {
         };
 
         let json = serde_json::to_string(&bundle).unwrap();
+        assert!(json.contains("mediaType"));
+        assert!(json.contains(SIGSTORE_BUNDLE_MEDIA_TYPE));
         assert!(json.contains("dsseEnvelope"));
         assert!(json.contains("verificationMaterial"));
         assert!(json.contains("x509CertificateChain"));

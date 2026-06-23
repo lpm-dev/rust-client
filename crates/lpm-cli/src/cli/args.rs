@@ -124,8 +124,20 @@ pub(crate) enum StageCommands {
         dry_run: bool,
 
         /// Generate and require Sigstore provenance.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["no_provenance", "provenance_file"])]
         provenance: bool,
+
+        /// Disable provenance even when npm config enables it.
+        #[arg(long = "no-provenance", conflicts_with_all = ["provenance", "provenance_file"])]
+        no_provenance: bool,
+
+        /// Attach a pre-generated Sigstore provenance bundle.
+        #[arg(
+            long = "provenance-file",
+            value_name = "PATH",
+            conflicts_with = "no_provenance"
+        )]
+        provenance_file: Option<PathBuf>,
 
         /// Minimum quality score required to stage (0-100).
         #[arg(long)]
@@ -931,8 +943,20 @@ pub(crate) enum Commands {
         yes: bool,
 
         /// Generate and require Sigstore provenance (CI with OIDC only). Fails if provenance cannot be produced.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["no_provenance", "provenance_file"])]
         provenance: bool,
+
+        /// Disable provenance even when npm config enables it.
+        #[arg(long = "no-provenance", conflicts_with_all = ["provenance", "provenance_file"])]
+        no_provenance: bool,
+
+        /// Attach a pre-generated Sigstore provenance bundle.
+        #[arg(
+            long = "provenance-file",
+            value_name = "PATH",
+            conflicts_with = "no_provenance"
+        )]
+        provenance_file: Option<PathBuf>,
 
         /// Minimum quality score required to publish (0-100).
         #[arg(long)]
@@ -2993,6 +3017,124 @@ mod tests {
             }) => assert!(allow_unverified, "flag must surface as true"),
             _ => panic!("expected download command"),
         }
+    }
+
+    #[test]
+    fn publish_provenance_file_flag_parses_for_npm_target() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "publish",
+            "--npm",
+            "--provenance-file",
+            "bundle.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Publish {
+                npm,
+                provenance,
+                no_provenance,
+                provenance_file,
+                ..
+            }) => {
+                assert!(npm);
+                assert!(!provenance);
+                assert!(!no_provenance);
+                assert_eq!(
+                    provenance_file.as_deref(),
+                    Some(std::path::Path::new("bundle.json"))
+                );
+            }
+            _ => panic!("expected publish command"),
+        }
+    }
+
+    #[test]
+    fn publish_provenance_modes_are_mutually_exclusive() {
+        assert!(
+            Cli::try_parse_from([
+                "lpm",
+                "publish",
+                "--provenance",
+                "--provenance-file",
+                "b.json"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["lpm", "publish", "--provenance", "--no-provenance"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "lpm",
+                "publish",
+                "--no-provenance",
+                "--provenance-file",
+                "b.json"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn stage_publish_provenance_file_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "stage",
+            "publish",
+            "--provenance-file",
+            "bundle.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Stage {
+                command:
+                    StageCommands::Publish {
+                        provenance,
+                        no_provenance,
+                        provenance_file,
+                        ..
+                    },
+            }) => {
+                assert!(!provenance);
+                assert!(!no_provenance);
+                assert_eq!(
+                    provenance_file.as_deref(),
+                    Some(std::path::Path::new("bundle.json"))
+                );
+            }
+            _ => panic!("expected stage publish command"),
+        }
+    }
+
+    #[test]
+    fn stage_publish_provenance_modes_are_mutually_exclusive() {
+        assert!(
+            Cli::try_parse_from([
+                "lpm",
+                "stage",
+                "publish",
+                "--provenance",
+                "--provenance-file",
+                "b.json"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["lpm", "stage", "publish", "--provenance", "--no-provenance"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "lpm",
+                "stage",
+                "publish",
+                "--no-provenance",
+                "--provenance-file",
+                "b.json"
+            ])
+            .is_err()
+        );
     }
 
     // ─── command_needs_global_state predicate ─────

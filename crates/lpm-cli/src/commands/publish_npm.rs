@@ -3,7 +3,9 @@
 //! Handles building the npm-compatible payload, sending the PUT request,
 //! OTP detection and retry, and npm-specific error handling.
 
-use crate::commands::publish_common::build_npm_payload;
+use crate::commands::publish_common::{
+    NpmPayloadOptions, NpmProvenanceAttachment, build_npm_payload,
+};
 use crate::commands::web_auth;
 use crate::output;
 use lpm_common::LpmError;
@@ -142,6 +144,7 @@ pub async fn publish_to_npm(
     version: &str,
     version_data: &serde_json::Value,
     tarball_data: &[u8],
+    provenance_attachment: Option<&NpmProvenanceAttachment>,
     access: &str,
     tag: &str,
     registry_url: &str,
@@ -155,6 +158,7 @@ pub async fn publish_to_npm(
         version,
         version_data,
         tarball_data,
+        provenance_attachment,
         access,
         tag,
         registry_url,
@@ -205,6 +209,7 @@ async fn publish_to_npm_impl(
     version: &str,
     version_data: &serde_json::Value,
     tarball_data: &[u8],
+    provenance_attachment: Option<&NpmProvenanceAttachment>,
     access: &str,
     tag: &str,
     registry_url: &str,
@@ -234,7 +239,10 @@ async fn publish_to_npm_impl(
         version_data,
         tarball_data,
         access,
-        Some(tag),
+        NpmPayloadOptions {
+            tag: Some(tag),
+            provenance_attachment,
+        },
     );
 
     // S3: Scale timeout based on tarball size
@@ -561,6 +569,7 @@ mod tests {
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
             b"fake-tarball",
+            None,
             "public",
             "latest",
             &server.uri(),
@@ -592,6 +601,50 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(web_auth::NPM_COMMAND_PUBLISH)
         );
+    }
+
+    #[tokio::test]
+    async fn publish_to_npm_attaches_explicit_sigstore_bundle() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let provenance = NpmProvenanceAttachment {
+            media_type: "application/vnd.dev.sigstore.bundle+json;version=0.2".into(),
+            data: r#"{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.2"}"#.into(),
+        };
+
+        let result = publish_to_npm_impl(
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
+            b"fake-tarball",
+            Some(&provenance),
+            "public",
+            "latest",
+            &server.uri(),
+            false,
+            false,
+            false,
+            NpmPublishRuntime::test(),
+        )
+        .await
+        .expect("publish should succeed");
+
+        assert!(result.success);
+        let requests = server.received_requests().await.unwrap();
+        let publish_request = requests
+            .iter()
+            .find(|request| request.method.as_str() == "PUT")
+            .expect("publish request should be recorded");
+        let payload: serde_json::Value = serde_json::from_slice(&publish_request.body).unwrap();
+        let attachment = &payload["_attachments"]["plain-pkg-1.0.0.sigstore"];
+        assert_eq!(attachment["content_type"], provenance.media_type);
+        assert_eq!(attachment["data"], provenance.data);
+        assert_eq!(attachment["length"], provenance.data.len());
     }
 
     #[tokio::test]
@@ -627,6 +680,7 @@ mod tests {
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
             b"fake-tarball",
+            None,
             "public",
             "latest",
             &server.uri(),
@@ -689,6 +743,7 @@ mod tests {
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
             b"fake-tarball",
+            None,
             "public",
             "latest",
             &server.uri(),

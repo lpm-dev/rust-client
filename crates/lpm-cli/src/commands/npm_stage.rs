@@ -1,4 +1,6 @@
-use crate::commands::publish_common::build_npm_payload;
+use crate::commands::publish_common::{
+    NpmPayloadOptions, NpmProvenanceAttachment, build_npm_payload,
+};
 use crate::commands::publish_npm::NPM_REGISTRY_URL;
 use crate::commands::web_auth;
 use crate::output;
@@ -221,6 +223,7 @@ pub(crate) async fn stage_publish(
     version: &str,
     version_data: &serde_json::Value,
     tarball_data: &[u8],
+    provenance_attachment: Option<&NpmProvenanceAttachment>,
     access: &str,
     tag: &str,
     registry_url: &str,
@@ -231,6 +234,7 @@ pub(crate) async fn stage_publish(
         version,
         version_data,
         tarball_data,
+        provenance_attachment,
         access,
         tag,
         registry_url,
@@ -245,6 +249,7 @@ async fn stage_publish_impl(
     version: &str,
     version_data: &serde_json::Value,
     tarball_data: &[u8],
+    provenance_attachment: Option<&NpmProvenanceAttachment>,
     access: &str,
     tag: &str,
     registry_url: &str,
@@ -258,7 +263,10 @@ async fn stage_publish_impl(
         version_data,
         tarball_data,
         access,
-        Some(tag),
+        NpmPayloadOptions {
+            tag: Some(tag),
+            provenance_attachment,
+        },
     );
     let tarball_mb = tarball_data.len() as u64 / (1024 * 1024);
     let timeout = Duration::from_secs(std::cmp::min(60 + tarball_mb * 2, 600));
@@ -720,6 +728,8 @@ fn safe_tarball_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn endpoint_url_joins_registry_and_route_once() {
@@ -772,5 +782,47 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("use HTTPS"));
+    }
+
+    #[tokio::test]
+    async fn stage_publish_attaches_explicit_sigstore_bundle() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/-/stage/package/plain-pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "stageId": "stage-123"
+            })))
+            .mount(&server)
+            .await;
+        let provenance = NpmProvenanceAttachment {
+            media_type: "application/vnd.dev.sigstore.bundle+json;version=0.2".into(),
+            data: r#"{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.2"}"#.into(),
+        };
+
+        let result = stage_publish_impl(
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({"name": "plain-pkg", "version": "1.0.0"}),
+            b"fake-tarball",
+            Some(&provenance),
+            "public",
+            "latest",
+            &server.uri(),
+        )
+        .await
+        .expect("stage publish should succeed");
+
+        assert_eq!(result.stage_id, "stage-123");
+        let requests = server.received_requests().await.unwrap();
+        let request = requests
+            .iter()
+            .find(|request| request.method.as_str() == "POST")
+            .expect("stage request should be recorded");
+        let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let attachment = &payload["_attachments"]["plain-pkg-1.0.0.sigstore"];
+        assert_eq!(attachment["content_type"], provenance.media_type);
+        assert_eq!(attachment["data"], provenance.data);
+        assert_eq!(attachment["length"], provenance.data.len());
     }
 }

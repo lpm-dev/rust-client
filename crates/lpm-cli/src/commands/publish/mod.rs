@@ -15,7 +15,9 @@ mod version_data;
 pub(crate) use npm_artifact::prepare_npm_target_artifact;
 pub use orchestrator::run;
 pub(crate) use prepare::prepare_publish_project;
-pub(crate) use provenance::resolve_provenance_context;
+pub(crate) use provenance::{
+    ProvenanceRequest, materialize_provenance_request, resolve_provenance_request,
+};
 pub(crate) use quality_gate::run_publish_quality_gate;
 pub(crate) use secret_scan::run_publish_secret_scan;
 #[allow(unused_imports)]
@@ -23,7 +25,7 @@ pub use target::resolve_targets;
 #[allow(unused_imports)]
 pub(crate) use types::{
     NpmTargetArtifactInput, ProvenanceContext, PublishProject, PublishQualityGateInput,
-    PublishResult, PublishTarget,
+    PublishResult, PublishTarget, ResolvedProvenance,
 };
 pub(crate) use version_data::build_publish_version_data;
 

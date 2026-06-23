@@ -4,6 +4,7 @@
 
 mod support;
 
+use support::assertions::parse_json_output;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
 use wiremock::matchers::{header, method, path};
@@ -472,7 +473,10 @@ async fn publish_npm_uses_trusted_publishing_token_exchange() {
     project.write_file("index.js", "module.exports = {}");
     project.write_file(
         "lpm.json",
-        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+        &format!(
+            r#"{{"publish":{{"npm":{{"registry":"{}","access":"restricted"}}}}}}"#,
+            mock.url()
+        ),
     );
 
     let output = lpm(&project)
@@ -599,6 +603,363 @@ async fn publish_npm_repo_configured_custom_registry_refuses_ambient_npm_token()
     assert!(
         requests.is_empty(),
         "ambient NPM_TOKEN must be rejected before contacting custom registry; got {} request(s)",
+        requests.len()
+    );
+}
+
+#[tokio::test]
+async fn publish_npm_json_upload_failure_emits_single_result_document() {
+    let mock = MockRegistry::start().await;
+    let package = "json-upload-failure-pkg";
+    Mock::given(method("PUT"))
+        .and(path(format!("/{package}")))
+        .and(header(
+            "authorization",
+            format!("Bearer {CUSTOM_REGISTRY_TOKEN}"),
+        ))
+        .and(header("npm-command", "publish"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+            "error": "server_error",
+            "message": "forced publish failure",
+        })))
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.0.0",
+        "description": "npm publish JSON upload failure",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+    );
+
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &mock.url(),
+            "--token",
+            CUSTOM_REGISTRY_TOKEN,
+        ])
+        .output()
+        .expect("failed to store custom registry token");
+    assert!(
+        login.status.success(),
+        "custom registry login must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&login.stdout),
+        String::from_utf8_lossy(&login.stderr),
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--npm", "--yes"])
+        .output()
+        .expect("failed to run lpm publish --npm --json");
+
+    assert!(
+        !output.status.success(),
+        "failed npm publish must return a non-zero status"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let documents = serde_json::Deserializer::from_str(&stdout)
+        .into_iter::<serde_json::Value>()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| panic!("stdout must contain JSON documents only: {e}\n---\n{stdout}"));
+    assert_eq!(
+        documents.len(),
+        1,
+        "publish --json must emit exactly one JSON document on target failure\n{stdout}"
+    );
+
+    let envelope = &documents[0];
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    let results = envelope["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("publish JSON results must be an array: {envelope:#}"));
+    assert_eq!(results.len(), 1, "expected one npm result: {envelope:#}");
+    assert_eq!(results[0]["registry"], serde_json::json!("npm"));
+    assert_eq!(results[0]["success"], serde_json::json!(false));
+    assert!(
+        results[0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("server_error")),
+        "target failure should be captured in the result envelope: {envelope:#}"
+    );
+    assert!(
+        !stderr.contains("one or more publish targets failed")
+            && !stderr.contains("registry error"),
+        "publish --json target failure must not emit a second framework diagnostic, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn publish_npm_provenance_restricted_access_fails_before_registry_contact() {
+    let mock = MockRegistry::start().await;
+    let package = "restricted-provenance-pkg";
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.0.0",
+        "description": "Restricted npm provenance precondition",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"registry":"{}","access":"restricted"}}}}}}"#,
+            mock.url()
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .args(["publish", "--npm", "--provenance", "--yes"])
+        .output()
+        .expect("failed to run lpm publish --npm --provenance");
+
+    assert!(
+        !output.status.success(),
+        "restricted npm provenance must fail before publish"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("npm provenance requires public access") && stderr.contains(package),
+        "expected public-access provenance error, got:\n{stderr}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "restricted provenance precondition must fail before contacting npm registry; got {} request(s)",
+        requests.len()
+    );
+}
+
+#[test]
+fn publish_provenance_file_rejects_lpm_target_before_validation() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.file-provenance",
+        "version": "1.0.0",
+        "description": "Mixed target provenance-file precondition",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"npm":{"name":"@scope/file-provenance"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "publish",
+            "--lpm",
+            "--npm",
+            "--provenance-file",
+            "bundle.sigstore",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to run lpm publish with mixed targets and provenance file");
+
+    assert!(
+        !output.status.success(),
+        "provenance-file must reject mixed LPM targets"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--provenance-file is only supported for npm-compatible publish targets"),
+        "expected provenance-file target error, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Secret scan"),
+        "target compatibility must fail before publish validation, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn publish_provenance_file_restricted_access_fails_before_file_validation() {
+    let mock = MockRegistry::start().await;
+    let package = "restricted-file-provenance-pkg";
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.0.0",
+        "description": "Restricted npm file provenance precondition",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"registry":"{}","access":"restricted"}}}}}}"#,
+            mock.url()
+        ),
+    );
+
+    let output = lpm(&project)
+        .args([
+            "publish",
+            "--npm",
+            "--provenance-file",
+            "missing.sigstore",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to run lpm publish --npm --provenance-file");
+
+    assert!(
+        !output.status.success(),
+        "restricted npm file provenance must fail before publish"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("npm provenance requires public access") && stderr.contains(package),
+        "expected public-access provenance error, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("missing.sigstore"),
+        "restricted access must fail before file validation, got:\n{stderr}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "restricted file-provenance precondition must fail before contacting npm registry; got {} request(s)",
+        requests.len()
+    );
+}
+
+#[tokio::test]
+async fn publish_provenance_file_invalid_json_fails_before_npm_auth() {
+    let mock = MockRegistry::start().await;
+    let package = "invalid-file-provenance-pkg";
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.0.0",
+        "description": "Invalid provenance-file preflight",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file("bundle.sigstore", "not json");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+    );
+
+    let output = lpm(&project)
+        .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .args([
+            "publish",
+            "--npm",
+            "--provenance-file",
+            "bundle.sigstore",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to run lpm publish --npm --provenance-file");
+
+    assert!(
+        !output.status.success(),
+        "invalid provenance file must fail before npm auth"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("invalid provenance file"),
+        "expected provenance file parse error, got:\n{combined}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "invalid provenance file must fail before contacting npm registry; got {} request(s)",
+        requests.len()
+    );
+}
+
+#[tokio::test]
+async fn publish_check_provenance_file_invalid_json_fails_before_success() {
+    let mock = MockRegistry::start().await;
+    let package = "check-invalid-file-provenance-pkg";
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.0.0",
+        "description": "Invalid provenance-file check preflight",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file("bundle.sigstore", "not json");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+    );
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "publish",
+            "--check",
+            "--npm",
+            "--provenance-file",
+            "bundle.sigstore",
+        ])
+        .output()
+        .expect("failed to run lpm publish --check --provenance-file");
+
+    assert!(
+        !output.status.success(),
+        "publish --check must validate provenance files before returning success"
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["error_code"], serde_json::json!("registry"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("invalid provenance file")),
+        "expected JSON provenance file parse error, got:\n{}",
+        serde_json::to_string_pretty(&envelope).unwrap()
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "invalid provenance file in --check must fail before contacting npm registry; got {} request(s)",
         requests.len()
     );
 }

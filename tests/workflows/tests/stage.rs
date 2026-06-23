@@ -175,6 +175,183 @@ async fn stage_publish_uses_npm_trusted_publishing_token_exchange() {
 }
 
 #[tokio::test]
+async fn stage_publish_provenance_restricted_access_fails_before_oidc_exchange() {
+    let mock = MockRegistry::start().await;
+    let project = stage_project();
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"npm":{"name":"@scope/staged-pkg","access":"restricted"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .args([
+            "stage",
+            "publish",
+            "--yes",
+            "--provenance",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("failed to run lpm stage publish --provenance");
+
+    assert!(
+        !output.status.success(),
+        "restricted stage provenance must fail before npm auth"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("npm provenance requires public access")
+            && stderr.contains("@scope/staged-pkg"),
+        "expected public-access provenance error, got:\n{stderr}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "restricted stage provenance precondition must fail before npm registry contact; got {} request(s)",
+        requests.len()
+    );
+}
+
+#[tokio::test]
+async fn stage_publish_dry_run_provenance_restricted_access_fails_before_registry_contact() {
+    let mock = MockRegistry::start().await;
+    let project = stage_project();
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"name":"@scope/staged-pkg","registry":"{}","access":"restricted"}}}}}}"#,
+            mock.url()
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["stage", "publish", "--dry-run", "--provenance", "--yes"])
+        .output()
+        .expect("failed to run lpm stage publish --dry-run --provenance");
+
+    assert!(
+        !output.status.success(),
+        "restricted stage provenance must fail even during dry-run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("npm provenance requires public access"),
+        "expected public-access provenance error, got:\n{stderr}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "dry-run restricted provenance must fail before registry contact; got {} request(s)",
+        requests.len()
+    );
+}
+
+#[tokio::test]
+async fn stage_publish_provenance_file_invalid_json_fails_before_npm_auth() {
+    let mock = MockRegistry::start().await;
+    let project = stage_project();
+    project.write_file("bundle.sigstore", "not json");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"name":"@scope/staged-pkg","registry":"{}"}}}}}}"#,
+            mock.url()
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .args([
+            "stage",
+            "publish",
+            "--provenance-file",
+            "bundle.sigstore",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to run lpm stage publish --provenance-file");
+
+    assert!(
+        !output.status.success(),
+        "invalid stage provenance file must fail before npm auth"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid provenance file"),
+        "expected provenance file parse error, got:\n{stderr}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "invalid stage provenance file must fail before npm registry contact; got {} request(s)",
+        requests.len()
+    );
+}
+
+#[tokio::test]
+async fn stage_publish_provenance_file_restricted_access_fails_before_file_validation() {
+    let mock = MockRegistry::start().await;
+    let project = stage_project();
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"name":"@scope/staged-pkg","registry":"{}","access":"restricted"}}}}}}"#,
+            mock.url()
+        ),
+    );
+
+    let output = lpm(&project)
+        .args([
+            "stage",
+            "publish",
+            "--provenance-file",
+            "missing.sigstore",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to run lpm stage publish --provenance-file");
+
+    assert!(
+        !output.status.success(),
+        "restricted stage file provenance must fail before npm auth"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("npm provenance requires public access")
+            && stderr.contains("@scope/staged-pkg"),
+        "expected public-access provenance error, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("missing.sigstore"),
+        "restricted access must fail before file validation, got:\n{stderr}"
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "restricted stage file-provenance precondition must fail before npm registry contact; got {} request(s)",
+        requests.len()
+    );
+}
+
+#[tokio::test]
 async fn stage_publish_repo_configured_custom_registry_uses_registry_scoped_token() {
     let mock = MockRegistry::start().await;
     mount_package_metadata_with_token(

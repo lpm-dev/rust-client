@@ -210,7 +210,7 @@ fn rejects_envelope_whose_signature_is_not_valid_base64() {
 fn rejects_envelope_whose_signature_is_neither_raw_nor_der() {
     // A 7-byte signature is neither 64-byte raw nor valid DER.
     // Single-signature envelopes must fail-closed with a parse-
-    // attempt diagnostic; the "tried raw and DER" wording is the
+    // attempt diagnostic; the "tried DER and raw" wording is the
     // contract.
     let (cert_der, signing_key) = p256_cert_and_signing_key();
     let mut envelope = dsse_envelope_signed_with(&signing_key, PAYLOAD);
@@ -219,7 +219,7 @@ fn rejects_envelope_whose_signature_is_neither_raw_nor_der() {
     let err = verify_dsse(&envelope, &cert).expect_err("unparseable signature must fail");
     let msg = expect_dsse_sig_msg(err);
     assert!(
-        msg.contains("raw and DER"),
+        msg.contains("DER and raw"),
         "expected parse-attempt diagnostic, got: {msg}"
     );
 }

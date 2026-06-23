@@ -1,4 +1,4 @@
-use crate::commands::publish_common::TarballFile;
+use crate::commands::publish_common::{NpmProvenanceAttachment, TarballFile};
 use crate::oidc;
 use lpm_runner::lpm_json;
 use std::path::Path;
@@ -73,14 +73,29 @@ pub(crate) struct PublishProject {
     pub(crate) swift_manifest: Option<serde_json::Value>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ProvenanceContext {
     pub(crate) ci: oidc::CiEnvironment,
     pub(crate) jwt: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LoadedProvenanceFile {
+    pub(crate) attachment: NpmProvenanceAttachment,
+    pub(crate) statement: serde_json::Value,
+}
+
+#[derive(Clone)]
+pub(crate) enum ResolvedProvenance {
+    Generate(ProvenanceContext),
+    File(LoadedProvenanceFile),
+}
+
+#[derive(Debug)]
 pub(crate) struct NpmTargetArtifact {
     pub(crate) tarball_data: Vec<u8>,
     pub(crate) version_data: serde_json::Value,
+    pub(crate) provenance_attachment: Option<NpmProvenanceAttachment>,
 }
 
 pub(crate) struct PublishQualityGateInput<'a> {
@@ -100,7 +115,7 @@ pub(crate) struct NpmTargetArtifactInput<'a> {
     pub(crate) version: &'a str,
     pub(crate) base_version_data: &'a serde_json::Value,
     pub(crate) base_tarball_data: &'a [u8],
-    pub(crate) provenance_context: Option<&'a ProvenanceContext>,
+    pub(crate) provenance_context: Option<&'a ResolvedProvenance>,
     pub(crate) target_label: &'a str,
     pub(crate) json_output: bool,
 }
