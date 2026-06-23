@@ -256,8 +256,10 @@ fn commit_digest_sha1(material: Option<&serde_json::Value>) -> serde_json::Value
         .and_then(|material| material.get("digest"))
         .and_then(|digest| digest.get("sha1"))
         .and_then(|sha1| sha1.as_str())
-        .map(|sha1| serde_json::json!({ "sha1": sha1 }))
-        .unwrap_or_else(|| serde_json::json!({}))
+        .map_or_else(
+            || serde_json::json!({}),
+            |sha1| serde_json::json!({ "sha1": sha1 }),
+        )
 }
 
 pub(crate) fn npm_package_purl(package_name: &str, version: &str) -> String {

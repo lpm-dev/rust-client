@@ -277,14 +277,13 @@ fn validate_identity_matches_predicate(
             "provenance statement workflow repository {actual_repository:?} does not match signing identity {expected_repository:?}"
         )));
     }
-    if let Some(expected_path) = verified.snapshot.workflow_path.as_deref() {
-        if let Some(actual_path) = workflow_path_from_statement(statement)
-            && actual_path != expected_path
-        {
-            return Err(LpmError::Registry(format!(
-                "provenance statement workflow path {actual_path:?} does not match signing identity {expected_path:?}"
-            )));
-        }
+    if let Some(expected_path) = verified.snapshot.workflow_path.as_deref()
+        && let Some(actual_path) = workflow_path_from_statement(statement)
+        && actual_path != expected_path
+    {
+        return Err(LpmError::Registry(format!(
+            "provenance statement workflow path {actual_path:?} does not match signing identity {expected_path:?}"
+        )));
     }
     if let Some(expected_ref) = verified.snapshot.workflow_ref.as_deref()
         && let Some(actual_ref) = workflow_ref_from_statement(statement)
