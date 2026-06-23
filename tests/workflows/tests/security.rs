@@ -309,6 +309,39 @@ fn security_unlock_rejects_empty_package_filter_before_interactive_guard() {
 }
 
 #[test]
+fn security_unlock_typosquat_disable_scope_reaches_approval_guard() {
+    let project = TempProject::empty(r#"{"name":"security-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "security",
+            "unlock",
+            "typosquat-disable",
+            "--project",
+            ".",
+        ])
+        .output()
+        .expect("failed to run lpm --json security unlock typosquat-disable");
+
+    assert!(
+        !output.status.success(),
+        "non-interactive typosquat-disable unlock must require approval"
+    );
+
+    let envelope = json_output(&output, "lpm --json security unlock typosquat-disable");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(
+        envelope["error_code"],
+        serde_json::json!("security_approval_required")
+    );
+    assert_eq!(
+        envelope["error"]["requested_scopes"][0],
+        "typosquat-disable"
+    );
+}
+
+#[test]
 fn security_lock_rejects_empty_package_filter() {
     let project = TempProject::empty(r#"{"name":"security-test","version":"1.0.0"}"#);
 

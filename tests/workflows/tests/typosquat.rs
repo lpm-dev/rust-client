@@ -2,7 +2,7 @@ mod support;
 
 use support::assertions::parse_json_output;
 use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry, write_signed_typosquat_guard_posture};
 
 #[test]
 fn install_json_rejects_new_cli_arg_typosquat_before_manifest_mutation() {
@@ -119,6 +119,154 @@ async fn install_json_env_can_disable_manifest_typosquat_analysis() {
     );
     let json = parse_json_output(&output.stdout);
     assert_eq!(json["success"], true);
+    assert!(project.file_exists("lpm.lock"));
+}
+
+#[test]
+fn install_json_force_floor_keeps_typosquat_guard_enabled_against_env_disable() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-force-floor",
+            "version":"1.0.0",
+            "dependencies":{"axois":"^1.0.0"}
+        }"#,
+    );
+    let config_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&config_dir).expect("create isolated LPM_HOME");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "force-security-floor = true\n",
+    )
+    .expect("seed force floor config");
+
+    let output = lpm(&project)
+        .env("LPM_TYPOSQUAT_GUARD", "off")
+        .args(["install", "--json"])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        !output.status.success(),
+        "force floor must keep typosquat analysis enabled despite env override\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["error_code"], "typosquat_suspected");
+    assert_eq!(json["error"]["findings"][0]["package"], "axois");
+}
+
+#[tokio::test]
+async fn install_json_global_config_can_disable_manifest_typosquat_analysis() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("axois", "1.0.0");
+    mock.with_package("axois", "1.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-config-disabled",
+            "version":"1.0.0",
+            "dependencies":{"axois":"^1.0.0"}
+        }"#,
+    );
+    let config_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&config_dir).expect("create isolated LPM_HOME");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "typosquat-guard = \"off\"\n",
+    )
+    .expect("seed global typosquat config");
+    write_signed_typosquat_guard_posture(&project, "off");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        output.status.success(),
+        "config-disabled typosquat analysis should allow install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert!(project.file_exists("lpm.lock"));
+}
+
+#[test]
+fn install_json_global_config_off_requires_security_approval_without_signed_posture() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-config-unapproved",
+            "version":"1.0.0",
+            "dependencies":{"axois":"^1.0.0"}
+        }"#,
+    );
+    let config_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&config_dir).expect("create isolated LPM_HOME");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "typosquat-guard = \"off\"\n",
+    )
+    .expect("seed global typosquat config");
+
+    let output = lpm(&project)
+        .args(["install", "--json"])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        !output.status.success(),
+        "unapproved typosquat-guard off must require security approval\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["error_code"], "security_approval_required");
+}
+
+#[tokio::test]
+async fn install_json_allows_known_legitimate_prismjs_package() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("prismjs", "1.0.0");
+    mock.with_package("prismjs", "1.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-legitimate",
+            "version":"1.0.0",
+            "dependencies":{}
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "prismjs",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        output.status.success(),
+        "legitimate prismjs install should pass typosquat guard\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert!(project.read_file("package.json").contains("prismjs"));
     assert!(project.file_exists("lpm.lock"));
 }
 

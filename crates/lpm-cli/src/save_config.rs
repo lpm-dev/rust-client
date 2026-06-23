@@ -6,7 +6,7 @@
 //! 1. **Project config**: `./lpm.toml` (in the install root). Highest
 //!    precedence — a project that wants exact pins for everything sets
 //!    `save-exact = true` here and every developer's install honors it.
-//! 2. **Global config**: `~/.lpm/config.toml`. The user's personal
+//! 2. **Global config**: the configured LPM root's `config.toml`. The user's personal
 //!    default for projects that don't specify one. Read via the existing
 //!    [`crate::commands::config::GlobalConfig`] reader so users can set
 //!    these keys with the existing `lpm config set save-prefix '~'`
@@ -44,7 +44,7 @@
 //! depending on the team's preference.
 
 use crate::save_spec::{SaveConfig, SavePrefix};
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot};
 use std::path::Path;
 
 /// save-policy config loader. Resolves the effective
@@ -59,7 +59,7 @@ pub struct SaveConfigLoader;
 impl SaveConfigLoader {
     /// Build the effective [`SaveConfig`] for `project_dir`.
     ///
-    /// Reads `<project_dir>/lpm.toml` first, then `~/.lpm/config.toml`,
+    /// Reads `<project_dir>/lpm.toml` first, then the configured LPM root's `config.toml`,
     /// then merges with built-in defaults. Per-project values win over
     /// per-user values; either may be partially specified.
     ///
@@ -71,14 +71,19 @@ impl SaveConfigLoader {
         let project_path = project_dir.join("lpm.toml");
         let project = read_save_keys_from_file(&project_path)?;
 
-        let global_path = dirs::home_dir().map(|h| h.join(".lpm").join("config.toml"));
-        let global = match global_path {
+        let global = match global_config_path() {
             Some(ref p) => read_save_keys_from_file(p)?,
             None => RawSaveKeys::default(),
         };
 
         Ok(merge(project, global))
     }
+}
+
+fn global_config_path() -> Option<std::path::PathBuf> {
+    LpmRoot::from_env()
+        .ok()
+        .map(|root| root.root().join("config.toml"))
 }
 
 /// Raw key snapshot from a single TOML file. `None` means the key is
@@ -519,6 +524,25 @@ some-future-key = 42
     }
 
     #[test]
+    fn load_for_project_reads_global_file_from_lpm_home_when_set() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("LPM_HOME", lpm_home.path().as_os_str().to_owned()),
+        ]);
+        write_config(&lpm_home.path().join("config.toml"), "save-exact = true");
+
+        let cfg = SaveConfigLoader::load_for_project(project_dir.path()).unwrap();
+
+        assert!(
+            cfg.save_exact,
+            "global save config must be read from LPM_HOME/config.toml when LPM_HOME is set",
+        );
+    }
+
+    #[test]
     fn load_for_project_project_overrides_global() {
         let project_dir = tempfile::tempdir().unwrap();
         write_config(&project_dir.path().join("lpm.toml"), r#"save-prefix = "^""#);
@@ -560,17 +584,20 @@ some-future-key = 42
         );
     }
 
-    /// Test helper: redirect HOME to a per-test temp directory so the
-    /// global config reader doesn't pick up the developer's actual
-    /// `~/.lpm/config.toml`. Returns a `TempDir` whose lifetime brackets
-    /// the override — drop it at the end of the test to restore.
+    /// Test helper: redirect HOME and LPM_HOME to a per-test temp
+    /// directory so the global config reader doesn't pick up the
+    /// developer's actual LPM root. Returns a `TempDir` whose lifetime
+    /// brackets the override — drop it at the end of the test to restore.
     ///
     /// **Concurrency note:** uses `std::env::set_var`, which is process-
     /// global. The test runner may run these tests in parallel, so we
     /// serialize them under a mutex.
     fn scoped_home_dir() -> ScopedHomeDir {
         let dir = tempfile::tempdir().unwrap();
-        let env = crate::test_env::ScopedEnv::set([("HOME", dir.path().as_os_str().to_owned())]);
+        let env = crate::test_env::ScopedEnv::set([
+            ("HOME", dir.path().as_os_str().to_owned()),
+            ("LPM_HOME", dir.path().join(".lpm").as_os_str().to_owned()),
+        ]);
         ScopedHomeDir { dir, _env: env }
     }
 

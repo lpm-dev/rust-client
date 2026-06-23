@@ -75,6 +75,14 @@ pub(super) fn managed_policy_blocks_scope(
         {
             Some("sigstore.verify")
         }
+        ApprovalScope::TyposquatDisable
+            if matches!(
+                effective.sources.typosquat_guard,
+                PostureSourceKind::ManagedPolicy
+            ) =>
+        {
+            Some(crate::commands::config::TYPOSQUAT_GUARD_KEY)
+        }
         _ => None,
     }?;
     Some(managed_policy_scope_error(
@@ -111,6 +119,9 @@ pub(super) fn managed_policy_blocks_scope_direct(
             if policy.sigstore_verify.is_some() =>
         {
             Some("sigstore.verify")
+        }
+        ApprovalScope::TyposquatDisable if policy.typosquat_guard.is_some() => {
+            Some(crate::commands::config::TYPOSQUAT_GUARD_KEY)
         }
         _ => None,
     }?;
@@ -674,6 +685,95 @@ pub fn authorize_persistent_sigstore(
     }
     posture.sigstore_verify = crate::security_floor::sigstore_mode_name(requested).to_string();
     persist_authorized_posture(&posture)
+}
+
+pub fn authorize_persistent_typosquat_guard(
+    requested: crate::commands::config::TyposquatGuardSelection,
+    json_output: bool,
+    command_hint: &str,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let current = effective.posture.typosquat_guard();
+    let weakens_current = requested.loosens(current);
+    if weakens_current
+        && matches!(
+            effective.sources.typosquat_guard,
+            PostureSourceKind::ManagedPolicy
+        )
+    {
+        let managed_policy = effective
+            .managed_policy
+            .as_ref()
+            .expect("managed policy source must include status metadata");
+        let err = managed_policy_write_error(
+            managed_policy,
+            crate::commands::config::TYPOSQUAT_GUARD_KEY,
+            requested.as_str(),
+            current.as_str(),
+        );
+        record_persistent_guarded_attempt(ApprovalScope::TyposquatDisable, false, &err.to_string());
+        return Err(err);
+    }
+
+    let mut posture = load_authorized_posture()?;
+    if weakens_current {
+        confirm_persistent_weakening(
+            ApprovalScope::TyposquatDisable,
+            json_output,
+            command_hint,
+            &format!(
+                "Persisting `{} = {}` weakens the approved machine posture.",
+                crate::commands::config::TYPOSQUAT_GUARD_KEY,
+                requested.as_str()
+            ),
+        )?;
+    } else if !matches!(
+        effective.approved_posture_source,
+        PostureSourceKind::ApprovedStore
+    ) {
+        return Ok(());
+    } else {
+        let approved = posture.typosquat_guard();
+        if requested == approved || requested.loosens(approved) {
+            return Ok(());
+        }
+    }
+    posture.typosquat_guard = requested.as_str().to_string();
+    persist_authorized_posture(&posture)
+}
+
+pub fn ensure_runtime_typosquat_guard_config_authorized(
+    project_dir: &Path,
+    json_output: bool,
+    requested: crate::commands::config::TyposquatGuardSelection,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let approved = effective.posture.typosquat_guard();
+    if !requested.loosens(approved) {
+        return Ok(());
+    }
+    if let Some(err) = managed_policy_blocks_scope(&effective, ApprovalScope::TyposquatDisable) {
+        record_audit_event(
+            AuditRecord::new(
+                "guarded-attempt",
+                false,
+                vec![ApprovalScope::TyposquatDisable.as_str().to_string()],
+            )
+            .project_root(canonical_project_root(project_dir))
+            .source(ApprovalSource::GlobalConfig)
+            .detail("runtime typosquat guard posture is weaker than managed policy".to_string()),
+        );
+        return Err(err);
+    }
+    ensure_project_unlock(
+        ApprovalScope::TyposquatDisable,
+        project_dir,
+        json_output,
+        ApprovalSource::GlobalConfig,
+        "The persisted global typosquat-guard setting weakens suspicious package-name analysis for this project.",
+        None,
+        &[],
+    )
 }
 
 pub fn ensure_runtime_sigstore_posture(

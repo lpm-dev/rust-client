@@ -188,6 +188,42 @@ pub fn write_signed_unlock(project: &TempProject, scopes: &[&str]) {
     .expect("write signed unlock");
 }
 
+/// Write a signed approved machine posture with a specific typosquat
+/// guard floor for workflow scenarios that intentionally exercise an
+/// approved machine-wide typosquat setting.
+pub fn write_signed_typosquat_guard_posture(project: &TempProject, typosquat_guard: &str) {
+    use hmac::Mac;
+
+    let security_dir = project.home().join(".lpm/security");
+    std::fs::create_dir_all(&security_dir).expect("create security dir");
+    let secret = [42u8; 32];
+    std::fs::write(security_dir.join("signing-secret.hex"), hex::encode(secret))
+        .expect("write security signing secret");
+
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+        "script_policy": "deny",
+        "minimum_release_age_secs": 86400,
+        "release_age_policy": "direct",
+        "sandbox_mode": "default",
+        "sandbox_allow_degraded": false,
+        "sigstore_verify": "deny",
+        "typosquat_guard": typosquat_guard,
+    });
+    let mut mac = HmacSha256::new_from_slice(&secret).expect("valid hmac secret");
+    mac.update(&serde_json::to_vec(&payload).expect("serialize posture payload"));
+    let envelope = serde_json::json!({
+        "payload": payload,
+        "signature": hex::encode(mac.finalize().into_bytes()),
+    });
+    std::fs::write(
+        security_dir.join("approved-posture.json"),
+        serde_json::to_string_pretty(&envelope).expect("serialize posture envelope"),
+    )
+    .expect("write signed approved posture");
+}
+
 /// Common interface for `assert_cmd::Command` and `std::process::Command`
 /// so the workflow-tier env-isolation set can be applied uniformly to both.
 ///

@@ -6,6 +6,7 @@ use lpm_common::{LpmError, TyposquatErrorContext, TyposquatErrorFinding};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, Value};
 
 const ENV_TYPOSQUAT_GUARD: &str = "LPM_TYPOSQUAT_GUARD";
+const SINGLE_FINDING_DEFAULT_CHOICE: &str = "cancel";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TyposquatSource<'a> {
@@ -45,7 +46,7 @@ pub(crate) fn guard_explicit_package_specs(
     json_output: bool,
 ) -> Result<GuardedPackageSpecs, LpmError> {
     let package_names = parse_package_names(packages)?;
-    if typosquat_guard_disabled() {
+    if typosquat_guard_disabled(project_dir, json_output)? {
         return Ok(GuardedPackageSpecs {
             specs: packages.to_vec(),
         });
@@ -97,7 +98,7 @@ pub(crate) fn guard_manifest_direct_dependencies(
         validate_package_name(name)?;
     }
 
-    if typosquat_guard_disabled() {
+    if typosquat_guard_disabled(project_dir, json_output)? {
         return Ok(());
     }
 
@@ -129,7 +130,7 @@ pub(crate) fn guard_manifest_direct_dependencies(
         return Ok(());
     }
 
-    Err(error_context(project_dir, findings, None))
+    Err(error_context(project_dir, findings, None, false))
 }
 
 pub(crate) fn validate_package_name(name: &str) -> Result<(), LpmError> {
@@ -176,7 +177,12 @@ fn resolve_findings(
         return prompt_explicit_findings(project_dir, specs, package_names, &findings, prompt_mode);
     }
 
-    Err(error_context(project_dir, findings, suggested_command))
+    Err(error_context(
+        project_dir,
+        findings,
+        suggested_command,
+        false,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -191,8 +197,42 @@ fn can_prompt(json_output: bool, yes: bool) -> bool {
         && std::io::stdin().is_terminal()
 }
 
-fn typosquat_guard_disabled() -> bool {
-    typosquat_guard_disabled_from_env_value(std::env::var(ENV_TYPOSQUAT_GUARD).ok().as_deref())
+fn typosquat_guard_disabled(project_dir: &Path, json_output: bool) -> Result<bool, LpmError> {
+    let global = crate::commands::config::GlobalConfig::load();
+    if let Some(selection) = global.get_typosquat_guard_mode() {
+        crate::security_approval::ensure_runtime_typosquat_guard_config_authorized(
+            project_dir,
+            json_output,
+            selection,
+        )?;
+        return Ok(selection.disables_guard());
+    }
+    if typosquat_guard_disabled_from_env_value(std::env::var(ENV_TYPOSQUAT_GUARD).ok().as_deref())
+        && typosquat_guard_env_disable_allowed(&global)?
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn typosquat_guard_env_disable_allowed(
+    global: &crate::commands::config::GlobalConfig,
+) -> Result<bool, LpmError> {
+    if crate::security_floor::force_security_floor_enabled(global) {
+        return Ok(false);
+    }
+
+    let effective = crate::security_approval::load_effective_authorized_posture()?;
+    if matches!(
+        effective.sources.typosquat_guard,
+        crate::security_approval::PostureSourceKind::ManagedPolicy
+    ) && crate::commands::config::TyposquatGuardSelection::Off
+        .loosens(effective.posture.typosquat_guard())
+    {
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 fn typosquat_guard_disabled_from_env_value(value: Option<&str>) -> bool {
@@ -244,7 +284,7 @@ fn prompt_explicit_findings(
         )
         .item("allow", allow_label, "Writes policy.typosquat to lpm.toml")
         .item("cancel", "Cancel", "")
-        .initial_value("install_suggestion")
+        .initial_value(SINGLE_FINDING_DEFAULT_CHOICE)
         .interact()
         .map_err(crate::prompt::prompt_err)?;
 
@@ -261,7 +301,12 @@ fn prompt_explicit_findings(
                     specs: specs.to_vec(),
                 })
             }
-            "cancel" => Err(error_context(project_dir, findings.to_vec(), None)),
+            "cancel" => Err(error_context(
+                project_dir,
+                findings.to_vec(),
+                suggested_command(specs, package_names, findings),
+                true,
+            )),
             _ => Err(LpmError::Registry(
                 "unknown typosquat prompt choice".to_string(),
             )),
@@ -289,7 +334,7 @@ fn prompt_explicit_findings(
                 specs: specs.to_vec(),
             })
         }
-        "cancel" => Err(error_context(project_dir, findings.to_vec(), None)),
+        "cancel" => Err(error_context(project_dir, findings.to_vec(), None, true)),
         _ => Err(LpmError::Registry(
             "unknown typosquat prompt choice".to_string(),
         )),
@@ -326,7 +371,7 @@ fn prompt_allow_manifest_findings(
             }
             Ok(())
         }
-        "cancel" => Err(error_context(project_dir, findings.to_vec(), None)),
+        "cancel" => Err(error_context(project_dir, findings.to_vec(), None, true)),
         _ => Err(LpmError::Registry(
             "unknown typosquat prompt choice".to_string(),
         )),
@@ -377,6 +422,7 @@ fn error_context(
     project_dir: &Path,
     findings: Vec<GuardFinding>,
     suggested_command: Option<String>,
+    cancelled: bool,
 ) -> LpmError {
     let allow_example = findings
         .first()
@@ -395,6 +441,7 @@ fn error_context(
         config_path: project_dir.join("lpm.toml").display().to_string(),
         allow_example,
         suggested_command,
+        cancelled,
     }))
 }
 
@@ -607,7 +654,86 @@ fn ensure_table(doc: &mut DocumentMut, key: &str) -> Result<(), LpmError> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::fs;
+
+    fn absent_managed_policy_path(dir: &tempfile::TempDir) -> OsString {
+        dir.path()
+            .join("absent-managed-security-policy.toml")
+            .as_os_str()
+            .to_owned()
+    }
+
+    fn scoped_lpm_home_with_config(raw: &str) -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), raw).unwrap();
+        let env = crate::test_env::ScopedEnv::update([
+            ("LPM_HOME", Some(dir.path().as_os_str().to_owned())),
+            (
+                "LPM_SECURITY_POLICY_PATH",
+                Some(absent_managed_policy_path(&dir)),
+            ),
+            (ENV_TYPOSQUAT_GUARD, None),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                Some(OsString::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )),
+            ),
+        ]);
+        (dir, env)
+    }
+
+    fn scoped_empty_lpm_home() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::test_env::ScopedEnv::update([
+            ("LPM_HOME", Some(dir.path().as_os_str().to_owned())),
+            (
+                "LPM_SECURITY_POLICY_PATH",
+                Some(absent_managed_policy_path(&dir)),
+            ),
+            (ENV_TYPOSQUAT_GUARD, None),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                Some(OsString::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )),
+            ),
+        ]);
+        (dir, env)
+    }
+
+    fn scoped_lpm_home_with_env(
+        env_value: &str,
+    ) -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::test_env::ScopedEnv::update([
+            ("LPM_HOME", Some(dir.path().as_os_str().to_owned())),
+            (
+                "LPM_SECURITY_POLICY_PATH",
+                Some(absent_managed_policy_path(&dir)),
+            ),
+            (
+                ENV_TYPOSQUAT_GUARD,
+                Some(std::ffi::OsString::from(env_value)),
+            ),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                Some(OsString::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )),
+            ),
+        ]);
+        (dir, env)
+    }
+
+    fn approve_typosquat_guard(selection: crate::commands::config::TyposquatGuardSelection) {
+        let posture = crate::security_approval::AuthorizedPosture {
+            typosquat_guard: selection.as_str().to_string(),
+            ..crate::security_approval::AuthorizedPosture::default()
+        };
+        crate::security_approval::persist_authorized_posture(&posture).unwrap();
+    }
 
     #[test]
     fn validate_package_name_rejects_flag_shaped_names() {
@@ -625,6 +751,130 @@ mod tests {
         assert!(!typosquat_guard_disabled_from_env_value(Some("")));
         assert!(!typosquat_guard_disabled_from_env_value(Some("1")));
         assert!(!typosquat_guard_disabled_from_env_value(Some("true")));
+    }
+
+    #[test]
+    fn typosquat_guard_global_config_off_disables_analysis() {
+        let (_dir, _env) = scoped_lpm_home_with_config("typosquat-guard = \"off\"\n");
+        approve_typosquat_guard(crate::commands::config::TyposquatGuardSelection::Off);
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(typosquat_guard_disabled(project.path(), true).unwrap());
+    }
+
+    #[test]
+    fn typosquat_guard_env_disable_applies_when_config_override_is_absent() {
+        let (_dir, _env) = scoped_lpm_home_with_env("0");
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(typosquat_guard_disabled(project.path(), true).unwrap());
+    }
+
+    #[test]
+    fn typosquat_guard_global_config_default_overrides_env_disable() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "typosquat-guard = \"default\"\n",
+        )
+        .unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("LPM_HOME", dir.path().as_os_str().to_owned()),
+            ("LPM_SECURITY_POLICY_PATH", absent_managed_policy_path(&dir)),
+            (ENV_TYPOSQUAT_GUARD, OsString::from("0")),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                OsString::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ),
+        ]);
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(!typosquat_guard_disabled(project.path(), true).unwrap());
+    }
+
+    #[test]
+    fn typosquat_guard_force_floor_blocks_env_disable_when_config_override_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "force-security-floor = true\n",
+        )
+        .unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("LPM_HOME", dir.path().as_os_str().to_owned()),
+            ("LPM_SECURITY_POLICY_PATH", absent_managed_policy_path(&dir)),
+            (ENV_TYPOSQUAT_GUARD, OsString::from("off")),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                OsString::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ),
+        ]);
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(!typosquat_guard_disabled(project.path(), true).unwrap());
+    }
+
+    #[test]
+    fn typosquat_guard_managed_policy_blocks_env_disable_when_config_override_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("managed-security-policy.toml"),
+            "typosquat-guard = \"on\"\n",
+        )
+        .unwrap();
+        let _env = crate::test_env::ScopedEnv::update([
+            ("LPM_HOME", Some(dir.path().as_os_str().to_owned())),
+            (
+                "LPM_SECURITY_POLICY_PATH",
+                Some(
+                    dir.path()
+                        .join("managed-security-policy.toml")
+                        .as_os_str()
+                        .to_owned(),
+                ),
+            ),
+            (ENV_TYPOSQUAT_GUARD, Some(OsString::from("off"))),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                Some(OsString::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )),
+            ),
+        ]);
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(!typosquat_guard_disabled(project.path(), true).unwrap());
+    }
+
+    #[test]
+    fn typosquat_guard_global_config_on_overrides_env_disable() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "typosquat-guard = \"on\"\n").unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("LPM_HOME", dir.path().as_os_str().to_owned()),
+            ("LPM_SECURITY_POLICY_PATH", absent_managed_policy_path(&dir)),
+            (ENV_TYPOSQUAT_GUARD, OsString::from("off")),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                OsString::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ),
+        ]);
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(!typosquat_guard_disabled(project.path(), true).unwrap());
+    }
+
+    #[test]
+    fn typosquat_guard_invalid_global_config_value_stays_enabled() {
+        let (_dir, _env) = scoped_lpm_home_with_config("typosquat-guard = \"yolo\"\n");
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(!typosquat_guard_disabled(project.path(), true).unwrap());
+    }
+
+    #[test]
+    fn explicit_typosquat_prompt_defaults_to_cancel() {
+        assert_eq!(SINGLE_FINDING_DEFAULT_CHOICE, "cancel");
     }
 
     #[test]
@@ -686,6 +936,7 @@ mod tests {
 
     #[test]
     fn guard_explicit_specs_returns_rewritten_suggestion_in_json_mode_error() {
+        let (_home, _env) = scoped_empty_lpm_home();
         let dir = tempfile::tempdir().unwrap();
         let specs = vec!["axois@^1".to_string()];
         let err = guard_explicit_package_specs(
@@ -718,6 +969,7 @@ mod tests {
                 source: "cli".to_string(),
             }],
             None,
+            false,
         );
 
         let LpmError::TyposquatSuspected(context) = err else {
@@ -730,6 +982,7 @@ mod tests {
 
     #[test]
     fn explicit_guard_rejects_when_package_is_new_for_one_target_root() {
+        let (_home, _env) = scoped_empty_lpm_home();
         let root_a = tempfile::tempdir().unwrap();
         let root_b = tempfile::tempdir().unwrap();
         let mut lockfile = lpm_lockfile::Lockfile::new();
@@ -759,6 +1012,7 @@ mod tests {
 
     #[test]
     fn explicit_guard_skips_when_package_is_locked_for_every_target_root() {
+        let (_home, _env) = scoped_empty_lpm_home();
         let root_a = tempfile::tempdir().unwrap();
         let root_b = tempfile::tempdir().unwrap();
         for root in [root_a.path(), root_b.path()] {
@@ -790,7 +1044,7 @@ mod tests {
 
     #[test]
     fn explicit_guard_env_disable_skips_suspicious_name_analysis() {
-        let _env = crate::test_env::ScopedEnv::set([(ENV_TYPOSQUAT_GUARD, "0".into())]);
+        let (_home, _env) = scoped_lpm_home_with_env("0");
         let dir = tempfile::tempdir().unwrap();
         let specs = vec!["axois".to_string()];
 
@@ -808,7 +1062,25 @@ mod tests {
 
     #[test]
     fn explicit_guard_env_disable_preserves_package_name_validation() {
-        let _env = crate::test_env::ScopedEnv::set([(ENV_TYPOSQUAT_GUARD, "0".into())]);
+        let (_home, _env) = scoped_lpm_home_with_env("0");
+        let dir = tempfile::tempdir().unwrap();
+        let specs = vec!["--legacy-peer-deps".to_string()];
+
+        let err = guard_explicit_package_specs(
+            dir.path(),
+            &specs,
+            &[dir.path().to_path_buf()],
+            false,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, LpmError::InvalidPackageName(_)));
+    }
+
+    #[test]
+    fn explicit_guard_config_disable_preserves_package_name_validation() {
+        let (_home, _env) = scoped_lpm_home_with_config("typosquat-guard = \"off\"\n");
         let dir = tempfile::tempdir().unwrap();
         let specs = vec!["--legacy-peer-deps".to_string()];
 
@@ -826,6 +1098,7 @@ mod tests {
 
     #[test]
     fn manifest_guard_skips_direct_dependency_already_in_lockfile() {
+        let (_home, _env) = scoped_empty_lpm_home();
         let dir = tempfile::tempdir().unwrap();
         let mut lockfile = lpm_lockfile::Lockfile::new();
         lockfile.importers.insert(
@@ -854,7 +1127,7 @@ mod tests {
 
     #[test]
     fn manifest_guard_env_disable_skips_suspicious_name_analysis() {
-        let _env = crate::test_env::ScopedEnv::set([(ENV_TYPOSQUAT_GUARD, "0".into())]);
+        let (_home, _env) = scoped_lpm_home_with_env("0");
         let dir = tempfile::tempdir().unwrap();
         let pkg = lpm_workspace::PackageJson {
             dependencies: HashMap::from([("axois".to_string(), "^1.0.0".to_string())]),
@@ -872,7 +1145,7 @@ mod tests {
 
     #[test]
     fn manifest_guard_env_disable_skips_typosquat_policy_loading() {
-        let _env = crate::test_env::ScopedEnv::set([(ENV_TYPOSQUAT_GUARD, "0".into())]);
+        let (_home, _env) = scoped_lpm_home_with_env("0");
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("lpm.toml"), "[policy.typosquat.allow]\n").unwrap();
         let pkg = lpm_workspace::PackageJson {

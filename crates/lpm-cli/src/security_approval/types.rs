@@ -15,10 +15,11 @@ pub enum ApprovalScope {
     SandboxNone,
     SandboxAllowDegraded,
     CapabilityWiden,
+    TyposquatDisable,
     FloorEdit,
 }
 
-const ALL_APPROVAL_SCOPES: [ApprovalScope; 13] = [
+const ALL_APPROVAL_SCOPES: [ApprovalScope; 14] = [
     ApprovalScope::CooldownBypass,
     ApprovalScope::CooldownWindow,
     ApprovalScope::ProvenanceIgnoreDrift,
@@ -31,10 +32,11 @@ const ALL_APPROVAL_SCOPES: [ApprovalScope; 13] = [
     ApprovalScope::SandboxNone,
     ApprovalScope::SandboxAllowDegraded,
     ApprovalScope::CapabilityWiden,
+    ApprovalScope::TyposquatDisable,
     ApprovalScope::FloorEdit,
 ];
 
-const DEFAULT_UNLOCK_SCOPES: [ApprovalScope; 9] = [
+const DEFAULT_UNLOCK_SCOPES: [ApprovalScope; 10] = [
     ApprovalScope::CooldownBypass,
     ApprovalScope::CooldownWindow,
     ApprovalScope::ProvenanceIgnoreDrift,
@@ -44,6 +46,7 @@ const DEFAULT_UNLOCK_SCOPES: [ApprovalScope; 9] = [
     ApprovalScope::SandboxDefault,
     ApprovalScope::SandboxNone,
     ApprovalScope::SandboxAllowDegraded,
+    ApprovalScope::TyposquatDisable,
 ];
 
 impl ApprovalScope {
@@ -69,6 +72,7 @@ impl ApprovalScope {
             Self::SandboxNone => "sandbox-none",
             Self::SandboxAllowDegraded => "sandbox-allow-degraded",
             Self::CapabilityWiden => "capability-widen",
+            Self::TyposquatDisable => "typosquat-disable",
             Self::FloorEdit => "floor-edit",
         }
     }
@@ -111,6 +115,8 @@ pub struct AuthorizedPosture {
     pub sandbox_mode: String,
     pub sandbox_allow_degraded: bool,
     pub sigstore_verify: String,
+    #[serde(default = "default_typosquat_guard_string")]
+    pub typosquat_guard: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -121,10 +127,17 @@ pub struct AuthorizedPostureView {
     pub sandbox_mode: String,
     pub sandbox_allow_degraded: bool,
     pub sigstore_verify: String,
+    pub typosquat_guard: String,
 }
 
 fn default_release_age_policy_string() -> String {
     ReleaseAgePolicy::Direct.as_str().to_string()
+}
+
+fn default_typosquat_guard_string() -> String {
+    crate::commands::config::TyposquatGuardSelection::Default
+        .as_str()
+        .to_string()
 }
 
 impl Default for AuthorizedPosture {
@@ -138,6 +151,7 @@ impl Default for AuthorizedPosture {
             sandbox_mode: ResolvedSandboxMode::Default.as_str().to_string(),
             sandbox_allow_degraded: false,
             sigstore_verify: "deny".to_string(),
+            typosquat_guard: default_typosquat_guard_string(),
         }
     }
 }
@@ -173,6 +187,11 @@ impl AuthorizedPosture {
         }
     }
 
+    pub fn typosquat_guard(&self) -> crate::commands::config::TyposquatGuardSelection {
+        crate::commands::config::TyposquatGuardSelection::parse(&self.typosquat_guard)
+            .unwrap_or(crate::commands::config::TyposquatGuardSelection::Default)
+    }
+
     pub fn to_view(&self) -> AuthorizedPostureView {
         AuthorizedPostureView {
             script_policy: self.script_policy.clone(),
@@ -181,6 +200,7 @@ impl AuthorizedPosture {
             sandbox_mode: self.sandbox_mode.clone(),
             sandbox_allow_degraded: self.sandbox_allow_degraded,
             sigstore_verify: self.sigstore_verify.clone(),
+            typosquat_guard: self.typosquat_guard().as_str().to_string(),
         }
     }
 }
@@ -201,6 +221,7 @@ pub struct EffectivePostureSources {
     pub sandbox_mode: PostureSourceKind,
     pub sandbox_allow_degraded: PostureSourceKind,
     pub sigstore_verify: PostureSourceKind,
+    pub typosquat_guard: PostureSourceKind,
 }
 
 impl EffectivePostureSources {
@@ -212,6 +233,7 @@ impl EffectivePostureSources {
             sandbox_mode: base,
             sandbox_allow_degraded: base,
             sigstore_verify: base,
+            typosquat_guard: base,
         }
     }
 }
@@ -276,6 +298,7 @@ pub(super) struct ManagedPolicy {
     pub(super) sandbox_mode: Option<ResolvedSandboxMode>,
     pub(super) sandbox_allow_degraded: Option<bool>,
     pub(super) sigstore_verify: Option<EnforceMode>,
+    pub(super) typosquat_guard: Option<crate::commands::config::TyposquatGuardSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

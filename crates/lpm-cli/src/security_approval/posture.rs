@@ -41,6 +41,10 @@ pub fn load_effective_authorized_posture() -> Result<EffectiveAuthorizedPosture,
                 crate::security_floor::sigstore_mode_name(sigstore_verify).to_string();
             sources.sigstore_verify = PostureSourceKind::ManagedPolicy;
         }
+        if let Some(typosquat_guard) = policy.typosquat_guard {
+            posture.typosquat_guard = typosquat_guard.as_str().to_string();
+            sources.typosquat_guard = PostureSourceKind::ManagedPolicy;
+        }
     }
 
     Ok(EffectiveAuthorizedPosture {
@@ -62,6 +66,7 @@ pub fn persist_authorized_posture(posture: &AuthorizedPosture) -> Result<(), Lpm
 fn active_runtime_overrides(effective: &EffectiveAuthorizedPosture) -> Vec<RuntimeOverride> {
     let env_value = std::env::var("LPM_PROVENANCE_ENFORCE").ok();
     let global = crate::commands::config::GlobalConfig::load();
+    let mut overrides = Vec::new();
     let (mode, source) =
         EnforceMode::resolve_from_chain(env_value.as_deref(), || global.get_sigstore_verify());
     let effective_mode = effective.posture.sigstore_verify();
@@ -71,7 +76,7 @@ fn active_runtime_overrides(effective: &EffectiveAuthorizedPosture) -> Vec<Runti
             | crate::provenance_fetch::EnforceModeSource::Config
     ) && mode != effective_mode
     {
-        return vec![RuntimeOverride {
+        overrides.push(RuntimeOverride {
             control: "sigstore.verify".to_string(),
             value: crate::security_floor::sigstore_mode_name(mode).to_string(),
             source: match source {
@@ -83,9 +88,19 @@ fn active_runtime_overrides(effective: &EffectiveAuthorizedPosture) -> Vec<Runti
                 }
                 crate::provenance_fetch::EnforceModeSource::Default => unreachable!(),
             },
-        }];
+        });
     }
-    Vec::new()
+    let effective_typosquat = effective.posture.typosquat_guard();
+    if let Some(config_typosquat) = global.get_typosquat_guard_mode()
+        && config_typosquat != effective_typosquat
+    {
+        overrides.push(RuntimeOverride {
+            control: crate::commands::config::TYPOSQUAT_GUARD_KEY.to_string(),
+            value: config_typosquat.as_str().to_string(),
+            source: "~/.lpm/config.toml typosquat-guard".to_string(),
+        });
+    }
+    overrides
 }
 
 pub fn load_security_status(

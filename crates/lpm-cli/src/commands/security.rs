@@ -21,6 +21,7 @@ pub(crate) enum SecurityScopeSelector {
     SandboxNone,
     SandboxAllowDegraded,
     CapabilityWiden,
+    TyposquatDisable,
     FloorEdit,
 }
 
@@ -41,6 +42,7 @@ impl SecurityScopeSelector {
             Self::SandboxNone => ApprovalScope::SandboxNone.as_str(),
             Self::SandboxAllowDegraded => ApprovalScope::SandboxAllowDegraded.as_str(),
             Self::CapabilityWiden => ApprovalScope::CapabilityWiden.as_str(),
+            Self::TyposquatDisable => ApprovalScope::TyposquatDisable.as_str(),
             Self::FloorEdit => ApprovalScope::FloorEdit.as_str(),
         }
     }
@@ -65,6 +67,7 @@ impl SecurityScopeSelector {
             Self::SandboxNone => vec![ApprovalScope::SandboxNone],
             Self::SandboxAllowDegraded => vec![ApprovalScope::SandboxAllowDegraded],
             Self::CapabilityWiden => vec![ApprovalScope::CapabilityWiden],
+            Self::TyposquatDisable => vec![ApprovalScope::TyposquatDisable],
             Self::FloorEdit => vec![ApprovalScope::FloorEdit],
         }
     }
@@ -392,6 +395,14 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 sourced_policy_value(
                     &status.effective_floor.sigstore_verify,
                     status.floor_sources.sigstore_verify
+                ),
+            );
+            println!(
+                "  {} {}",
+                install_ui::dim(&format!("{:<24}", "typosquat guard")),
+                sourced_policy_value(
+                    &status.effective_floor.typosquat_guard,
+                    status.floor_sources.typosquat_guard
                 ),
             );
 
