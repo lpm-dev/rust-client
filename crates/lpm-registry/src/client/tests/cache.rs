@@ -597,6 +597,95 @@ async fn direct_npm_release_times_full_accepts_time_only_metadata_and_caches_it(
 }
 
 #[tokio::test]
+async fn worker_release_times_request_uses_slim_query_and_caches_it() {
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "vite";
+    let release_times = serde_json::json!({
+        "name": npm_name,
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/registry/vite"))
+        .and(query_param("release_times", "1"))
+        .and(header("Accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(release_times))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fetched = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::LpmWorker)
+        .await
+        .expect("Worker release-time fetch should accept a slim response");
+    assert_eq!(
+        fetched.time.get("1.0.0").map(String::as_str),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/vite"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let cached = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::LpmWorker)
+        .await
+        .expect("fresh Worker release-time cache should avoid the network");
+    assert_eq!(
+        cached.time.get("1.0.0").map(String::as_str),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}
+
+#[tokio::test]
+async fn worker_release_times_use_time_from_batch_metadata_cache() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "vite";
+    let mut metadata = test_metadata(npm_name);
+    metadata
+        .time
+        .insert("1.0.0".to_string(), "2025-01-01T00:00:00.000Z".to_string());
+    client.write_metadata_cache(&format!("npm:{npm_name}"), &metadata, None);
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/vite"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let fetched = client
+        .get_npm_release_times_routed_full(npm_name, crate::UpstreamRoute::LpmWorker)
+        .await
+        .expect("batch metadata cache should satisfy release-time lookup");
+    assert_eq!(
+        fetched.time.get("1.0.0").map(String::as_str),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+}
+
+#[tokio::test]
 async fn direct_npm_release_times_etag_304_revalidation_refreshes_cache() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

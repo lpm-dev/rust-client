@@ -116,6 +116,17 @@ impl RegistryClient {
         )))
     }
 
+    async fn cached_release_times_from_metadata_cache(
+        &self,
+        name: &str,
+    ) -> Option<ReleaseTimeMetadata> {
+        let metadata_cache_key = format!("npm:{name}");
+        let (cached, _etag) = self
+            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&metadata_cache_key)
+            .await?;
+        (cached.matches_package(name) && !cached.time.is_empty()).then_some(cached)
+    }
+
     async fn send_package_metadata_request(
         &self,
         request_builder: reqwest::RequestBuilder,
@@ -203,7 +214,8 @@ impl RegistryClient {
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        self.batch_metadata_inner(package_names, false).await
+        self.batch_metadata_inner(package_names, false, &[], false)
+            .await
     }
 
     /// Batch fetch with deep transitive resolution.
@@ -214,13 +226,31 @@ impl RegistryClient {
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        self.batch_metadata_inner(package_names, true).await
+        self.batch_metadata_inner(package_names, true, &[], false)
+            .await
+    }
+
+    pub async fn batch_metadata_deep_with_release_age_packages(
+        &self,
+        package_names: &[String],
+        release_age_package_names: &[String],
+        release_age_all_packages: bool,
+    ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
+        self.batch_metadata_inner(
+            package_names,
+            true,
+            release_age_package_names,
+            release_age_all_packages,
+        )
+        .await
     }
 
     pub(super) async fn batch_metadata_inner(
         &self,
         package_names: &[String],
         deep: bool,
+        release_age_package_names: &[String],
+        release_age_all_packages: bool,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         if package_names.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -231,7 +261,22 @@ impl RegistryClient {
         }
 
         let url = format!("{}/api/registry/batch-metadata", self.base_url);
-        let body = serde_json::json!({ "packages": package_names, "deep": deep });
+        let mut body = serde_json::json!({ "packages": package_names, "deep": deep });
+        if release_age_all_packages {
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "releaseAgeAllPackages".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+        } else if !release_age_package_names.is_empty()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert(
+                "releaseAgePackages".to_string(),
+                serde_json::json!(release_age_package_names),
+            );
+        }
 
         // Wall-clock the entire RPC (request + parse). Metadata fetches
         // dominate `resolve_ms` on cold installs; the timer feeds
@@ -1442,9 +1487,13 @@ impl RegistryClient {
             crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
+        if let Some(cached) = self.cached_release_times_from_metadata_cache(name).await {
+            crate::timing::record_metadata_cache_hit();
+            return Ok(cached);
+        }
         crate::timing::record_metadata_cache_miss();
 
-        let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
+        let proxy_url = format!("{}/api/registry/{}?release_times=1", self.base_url, name);
         let cache_validator = self.read_cache_validator(&cache_key);
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
@@ -1548,6 +1597,15 @@ impl RegistryClient {
                 && cached.matches_package(name)
                 && !cached.time.is_empty()
             {
+                timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+                timings.cache_hit = true;
+                crate::timing::record_metadata_cache_hit();
+                return Ok(TimedReleaseTimeMetadata {
+                    metadata: cached,
+                    timings,
+                });
+            }
+            if let Some(cached) = self.cached_release_times_from_metadata_cache(name).await {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
