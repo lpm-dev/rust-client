@@ -1389,7 +1389,7 @@ async fn async_main() -> Result<()> {
             set,
         } => {
             commands::config::run(
-                &action,
+                action.as_deref(),
                 key.as_deref(),
                 value.as_deref(),
                 set.as_deref(),

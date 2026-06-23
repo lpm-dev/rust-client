@@ -14,6 +14,33 @@ fn seed_config(project: &TempProject, content: &str) {
 }
 
 #[test]
+fn config_without_action_requires_interactive_terminal() {
+    let project = TempProject::empty(r#"{"name":"config-menu","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["config"])
+        .output()
+        .expect("failed to run bare lpm config");
+
+    assert!(
+        !output.status.success(),
+        "bare lpm config without a TTY must fail:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lpm config requires an interactive terminal"),
+        "bare lpm config must emit the guided-editor TTY error, got:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("required arguments") && !stderr.contains("Usage:"),
+        "bare lpm config must be handled by the command, not rejected by clap, got:\n{stderr}",
+    );
+}
+
+#[test]
 fn config_set_writes_value_into_isolated_home() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
 

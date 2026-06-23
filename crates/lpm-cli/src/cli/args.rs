@@ -1099,20 +1099,23 @@ pub(crate) enum Commands {
     /// Manage CLI configuration.
     Config {
         /// Action: get, set, delete, list, scripts, triage, sandbox,
-        /// sigstore, signatures, release-age, release-age-policy.
-        action: String,
+        /// sigstore, signatures, trust-policy, release-age, release-age-policy.
+        /// Omit to open the guided configuration editor.
+        action: Option<String>,
         /// Config key (for get/set/delete).
         key: Option<String>,
         /// Config value (for set).
         value: Option<String>,
         /// Non-interactive value for the `scripts` / `triage` /
-        /// `sandbox` / `sigstore` / `signatures` / `release-age` / `release-age-policy` wizards. Required when stdin is not
+        /// `sandbox` / `sigstore` / `signatures` / `trust-policy` /
+        /// `release-age` / `release-age-policy` wizards. Required when stdin is not
         /// a TTY. Examples:
         ///   `lpm config scripts --set triage`
         ///   `lpm config triage --set claude-cli`
         ///   `lpm config sandbox --set strict`
         ///   `lpm config sigstore --set deny`
         ///   `lpm config signatures --set true`
+        ///   `lpm config trust-policy --set no-downgrade`
         ///   `lpm config release-age --set 3d`
         ///   `lpm config release-age-policy --set strict`
         #[arg(long = "set", value_name = "VALUE")]
@@ -2950,6 +2953,25 @@ mod tests {
             "--verbose must not trigger version output"
         );
         assert!(matches!(cli.command, Some(Commands::Whoami)));
+    }
+
+    #[test]
+    fn config_without_action_parses_to_guided_editor() {
+        let cli = Cli::try_parse_from(["lpm", "config"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Config {
+                action,
+                key,
+                value,
+                set,
+            } => {
+                assert!(action.is_none());
+                assert!(key.is_none());
+                assert!(value.is_none());
+                assert!(set.is_none());
+            }
+            _ => panic!("expected Config command"),
+        }
     }
 
     #[test]
