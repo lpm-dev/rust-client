@@ -323,40 +323,26 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         }
         lpm_common::LpmError::Resolution(context) => resolution_error_lines(context, error),
         lpm_common::LpmError::TyposquatSuspected(context) => {
-            let mut lines = vec![SlimErrorLine::Failed("Suspicious package name".to_owned())];
+            let headline = if context.cancelled {
+                "Install cancelled"
+            } else {
+                "Suspicious package name"
+            };
+            let mut lines = vec![SlimErrorLine::Failed(headline.to_owned())];
             for finding in &context.findings {
-                lines.push(SlimErrorLine::Detail(format!(
-                    "  {} {} {} {} {}",
-                    install_ui::dim("package"),
-                    install_ui::yellow(&finding.package),
-                    install_ui::dim("looks like"),
-                    install_ui::yellow(&finding.similar_to),
-                    install_ui::dim(&format!("({})", finding.technique))
-                )));
-                lines.push(SlimErrorLine::Detail(format!(
-                    "  {} {}",
-                    install_ui::dim("source"),
-                    install_ui::cyan(&finding.source)
-                )));
+                push_detail(&mut lines, "package", &install_ui::yellow(&finding.package));
+                push_detail(
+                    &mut lines,
+                    "resembles",
+                    &format!(
+                        "{} {}",
+                        install_ui::yellow(&finding.similar_to),
+                        install_ui::dim(&format!("({})", finding.technique))
+                    ),
+                );
             }
             if let Some(command) = &context.suggested_command {
-                lines.push(SlimErrorLine::Detail(format!(
-                    "  {} {}",
-                    install_ui::dim("try"),
-                    install_ui::yellow(command)
-                )));
-            }
-            lines.push(SlimErrorLine::Detail(format!(
-                "  {} {}",
-                install_ui::dim("allow"),
-                install_ui::cyan(&context.config_path)
-            )));
-            for line in context.allow_example.lines() {
-                lines.push(SlimErrorLine::Detail(format!(
-                    "  {} {}",
-                    install_ui::dim("toml"),
-                    install_ui::cyan(line)
-                )));
+                push_detail(&mut lines, "try", &install_ui::yellow(command));
             }
             lines
         }
@@ -957,5 +943,41 @@ mod tests {
         assert_eq!(plain[2], "  scopes sandbox.strict, network.host");
         assert_eq!(plain[3], "  project /repo/app");
         assert_eq!(plain[4], "  command lpm security unlock sandbox.strict");
+    }
+
+    #[test]
+    fn slim_error_lines_render_typosquat_cancel_as_compact_contract_rows() {
+        let error =
+            lpm_common::LpmError::TyposquatSuspected(Box::new(lpm_common::TyposquatErrorContext {
+                findings: vec![lpm_common::TyposquatErrorFinding {
+                    package: "axois".into(),
+                    similar_to: "axios".into(),
+                    technique: "edit_distance".into(),
+                    source: "cli".into(),
+                }],
+                config_path: "/repo/app/lpm.toml".into(),
+                allow_example: concat!(
+                    "[[policy.typosquat.allow]]\n",
+                    "package = \"axois\"\n",
+                    "similar-to = \"axios\"\n",
+                    "reason = \"Intentional package\""
+                )
+                .into(),
+                suggested_command: Some("lpm install axios".into()),
+                cancelled: true,
+            }));
+
+        let lines = slim_error_lines(&error);
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(
+            plain,
+            vec![
+                "Install cancelled",
+                "  package axois",
+                "  resembles axios (edit_distance)",
+                "  try lpm install axios",
+            ]
+        );
     }
 }

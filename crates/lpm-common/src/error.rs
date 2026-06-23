@@ -128,6 +128,9 @@ pub struct TyposquatErrorContext {
     pub allow_example: String,
     /// Safer command when a single CLI package arg has an obvious intended target.
     pub suggested_command: Option<String>,
+    /// Whether an interactive user declined the typosquat prompt.
+    #[serde(skip)]
+    pub cancelled: bool,
 }
 
 impl TyposquatErrorContext {

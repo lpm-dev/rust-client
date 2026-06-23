@@ -8,7 +8,8 @@
 //! 2. **Per-project**: `package.json > lpm > minimumReleaseAge`. Read
 //!    via [`lpm_workspace::read_package_json`]; tolerant of missing /
 //!    malformed manifest (matches [`lpm_security::SecurityPolicy::from_package_json`]).
-//! 3. **Global**: `~/.lpm/config.toml` key `minimum-release-age-secs`.
+//! 3. **Global**: the configured LPM root's `config.toml` key
+//!    `minimum-release-age-secs`.
 //!    Read with a path-aware fallible loader; malformed TOML or a
 //!    garbage value surfaces a file-pathed error rather than being
 //!    silently ignored as [`crate::commands::config::GlobalConfig::load`]
@@ -47,7 +48,7 @@
 //! via [`parse_duration`] and fans the resulting `Option<u64>` through
 //! the install entry points alongside `allow_new`.
 
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -497,11 +498,13 @@ fn enforce_release_age_policy_posture(
     Ok(requested)
 }
 
-/// Locate `~/.lpm/config.toml`. Returns `None` only when `HOME` is
+/// Locate the configured LPM root's `config.toml`. Returns `None` only when the root is
 /// unset — in that case the global layer is silently skipped
 /// (matches [`crate::commands::config::GlobalConfig::load`]).
 fn global_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".lpm").join("config.toml"))
+    LpmRoot::from_env()
+        .ok()
+        .map(|root| root.root().join("config.toml"))
 }
 
 fn read_package_json_release_age_config(
@@ -1143,14 +1146,15 @@ mod tests {
 
     // ── ReleaseAgeResolver::resolve ──────────────────────────────
 
-    /// Redirect HOME so `dirs::home_dir()` points at a per-test temp
-    /// directory — otherwise the resolver would pick up the developer's
-    /// actual `~/.lpm/config.toml`. Mirrors the `scoped_home_dir` helper
-    /// in [`crate::save_config`].
+    /// Redirect HOME and LPM_HOME so the default LPM root points at a
+    /// per-test temp directory — otherwise the resolver would pick up the
+    /// developer's actual global config. Mirrors the `scoped_home_dir`
+    /// helper in [`crate::save_config`].
     fn scoped_home_dir() -> ScopedHomeDir {
         let dir = tempfile::tempdir().unwrap();
         let env = crate::test_env::ScopedEnv::set([
             ("HOME", dir.path().as_os_str().to_owned()),
+            ("LPM_HOME", dir.path().join(".lpm").as_os_str().to_owned()),
             (
                 "LPM_TEST_SECURITY_SECRET_HEX",
                 std::ffi::OsString::from(
@@ -1307,6 +1311,36 @@ mod tests {
 
         let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
         assert_eq!(result, 2000, "global config must override 24h default");
+    }
+
+    #[test]
+    fn resolve_global_config_reads_lpm_home_when_set() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([
+            ("HOME", home.path().as_os_str().to_owned()),
+            ("LPM_HOME", lpm_home.path().as_os_str().to_owned()),
+            (
+                "LPM_TEST_SECURITY_SECRET_HEX",
+                std::ffi::OsString::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            ),
+        ]);
+        write_authorized_min_age(0);
+        write_package_json_with_min_age(project.path(), None);
+        write_file(
+            &lpm_home.path().join("config.toml"),
+            "minimum-release-age-secs = 2000\n",
+        );
+
+        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
+
+        assert_eq!(
+            result, 2000,
+            "global release-age config must be read from LPM_HOME/config.toml when LPM_HOME is set",
+        );
     }
 
     #[test]

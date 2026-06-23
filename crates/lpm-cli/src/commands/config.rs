@@ -14,7 +14,7 @@ use std::io::IsTerminal;
 /// Bare `lpm config` opens a guided editor that routes into the focused
 /// wizards below. The direct forms stay available for scripts and deep links.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, eight focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, nine focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
@@ -24,11 +24,13 @@ use std::io::IsTerminal;
 ///   (operator persistent toggle for npm registry package signatures).
 /// - `lpm config trust-policy` owns `trust-policy = off | no-downgrade`
 ///   (operator persistent toggle for npm publisher/provenance downgrade checks).
+/// - `lpm config typosquat` owns `typosquat-guard = default | on | off`
+///   (operator persistent toggle for suspicious package-name analysis).
 /// - `lpm config release-age` owns `minimum-release-age-secs = <seconds>`
 ///   via human-friendly duration inputs.
 /// - `lpm config release-age-policy` owns `release-age-policy = direct | strict`.
 ///
-/// All eight default to interactive in a TTY; `--set <value>` is the
+/// All nine default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: Option<&str>,
@@ -60,6 +62,9 @@ pub async fn run(
     }
     if action == "trust-policy" {
         return run_trust_policy_wizard(&config_path, set, json_output).await;
+    }
+    if action == "typosquat" {
+        return run_typosquat_wizard(&config_path, set, json_output).await;
     }
     if action == "release-age" {
         return run_release_age_wizard(&config_path, set, json_output).await;
@@ -137,23 +142,43 @@ pub async fn run(
                     })?;
                 }
                 TRUST_POLICY_KEY => validate_trust_policy_value(value)?,
+                TYPOSQUAT_GUARD_KEY => {
+                    let requested = parse_typosquat_guard_selection(value)?;
+                    let global = global_config_view_from_value(&config);
+                    reject_looser_typosquat_guard_write(&global, requested)?;
+                    crate::security_approval::authorize_persistent_typosquat_guard(
+                        requested,
+                        json_output,
+                        &format!("lpm config set {key} {}", requested.as_str()),
+                    )?;
+                }
                 _ => {}
             }
             if let Some(table) = config.as_table_mut() {
-                let value = if key == SIGNATURES_KEY {
-                    toml::Value::Boolean(parse_config_bool(value).map_err(|message| {
-                        LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
-                    })?)
-                } else if key == RELEASE_AGE_POLICY_KEY {
-                    toml::Value::String(
-                        crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
-                            .as_str()
-                            .to_string(),
-                    )
+                if key == TYPOSQUAT_GUARD_KEY
+                    && parse_typosquat_guard_selection(value)? == TyposquatGuardSelection::Default
+                {
+                    table.remove(key);
                 } else {
-                    toml::Value::String(value.to_string())
-                };
-                table.insert(key.to_string(), value);
+                    let value = if key == SIGNATURES_KEY {
+                        toml::Value::Boolean(parse_config_bool(value).map_err(|message| {
+                            LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}"))
+                        })?)
+                    } else if key == RELEASE_AGE_POLICY_KEY {
+                        toml::Value::String(
+                            crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
+                                .as_str()
+                                .to_string(),
+                        )
+                    } else if key == TYPOSQUAT_GUARD_KEY {
+                        toml::Value::String(
+                            parse_typosquat_guard_selection(value)?.as_str().to_string(),
+                        )
+                    } else {
+                        toml::Value::String(value.to_string())
+                    };
+                    table.insert(key.to_string(), value);
+                }
             }
             write_config(&config_path, &config)?;
             if json_output {
@@ -166,6 +191,10 @@ pub async fn run(
                         crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
                             .as_str()
                             .to_string(),
+                    )
+                } else if key == TYPOSQUAT_GUARD_KEY {
+                    serde_json::Value::String(
+                        parse_typosquat_guard_selection(value)?.as_str().to_string(),
                     )
                 } else {
                     serde_json::Value::String(value.to_string())
@@ -217,6 +246,13 @@ pub async fn run(
                     json_output,
                     "lpm config delete sandbox",
                 )?,
+                TYPOSQUAT_GUARD_KEY => {
+                    crate::security_approval::authorize_persistent_typosquat_guard(
+                        TyposquatGuardSelection::Default,
+                        json_output,
+                        &format!("lpm config delete {key}"),
+                    )?;
+                }
                 _ => {}
             }
             let existed = config.as_table_mut().and_then(|t| t.remove(key)).is_some();
@@ -259,7 +295,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore, signatures, trust-policy, release-age, release-age-policy"
+                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, release-age, release-age-policy"
             )));
         }
     }
@@ -325,6 +361,11 @@ async fn run_guided_config_menu(
                 format!("current: {}", summary.trust_policy),
             )
             .item(
+                "typosquat",
+                "Typosquat guard",
+                format!("current: {}", summary.typosquat_guard),
+            )
+            .item(
                 "release-age",
                 "Minimum release age",
                 format!("current: {}", summary.release_age),
@@ -348,6 +389,7 @@ async fn run_guided_config_menu(
             "sigstore" => run_sigstore_wizard(config_path, None, false).await?,
             "signatures" => run_signatures_wizard(config_path, None, false).await?,
             "trust-policy" => run_trust_policy_wizard(config_path, None, false).await?,
+            "typosquat" => run_typosquat_wizard(config_path, None, false).await?,
             "release-age" => run_release_age_wizard(config_path, None, false).await?,
             "release-age-policy" => run_release_age_policy_wizard(config_path, None, false).await?,
             "done" => return Ok(()),
@@ -379,6 +421,7 @@ struct GuidedConfigSummary {
     sigstore_verify: String,
     signatures: &'static str,
     trust_policy: String,
+    typosquat_guard: String,
     release_age: String,
     release_age_policy: String,
 }
@@ -405,6 +448,9 @@ fn read_guided_config_summary(
         trust_policy: read_string_value(config_path, TRUST_POLICY_KEY)?
             .filter(|value| TRUST_POLICY_VALUES.contains(&value.as_str()))
             .unwrap_or_else(|| "off".to_string()),
+        typosquat_guard: format_current_typosquat_guard(read_typosquat_guard_override(
+            config_path,
+        )?),
         release_age: format_current_release_age(read_release_age_override(config_path)?),
         release_age_policy: read_release_age_policy_override(config_path)?
             .unwrap_or_default()
@@ -486,6 +532,11 @@ fn guard_generic_set_against_force_floor(
                 crate::security_floor::reject_looser_release_age_policy_write(&global, requested)?;
             }
         }
+        TYPOSQUAT_GUARD_KEY => {
+            if let Some(requested) = TyposquatGuardSelection::parse(value) {
+                reject_looser_typosquat_guard_write(&global, requested)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -509,6 +560,9 @@ fn guard_generic_delete_against_force_floor(
             &global,
             ResolvedSandboxMode::Default,
         )?,
+        TYPOSQUAT_GUARD_KEY => {
+            reject_looser_typosquat_guard_write(&global, TyposquatGuardSelection::Default)?
+        }
         "force-security-floor" if crate::security_floor::force_security_floor_enabled(&global) => {
             return Err(crate::security_floor::security_floor_write_error(
                 "force-security-floor",
@@ -530,10 +584,12 @@ pub struct GlobalConfig {
 }
 
 impl GlobalConfig {
-    /// Load from ~/.lpm/config.toml. Returns empty config if missing or unreadable.
+    /// Load from the configured LPM root's config.toml. Returns empty
+    /// config if missing or unreadable.
     pub fn load() -> Self {
-        let table = dirs::home_dir()
-            .map(|h| h.join(".lpm").join("config.toml"))
+        let table = LpmRoot::from_env()
+            .ok()
+            .map(|root| root.root().join("config.toml"))
             .and_then(|p| read_config(&p).ok())
             .and_then(|v| match v {
                 toml::Value::Table(t) => Some(t),
@@ -624,6 +680,11 @@ impl GlobalConfig {
             "off" | "no-downgrade" => Some(raw),
             _ => None,
         }
+    }
+
+    pub(crate) fn get_typosquat_guard_mode(&self) -> Option<TyposquatGuardSelection> {
+        self.get_str(TYPOSQUAT_GUARD_KEY)
+            .and_then(TyposquatGuardSelection::parse)
     }
 
     /// Get a value that should be an array of strings, returning the
@@ -1026,10 +1087,54 @@ const SCRIPT_POLICY_KEY: &str = "script-policy";
 const TRIAGE_ADVISOR_KEY: &str = "triage-advisor";
 const SIGNATURES_KEY: &str = "signatures";
 pub(crate) const TRUST_POLICY_KEY: &str = "trust-policy";
+pub(crate) const TYPOSQUAT_GUARD_KEY: &str = "typosquat-guard";
 
 const SCRIPT_POLICY_VALUES: &[&str] = &["deny", "triage", "allow"];
 const TRIAGE_ADVISOR_VALUES: &[&str] = &["none", "claude-cli", "codex", "ollama"];
 const TRUST_POLICY_VALUES: &[&str] = &["off", "no-downgrade"];
+const TYPOSQUAT_GUARD_VALUES: &[&str] = &["default", "on", "off"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TyposquatGuardSelection {
+    Default,
+    On,
+    Off,
+}
+
+impl TyposquatGuardSelection {
+    pub(crate) fn parse(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
+            "on" | "true" | "1" | "yes" | "enabled" => Some(Self::On),
+            "off" | "false" | "0" | "no" | "disabled" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    pub(crate) fn disables_guard(self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    pub(crate) fn loosens(self, floor: Self) -> bool {
+        self.rank() < floor.rank()
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Default => 1,
+            Self::On => 2,
+        }
+    }
+}
 
 /// Privacy one-liner shown when a cloud advisor is the chosen path.
 /// Locked wording: short, accurate, not a consent wall.
@@ -1117,6 +1222,79 @@ async fn run_trust_policy_wizard(
     Ok(())
 }
 
+async fn run_typosquat_wizard(
+    config_path: &std::path::Path,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let selection = if let Some(value) = set {
+        parse_typosquat_guard_selection(value)?
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err(LpmError::Registry(
+                "lpm config typosquat requires a TTY; use `--set default|on|off` instead"
+                    .to_string(),
+            ));
+        }
+
+        let current =
+            read_typosquat_guard_override(config_path)?.unwrap_or(TyposquatGuardSelection::Default);
+        println!();
+        println!(
+            "  current: {}",
+            format_current_typosquat_guard(Some(current)).cyan()
+        );
+        let new_value: &str = cliclack::select("How should LPM handle suspicious package names?")
+            .item(
+                "default",
+                "default — enabled unless the product default changes",
+                "recommended",
+            )
+            .item(
+                "on",
+                "on — always run the guard",
+                "ignores diagnostic env opt-outs",
+            )
+            .item("off", "off — skip typosquat analysis", "NOT recommended")
+            .initial_value(current.as_str())
+            .interact()
+            .map_err(prompt_err)?;
+        parse_typosquat_guard_selection(new_value)?
+    };
+
+    if set.is_none() && selection.disables_guard() {
+        println!();
+        println!(
+            "  {}: setting typosquat-guard = {} disables suspicious-name checks for every \
+             install on this machine. Prefer project allow-list entries for intentional \
+             false positives.",
+            "warning".yellow(),
+            "off".yellow().bold(),
+        );
+        let confirmed = cliclack::confirm(
+            "Are you sure you want typosquat-guard = off for every install on this machine?",
+        )
+        .initial_value(false)
+        .interact()
+        .map_err(prompt_err)?;
+        if !confirmed {
+            println!("  Aborted. No config change.");
+            return Ok(());
+        }
+    }
+
+    let existing_cfg = read_config(config_path)?;
+    reject_looser_typosquat_guard_write(&global_config_view_from_value(&existing_cfg), selection)?;
+    crate::security_approval::authorize_persistent_typosquat_guard(
+        selection,
+        json_output,
+        &format!("lpm config typosquat --set {}", selection.as_str()),
+    )?;
+    persist_typosquat_guard_selection(config_path, selection)?;
+    announce_typosquat_guard_set(selection, json_output);
+    Ok(())
+}
+
 fn validate_trust_policy_value(value: &str) -> Result<(), LpmError> {
     if TRUST_POLICY_VALUES.contains(&value) {
         Ok(())
@@ -1125,6 +1303,87 @@ fn validate_trust_policy_value(value: &str) -> Result<(), LpmError> {
             "invalid trust-policy '{value}'; must be one of: {}",
             TRUST_POLICY_VALUES.join(" | ")
         )))
+    }
+}
+
+fn parse_typosquat_guard_selection(input: &str) -> Result<TyposquatGuardSelection, LpmError> {
+    TyposquatGuardSelection::parse(input).ok_or_else(|| {
+        LpmError::Registry(format!(
+            "invalid typosquat-guard '{input}'; must be one of: {}",
+            TYPOSQUAT_GUARD_VALUES.join(" | ")
+        ))
+    })
+}
+
+fn read_typosquat_guard_override(
+    config_path: &std::path::Path,
+) -> Result<Option<TyposquatGuardSelection>, LpmError> {
+    let cfg = read_config(config_path)?;
+    let table = match cfg {
+        toml::Value::Table(table) => table,
+        _ => return Ok(None),
+    };
+    Ok(GlobalConfig { table }.get_typosquat_guard_mode())
+}
+
+fn reject_looser_typosquat_guard_write(
+    global: &GlobalConfig,
+    requested: TyposquatGuardSelection,
+) -> Result<(), LpmError> {
+    if !crate::security_floor::force_security_floor_enabled(global) {
+        return Ok(());
+    }
+    let floor = global
+        .get_typosquat_guard_mode()
+        .unwrap_or(TyposquatGuardSelection::Default);
+    if !requested.loosens(floor) {
+        return Ok(());
+    }
+    Err(crate::security_floor::security_floor_write_error(
+        TYPOSQUAT_GUARD_KEY,
+        requested.as_str(),
+        floor.as_str(),
+    ))
+}
+
+fn persist_typosquat_guard_selection(
+    config_path: &std::path::Path,
+    selection: TyposquatGuardSelection,
+) -> Result<(), LpmError> {
+    if selection != TyposquatGuardSelection::Default {
+        return persist_string(config_path, TYPOSQUAT_GUARD_KEY, selection.as_str());
+    }
+
+    let mut cfg = read_config(config_path)?;
+    let top = cfg.as_table_mut().ok_or_else(|| {
+        LpmError::Registry("config.toml must be a TOML table at the top level".into())
+    })?;
+    top.remove(TYPOSQUAT_GUARD_KEY);
+    write_config(config_path, &cfg)
+}
+
+fn format_current_typosquat_guard(current: Option<TyposquatGuardSelection>) -> String {
+    match current {
+        None | Some(TyposquatGuardSelection::Default) => "default (enabled)".to_string(),
+        Some(selection) => selection.as_str().to_string(),
+    }
+}
+
+fn announce_typosquat_guard_set(selection: TyposquatGuardSelection, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                TYPOSQUAT_GUARD_KEY: selection.as_str(),
+            }))
+            .unwrap()
+        );
+    } else {
+        install_ui::done(&format!(
+            "Set typosquat-guard = {}",
+            format_current_typosquat_guard(Some(selection)).bold()
+        ));
     }
 }
 
@@ -1830,6 +2089,13 @@ mod wizard_tests {
         let env = crate::test_env::ScopedEnv::set([
             ("LPM_SECURITY_DIR", security_dir.as_os_str().to_owned()),
             (
+                "LPM_SECURITY_POLICY_PATH",
+                dir.path()
+                    .join("absent-managed-security-policy.toml")
+                    .as_os_str()
+                    .to_owned(),
+            ),
+            (
                 "LPM_TEST_SECURITY_SECRET_HEX",
                 std::ffi::OsString::from(
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1841,6 +2107,7 @@ mod wizard_tests {
             minimum_release_age_secs: 0,
             sandbox_mode: "none".to_string(),
             sigstore_verify: "off".to_string(),
+            typosquat_guard: "off".to_string(),
             ..crate::security_approval::AuthorizedPosture::default()
         };
         crate::security_approval::persist_authorized_posture(&posture).unwrap();
@@ -1863,6 +2130,7 @@ mod wizard_tests {
                 sigstore_verify: "deny".to_string(),
                 signatures: "disabled",
                 trust_policy: "off".to_string(),
+                typosquat_guard: "default (enabled)".to_string(),
                 release_age: "default (1d)".to_string(),
                 release_age_policy: "direct".to_string(),
             }
@@ -1879,6 +2147,7 @@ script-policy = "triage"
 triage-advisor = "codex"
 signatures = true
 trust-policy = "no-downgrade"
+typosquat-guard = "off"
 minimum-release-age-secs = "259200"
 release-age-policy = "strict"
 
@@ -1902,6 +2171,7 @@ verify = "warn"
                 sigstore_verify: "warn".to_string(),
                 signatures: "enabled",
                 trust_policy: "no-downgrade".to_string(),
+                typosquat_guard: "off".to_string(),
                 release_age: "3d".to_string(),
                 release_age_policy: "strict".to_string(),
             }
@@ -2017,6 +2287,139 @@ verify = "warn"
         assert_eq!(
             table.get(SCRIPT_POLICY_KEY).and_then(|v| v.as_str()),
             Some("deny")
+        );
+    }
+
+    #[tokio::test]
+    async fn typosquat_wizard_set_persists_explicit_on_and_off_values() {
+        for value in ["on", "off"] {
+            let (_dir, path, _env) = tmp_config();
+
+            run_typosquat_wizard(&path, Some(value), true)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                read_typosquat_guard_override(&path).unwrap(),
+                Some(parse_typosquat_guard_selection(value).unwrap()),
+                "typosquat guard value '{value}' must persist",
+            );
+            let cfg = read_config(&path).unwrap();
+            assert_eq!(
+                cfg.get(TYPOSQUAT_GUARD_KEY).and_then(|v| v.as_str()),
+                Some(value),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typosquat_wizard_set_default_deletes_existing_override() {
+        let (_dir, path, _env) = tmp_config();
+        std::fs::write(
+            &path,
+            "script-policy = \"triage\"\ntyposquat-guard = \"on\"\n",
+        )
+        .unwrap();
+
+        run_typosquat_wizard(&path, Some("default"), true)
+            .await
+            .unwrap();
+
+        assert_eq!(read_typosquat_guard_override(&path).unwrap(), None);
+        let cfg = read_config(&path).unwrap();
+        let table = cfg.as_table().unwrap();
+        assert_eq!(
+            table.get("script-policy").and_then(|v| v.as_str()),
+            Some("triage"),
+            "default must preserve unrelated config keys",
+        );
+        assert!(
+            !table.contains_key(TYPOSQUAT_GUARD_KEY),
+            "default must remove the explicit typosquat-guard override",
+        );
+    }
+
+    #[tokio::test]
+    async fn typosquat_wizard_set_persists_canonical_values_for_bool_aliases() {
+        for (input, expected) in [("enabled", "on"), ("disabled", "off"), ("false", "off")] {
+            let (_dir, path, _env) = tmp_config();
+
+            run_typosquat_wizard(&path, Some(input), true)
+                .await
+                .unwrap();
+
+            let cfg = read_config(&path).unwrap();
+            assert_eq!(
+                cfg.get(TYPOSQUAT_GUARD_KEY).and_then(|v| v.as_str()),
+                Some(expected),
+                "input '{input}' must persist canonical typosquat-guard value '{expected}'",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn typosquat_wizard_set_rejects_invalid_value_without_persisting() {
+        let (_dir, path, _env) = tmp_config();
+
+        let err = run_typosquat_wizard(&path, Some("yolo"), true)
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("invalid typosquat-guard 'yolo'"), "got: {msg}");
+        assert!(
+            read_typosquat_guard_override(&path).unwrap().is_none(),
+            "invalid typosquat guard value must not create config.toml",
+        );
+    }
+
+    #[tokio::test]
+    async fn typosquat_wizard_preserves_unrelated_keys() {
+        let (_dir, path, _env) = tmp_config();
+        std::fs::write(&path, "script-policy = \"triage\"\n").unwrap();
+
+        run_typosquat_wizard(&path, Some("off"), true)
+            .await
+            .unwrap();
+
+        let cfg = read_config(&path).unwrap();
+        let table = cfg.as_table().unwrap();
+        assert_eq!(
+            table.get("script-policy").and_then(|v| v.as_str()),
+            Some("triage"),
+        );
+        assert_eq!(
+            table.get(TYPOSQUAT_GUARD_KEY).and_then(|v| v.as_str()),
+            Some("off"),
+        );
+    }
+
+    #[tokio::test]
+    async fn typosquat_wizard_rejects_off_when_force_floor_keeps_guard_enabled() {
+        let (_dir, path, _env) = tmp_config();
+        std::fs::write(&path, "force-security-floor = true\n").unwrap();
+
+        let err = run_typosquat_wizard(&path, Some("off"), true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains(TYPOSQUAT_GUARD_KEY));
+        assert!(read_typosquat_guard_override(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn global_config_get_typosquat_guard_mode_accepts_canonical_values() {
+        let mut table = toml::map::Map::new();
+        table.insert(
+            TYPOSQUAT_GUARD_KEY.to_string(),
+            toml::Value::String("off".to_string()),
+        );
+        let cfg = GlobalConfig { table };
+
+        assert_eq!(
+            cfg.get_typosquat_guard_mode(),
+            Some(TyposquatGuardSelection::Off),
         );
     }
 
@@ -2422,6 +2825,26 @@ verify = "warn"
         let err =
             guard_generic_delete_against_force_floor(&config, "force-security-floor").unwrap_err();
         assert_eq!(err.error_code(), "security_floor");
+    }
+
+    #[test]
+    fn guard_generic_delete_rejects_unsetting_enabled_typosquat_guard_under_force_floor() {
+        let config: toml::Value =
+            toml::from_str("force-security-floor = true\ntyposquat-guard = \"on\"\n").unwrap();
+
+        let err =
+            guard_generic_delete_against_force_floor(&config, TYPOSQUAT_GUARD_KEY).unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains(TYPOSQUAT_GUARD_KEY));
+    }
+
+    #[test]
+    fn guard_generic_delete_allows_removing_disabled_typosquat_guard_under_force_floor() {
+        let config: toml::Value =
+            toml::from_str("force-security-floor = true\ntyposquat-guard = \"off\"\n").unwrap();
+
+        guard_generic_delete_against_force_floor(&config, TYPOSQUAT_GUARD_KEY).unwrap();
     }
 
     /// JSON envelope shape for the announce-set path — mirrors the

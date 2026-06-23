@@ -130,6 +130,8 @@ const POPULAR_PACKAGES: &[&str] = &[
     "cypress",
 ];
 
+const KNOWN_LEGITIMATE_COLLISIONS: &[&str] = &["prism", "prismjs"];
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TyposquatTechnique {
     DelimiterVariant,
@@ -195,6 +197,9 @@ pub fn analyze_typosquatting(name: &str) -> Option<TyposquatFinding> {
 
     // Exact match = user wants the real thing
     if POPULAR_PACKAGES.contains(&bare_name) {
+        return None;
+    }
+    if KNOWN_LEGITIMATE_COLLISIONS.contains(&bare_name) {
         return None;
     }
 
@@ -341,6 +346,16 @@ mod tests {
     #[test]
     fn no_warn_nuxt_framework_package() {
         assert_eq!(check_typosquatting("nuxt"), None);
+    }
+
+    #[test]
+    fn no_warn_known_legitimate_prism_package() {
+        assert_eq!(check_typosquatting("prism"), None);
+    }
+
+    #[test]
+    fn no_warn_known_legitimate_prismjs_package() {
+        assert_eq!(check_typosquatting("prismjs"), None);
     }
 
     #[test]

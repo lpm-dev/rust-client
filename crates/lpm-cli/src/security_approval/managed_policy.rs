@@ -435,6 +435,24 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         .map(|raw| parse_policy_sigstore(&path, raw))
         .transpose()?;
 
+    let typosquat_guard = table
+        .get(crate::commands::config::TYPOSQUAT_GUARD_KEY)
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                managed_policy_error(&path, "must set `typosquat-guard` to a string")
+            })
+        })
+        .transpose()?
+        .map(|raw| {
+            crate::commands::config::TyposquatGuardSelection::parse(raw).ok_or_else(|| {
+                managed_policy_error(
+                    &path,
+                    format!("has invalid `typosquat-guard` value `{raw}`"),
+                )
+            })
+        })
+        .transpose()?;
+
     let mut enforced_controls = Vec::new();
     if script_policy.is_some() {
         enforced_controls.push("script-policy".to_string());
@@ -454,6 +472,9 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     if sigstore_verify.is_some() {
         enforced_controls.push("sigstore.verify".to_string());
     }
+    if typosquat_guard.is_some() {
+        enforced_controls.push(crate::commands::config::TYPOSQUAT_GUARD_KEY.to_string());
+    }
 
     Ok(Some(ManagedPolicy {
         status: ManagedPolicyStatus {
@@ -468,5 +489,6 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         sandbox_mode,
         sandbox_allow_degraded,
         sigstore_verify,
+        typosquat_guard,
     }))
 }
