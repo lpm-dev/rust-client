@@ -11,6 +11,9 @@ use std::io::IsTerminal;
 /// Stores config in ~/.lpm/config.toml (user/machine config).
 /// Project config lives in package.json under "lpm" key.
 ///
+/// Bare `lpm config` opens a guided editor that routes into the focused
+/// wizards below. The direct forms stay available for scripts and deep links.
+///
 /// Beyond `get`/`set`/`delete`/`list`, eight focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
@@ -28,13 +31,17 @@ use std::io::IsTerminal;
 /// All eight default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
-    action: &str,
+    action: Option<&str>,
     key: Option<&str>,
     value: Option<&str>,
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let config_path = LpmRoot::from_env()?.root().join("config.toml");
+
+    let Some(action) = action else {
+        return run_guided_config_menu(&config_path, key, value, set, json_output).await;
+    };
 
     if action == "scripts" {
         return run_scripts_wizard(&config_path, set, json_output).await;
@@ -258,6 +265,152 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+async fn run_guided_config_menu(
+    config_path: &std::path::Path,
+    key: Option<&str>,
+    value: Option<&str>,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if key.is_some() || value.is_some() || set.is_some() {
+        return Err(LpmError::Registry(
+            "lpm config needs a setting before --set; use `lpm config scripts --set triage` or run `lpm config` interactively".into(),
+        ));
+    }
+    if json_output {
+        return Err(LpmError::Registry(
+            "lpm config requires an interactive terminal; use `lpm config list --json` for machine-readable config".into(),
+        ));
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(LpmError::Registry(
+            "lpm config requires an interactive terminal; use `lpm config list` or `lpm config <setting> --set <value>` instead".into(),
+        ));
+    }
+
+    loop {
+        let summary = read_guided_config_summary(config_path)?;
+        println!();
+        let choice: &str = cliclack::select("What do you want to configure?")
+            .item(
+                "scripts",
+                "Lifecycle scripts",
+                format!("current: {}", summary.script_policy),
+            )
+            .item(
+                "triage",
+                "Triage advisor",
+                format!("current: {}", summary.triage_advisor),
+            )
+            .item(
+                "sandbox",
+                "Sandbox mode",
+                format!("current: {}", summary.sandbox_mode),
+            )
+            .item(
+                "sigstore",
+                "Sigstore provenance",
+                format!("current: {}", summary.sigstore_verify),
+            )
+            .item(
+                "signatures",
+                "Registry signatures",
+                format!("current: {}", summary.signatures),
+            )
+            .item(
+                "trust-policy",
+                "Trust downgrade policy",
+                format!("current: {}", summary.trust_policy),
+            )
+            .item(
+                "release-age",
+                "Minimum release age",
+                format!("current: {}", summary.release_age),
+            )
+            .item(
+                "release-age-policy",
+                "Release-age scope",
+                format!("current: {}", summary.release_age_policy),
+            )
+            .item("done", "Done", "exit")
+            .interact()
+            .map_err(prompt_err)?;
+
+        match choice {
+            "scripts" => {
+                run_scripts_wizard(config_path, None, false).await?;
+                maybe_offer_triage_advisor(config_path).await?;
+            }
+            "triage" => run_triage_wizard(config_path, None, false).await?,
+            "sandbox" => run_sandbox_wizard(config_path, None, false).await?,
+            "sigstore" => run_sigstore_wizard(config_path, None, false).await?,
+            "signatures" => run_signatures_wizard(config_path, None, false).await?,
+            "trust-policy" => run_trust_policy_wizard(config_path, None, false).await?,
+            "release-age" => run_release_age_wizard(config_path, None, false).await?,
+            "release-age-policy" => run_release_age_policy_wizard(config_path, None, false).await?,
+            "done" => return Ok(()),
+            _ => unreachable!("guided config select returned unexpected setting"),
+        }
+    }
+}
+
+async fn maybe_offer_triage_advisor(config_path: &std::path::Path) -> Result<(), LpmError> {
+    if read_string_value(config_path, SCRIPT_POLICY_KEY)?.as_deref() != Some("triage") {
+        return Ok(());
+    }
+
+    let configure = cliclack::confirm("Configure the triage advisor now?")
+        .initial_value(false)
+        .interact()
+        .map_err(prompt_err)?;
+    if configure {
+        run_triage_wizard(config_path, None, false).await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GuidedConfigSummary {
+    script_policy: String,
+    triage_advisor: String,
+    sandbox_mode: String,
+    sigstore_verify: String,
+    signatures: &'static str,
+    trust_policy: String,
+    release_age: String,
+    release_age_policy: String,
+}
+
+fn read_guided_config_summary(
+    config_path: &std::path::Path,
+) -> Result<GuidedConfigSummary, LpmError> {
+    Ok(GuidedConfigSummary {
+        script_policy: read_string_value(config_path, SCRIPT_POLICY_KEY)?
+            .filter(|value| SCRIPT_POLICY_VALUES.contains(&value.as_str()))
+            .unwrap_or_else(|| "deny".to_string()),
+        triage_advisor: read_string_value(config_path, TRIAGE_ADVISOR_KEY)?
+            .filter(|value| TRIAGE_ADVISOR_VALUES.contains(&value.as_str()))
+            .unwrap_or_else(|| "none".to_string()),
+        sandbox_mode: read_sandbox_mode(config_path)?
+            .filter(|value| SANDBOX_MODE_VALUES.contains(&value.as_str()))
+            .unwrap_or_else(|| "default".to_string()),
+        sigstore_verify: read_sigstore_verify(config_path)?
+            .filter(|value| SIGSTORE_VERIFY_VALUES.contains(&value.as_str()))
+            .unwrap_or_else(|| "deny".to_string()),
+        signatures: format_bool_enabled(
+            read_bool_value(config_path, SIGNATURES_KEY)?.unwrap_or(false),
+        ),
+        trust_policy: read_string_value(config_path, TRUST_POLICY_KEY)?
+            .filter(|value| TRUST_POLICY_VALUES.contains(&value.as_str()))
+            .unwrap_or_else(|| "off".to_string()),
+        release_age: format_current_release_age(read_release_age_override(config_path)?),
+        release_age_policy: read_release_age_policy_override(config_path)?
+            .unwrap_or_default()
+            .as_str()
+            .to_string(),
+    })
 }
 
 fn read_config(path: &std::path::Path) -> Result<toml::Value, LpmError> {
@@ -1043,8 +1196,6 @@ async fn run_scripts_wizard(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let existing_cfg = read_config(config_path)?;
-    let global = global_config_view_from_value(&existing_cfg);
     if let Some(v) = set {
         if !SCRIPT_POLICY_VALUES.contains(&v) {
             return Err(LpmError::Registry(format!(
@@ -1052,15 +1203,7 @@ async fn run_scripts_wizard(
                 SCRIPT_POLICY_VALUES.join(" | ")
             )));
         }
-        let requested = crate::script_policy_config::ScriptPolicy::parse(v)
-            .map_err(|e| LpmError::Registry(e.to_string()))?;
-        crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
-        crate::security_approval::authorize_persistent_script_policy(
-            requested,
-            json_output,
-            &format!("lpm config scripts --set {v}"),
-        )?;
-        persist_string(config_path, SCRIPT_POLICY_KEY, v)?;
+        persist_script_policy(config_path, v, json_output)?;
         announce_set(SCRIPT_POLICY_KEY, v, json_output);
         if v == "triage" {
             print_triage_policy_followup(json_output);
@@ -1097,21 +1240,31 @@ async fn run_scripts_wizard(
         .initial_value(current.as_str())
         .interact()
         .map_err(prompt_err)?;
-    let requested = crate::script_policy_config::ScriptPolicy::parse(new_value)
-        .map_err(|e| LpmError::Registry(e.to_string()))?;
-    crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
-    crate::security_approval::authorize_persistent_script_policy(
-        requested,
-        json_output,
-        &format!("lpm config scripts --set {new_value}"),
-    )?;
-    persist_string(config_path, SCRIPT_POLICY_KEY, new_value)?;
+    persist_script_policy(config_path, new_value, json_output)?;
     announce_set(SCRIPT_POLICY_KEY, new_value, json_output);
 
     if new_value == "triage" {
         print_triage_policy_followup(json_output);
     }
     Ok(())
+}
+
+fn persist_script_policy(
+    config_path: &std::path::Path,
+    value: &str,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let cfg = read_config(config_path)?;
+    let global = global_config_view_from_value(&cfg);
+    let requested = crate::script_policy_config::ScriptPolicy::parse(value)
+        .map_err(|e| LpmError::Registry(e.to_string()))?;
+    crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
+    crate::security_approval::authorize_persistent_script_policy(
+        requested,
+        json_output,
+        &format!("lpm config scripts --set {value}"),
+    )?;
+    persist_string(config_path, SCRIPT_POLICY_KEY, value)
 }
 
 async fn run_triage_wizard(
@@ -1155,7 +1308,7 @@ async fn run_triage_wizard(
             .interact()
             .map_err(prompt_err)?;
         if switch {
-            persist_string(config_path, SCRIPT_POLICY_KEY, "triage")?;
+            persist_script_policy(config_path, "triage", json_output)?;
             install_ui::done(&format!(
                 "Done · {SCRIPT_POLICY_KEY} = {}",
                 install_ui::section("\"triage\"")
@@ -1695,6 +1848,66 @@ mod wizard_tests {
         (dir, path, env)
     }
 
+    #[test]
+    fn guided_config_summary_uses_product_defaults_when_unset() {
+        let (_dir, path, _env) = tmp_config();
+
+        let summary = read_guided_config_summary(&path).unwrap();
+
+        assert_eq!(
+            summary,
+            GuidedConfigSummary {
+                script_policy: "deny".to_string(),
+                triage_advisor: "none".to_string(),
+                sandbox_mode: "default".to_string(),
+                sigstore_verify: "deny".to_string(),
+                signatures: "disabled",
+                trust_policy: "off".to_string(),
+                release_age: "default (1d)".to_string(),
+                release_age_policy: "direct".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn guided_config_summary_reflects_persisted_settings() {
+        let (_dir, path, _env) = tmp_config();
+        std::fs::write(
+            &path,
+            r#"
+script-policy = "triage"
+triage-advisor = "codex"
+signatures = true
+trust-policy = "no-downgrade"
+minimum-release-age-secs = "259200"
+release-age-policy = "strict"
+
+[sandbox]
+mode = "strict"
+
+[sigstore]
+verify = "warn"
+"#,
+        )
+        .unwrap();
+
+        let summary = read_guided_config_summary(&path).unwrap();
+
+        assert_eq!(
+            summary,
+            GuidedConfigSummary {
+                script_policy: "triage".to_string(),
+                triage_advisor: "codex".to_string(),
+                sandbox_mode: "strict".to_string(),
+                sigstore_verify: "warn".to_string(),
+                signatures: "enabled",
+                trust_policy: "no-downgrade".to_string(),
+                release_age: "3d".to_string(),
+                release_age_policy: "strict".to_string(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn scripts_wizard_set_persists_valid_value() {
         let (_dir, path, _env) = tmp_config();
@@ -1731,6 +1944,27 @@ mod wizard_tests {
             .unwrap_err();
         assert_eq!(err.error_code(), "security_floor");
         assert!(err.to_string().contains("script-policy"));
+    }
+
+    #[test]
+    fn persist_script_policy_rejects_triage_when_force_floor_requires_deny() {
+        let (_dir, path, _env) = tmp_config();
+        std::fs::write(
+            &path,
+            "force-security-floor = true\nscript-policy = \"deny\"\n",
+        )
+        .unwrap();
+
+        let err = persist_script_policy(&path, "triage", true).unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains("script-policy"));
+        assert_eq!(
+            read_string_value(&path, SCRIPT_POLICY_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("deny")
+        );
     }
 
     #[tokio::test]
