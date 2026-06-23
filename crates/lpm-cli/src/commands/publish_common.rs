@@ -707,22 +707,35 @@ pub fn npm_tarball_url(registry_url: &str, npm_name: &str, version: &str) -> Str
     format!("{base}/{npm_name}/-/{short_name}-{version}.tgz")
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NpmProvenanceAttachment {
+    pub(crate) media_type: String,
+    pub(crate) data: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct NpmPayloadOptions<'a> {
+    pub(crate) tag: Option<&'a str>,
+    pub(crate) provenance_attachment: Option<&'a NpmProvenanceAttachment>,
+}
+
 /// Build the npm-compatible publish payload.
 ///
 /// Takes the LPM version_data, strips LPM-specific fields, sets npm-required
 /// fields, and returns a JSON value ready for PUT to the target registry.
-pub fn build_npm_payload(
+pub(crate) fn build_npm_payload(
     registry_url: &str,
     npm_name: &str,
     version: &str,
     version_data: &serde_json::Value,
     tarball_data: &[u8],
     access: &str,
-    tag: Option<&str>,
+    options: NpmPayloadOptions<'_>,
 ) -> serde_json::Value {
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
-    let dist_tag = tag.unwrap_or("latest");
+    let dist_tag = options.tag.unwrap_or("latest");
+    let provenance_attachment = options.provenance_attachment;
 
     // Clone version data and strip LPM-specific fields
     let mut npm_version = version_data.clone();
@@ -758,6 +771,28 @@ pub fn build_npm_payload(
     let mut tarball_base64 = String::with_capacity(tarball_data.len() * 4 / 3 + 4);
     BASE64.encode_string(tarball_data, &mut tarball_base64);
 
+    let mut attachments =
+        serde_json::Map::with_capacity(1 + usize::from(provenance_attachment.is_some()));
+    attachments.insert(
+        tarball_key,
+        serde_json::json!({
+            "content_type": "application/octet-stream",
+            "data": tarball_base64,
+            "length": tarball_data.len(),
+        }),
+    );
+    if let Some(attachment) = provenance_attachment {
+        let provenance_key = format!("{npm_name}-{version}.sigstore");
+        attachments.insert(
+            provenance_key,
+            serde_json::json!({
+                "content_type": attachment.media_type,
+                "data": attachment.data,
+                "length": javascript_string_length(&attachment.data),
+            }),
+        );
+    }
+
     serde_json::json!({
         "_id": npm_name,
         "name": npm_name,
@@ -769,14 +804,12 @@ pub fn build_npm_payload(
         "versions": {
             version: npm_version,
         },
-        "_attachments": {
-            tarball_key: {
-                "content_type": "application/octet-stream",
-                "data": tarball_base64,
-                "length": tarball_data.len(),
-            }
-        },
+        "_attachments": attachments,
     })
+}
+
+fn javascript_string_length(value: &str) -> usize {
+    value.encode_utf16().count()
 }
 
 #[cfg(test)]
@@ -933,7 +966,7 @@ mod tests {
             &version_data,
             tarball_data,
             "public",
-            None,
+            NpmPayloadOptions::default(),
         );
 
         // LPM-specific fields must be stripped from version data
@@ -977,7 +1010,7 @@ mod tests {
             &version_data,
             b"data",
             "public",
-            None,
+            NpmPayloadOptions::default(),
         );
         let dist = &payload["versions"]["1.0.0"]["dist"];
         assert_eq!(
@@ -1001,10 +1034,95 @@ mod tests {
             &version_data,
             b"data",
             "public",
-            Some("beta"),
+            NpmPayloadOptions {
+                tag: Some("beta"),
+                ..Default::default()
+            },
         );
 
         assert_eq!(payload["dist-tags"]["beta"], "2.0.0-beta.1");
+    }
+
+    #[test]
+    fn build_npm_payload_ignores_untrusted_manifest_provenance_metadata() {
+        let bundle = serde_json::json!({
+            "mediaType": "application/vnd.dev.sigstore.bundle+json;version=0.2",
+            "dsseEnvelope": {
+                "payloadType": "application/vnd.in-toto+json",
+                "payload": "e30=",
+                "signatures": []
+            },
+            "verificationMaterial": {
+                "x509CertificateChain": {"certificates": []},
+                "tlogEntries": []
+            }
+        });
+        let version_data = serde_json::json!({
+            "name": "@scope/pkg",
+            "version": "1.0.0",
+            "dist": {"shasum": "x", "integrity": "y"},
+            "_provenance": bundle,
+        });
+
+        let payload = build_npm_payload(
+            "https://registry.npmjs.org",
+            "@scope/pkg",
+            "1.0.0",
+            &version_data,
+            b"data",
+            "public",
+            NpmPayloadOptions::default(),
+        );
+
+        assert!(
+            payload["_attachments"]
+                .as_object()
+                .expect("attachments must be an object")
+                .get("@scope/pkg-1.0.0.sigstore")
+                .is_none(),
+            "manifest _provenance must not become an npm .sigstore attachment without explicit verification"
+        );
+    }
+
+    #[test]
+    fn build_npm_payload_attaches_explicit_sigstore_bundle() {
+        let provenance = NpmProvenanceAttachment {
+            media_type: "application/vnd.dev.sigstore.bundle+json;version=0.2".into(),
+            data: r#"{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.2","checkpoint":"rekor — checkpoint"}"#.into(),
+        };
+        let version_data = serde_json::json!({
+            "name": "@scope/pkg",
+            "version": "1.0.0",
+            "dist": {"shasum": "x", "integrity": "y"},
+        });
+
+        let payload = build_npm_payload(
+            "https://registry.npmjs.org",
+            "@scope/pkg",
+            "1.0.0",
+            &version_data,
+            b"data",
+            "public",
+            NpmPayloadOptions {
+                provenance_attachment: Some(&provenance),
+                ..Default::default()
+            },
+        );
+
+        let attachment = &payload["_attachments"]["@scope/pkg-1.0.0.sigstore"];
+        assert_eq!(
+            attachment["content_type"],
+            "application/vnd.dev.sigstore.bundle+json;version=0.2",
+        );
+        assert_eq!(attachment["data"], provenance.data);
+        assert_eq!(
+            attachment["length"].as_u64().unwrap(),
+            javascript_string_length(&provenance.data) as u64
+        );
+        assert!(
+            provenance.data.len() > javascript_string_length(&provenance.data),
+            "test fixture must contain non-ASCII so npm string length differs from UTF-8 byte length"
+        );
     }
 
     #[test]
@@ -1022,7 +1140,7 @@ mod tests {
             &version_data,
             b"tarball",
             "public",
-            None,
+            NpmPayloadOptions::default(),
         );
 
         // Round-trip through JSON string — no data loss
@@ -1181,7 +1299,7 @@ mod tests {
             &version_data,
             &npm_tarball,
             "public",
-            None,
+            NpmPayloadOptions::default(),
         );
 
         // The payload's dist hashes must match the rewritten tarball, not the stale input
@@ -1221,7 +1339,7 @@ mod tests {
                 &version_data,
                 b"data",
                 "public",
-                None,
+                NpmPayloadOptions::default(),
             );
             let tarball_url = payload["versions"]["1.0.0"]["dist"]["tarball"]
                 .as_str()

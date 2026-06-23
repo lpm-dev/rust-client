@@ -218,7 +218,7 @@ pub struct NpmPublishConfig {
     pub name: Option<String>,
 
     /// Access level: `"public"` or `"restricted"`.
-    /// Scoped packages default to `"restricted"`, unscoped to `"public"`.
+    /// Defaults to `"public"` for npm-compatible publishes unless configured.
     #[serde(default)]
     pub access: Option<String>,
 

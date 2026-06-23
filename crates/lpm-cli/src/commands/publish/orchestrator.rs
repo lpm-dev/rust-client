@@ -1,11 +1,13 @@
-use super::npm_artifact::prepare_npm_target_artifact;
+use super::npm_artifact::{load_provenance_file, prepare_npm_target_artifact};
 use super::output::{
     DryRunSummary, format_publish_retry_detail, format_upload_message, lpm_visibility,
     print_dry_run_summary, print_upload_details, publish_check_json, publish_detail,
     publish_result_json, visibility_from_access,
 };
 use super::prepare::prepare_publish_project;
-use super::provenance::resolve_provenance_context;
+use super::provenance::{
+    ProvenanceRequest, materialize_provenance_request, resolve_provenance_request,
+};
 use super::quality_gate::run_publish_quality_gate;
 use super::secret_scan::run_publish_secret_scan;
 use super::skills::{
@@ -14,7 +16,8 @@ use super::skills::{
 };
 use super::target::resolve_targets;
 use super::types::{
-    NpmTargetArtifactInput, PublishProject, PublishQualityGateInput, PublishResult, PublishTarget,
+    NpmTargetArtifact, NpmTargetArtifactInput, PublishProject, PublishQualityGateInput,
+    PublishResult, PublishTarget, ResolvedProvenance,
 };
 use super::upload_lpm::publish_to_lpm;
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
@@ -24,6 +27,17 @@ use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use std::collections::HashMap;
 use std::path::Path;
+
+struct NpmFilePreflightInput<'a> {
+    provenance_request: &'a ProvenanceRequest,
+    targets: &'a [PublishTarget],
+    target_names: &'a HashMap<String, String>,
+    package_json_name: &'a str,
+    version: &'a str,
+    version_data: &'a serde_json::Value,
+    tarball_data: &'a [u8],
+    json_output: bool,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -41,6 +55,8 @@ pub async fn run(
     cli_gitlab: bool,
     cli_registry: Option<&str>,
     provenance_flag: bool,
+    no_provenance: bool,
+    provenance_file: Option<&Path>,
 ) -> Result<(), LpmError> {
     let publish_started = std::time::Instant::now();
 
@@ -152,6 +168,59 @@ pub async fn run(
         };
         target_names.insert(target.key(), resolved);
     }
+
+    let provenance_request = resolve_provenance_request(
+        project_dir,
+        &pkg_json,
+        provenance_flag,
+        no_provenance,
+        provenance_file,
+    )?;
+    if matches!(provenance_request, ProvenanceRequest::File(_)) && targets_lpm {
+        return Err(LpmError::Registry(
+            "--provenance-file is only supported for npm-compatible publish targets".into(),
+        ));
+    }
+    if !matches!(provenance_request, ProvenanceRequest::Disabled) {
+        for target in &targets {
+            if !is_npm_compatible_target(target) {
+                continue;
+            }
+            let npm_name_str = target_names.get(&target.key()).ok_or_else(|| {
+                LpmError::Registry(format!("no name resolved for {}", target.display_name()))
+            })?;
+            let npm_access = match target {
+                PublishTarget::GitHub => github_config
+                    .and_then(|c| c.access.clone())
+                    .unwrap_or_else(|| publish_npm::resolve_npm_access(npm_name_str, npm_config)),
+                PublishTarget::GitLab => gitlab_config
+                    .and_then(|c| c.access.clone())
+                    .unwrap_or_else(|| publish_npm::resolve_npm_access(npm_name_str, npm_config)),
+                _ => publish_npm::resolve_npm_access(npm_name_str, npm_config),
+            };
+            if npm_access != "public" {
+                return Err(LpmError::Registry(format!(
+                    "npm provenance requires public access for {npm_name_str}. \
+                     Set publish.npm.access to \"public\" or omit restricted access."
+                )));
+            }
+        }
+    }
+
+    let version_data =
+        build_publish_version_data(&pkg_json, &name, &version, readme.as_deref(), &tarball_data);
+    let mut precomputed_npm_artifacts =
+        precompute_file_provenance_artifacts(NpmFilePreflightInput {
+            provenance_request: &provenance_request,
+            targets: &targets,
+            target_names: &target_names,
+            package_json_name: &name,
+            version: &version,
+            version_data: &version_data,
+            tarball_data: &tarball_data,
+            json_output,
+        })
+        .await?;
 
     run_publish_secret_scan(project_dir, json_output, allow_secrets)?;
 
@@ -365,9 +434,11 @@ pub async fn run(
         }
     }
 
-    let version_data =
-        build_publish_version_data(&pkg_json, &name, &version, readme.as_deref(), &tarball_data);
-    let provenance_context = resolve_provenance_context(provenance_flag).await?;
+    let provenance_context = if matches!(provenance_request, ProvenanceRequest::File(_)) {
+        None
+    } else {
+        materialize_provenance_request(provenance_request).await?
+    };
 
     // Publish sequentially so per-target auth prompts and summaries stay deterministic.
     // All per-target errors are caught and collected — the loop NEVER aborts early.
@@ -401,7 +472,13 @@ pub async fn run(
                     }
 
                     // Generate per-target provenance from the final rewritten tarball
-                    if let Some(ref context) = provenance_context {
+                    if let Some(ref provenance) = provenance_context {
+                        let ResolvedProvenance::Generate(context) = provenance else {
+                            return Err(LpmError::Registry(
+                                "--provenance-file is only supported for npm-compatible publish targets"
+                                    .into(),
+                            ));
+                        };
                         let final_hashes = publish_common::compute_hashes(&lpm_tarball);
                         let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
                         let slsa = provenance::build_slsa_statement(
@@ -609,6 +686,12 @@ pub async fn run(
                             }),
                         _ => publish_npm::resolve_npm_access(npm_name_str, npm_config),
                     };
+                    if provenance_context.is_some() && npm_access != "public" {
+                        return Err(LpmError::Registry(format!(
+                            "npm provenance requires public access for {npm_name_str}. \
+                             Set publish.npm.access to \"public\" or omit restricted access."
+                        )));
+                    }
                     let npm_tag = publish_npm::resolve_npm_tag(npm_config);
 
                     // OTP preemption
@@ -623,17 +706,23 @@ pub async fn run(
                         .unwrap_or(false)
                         || auth::is_otp_required(registry_key_for_otp);
 
-                    let target_artifact = prepare_npm_target_artifact(NpmTargetArtifactInput {
-                        package_json_name: &name,
-                        npm_name: npm_name_str,
-                        version: &version,
-                        base_version_data: &version_data,
-                        base_tarball_data: &tarball_data,
-                        provenance_context: provenance_context.as_ref(),
-                        target_label: display,
-                        json_output,
-                    })
-                    .await?;
+                    let target_key = target.key();
+                    let target_artifact =
+                        if let Some(artifact) = precomputed_npm_artifacts.remove(&target_key) {
+                            artifact
+                        } else {
+                            prepare_npm_target_artifact(NpmTargetArtifactInput {
+                                package_json_name: &name,
+                                npm_name: npm_name_str,
+                                version: &version,
+                                base_version_data: &version_data,
+                                base_tarball_data: &tarball_data,
+                                provenance_context: provenance_context.as_ref(),
+                                target_label: display,
+                                json_output,
+                            })
+                            .await?
+                        };
 
                     let upload_spinner = if json_output {
                         None
@@ -646,6 +735,7 @@ pub async fn run(
                         &version,
                         &target_artifact.version_data,
                         &target_artifact.tarball_data,
+                        target_artifact.provenance_attachment.as_ref(),
                         &npm_access,
                         &npm_tag,
                         &registry_url,
@@ -775,10 +865,64 @@ pub async fn run(
     }
 
     if any_failed {
-        Err(LpmError::Registry(
-            "one or more publish targets failed".into(),
-        ))
+        if json_output {
+            Err(LpmError::ExitCode(1))
+        } else {
+            Err(LpmError::Registry(
+                "one or more publish targets failed".into(),
+            ))
+        }
     } else {
         Ok(())
     }
+}
+
+async fn precompute_file_provenance_artifacts(
+    input: NpmFilePreflightInput<'_>,
+) -> Result<HashMap<String, NpmTargetArtifact>, LpmError> {
+    let ProvenanceRequest::File(path) = input.provenance_request else {
+        return Ok(HashMap::new());
+    };
+    let file = load_provenance_file(path)?;
+    let provenance = ResolvedProvenance::File(file);
+    let npm_target_count = input
+        .targets
+        .iter()
+        .filter(|target| is_npm_compatible_target(target))
+        .count();
+    let mut artifacts = HashMap::with_capacity(npm_target_count);
+
+    for target in input.targets {
+        if !is_npm_compatible_target(target) {
+            continue;
+        }
+        let key = target.key();
+        let npm_name = input.target_names.get(&key).ok_or_else(|| {
+            LpmError::Registry(format!("no name resolved for {}", target.display_name()))
+        })?;
+        let artifact = prepare_npm_target_artifact(NpmTargetArtifactInput {
+            package_json_name: input.package_json_name,
+            npm_name,
+            version: input.version,
+            base_version_data: input.version_data,
+            base_tarball_data: input.tarball_data,
+            provenance_context: Some(&provenance),
+            target_label: target.display_name(),
+            json_output: input.json_output,
+        })
+        .await?;
+        artifacts.insert(key, artifact);
+    }
+
+    Ok(artifacts)
+}
+
+fn is_npm_compatible_target(target: &PublishTarget) -> bool {
+    matches!(
+        target,
+        PublishTarget::Npm
+            | PublishTarget::GitHub
+            | PublishTarget::GitLab
+            | PublishTarget::Custom(_)
+    )
 }

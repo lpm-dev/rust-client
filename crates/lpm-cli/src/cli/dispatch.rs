@@ -1074,6 +1074,8 @@ async fn async_main() -> Result<()> {
             github,
             gitlab,
             publish_registry,
+            no_provenance,
+            provenance_file,
         } => {
             // Token expiry warnings (Feature 42)
             if !cli.json {
@@ -1100,6 +1102,8 @@ async fn async_main() -> Result<()> {
                 gitlab,
                 publish_registry.as_deref(),
                 provenance,
+                no_provenance,
+                provenance_file.as_deref(),
             )
             .await
         }
@@ -1121,6 +1125,8 @@ async fn async_main() -> Result<()> {
                     access,
                     dry_run,
                     provenance,
+                    no_provenance,
+                    provenance_file,
                     min_score,
                     allow_secrets,
                     yes,
@@ -1133,6 +1139,8 @@ async fn async_main() -> Result<()> {
                             access: access.as_deref(),
                             dry_run,
                             provenance,
+                            no_provenance,
+                            provenance_file: provenance_file.as_deref(),
                             min_score,
                             allow_secrets,
                             yes,

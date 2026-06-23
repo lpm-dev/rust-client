@@ -15,7 +15,7 @@
 //!
 //! PAE is re-encoded from the envelope's `payload_type` and raw decoded
 //! `payload`, and verified against the leaf cert's SPKI via ECDSA-P256.
-//! Both raw R||S and DER signature encodings are accepted; Sigstore's
+//! Both DER and raw R||S signature encodings are accepted; Sigstore's
 //! profile is fixed at P-256, so any non-P256 SPKI on the leaf cert is
 //! rejected before signature work runs.
 

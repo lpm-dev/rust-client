@@ -9,6 +9,8 @@ pub(crate) struct StagePublishOptions<'a> {
     pub(crate) access: Option<&'a str>,
     pub(crate) dry_run: bool,
     pub(crate) provenance: bool,
+    pub(crate) no_provenance: bool,
+    pub(crate) provenance_file: Option<&'a Path>,
     pub(crate) min_score: Option<u32>,
     pub(crate) allow_secrets: bool,
     pub(crate) yes: bool,
@@ -33,6 +35,45 @@ pub(crate) async fn publish_current_project(
         npm_stage::resolve_npm_stage_registry_with_source(npm_config, options.npm_registry)?;
     let access = resolve_stage_access(options.access, &npm_name, npm_config)?;
     let (tag, tag_explicit) = resolve_stage_tag(options.tag, npm_config);
+    let provenance_request = publish::resolve_provenance_request(
+        project_dir,
+        &prepared.pkg_json,
+        options.provenance,
+        options.no_provenance,
+        options.provenance_file,
+    )?;
+    if !matches!(provenance_request, publish::ProvenanceRequest::Disabled) && access != "public" {
+        return Err(LpmError::Registry(format!(
+            "npm provenance requires public access for {npm_name}. \
+             Pass --access public or set publish.npm.access to \"public\"."
+        )));
+    }
+    let version_data = publish::build_publish_version_data(
+        &prepared.pkg_json,
+        &prepared.name,
+        &prepared.version,
+        prepared.readme.as_deref(),
+        &prepared.tarball_data,
+    );
+    let file_artifact = if matches!(provenance_request, publish::ProvenanceRequest::File(_)) {
+        let provenance_context =
+            publish::materialize_provenance_request(provenance_request.clone()).await?;
+        Some(
+            publish::prepare_npm_target_artifact(publish::NpmTargetArtifactInput {
+                package_json_name: &prepared.name,
+                npm_name: &npm_name,
+                version: &prepared.version,
+                base_version_data: &version_data,
+                base_tarball_data: &prepared.tarball_data,
+                provenance_context: provenance_context.as_ref(),
+                target_label: "npm",
+                json_output: options.json_output,
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
 
     publish::run_publish_secret_scan(project_dir, options.json_output, options.allow_secrets)?;
     let quality = publish::run_publish_quality_gate(publish::PublishQualityGateInput {
@@ -98,25 +139,23 @@ pub(crate) async fn publish_current_project(
     let metadata =
         npm_stage::fetch_package_metadata(auth.token(), &npm_name, registry.url()).await?;
     enforce_stage_version_policy(&metadata, &npm_name, &prepared.version, tag_explicit)?;
-    let version_data = publish::build_publish_version_data(
-        &prepared.pkg_json,
-        &prepared.name,
-        &prepared.version,
-        prepared.readme.as_deref(),
-        &prepared.tarball_data,
-    );
-    let provenance_context = publish::resolve_provenance_context(options.provenance).await?;
-    let artifact = publish::prepare_npm_target_artifact(publish::NpmTargetArtifactInput {
-        package_json_name: &prepared.name,
-        npm_name: &npm_name,
-        version: &prepared.version,
-        base_version_data: &version_data,
-        base_tarball_data: &prepared.tarball_data,
-        provenance_context: provenance_context.as_ref(),
-        target_label: "npm",
-        json_output: options.json_output,
-    })
-    .await?;
+    let artifact = if let Some(artifact) = file_artifact {
+        artifact
+    } else {
+        let provenance_context =
+            publish::materialize_provenance_request(provenance_request).await?;
+        publish::prepare_npm_target_artifact(publish::NpmTargetArtifactInput {
+            package_json_name: &prepared.name,
+            npm_name: &npm_name,
+            version: &prepared.version,
+            base_version_data: &version_data,
+            base_tarball_data: &prepared.tarball_data,
+            provenance_context: provenance_context.as_ref(),
+            target_label: "npm",
+            json_output: options.json_output,
+        })
+        .await?
+    };
 
     let upload_spinner = if options.json_output {
         None
@@ -133,6 +172,7 @@ pub(crate) async fn publish_current_project(
         &prepared.version,
         &artifact.version_data,
         &artifact.tarball_data,
+        artifact.provenance_attachment.as_ref(),
         &access,
         &tag,
         registry.url(),

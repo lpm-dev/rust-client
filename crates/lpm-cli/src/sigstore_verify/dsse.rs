@@ -47,11 +47,9 @@ pub(crate) fn pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
 /// signature verification.
 ///
 /// Both signature encodings are accepted:
-/// - **Raw R||S** (64 bytes for P-256). What LPM's publish path emits
-///   and what npm's signers use.
-/// - **DER** (variable-length ECDSA-Sig-Value). What some third-party
-///   signers (GitHub `attest-build-provenance` cohorts, older
-///   sigstore-rs versions) emit.
+/// - **DER** (variable-length ECDSA-Sig-Value). What npm's sigstore-js
+///   path and current LPM publish emit.
+/// - **Raw R||S** (64 bytes for P-256). What older LPM bundles emitted.
 ///
 /// The fallback decoding tries raw first; DER second.
 #[allow(dead_code)] // wired into provenance_bundle
@@ -75,24 +73,24 @@ pub fn verify_dsse(envelope: &DsseEnvelope, cert: &X509Certificate<'_>) -> Resul
             .decode(sig.sig.as_bytes())
             .map_err(|e| VerifyError::DsseSignature(format!("signature not valid base64: {e}")))?;
 
-        // Raw R||S first — the simpler form, what the LPM publish
-        // path emits. Fall back to DER for signers that prefer the
-        // longer encoding. A signature that parses as neither is
-        // not a verification miss on this leaf cert; record it and
-        // move on so a multi-signature envelope with one malformed
-        // entry can still verify on a sibling.
-        let signature = match Signature::from_slice(&sig_bytes) {
-            Ok(s) => s,
-            Err(_) => match Signature::from_der(&sig_bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    parse_errors.push(format!("(tried raw and DER) {e}"));
-                    continue;
-                }
-            },
-        };
+        let candidates = parse_signature_candidates(&sig_bytes);
+        if candidates.der.is_none() && candidates.raw.is_none() {
+            parse_errors.push(candidates.parse_error);
+            continue;
+        }
 
-        if verifying_key.verify(&pae_bytes, &signature).is_ok() {
+        if candidates
+            .der
+            .as_ref()
+            .is_some_and(|signature| verifying_key.verify(&pae_bytes, signature).is_ok())
+        {
+            return Ok(());
+        }
+        if candidates
+            .raw
+            .as_ref()
+            .is_some_and(|signature| verifying_key.verify(&pae_bytes, signature).is_ok())
+        {
             return Ok(());
         }
     }
@@ -109,6 +107,26 @@ pub fn verify_dsse(envelope: &DsseEnvelope, cert: &X509Certificate<'_>) -> Resul
             if parse_errors.len() == 1 { "y" } else { "ies" },
             parse_errors.join("; ")
         )))
+    }
+}
+
+struct SignatureCandidates {
+    der: Option<Signature>,
+    raw: Option<Signature>,
+    parse_error: String,
+}
+
+fn parse_signature_candidates(sig_bytes: &[u8]) -> SignatureCandidates {
+    let der = Signature::from_der(sig_bytes);
+    let raw = Signature::from_slice(sig_bytes);
+    let parse_error = match (&der, &raw) {
+        (Err(der), Err(raw)) => format!("(tried DER and raw) DER: {der}; raw: {raw}"),
+        _ => String::new(),
+    };
+    SignatureCandidates {
+        der: der.ok(),
+        raw: raw.ok(),
+        parse_error,
     }
 }
 
@@ -153,4 +171,23 @@ fn extract_p256_verifying_key(cert: &X509Certificate<'_>) -> Result<VerifyingKey
             "leaf cert SPKI is not a valid SEC1 P-256 point: {e}"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_signature_candidates_keeps_raw_when_bytes_also_parse_as_der() {
+        let mut sig_bytes = Vec::with_capacity(64);
+        sig_bytes.extend_from_slice(&[0x30, 0x3e, 0x02, 0x1d]);
+        sig_bytes.extend(std::iter::repeat_n(0x01, 29));
+        sig_bytes.extend_from_slice(&[0x02, 0x1d]);
+        sig_bytes.extend(std::iter::repeat_n(0x01, 29));
+
+        let candidates = parse_signature_candidates(&sig_bytes);
+
+        assert!(candidates.der.is_some());
+        assert!(candidates.raw.is_some());
+    }
 }
