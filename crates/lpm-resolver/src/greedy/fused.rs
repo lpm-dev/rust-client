@@ -21,6 +21,8 @@ struct FusedTreeProvider<'a> {
     dispatcher_rpc_count: Cell<u64>,
     tarball_dispatched_count: Cell<u64>,
     worker_batch_disabled: &'a Cell<bool>,
+    release_age_package_names: &'a [String],
+    release_age_all_packages: bool,
     trace_metadata_fetches: bool,
 }
 
@@ -123,7 +125,15 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                 return;
             }
 
-            match self.client.batch_metadata_deep(&names).await {
+            match self
+                .client
+                .batch_metadata_deep_with_release_age_packages(
+                    &names,
+                    self.release_age_package_names,
+                    self.release_age_all_packages,
+                )
+                .await
+            {
                 Ok(batch) => {
                     self.dispatcher_rpc_count
                         .set(self.dispatcher_rpc_count.get() + 1);
@@ -195,6 +205,33 @@ fn spawn_metadata_fetch_job(
         .await;
         (canonical, result)
     });
+}
+
+fn release_age_names_from_root_deps(
+    root_deps: &HashMap<String, String>,
+    policy: &ResolverPolicy,
+) -> Vec<String> {
+    if !policy.release_age_active() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = root_deps
+        .iter()
+        .filter_map(|(name, range)| {
+            let candidate = crate::ranges::parse_npm_alias(range)
+                .map_or_else(|| name.clone(), |alias| alias.target);
+            let canonical = CanonicalKey::from_dep_name(&candidate);
+            if matches!(&canonical, CanonicalKey::Npm { .. })
+                && policy.release_age_applies_to_package(&canonical)
+            {
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Fused dispatcher: greedy resolver IS the fetch dispatcher. Replaces the
@@ -382,6 +419,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     state.set_selected_package_tx(selected_package_tx);
     state.seed_root_edges()?;
     let worker_batch_disabled = Cell::new(false);
+    let release_age_all_packages = policy.release_age_checks_all_packages();
+    let release_age_package_names = if release_age_all_packages {
+        Vec::new()
+    } else {
+        release_age_names_from_root_deps(&state.root_deps, &policy)
+    };
     let tree_provider = FusedTreeProvider {
         client: &client,
         route_table: &route_table,
@@ -391,6 +434,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
         dispatcher_rpc_count: Cell::new(0),
         tarball_dispatched_count: Cell::new(0),
         worker_batch_disabled: &worker_batch_disabled,
+        release_age_package_names: &release_age_package_names,
+        release_age_all_packages,
         trace_metadata_fetches,
     };
     let tree_status_cache = super::tree_policy::TreeStatusCache::default();
@@ -452,7 +497,14 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
         .cloned()
         .collect();
     if !worker_root_names.is_empty() {
-        match client.batch_metadata_deep(&worker_root_names).await {
+        match client
+            .batch_metadata_deep_with_release_age_packages(
+                &worker_root_names,
+                &release_age_package_names,
+                release_age_all_packages,
+            )
+            .await
+        {
             Ok(batch) => {
                 // One actual HTTP round trip regardless of
                 // batch.len(). The dispatcher_rpc_count metric tracks
@@ -593,7 +645,14 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                 .iter()
                 .map(|(_, name)| name.clone())
                 .collect();
-            match client.batch_metadata_deep(&worker_names).await {
+            match client
+                .batch_metadata_deep_with_release_age_packages(
+                    &worker_names,
+                    &release_age_package_names,
+                    release_age_all_packages,
+                )
+                .await
+            {
                 Ok(batch) => {
                     dispatcher_rpc_count += 1;
                     let mut returned = AHashSet::with_capacity(batch.len());
@@ -939,4 +998,50 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             policy_trust_rejected_count: policy_snap.trust_policy.rejected_count,
         },
     })
+}
+
+#[cfg(test)]
+mod release_age_hint_tests {
+    use super::*;
+    use crate::policy::TrustPolicyMode;
+
+    #[test]
+    fn release_age_names_from_root_deps_returns_direct_npm_targets_only() {
+        let root_deps = HashMap::from_iter([
+            ("plain".to_string(), "^1.0.0".to_string()),
+            (
+                "alias-local".to_string(),
+                "npm:@scope/real@^2.0.0".to_string(),
+            ),
+            (
+                "lpm".to_string(),
+                "npm:@lpm.dev/acme.widget@^3.0.0".to_string(),
+            ),
+            ("unlisted".to_string(), "^4.0.0".to_string()),
+        ]);
+        let policy = ResolverPolicy::with_cutoff_unix_and_release_age_packages(
+            86_400,
+            1_735_776_000,
+            TrustPolicyMode::Off,
+            [
+                CanonicalKey::npm("plain"),
+                CanonicalKey::npm("@scope/real"),
+                CanonicalKey::lpm("acme", "widget"),
+            ],
+        );
+
+        let names = release_age_names_from_root_deps(&root_deps, &policy);
+
+        assert_eq!(names, vec!["@scope/real".to_string(), "plain".to_string()]);
+    }
+
+    #[test]
+    fn release_age_names_from_root_deps_returns_empty_when_release_age_is_off() {
+        let root_deps = HashMap::from_iter([("plain".to_string(), "^1.0.0".to_string())]);
+        let policy = ResolverPolicy::new(0, TrustPolicyMode::Off);
+
+        let names = release_age_names_from_root_deps(&root_deps, &policy);
+
+        assert!(names.is_empty());
+    }
 }

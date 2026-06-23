@@ -483,6 +483,47 @@ async fn batch_metadata_sends_bearer_auth_header_when_token_is_present() {
 }
 
 #[tokio::test]
+async fn batch_metadata_deep_sends_release_age_packages_when_present() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let valid_name = "vite";
+    let valid_metadata: serde_json::Value =
+        serde_json::from_str(&test_metadata_json(valid_name)).expect("valid metadata json");
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .and(body_string_contains("\"packages\":[\"vite\",\"react\"]"))
+        .and(body_string_contains("\"releaseAgePackages\":[\"vite\"]"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "packages": {
+                        valid_name: valid_metadata,
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .batch_metadata_deep_with_release_age_packages(
+            &["vite".to_string(), "react".to_string()],
+            &["vite".to_string()],
+            false,
+        )
+        .await
+        .expect("batch metadata with release-age hints should succeed");
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[valid_name].name, valid_name);
+}
+
+#[tokio::test]
 async fn batch_metadata_omits_auth_header_when_token_is_absent() {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
