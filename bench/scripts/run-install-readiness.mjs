@@ -446,6 +446,9 @@ function extractLpmMetrics(json) {
     firewall_checked_count: finiteNumber(firewall?.checked_count),
     firewall_lookup_mode:
       typeof firewall?.lookup_mode === 'string' ? firewall.lookup_mode : undefined,
+    firewall_chunk_count: finiteNumber(firewall?.chunk_count),
+    firewall_chunk_sum_ms: finiteNumber(firewall?.chunk_sum_ms),
+    firewall_chunk_max_ms: finiteNumber(firewall?.chunk_max_ms),
     firewall_allow_count: finiteNumber(firewall?.allow_count),
     firewall_warn_count: finiteNumber(firewall?.warn_count),
     firewall_block_count: finiteNumber(firewall?.block_count),
@@ -797,6 +800,9 @@ function summarizeMetrics(rows) {
     'duration_ms',
     'resolve_ms',
     'firewall_batch_ms',
+    'firewall_chunk_count',
+    'firewall_chunk_sum_ms',
+    'firewall_chunk_max_ms',
     'firewall_checked_count',
     'firewall_allow_count',
     'firewall_warn_count',
@@ -916,8 +922,8 @@ function summarizeMetrics(rows) {
 
 function renderSummaryMarkdown(summary) {
   const lines = [
-    '| Fixture | Spec | Mode | OK | Wall med/min | Resolve med/min | Firewall med/min | Fetch med/min | Link med/min | Pkgs | FW checked | FW warn/block/unknown | Metadata MB | Version docs | Parity mismatches | Warnings exp/unknown |',
-    '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    '| Fixture | Spec | Mode | OK | Wall med/min | Resolve med/min | Firewall med/min | FW chunks | FW chunk sum | FW chunk max | Fetch med/min | Link med/min | Pkgs | FW checked | FW warn/block/unknown | Metadata MB | Version docs | Parity mismatches | Warnings exp/unknown |',
+    '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   ];
   for (const row of summary) {
     const m = row.metrics;
@@ -938,7 +944,7 @@ function renderSummaryMarkdown(summary) {
       ? `${one(m.firewall_warn_count)}/${one(m.firewall_block_count)}/${one(m.firewall_unknown_count)}`
       : 'n/a';
     lines.push(
-      `| ${row.fixture} | ${row.spec} | ${row.mode} | ${row.successful_samples}/${row.samples} | ${stat(m.wall_ms)} | ${stat(m.resolve_ms)} | ${stat(m.firewall_batch_ms)} | ${stat(m.fetch_ms)} | ${stat(m.link_ms)} | ${one(m.package_count)} | ${one(m.firewall_checked_count)} | ${firewallVerdicts} | ${stat(m.metadata_body_mb_sum)} | ${versionDocs} | ${mismatches} | ${warnings} |`,
+      `| ${row.fixture} | ${row.spec} | ${row.mode} | ${row.successful_samples}/${row.samples} | ${stat(m.wall_ms)} | ${stat(m.resolve_ms)} | ${stat(m.firewall_batch_ms)} | ${one(m.firewall_chunk_count)} | ${stat(m.firewall_chunk_sum_ms)} | ${stat(m.firewall_chunk_max_ms)} | ${stat(m.fetch_ms)} | ${stat(m.link_ms)} | ${one(m.package_count)} | ${one(m.firewall_checked_count)} | ${firewallVerdicts} | ${stat(m.metadata_body_mb_sum)} | ${versionDocs} | ${mismatches} | ${warnings} |`,
     );
   }
   return lines.join('\n');

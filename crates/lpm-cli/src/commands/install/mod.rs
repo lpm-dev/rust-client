@@ -2502,6 +2502,7 @@ async fn run_with_options_under_store_lock(
     // the dispatcher early removes the resolve/fetch overlap.
     let mut speculation_join: Option<SpeculationJoin> = None;
     let mut fetch_overlap_join: Option<FetchOverlapJoin> = None;
+    let mut npm_firewall_preflight_join: Option<NpmFirewallPreflightJoin> = None;
     let mut post_firewall_fetch_overlap_allowed = false;
     // Post-lockfile metadata: which resolver actually ran.
     // Stamped into `lpm.lock`'s `resolved-with` field at the cold-
@@ -2642,7 +2643,7 @@ async fn run_with_options_under_store_lock(
                     // ── FUSION PATH ─────────────────────────────────────
                     let fetch_overlap_allowed_local =
                         fetch_overlap_enabled(fusion_enabled_local, force, omit_policy.dev);
-                    let fetch_overlap_enabled_local = fetch_overlap_allowed_local
+                    let fetch_overlap_downloads_during_resolve = fetch_overlap_allowed_local
                         && !npm_firewall_mode.disables_tarball_prefetch();
                     if npm_firewall_mode.is_enabled() && fetch_overlap_allowed_local {
                         post_firewall_fetch_overlap_allowed = true;
@@ -2650,7 +2651,7 @@ async fn run_with_options_under_store_lock(
                     let npm_fanout = positive_usize_env_or_default(
                         "LPM_NPM_FANOUT",
                         default_fusion_npm_fanout(
-                            fetch_overlap_enabled_local,
+                            fetch_overlap_downloads_during_resolve,
                             resolver_min_age_secs,
                         ),
                     );
@@ -2680,23 +2681,54 @@ async fn run_with_options_under_store_lock(
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
                     );
-                    let selected_package_tx = if fetch_overlap_enabled_local {
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                        fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
-                            rx,
-                            arc_client.clone(),
-                            route_table.clone(),
-                            store.clone(),
-                            store_v2_handle.clone(),
-                            fetch_semaphore.clone(),
-                            fetch_coord.clone(),
-                            project_dir.to_path_buf(),
-                            gate_stats.clone(),
-                            fetch_extract_limiter.clone(),
-                            streaming_fetch,
-                            fetch_overlap_min_selected(),
-                        ));
-                        Some(tx)
+                    let selected_package_tx = if fetch_overlap_allowed_local {
+                        if npm_firewall_mode.is_enabled() {
+                            let (selected_tx, selected_rx) = tokio::sync::mpsc::unbounded_channel();
+                            let (fetch_tx, fetch_rx) = tokio::sync::mpsc::unbounded_channel();
+                            fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
+                                fetch_rx,
+                                arc_client.clone(),
+                                route_table.clone(),
+                                store.clone(),
+                                store_v2_handle.clone(),
+                                fetch_semaphore.clone(),
+                                fetch_coord.clone(),
+                                project_dir.to_path_buf(),
+                                gate_stats.clone(),
+                                fetch_extract_limiter.clone(),
+                                streaming_fetch,
+                                1,
+                            ));
+                            npm_firewall_preflight_join =
+                                Some(spawn_chunked_npm_firewall_preflight(
+                                    selected_rx,
+                                    fetch_tx,
+                                    arc_client.clone(),
+                                    route_table.clone(),
+                                    npm_firewall_mode,
+                                    NpmFirewallLookupMode::from_env(),
+                                    offline,
+                                    npm_firewall_chunk_size_from_env(),
+                                ));
+                            Some(selected_tx)
+                        } else {
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                            fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
+                                rx,
+                                arc_client.clone(),
+                                route_table.clone(),
+                                store.clone(),
+                                store_v2_handle.clone(),
+                                fetch_semaphore.clone(),
+                                fetch_coord.clone(),
+                                project_dir.to_path_buf(),
+                                gate_stats.clone(),
+                                fetch_extract_limiter.clone(),
+                                streaming_fetch,
+                                fetch_overlap_min_selected(),
+                            ));
+                            Some(tx)
+                        }
                     } else {
                         None
                     };
@@ -3084,15 +3116,20 @@ async fn run_with_options_under_store_lock(
     }
     platform_skipped += filter_platform_packages(&mut packages)?;
 
-    let npm_firewall_stats = run_npm_firewall_preflight(
-        npm_firewall_mode,
-        &arc_client,
-        &route_table,
-        &packages,
-        offline,
-        json_output,
-    )
-    .await?;
+    let npm_firewall_stats = if let Some(join) = npm_firewall_preflight_join.take() {
+        let result = join.drain().await?;
+        finish_npm_firewall_preflight(result, json_output)?
+    } else {
+        run_npm_firewall_preflight(
+            npm_firewall_mode,
+            &arc_client,
+            &route_table,
+            &packages,
+            offline,
+            json_output,
+        )
+        .await?
+    };
     if post_firewall_fetch_overlap_allowed && fetch_overlap_join.is_none() && !packages.is_empty() {
         fetch_overlap_join = Some(spawn_fetch_overlap_for_packages(
             packages.clone(),

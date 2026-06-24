@@ -70,6 +70,19 @@ fn npm_firewall_lookup_mode_defaults_to_package_and_integrity() {
 }
 
 #[test]
+fn npm_firewall_chunk_size_uses_positive_values_or_default() {
+    assert_eq!(npm_firewall_chunk_size("128"), 128);
+    assert_eq!(
+        npm_firewall_chunk_size("0"),
+        DEFAULT_NPM_FIREWALL_CHUNK_SIZE
+    );
+    assert_eq!(
+        npm_firewall_chunk_size("not-a-number"),
+        DEFAULT_NPM_FIREWALL_CHUNK_SIZE
+    );
+}
+
+#[test]
 fn npm_firewall_mode_disables_tarball_prefetch_when_enabled() {
     assert!(NpmFirewallExperimentMode::Report.disables_tarball_prefetch());
     assert!(NpmFirewallExperimentMode::Enforce.disables_tarball_prefetch());
@@ -94,6 +107,9 @@ fn npm_firewall_stats_serializes_timing_and_verdict_counts() {
         mode: NpmFirewallExperimentMode::Report,
         checked_count: 12,
         batch_ms: 34,
+        chunk_count: 2,
+        chunk_sum_ms: 30,
+        chunk_max_ms: 21,
         ..NpmFirewallPreflightStats::default()
     };
     stats.record_summary(lpm_registry::client::NpmFirewallSummary {
@@ -160,6 +176,9 @@ fn npm_firewall_stats_serializes_timing_and_verdict_counts() {
     assert_eq!(json["lookup_mode"], "package_and_integrity");
     assert_eq!(json["checked_count"], 12);
     assert_eq!(json["batch_ms"], 34);
+    assert_eq!(json["chunk_count"], 2);
+    assert_eq!(json["chunk_sum_ms"], 30);
+    assert_eq!(json["chunk_max_ms"], 21);
     assert_eq!(json["allow_count"], 9);
     assert_eq!(json["warn_count"], 1);
     assert_eq!(json["block_count"], 0);
@@ -243,6 +262,58 @@ fn npm_firewall_package_skips_lpm_package() {
     assert!(
         npm_firewall_package(
             &package,
+            &route_table,
+            NpmFirewallLookupMode::PackageAndIntegrity
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn npm_firewall_package_from_selected_event_uses_package_only_lookup() {
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let event = lpm_resolver::SelectedPackageEvent {
+        name: "left-pad".to_string(),
+        version: "1.0.0".to_string(),
+        is_lpm: false,
+        tarball_url: None,
+        integrity: Some("sha512-test".to_string()),
+        platform: None,
+        optional: false,
+    };
+
+    let verdict_package = npm_firewall_package_from_selected_event(
+        &event,
+        &route_table,
+        NpmFirewallLookupMode::PackageOnly,
+    )
+    .expect("public npm package is eligible");
+
+    assert_eq!(verdict_package.name, "left-pad");
+    assert_eq!(verdict_package.version, "1.0.0");
+    assert_eq!(verdict_package.integrity.as_deref(), None);
+}
+
+#[test]
+fn npm_firewall_package_from_selected_event_skips_incompatible_platform_package() {
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let event = lpm_resolver::SelectedPackageEvent {
+        name: "left-pad".to_string(),
+        version: "1.0.0".to_string(),
+        is_lpm: false,
+        tarball_url: None,
+        integrity: Some("sha512-test".to_string()),
+        platform: Some(lpm_resolver::PlatformMeta {
+            os: vec!["definitely-not-this-os".to_string()],
+            cpu: Vec::new(),
+            libc: Vec::new(),
+        }),
+        optional: true,
+    };
+
+    assert!(
+        npm_firewall_package_from_selected_event(
+            &event,
             &route_table,
             NpmFirewallLookupMode::PackageAndIntegrity
         )
