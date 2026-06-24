@@ -412,6 +412,13 @@ function extractLpmMetrics(json) {
     lpmMetadataMetrics(json);
   const fetchBreakdown = at(json, ['timing', 'fetch_breakdown']);
   const fetchOverlap = at(json, ['timing', 'detail', 'fetch', 'overlap']);
+  const firewall =
+    at(json, ['timing', 'firewall']) ?? at(json, ['timing', 'detail', 'security', 'firewall']);
+  const firewallClient = firewall?.client;
+  const firewallWorker = firewall?.worker;
+  const firewallWorkerMatchSources = firewallWorker?.matchSources;
+  const firewallWorkerLookupDuration = firewallWorker?.lookupDuration;
+  const firewallWorkerFlaggedIndex = firewallWorker?.flaggedPackageIndex;
   const resolveDetail = at(json, ['timing', 'resolve']);
   const resolveDispatcher = resolveDetail?.dispatcher;
   const streamingBfs = resolveDetail?.streaming_bfs;
@@ -433,6 +440,79 @@ function extractLpmMetrics(json) {
     cached: numberAt(json, ['cached']),
     linked: numberAt(json, ['linked']),
     resolve_ms: numberAt(json, ['timing', 'resolve_ms']),
+    firewall_batch_ms: finiteNumber(
+      firstFinite(at(json, ['timing', 'firewall_batch_ms']), firewall?.batch_ms),
+    ),
+    firewall_checked_count: finiteNumber(firewall?.checked_count),
+    firewall_lookup_mode:
+      typeof firewall?.lookup_mode === 'string' ? firewall.lookup_mode : undefined,
+    firewall_allow_count: finiteNumber(firewall?.allow_count),
+    firewall_warn_count: finiteNumber(firewall?.warn_count),
+    firewall_block_count: finiteNumber(firewall?.block_count),
+    firewall_unknown_count: finiteNumber(firewall?.unknown_count),
+    firewall_matched_count: finiteNumber(firewall?.matched_count),
+    firewall_worker_package_count: finiteNumber(firewallWorker?.packageCount),
+    firewall_worker_lookup_concurrency: finiteNumber(firewallWorker?.lookupConcurrency),
+    firewall_worker_kv_read_count: finiteNumber(firewallWorker?.kvReadCount),
+    firewall_worker_kv_lookup_ms: finiteNumber(firewallWorker?.kvLookupMs),
+    firewall_worker_entitlement_ms: finiteNumber(firewallWorker?.entitlementMs),
+    firewall_worker_parse_ms: finiteNumber(firewallWorker?.parseMs),
+    firewall_worker_total_ms: finiteNumber(firewallWorker?.totalMs),
+    firewall_worker_matched_count: finiteNumber(firewallWorker?.matchedCount),
+    firewall_worker_returned_decision_count: finiteNumber(firewallWorker?.returnedDecisionCount),
+    firewall_worker_flagged_index_enabled:
+      firewallWorkerFlaggedIndex?.enabled === true
+        ? 1
+        : firewallWorkerFlaggedIndex?.enabled === false
+          ? 0
+          : finiteNumber(firewallWorkerFlaggedIndex?.enabled),
+    firewall_worker_flagged_index_used:
+      firewallWorkerFlaggedIndex?.used === true
+        ? 1
+        : firewallWorkerFlaggedIndex?.used === false
+          ? 0
+          : finiteNumber(firewallWorkerFlaggedIndex?.used),
+    firewall_worker_flagged_index_read_ms: finiteNumber(firewallWorkerFlaggedIndex?.readMs),
+    firewall_worker_flagged_index_package_key_count: finiteNumber(
+      firewallWorkerFlaggedIndex?.packageKeyCount,
+    ),
+    firewall_worker_flagged_index_candidate_count: finiteNumber(
+      firewallWorkerFlaggedIndex?.candidateCount,
+    ),
+    firewall_worker_flagged_index_detail_read_count: finiteNumber(
+      firewallWorkerFlaggedIndex?.detailReadCount,
+    ),
+    firewall_worker_flagged_index_skipped_package_lookup_count: finiteNumber(
+      firewallWorkerFlaggedIndex?.skippedPackageLookupCount,
+    ),
+    firewall_worker_match_integrity_count: finiteNumber(firewallWorkerMatchSources?.integrity),
+    firewall_worker_match_package_count: finiteNumber(firewallWorkerMatchSources?.package),
+    firewall_worker_match_none_count: finiteNumber(firewallWorkerMatchSources?.none),
+    firewall_worker_lookup_duration_count: finiteNumber(firewallWorkerLookupDuration?.count),
+    firewall_worker_lookup_duration_sum_ms: finiteNumber(firewallWorkerLookupDuration?.sumMs),
+    firewall_worker_lookup_duration_max_ms: finiteNumber(firewallWorkerLookupDuration?.maxMs),
+    firewall_worker_lookup_duration_p50_ms: finiteNumber(firewallWorkerLookupDuration?.p50Ms),
+    firewall_worker_lookup_duration_p95_ms: finiteNumber(firewallWorkerLookupDuration?.p95Ms),
+    firewall_client_request_ms: finiteNumber(firewallClient?.requestMs),
+    firewall_client_body_read_ms: finiteNumber(firewallClient?.bodyReadMs),
+    firewall_client_json_parse_ms: finiteNumber(firewallClient?.jsonParseMs),
+    firewall_client_total_ms: finiteNumber(firewallClient?.totalMs),
+    firewall_client_request_body_bytes: finiteNumber(firewallClient?.requestBodyBytes),
+    firewall_client_request_body_mb: bytesToMb(firewallClient?.requestBodyBytes),
+    firewall_client_response_body_bytes: finiteNumber(firewallClient?.responseBodyBytes),
+    firewall_client_response_body_mb: bytesToMb(firewallClient?.responseBodyBytes),
+    firewall_rpc_failed_count:
+      firewall?.rpc_failed === true
+        ? 1
+        : firewall?.rpc_failed === false
+          ? 0
+          : finiteNumber(firewall?.rpc_failed),
+    firewall_offline_skipped_count:
+      firewall?.offline_skipped === true
+        ? 1
+        : firewall?.offline_skipped === false
+          ? 0
+          : finiteNumber(firewall?.offline_skipped),
     resolve_initial_batch_ms: finiteNumber(resolveDetail?.initial_batch_ms),
     resolve_followup_rpc_ms: finiteNumber(resolveDetail?.followup_rpc_ms),
     resolve_followup_rpc_count: finiteNumber(resolveDetail?.followup_rpc_count),
@@ -716,6 +796,45 @@ function summarizeMetrics(rows) {
     'wall_ms',
     'duration_ms',
     'resolve_ms',
+    'firewall_batch_ms',
+    'firewall_checked_count',
+    'firewall_allow_count',
+    'firewall_warn_count',
+    'firewall_block_count',
+    'firewall_unknown_count',
+    'firewall_matched_count',
+    'firewall_worker_package_count',
+    'firewall_worker_lookup_concurrency',
+    'firewall_worker_kv_read_count',
+    'firewall_worker_kv_lookup_ms',
+    'firewall_worker_entitlement_ms',
+    'firewall_worker_parse_ms',
+    'firewall_worker_total_ms',
+    'firewall_worker_matched_count',
+    'firewall_worker_returned_decision_count',
+    'firewall_worker_flagged_index_enabled',
+    'firewall_worker_flagged_index_used',
+    'firewall_worker_flagged_index_read_ms',
+    'firewall_worker_flagged_index_package_key_count',
+    'firewall_worker_flagged_index_candidate_count',
+    'firewall_worker_flagged_index_detail_read_count',
+    'firewall_worker_flagged_index_skipped_package_lookup_count',
+    'firewall_worker_match_integrity_count',
+    'firewall_worker_match_package_count',
+    'firewall_worker_match_none_count',
+    'firewall_worker_lookup_duration_count',
+    'firewall_worker_lookup_duration_sum_ms',
+    'firewall_worker_lookup_duration_max_ms',
+    'firewall_worker_lookup_duration_p50_ms',
+    'firewall_worker_lookup_duration_p95_ms',
+    'firewall_client_request_ms',
+    'firewall_client_body_read_ms',
+    'firewall_client_json_parse_ms',
+    'firewall_client_total_ms',
+    'firewall_client_request_body_mb',
+    'firewall_client_response_body_mb',
+    'firewall_rpc_failed_count',
+    'firewall_offline_skipped_count',
     'resolve_initial_batch_ms',
     'resolve_followup_rpc_ms',
     'resolve_followup_rpc_count',
@@ -797,8 +916,8 @@ function summarizeMetrics(rows) {
 
 function renderSummaryMarkdown(summary) {
   const lines = [
-    '| Fixture | Spec | Mode | OK | Wall med/min | Resolve med/min | Fetch med/min | Link med/min | Pkgs | Metadata MB | Version docs | Parity mismatches | Warnings exp/unknown |',
-    '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    '| Fixture | Spec | Mode | OK | Wall med/min | Resolve med/min | Firewall med/min | Fetch med/min | Link med/min | Pkgs | FW checked | FW warn/block/unknown | Metadata MB | Version docs | Parity mismatches | Warnings exp/unknown |',
+    '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   ];
   for (const row of summary) {
     const m = row.metrics;
@@ -814,8 +933,12 @@ function renderSummaryMarkdown(summary) {
       m.expected_warning_count || m.unexpected_warning_count
         ? `${one(m.expected_warning_count)}/${one(m.unexpected_warning_count)}`
         : '0/0';
+    const hasFirewall = Boolean(m.firewall_checked_count) || Boolean(m.firewall_batch_ms);
+    const firewallVerdicts = hasFirewall
+      ? `${one(m.firewall_warn_count)}/${one(m.firewall_block_count)}/${one(m.firewall_unknown_count)}`
+      : 'n/a';
     lines.push(
-      `| ${row.fixture} | ${row.spec} | ${row.mode} | ${row.successful_samples}/${row.samples} | ${stat(m.wall_ms)} | ${stat(m.resolve_ms)} | ${stat(m.fetch_ms)} | ${stat(m.link_ms)} | ${one(m.package_count)} | ${stat(m.metadata_body_mb_sum)} | ${versionDocs} | ${mismatches} | ${warnings} |`,
+      `| ${row.fixture} | ${row.spec} | ${row.mode} | ${row.successful_samples}/${row.samples} | ${stat(m.wall_ms)} | ${stat(m.resolve_ms)} | ${stat(m.firewall_batch_ms)} | ${stat(m.fetch_ms)} | ${stat(m.link_ms)} | ${one(m.package_count)} | ${one(m.firewall_checked_count)} | ${firewallVerdicts} | ${stat(m.metadata_body_mb_sum)} | ${versionDocs} | ${mismatches} | ${warnings} |`,
     );
   }
   return lines.join('\n');
@@ -1390,6 +1513,58 @@ function runSelfTests() {
   const currentMetadataMetrics = extractLpmMetrics({
     count: 2,
     timing: {
+      firewall_batch_ms: 31,
+      firewall: {
+        checked_count: 10,
+        batch_ms: 31,
+        allow_count: 7,
+        warn_count: 1,
+        block_count: 0,
+        unknown_count: 2,
+        matched_count: 1,
+        rpc_failed: false,
+        offline_skipped: false,
+        client: {
+          requestMs: 18,
+          bodyReadMs: 3,
+          jsonParseMs: 2,
+          totalMs: 23,
+          requestBodyBytes: 2 * 1024 * 1024,
+          responseBodyBytes: 1024 * 1024,
+        },
+        worker: {
+          packageCount: 10,
+          lookupConcurrency: 64,
+          kvReadCount: 12,
+          kvLookupMs: 14,
+          entitlementMs: 1,
+          parseMs: 2,
+          totalMs: 17,
+          matchedCount: 1,
+          returnedDecisionCount: 1,
+          flaggedPackageIndex: {
+            enabled: true,
+            used: true,
+            readMs: 2,
+            packageKeyCount: 3,
+            candidateCount: 1,
+            detailReadCount: 1,
+            skippedPackageLookupCount: 9,
+          },
+          matchSources: {
+            integrity: 1,
+            package: 0,
+            none: 9,
+          },
+          lookupDuration: {
+            count: 10,
+            sumMs: 80,
+            maxMs: 12,
+            p50Ms: 7,
+            p95Ms: 12,
+          },
+        },
+      },
       resolve: {
         initial_batch_ms: 3,
         followup_rpc_ms: 13,
@@ -1492,6 +1667,40 @@ function runSelfTests() {
   assert.equal(currentMetadataMetrics.resolve_streaming_bfs_walk_ms, 23);
   assert.equal(currentMetadataMetrics.resolve_streaming_bfs_manifests_fetched, 11);
   assert.equal(currentMetadataMetrics.resolve_streaming_bfs_cache_hits, 7);
+  assert.equal(currentMetadataMetrics.firewall_batch_ms, 31);
+  assert.equal(currentMetadataMetrics.firewall_checked_count, 10);
+  assert.equal(currentMetadataMetrics.firewall_warn_count, 1);
+  assert.equal(currentMetadataMetrics.firewall_block_count, 0);
+  assert.equal(currentMetadataMetrics.firewall_unknown_count, 2);
+  assert.equal(currentMetadataMetrics.firewall_rpc_failed_count, 0);
+  assert.equal(currentMetadataMetrics.firewall_worker_package_count, 10);
+  assert.equal(currentMetadataMetrics.firewall_worker_lookup_concurrency, 64);
+  assert.equal(currentMetadataMetrics.firewall_worker_kv_read_count, 12);
+  assert.equal(currentMetadataMetrics.firewall_worker_kv_lookup_ms, 14);
+  assert.equal(currentMetadataMetrics.firewall_worker_entitlement_ms, 1);
+  assert.equal(currentMetadataMetrics.firewall_worker_parse_ms, 2);
+  assert.equal(currentMetadataMetrics.firewall_worker_total_ms, 17);
+  assert.equal(currentMetadataMetrics.firewall_worker_matched_count, 1);
+  assert.equal(currentMetadataMetrics.firewall_worker_returned_decision_count, 1);
+  assert.equal(currentMetadataMetrics.firewall_worker_flagged_index_enabled, 1);
+  assert.equal(currentMetadataMetrics.firewall_worker_flagged_index_used, 1);
+  assert.equal(currentMetadataMetrics.firewall_worker_flagged_index_read_ms, 2);
+  assert.equal(currentMetadataMetrics.firewall_worker_flagged_index_package_key_count, 3);
+  assert.equal(currentMetadataMetrics.firewall_worker_flagged_index_candidate_count, 1);
+  assert.equal(currentMetadataMetrics.firewall_worker_flagged_index_detail_read_count, 1);
+  assert.equal(
+    currentMetadataMetrics.firewall_worker_flagged_index_skipped_package_lookup_count,
+    9,
+  );
+  assert.equal(currentMetadataMetrics.firewall_worker_match_integrity_count, 1);
+  assert.equal(currentMetadataMetrics.firewall_worker_match_none_count, 9);
+  assert.equal(currentMetadataMetrics.firewall_worker_lookup_duration_p95_ms, 12);
+  assert.equal(currentMetadataMetrics.firewall_client_request_ms, 18);
+  assert.equal(currentMetadataMetrics.firewall_client_body_read_ms, 3);
+  assert.equal(currentMetadataMetrics.firewall_client_json_parse_ms, 2);
+  assert.equal(currentMetadataMetrics.firewall_client_total_ms, 23);
+  assert.equal(currentMetadataMetrics.firewall_client_request_body_mb, 2);
+  assert.equal(currentMetadataMetrics.firewall_client_response_body_mb, 1);
   assert.equal(currentMetadataMetrics.fetch_overlap_selected_count, 5);
   assert.equal(currentMetadataMetrics.fetch_overlap_buffered_count, 2);
   assert.equal(currentMetadataMetrics.fetch_overlap_buffered_dispatch_count, 1);

@@ -27,6 +27,7 @@ use tokio::sync::Semaphore;
 mod catalog;
 mod fetch;
 mod fetch_overlap;
+mod firewall;
 mod gitignore;
 mod installer_spike;
 mod lifecycle;
@@ -48,6 +49,7 @@ mod workspace;
 use catalog::*;
 use fetch::*;
 use fetch_overlap::*;
+use firewall::*;
 use gitignore::*;
 pub use gitignore::{
     ensure_lpm_hoisted_gitignore, ensure_lpm_wrappers_gitignore, ensure_skills_gitignore,
@@ -951,6 +953,7 @@ async fn run_with_options_under_store_lock(
     let provenance_timings = timing_detail_mode
         .enabled()
         .then(crate::provenance_fetch::ProvenanceTimings::default);
+    let npm_firewall_mode = NpmFirewallExperimentMode::from_env();
     let mut slow_package_timings = SlowPackageTimings::default();
     let mut wf_tail_lockfile_write_ms = 0u128;
     let mut wf_tail_lockfile_write_count = 0u64;
@@ -2499,6 +2502,7 @@ async fn run_with_options_under_store_lock(
     // the dispatcher early removes the resolve/fetch overlap.
     let mut speculation_join: Option<SpeculationJoin> = None;
     let mut fetch_overlap_join: Option<FetchOverlapJoin> = None;
+    let mut post_firewall_fetch_overlap_allowed = false;
     // Post-lockfile metadata: which resolver actually ran.
     // Stamped into `lpm.lock`'s `resolved-with` field at the cold-
     // write site below. Defaults to the greedy-fusion install default
@@ -2636,8 +2640,13 @@ async fn run_with_options_under_store_lock(
                     u128,
                 ) = if fusion_enabled_local {
                     // ── FUSION PATH ─────────────────────────────────────
-                    let fetch_overlap_enabled_local =
+                    let fetch_overlap_allowed_local =
                         fetch_overlap_enabled(fusion_enabled_local, force, omit_policy.dev);
+                    let fetch_overlap_enabled_local = fetch_overlap_allowed_local
+                        && !npm_firewall_mode.disables_tarball_prefetch();
+                    if npm_firewall_mode.is_enabled() && fetch_overlap_allowed_local {
+                        post_firewall_fetch_overlap_allowed = true;
+                    }
                     let npm_fanout = positive_usize_env_or_default(
                         "LPM_NPM_FANOUT",
                         default_fusion_npm_fanout(
@@ -2662,7 +2671,11 @@ async fn run_with_options_under_store_lock(
                         fetch_semaphore.clone(),
                         Some(Arc::new(Semaphore::new(speculation_permits))),
                         fetch_coord.clone(),
-                        speculation_deps,
+                        if npm_firewall_mode.disables_tarball_prefetch() {
+                            HashMap::new()
+                        } else {
+                            speculation_deps
+                        },
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
@@ -2796,7 +2809,11 @@ async fn run_with_options_under_store_lock(
                         fetch_semaphore.clone(),
                         None,
                         fetch_coord.clone(),
-                        speculation_deps,
+                        if npm_firewall_mode.disables_tarball_prefetch() {
+                            HashMap::new()
+                        } else {
+                            speculation_deps
+                        },
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
@@ -3066,6 +3083,31 @@ async fn run_with_options_under_store_lock(
         filter_dev_packages(&mut packages, &production_dependency_names);
     }
     platform_skipped += filter_platform_packages(&mut packages)?;
+
+    let npm_firewall_stats = run_npm_firewall_preflight(
+        npm_firewall_mode,
+        &arc_client,
+        &route_table,
+        &packages,
+        offline,
+        json_output,
+    )
+    .await?;
+    if post_firewall_fetch_overlap_allowed && fetch_overlap_join.is_none() && !packages.is_empty() {
+        fetch_overlap_join = Some(spawn_fetch_overlap_for_packages(
+            packages.clone(),
+            arc_client.clone(),
+            route_table.clone(),
+            store.clone(),
+            store_v2_handle.clone(),
+            fetch_semaphore.clone(),
+            fetch_coord.clone(),
+            project_dir.to_path_buf(),
+            gate_stats.clone(),
+            fetch_extract_limiter.clone(),
+            streaming_fetch,
+        ));
+    }
 
     append_workspace_links_from_local_packages(
         project_dir,
@@ -5747,6 +5789,8 @@ async fn run_with_options_under_store_lock(
                    "duration_ms": elapsed.as_millis() as u64,
                    "timing": {
                        "resolve_ms": resolve_ms,
+                       "firewall_batch_ms": npm_firewall_stats.batch_ms,
+                       "firewall": npm_firewall_stats.to_json(),
                        "fetch_ms": fetch_ms,
                        "link_ms": link_ms,
                        "total_ms": elapsed.as_millis(),
@@ -6017,6 +6061,7 @@ async fn run_with_options_under_store_lock(
                     fetch_breakdown,
                 ),
                 "security": {
+                    "firewall": npm_firewall_stats.to_json(),
                     "registry_signatures": registry_signature_timings
                         .as_ref()
                         .map_or(serde_json::Value::Null, |timings| timings.to_json()),

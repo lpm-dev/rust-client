@@ -3,6 +3,7 @@ use super::*;
 mod api;
 mod body;
 mod cache;
+mod firewall;
 mod http_tls;
 mod metadata;
 mod tarball;

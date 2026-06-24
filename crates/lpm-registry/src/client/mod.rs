@@ -19,6 +19,7 @@ mod auth;
 mod body;
 mod cache;
 mod config;
+mod firewall;
 mod http;
 mod metadata;
 mod state;
@@ -30,6 +31,11 @@ mod url_gate;
 
 pub use self::auth::AuthPosture;
 pub use self::body::parse_capped_api_json;
+pub use self::firewall::{
+    NpmFirewallAction, NpmFirewallBatchPackage, NpmFirewallBatchResponse, NpmFirewallClientTiming,
+    NpmFirewallDecision, NpmFirewallDiagnostics, NpmFirewallFlaggedPackageIndexDiagnostics,
+    NpmFirewallLookupDuration, NpmFirewallMatchSources, NpmFirewallSummary,
+};
 pub use self::metadata::BatchMetadataEntryStream;
 pub use self::state::{
     DownloadedTarball, FanOutStats, HttpClients, PackageMetadataFetchTimings, RegistryClient,
@@ -42,8 +48,9 @@ pub use self::url_gate::{
 
 use self::auth::{apply_npmrc_auth, cert_pem_fingerprint, principal_fingerprint};
 use self::body::{
-    MAX_METADATA_BYTES, forbidden_error_from_body, parse_capped_metadata,
-    parse_capped_metadata_with_timing, read_capped_error_text,
+    MAX_METADATA_BYTES, elapsed_millis, forbidden_error_from_body,
+    parse_capped_api_json_with_timing, parse_capped_metadata, parse_capped_metadata_with_timing,
+    read_capped_error_text,
 };
 use self::http::{CONNECT_TIMEOUT, READ_TIMEOUT, build_per_origin_http_client};
 use self::state::{CacheContent, CacheValidator, CachedClient};

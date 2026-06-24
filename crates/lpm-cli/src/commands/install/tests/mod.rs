@@ -2,6 +2,7 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 
 mod fetch;
+mod firewall;
 mod gitignore;
 mod lifecycle;
 mod lockfile;
