@@ -92,6 +92,13 @@ pub(super) struct MetadataBodyTimings {
     pub(super) body_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ApiBodyTimings {
+    pub(super) body_read_ms: u64,
+    pub(super) json_parse_ms: u64,
+    pub(super) body_bytes: u64,
+}
+
 pub(super) async fn parse_capped_metadata_with_timing<
     T: serde::de::DeserializeOwned + Send + 'static,
 >(
@@ -147,6 +154,29 @@ pub async fn parse_capped_api_json<T: serde::de::DeserializeOwned>(
         .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))
 }
 
+pub(super) async fn parse_capped_api_json_with_timing<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<(T, ApiBodyTimings), LpmError> {
+    let body_start = std::time::Instant::now();
+    let buf = read_capped_body(response, MAX_API_RESPONSE_BYTES, context).await?;
+    let body_read_ms = elapsed_millis(body_start);
+
+    let parse_start = std::time::Instant::now();
+    let parsed = serde_json::from_slice(strip_json_bom_bytes(&buf))
+        .map_err(|e| LpmError::Registry(format!("{context}: failed to parse JSON: {e}")))?;
+    let json_parse_ms = elapsed_millis(parse_start);
+
+    Ok((
+        parsed,
+        ApiBodyTimings {
+            body_read_ms,
+            json_parse_ms,
+            body_bytes: buf.len() as u64,
+        },
+    ))
+}
+
 /// Read an error-body response as UTF-8 text under the API-tier cap.
 ///
 /// Returns the empty string on cap-overflow or read errors so the
@@ -198,4 +228,8 @@ pub(super) fn forbidden_error_from_body(body: String) -> LpmError {
 
 pub(super) fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(serde_json::Value::as_str)
+}
+
+pub(super) fn elapsed_millis(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }

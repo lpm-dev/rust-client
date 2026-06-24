@@ -61,6 +61,10 @@ fn security_status_json_defaults_to_project_target() {
         envelope["status"]["project_root"],
         serde_json::json!(expected_root)
     );
+    assert_eq!(
+        envelope["status"]["effective_floor"]["firewall_mode"],
+        serde_json::json!("off")
+    );
 }
 
 #[test]
@@ -83,6 +87,7 @@ fn security_status_human_uses_slim_completion() {
     assert!(
         stdout.contains("target   project")
             && stdout.contains("effective floor")
+            && stdout.contains("npm firewall")
             && stdout.contains("active unlocks"),
         "security status must render the status sections to stdout, got:\n{stdout}",
     );

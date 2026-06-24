@@ -45,6 +45,10 @@ pub fn load_effective_authorized_posture() -> Result<EffectiveAuthorizedPosture,
             posture.typosquat_guard = typosquat_guard.as_str().to_string();
             sources.typosquat_guard = PostureSourceKind::ManagedPolicy;
         }
+        if let Some(firewall_mode) = policy.firewall_mode {
+            posture.firewall_mode = firewall_mode.as_str().to_string();
+            sources.firewall_mode = PostureSourceKind::ManagedPolicy;
+        }
     }
 
     Ok(EffectiveAuthorizedPosture {
@@ -63,9 +67,11 @@ pub fn persist_authorized_posture(posture: &AuthorizedPosture) -> Result<(), Lpm
     write_signed_json(&approved_posture_path()?, &normalized)
 }
 
-fn active_runtime_overrides(effective: &EffectiveAuthorizedPosture) -> Vec<RuntimeOverride> {
+fn active_runtime_overrides(
+    effective: &EffectiveAuthorizedPosture,
+) -> Result<Vec<RuntimeOverride>, LpmError> {
     let env_value = std::env::var("LPM_PROVENANCE_ENFORCE").ok();
-    let global = crate::commands::config::GlobalConfig::load();
+    let global = crate::commands::config::GlobalConfig::load_checked()?;
     let mut overrides = Vec::new();
     let (mode, source) =
         EnforceMode::resolve_from_chain(env_value.as_deref(), || global.get_sigstore_verify());
@@ -100,7 +106,17 @@ fn active_runtime_overrides(effective: &EffectiveAuthorizedPosture) -> Vec<Runti
             source: "~/.lpm/config.toml typosquat-guard".to_string(),
         });
     }
-    overrides
+    let effective_firewall = effective.posture.firewall_mode();
+    if let Some(request_firewall) = crate::npm_firewall_config::runtime_request_mode(&global)?
+        && request_firewall.mode() != effective_firewall
+    {
+        overrides.push(RuntimeOverride {
+            control: crate::npm_firewall_config::FIREWALL_CONFIG_PATH.to_string(),
+            value: request_firewall.mode().as_str().to_string(),
+            source: request_firewall.source_label().to_string(),
+        });
+    }
+    Ok(overrides)
 }
 
 pub fn load_security_status(
@@ -108,7 +124,7 @@ pub fn load_security_status(
     global: bool,
 ) -> Result<SecurityStatus, LpmError> {
     let effective = load_effective_authorized_posture()?;
-    let active_runtime_overrides = active_runtime_overrides(&effective);
+    let active_runtime_overrides = active_runtime_overrides(&effective)?;
     let (target, project_root, active_unlocks) = if global {
         (
             UnlockTargetKind::Global,

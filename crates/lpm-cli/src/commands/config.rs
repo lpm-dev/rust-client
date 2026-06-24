@@ -1,4 +1,7 @@
 use crate::install_ui;
+use crate::npm_firewall_config::{
+    FIREWALL_CONFIG_MODE_KEY, FIREWALL_CONFIG_PATH, FIREWALL_CONFIG_SECTION, NpmFirewallMode,
+};
 use crate::prompt::prompt_err;
 use crate::provenance_fetch::EnforceMode;
 use crate::sandbox_config::ResolvedSandboxMode;
@@ -14,7 +17,7 @@ use std::io::IsTerminal;
 /// Bare `lpm config` opens a guided editor that routes into the focused
 /// wizards below. The direct forms stay available for scripts and deep links.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, nine focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, ten focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
@@ -26,11 +29,13 @@ use std::io::IsTerminal;
 ///   (operator persistent toggle for npm publisher/provenance downgrade checks).
 /// - `lpm config typosquat` owns `typosquat-guard = default | on | off`
 ///   (operator persistent toggle for suspicious package-name analysis).
+/// - `lpm config firewall` owns `[firewall] mode = off | report | enforce`
+///   (operator persistent toggle for lpm.dev firewall verdict checks).
 /// - `lpm config release-age` owns `minimum-release-age-secs = <seconds>`
 ///   via human-friendly duration inputs.
 /// - `lpm config release-age-policy` owns `release-age-policy = direct | strict`.
 ///
-/// All nine default to interactive in a TTY; `--set <value>` is the
+/// All ten default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: Option<&str>,
@@ -65,6 +70,9 @@ pub async fn run(
     }
     if action == "typosquat" {
         return run_typosquat_wizard(&config_path, set, json_output).await;
+    }
+    if action == "firewall" {
+        return run_firewall_wizard(&config_path, set, json_output).await;
     }
     if action == "release-age" {
         return run_release_age_wizard(&config_path, set, json_output).await;
@@ -152,9 +160,26 @@ pub async fn run(
                         &format!("lpm config set {key} {}", requested.as_str()),
                     )?;
                 }
+                FIREWALL_CONFIG_SECTION => {
+                    let requested = parse_firewall_mode_selection(value)?;
+                    crate::security_floor::reject_looser_firewall_mode_write(
+                        &global_config_view_from_value(&config),
+                        requested,
+                    )?;
+                    crate::security_approval::authorize_persistent_npm_firewall_mode(
+                        requested,
+                        json_output,
+                        &format!("lpm config set {key} {}", requested.as_str()),
+                    )?;
+                }
                 _ => {}
             }
-            if let Some(table) = config.as_table_mut() {
+            if key == FIREWALL_CONFIG_SECTION {
+                persist_firewall_mode_in_config_value(
+                    &mut config,
+                    parse_firewall_mode_selection(value)?,
+                )?;
+            } else if let Some(table) = config.as_table_mut() {
                 if key == TYPOSQUAT_GUARD_KEY
                     && parse_typosquat_guard_selection(value)? == TyposquatGuardSelection::Default
                 {
@@ -196,6 +221,10 @@ pub async fn run(
                     serde_json::Value::String(
                         parse_typosquat_guard_selection(value)?.as_str().to_string(),
                     )
+                } else if key == FIREWALL_CONFIG_SECTION {
+                    serde_json::json!({
+                        "mode": parse_firewall_mode_selection(value)?.as_str(),
+                    })
                 } else {
                     serde_json::Value::String(value.to_string())
                 };
@@ -253,6 +282,17 @@ pub async fn run(
                         &format!("lpm config delete {key}"),
                     )?;
                 }
+                FIREWALL_CONFIG_SECTION => {
+                    crate::security_floor::reject_looser_firewall_mode_write(
+                        &global_config_view_from_value(&config),
+                        NpmFirewallMode::Off,
+                    )?;
+                    crate::security_approval::authorize_persistent_npm_firewall_mode(
+                        NpmFirewallMode::Off,
+                        json_output,
+                        &format!("lpm config delete {key}"),
+                    )?;
+                }
                 _ => {}
             }
             let existed = config.as_table_mut().and_then(|t| t.remove(key)).is_some();
@@ -295,7 +335,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, release-age, release-age-policy"
+                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, release-age, release-age-policy"
             )));
         }
     }
@@ -366,6 +406,11 @@ async fn run_guided_config_menu(
                 format!("current: {}", summary.typosquat_guard),
             )
             .item(
+                "firewall",
+                "npm firewall",
+                format!("current: {}", summary.firewall_mode),
+            )
+            .item(
                 "release-age",
                 "Minimum release age",
                 format!("current: {}", summary.release_age),
@@ -390,6 +435,7 @@ async fn run_guided_config_menu(
             "signatures" => run_signatures_wizard(config_path, None, false).await?,
             "trust-policy" => run_trust_policy_wizard(config_path, None, false).await?,
             "typosquat" => run_typosquat_wizard(config_path, None, false).await?,
+            "firewall" => run_firewall_wizard(config_path, None, false).await?,
             "release-age" => run_release_age_wizard(config_path, None, false).await?,
             "release-age-policy" => run_release_age_policy_wizard(config_path, None, false).await?,
             "done" => return Ok(()),
@@ -422,6 +468,7 @@ struct GuidedConfigSummary {
     signatures: &'static str,
     trust_policy: String,
     typosquat_guard: String,
+    firewall_mode: String,
     release_age: String,
     release_age_policy: String,
 }
@@ -451,6 +498,7 @@ fn read_guided_config_summary(
         typosquat_guard: format_current_typosquat_guard(read_typosquat_guard_override(
             config_path,
         )?),
+        firewall_mode: format_current_firewall_mode(read_firewall_mode(config_path)?),
         release_age: format_current_release_age(read_release_age_override(config_path)?),
         release_age_policy: read_release_age_policy_override(config_path)?
             .unwrap_or_default()
@@ -587,16 +635,25 @@ impl GlobalConfig {
     /// Load from the configured LPM root's config.toml. Returns empty
     /// config if missing or unreadable.
     pub fn load() -> Self {
-        let table = LpmRoot::from_env()
-            .ok()
-            .map(|root| root.root().join("config.toml"))
-            .and_then(|p| read_config(&p).ok())
-            .and_then(|v| match v {
-                toml::Value::Table(t) => Some(t),
-                _ => None,
-            })
-            .unwrap_or_default();
-        Self { table }
+        Self::load_checked().unwrap_or_else(|_| Self {
+            table: toml::map::Map::new(),
+        })
+    }
+
+    /// Load from the configured LPM root's config.toml and propagate
+    /// parse/read errors to security-sensitive command paths.
+    pub fn load_checked() -> Result<Self, LpmError> {
+        let config_path = LpmRoot::from_env()?.root().join("config.toml");
+        let table = match read_config(&config_path)? {
+            toml::Value::Table(table) => table,
+            _ => {
+                return Err(LpmError::Registry(format!(
+                    "{} must contain a TOML table",
+                    config_path.display()
+                )));
+            }
+        };
+        Ok(Self { table })
     }
 
     /// Construct an empty config — used by in-crate tests that need a
@@ -647,6 +704,10 @@ impl GlobalConfig {
     /// resolve to a table, and any non-table value at this key.
     pub fn get_table(&self, key: &str) -> Option<&toml::value::Table> {
         self.table.get(key)?.as_table()
+    }
+
+    pub fn get_value(&self, key: &str) -> Option<&toml::Value> {
+        self.table.get(key)
     }
 
     /// Read `[sigstore] verify`. Returns the raw string (`"deny"`
@@ -1383,6 +1444,155 @@ fn announce_typosquat_guard_set(selection: TyposquatGuardSelection, json_output:
         install_ui::done(&format!(
             "Set typosquat-guard = {}",
             format_current_typosquat_guard(Some(selection)).bold()
+        ));
+    }
+}
+
+async fn run_firewall_wizard(
+    config_path: &std::path::Path,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let selection = if let Some(value) = set {
+        parse_firewall_mode_selection(value)?
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err(LpmError::Registry(
+                "lpm config firewall requires a TTY; use `--set off|report|enforce` instead"
+                    .to_string(),
+            ));
+        }
+
+        let current = read_firewall_mode(config_path)?.unwrap_or_default();
+        println!();
+        println!(
+            "  current: {}",
+            format_current_firewall_mode(Some(current)).cyan()
+        );
+        let new_value: &str =
+            cliclack::select("How should LPM handle lpm.dev npm firewall verdicts?")
+                .item(
+                    "off",
+                    "off",
+                    "default; direct npm metadata and tarballs only",
+                )
+                .item(
+                    "report",
+                    "report",
+                    "check selected packages and warn without blocking install",
+                )
+                .item(
+                    "enforce",
+                    "enforce",
+                    "block packages marked malicious by lpm.dev firewall",
+                )
+                .initial_value(current.as_str())
+                .interact()
+                .map_err(prompt_err)?;
+        parse_firewall_mode_selection(new_value)?
+    };
+
+    if set.is_none() && selection.loosens(read_firewall_mode(config_path)?.unwrap_or_default()) {
+        println!();
+        println!(
+            "  {}: setting firewall mode to {} weakens npm firewall checks for every \
+             install on this machine.",
+            "warning".yellow(),
+            selection.as_str().yellow().bold(),
+        );
+        let confirmed = cliclack::confirm(
+            "Are you sure you want to weaken npm firewall checks for every install on this machine?",
+        )
+        .initial_value(false)
+        .interact()
+        .map_err(prompt_err)?;
+        if !confirmed {
+            println!("  Aborted. No config change.");
+            return Ok(());
+        }
+    }
+
+    let existing_cfg = read_config(config_path)?;
+    crate::security_floor::reject_looser_firewall_mode_write(
+        &global_config_view_from_value(&existing_cfg),
+        selection,
+    )?;
+    crate::security_approval::authorize_persistent_npm_firewall_mode(
+        selection,
+        json_output,
+        &format!("lpm config firewall --set {}", selection.as_str()),
+    )?;
+    persist_firewall_mode(config_path, selection)?;
+    announce_firewall_mode_set(selection, json_output);
+    Ok(())
+}
+
+fn parse_firewall_mode_selection(input: &str) -> Result<NpmFirewallMode, LpmError> {
+    NpmFirewallMode::parse(input).ok_or_else(|| {
+        LpmError::Registry(format!(
+            "invalid firewall mode '{input}'; must be one of: off | report | enforce"
+        ))
+    })
+}
+
+fn read_firewall_mode(config_path: &std::path::Path) -> Result<Option<NpmFirewallMode>, LpmError> {
+    let cfg = read_config(config_path)?;
+    let table = match cfg {
+        toml::Value::Table(table) => table,
+        _ => return Ok(None),
+    };
+    crate::npm_firewall_config::config_mode(&GlobalConfig { table })
+}
+
+fn persist_firewall_mode(
+    config_path: &std::path::Path,
+    mode: NpmFirewallMode,
+) -> Result<(), LpmError> {
+    let mut cfg = read_config(config_path)?;
+    persist_firewall_mode_in_config_value(&mut cfg, mode)?;
+    write_config(config_path, &cfg)
+}
+
+fn persist_firewall_mode_in_config_value(
+    cfg: &mut toml::Value,
+    mode: NpmFirewallMode,
+) -> Result<(), LpmError> {
+    let top = cfg.as_table_mut().ok_or_else(|| {
+        LpmError::Registry("config.toml must be a TOML table at the top level".into())
+    })?;
+    let firewall_section = top
+        .entry(FIREWALL_CONFIG_SECTION.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let firewall_table = firewall_section.as_table_mut().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "`{FIREWALL_CONFIG_SECTION}` is not a TOML table — refusing to clobber"
+        ))
+    })?;
+    firewall_table.insert(
+        FIREWALL_CONFIG_MODE_KEY.to_string(),
+        toml::Value::String(mode.as_str().to_string()),
+    );
+    Ok(())
+}
+
+fn format_current_firewall_mode(current: Option<NpmFirewallMode>) -> String {
+    current.unwrap_or_default().as_str().to_string()
+}
+
+fn announce_firewall_mode_set(mode: NpmFirewallMode, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "firewall": { "mode": mode.as_str() },
+            }))
+            .unwrap()
+        );
+    } else {
+        install_ui::done(&format!(
+            "Set {FIREWALL_CONFIG_PATH} = {}",
+            mode.as_str().bold()
         ));
     }
 }
@@ -2131,6 +2341,7 @@ mod wizard_tests {
                 signatures: "disabled",
                 trust_policy: "off".to_string(),
                 typosquat_guard: "default (enabled)".to_string(),
+                firewall_mode: "off".to_string(),
                 release_age: "default (1d)".to_string(),
                 release_age_policy: "direct".to_string(),
             }
@@ -2156,6 +2367,9 @@ mode = "strict"
 
 [sigstore]
 verify = "warn"
+
+[firewall]
+mode = "enforce"
 "#,
         )
         .unwrap();
@@ -2172,6 +2386,7 @@ verify = "warn"
                 signatures: "enabled",
                 trust_policy: "no-downgrade".to_string(),
                 typosquat_guard: "off".to_string(),
+                firewall_mode: "enforce".to_string(),
                 release_age: "3d".to_string(),
                 release_age_policy: "strict".to_string(),
             }
@@ -2420,6 +2635,148 @@ verify = "warn"
         assert_eq!(
             cfg.get_typosquat_guard_mode(),
             Some(TyposquatGuardSelection::Off),
+        );
+    }
+
+    #[tokio::test]
+    async fn firewall_wizard_set_persists_each_valid_mode() {
+        for mode in ["off", "report", "enforce"] {
+            let (_dir, path, _env) = tmp_config();
+
+            run_firewall_wizard(&path, Some(mode), true).await.unwrap();
+
+            assert_eq!(
+                read_firewall_mode(&path).unwrap(),
+                Some(parse_firewall_mode_selection(mode).unwrap()),
+                "firewall mode '{mode}' must persist",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn firewall_wizard_set_writes_nested_firewall_table() {
+        let (_dir, path, _env) = tmp_config();
+
+        run_firewall_wizard(&path, Some("enforce"), true)
+            .await
+            .unwrap();
+
+        let cfg = read_config(&path).unwrap();
+        assert_eq!(
+            cfg.get(FIREWALL_CONFIG_SECTION)
+                .and_then(|v| v.as_table())
+                .and_then(|t| t.get(FIREWALL_CONFIG_MODE_KEY))
+                .and_then(|v| v.as_str()),
+            Some("enforce")
+        );
+    }
+
+    #[tokio::test]
+    async fn firewall_wizard_set_rejects_invalid_mode_without_persisting() {
+        let (_dir, path, _env) = tmp_config();
+
+        let err = run_firewall_wizard(&path, Some("observe"), true)
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid firewall mode 'observe'"),
+            "got: {msg}"
+        );
+        assert!(read_firewall_mode(&path).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn firewall_wizard_set_records_enabled_mode_as_approved_posture() {
+        let (_dir, path, _env) = tmp_config();
+
+        run_firewall_wizard(&path, Some("enforce"), true)
+            .await
+            .unwrap();
+
+        let posture = crate::security_approval::load_authorized_posture().unwrap();
+        assert_eq!(posture.firewall_mode(), NpmFirewallMode::Enforce);
+    }
+
+    #[tokio::test]
+    async fn firewall_wizard_set_rejects_disable_when_approved_posture_requires_enforce() {
+        let (_dir, path, _env) = tmp_config();
+        run_firewall_wizard(&path, Some("enforce"), true)
+            .await
+            .unwrap();
+
+        let err = run_firewall_wizard(&path, Some("off"), true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_approval_required");
+        assert!(matches!(
+            err,
+            LpmError::SecurityApprovalRequired {
+                ref requested_scopes,
+                ..
+            } if requested_scopes == &["firewall-disable"]
+        ));
+        assert_eq!(
+            read_firewall_mode(&path).unwrap(),
+            Some(NpmFirewallMode::Enforce)
+        );
+    }
+
+    #[tokio::test]
+    async fn firewall_wizard_set_rejects_looser_mode_when_force_floor_enabled() {
+        let (_dir, path, _env) = tmp_config();
+        std::fs::write(
+            &path,
+            "force-security-floor = true\n[firewall]\nmode = \"enforce\"\n",
+        )
+        .unwrap();
+
+        let err = run_firewall_wizard(&path, Some("report"), true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+        assert!(err.to_string().contains(FIREWALL_CONFIG_PATH));
+        assert_eq!(
+            read_firewall_mode(&path).unwrap(),
+            Some(NpmFirewallMode::Enforce)
+        );
+    }
+
+    #[tokio::test]
+    async fn firewall_wizard_preserves_sibling_keys() {
+        let (_dir, path, _env) = tmp_config();
+        std::fs::write(
+            &path,
+            "script-policy = \"triage\"\n[firewall]\nnote = \"keep-me\"\n",
+        )
+        .unwrap();
+
+        run_firewall_wizard(&path, Some("report"), true)
+            .await
+            .unwrap();
+
+        let cfg = read_config(&path).unwrap();
+        let top = cfg.as_table().unwrap();
+        assert_eq!(
+            top.get("script-policy").and_then(|v| v.as_str()),
+            Some("triage")
+        );
+        let firewall = top
+            .get(FIREWALL_CONFIG_SECTION)
+            .and_then(|v| v.as_table())
+            .unwrap();
+        assert_eq!(
+            firewall
+                .get(FIREWALL_CONFIG_MODE_KEY)
+                .and_then(|v| v.as_str()),
+            Some("report")
+        );
+        assert_eq!(
+            firewall.get("note").and_then(|v| v.as_str()),
+            Some("keep-me")
         );
     }
 
@@ -2736,6 +3093,27 @@ verify = "warn"
         };
         let cfg = GlobalConfig { table };
         assert!(cfg.get_sigstore_verify().is_none());
+    }
+
+    #[test]
+    fn global_config_load_checked_rejects_malformed_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", dir.path().as_os_str().to_owned())]);
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[firewall\nmode = \"enforce\"\n",
+        )
+        .unwrap();
+
+        let Err(err) = GlobalConfig::load_checked() else {
+            panic!("malformed config must fail checked load");
+        };
+
+        assert!(
+            err.to_string().contains("config parse error"),
+            "unexpected error: {err}"
+        );
     }
 
     // ── lpm config sigstore wizard (--set path) ────────────────

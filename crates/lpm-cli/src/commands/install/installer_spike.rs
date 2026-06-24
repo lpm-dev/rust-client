@@ -33,6 +33,7 @@ pub(super) struct InstallerSpikeAdmission {
     pub(super) verify_registry_signatures: bool,
     pub(super) strict_integrity: bool,
     pub(super) force_security_floor: bool,
+    pub(super) npm_firewall_enabled: bool,
     pub(super) auto_build: bool,
     pub(super) script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     pub(super) script_policy_is_default: bool,
@@ -131,6 +132,9 @@ fn unsupported_admission_reasons(
     }
     if admission.force_security_floor {
         reasons.push("force-security-floor is not supported");
+    }
+    if admission.npm_firewall_enabled {
+        reasons.push("npm firewall is not supported");
     }
     if admission.auto_build
         || admission.script_policy_override.is_some()
@@ -3590,6 +3594,7 @@ mod tests {
             verify_registry_signatures: false,
             strict_integrity: false,
             force_security_floor: false,
+            npm_firewall_enabled: false,
             auto_build: false,
             script_policy_override: None,
             script_policy_is_default: true,
@@ -3790,6 +3795,7 @@ mod tests {
         admission.omit_policy.dev = true;
         admission.has_workspace_member_deps = true;
         admission.verify_registry_signatures = true;
+        admission.npm_firewall_enabled = true;
         admission.audit_after_install = true;
         admission.script_policy_is_default = false;
         admission.has_trusted_dependencies = true;
@@ -3807,6 +3813,7 @@ mod tests {
         assert!(!reasons.contains(&"overrides are not supported"));
         assert!(!reasons.contains(&"patches are not supported"));
         assert!(reasons.contains(&"registry signature verification is not supported"));
+        assert!(reasons.contains(&"npm firewall is not supported"));
         assert!(reasons.contains(&"audit-after-install is not supported"));
         assert!(reasons.contains(&"script policy/build execution options are not supported"));
         assert!(reasons.contains(&"strict minimumReleaseAge lockfile replay is not supported"));

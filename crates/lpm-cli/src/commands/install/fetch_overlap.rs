@@ -184,6 +184,58 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_fetch_overlap_for_packages(
+    packages: Vec<InstallPackage>,
+    client: Arc<RegistryClient>,
+    route_table: RouteTable,
+    store: PackageStore,
+    store_v2_handle: Option<Arc<lpm_store::v2::Store>>,
+    fetch_semaphore: Arc<Semaphore>,
+    fetch_coord: Arc<FetchCoordinator>,
+    project_dir: PathBuf,
+    gate_stats: Arc<GateStats>,
+    fetch_extract_limiter: FetchExtractLimiter,
+    streaming_fetch: bool,
+) -> FetchOverlapJoin {
+    let handle = tokio::spawn(async move {
+        let mut seen = HashSet::with_capacity(packages.len());
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut outcomes = Vec::new();
+        let mut stats = FetchOverlapStats::default();
+
+        for package in packages {
+            stats.selected_count = stats.selected_count.saturating_add(1);
+            dispatch_install_package(
+                package,
+                &route_table,
+                &client,
+                &store,
+                &store_v2_handle,
+                &fetch_semaphore,
+                &fetch_coord,
+                &project_dir,
+                &gate_stats,
+                &fetch_extract_limiter,
+                streaming_fetch,
+                &mut seen,
+                &mut tasks,
+                &mut stats,
+            );
+        }
+
+        while let Some(joined) = tasks.join_next().await {
+            record_overlap_task(Some(joined), &mut stats, &mut outcomes);
+        }
+
+        FetchOverlapDrain { outcomes, stats }
+    });
+
+    FetchOverlapJoin {
+        handle: Some(handle),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_selected_event(
     event: lpm_resolver::SelectedPackageEvent,
     route_table: &RouteTable,
@@ -201,6 +253,41 @@ fn dispatch_selected_event(
     stats: &mut FetchOverlapStats,
 ) {
     let package = install_package_from_selected_event(event, route_table);
+    dispatch_install_package(
+        package,
+        route_table,
+        client,
+        store,
+        store_v2_handle,
+        fetch_semaphore,
+        fetch_coord,
+        project_dir,
+        gate_stats,
+        fetch_extract_limiter,
+        streaming_fetch,
+        seen,
+        tasks,
+        stats,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_install_package(
+    package: InstallPackage,
+    route_table: &RouteTable,
+    client: &Arc<RegistryClient>,
+    store: &PackageStore,
+    store_v2_handle: &Option<Arc<lpm_store::v2::Store>>,
+    fetch_semaphore: &Arc<Semaphore>,
+    fetch_coord: &Arc<FetchCoordinator>,
+    project_dir: &Path,
+    gate_stats: &Arc<GateStats>,
+    fetch_extract_limiter: &FetchExtractLimiter,
+    streaming_fetch: bool,
+    seen: &mut HashSet<String>,
+    tasks: &mut tokio::task::JoinSet<FetchOverlapTaskStatus>,
+    stats: &mut FetchOverlapStats,
+) {
     let key = install_pkg_key(&package);
     if !seen.insert(key) {
         return;

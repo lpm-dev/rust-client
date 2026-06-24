@@ -74,6 +74,96 @@ fn install_without_dependencies_uses_slim_status_output() {
     );
 }
 
+#[test]
+fn install_rejects_malformed_global_config() {
+    let project = TempProject::empty(r#"{"name":"malformed-config","version":"1.0.0"}"#);
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(
+        lpm_dir.join("config.toml"),
+        "[firewall\nmode = \"enforce\"\n",
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install");
+
+    assert!(
+        !output.status.success(),
+        "malformed global config must fail install\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("config parse error"),
+        "install must surface the config parse error; got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn install_fast_lane_rejects_malformed_firewall_config() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "firewall-fast-lane-config",
+        "version": "1.0.0",
+        "dependencies": {
+            "ms": "^2.1.3"
+        }
+    }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(lpm_dir.join("config.toml"), "firewall = \"enforce\"\n").unwrap();
+
+    let output = lpm(&project)
+        .arg("install")
+        .env("LPM_REGISTRY_URL", mock.url())
+        .output()
+        .expect("failed to run bare install");
+
+    assert!(
+        !output.status.success(),
+        "bare warm-cache install must reject malformed firewall config\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("up to date"),
+        "fast lane must not exit as up to date when firewall config is malformed; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("`[firewall]` must be a TOML table"),
+        "error must name the malformed firewall table; got:\n{combined}"
+    );
+}
+
 #[tokio::test]
 async fn bare_install_runs_root_project_lifecycle_scripts_in_order() {
     let mock = MockRegistry::start().await;
@@ -3354,6 +3444,117 @@ async fn install_offline_with_store_succeeds() {
     // node_modules should be re-populated
     assertions::assert_node_modules_exists(project.path());
     assertions::assert_in_node_modules(project.path(), "ms");
+}
+
+#[tokio::test]
+async fn install_offline_firewall_report_relinks_and_reports_offline_skip_json() {
+    let project = warm_public_npm_lockfile_project_for_offline_firewall("report").await;
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("LPM_NPM_ROUTE", "direct")
+        .args([
+            "install",
+            "--offline",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run offline install with firewall report");
+
+    assert!(
+        output.status.success(),
+        "report-mode firewall must not block offline lockfile replay\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["offline"], serde_json::json!(true));
+    assert_eq!(envelope["timing"]["firewall"]["mode"], "report");
+    assert_eq!(
+        envelope["timing"]["firewall"]["lookup_mode"],
+        "package_only"
+    );
+    assert_eq!(envelope["timing"]["firewall"]["checked_count"], 1);
+    assert_eq!(envelope["timing"]["firewall"]["offline_skipped"], true);
+    assert_eq!(envelope["security"]["firewall"]["mode"], "report");
+    assertions::assert_in_node_modules(project.path(), "ms");
+}
+
+#[tokio::test]
+async fn install_offline_firewall_enforce_fails_closed_before_linking() {
+    let project = warm_public_npm_lockfile_project_for_offline_firewall("enforce").await;
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("LPM_NPM_ROUTE", "direct")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run offline install with firewall enforce");
+
+    assert!(
+        !output.status.success(),
+        "enforce-mode firewall must fail closed offline\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("npm firewall verdict preflight requires network access"),
+        "offline enforce failure must explain the firewall network requirement; got:\n{combined}"
+    );
+    assert!(
+        !project.path().join("node_modules").exists(),
+        "offline enforce must fail before recreating node_modules"
+    );
+}
+
+#[tokio::test]
+async fn install_offline_firewall_enforce_uses_public_lockfile_source_when_npmrc_drifts() {
+    let project = warm_public_npm_lockfile_project_for_offline_firewall("enforce").await;
+    project.write_file(".npmrc", "registry=https://npm.internal.example.com/\n");
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run offline install with drifted npmrc");
+
+    assert!(
+        !output.status.success(),
+        "offline enforce must still check public lockfile source when .npmrc drifts\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("npm firewall verdict preflight requires network access"),
+        "offline enforce failure must come from firewall preflight; got:\n{combined}"
+    );
+    assert!(
+        !project.path().join("node_modules").exists(),
+        "offline enforce must fail before recreating node_modules"
+    );
 }
 
 #[tokio::test]
@@ -8062,6 +8263,68 @@ fn write_release_age_global_config(project: &TempProject, secs: u64) {
         format!("minimum-release-age-secs = {secs}\n"),
     )
     .unwrap();
+}
+
+fn write_npm_firewall_global_config(project: &TempProject, mode: &str) {
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(
+        lpm_dir.join("config.toml"),
+        format!("[firewall]\nmode = \"{mode}\"\n"),
+    )
+    .unwrap();
+}
+
+fn rewrite_lockfile_registry_sources_to_public_npm(project: &TempProject) {
+    let lockfile_path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).unwrap();
+    for package in &mut lockfile.packages {
+        if package
+            .source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("registry+"))
+        {
+            package.source = Some(format!("registry+{}", lpm_common::NPM_REGISTRY_URL));
+        }
+    }
+    lockfile.write_to_file(&lockfile_path).unwrap();
+    let _ = std::fs::remove_file(lockfile_path.with_extension("lockb"));
+}
+
+async fn warm_public_npm_lockfile_project_for_offline_firewall(mode: &str) -> TempProject {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "offline-firewall",
+        "version": "1.0.0",
+        "dependencies": {
+            "ms": "^2.1.3"
+        }
+    }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assertions::assert_lockfile_exists(project.path());
+    rewrite_lockfile_registry_sources_to_public_npm(&project);
+    write_npm_firewall_global_config(&project, mode);
+
+    let node_modules = project.path().join("node_modules");
+    if node_modules.exists() {
+        std::fs::remove_dir_all(node_modules).unwrap();
+    }
+
+    project
 }
 
 fn assert_cooldown_blocked(out: &std::process::Output) {

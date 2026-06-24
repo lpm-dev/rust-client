@@ -63,6 +63,9 @@ pub(crate) fn run() -> Result<()> {
         if !workspace_json_output && let Some(pkg_content) = pkg_content_opt.as_deref() {
             let state = install_state::check_install_state_with_content(&cwd, pkg_content);
             if state.up_to_date {
+                if let Err(error) = ensure_fast_lane_firewall_posture(&cwd, json_mode) {
+                    exit_with_lpm_error(&error, json_mode, lpm_common::DEFAULT_REGISTRY_URL);
+                }
                 let elapsed_ms = start.elapsed().as_millis();
                 if json_mode {
                     // Hand-formatted to match `serde_json::to_string_pretty`
@@ -108,6 +111,15 @@ pub(crate) fn run() -> Result<()> {
         .expect("failed to create tokio runtime");
 
     runtime.block_on(async_main())
+}
+
+fn ensure_fast_lane_firewall_posture(
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), lpm_common::LpmError> {
+    let global_config = crate::commands::config::GlobalConfig::load_checked()?;
+    crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
+    Ok(())
 }
 
 async fn async_main() -> Result<()> {
