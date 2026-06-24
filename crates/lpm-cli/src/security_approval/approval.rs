@@ -843,17 +843,32 @@ pub fn ensure_runtime_typosquat_guard_config_authorized(
     )
 }
 
-pub fn ensure_runtime_npm_firewall_config_authorized(
+#[cfg(test)]
+pub(crate) fn ensure_runtime_npm_firewall_config_authorized(
     project_dir: &Path,
     json_output: bool,
     requested: crate::npm_firewall_config::NpmFirewallMode,
 ) -> Result<(), LpmError> {
     let effective = load_effective_authorized_posture()?;
+    ensure_runtime_npm_firewall_config_authorized_with_effective(
+        &effective,
+        project_dir,
+        json_output,
+        requested,
+    )
+}
+
+pub(crate) fn ensure_runtime_npm_firewall_config_authorized_with_effective(
+    effective: &EffectiveAuthorizedPosture,
+    project_dir: &Path,
+    json_output: bool,
+    requested: crate::npm_firewall_config::NpmFirewallMode,
+) -> Result<(), LpmError> {
     let approved = effective.posture.firewall_mode();
     if !requested.loosens(approved) {
         return Ok(());
     }
-    if let Some(err) = managed_policy_blocks_scope(&effective, ApprovalScope::FirewallDisable) {
+    if let Some(err) = managed_policy_blocks_scope(effective, ApprovalScope::FirewallDisable) {
         record_audit_event(
             AuditRecord::new(
                 "guarded-attempt",

@@ -20,6 +20,8 @@ fn with_test_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
             TEST_AUTH_RESULT_ENV,
             Some(std::ffi::OsString::from("approve")),
         ),
+        ("LPM_NPM_FIREWALL", None),
+        ("LPM_EXPERIMENT_NPM_FIREWALL", None),
         ("LPM_FORCE_FILE_VAULT", None),
     ]);
     f()
@@ -80,6 +82,20 @@ fn without_test_native_auth<T>(f: impl FnOnce() -> T) -> T {
 fn write_managed_policy(dir: &Path, body: &str) {
     let policy_path = dir.join("managed-security-policy.toml");
     std::fs::write(policy_path, body).unwrap();
+}
+
+fn firewall_global_config(mode: &str) -> crate::commands::config::GlobalConfig {
+    let mut firewall = toml::map::Map::new();
+    firewall.insert(
+        crate::npm_firewall_config::FIREWALL_CONFIG_MODE_KEY.to_string(),
+        toml::Value::String(mode.to_string()),
+    );
+    let mut table = toml::map::Map::new();
+    table.insert(
+        crate::npm_firewall_config::FIREWALL_CONFIG_SECTION.to_string(),
+        toml::Value::Table(firewall),
+    );
+    crate::commands::config::GlobalConfig::from_table(table)
 }
 
 #[test]
@@ -402,6 +418,76 @@ source = "test"
                 .contains("must set `[firewall]` to a TOML table"),
             "unexpected error: {err}"
         );
+    });
+}
+
+#[test]
+fn runtime_firewall_mode_uses_managed_policy_floor_when_config_is_absent() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+mode = "enforce"
+"#,
+        );
+        let mode = crate::npm_firewall_config::resolve_runtime_mode(
+            &crate::commands::config::GlobalConfig::empty(),
+            &project,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(mode, crate::npm_firewall_config::NpmFirewallMode::Enforce);
+    });
+}
+
+#[test]
+fn runtime_firewall_mode_rejects_explicit_config_below_managed_policy_floor() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+mode = "enforce"
+"#,
+        );
+        let err = crate::npm_firewall_config::resolve_runtime_mode(
+            &firewall_global_config("off"),
+            &project,
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_floor");
+    });
+}
+
+#[test]
+fn security_status_does_not_report_absent_firewall_config_as_runtime_override() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+[firewall]
+mode = "enforce"
+"#,
+        );
+        let status = load_security_status(Some(&project), false).unwrap();
+
+        assert!(status.active_runtime_overrides.is_empty());
     });
 }
 

@@ -953,7 +953,6 @@ async fn run_with_options_under_store_lock(
     let provenance_timings = timing_detail_mode
         .enabled()
         .then(crate::provenance_fetch::ProvenanceTimings::default);
-    let npm_firewall_mode = crate::npm_firewall_config::resolve_mode(&global_config)?;
     let npm_firewall_lookup_mode = NpmFirewallLookupMode::from_env();
     let npm_firewall_chunk_size = npm_firewall_chunk_size_from_env();
     let mut slow_package_timings = SlowPackageTimings::default();
@@ -984,11 +983,8 @@ async fn run_with_options_under_store_lock(
         json_output,
         crate::security_approval::ApprovalSource::ProjectConfig,
     )?;
-    crate::security_approval::ensure_runtime_npm_firewall_config_authorized(
-        project_dir,
-        json_output,
-        npm_firewall_mode,
-    )?;
+    let npm_firewall_mode =
+        crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
     crate::typosquat_guard::guard_manifest_direct_dependencies(
         project_dir,
         &pkg_json_path,

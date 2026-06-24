@@ -106,13 +106,14 @@ fn active_runtime_overrides(
             source: "~/.lpm/config.toml typosquat-guard".to_string(),
         });
     }
-    let config_firewall = crate::npm_firewall_config::config_mode(&global)?.unwrap_or_default();
     let effective_firewall = effective.posture.firewall_mode();
-    if config_firewall != effective_firewall {
+    if let Some(request_firewall) = crate::npm_firewall_config::runtime_request_mode(&global)?
+        && request_firewall.mode() != effective_firewall
+    {
         overrides.push(RuntimeOverride {
             control: crate::npm_firewall_config::FIREWALL_CONFIG_PATH.to_string(),
-            value: config_firewall.as_str().to_string(),
-            source: "~/.lpm/config.toml [firewall].mode".to_string(),
+            value: request_firewall.mode().as_str().to_string(),
+            source: request_firewall.source_label().to_string(),
         });
     }
     Ok(overrides)

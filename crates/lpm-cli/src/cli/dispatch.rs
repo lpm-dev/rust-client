@@ -118,12 +118,8 @@ fn ensure_fast_lane_firewall_posture(
     json_output: bool,
 ) -> Result<(), lpm_common::LpmError> {
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
-    let npm_firewall_mode = crate::npm_firewall_config::resolve_mode(&global_config)?;
-    crate::security_approval::ensure_runtime_npm_firewall_config_authorized(
-        project_dir,
-        json_output,
-        npm_firewall_mode,
-    )
+    crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
+    Ok(())
 }
 
 async fn async_main() -> Result<()> {

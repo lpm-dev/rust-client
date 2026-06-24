@@ -1,5 +1,6 @@
 use crate::commands::config::GlobalConfig;
 use lpm_common::LpmError;
+use std::path::Path;
 
 pub(crate) const FIREWALL_CONFIG_SECTION: &str = "firewall";
 pub(crate) const FIREWALL_CONFIG_MODE_KEY: &str = "mode";
@@ -14,6 +15,35 @@ pub(crate) enum NpmFirewallMode {
     Off,
     Report,
     Enforce,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NpmFirewallModeRequest {
+    mode: NpmFirewallMode,
+    source: NpmFirewallModeRequestSource,
+}
+
+impl NpmFirewallModeRequest {
+    pub(crate) fn mode(self) -> NpmFirewallMode {
+        self.mode
+    }
+
+    pub(crate) fn source_label(self) -> &'static str {
+        match self.source {
+            NpmFirewallModeRequestSource::Config => "~/.lpm/config.toml [firewall].mode",
+            NpmFirewallModeRequestSource::Env => "environment",
+            NpmFirewallModeRequestSource::ConfigAndEnv => {
+                "~/.lpm/config.toml [firewall].mode + environment"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NpmFirewallModeRequestSource {
+    Config,
+    Env,
+    ConfigAndEnv,
 }
 
 impl NpmFirewallMode {
@@ -110,9 +140,45 @@ fn parse_env_mode(key: &str) -> Result<Option<NpmFirewallMode>, LpmError> {
     }
 }
 
-pub(crate) fn resolve_mode(global: &GlobalConfig) -> Result<NpmFirewallMode, LpmError> {
-    let config = config_mode(global)?.unwrap_or_default();
-    Ok(env_mode()?.map_or(config, |env| config.stricter(env)))
+pub(crate) fn runtime_request_mode(
+    global: &GlobalConfig,
+) -> Result<Option<NpmFirewallModeRequest>, LpmError> {
+    let config = config_mode(global)?;
+    let env = env_mode()?;
+    let request = match (config, env) {
+        (Some(config), Some(env)) => Some(NpmFirewallModeRequest {
+            mode: config.stricter(env),
+            source: NpmFirewallModeRequestSource::ConfigAndEnv,
+        }),
+        (Some(config), None) => Some(NpmFirewallModeRequest {
+            mode: config,
+            source: NpmFirewallModeRequestSource::Config,
+        }),
+        (None, Some(env)) => Some(NpmFirewallModeRequest {
+            mode: env,
+            source: NpmFirewallModeRequestSource::Env,
+        }),
+        (None, None) => None,
+    };
+    Ok(request)
+}
+
+pub(crate) fn resolve_runtime_mode(
+    global: &GlobalConfig,
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<NpmFirewallMode, LpmError> {
+    let effective = crate::security_approval::load_effective_authorized_posture()?;
+    let Some(request) = runtime_request_mode(global)? else {
+        return Ok(effective.posture.firewall_mode());
+    };
+    crate::security_approval::ensure_runtime_npm_firewall_config_authorized_with_effective(
+        &effective,
+        project_dir,
+        json_output,
+        request.mode(),
+    )?;
+    Ok(request.mode())
 }
 
 #[cfg(test)]
