@@ -28,7 +28,7 @@ mod support;
 
 use serde_json::json;
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm_with_registry, write_npm_firewall_global_config};
 
 /// Assemble a source-package tarball: `lpm.config.json` at the root
 /// (which makes `lpm add` treat the package as a source delivery) plus
@@ -219,6 +219,64 @@ async fn lpm_add_with_mixed_registry_deps_installs_and_writes_resolved_specs() {
         deps.get("lodash").and_then(|v| v.as_str()),
         Some("4.17.21"),
         "explicit Exact specs must be preserved verbatim; got {deps:?}"
+    );
+}
+
+#[tokio::test]
+async fn lpm_add_firewall_enforce_blocks_source_package_before_tarball_fetch() {
+    let mock = MockRegistry::start().await;
+    let source_tarball = make_tarball_from_pkg_json(
+        json!({
+            "name": "blocked-source",
+            "version": "1.0.0",
+        }),
+        &[],
+    );
+    mock.with_package("blocked-source", "1.0.0", &source_tarball)
+        .await;
+    mock.with_npm_firewall_block("blocked-source", "1.0.0")
+        .await;
+
+    let project =
+        TempProject::empty(r#"{"name":"add-firewall","version":"1.0.0","dependencies":{}}"#);
+    write_npm_firewall_global_config(&project, "enforce");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "blocked-source",
+            "--yes",
+            "--path",
+            "components",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm add with firewall enforce");
+
+    assert!(
+        !output.status.success(),
+        "firewall enforce must block add source download:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("blocked by LPM npm firewall"),
+        "error must name the firewall block; got:\n{combined}"
+    );
+    assert_eq!(
+        mock.tarball_request_count("blocked-source", "1.0.0").await,
+        0,
+        "firewall block must happen before source tarball download"
+    );
+    assert!(
+        !project.file_exists("components/package.json"),
+        "blocked add must not copy source files"
     );
 }
 

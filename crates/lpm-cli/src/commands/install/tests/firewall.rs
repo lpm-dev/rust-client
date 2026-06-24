@@ -1,4 +1,9 @@
 use super::*;
+use crate::commands::install::firewall::{
+    DEFAULT_NPM_FIREWALL_CHUNK_SIZE, NpmFirewallLookupMode, NpmFirewallPreflightStats,
+    npm_firewall_chunk_size, npm_firewall_package, npm_firewall_package_from_selected_event,
+};
+use crate::npm_firewall_config::NpmFirewallMode;
 
 fn package_with_source(name: &str, source: &str) -> InstallPackage {
     InstallPackage {

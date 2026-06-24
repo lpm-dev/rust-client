@@ -1,3 +1,6 @@
+use crate::commands::install::{
+    NpmFirewallMaterializationPackage, run_npm_firewall_materialization_preflight,
+};
 use crate::install_ui;
 use lpm_common::{LpmError, LpmRoot};
 use lpm_lockfile::{LockedPackage, Source};
@@ -22,14 +25,20 @@ struct FetchPlatform {
 
 #[derive(Debug, Clone)]
 enum FetchSource {
-    Registry { url: String },
-    RemoteTarball { url: String },
+    Registry {
+        registry_url: String,
+        tarball_url: String,
+    },
+    RemoteTarball {
+        url: String,
+    },
 }
 
 impl FetchSource {
     fn url(&self) -> &str {
         match self {
-            Self::Registry { url } | Self::RemoteTarball { url } => url,
+            Self::Registry { tarball_url, .. } => tarball_url,
+            Self::RemoteTarball { url } => url,
         }
     }
 
@@ -138,6 +147,15 @@ pub async fn run(
             render_platform(&target_platform)
         ));
     }
+
+    let firewall_packages = npm_firewall_packages_for_fetch_targets(&targets);
+    run_npm_firewall_materialization_preflight(
+        client,
+        project_dir,
+        &firewall_packages,
+        json_output,
+    )
+    .await?;
 
     let client = Arc::new(client.clone_with_config());
     let store = Arc::new(store);
@@ -263,9 +281,9 @@ fn classify_package(
     };
 
     match source {
-        Source::Registry { .. } => {
+        Source::Registry { url: registry_url } => {
             let integrity = required_integrity(package)?;
-            let url = package.tarball.clone().ok_or_else(|| {
+            let tarball_url = package.tarball.clone().ok_or_else(|| {
                 LpmError::Registry(format!(
                     "lpm.lock package {}@{} is missing tarball URL; run `lpm install` to refresh the lockfile before `lpm fetch`",
                     package.name, package.version
@@ -275,7 +293,10 @@ fn classify_package(
                 name: package.name.clone(),
                 version: package.version.clone(),
                 integrity,
-                source: FetchSource::Registry { url },
+                source: FetchSource::Registry {
+                    registry_url,
+                    tarball_url,
+                },
             }))
         }
         Source::Tarball { url } if is_remote_tarball_url(&url) => {
@@ -323,10 +344,29 @@ fn is_cached(
             .is_ok_and(|object_dir| object_dir.is_some());
     }
 
-    match target.source {
+    match &target.source {
         FetchSource::Registry { .. } => store.has_package(&target.name, &target.version),
         FetchSource::RemoteTarball { .. } => store.has_tarball(&target.integrity),
     }
+}
+
+fn npm_firewall_packages_for_fetch_targets(
+    targets: &[FetchTarget],
+) -> Vec<NpmFirewallMaterializationPackage> {
+    let mut packages = Vec::with_capacity(targets.len());
+    for target in targets {
+        if let FetchSource::Registry { registry_url, .. } = &target.source
+            && crate::npm_public_source::is_public_npm_origin(registry_url)
+        {
+            packages.push(NpmFirewallMaterializationPackage::new(
+                &target.name,
+                &target.version,
+                Some(&target.integrity),
+                None,
+            ));
+        }
+    }
+    packages
 }
 
 fn result_for(target: &FetchTarget, status: FetchPackageStatus) -> FetchPackageResult {

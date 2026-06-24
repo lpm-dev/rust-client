@@ -12,6 +12,42 @@ const ENV_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE: &str = "LPM_EXPERIMENT_NPM_FIREWAL
 pub(super) const DEFAULT_NPM_FIREWALL_CHUNK_SIZE: usize = 64;
 const NPM_FIREWALL_OFFLINE_HINT: &str = "npm firewall verdict preflight requires network access; set [firewall].mode = \"off\" or run online";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NpmFirewallMaterializationPackage {
+    name: String,
+    version: String,
+    integrity: Option<String>,
+    published_at: Option<String>,
+}
+
+impl NpmFirewallMaterializationPackage {
+    pub(crate) fn new(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        integrity: Option<&str>,
+        published_at: Option<&str>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            integrity: integrity.map(str::to_string),
+            published_at: published_at.map(str::to_string),
+        }
+    }
+
+    fn to_batch_package(&self, lookup_mode: NpmFirewallLookupMode) -> NpmFirewallBatchPackage {
+        NpmFirewallBatchPackage {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            integrity: lookup_mode
+                .include_integrity()
+                .then(|| self.integrity.clone())
+                .flatten(),
+            published_at: self.published_at.clone(),
+        }
+    }
+}
+
 impl NpmFirewallMode {
     pub(super) fn auth_posture(self) -> AuthPosture {
         match self {
@@ -883,6 +919,43 @@ fn route_is_public_npm(route_table: &RouteTable, name: &str) -> bool {
         }
         UpstreamRoute::LpmWorker => false,
     }
+}
+
+pub(crate) fn registry_materialization_route_is_public_npm(
+    route_table: &RouteTable,
+    name: &str,
+) -> bool {
+    match route_table.route_for_package(name) {
+        UpstreamRoute::NpmDirect | UpstreamRoute::LpmWorker => true,
+        UpstreamRoute::Custom { target, .. } => {
+            crate::npm_public_source::is_public_npm_origin(&target.base_url)
+        }
+    }
+}
+
+pub(crate) async fn run_npm_firewall_materialization_preflight(
+    client: &RegistryClient,
+    project_dir: &Path,
+    packages: &[NpmFirewallMaterializationPackage],
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let global_config = crate::commands::config::GlobalConfig::load_checked()?;
+    let mode =
+        crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
+    let lookup_mode = NpmFirewallLookupMode::from_env();
+    let mut verdict_packages = Vec::with_capacity(packages.len());
+    for package in packages {
+        verdict_packages.push(package.to_batch_package(lookup_mode));
+    }
+    let result = request_npm_firewall_preflight(
+        mode,
+        lookup_mode,
+        Arc::new(client.clone_with_config()),
+        verdict_packages,
+        false,
+    )
+    .await?;
+    finish_npm_firewall_preflight(result, json_output).map(|_| ())
 }
 
 fn print_firewall_decisions(decisions: &[&NpmFirewallDecision]) {

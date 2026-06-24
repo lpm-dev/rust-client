@@ -1,5 +1,10 @@
+use crate::commands::install::{
+    NpmFirewallMaterializationPackage, registry_materialization_route_is_public_npm,
+    run_npm_firewall_materialization_preflight,
+};
 use crate::commands::registry_reads::{
-    fetch_routed_package_metadata, normalize_package_version_input, prepare_routed_read_context,
+    RoutedPackageRef, fetch_routed_package_metadata, normalize_package_version_input,
+    prepare_routed_read_context,
 };
 use crate::install_ui;
 use lpm_common::LpmError;
@@ -49,6 +54,27 @@ pub async fn run(
     })?;
 
     let integrity_str = ver.integrity_or_shasum();
+
+    let firewall_packages = match &package_ref {
+        RoutedPackageRef::Registry(route_name)
+            if registry_materialization_route_is_public_npm(&context.route_table, route_name) =>
+        {
+            vec![NpmFirewallMaterializationPackage::new(
+                &package_name,
+                &version_key,
+                integrity_str.as_deref(),
+                metadata.time.get(&version_key).map(String::as_str),
+            )]
+        }
+        _ => Vec::new(),
+    };
+    run_npm_firewall_materialization_preflight(
+        &context.client,
+        project_dir,
+        &firewall_packages,
+        json_output,
+    )
+    .await?;
 
     if !json_output {
         install_ui::phase(&format!("Downloading {package_name}@{version_key}"));

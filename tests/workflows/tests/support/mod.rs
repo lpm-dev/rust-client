@@ -188,6 +188,16 @@ pub fn write_signed_unlock(project: &TempProject, scopes: &[&str]) {
     .expect("write signed unlock");
 }
 
+pub fn write_npm_firewall_global_config(project: &TempProject, mode: &str) {
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).expect("create isolated lpm home");
+    std::fs::write(
+        lpm_dir.join("config.toml"),
+        format!("[firewall]\nmode = \"{mode}\"\n"),
+    )
+    .expect("write isolated npm firewall config");
+}
+
 /// Write a signed approved machine posture with a specific typosquat
 /// guard floor for workflow scenarios that intentionally exercise an
 /// approved machine-wide typosquat setting.

@@ -2,7 +2,7 @@ mod support;
 
 use support::assertions::{JsonType, assert_json_field, parse_json_output};
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm_with_registry, write_npm_firewall_global_config};
 
 /// `lpm download` must accept its subcommand-local `--version` flag
 /// without colliding with the global `--version` bool, and the JSON
@@ -279,6 +279,56 @@ async fn download_positional_npm_version_spec_resolves_requested_version() {
         serde_json::from_str(&project.read_file("inline-version-out/package.json"))
             .expect("download must extract a valid package.json");
     assert_eq!(package_json["version"], "0.14.3");
+}
+
+#[tokio::test]
+async fn download_firewall_enforce_blocks_public_npm_package_before_tarball_fetch() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    write_npm_firewall_global_config(&project, "enforce");
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("blocked-download", "1.0.0");
+    mock.with_package("blocked-download", "1.0.0", &tarball)
+        .await;
+    mock.with_npm_firewall_block("blocked-download", "1.0.0")
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "download",
+            "blocked-download",
+            "--version",
+            "1.0.0",
+            "--output",
+            "blocked-out",
+        ])
+        .output()
+        .expect("failed to run lpm download with firewall enforce");
+
+    assert!(
+        !output.status.success(),
+        "firewall enforce must block download:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("blocked by LPM npm firewall"),
+        "error must name the firewall block; got:\n{combined}"
+    );
+    assert_eq!(
+        mock.tarball_request_count("blocked-download", "1.0.0")
+            .await,
+        0,
+        "firewall block must happen before tarball download"
+    );
+    assert!(
+        !project.file_exists("blocked-out/package.json"),
+        "blocked download must not extract package files"
+    );
 }
 
 #[tokio::test]
