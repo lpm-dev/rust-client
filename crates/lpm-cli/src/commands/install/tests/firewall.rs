@@ -24,29 +24,23 @@ fn package_with_source(name: &str, source: &str) -> InstallPackage {
 #[test]
 fn npm_firewall_mode_parses_report_and_enforce_values() {
     assert_eq!(
-        NpmFirewallExperimentMode::from_env_value(Some("report")),
-        NpmFirewallExperimentMode::Report
+        NpmFirewallMode::parse("report"),
+        Some(NpmFirewallMode::Report)
+    );
+    assert_eq!(NpmFirewallMode::parse("1"), Some(NpmFirewallMode::Enforce));
+    assert_eq!(
+        NpmFirewallMode::parse("TRUE"),
+        Some(NpmFirewallMode::Enforce)
     );
     assert_eq!(
-        NpmFirewallExperimentMode::from_env_value(Some("1")),
-        NpmFirewallExperimentMode::Enforce
-    );
-    assert_eq!(
-        NpmFirewallExperimentMode::from_env_value(Some("TRUE")),
-        NpmFirewallExperimentMode::Enforce
-    );
-    assert_eq!(
-        NpmFirewallExperimentMode::from_env_value(Some(" Report ")),
-        NpmFirewallExperimentMode::Report
+        NpmFirewallMode::parse(" Report "),
+        Some(NpmFirewallMode::Report)
     );
 }
 
 #[test]
-fn npm_firewall_mode_defaults_off_for_unrecognized_values() {
-    assert_eq!(
-        NpmFirewallExperimentMode::from_env_value(Some("maybe")),
-        NpmFirewallExperimentMode::Off
-    );
+fn npm_firewall_mode_rejects_unrecognized_values() {
+    assert_eq!(NpmFirewallMode::parse("maybe"), None);
 }
 
 #[test]
@@ -62,9 +56,17 @@ fn npm_firewall_lookup_mode_parses_package_only_values() {
 }
 
 #[test]
-fn npm_firewall_lookup_mode_defaults_to_package_and_integrity() {
+fn npm_firewall_lookup_mode_defaults_to_package_only() {
     assert_eq!(
         NpmFirewallLookupMode::from_env_value(Some("maybe")),
+        NpmFirewallLookupMode::PackageOnly
+    );
+}
+
+#[test]
+fn npm_firewall_lookup_mode_accepts_integrity_debug_values() {
+    assert_eq!(
+        NpmFirewallLookupMode::from_env_value(Some("package-and-integrity")),
         NpmFirewallLookupMode::PackageAndIntegrity
     );
 }
@@ -84,19 +86,19 @@ fn npm_firewall_chunk_size_uses_positive_values_or_default() {
 
 #[test]
 fn npm_firewall_mode_disables_tarball_prefetch_when_enabled() {
-    assert!(NpmFirewallExperimentMode::Report.disables_tarball_prefetch());
-    assert!(NpmFirewallExperimentMode::Enforce.disables_tarball_prefetch());
-    assert!(!NpmFirewallExperimentMode::Off.disables_tarball_prefetch());
+    assert!(NpmFirewallMode::Report.disables_tarball_prefetch());
+    assert!(NpmFirewallMode::Enforce.disables_tarball_prefetch());
+    assert!(!NpmFirewallMode::Off.disables_tarball_prefetch());
 }
 
 #[test]
 fn npm_firewall_mode_uses_auth_only_for_enforce_mode() {
     assert_eq!(
-        NpmFirewallExperimentMode::Report.auth_posture(),
+        NpmFirewallMode::Report.auth_posture(),
         lpm_registry::client::AuthPosture::AnonymousPreferred
     );
     assert_eq!(
-        NpmFirewallExperimentMode::Enforce.auth_posture(),
+        NpmFirewallMode::Enforce.auth_posture(),
         lpm_registry::client::AuthPosture::AuthRequired
     );
 }
@@ -104,7 +106,7 @@ fn npm_firewall_mode_uses_auth_only_for_enforce_mode() {
 #[test]
 fn npm_firewall_stats_serializes_timing_and_verdict_counts() {
     let mut stats = NpmFirewallPreflightStats {
-        mode: NpmFirewallExperimentMode::Report,
+        mode: NpmFirewallMode::Report,
         checked_count: 12,
         batch_ms: 34,
         chunk_count: 2,
@@ -173,7 +175,7 @@ fn npm_firewall_stats_serializes_timing_and_verdict_counts() {
 
     assert_eq!(json["enabled"], true);
     assert_eq!(json["mode"], "report");
-    assert_eq!(json["lookup_mode"], "package_and_integrity");
+    assert_eq!(json["lookup_mode"], "package_only");
     assert_eq!(json["checked_count"], 12);
     assert_eq!(json["batch_ms"], 34);
     assert_eq!(json["chunk_count"], 2);
@@ -224,6 +226,50 @@ fn npm_firewall_package_includes_public_npm_registry_package() {
         verdict_package.published_at.as_deref(),
         Some("2025-01-01T00:00:00.000Z")
     );
+}
+
+#[test]
+fn npm_firewall_package_includes_public_npm_registry_from_npmrc() {
+    for (registry, source) in [
+        (
+            "https://registry.npmjs.org/",
+            "registry+https://registry.npmjs.org",
+        ),
+        (
+            "https://registry.npmjs.org:443/",
+            "registry+https://registry.npmjs.org:443",
+        ),
+        (
+            "https://registry.npmjs.com/",
+            "registry+https://registry.npmjs.com",
+        ),
+        (
+            "https://registry.npmjs.com:443/",
+            "registry+https://registry.npmjs.com:443",
+        ),
+        (
+            "https://REGISTRY.NPMJS.ORG/",
+            "registry+https://REGISTRY.NPMJS.ORG",
+        ),
+    ] {
+        let npmrc = lpm_registry::NpmrcConfig::parse(
+            &format!("registry={registry}\n"),
+            "test-npmrc",
+            &|_| None,
+        );
+        let route_table = RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).unwrap();
+        let package = package_with_source("left-pad", source);
+
+        let verdict_package = npm_firewall_package(
+            &package,
+            &route_table,
+            NpmFirewallLookupMode::PackageAndIntegrity,
+        )
+        .expect("explicit public npm registry is eligible");
+
+        assert_eq!(verdict_package.name, "left-pad");
+        assert_eq!(verdict_package.integrity.as_deref(), Some("sha512-test"));
+    }
 }
 
 #[test]
@@ -292,6 +338,43 @@ fn npm_firewall_package_from_selected_event_uses_package_only_lookup() {
     assert_eq!(verdict_package.name, "left-pad");
     assert_eq!(verdict_package.version, "1.0.0");
     assert_eq!(verdict_package.integrity.as_deref(), None);
+}
+
+#[test]
+fn npm_firewall_package_from_selected_event_includes_public_npm_registry_from_npmrc() {
+    for registry in [
+        "https://registry.npmjs.org/",
+        "https://registry.npmjs.org:443/",
+        "https://registry.npmjs.com/",
+        "https://registry.npmjs.com:443/",
+        "https://REGISTRY.NPMJS.ORG/",
+    ] {
+        let npmrc = lpm_registry::NpmrcConfig::parse(
+            &format!("registry={registry}\n"),
+            "test-npmrc",
+            &|_| None,
+        );
+        let route_table = RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).unwrap();
+        let event = lpm_resolver::SelectedPackageEvent {
+            name: "left-pad".to_string(),
+            version: "1.0.0".to_string(),
+            is_lpm: false,
+            tarball_url: None,
+            integrity: Some("sha512-test".to_string()),
+            platform: None,
+            optional: false,
+        };
+
+        let verdict_package = npm_firewall_package_from_selected_event(
+            &event,
+            &route_table,
+            NpmFirewallLookupMode::PackageOnly,
+        )
+        .expect("explicit public npm registry is eligible");
+
+        assert_eq!(verdict_package.name, "left-pad");
+        assert_eq!(verdict_package.integrity.as_deref(), None);
+    }
 }
 
 #[test]

@@ -344,6 +344,15 @@ fn parse_policy_sigstore(path: &Path, raw: &str) -> Result<EnforceMode, LpmError
     }
 }
 
+fn parse_policy_firewall(
+    path: &Path,
+    raw: &str,
+) -> Result<crate::npm_firewall_config::NpmFirewallMode, LpmError> {
+    crate::npm_firewall_config::NpmFirewallMode::parse(raw).ok_or_else(|| {
+        managed_policy_error(path, format!("has invalid `[firewall].mode` value `{raw}`"))
+    })
+}
+
 pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     let path = managed_policy_path();
     if !path.exists() {
@@ -453,6 +462,25 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         })
         .transpose()?;
 
+    let firewall = table
+        .get(crate::npm_firewall_config::FIREWALL_CONFIG_SECTION)
+        .map(|value| {
+            value
+                .as_table()
+                .ok_or_else(|| managed_policy_error(&path, "must set `[firewall]` to a TOML table"))
+        })
+        .transpose()?;
+    let firewall_mode = firewall
+        .and_then(|tbl| tbl.get(crate::npm_firewall_config::FIREWALL_CONFIG_MODE_KEY))
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                managed_policy_error(&path, "must set `[firewall].mode` to a string")
+            })
+        })
+        .transpose()?
+        .map(|raw| parse_policy_firewall(&path, raw))
+        .transpose()?;
+
     let mut enforced_controls = Vec::new();
     if script_policy.is_some() {
         enforced_controls.push("script-policy".to_string());
@@ -475,6 +503,9 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     if typosquat_guard.is_some() {
         enforced_controls.push(crate::commands::config::TYPOSQUAT_GUARD_KEY.to_string());
     }
+    if firewall_mode.is_some() {
+        enforced_controls.push("firewall.mode".to_string());
+    }
 
     Ok(Some(ManagedPolicy {
         status: ManagedPolicyStatus {
@@ -490,5 +521,6 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         sandbox_allow_degraded,
         sigstore_verify,
         typosquat_guard,
+        firewall_mode,
     }))
 }

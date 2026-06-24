@@ -22,6 +22,7 @@ pub mod intelligence;
 mod linker_config;
 mod manifest_tx;
 pub mod migration_warnings;
+mod npm_firewall_config;
 mod npm_public_source;
 mod oidc;
 mod output;

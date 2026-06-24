@@ -381,6 +381,31 @@ source = "test"
 }
 
 #[test]
+fn managed_policy_rejects_non_table_firewall_section() {
+    let temp = tempdir().unwrap();
+    with_test_env(temp.path(), || {
+        write_managed_policy(
+            temp.path(),
+            r#"
+firewall = "enforce"
+
+[policy]
+name = "ci"
+source = "test"
+"#,
+        );
+
+        let err = load_effective_authorized_posture().unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("must set `[firewall]` to a TOML table"),
+            "unexpected error: {err}"
+        );
+    });
+}
+
+#[test]
 fn persistent_weakening_rejects_when_managed_policy_owns_that_floor() {
     let temp = tempdir().unwrap();
     with_test_env(temp.path(), || {
@@ -923,6 +948,71 @@ fn runtime_sigstore_config_downgrade_uses_active_project_unlock() {
             true,
             EnforceMode::Warn,
             crate::provenance_fetch::EnforceModeSource::Config,
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+fn runtime_firewall_config_downgrade_requires_project_unlock() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        persist_authorized_posture(&AuthorizedPosture {
+            firewall_mode: crate::npm_firewall_config::NpmFirewallMode::Enforce
+                .as_str()
+                .to_string(),
+            ..AuthorizedPosture::default()
+        })
+        .unwrap();
+
+        let err = ensure_runtime_npm_firewall_config_authorized(
+            &project,
+            true,
+            crate::npm_firewall_config::NpmFirewallMode::Off,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.error_code(), "security_approval_required");
+        assert!(matches!(
+            err,
+            LpmError::SecurityApprovalRequired {
+                ref requested_scopes,
+                ..
+            } if requested_scopes == &["firewall-disable"]
+        ));
+    });
+}
+
+#[test]
+fn runtime_firewall_config_downgrade_uses_active_project_unlock() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    with_test_env(temp.path(), || {
+        persist_authorized_posture(&AuthorizedPosture {
+            firewall_mode: crate::npm_firewall_config::NpmFirewallMode::Enforce
+                .as_str()
+                .to_string(),
+            ..AuthorizedPosture::default()
+        })
+        .unwrap();
+        persist_unlock_grant(&create_unlock_grant(
+            ApprovalScope::FirewallDisable,
+            &project,
+            DEFAULT_UNLOCK_TTL_SECS,
+            None,
+            &[],
+        ))
+        .unwrap();
+
+        ensure_runtime_npm_firewall_config_authorized(
+            &project,
+            true,
+            crate::npm_firewall_config::NpmFirewallMode::Off,
         )
         .unwrap();
     });

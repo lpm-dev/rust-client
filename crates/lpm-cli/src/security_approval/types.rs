@@ -16,10 +16,11 @@ pub enum ApprovalScope {
     SandboxAllowDegraded,
     CapabilityWiden,
     TyposquatDisable,
+    FirewallDisable,
     FloorEdit,
 }
 
-const ALL_APPROVAL_SCOPES: [ApprovalScope; 14] = [
+const ALL_APPROVAL_SCOPES: [ApprovalScope; 15] = [
     ApprovalScope::CooldownBypass,
     ApprovalScope::CooldownWindow,
     ApprovalScope::ProvenanceIgnoreDrift,
@@ -33,10 +34,11 @@ const ALL_APPROVAL_SCOPES: [ApprovalScope; 14] = [
     ApprovalScope::SandboxAllowDegraded,
     ApprovalScope::CapabilityWiden,
     ApprovalScope::TyposquatDisable,
+    ApprovalScope::FirewallDisable,
     ApprovalScope::FloorEdit,
 ];
 
-const DEFAULT_UNLOCK_SCOPES: [ApprovalScope; 10] = [
+const DEFAULT_UNLOCK_SCOPES: [ApprovalScope; 11] = [
     ApprovalScope::CooldownBypass,
     ApprovalScope::CooldownWindow,
     ApprovalScope::ProvenanceIgnoreDrift,
@@ -47,6 +49,7 @@ const DEFAULT_UNLOCK_SCOPES: [ApprovalScope; 10] = [
     ApprovalScope::SandboxNone,
     ApprovalScope::SandboxAllowDegraded,
     ApprovalScope::TyposquatDisable,
+    ApprovalScope::FirewallDisable,
 ];
 
 impl ApprovalScope {
@@ -73,6 +76,7 @@ impl ApprovalScope {
             Self::SandboxAllowDegraded => "sandbox-allow-degraded",
             Self::CapabilityWiden => "capability-widen",
             Self::TyposquatDisable => "typosquat-disable",
+            Self::FirewallDisable => "firewall-disable",
             Self::FloorEdit => "floor-edit",
         }
     }
@@ -117,6 +121,8 @@ pub struct AuthorizedPosture {
     pub sigstore_verify: String,
     #[serde(default = "default_typosquat_guard_string")]
     pub typosquat_guard: String,
+    #[serde(default = "default_firewall_mode_string")]
+    pub firewall_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -128,6 +134,7 @@ pub struct AuthorizedPostureView {
     pub sandbox_allow_degraded: bool,
     pub sigstore_verify: String,
     pub typosquat_guard: String,
+    pub firewall_mode: String,
 }
 
 fn default_release_age_policy_string() -> String {
@@ -136,6 +143,12 @@ fn default_release_age_policy_string() -> String {
 
 fn default_typosquat_guard_string() -> String {
     crate::commands::config::TyposquatGuardSelection::Default
+        .as_str()
+        .to_string()
+}
+
+fn default_firewall_mode_string() -> String {
+    crate::npm_firewall_config::NpmFirewallMode::Off
         .as_str()
         .to_string()
 }
@@ -152,6 +165,7 @@ impl Default for AuthorizedPosture {
             sandbox_allow_degraded: false,
             sigstore_verify: "deny".to_string(),
             typosquat_guard: default_typosquat_guard_string(),
+            firewall_mode: default_firewall_mode_string(),
         }
     }
 }
@@ -192,6 +206,10 @@ impl AuthorizedPosture {
             .unwrap_or(crate::commands::config::TyposquatGuardSelection::Default)
     }
 
+    pub fn firewall_mode(&self) -> crate::npm_firewall_config::NpmFirewallMode {
+        crate::npm_firewall_config::NpmFirewallMode::parse(&self.firewall_mode).unwrap_or_default()
+    }
+
     pub fn to_view(&self) -> AuthorizedPostureView {
         AuthorizedPostureView {
             script_policy: self.script_policy.clone(),
@@ -201,6 +219,7 @@ impl AuthorizedPosture {
             sandbox_allow_degraded: self.sandbox_allow_degraded,
             sigstore_verify: self.sigstore_verify.clone(),
             typosquat_guard: self.typosquat_guard().as_str().to_string(),
+            firewall_mode: self.firewall_mode().as_str().to_string(),
         }
     }
 }
@@ -222,6 +241,7 @@ pub struct EffectivePostureSources {
     pub sandbox_allow_degraded: PostureSourceKind,
     pub sigstore_verify: PostureSourceKind,
     pub typosquat_guard: PostureSourceKind,
+    pub firewall_mode: PostureSourceKind,
 }
 
 impl EffectivePostureSources {
@@ -234,6 +254,7 @@ impl EffectivePostureSources {
             sandbox_allow_degraded: base,
             sigstore_verify: base,
             typosquat_guard: base,
+            firewall_mode: base,
         }
     }
 }
@@ -299,6 +320,7 @@ pub(super) struct ManagedPolicy {
     pub(super) sandbox_allow_degraded: Option<bool>,
     pub(super) sigstore_verify: Option<EnforceMode>,
     pub(super) typosquat_guard: Option<crate::commands::config::TyposquatGuardSelection>,
+    pub(super) firewall_mode: Option<crate::npm_firewall_config::NpmFirewallMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

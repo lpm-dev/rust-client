@@ -945,7 +945,7 @@ async fn run_with_options_under_store_lock(
     crate::build_state::reset_write_timing();
     crate::security_floor::clear_recorded_suppressions();
     let timing_detail_mode = TimingDetailMode::from_env();
-    let global_config = crate::commands::config::GlobalConfig::load();
+    let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     let verify_registry_signatures = registry_signature_verification_enabled(&global_config);
     let registry_signature_timings = timing_detail_mode
         .enabled()
@@ -953,7 +953,9 @@ async fn run_with_options_under_store_lock(
     let provenance_timings = timing_detail_mode
         .enabled()
         .then(crate::provenance_fetch::ProvenanceTimings::default);
-    let npm_firewall_mode = NpmFirewallExperimentMode::from_env();
+    let npm_firewall_mode = crate::npm_firewall_config::resolve_mode(&global_config)?;
+    let npm_firewall_lookup_mode = NpmFirewallLookupMode::from_env();
+    let npm_firewall_chunk_size = npm_firewall_chunk_size_from_env();
     let mut slow_package_timings = SlowPackageTimings::default();
     let mut wf_tail_lockfile_write_ms = 0u128;
     let mut wf_tail_lockfile_write_count = 0u64;
@@ -981,6 +983,11 @@ async fn run_with_options_under_store_lock(
         project_dir,
         json_output,
         crate::security_approval::ApprovalSource::ProjectConfig,
+    )?;
+    crate::security_approval::ensure_runtime_npm_firewall_config_authorized(
+        project_dir,
+        json_output,
+        npm_firewall_mode,
     )?;
     crate::typosquat_guard::guard_manifest_direct_dependencies(
         project_dir,
@@ -2094,6 +2101,16 @@ async fn run_with_options_under_store_lock(
             )
             .await?;
         }
+        let npm_firewall_stats = run_npm_firewall_preflight(
+            npm_firewall_mode,
+            npm_firewall_lookup_mode,
+            &arc_client,
+            &route_table,
+            &locked,
+            offline,
+            json_output,
+        )
+        .await?;
 
         // Go directly to link step (skip resolution and download).
         // forward the already-resolved
@@ -2111,6 +2128,7 @@ async fn run_with_options_under_store_lock(
             0,
             0,
             true,
+            npm_firewall_stats,
             json_output,
             start,
             linker_mode,
@@ -2326,6 +2344,7 @@ async fn run_with_options_under_store_lock(
         verify_registry_signatures,
         strict_integrity,
         force_security_floor,
+        npm_firewall_enabled: npm_firewall_mode.is_enabled(),
         auto_build,
         script_policy_override,
         script_policy_is_default: installer_spike_script_policy_is_default,
@@ -2704,11 +2723,13 @@ async fn run_with_options_under_store_lock(
                                     selected_rx,
                                     fetch_tx,
                                     arc_client.clone(),
-                                    route_table.clone(),
-                                    npm_firewall_mode,
-                                    NpmFirewallLookupMode::from_env(),
-                                    offline,
-                                    npm_firewall_chunk_size_from_env(),
+                                    NpmFirewallChunkedPreflightConfig {
+                                        route_table: route_table.clone(),
+                                        mode: npm_firewall_mode,
+                                        lookup_mode: npm_firewall_lookup_mode,
+                                        offline,
+                                        chunk_size: npm_firewall_chunk_size,
+                                    },
                                 ));
                             Some(selected_tx)
                         } else {
@@ -3122,6 +3143,7 @@ async fn run_with_options_under_store_lock(
     } else {
         run_npm_firewall_preflight(
             npm_firewall_mode,
+            npm_firewall_lookup_mode,
             &arc_client,
             &route_table,
             &packages,

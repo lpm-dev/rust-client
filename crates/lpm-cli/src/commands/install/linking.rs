@@ -174,6 +174,7 @@ pub(super) async fn run_link_and_finish(
     downloaded: usize,
     cached: usize,
     used_lockfile: bool,
+    npm_firewall_stats: NpmFirewallPreflightStats,
     json_output: bool,
     start: Instant,
     linker_mode: lpm_linker::LinkerMode,
@@ -500,8 +501,13 @@ pub(super) async fn run_link_and_finish(
             "offline": true,
             "duration_ms": elapsed.as_millis() as u64,
             "timing": {
+                "firewall_batch_ms": npm_firewall_stats.batch_ms,
+                "firewall": npm_firewall_stats.to_json(),
                 "link_ms": link_ms,
                 "total_ms": elapsed.as_millis(),
+            },
+            "security": {
+                "firewall": npm_firewall_stats.to_json(),
             },
             "warnings": [],
             "errors": [],

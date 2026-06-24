@@ -83,6 +83,14 @@ pub(super) fn managed_policy_blocks_scope(
         {
             Some(crate::commands::config::TYPOSQUAT_GUARD_KEY)
         }
+        ApprovalScope::FirewallDisable
+            if matches!(
+                effective.sources.firewall_mode,
+                PostureSourceKind::ManagedPolicy
+            ) =>
+        {
+            Some(crate::npm_firewall_config::FIREWALL_CONFIG_PATH)
+        }
         _ => None,
     }?;
     Some(managed_policy_scope_error(
@@ -122,6 +130,9 @@ pub(super) fn managed_policy_blocks_scope_direct(
         }
         ApprovalScope::TyposquatDisable if policy.typosquat_guard.is_some() => {
             Some(crate::commands::config::TYPOSQUAT_GUARD_KEY)
+        }
+        ApprovalScope::FirewallDisable if policy.firewall_mode.is_some() => {
+            Some(crate::npm_firewall_config::FIREWALL_CONFIG_PATH)
         }
         _ => None,
     }?;
@@ -742,6 +753,62 @@ pub fn authorize_persistent_typosquat_guard(
     persist_authorized_posture(&posture)
 }
 
+pub fn authorize_persistent_npm_firewall_mode(
+    requested: crate::npm_firewall_config::NpmFirewallMode,
+    json_output: bool,
+    command_hint: &str,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let current = effective.posture.firewall_mode();
+    let weakens_current = requested.loosens(current);
+    if weakens_current
+        && matches!(
+            effective.sources.firewall_mode,
+            PostureSourceKind::ManagedPolicy
+        )
+    {
+        let managed_policy = effective
+            .managed_policy
+            .as_ref()
+            .expect("managed policy source must include status metadata");
+        let err = managed_policy_write_error(
+            managed_policy,
+            crate::npm_firewall_config::FIREWALL_CONFIG_PATH,
+            requested.as_str(),
+            current.as_str(),
+        );
+        record_persistent_guarded_attempt(ApprovalScope::FirewallDisable, false, &err.to_string());
+        return Err(err);
+    }
+
+    let mut posture = load_authorized_posture()?;
+    if weakens_current {
+        confirm_persistent_weakening(
+            ApprovalScope::FirewallDisable,
+            json_output,
+            command_hint,
+            &format!(
+                "Persisting `{}` = \"{}\" weakens the approved machine posture.",
+                crate::npm_firewall_config::FIREWALL_CONFIG_PATH,
+                requested.as_str(),
+            ),
+        )?;
+    } else if !matches!(
+        effective.approved_posture_source,
+        PostureSourceKind::ApprovedStore
+    ) && requested == current
+    {
+        return Ok(());
+    } else {
+        let approved = posture.firewall_mode();
+        if requested == approved || requested.loosens(approved) {
+            return Ok(());
+        }
+    }
+    posture.firewall_mode = requested.as_str().to_string();
+    persist_authorized_posture(&posture)
+}
+
 pub fn ensure_runtime_typosquat_guard_config_authorized(
     project_dir: &Path,
     json_output: bool,
@@ -771,6 +838,40 @@ pub fn ensure_runtime_typosquat_guard_config_authorized(
         json_output,
         ApprovalSource::GlobalConfig,
         "The persisted global typosquat-guard setting weakens suspicious package-name analysis for this project.",
+        None,
+        &[],
+    )
+}
+
+pub fn ensure_runtime_npm_firewall_config_authorized(
+    project_dir: &Path,
+    json_output: bool,
+    requested: crate::npm_firewall_config::NpmFirewallMode,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    let approved = effective.posture.firewall_mode();
+    if !requested.loosens(approved) {
+        return Ok(());
+    }
+    if let Some(err) = managed_policy_blocks_scope(&effective, ApprovalScope::FirewallDisable) {
+        record_audit_event(
+            AuditRecord::new(
+                "guarded-attempt",
+                false,
+                vec![ApprovalScope::FirewallDisable.as_str().to_string()],
+            )
+            .project_root(canonical_project_root(project_dir))
+            .source(ApprovalSource::GlobalConfig)
+            .detail("runtime npm firewall posture is weaker than managed policy".to_string()),
+        );
+        return Err(err);
+    }
+    ensure_project_unlock(
+        ApprovalScope::FirewallDisable,
+        project_dir,
+        json_output,
+        ApprovalSource::GlobalConfig,
+        "The persisted global [firewall].mode setting weakens npm firewall checks for this project.",
         None,
         &[],
     )

@@ -22,6 +22,7 @@ pub(crate) enum SecurityScopeSelector {
     SandboxAllowDegraded,
     CapabilityWiden,
     TyposquatDisable,
+    FirewallDisable,
     FloorEdit,
 }
 
@@ -43,6 +44,7 @@ impl SecurityScopeSelector {
             Self::SandboxAllowDegraded => ApprovalScope::SandboxAllowDegraded.as_str(),
             Self::CapabilityWiden => ApprovalScope::CapabilityWiden.as_str(),
             Self::TyposquatDisable => ApprovalScope::TyposquatDisable.as_str(),
+            Self::FirewallDisable => ApprovalScope::FirewallDisable.as_str(),
             Self::FloorEdit => ApprovalScope::FloorEdit.as_str(),
         }
     }
@@ -68,6 +70,7 @@ impl SecurityScopeSelector {
             Self::SandboxAllowDegraded => vec![ApprovalScope::SandboxAllowDegraded],
             Self::CapabilityWiden => vec![ApprovalScope::CapabilityWiden],
             Self::TyposquatDisable => vec![ApprovalScope::TyposquatDisable],
+            Self::FirewallDisable => vec![ApprovalScope::FirewallDisable],
             Self::FloorEdit => vec![ApprovalScope::FloorEdit],
         }
     }
@@ -405,6 +408,14 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                     status.floor_sources.typosquat_guard
                 ),
             );
+            println!(
+                "  {} {}",
+                install_ui::dim(&format!("{:<24}", "npm firewall")),
+                sourced_policy_value(
+                    &status.effective_floor.firewall_mode,
+                    status.floor_sources.firewall_mode
+                ),
+            );
 
             println!();
             println!("{}", install_ui::section("policy sources"));
@@ -588,6 +599,14 @@ mod tests {
     fn default_selector_resolves_only_runtime_weakeners() {
         let scopes = SecurityScopeSelector::Default.resolve_scopes();
         assert_eq!(scopes, ApprovalScope::default_unlock_scopes());
+    }
+
+    #[test]
+    fn firewall_disable_selector_resolves_concrete_scope() {
+        assert_eq!(
+            SecurityScopeSelector::FirewallDisable.resolve_scopes(),
+            vec![ApprovalScope::FirewallDisable]
+        );
     }
 
     #[test]

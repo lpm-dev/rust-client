@@ -34,6 +34,8 @@ pub enum GuardedControl {
     ScriptPolicy,
     #[allow(dead_code)]
     SigstoreVerify,
+    #[allow(dead_code)]
+    FirewallMode,
 }
 
 impl GuardedControl {
@@ -46,6 +48,7 @@ impl GuardedControl {
             Self::SandboxAllowDegraded => "sandbox_allow_degraded",
             Self::ScriptPolicy => "script_policy",
             Self::SigstoreVerify => "sigstore_verify",
+            Self::FirewallMode => "firewall_mode",
         }
     }
 }
@@ -270,6 +273,30 @@ pub fn reject_looser_sigstore_write(
             "[sigstore].verify",
             sigstore_mode_name(requested),
             sigstore_mode_name(floor),
+        ));
+    }
+    Ok(())
+}
+
+pub fn current_firewall_floor(
+    global: &GlobalConfig,
+) -> Result<crate::npm_firewall_config::NpmFirewallMode, LpmError> {
+    Ok(crate::npm_firewall_config::config_mode(global)?.unwrap_or_default())
+}
+
+pub fn reject_looser_firewall_mode_write(
+    global: &GlobalConfig,
+    requested: crate::npm_firewall_config::NpmFirewallMode,
+) -> Result<(), LpmError> {
+    if !force_security_floor_enabled(global) {
+        return Ok(());
+    }
+    let floor = current_firewall_floor(global)?;
+    if requested.loosens(floor) {
+        return Err(security_floor_write_error(
+            crate::npm_firewall_config::FIREWALL_CONFIG_PATH,
+            requested.as_str(),
+            floor.as_str(),
         ));
     }
     Ok(())

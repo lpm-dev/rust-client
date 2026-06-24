@@ -27,12 +27,19 @@ fn lockfile_package_registry_source_url(pkg: &lpm_lockfile::LockedPackage) -> Op
     }
 }
 
-fn is_public_npm_origin(url: &str) -> bool {
-    let lower = url.trim_end_matches('/').to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "https://registry.npmjs.org" | "https://registry.npmjs.com"
-    )
+pub(crate) fn is_public_npm_origin(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    if parsed.scheme() != "https" || parsed.port_or_known_default() != Some(443) {
+        return false;
+    }
+    parsed.host_str().is_some_and(|host| {
+        matches!(
+            host.to_ascii_lowercase().as_str(),
+            "registry.npmjs.org" | "registry.npmjs.com"
+        )
+    })
 }
 
 fn is_lpm_worker_origin(url: &str) -> bool {
@@ -84,7 +91,9 @@ mod tests {
     fn public_npm_origin_recognises_canonical_shapes() {
         assert!(is_public_npm_origin("https://registry.npmjs.org"));
         assert!(is_public_npm_origin("https://registry.npmjs.org/"));
+        assert!(is_public_npm_origin("https://registry.npmjs.org:443/"));
         assert!(is_public_npm_origin("https://registry.npmjs.com"));
+        assert!(is_public_npm_origin("https://registry.npmjs.com:443/"));
         assert!(is_public_npm_origin("https://REGISTRY.NPMJS.ORG"));
     }
 
@@ -94,6 +103,7 @@ mod tests {
         assert!(!is_public_npm_origin("https://npm.pkg.github.com"));
         assert!(!is_public_npm_origin("https://verdaccio.local"));
         assert!(!is_public_npm_origin("http://localhost:4873"));
+        assert!(!is_public_npm_origin("https://registry.npmjs.org:444"));
         assert!(!is_public_npm_origin(""));
     }
 

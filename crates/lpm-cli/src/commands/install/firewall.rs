@@ -5,60 +5,14 @@ use lpm_registry::client::{
     NpmFirewallFlaggedPackageIndexDiagnostics,
 };
 
-const ENV_EXPERIMENT_NPM_FIREWALL: &str = "LPM_EXPERIMENT_NPM_FIREWALL";
+pub(super) use crate::npm_firewall_config::NpmFirewallMode;
+
 const ENV_EXPERIMENT_NPM_FIREWALL_LOOKUP: &str = "LPM_EXPERIMENT_NPM_FIREWALL_LOOKUP";
 const ENV_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE: &str = "LPM_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE";
 pub(super) const DEFAULT_NPM_FIREWALL_CHUNK_SIZE: usize = 64;
+const NPM_FIREWALL_OFFLINE_HINT: &str = "npm firewall verdict preflight requires network access; set [firewall].mode = \"off\" or run online";
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) enum NpmFirewallExperimentMode {
-    #[default]
-    Off,
-    Report,
-    Enforce,
-}
-
-impl NpmFirewallExperimentMode {
-    pub(super) fn from_env() -> Self {
-        Self::from_env_value(std::env::var(ENV_EXPERIMENT_NPM_FIREWALL).ok().as_deref())
-    }
-
-    pub(super) fn from_env_value(raw: Option<&str>) -> Self {
-        match raw.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(value)
-                if value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("enforce")
-                    || value.eq_ignore_ascii_case("deny")
-                    || value.eq_ignore_ascii_case("block") =>
-            {
-                Self::Enforce
-            }
-            Some(value)
-                if value.eq_ignore_ascii_case("report") || value.eq_ignore_ascii_case("warn") =>
-            {
-                Self::Report
-            }
-            _ => Self::Off,
-        }
-    }
-
-    pub(super) fn is_enabled(self) -> bool {
-        !matches!(self, Self::Off)
-    }
-
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Report => "report",
-            Self::Enforce => "enforce",
-        }
-    }
-
-    pub(super) fn disables_tarball_prefetch(self) -> bool {
-        self.is_enabled()
-    }
-
+impl NpmFirewallMode {
     pub(super) fn auth_posture(self) -> AuthPosture {
         match self {
             Self::Off | Self::Report => AuthPosture::AnonymousPreferred,
@@ -69,8 +23,8 @@ impl NpmFirewallExperimentMode {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum NpmFirewallLookupMode {
-    #[default]
     PackageAndIntegrity,
+    #[default]
     PackageOnly,
 }
 
@@ -94,7 +48,15 @@ impl NpmFirewallLookupMode {
             {
                 Self::PackageOnly
             }
-            _ => Self::PackageAndIntegrity,
+            Some(value)
+                if value.eq_ignore_ascii_case("package-and-integrity")
+                    || value.eq_ignore_ascii_case("package_and_integrity")
+                    || value.eq_ignore_ascii_case("integrity")
+                    || value.eq_ignore_ascii_case("strict") =>
+            {
+                Self::PackageAndIntegrity
+            }
+            _ => Self::PackageOnly,
         }
     }
 
@@ -127,7 +89,7 @@ pub(super) fn npm_firewall_chunk_size(raw: &str) -> usize {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct NpmFirewallPreflightStats {
-    pub(super) mode: NpmFirewallExperimentMode,
+    pub(super) mode: NpmFirewallMode,
     pub(super) lookup_mode: NpmFirewallLookupMode,
     pub(super) checked_count: u64,
     pub(super) batch_ms: u128,
@@ -146,10 +108,10 @@ pub(super) struct NpmFirewallPreflightStats {
 }
 
 impl NpmFirewallPreflightStats {
-    fn for_mode(mode: NpmFirewallExperimentMode) -> Self {
+    fn for_mode(mode: NpmFirewallMode, lookup_mode: NpmFirewallLookupMode) -> Self {
         Self {
             mode,
-            lookup_mode: NpmFirewallLookupMode::from_env(),
+            lookup_mode,
             ..Self::default()
         }
     }
@@ -319,12 +281,9 @@ fn add_flagged_index_diagnostics(
     let total = aggregate.get_or_insert_with(NpmFirewallFlaggedPackageIndexDiagnostics::default);
     total.enabled |= diagnostics.enabled;
     total.used |= diagnostics.used;
-    total.status = total.status.take().or(diagnostics.status.clone());
-    total.cache_status = total
-        .cache_status
-        .take()
-        .or(diagnostics.cache_status.clone());
-    total.key = total.key.take().or(diagnostics.key.clone());
+    total.status = total.status.take().or(diagnostics.status);
+    total.cache_status = total.cache_status.take().or(diagnostics.cache_status);
+    total.key = total.key.take().or(diagnostics.key);
     total.read_ms += diagnostics.read_ms;
     total.package_key_count = total.package_key_count.max(diagnostics.package_key_count);
     total.candidate_count = total
@@ -336,10 +295,7 @@ fn add_flagged_index_diagnostics(
     total.skipped_package_lookup_count = total
         .skipped_package_lookup_count
         .saturating_add(diagnostics.skipped_package_lookup_count);
-    total.generated_at = total
-        .generated_at
-        .take()
-        .or(diagnostics.generated_at.clone());
+    total.generated_at = total.generated_at.take().or(diagnostics.generated_at);
 }
 
 #[derive(Debug)]
@@ -350,9 +306,9 @@ pub(super) struct NpmFirewallPreflightResult {
 }
 
 impl NpmFirewallPreflightResult {
-    fn empty(mode: NpmFirewallExperimentMode) -> Self {
+    fn empty(mode: NpmFirewallMode, lookup_mode: NpmFirewallLookupMode) -> Self {
         Self {
-            stats: NpmFirewallPreflightStats::for_mode(mode),
+            stats: NpmFirewallPreflightStats::for_mode(mode, lookup_mode),
             decisions: Vec::new(),
             report_error: None,
         }
@@ -416,35 +372,45 @@ struct FirewallChunkResult {
     report_error: Option<String>,
 }
 
+pub(super) struct NpmFirewallChunkedPreflightConfig {
+    pub(super) route_table: RouteTable,
+    pub(super) mode: NpmFirewallMode,
+    pub(super) lookup_mode: NpmFirewallLookupMode,
+    pub(super) offline: bool,
+    pub(super) chunk_size: usize,
+}
+
 pub(super) fn spawn_chunked_npm_firewall_preflight(
     mut selected_rx: tokio::sync::mpsc::UnboundedReceiver<lpm_resolver::SelectedPackageEvent>,
     fetch_tx: tokio::sync::mpsc::UnboundedSender<lpm_resolver::SelectedPackageEvent>,
     client: Arc<RegistryClient>,
-    route_table: RouteTable,
-    mode: NpmFirewallExperimentMode,
-    lookup_mode: NpmFirewallLookupMode,
-    offline: bool,
-    chunk_size: usize,
+    config: NpmFirewallChunkedPreflightConfig,
 ) -> NpmFirewallPreflightJoin {
     let handle = tokio::spawn(async move {
+        let NpmFirewallChunkedPreflightConfig {
+            route_table,
+            mode,
+            lookup_mode,
+            offline,
+            chunk_size,
+        } = config;
+
         if !mode.is_enabled() {
             while let Some(event) = selected_rx.recv().await {
                 let _ = fetch_tx.send(event);
             }
-            return Ok(NpmFirewallPreflightResult::empty(mode));
+            return Ok(NpmFirewallPreflightResult::empty(mode, lookup_mode));
         }
 
         let chunk_size = chunk_size.max(1);
-        let mut stats = NpmFirewallPreflightStats::for_mode(mode);
+        let mut stats = NpmFirewallPreflightStats::for_mode(mode, lookup_mode);
         let mut decisions = Vec::new();
         let mut report_error = None;
         let total_started = Instant::now();
 
         if offline {
-            if matches!(mode, NpmFirewallExperimentMode::Enforce) {
-                return Err(LpmError::Registry(format!(
-                    "npm firewall verdict preflight requires network access; unset {ENV_EXPERIMENT_NPM_FIREWALL} or run online"
-                )));
+            if matches!(mode, NpmFirewallMode::Enforce) {
+                return Err(LpmError::Registry(NPM_FIREWALL_OFFLINE_HINT.to_string()));
             }
             stats.offline_skipped = true;
             while let Some(event) = selected_rx.recv().await {
@@ -456,7 +422,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                 let _ = fetch_tx.send(event);
             }
             report_error = Some(format!(
-                "npm firewall verdict preflight requires network access; unset {ENV_EXPERIMENT_NPM_FIREWALL} or run online; continuing because report mode is active"
+                "{NPM_FIREWALL_OFFLINE_HINT}; continuing because report mode is active"
             ));
             stats.batch_ms = total_started.elapsed().as_millis();
             return Ok(NpmFirewallPreflightResult {
@@ -516,8 +482,8 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                         &mut stats,
                         &mut decisions,
                         &mut report_error,
-                    )?;
-                    if matches!(mode, NpmFirewallExperimentMode::Enforce) && stats.block_count > 0 {
+                    );
+                    if matches!(mode, NpmFirewallMode::Enforce) && stats.block_count > 0 {
                         tasks.abort_all();
                         stats.batch_ms = total_started.elapsed().as_millis();
                         return Ok(NpmFirewallPreflightResult {
@@ -565,7 +531,7 @@ fn spawn_or_release_firewall_chunk(
     chunk: &mut FirewallSelectedChunk,
     fetch_tx: &tokio::sync::mpsc::UnboundedSender<lpm_resolver::SelectedPackageEvent>,
     client: &Arc<RegistryClient>,
-    mode: NpmFirewallExperimentMode,
+    mode: NpmFirewallMode,
     stats: &mut NpmFirewallPreflightStats,
     tasks: &mut tokio::task::JoinSet<Result<FirewallChunkResult, LpmError>>,
 ) {
@@ -590,7 +556,7 @@ fn spawn_or_release_firewall_chunk(
 
 async fn request_firewall_chunk(
     client: Arc<RegistryClient>,
-    mode: NpmFirewallExperimentMode,
+    mode: NpmFirewallMode,
     events: Vec<lpm_resolver::SelectedPackageEvent>,
     verdict_packages: Vec<NpmFirewallBatchPackage>,
 ) -> Result<FirewallChunkResult, LpmError> {
@@ -600,7 +566,7 @@ async fn request_firewall_chunk(
         .await
     {
         Ok(response) => response,
-        Err(error) if matches!(mode, NpmFirewallExperimentMode::Report) => {
+        Err(error) if matches!(mode, NpmFirewallMode::Report) => {
             return Ok(FirewallChunkResult {
                 events,
                 response: None,
@@ -627,11 +593,11 @@ async fn request_firewall_chunk(
 fn apply_firewall_chunk_result(
     chunk_result: FirewallChunkResult,
     fetch_tx: &tokio::sync::mpsc::UnboundedSender<lpm_resolver::SelectedPackageEvent>,
-    mode: NpmFirewallExperimentMode,
+    mode: NpmFirewallMode,
     stats: &mut NpmFirewallPreflightStats,
     decisions: &mut Vec<NpmFirewallDecision>,
     report_error: &mut Option<String>,
-) -> Result<(), LpmError> {
+) {
     if let Some(error) = chunk_result.report_error {
         stats.rpc_failed = true;
         stats.chunk_count = stats.chunk_count.saturating_add(1);
@@ -641,12 +607,12 @@ fn apply_firewall_chunk_result(
             *report_error = Some(error);
         }
         release_firewall_events(fetch_tx, chunk_result.events);
-        return Ok(());
+        return;
     }
 
     let Some(response) = chunk_result.response else {
         release_firewall_events(fetch_tx, chunk_result.events);
-        return Ok(());
+        return;
     };
 
     stats.record_response(&response, chunk_result.elapsed_ms);
@@ -668,10 +634,9 @@ fn apply_firewall_chunk_result(
             .iter()
             .any(|decision| decision.action == NpmFirewallAction::Block);
     decisions.extend(response.decisions);
-    if matches!(mode, NpmFirewallExperimentMode::Report) || !chunk_has_block {
+    if matches!(mode, NpmFirewallMode::Report) || !chunk_has_block {
         release_firewall_events(fetch_tx, chunk_result.events);
     }
-    Ok(())
 }
 
 fn release_firewall_events(
@@ -684,14 +649,15 @@ fn release_firewall_events(
 }
 
 pub(super) async fn request_npm_firewall_preflight(
-    mode: NpmFirewallExperimentMode,
+    mode: NpmFirewallMode,
+    lookup_mode: NpmFirewallLookupMode,
     client: Arc<RegistryClient>,
     verdict_packages: Vec<NpmFirewallBatchPackage>,
     offline: bool,
 ) -> Result<NpmFirewallPreflightResult, LpmError> {
-    let mut stats = NpmFirewallPreflightStats::for_mode(mode);
+    let mut stats = NpmFirewallPreflightStats::for_mode(mode, lookup_mode);
     if !mode.is_enabled() {
-        return Ok(NpmFirewallPreflightResult::empty(mode));
+        return Ok(NpmFirewallPreflightResult::empty(mode, lookup_mode));
     }
 
     stats.checked_count = verdict_packages.len() as u64;
@@ -705,10 +671,8 @@ pub(super) async fn request_npm_firewall_preflight(
 
     if offline {
         stats.offline_skipped = true;
-        let message = format!(
-            "npm firewall verdict preflight requires network access; unset {ENV_EXPERIMENT_NPM_FIREWALL} or run online"
-        );
-        if matches!(mode, NpmFirewallExperimentMode::Report) {
+        let message = NPM_FIREWALL_OFFLINE_HINT.to_string();
+        if matches!(mode, NpmFirewallMode::Report) {
             return Ok(NpmFirewallPreflightResult {
                 stats,
                 decisions: Vec::new(),
@@ -726,7 +690,7 @@ pub(super) async fn request_npm_firewall_preflight(
         .await
     {
         Ok(response) => response,
-        Err(error) if matches!(mode, NpmFirewallExperimentMode::Report) => {
+        Err(error) if matches!(mode, NpmFirewallMode::Report) => {
             stats.batch_ms = started.elapsed().as_millis();
             stats.rpc_failed = true;
             return Ok(NpmFirewallPreflightResult {
@@ -788,7 +752,7 @@ pub(super) fn finish_npm_firewall_preflight(
     let blocked_count = blocked.len().max(stats.block_count as usize);
     let warned_count = warned.len().max(stats.warn_count as usize);
 
-    if matches!(stats.mode, NpmFirewallExperimentMode::Report) {
+    if matches!(stats.mode, NpmFirewallMode::Report) {
         if !json_output && (blocked_count > 0 || warned_count > 0) {
             output::warn(&format!(
                 "npm firewall report found {} blocked and {} warned package(s); install continues because report mode is active.",
@@ -826,17 +790,23 @@ pub(super) fn finish_npm_firewall_preflight(
 }
 
 pub(super) async fn run_npm_firewall_preflight(
-    mode: NpmFirewallExperimentMode,
+    mode: NpmFirewallMode,
+    lookup_mode: NpmFirewallLookupMode,
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     packages: &[InstallPackage],
     offline: bool,
     json_output: bool,
 ) -> Result<NpmFirewallPreflightStats, LpmError> {
-    let lookup_mode = NpmFirewallLookupMode::from_env();
     let verdict_packages = npm_firewall_packages(packages, route_table, lookup_mode);
-    let result =
-        request_npm_firewall_preflight(mode, Arc::clone(client), verdict_packages, offline).await?;
+    let result = request_npm_firewall_preflight(
+        mode,
+        lookup_mode,
+        Arc::clone(client),
+        verdict_packages,
+        offline,
+    )
+    .await?;
     finish_npm_firewall_preflight(result, json_output)
 }
 
@@ -869,10 +839,7 @@ pub(super) fn npm_firewall_package_from_selected_event(
     {
         return None;
     }
-    if !matches!(
-        route_table.route_for_package(&event.name),
-        UpstreamRoute::NpmDirect
-    ) {
+    if !route_is_public_npm(route_table, &event.name) {
         return None;
     }
     Some(NpmFirewallBatchPackage {
@@ -888,19 +855,13 @@ pub(super) fn npm_firewall_package_from_selected_event(
 
 pub(super) fn npm_firewall_package(
     package: &InstallPackage,
-    route_table: &RouteTable,
+    _route_table: &RouteTable,
     lookup_mode: NpmFirewallLookupMode,
 ) -> Option<NpmFirewallBatchPackage> {
     let Ok(lpm_lockfile::Source::Registry { url }) = package.source_kind() else {
         return None;
     };
-    if url.trim_end_matches('/') != lpm_common::NPM_REGISTRY_URL {
-        return None;
-    }
-    if !matches!(
-        route_table.route_for_package(&package.name),
-        UpstreamRoute::NpmDirect
-    ) {
+    if !crate::npm_public_source::is_public_npm_origin(&url) {
         return None;
     }
     Some(NpmFirewallBatchPackage {
@@ -912,6 +873,16 @@ pub(super) fn npm_firewall_package(
             .flatten(),
         published_at: package.registry_published_at.clone(),
     })
+}
+
+fn route_is_public_npm(route_table: &RouteTable, name: &str) -> bool {
+    match route_table.route_for_package(name) {
+        UpstreamRoute::NpmDirect => true,
+        UpstreamRoute::Custom { target, .. } => {
+            crate::npm_public_source::is_public_npm_origin(&target.base_url)
+        }
+        UpstreamRoute::LpmWorker => false,
+    }
 }
 
 fn print_firewall_decisions(decisions: &[&NpmFirewallDecision]) {
