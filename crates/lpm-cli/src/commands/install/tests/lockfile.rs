@@ -384,6 +384,8 @@ fn resolved_to_install_packages_carries_registry_signature_metadata() {
             modified: None,
             modified_unix: None,
             trust_metadata_complete: false,
+            versions_complete: true,
+            covered_ranges: std::collections::HashSet::new(),
             versions: vec![NpmVersion::parse("1.0.0").unwrap()],
             deps: HashMap::new(),
             peer_deps: HashMap::new(),

@@ -333,6 +333,8 @@ fn make_cached_info(
         modified: None,
         modified_unix: None,
         trust_metadata_complete: false,
+        versions_complete: true,
+        covered_ranges: HashSet::new(),
         versions: versions
             .iter()
             .map(|v| NpmVersion::parse(v).unwrap())

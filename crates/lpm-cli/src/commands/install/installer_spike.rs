@@ -3887,6 +3887,8 @@ mod tests {
             modified: None,
             modified_unix: None,
             trust_metadata_complete: false,
+            versions_complete: true,
+            covered_ranges: HashSet::new(),
             versions: Vec::new(),
             deps: HashMap::new(),
             peer_deps: HashMap::new(),

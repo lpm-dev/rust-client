@@ -3,6 +3,7 @@ use super::metrics::{metrics_incr_cache_wait, metrics_incr_escape_hatch, metrics
 use super::prelude::*;
 use super::state::{MetadataEdgeMissLatest, ResolveState};
 use super::types::Edge;
+use crate::provider::CachedDistInfo;
 
 /// Fast cache hit, then short-lived per-canonical wait, then escape-hatch
 /// direct fetch. Mirrors `LpmDependencyProvider::ensure_cached` but yields an
@@ -293,7 +294,7 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
     timings.body_bytes = raw.timings.body_bytes;
 
     let parse_start = Instant::now();
-    let info = parse_metadata_to_cache_info(&raw.metadata);
+    let info = parse_partial_metadata_to_cache_info(&raw.metadata);
     timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
     if info.needs_policy_metadata(canonical, policy) {
         let policy_start = Instant::now();
@@ -409,10 +410,47 @@ pub(super) fn parse_fetched_metadata(
     include_speculation: bool,
     include_latest_version: bool,
 ) -> FetchedMetadata {
+    parse_fetched_metadata_with_cache_completeness(
+        metadata,
+        include_speculation,
+        include_latest_version,
+        true,
+        std::iter::empty(),
+    )
+}
+
+pub(super) fn parse_partial_fetched_metadata(
+    metadata: lpm_registry::PackageMetadata,
+    include_speculation: bool,
+    include_latest_version: bool,
+    covered_ranges: impl IntoIterator<Item = String>,
+) -> FetchedMetadata {
+    parse_fetched_metadata_with_cache_completeness(
+        metadata,
+        include_speculation,
+        include_latest_version,
+        false,
+        covered_ranges,
+    )
+}
+
+fn parse_fetched_metadata_with_cache_completeness(
+    metadata: lpm_registry::PackageMetadata,
+    include_speculation: bool,
+    include_latest_version: bool,
+    versions_complete: bool,
+    covered_ranges: impl IntoIterator<Item = String>,
+) -> FetchedMetadata {
     let latest_version = include_latest_version
         .then(|| latest_version_from_metadata(&metadata))
         .flatten();
-    let info = Arc::new(parse_metadata_to_cache_info(&metadata));
+    let mut info = if versions_complete {
+        parse_metadata_to_cache_info(&metadata)
+    } else {
+        parse_partial_metadata_to_cache_info(&metadata)
+    };
+    info.covered_ranges.extend(covered_ranges);
+    let info = Arc::new(info);
     let speculation = include_speculation.then(|| {
         SpeculativePackageMetadata::from_dist_tags_and_info(metadata.dist_tags, info.clone())
     });
@@ -684,6 +722,116 @@ pub(super) struct MetadataFetchCompletion<'a> {
     pub(super) state: &'a mut ResolveState,
 }
 
+pub(super) fn insert_or_merge_cached_package_info(
+    shared_cache: &SharedCache,
+    canonical: CanonicalKey,
+    incoming: Arc<CachedPackageInfo>,
+) -> Arc<CachedPackageInfo> {
+    if incoming.versions_complete {
+        shared_cache.insert(canonical, incoming.clone());
+        return incoming;
+    }
+
+    let Some(existing) = shared_cache
+        .get(&canonical)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        shared_cache.insert(canonical, incoming.clone());
+        return incoming;
+    };
+
+    let merged = Arc::new(merge_cached_package_info(&existing, &incoming));
+    shared_cache.insert(canonical, merged.clone());
+    merged
+}
+
+fn merge_cached_package_info(
+    existing: &CachedPackageInfo,
+    incoming: &CachedPackageInfo,
+) -> CachedPackageInfo {
+    let mut versions = Vec::with_capacity(existing.versions.len() + incoming.versions.len());
+    versions.extend(existing.versions.iter().cloned());
+    versions.extend(incoming.versions.iter().cloned());
+    versions.sort_by(|a, b| b.cmp(a));
+    versions.dedup();
+
+    let mut dist = existing.dist.clone();
+    for (version, incoming_dist) in &incoming.dist {
+        dist.entry(version.clone())
+            .and_modify(|existing_dist| {
+                *existing_dist = merge_cached_dist_info(existing_dist, incoming_dist);
+            })
+            .or_insert_with(|| incoming_dist.clone());
+    }
+
+    let mut deps = existing.deps.clone();
+    deps.extend(incoming.deps.clone());
+    let mut peer_deps = existing.peer_deps.clone();
+    peer_deps.extend(incoming.peer_deps.clone());
+    let mut optional_dep_names = existing.optional_dep_names.clone();
+    optional_dep_names.extend(incoming.optional_dep_names.clone());
+    let mut optional_peer_names = existing.optional_peer_names.clone();
+    optional_peer_names.extend(incoming.optional_peer_names.clone());
+    let mut bundled_dep_names = existing.bundled_dep_names.clone();
+    bundled_dep_names.extend(incoming.bundled_dep_names.clone());
+    let mut platform = existing.platform.clone();
+    platform.extend(incoming.platform.clone());
+    let mut aliases = existing.aliases.clone();
+    aliases.extend(incoming.aliases.clone());
+    let mut covered_ranges = existing.covered_ranges.clone();
+    covered_ranges.extend(incoming.covered_ranges.iter().cloned());
+    let incoming_adds_versions = incoming
+        .versions
+        .iter()
+        .any(|version| !existing.versions.contains(version));
+    let versions_complete = existing.versions_complete && !incoming_adds_versions;
+
+    CachedPackageInfo {
+        modified: incoming
+            .modified
+            .clone()
+            .or_else(|| existing.modified.clone()),
+        modified_unix: incoming.modified_unix.or(existing.modified_unix),
+        trust_metadata_complete: versions_complete
+            && (existing.trust_metadata_complete || incoming.trust_metadata_complete),
+        versions_complete,
+        covered_ranges,
+        versions,
+        deps,
+        peer_deps,
+        optional_dep_names,
+        optional_peer_names,
+        bundled_dep_names,
+        platform,
+        dist,
+        aliases,
+    }
+}
+
+fn merge_cached_dist_info(existing: &CachedDistInfo, incoming: &CachedDistInfo) -> CachedDistInfo {
+    CachedDistInfo {
+        tarball_url: incoming
+            .tarball_url
+            .clone()
+            .or_else(|| existing.tarball_url.clone()),
+        integrity: incoming
+            .integrity
+            .clone()
+            .or_else(|| existing.integrity.clone()),
+        signatures: if incoming.signatures.is_empty() {
+            existing.signatures.clone()
+        } else {
+            incoming.signatures.clone()
+        },
+        published_at: incoming
+            .published_at
+            .clone()
+            .or_else(|| existing.published_at.clone()),
+        published_at_unix: incoming.published_at_unix.or(existing.published_at_unix),
+        trust_evidence: incoming.trust_evidence.or(existing.trust_evidence),
+    }
+}
+
 pub(super) fn complete_metadata_fetch(
     canonical: CanonicalKey,
     result: FetchResult,
@@ -705,6 +853,11 @@ pub(super) fn complete_metadata_fetch(
             {
                 *completion.tarball_dispatched_count += 1;
             }
+            let info = insert_or_merge_cached_package_info(
+                completion.shared_cache,
+                canonical.clone(),
+                info,
+            );
             if let Some(mut edges) = completion.parked.remove(&canonical) {
                 if count_latest_for_miss && let Some(edge) = edges.first() {
                     completion
@@ -727,7 +880,6 @@ pub(super) fn complete_metadata_fetch(
                     completion.state.task_queue.push_back(e);
                 }
             }
-            completion.shared_cache.insert(canonical, info);
         }
         Err(e) => {
             if let Some(edges) = completion.parked.remove(&canonical) {

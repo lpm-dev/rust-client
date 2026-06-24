@@ -62,6 +62,8 @@ fn peer_deps_stored_per_version() {
         modified: None,
         modified_unix: None,
         trust_metadata_complete: false,
+        versions_complete: true,
+        covered_ranges: HashSet::new(),
         versions: vec![
             NpmVersion::parse("2.0.0").unwrap(),
             NpmVersion::parse("1.0.0").unwrap(),
@@ -472,6 +474,8 @@ fn make_info(
         modified: None,
         modified_unix: None,
         trust_metadata_complete: false,
+        versions_complete: true,
+        covered_ranges: HashSet::new(),
         versions: versions
             .iter()
             .filter_map(|v| NpmVersion::parse(v).ok())

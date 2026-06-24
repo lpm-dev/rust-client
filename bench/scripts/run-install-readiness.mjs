@@ -412,6 +412,9 @@ function extractLpmMetrics(json) {
     lpmMetadataMetrics(json);
   const fetchBreakdown = at(json, ['timing', 'fetch_breakdown']);
   const fetchOverlap = at(json, ['timing', 'detail', 'fetch', 'overlap']);
+  const resolveDetail = at(json, ['timing', 'resolve']);
+  const resolveDispatcher = resolveDetail?.dispatcher;
+  const streamingBfs = resolveDetail?.streaming_bfs;
   const parity = experimental?.parity;
   const metadataBodyBytesSum = firstFinite(
     metadata?.body_bytes_sum,
@@ -430,6 +433,21 @@ function extractLpmMetrics(json) {
     cached: numberAt(json, ['cached']),
     linked: numberAt(json, ['linked']),
     resolve_ms: numberAt(json, ['timing', 'resolve_ms']),
+    resolve_initial_batch_ms: finiteNumber(resolveDetail?.initial_batch_ms),
+    resolve_followup_rpc_ms: finiteNumber(resolveDetail?.followup_rpc_ms),
+    resolve_followup_rpc_count: finiteNumber(resolveDetail?.followup_rpc_count),
+    resolve_walker_rpc_count: finiteNumber(resolveDetail?.walker_rpc_count),
+    resolve_escape_hatch_rpc_count: finiteNumber(resolveDetail?.escape_hatch_rpc_count),
+    resolve_parse_ndjson_ms: finiteNumber(resolveDetail?.parse_ndjson_ms),
+    resolve_pubgrub_ms: finiteNumber(resolveDetail?.pubgrub_ms),
+    resolve_platform_skipped_count: finiteNumber(resolveDetail?.platform_skipped),
+    resolve_dispatcher_rpc_count: finiteNumber(resolveDispatcher?.rpc_count),
+    resolve_dispatcher_inflight_high_water: finiteNumber(resolveDispatcher?.inflight_high_water),
+    resolve_dispatcher_tarball_dispatched_count: finiteNumber(resolveDispatcher?.tarball_dispatched),
+    resolve_dispatcher_peer_prefetch_count: finiteNumber(resolveDispatcher?.peer_prefetch_count),
+    resolve_streaming_bfs_walk_ms: finiteNumber(streamingBfs?.walk_ms),
+    resolve_streaming_bfs_manifests_fetched: finiteNumber(streamingBfs?.manifests_fetched),
+    resolve_streaming_bfs_cache_hits: finiteNumber(streamingBfs?.cache_hits),
     fetch_ms: numberAt(json, ['timing', 'fetch_ms']),
     link_ms: numberAt(json, ['timing', 'link_ms']),
     total_ms: numberAt(json, ['timing', 'total_ms']),
@@ -698,6 +716,21 @@ function summarizeMetrics(rows) {
     'wall_ms',
     'duration_ms',
     'resolve_ms',
+    'resolve_initial_batch_ms',
+    'resolve_followup_rpc_ms',
+    'resolve_followup_rpc_count',
+    'resolve_walker_rpc_count',
+    'resolve_escape_hatch_rpc_count',
+    'resolve_parse_ndjson_ms',
+    'resolve_pubgrub_ms',
+    'resolve_platform_skipped_count',
+    'resolve_dispatcher_rpc_count',
+    'resolve_dispatcher_inflight_high_water',
+    'resolve_dispatcher_tarball_dispatched_count',
+    'resolve_dispatcher_peer_prefetch_count',
+    'resolve_streaming_bfs_walk_ms',
+    'resolve_streaming_bfs_manifests_fetched',
+    'resolve_streaming_bfs_cache_hits',
     'fetch_ms',
     'link_ms',
     'package_count',
@@ -1357,6 +1390,27 @@ function runSelfTests() {
   const currentMetadataMetrics = extractLpmMetrics({
     count: 2,
     timing: {
+      resolve: {
+        initial_batch_ms: 3,
+        followup_rpc_ms: 13,
+        followup_rpc_count: 2,
+        walker_rpc_count: 1,
+        escape_hatch_rpc_count: 0,
+        parse_ndjson_ms: 5,
+        pubgrub_ms: 17,
+        platform_skipped: 4,
+        dispatcher: {
+          rpc_count: 6,
+          inflight_high_water: 2,
+          tarball_dispatched: 8,
+          peer_prefetch_count: 1,
+        },
+        streaming_bfs: {
+          walk_ms: 23,
+          manifests_fetched: 11,
+          cache_hits: 7,
+        },
+      },
       detail: {
         fetch: {
           overlap: {
@@ -1423,6 +1477,21 @@ function runSelfTests() {
   assert.equal(currentMetadataMetrics.metadata_policy_release_time_fetch_cache_hit_count, 1);
   assert.equal(currentMetadataMetrics.metadata_policy_release_time_fetch_not_modified_count, 0);
   assert.equal(currentMetadataMetrics.metadata_route_npm_direct, 2);
+  assert.equal(currentMetadataMetrics.resolve_initial_batch_ms, 3);
+  assert.equal(currentMetadataMetrics.resolve_followup_rpc_ms, 13);
+  assert.equal(currentMetadataMetrics.resolve_followup_rpc_count, 2);
+  assert.equal(currentMetadataMetrics.resolve_walker_rpc_count, 1);
+  assert.equal(currentMetadataMetrics.resolve_escape_hatch_rpc_count, 0);
+  assert.equal(currentMetadataMetrics.resolve_parse_ndjson_ms, 5);
+  assert.equal(currentMetadataMetrics.resolve_pubgrub_ms, 17);
+  assert.equal(currentMetadataMetrics.resolve_platform_skipped_count, 4);
+  assert.equal(currentMetadataMetrics.resolve_dispatcher_rpc_count, 6);
+  assert.equal(currentMetadataMetrics.resolve_dispatcher_inflight_high_water, 2);
+  assert.equal(currentMetadataMetrics.resolve_dispatcher_tarball_dispatched_count, 8);
+  assert.equal(currentMetadataMetrics.resolve_dispatcher_peer_prefetch_count, 1);
+  assert.equal(currentMetadataMetrics.resolve_streaming_bfs_walk_ms, 23);
+  assert.equal(currentMetadataMetrics.resolve_streaming_bfs_manifests_fetched, 11);
+  assert.equal(currentMetadataMetrics.resolve_streaming_bfs_cache_hits, 7);
   assert.equal(currentMetadataMetrics.fetch_overlap_selected_count, 5);
   assert.equal(currentMetadataMetrics.fetch_overlap_buffered_count, 2);
   assert.equal(currentMetadataMetrics.fetch_overlap_buffered_dispatch_count, 1);
@@ -1588,7 +1657,7 @@ Examples:
     --lpm-cell current \\
     --lpm-cell cap:LPM_V2_FINALIZE_PERMITS=2
 
-  # Compare exact-version-doc experimental path.
+  # Compare exact-version-doc metadata path.
   node bench/scripts/run-install-readiness.mjs \\
     --samples 5 \\
     --lpm-cell current \\

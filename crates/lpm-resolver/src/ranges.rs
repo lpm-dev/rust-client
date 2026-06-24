@@ -108,6 +108,11 @@ impl NpmRange {
     pub fn raw(&self) -> &str {
         &self.raw
     }
+
+    pub fn exact_version(&self) -> Option<NpmVersion> {
+        let raw = self.raw.strip_prefix('=').unwrap_or(&self.raw);
+        NpmVersion::parse(raw).ok()
+    }
 }
 
 /// Parsed npm-alias declaration.

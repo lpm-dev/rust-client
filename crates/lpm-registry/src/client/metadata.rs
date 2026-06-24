@@ -1,5 +1,314 @@
 use super::*;
 
+#[derive(serde::Deserialize)]
+struct NdjsonBatchEntry {
+    name: String,
+    metadata: PackageMetadata,
+}
+
+struct NdjsonBatchEntryStream {
+    response: reqwest::Response,
+    cache_entries: bool,
+    buffer: Vec<u8>,
+    scan_from: usize,
+    bytes_read: u64,
+    chunks_read: u64,
+    json_parse_ns: u128,
+    cache_write_ns: u128,
+    received: usize,
+    finished: bool,
+    finish_logged: bool,
+}
+
+impl NdjsonBatchEntryStream {
+    fn new(response: reqwest::Response, cache_entries: bool) -> Result<Self, LpmError> {
+        if let Some(declared) = response.content_length()
+            && declared as usize > MAX_METADATA_BYTES
+        {
+            return Err(LpmError::Registry(format!(
+                "NDJSON batch: declared body length {declared} exceeds cap {MAX_METADATA_BYTES}"
+            )));
+        }
+        Ok(Self {
+            response,
+            cache_entries,
+            buffer: Vec::new(),
+            scan_from: 0,
+            bytes_read: 0,
+            chunks_read: 0,
+            json_parse_ns: 0,
+            cache_write_ns: 0,
+            received: 0,
+            finished: false,
+            finish_logged: false,
+        })
+    }
+
+    async fn next(
+        &mut self,
+        client: &RegistryClient,
+    ) -> Result<Option<(String, PackageMetadata)>, LpmError> {
+        loop {
+            if let Some(entry) = self.next_buffered_entry(client)? {
+                return Ok(Some(entry));
+            }
+            if self.finished {
+                self.record_finished();
+                return Ok(None);
+            }
+            match self.response.chunk().await {
+                Ok(None) => {
+                    self.finished = true;
+                    self.scan_from = 0;
+                }
+                Ok(Some(chunk)) => {
+                    self.chunks_read += 1;
+                    self.bytes_read += chunk.len() as u64;
+                    if (self.bytes_read as usize) > MAX_METADATA_BYTES {
+                        return Err(LpmError::Registry(format!(
+                            "NDJSON batch: streamed body exceeded cap {MAX_METADATA_BYTES} \
+                             (after {} chunks)",
+                            self.chunks_read
+                        )));
+                    }
+                    self.buffer.extend_from_slice(&chunk);
+                }
+                Err(e) => {
+                    let chain: Vec<String> =
+                        std::iter::successors(Some(&e as &dyn std::error::Error), |e| e.source())
+                            .map(|e| e.to_string())
+                            .collect();
+                    return Err(LpmError::Registry(format!(
+                        "NDJSON read error after {} chunks / {} bytes (parse: {:.1}ms, cache_write: {:.1}ms): {} cause(s): {}",
+                        self.chunks_read,
+                        self.bytes_read,
+                        self.json_parse_ns as f64 / 1_000_000.0,
+                        self.cache_write_ns as f64 / 1_000_000.0,
+                        chain.len(),
+                        chain.join(" <- "),
+                    )));
+                }
+            }
+        }
+    }
+
+    fn next_buffered_entry(
+        &mut self,
+        client: &RegistryClient,
+    ) -> Result<Option<(String, PackageMetadata)>, LpmError> {
+        loop {
+            if self.finished {
+                if !self.buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    return Ok(None);
+                }
+                let line_bytes = std::mem::take(&mut self.buffer);
+                let line = match std::str::from_utf8(&line_bytes) {
+                    Ok(line) => line,
+                    Err(_) => return Ok(None),
+                };
+                return Ok(self.parse_entry_line(client, line));
+            }
+
+            let search_slice = &self.buffer[self.scan_from..];
+            let Some(rel_pos) = search_slice.iter().position(|&b| b == b'\n') else {
+                self.scan_from = self.buffer.len();
+                return Ok(None);
+            };
+            let newline_pos = self.scan_from + rel_pos;
+            let line = std::str::from_utf8(&self.buffer[..newline_pos])
+                .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?
+                .to_string();
+            self.buffer.drain(..newline_pos + 1);
+            self.scan_from = 0;
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(entry) = self.parse_entry_line(client, &line) {
+                return Ok(Some(entry));
+            }
+        }
+    }
+
+    fn parse_entry_line(
+        &mut self,
+        client: &RegistryClient,
+        line: &str,
+    ) -> Option<(String, PackageMetadata)> {
+        let parse_start = std::time::Instant::now();
+        let parsed: Option<NdjsonBatchEntry> = serde_json::from_str(line).ok();
+        let parse_elapsed = parse_start.elapsed();
+        self.json_parse_ns += parse_elapsed.as_nanos();
+        crate::timing::record_parse(parse_elapsed);
+
+        let entry = parsed?;
+        let name = entry.name;
+        let meta = entry.metadata;
+        if !batch_metadata_entry_matches_name(&name, &meta) {
+            tracing::debug!(
+                "skipping NDJSON metadata entry with mismatched package name: requested {name}, metadata {}",
+                meta.name
+            );
+            return None;
+        }
+
+        if self.cache_entries {
+            let cache_key = batch_metadata_cache_key(&name);
+            let write_start = std::time::Instant::now();
+            client.write_metadata_cache(&cache_key, &meta, None);
+            self.cache_write_ns += write_start.elapsed().as_nanos();
+        }
+        self.received += 1;
+        Some((name, meta))
+    }
+
+    fn record_finished(&mut self) {
+        if self.finish_logged {
+            return;
+        }
+        self.finish_logged = true;
+        tracing::debug!(
+            "batch metadata (NDJSON): received {} — json_parse: {:.2}ms, cache_write: {:.2}ms",
+            self.received,
+            self.json_parse_ns as f64 / 1_000_000.0,
+            self.cache_write_ns as f64 / 1_000_000.0,
+        );
+    }
+}
+
+/// Incremental view over a Worker batch metadata response.
+///
+/// For NDJSON responses, each call to [`Self::next`] reads only as far as the
+/// next complete metadata entry. JSON fallback responses are parsed eagerly and
+/// then yielded from memory.
+pub struct BatchMetadataEntryStream<'a> {
+    client: &'a RegistryClient,
+    inner: BatchMetadataEntryStreamInner,
+    rpc_start: std::time::Instant,
+    rpc_recorded: bool,
+}
+
+enum BatchMetadataEntryStreamInner {
+    Ndjson(Box<NdjsonBatchEntryStream>),
+    Json(std::vec::IntoIter<(String, PackageMetadata)>),
+}
+
+impl BatchMetadataEntryStream<'_> {
+    pub async fn next(&mut self) -> Result<Option<(String, PackageMetadata)>, LpmError> {
+        let client = self.client;
+        let result = match &mut self.inner {
+            BatchMetadataEntryStreamInner::Ndjson(stream) => stream.next(client).await,
+            BatchMetadataEntryStreamInner::Json(entries) => Ok(entries.next()),
+        };
+        match result {
+            Ok(None) => {
+                self.record_rpc_once();
+                Ok(None)
+            }
+            Ok(Some(entry)) => Ok(Some(entry)),
+            Err(error) => {
+                self.record_rpc_once();
+                Err(error)
+            }
+        }
+    }
+
+    fn ndjson(
+        client: &RegistryClient,
+        response: reqwest::Response,
+        rpc_start: std::time::Instant,
+        cache_entries: bool,
+    ) -> Result<BatchMetadataEntryStream<'_>, LpmError> {
+        Ok(BatchMetadataEntryStream {
+            client,
+            inner: BatchMetadataEntryStreamInner::Ndjson(Box::new(NdjsonBatchEntryStream::new(
+                response,
+                cache_entries,
+            )?)),
+            rpc_start,
+            rpc_recorded: false,
+        })
+    }
+
+    fn json(
+        client: &RegistryClient,
+        entries: std::vec::IntoIter<(String, PackageMetadata)>,
+        rpc_start: std::time::Instant,
+    ) -> BatchMetadataEntryStream<'_> {
+        BatchMetadataEntryStream {
+            client,
+            inner: BatchMetadataEntryStreamInner::Json(entries),
+            rpc_start,
+            rpc_recorded: false,
+        }
+    }
+
+    fn record_rpc_once(&mut self) {
+        if self.rpc_recorded {
+            return;
+        }
+        crate::timing::record_rpc(self.rpc_start.elapsed());
+        self.rpc_recorded = true;
+    }
+}
+
+impl Drop for BatchMetadataEntryStream<'_> {
+    fn drop(&mut self) {
+        self.record_rpc_once();
+    }
+}
+
+fn batch_metadata_cache_key(name: &str) -> String {
+    if name.starts_with("@lpm.dev/") {
+        format!("lpm:{name}")
+    } else {
+        format!("npm:{name}")
+    }
+}
+
+fn batch_metadata_entry_matches_name(name: &str, meta: &PackageMetadata) -> bool {
+    meta.name == name || meta.versions.values().any(|version| version.name == name)
+}
+
+fn merge_batch_package_metadata(existing: &mut PackageMetadata, incoming: PackageMetadata) {
+    let incoming_latest_version = incoming.latest_version;
+    existing.description = incoming.description.or_else(|| existing.description.take());
+    existing.modified = incoming.modified.or_else(|| existing.modified.take());
+    existing.downloads = incoming.downloads.or(existing.downloads);
+    existing.distribution_mode = incoming
+        .distribution_mode
+        .or_else(|| existing.distribution_mode.take());
+    existing.package_type = incoming
+        .package_type
+        .or_else(|| existing.package_type.take());
+    existing.ecosystem = incoming.ecosystem.or_else(|| existing.ecosystem.take());
+    existing.dist_tags.extend(incoming.dist_tags);
+    existing.versions.extend(incoming.versions);
+    existing.time.extend(incoming.time);
+
+    if let Some(latest) = highest_metadata_version(&existing.versions) {
+        existing
+            .dist_tags
+            .insert("latest".to_string(), latest.clone());
+        existing.latest_version = Some(latest);
+    } else if existing.latest_version.is_none() {
+        existing.latest_version = incoming_latest_version;
+    }
+}
+
+fn highest_metadata_version(
+    versions: &std::collections::HashMap<String, VersionMetadata>,
+) -> Option<String> {
+    versions
+        .keys()
+        .filter_map(|version| {
+            lpm_semver::Version::parse(version)
+                .ok()
+                .map(|parsed| (parsed, version))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, version)| version.clone())
+}
+
 impl RegistryClient {
     pub(super) fn apply_worker_metadata_http_version(
         &self,
@@ -214,7 +523,7 @@ impl RegistryClient {
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        self.batch_metadata_inner(package_names, false, &[], false)
+        self.batch_metadata_inner(package_names, false, &[], false, &[], None)
             .await
     }
 
@@ -226,7 +535,7 @@ impl RegistryClient {
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        self.batch_metadata_inner(package_names, true, &[], false)
+        self.batch_metadata_inner(package_names, true, &[], false, &[], None)
             .await
     }
 
@@ -241,8 +550,90 @@ impl RegistryClient {
             true,
             release_age_package_names,
             release_age_all_packages,
+            &[],
+            None,
         )
         .await
+    }
+
+    pub async fn batch_metadata_deep_with_release_age_packages_and_package_specs(
+        &self,
+        package_names: &[String],
+        release_age_package_names: &[String],
+        release_age_all_packages: bool,
+        package_specs: &[(String, String)],
+        release_age_cutoff_unix: Option<i64>,
+    ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
+        self.batch_metadata_inner(
+            package_names,
+            true,
+            release_age_package_names,
+            release_age_all_packages,
+            package_specs,
+            release_age_cutoff_unix,
+        )
+        .await
+    }
+
+    pub async fn batch_metadata_deep_with_release_age_packages_and_package_specs_stream(
+        &self,
+        package_names: &[String],
+        release_age_package_names: &[String],
+        release_age_all_packages: bool,
+        package_specs: &[(String, String)],
+        release_age_cutoff_unix: Option<i64>,
+    ) -> Result<BatchMetadataEntryStream<'_>, LpmError> {
+        if package_names.is_empty() {
+            return Ok(BatchMetadataEntryStream::json(
+                self,
+                Vec::new().into_iter(),
+                std::time::Instant::now(),
+            ));
+        }
+        self.record_batch_metadata_request_packages(package_names);
+        let body = Self::batch_metadata_request_body(
+            package_names,
+            true,
+            release_age_package_names,
+            release_age_all_packages,
+            package_specs,
+            release_age_cutoff_unix,
+        );
+        let cache_batch_entries = package_specs.is_empty();
+        let rpc_start = std::time::Instant::now();
+        let response = match self.send_batch_metadata_response(&body).await {
+            Ok(response) => response,
+            Err(error) => {
+                crate::timing::record_rpc(rpc_start.elapsed());
+                return Err(error);
+            }
+        };
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if content_type.contains("application/x-ndjson") {
+            BatchMetadataEntryStream::ndjson(self, response, rpc_start, cache_batch_entries)
+        } else {
+            let map = match self
+                .parse_json_batch_with_cache(response, cache_batch_entries)
+                .await
+            {
+                Ok(map) => map,
+                Err(error) => {
+                    crate::timing::record_rpc(rpc_start.elapsed());
+                    return Err(error);
+                }
+            };
+            Ok(BatchMetadataEntryStream::json(
+                self,
+                map.into_iter().collect::<Vec<_>>().into_iter(),
+                rpc_start,
+            ))
+        }
     }
 
     pub(super) async fn batch_metadata_inner(
@@ -251,16 +642,61 @@ impl RegistryClient {
         deep: bool,
         release_age_package_names: &[String],
         release_age_all_packages: bool,
+        package_specs: &[(String, String)],
+        release_age_cutoff_unix: Option<i64>,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         if package_names.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        self.record_batch_metadata_request_packages(package_names);
+        let body = Self::batch_metadata_request_body(
+            package_names,
+            deep,
+            release_age_package_names,
+            release_age_all_packages,
+            package_specs,
+            release_age_cutoff_unix,
+        );
+
+        let rpc_start = std::time::Instant::now();
+        let result = async {
+            let response = self.send_batch_metadata_response(&body).await?;
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            if content_type.contains("application/x-ndjson") {
+                self.parse_ndjson_batch_with_cache(response, package_specs.is_empty())
+                    .await
+            } else {
+                self.parse_json_batch_with_cache(response, package_specs.is_empty())
+                    .await
+            }
+        }
+        .await;
+
+        crate::timing::record_rpc(rpc_start.elapsed());
+        result
+    }
+
+    fn record_batch_metadata_request_packages(&self, package_names: &[String]) {
         for package_name in package_names {
             crate::timing::record_metadata_request(package_name);
             crate::timing::record_metadata_cache_miss();
         }
+    }
 
-        let url = format!("{}/api/registry/batch-metadata", self.base_url);
+    fn batch_metadata_request_body(
+        package_names: &[String],
+        deep: bool,
+        release_age_package_names: &[String],
+        release_age_all_packages: bool,
+        package_specs: &[(String, String)],
+        release_age_cutoff_unix: Option<i64>,
+    ) -> serde_json::Value {
         let mut body = serde_json::json!({ "packages": package_names, "deep": deep });
         if release_age_all_packages {
             if let Some(object) = body.as_object_mut() {
@@ -277,234 +713,83 @@ impl RegistryClient {
                 serde_json::json!(release_age_package_names),
             );
         }
+        if deep
+            && !package_specs.is_empty()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert("rangeAware".to_string(), serde_json::Value::Bool(true));
+            if let Some(cutoff_unix) = release_age_cutoff_unix {
+                object.insert(
+                    "releaseAgeCutoffUnix".to_string(),
+                    serde_json::json!(cutoff_unix),
+                );
+            }
+            object.insert(
+                "packageSpecs".to_string(),
+                serde_json::Value::Array(
+                    package_specs
+                        .iter()
+                        .map(|(name, range)| {
+                            serde_json::json!({
+                                "name": name,
+                                "range": range,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        body
+    }
 
-        // Wall-clock the entire RPC (request + parse). Metadata fetches
-        // dominate `resolve_ms` on cold installs; the timer feeds
-        // `crate::timing::record_rpc` so the resolver can surface the
-        // bound in `--json` as `timing.resolve.metadata_rpc_ms`.
-        let rpc_start = std::time::Instant::now();
-
-        // Posture: AuthRequired. Batch metadata may include `@lpm.dev`
-        // packages whose metadata is auth-gated; on 401 the recovery
-        // wrapper lazily refreshes and re-runs the entire closure
-        // (request + parse) once.
-        let result = self
-            .execute_with_recovery(AuthPosture::AuthRequired, || async {
-                let mut req = self
-                    .build_worker_metadata_post(&url)
-                    .await?
-                    .header("Accept", "application/x-ndjson")
-                    .json(&body);
-                if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
-                    req = req.bearer_auth(bearer);
-                }
-                let req = self.apply_worker_metadata_http_version(req, &url);
-                let response = self.send_package_metadata_request(req).await?;
-
-                let content_type = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-
-                if content_type.contains("application/x-ndjson") {
-                    self.parse_ndjson_batch(response).await
-                } else {
-                    self.parse_json_batch(response).await
-                }
-            })
-            .await;
-
-        // Record even on error — a timed-out RPC contributed to the
-        // observed wall-clock just as much as a successful one, and
-        // the caller will surface the error elsewhere.
-        crate::timing::record_rpc(rpc_start.elapsed());
-        result
+    async fn send_batch_metadata_response(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, LpmError> {
+        let url = format!("{}/api/registry/batch-metadata", self.base_url);
+        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let mut req = self
+                .build_worker_metadata_post(&url)
+                .await?
+                .header("Accept", "application/x-ndjson")
+                .json(&body);
+            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+                req = req.bearer_auth(bearer);
+            }
+            let req = self.apply_worker_metadata_http_version(req, &url);
+            self.send_package_metadata_request(req).await
+        })
+        .await
     }
 
     /// Parse an NDJSON batch response. Each line is:
     /// `{"name":"lodash","metadata":{...}}\n`. Returns the
     /// fully-populated map.
-    pub(super) async fn parse_ndjson_batch(
+    async fn parse_ndjson_batch_with_cache(
         &self,
         response: reqwest::Response,
+        cache_entries: bool,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let mut map = std::collections::HashMap::new();
-        let mut buffer = Vec::new();
-        // Avoid quadratic `\n` scan. Each time reqwest gives us a fresh
-        // chunk we append to `buffer` and then look for a newline to frame
-        // the next NDJSON line. Scanning from offset 0 on every chunk
-        // grows triangularly; `scan_from` tracks the first unscanned byte
-        // so total scan work is O(total bytes) instead of
-        // O(chunks × buffer_size).
-        let mut scan_from: usize = 0;
-        let mut json_parse_ns: u128 = 0;
-        let mut cache_write_ns: u128 = 0;
-
-        // Read chunks from the response body and parse complete lines.
-        //
-        // `reqwest::Error`'s top-level Display is the kind only (e.g.
-        // "error decoding response body"). The actual fault lives in the
-        // `source()` chain from hyper. Walk the chain explicitly so the
-        // warn log is diagnostic and not just the opaque top-level string.
-        //
-        // Cap the total bytes accumulated from the NDJSON stream at
-        // the same `MAX_METADATA_BYTES` ceiling the single-package
-        // metadata path uses. A hostile Worker / poisoned base URL
-        // could otherwise stream one giant line (or unbounded
-        // whitespace) and exhaust install memory before the JSON
-        // parser noticed the line was malformed.
-        if let Some(declared) = response.content_length()
-            && declared as usize > MAX_METADATA_BYTES
-        {
-            return Err(LpmError::Registry(format!(
-                "NDJSON batch: declared body length {declared} exceeds cap {MAX_METADATA_BYTES}"
-            )));
-        }
-        let mut response = response;
-        let mut bytes_read: u64 = 0;
-        let mut chunks_read: u64 = 0;
-        loop {
-            match response.chunk().await {
-                Ok(None) => break,
-                Ok(Some(chunk)) => {
-                    chunks_read += 1;
-                    bytes_read += chunk.len() as u64;
-                    if (bytes_read as usize) > MAX_METADATA_BYTES {
-                        return Err(LpmError::Registry(format!(
-                            "NDJSON batch: streamed body exceeded cap {MAX_METADATA_BYTES} \
-                             (after {chunks_read} chunks)"
-                        )));
-                    }
-                    buffer.extend_from_slice(&chunk);
+        let mut entries = NdjsonBatchEntryStream::new(response, cache_entries)?;
+        while let Some((name, meta)) = entries.next(self).await? {
+            match map.entry(name) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    merge_batch_package_metadata(entry.get_mut(), meta);
                 }
-                Err(e) => {
-                    let chain: Vec<String> =
-                        std::iter::successors(Some(&e as &dyn std::error::Error), |e| e.source())
-                            .map(|e| e.to_string())
-                            .collect();
-                    return Err(LpmError::Registry(format!(
-                        "NDJSON read error after {chunks_read} chunks / {bytes_read} bytes (parse: {:.1}ms, cache_write: {:.1}ms): {} cause(s): {}",
-                        json_parse_ns as f64 / 1_000_000.0,
-                        cache_write_ns as f64 / 1_000_000.0,
-                        chain.len(),
-                        chain.join(" <- "),
-                    )));
-                }
-            }
-            // Process all complete lines in the buffer. Only scan the
-            // new bytes — `scan_from` marks the first byte we haven't
-            // inspected yet. See the top-of-function comment for the
-            // quadratic-scan story this avoids.
-            loop {
-                let search_slice = &buffer[scan_from..];
-                let Some(rel_pos) = search_slice.iter().position(|&b| b == b'\n') else {
-                    // No newline in the unscanned region; everything up
-                    // to `buffer.len()` is scanned. Pick up from here on
-                    // the next chunk.
-                    scan_from = buffer.len();
-                    break;
-                };
-                let newline_pos = scan_from + rel_pos;
-
-                let line = std::str::from_utf8(&buffer[..newline_pos])
-                    .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?;
-                if !line.is_empty() {
-                    // Parse directly into typed struct, avoiding the
-                    // intermediate Value + clone that doubled parse cost.
-                    #[derive(serde::Deserialize)]
-                    struct NdjsonEntry {
-                        name: String,
-                        metadata: PackageMetadata,
-                    }
-                    let parse_start = std::time::Instant::now();
-                    let parsed: Option<NdjsonEntry> = serde_json::from_str(line).ok();
-                    json_parse_ns += parse_start.elapsed().as_nanos();
-                    let parsed = parsed.map(|e| (e.name, e.metadata));
-
-                    if let Some((name, meta)) = parsed {
-                        if meta.name != name
-                            && !meta.versions.values().any(|version| version.name == name)
-                        {
-                            buffer.drain(..newline_pos + 1);
-                            scan_from = 0;
-                            continue;
-                        }
-
-                        let cache_key = if name.starts_with("@lpm.dev/") {
-                            format!("lpm:{name}")
-                        } else {
-                            format!("npm:{name}")
-                        };
-                        let write_start = std::time::Instant::now();
-                        self.write_metadata_cache(&cache_key, &meta, None);
-                        cache_write_ns += write_start.elapsed().as_nanos();
-                        map.insert(name, meta);
-                    }
-                }
-                buffer.drain(..newline_pos + 1);
-                // Bytes shifted left by `newline_pos + 1`; everything
-                // remaining is unscanned, so restart from 0.
-                scan_from = 0;
-            }
-        }
-
-        // Handle final line in buffer (no trailing newline)
-        if buffer.iter().any(|byte| !byte.is_ascii_whitespace())
-            && let Ok(line) = std::str::from_utf8(&buffer)
-        {
-            #[derive(serde::Deserialize)]
-            struct NdjsonEntry {
-                name: String,
-                metadata: PackageMetadata,
-            }
-            let parse_start = std::time::Instant::now();
-            let parsed: Option<NdjsonEntry> = serde_json::from_str(line).ok();
-            json_parse_ns += parse_start.elapsed().as_nanos();
-
-            if let Some(entry) = parsed {
-                let name = entry.name;
-                let meta = entry.metadata;
-                if meta.name != name && !meta.versions.values().any(|version| version.name == name)
-                {
-                    tracing::debug!(
-                        "skipping NDJSON metadata entry with mismatched package name: requested {name}, metadata {}",
-                        meta.name
-                    );
-                } else {
-                    let cache_key = if name.starts_with("@lpm.dev/") {
-                        format!("lpm:{name}")
-                    } else {
-                        format!("npm:{name}")
-                    };
-                    let write_start = std::time::Instant::now();
-                    self.write_metadata_cache(&cache_key, &meta, None);
-                    cache_write_ns += write_start.elapsed().as_nanos();
-                    map.insert(name, meta);
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(meta);
                 }
             }
         }
-
-        tracing::debug!(
-            "batch metadata (NDJSON): received {} — json_parse: {:.2}ms, cache_write: {:.2}ms",
-            map.len(),
-            json_parse_ns as f64 / 1_000_000.0,
-            cache_write_ns as f64 / 1_000_000.0,
-        );
-
-        // Feed the locally-accumulated parse time into the resolver-visible
-        // `parse_ndjson_ms` counter. Cache-write is intentionally NOT
-        // reported here: it's disk I/O, not parse CPU.
-        crate::timing::record_parse(std::time::Duration::from_nanos(json_parse_ns as u64));
-
         Ok(map)
     }
 
     /// Parse a legacy JSON batch response: `{ "packages": { "name": {...} } }`
-    pub(super) async fn parse_json_batch(
+    async fn parse_json_batch_with_cache(
         &self,
         response: reqwest::Response,
+        cache_entries: bool,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let result: serde_json::Value = parse_capped_metadata(response, "batch metadata").await?;
 
@@ -516,18 +801,14 @@ impl RegistryClient {
         let mut map = std::collections::HashMap::new();
         for (name, meta_value) in packages_obj {
             if let Ok(meta) = serde_json::from_value::<PackageMetadata>(meta_value.clone()) {
-                if meta.name != *name
-                    && !meta.versions.values().any(|version| version.name == *name)
-                {
+                if !batch_metadata_entry_matches_name(name, &meta) {
                     continue;
                 }
 
-                let cache_key = if name.starts_with("@lpm.dev/") {
-                    format!("lpm:{name}")
-                } else {
-                    format!("npm:{name}")
-                };
-                self.write_metadata_cache(&cache_key, &meta, None);
+                if cache_entries {
+                    let cache_key = batch_metadata_cache_key(name);
+                    self.write_metadata_cache(&cache_key, &meta, None);
+                }
                 map.insert(name.clone(), meta);
             }
         }

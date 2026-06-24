@@ -110,6 +110,13 @@ pub struct CachedPackageInfo {
     /// missing trust evidence can be treated as genuinely absent rather
     /// than "not present in abbreviated metadata."
     pub trust_metadata_complete: bool,
+    /// True when `versions` represents the complete available version set.
+    /// Range-aware Worker responses intentionally carry only selected
+    /// versions, so broad ranges must refetch before choosing a version.
+    pub versions_complete: bool,
+    /// Range strings for which an incomplete `versions` set is known to be
+    /// Worker-selected. Empty for normal complete packuments.
+    pub covered_ranges: HashSet<String>,
     /// Available versions, sorted descending (newest first).
     pub versions: Vec<NpmVersion>,
     /// Regular dependencies for each version: version_string → { dep_name → range_string }.
