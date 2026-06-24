@@ -156,6 +156,11 @@ impl ResolverPolicy {
     }
 
     #[inline]
+    pub fn release_age_cutoff_unix(&self) -> Option<i64> {
+        self.cutoff_unix
+    }
+
+    #[inline]
     pub fn release_age_excluded(&self, package: &CanonicalKey) -> bool {
         self.minimum_release_age_exclude.contains(package)
     }

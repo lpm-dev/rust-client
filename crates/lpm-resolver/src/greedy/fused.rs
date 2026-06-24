@@ -234,6 +234,72 @@ fn release_age_names_from_root_deps(
     names
 }
 
+fn worker_range_aware_batch_enabled() -> bool {
+    std::env::var("LPM_WORKER_RANGE_AWARE_BATCH").as_deref() == Ok("1")
+}
+
+fn worker_streaming_batch_enabled() -> bool {
+    std::env::var("LPM_WORKER_STREAMING_BATCH").as_deref() == Ok("1")
+}
+
+fn worker_package_specs_from_root_deps(
+    root_deps: &HashMap<String, String>,
+    route_table: &RouteTable,
+) -> Vec<(String, String)> {
+    let mut seen = AHashSet::with_capacity(root_deps.len());
+    let mut specs = Vec::with_capacity(root_deps.len());
+    for (name, range) in root_deps {
+        let (package_name, package_range) = crate::ranges::parse_npm_alias(range).map_or_else(
+            || (name.clone(), range.clone()),
+            |alias| (alias.target, alias.range),
+        );
+        if !matches!(
+            CanonicalKey::from_dep_name(&package_name),
+            CanonicalKey::Npm { .. }
+        ) {
+            continue;
+        }
+        if !matches!(
+            route_table.route_for_package(&package_name),
+            UpstreamRoute::LpmWorker
+        ) {
+            continue;
+        }
+        if seen.insert((package_name.clone(), package_range.clone())) {
+            specs.push((package_name, package_range));
+        }
+    }
+    specs.sort();
+    specs
+}
+
+fn worker_package_names_from_specs(package_specs: &[(String, String)]) -> Vec<String> {
+    let mut names: Vec<String> = package_specs.iter().map(|(name, _)| name.clone()).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn worker_package_specs_from_parked_edges(
+    candidates: &[(CanonicalKey, String)],
+    parked: &AHashMap<CanonicalKey, Vec<Edge>>,
+) -> Vec<(String, String)> {
+    let mut seen = AHashSet::with_capacity(candidates.len());
+    let mut specs = Vec::with_capacity(candidates.len());
+    for (canonical, name) in candidates {
+        let Some(edges) = parked.get(canonical) else {
+            continue;
+        };
+        for edge in edges {
+            let range = edge.range.raw().to_string();
+            if seen.insert((name.clone(), range.clone())) {
+                specs.push((name.clone(), range));
+            }
+        }
+    }
+    specs
+}
+
 /// Fused dispatcher: greedy resolver IS the fetch dispatcher. Replaces the
 /// walker + resolver two-task model with a single tokio task that drains
 /// its work queue synchronously, parks edges on cache misses, and resumes
@@ -409,6 +475,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     crate::profile::reset_all();
     lpm_registry::timing::reset();
     let trace_metadata_fetches = lpm_registry::timing::metadata_fetch_detail_enabled();
+    let range_aware_worker_batch = worker_range_aware_batch_enabled();
 
     let mut state = ResolveState::new_with_options_and_policy(
         dependencies,
@@ -425,6 +492,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     } else {
         release_age_names_from_root_deps(&state.root_deps, &policy)
     };
+    let release_age_cutoff_unix = policy.release_age_cutoff_unix();
     let tree_provider = FusedTreeProvider {
         client: &client,
         route_table: &route_table,
@@ -462,6 +530,24 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     // `StageTiming.peer_prefetch_count`.
     let mut peer_prefetch_count: u64 = 0;
 
+    // Pre-size both maps to the expected steady-state cardinality.
+    // For bench/fixture-large (266 transitive packages) the default-
+    // sized HashMap rehashes ~5-7 times growing from 0 → 266; samply
+    // surfaced `hashbrown::reserve_rehash` at ~6.7 % of cold-install
+    // CPU. `npm_fanout` (the metadata-semaphore size) is the closest
+    // proxy for "how many manifests this resolver might
+    // track simultaneously" without threading a dependency-count estimate
+    // through. Slight over-allocation is cheaper than rehashing.
+    let mut inflight: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
+    let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
+    let mut counted_metadata_edge_misses =
+        trace_metadata_fetches.then(|| AHashSet::with_capacity(npm_fanout));
+    let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
+        tokio::task::JoinSet::new();
+    let mut worker_batch_stream = None;
+    let mut worker_stream_can_batch_waiting = false;
+    let mut worker_stream_waiting: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
+
     // Pre-batch root deps routed through the LPM Worker in one round trip
     // before the main fetch loop. Without this, each such dep would
     // fire its own [`fetch_metadata_raw`] call inside the dispatcher
@@ -485,81 +571,117 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     //   - On per-name parse failure (server returned something we
     //     can't interpret as a CanonicalKey), skip that entry and
     //     let the main loop refetch it.
-    let worker_root_names: Vec<String> = state
-        .root_deps
-        .keys()
-        .filter(|name| {
-            matches!(
-                route_table.route_for_package(name),
-                UpstreamRoute::LpmWorker
-            )
-        })
-        .cloned()
-        .collect();
+    let worker_root_package_specs = if range_aware_worker_batch {
+        worker_package_specs_from_root_deps(&state.root_deps, &route_table)
+    } else {
+        Vec::new()
+    };
+    let worker_root_names: Vec<String> = if worker_root_package_specs.is_empty() {
+        state
+            .root_deps
+            .keys()
+            .filter(|name| {
+                matches!(
+                    route_table.route_for_package(name),
+                    UpstreamRoute::LpmWorker
+                )
+            })
+            .cloned()
+            .collect()
+    } else {
+        worker_package_names_from_specs(&worker_root_package_specs)
+    };
+    let streaming_worker_batch = range_aware_worker_batch
+        && worker_streaming_batch_enabled()
+        && !worker_root_package_specs.is_empty();
     if !worker_root_names.is_empty() {
-        match client
-            .batch_metadata_deep_with_release_age_packages(
-                &worker_root_names,
-                &release_age_package_names,
-                release_age_all_packages,
-            )
-            .await
-        {
-            Ok(batch) => {
-                // One actual HTTP round trip regardless of
-                // batch.len(). The dispatcher_rpc_count metric tracks
-                // RPCs (not packages); record exactly 1 for the batch
-                // — keeps the metric semantics stable across arms.
-                dispatcher_rpc_count += 1;
-                for (name, meta) in batch {
-                    let canonical = crate::package::CanonicalKey::from_dep_name(&name);
-                    if matches!(canonical, crate::package::CanonicalKey::Root) {
-                        continue;
-                    }
-                    if !matches!(
-                        route_table.route_for_package(&name),
-                        UpstreamRoute::LpmWorker
-                    ) {
-                        continue;
-                    }
-                    let fetched =
-                        parse_fetched_metadata(meta, spec_tx.is_some(), trace_metadata_fetches);
-                    let FetchedMetadata {
-                        speculation, info, ..
-                    } = fetched;
-                    shared_cache.insert(canonical.clone(), info);
-                    if let (Some(tx), Some(speculation)) = (spec_tx.as_ref(), speculation)
-                        && tx.try_send((canonical.to_string(), speculation)).is_ok()
-                    {
-                        tarball_dispatched_count += 1;
-                    }
+        if streaming_worker_batch {
+            match client
+                .batch_metadata_deep_with_release_age_packages_and_package_specs_stream(
+                    &worker_root_names,
+                    &release_age_package_names,
+                    release_age_all_packages,
+                    &worker_root_package_specs,
+                    release_age_cutoff_unix,
+                )
+                .await
+            {
+                Ok(stream) => {
+                    dispatcher_rpc_count += 1;
+                    worker_batch_stream = Some(stream);
+                    worker_stream_can_batch_waiting = true;
+                }
+                Err(e) => {
+                    worker_batch_disabled.set(true);
+                    tracing::debug!(
+                        "greedy-fusion: streaming Worker pre-batch failed to open ({} names): {e} \
+                         — falling back to per-package dispatch",
+                        worker_root_names.len()
+                    );
                 }
             }
-            Err(e) => {
-                worker_batch_disabled.set(true);
-                tracing::debug!(
-                    "greedy-fusion: Worker pre-batch failed ({} names): {e} \
-                     — falling back to per-package dispatch",
-                    worker_root_names.len()
-                );
+        } else {
+            let batch_result = if worker_root_package_specs.is_empty() {
+                client
+                    .batch_metadata_deep_with_release_age_packages(
+                        &worker_root_names,
+                        &release_age_package_names,
+                        release_age_all_packages,
+                    )
+                    .await
+            } else {
+                client
+                    .batch_metadata_deep_with_release_age_packages_and_package_specs(
+                        &worker_root_names,
+                        &release_age_package_names,
+                        release_age_all_packages,
+                        &worker_root_package_specs,
+                        release_age_cutoff_unix,
+                    )
+                    .await
+            };
+            match batch_result {
+                Ok(batch) => {
+                    // One actual HTTP round trip regardless of
+                    // batch.len(). The dispatcher_rpc_count metric tracks
+                    // RPCs (not packages); record exactly 1 for the batch
+                    // — keeps the metric semantics stable across arms.
+                    dispatcher_rpc_count += 1;
+                    for (name, meta) in batch {
+                        let canonical = crate::package::CanonicalKey::from_dep_name(&name);
+                        if matches!(canonical, crate::package::CanonicalKey::Root) {
+                            continue;
+                        }
+                        if !matches!(
+                            route_table.route_for_package(&name),
+                            UpstreamRoute::LpmWorker
+                        ) {
+                            continue;
+                        }
+                        let fetched =
+                            parse_fetched_metadata(meta, spec_tx.is_some(), trace_metadata_fetches);
+                        let FetchedMetadata {
+                            speculation, info, ..
+                        } = fetched;
+                        shared_cache.insert(canonical.clone(), info);
+                        if let (Some(tx), Some(speculation)) = (spec_tx.as_ref(), speculation)
+                            && tx.try_send((canonical.to_string(), speculation)).is_ok()
+                        {
+                            tarball_dispatched_count += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    worker_batch_disabled.set(true);
+                    tracing::debug!(
+                        "greedy-fusion: Worker pre-batch failed ({} names): {e} \
+                         — falling back to per-package dispatch",
+                        worker_root_names.len()
+                    );
+                }
             }
         }
     }
-    // Pre-size both maps to the expected steady-state cardinality.
-    // For bench/fixture-large (266 transitive packages) the default-
-    // sized HashMap rehashes ~5-7 times growing from 0 → 266; samply
-    // surfaced `hashbrown::reserve_rehash` at ~6.7 % of cold-install
-    // CPU. `npm_fanout` (the metadata-semaphore size) is the closest
-    // proxy for "how many manifests this resolver might
-    // track simultaneously" without threading a dependency-count estimate
-    // through. Slight over-allocation is cheaper than rehashing.
-    let mut inflight: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
-    let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
-    let mut counted_metadata_edge_misses =
-        trace_metadata_fetches.then(|| AHashSet::with_capacity(npm_fanout));
-    let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
-        tokio::task::JoinSet::new();
-
     // High-water marks update after each queue-drain pass
     // so the post-loop value reflects the peak across the run, not just the
     // final tick. `dispatcher_rpc_count` and `tarball_dispatched_count` are
@@ -576,6 +698,37 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             // refcount bump on the Arc<CachedPackageInfo>. The shard
             // lock is released before `process_edge` mutates state.
             if let Some(info_arc) = shared_cache.get(&edge.canonical).map(|e| e.value().clone()) {
+                if worker_batch_stream.is_some()
+                    && !info_arc
+                        .versions
+                        .iter()
+                        .any(|version| edge.range.satisfies(version))
+                    && matches!(
+                        &edge.canonical,
+                        CanonicalKey::Npm { name }
+                            if matches!(
+                                route_table.route_for_package(name),
+                                UpstreamRoute::LpmWorker
+                            )
+                    )
+                {
+                    let canonical = edge.canonical.clone();
+                    if inflight.insert(canonical.clone()) && trace_metadata_fetches {
+                        state.work_stats.record_metadata_edge_miss(
+                            &canonical,
+                            &edge.range,
+                            &route_table,
+                        );
+                        if let Some(counted_metadata_edge_misses) =
+                            counted_metadata_edge_misses.as_mut()
+                        {
+                            counted_metadata_edge_misses.insert(canonical.clone());
+                        }
+                    }
+                    parked.entry(canonical.clone()).or_default().push(edge);
+                    worker_stream_waiting.insert(canonical);
+                    continue;
+                }
                 let info_arc = ensure_policy_metadata_for_cached_manifest(
                     &edge.canonical,
                     info_arc,
@@ -627,7 +780,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                     _ => None,
                 };
                 if let Some(name) = worker_name {
-                    worker_batch_candidates.push((canonical, name));
+                    if worker_batch_stream.is_some() {
+                        worker_stream_waiting.insert(canonical);
+                    } else {
+                        worker_batch_candidates.push((canonical, name));
+                    }
                 } else {
                     spawn_metadata_fetch_job(
                         &mut metadata_jobs,
@@ -645,74 +802,136 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                 .iter()
                 .map(|(_, name)| name.clone())
                 .collect();
-            match client
-                .batch_metadata_deep_with_release_age_packages(
-                    &worker_names,
-                    &release_age_package_names,
-                    release_age_all_packages,
-                )
-                .await
-            {
-                Ok(batch) => {
-                    dispatcher_rpc_count += 1;
-                    let mut returned = AHashSet::with_capacity(batch.len());
-                    for (name, meta) in batch {
-                        let canonical = crate::package::CanonicalKey::from_dep_name(&name);
-                        if matches!(canonical, crate::package::CanonicalKey::Root) {
-                            continue;
-                        }
-                        if !matches!(
-                            route_table.route_for_package(&name),
-                            UpstreamRoute::LpmWorker
-                        ) {
-                            continue;
-                        }
-                        returned.insert(canonical.clone());
-                        inflight.remove(&canonical);
-                        let fetched =
-                            parse_fetched_metadata(meta, spec_tx.is_some(), trace_metadata_fetches);
-                        let mut completion = MetadataFetchCompletion {
-                            shared_cache: &shared_cache,
-                            route_table: &route_table,
-                            counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
-                            trace_metadata_fetches,
-                            spec_tx: spec_tx.as_ref(),
-                            tarball_dispatched_count: &mut tarball_dispatched_count,
-                            parked: &mut parked,
-                            state: &mut state,
-                        };
-                        complete_metadata_fetch(canonical, Ok(fetched), &mut completion)?;
-                    }
-
-                    for (canonical, _) in worker_batch_candidates {
-                        if returned.contains(&canonical) {
-                            continue;
-                        }
-                        spawn_metadata_fetch_job(
-                            &mut metadata_jobs,
-                            &metadata_dispatch,
-                            canonical,
-                            spec_tx.is_some(),
-                        );
+            let worker_package_specs = if range_aware_worker_batch {
+                worker_package_specs_from_parked_edges(&worker_batch_candidates, &parked)
+            } else {
+                Vec::new()
+            };
+            if streaming_worker_batch && !worker_package_specs.is_empty() {
+                match client
+                    .batch_metadata_deep_with_release_age_packages_and_package_specs_stream(
+                        &worker_names,
+                        &release_age_package_names,
+                        release_age_all_packages,
+                        &worker_package_specs,
+                        release_age_cutoff_unix,
+                    )
+                    .await
+                {
+                    Ok(stream) => {
                         dispatcher_rpc_count += 1;
+                        worker_batch_stream = Some(stream);
+                        worker_stream_can_batch_waiting = false;
+                        worker_stream_waiting.extend(
+                            worker_batch_candidates
+                                .into_iter()
+                                .map(|(canonical, _)| canonical),
+                        );
+                        continue;
                     }
-                    continue;
+                    Err(e) => {
+                        worker_batch_disabled.set(true);
+                        tracing::debug!(
+                            "greedy-fusion: streaming Worker tail batch failed to open ({} names): {e} \
+                             — falling back to per-package dispatch",
+                            worker_batch_candidates.len()
+                        );
+                        for (canonical, _) in worker_batch_candidates {
+                            spawn_metadata_fetch_job(
+                                &mut metadata_jobs,
+                                &metadata_dispatch,
+                                canonical,
+                                spec_tx.is_some(),
+                            );
+                            dispatcher_rpc_count += 1;
+                        }
+                    }
                 }
-                Err(e) => {
-                    worker_batch_disabled.set(true);
-                    tracing::debug!(
-                        "greedy-fusion: Worker tail batch failed ({} names): {e} \
-                         — falling back to per-package dispatch",
-                        worker_batch_candidates.len()
-                    );
-                    for (canonical, _) in worker_batch_candidates {
-                        spawn_metadata_fetch_job(
-                            &mut metadata_jobs,
-                            &metadata_dispatch,
-                            canonical,
-                            spec_tx.is_some(),
-                        );
+            } else {
+                let batch_result = if worker_package_specs.is_empty() {
+                    client
+                        .batch_metadata_deep_with_release_age_packages(
+                            &worker_names,
+                            &release_age_package_names,
+                            release_age_all_packages,
+                        )
+                        .await
+                } else {
+                    client
+                        .batch_metadata_deep_with_release_age_packages_and_package_specs(
+                            &worker_names,
+                            &release_age_package_names,
+                            release_age_all_packages,
+                            &worker_package_specs,
+                            release_age_cutoff_unix,
+                        )
+                        .await
+                };
+                match batch_result {
+                    Ok(batch) => {
                         dispatcher_rpc_count += 1;
+                        let mut returned = AHashSet::with_capacity(batch.len());
+                        for (name, meta) in batch {
+                            let canonical = crate::package::CanonicalKey::from_dep_name(&name);
+                            if matches!(canonical, crate::package::CanonicalKey::Root) {
+                                continue;
+                            }
+                            if !matches!(
+                                route_table.route_for_package(&name),
+                                UpstreamRoute::LpmWorker
+                            ) {
+                                continue;
+                            }
+                            returned.insert(canonical.clone());
+                            inflight.remove(&canonical);
+                            let fetched = parse_fetched_metadata(
+                                meta,
+                                spec_tx.is_some(),
+                                trace_metadata_fetches,
+                            );
+                            let mut completion = MetadataFetchCompletion {
+                                shared_cache: &shared_cache,
+                                route_table: &route_table,
+                                counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
+                                trace_metadata_fetches,
+                                spec_tx: spec_tx.as_ref(),
+                                tarball_dispatched_count: &mut tarball_dispatched_count,
+                                parked: &mut parked,
+                                state: &mut state,
+                            };
+                            complete_metadata_fetch(canonical, Ok(fetched), &mut completion)?;
+                        }
+
+                        for (canonical, _) in worker_batch_candidates {
+                            if returned.contains(&canonical) {
+                                continue;
+                            }
+                            spawn_metadata_fetch_job(
+                                &mut metadata_jobs,
+                                &metadata_dispatch,
+                                canonical,
+                                spec_tx.is_some(),
+                            );
+                            dispatcher_rpc_count += 1;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        worker_batch_disabled.set(true);
+                        tracing::debug!(
+                            "greedy-fusion: Worker tail batch failed ({} names): {e} \
+                             — falling back to per-package dispatch",
+                            worker_batch_candidates.len()
+                        );
+                        for (canonical, _) in worker_batch_candidates {
+                            spawn_metadata_fetch_job(
+                                &mut metadata_jobs,
+                                &metadata_dispatch,
+                                canonical,
+                                spec_tx.is_some(),
+                            );
+                            dispatcher_rpc_count += 1;
+                        }
                     }
                 }
             }
@@ -783,6 +1002,113 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
         // `peer_requirements` is empty OR `auto_install_peers`
         // is false.
         if metadata_jobs.is_empty() && state.task_queue.is_empty() {
+            let mut worker_stream_finished = false;
+            if let Some(stream) = worker_batch_stream.as_mut() {
+                match stream.next().await {
+                    Ok(Some((name, meta))) => {
+                        let canonical = crate::package::CanonicalKey::from_dep_name(&name);
+                        if !matches!(canonical, crate::package::CanonicalKey::Root)
+                            && matches!(
+                                route_table.route_for_package(&name),
+                                UpstreamRoute::LpmWorker
+                            )
+                        {
+                            worker_stream_waiting.remove(&canonical);
+                            inflight.remove(&canonical);
+                            let fetched = parse_fetched_metadata(
+                                meta,
+                                spec_tx.is_some(),
+                                trace_metadata_fetches,
+                            );
+                            let mut completion = MetadataFetchCompletion {
+                                shared_cache: &shared_cache,
+                                route_table: &route_table,
+                                counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
+                                trace_metadata_fetches,
+                                spec_tx: spec_tx.as_ref(),
+                                tarball_dispatched_count: &mut tarball_dispatched_count,
+                                parked: &mut parked,
+                                state: &mut state,
+                            };
+                            complete_metadata_fetch(canonical, Ok(fetched), &mut completion)?;
+                        }
+                        continue;
+                    }
+                    Ok(None) => {
+                        worker_stream_finished = true;
+                    }
+                    Err(e) => {
+                        worker_stream_finished = true;
+                        worker_batch_disabled.set(true);
+                        tracing::debug!(
+                            "greedy-fusion: streaming Worker batch failed mid-body: {e} \
+                             — falling back to per-package dispatch for pending names"
+                        );
+                    }
+                }
+            }
+
+            if worker_stream_finished {
+                worker_batch_stream = None;
+                if !worker_stream_waiting.is_empty() {
+                    let waiting_candidates: Vec<(CanonicalKey, String)> = worker_stream_waiting
+                        .iter()
+                        .filter_map(|canonical| match canonical {
+                            CanonicalKey::Npm { name } => Some((canonical.clone(), name.clone())),
+                            CanonicalKey::Root | CanonicalKey::Lpm { .. } => None,
+                        })
+                        .collect();
+                    if worker_stream_can_batch_waiting && !waiting_candidates.is_empty() {
+                        let worker_names: Vec<String> = waiting_candidates
+                            .iter()
+                            .map(|(_, name)| name.clone())
+                            .collect();
+                        let worker_package_specs =
+                            worker_package_specs_from_parked_edges(&waiting_candidates, &parked);
+                        if !worker_package_specs.is_empty() {
+                            match client
+                                .batch_metadata_deep_with_release_age_packages_and_package_specs_stream(
+                                    &worker_names,
+                                    &release_age_package_names,
+                                    release_age_all_packages,
+                                    &worker_package_specs,
+                                    release_age_cutoff_unix,
+                                )
+                                .await
+                            {
+                                Ok(stream) => {
+                                    dispatcher_rpc_count += 1;
+                                    worker_batch_stream = Some(stream);
+                                    worker_stream_can_batch_waiting = false;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    worker_batch_disabled.set(true);
+                                    tracing::debug!(
+                                        "greedy-fusion: streaming Worker follow-up batch failed to open ({} names): {e} \
+                                         — falling back to per-package dispatch",
+                                        waiting_candidates.len()
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    worker_stream_can_batch_waiting = false;
+                    for canonical in worker_stream_waiting.drain() {
+                        spawn_metadata_fetch_job(
+                            &mut metadata_jobs,
+                            &metadata_dispatch,
+                            canonical,
+                            spec_tx.is_some(),
+                        );
+                        dispatcher_rpc_count += 1;
+                    }
+                    continue;
+                }
+                worker_stream_can_batch_waiting = false;
+            }
+
             debug_assert!(
                 parked.is_empty(),
                 "greedy-fusion: non-empty parked at termination — invariant violated \
@@ -1043,5 +1369,102 @@ mod release_age_hint_tests {
         let names = release_age_names_from_root_deps(&root_deps, &policy);
 
         assert!(names.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod range_aware_worker_batch_tests {
+    use super::*;
+
+    #[test]
+    fn worker_package_specs_from_root_deps_keeps_proxy_routed_npm_specs() {
+        let root_deps = HashMap::from_iter([
+            ("plain".to_string(), "^1.0.0".to_string()),
+            (
+                "alias-local".to_string(),
+                "npm:@scope/real@^2.0.0".to_string(),
+            ),
+            (
+                "lpm".to_string(),
+                "npm:@lpm.dev/acme.widget@^3.0.0".to_string(),
+            ),
+        ]);
+        let route_table = RouteTable::from_mode_only(RouteMode::Proxy);
+
+        let specs = worker_package_specs_from_root_deps(&root_deps, &route_table);
+
+        assert_eq!(
+            specs,
+            vec![
+                ("@scope/real".to_string(), "^2.0.0".to_string()),
+                ("plain".to_string(), "^1.0.0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_package_specs_from_root_deps_skips_direct_npm_routes() {
+        let root_deps = HashMap::from_iter([("plain".to_string(), "^1.0.0".to_string())]);
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+
+        let specs = worker_package_specs_from_root_deps(&root_deps, &route_table);
+
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn worker_package_names_from_specs_dedupes_duplicate_package_ranges() {
+        let specs = vec![
+            ("shared".to_string(), "^1.0.0".to_string()),
+            ("shared".to_string(), "^2.0.0".to_string()),
+            ("other".to_string(), "*".to_string()),
+        ];
+
+        let names = worker_package_names_from_specs(&specs);
+
+        assert_eq!(names, vec!["other".to_string(), "shared".to_string()]);
+    }
+
+    #[test]
+    fn worker_package_specs_from_parked_edges_preserves_distinct_ranges() {
+        let canonical = CanonicalKey::npm("shared");
+        let mut parked = AHashMap::new();
+        parked.insert(
+            canonical.clone(),
+            vec![
+                Edge {
+                    parent: 0,
+                    local_name: "shared".to_string(),
+                    canonical: canonical.clone(),
+                    range: NpmRange::parse("^1.0.0").expect("valid range"),
+                    behavior: Default::default(),
+                },
+                Edge {
+                    parent: 1,
+                    local_name: "shared".to_string(),
+                    canonical: canonical.clone(),
+                    range: NpmRange::parse("^2.0.0").expect("valid range"),
+                    behavior: Default::default(),
+                },
+                Edge {
+                    parent: 2,
+                    local_name: "shared".to_string(),
+                    canonical: canonical.clone(),
+                    range: NpmRange::parse("^1.0.0").expect("valid range"),
+                    behavior: Default::default(),
+                },
+            ],
+        );
+        let candidates = vec![(canonical, "shared".to_string())];
+
+        let specs = worker_package_specs_from_parked_edges(&candidates, &parked);
+
+        assert_eq!(
+            specs,
+            vec![
+                ("shared".to_string(), "^1.0.0".to_string()),
+                ("shared".to_string(), "^2.0.0".to_string()),
+            ]
+        );
     }
 }

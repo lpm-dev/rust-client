@@ -18,29 +18,82 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+struct ScopedEnvVars {
+    originals: Vec<(&'static str, Option<String>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedEnvVars {
+    fn set(vars: &[(&'static str, &'static str)]) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let originals = vars
+            .iter()
+            .map(|(key, _)| (*key, std::env::var(key).ok()))
+            .collect();
+        // SAFETY: the module-local lock serializes mutations of these
+        // test-scoped environment variables.
+        unsafe {
+            for (key, value) in vars {
+                std::env::set_var(key, value);
+            }
+        }
+        Self {
+            originals,
+            _lock: guard,
+        }
+    }
+}
+
+impl Drop for ScopedEnvVars {
+    fn drop(&mut self) {
+        // SAFETY: see `ScopedEnvVars::set`.
+        unsafe {
+            for (key, value) in &self.originals {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
 /// Build a minimal npm-packument JSON shape for wiremock-based
 /// resolver tests. Mirrors `walker::tests::metadata_json` so the
 /// fixture shape stays identical across resolver-arm tests.
 fn metadata_json(name: &str, deps: &[(&str, &str)]) -> serde_json::Value {
+    metadata_json_version(name, "1.0.0", deps)
+}
+
+fn metadata_json_version(name: &str, version: &str, deps: &[(&str, &str)]) -> serde_json::Value {
     let deps_obj: serde_json::Map<String, serde_json::Value> = deps
         .iter()
         .map(|(n, r)| (n.to_string(), serde_json::Value::String(r.to_string())))
         .collect();
+    let mut versions = serde_json::Map::new();
+    versions.insert(
+        version.to_string(),
+        serde_json::json!({
+            "name": name,
+            "version": version,
+            "dist": {
+                "tarball": "https://example.com/pkg.tgz",
+                "integrity": "sha512-test"
+            },
+            "dependencies": deps_obj
+        }),
+    );
+    let mut time = serde_json::Map::new();
+    time.insert(
+        version.to_string(),
+        serde_json::Value::String("2025-01-01T00:00:00.000Z".to_string()),
+    );
     serde_json::json!({
         "name": name,
-        "dist-tags": { "latest": "1.0.0" },
-        "versions": {
-            "1.0.0": {
-                "name": name,
-                "version": "1.0.0",
-                "dist": {
-                    "tarball": "https://example.com/pkg.tgz",
-                    "integrity": "sha512-test"
-                },
-                "dependencies": deps_obj
-            }
-        },
-        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        "dist-tags": { "latest": version },
+        "versions": versions,
+        "time": time
     })
 }
 
@@ -1362,11 +1415,10 @@ fn process_edge_path_selector_splits_two_parents() {
     // override allocates `lodash@3.10.1` first; the subsequent
     // root edge must NOT silently inherit that forced version
     // via range-satisfies dedupe (3.10.1 satisfies `>=3.0.0`).
-    // Pre-fix, that's exactly what happened — the path-selector
-    // override leaked into every sibling of `react`. Post-fix,
-    // `OverrideSet::split_targets` (containing "lodash") forces
-    // exact-match dedupe on every slow-path edge, so the root
-    // edge allocates the natural 4.17.21 in its own node.
+    // The regression was a path-selector override leaking into every
+    // sibling of `react`. `OverrideSet::split_targets` (containing
+    // "lodash") forces exact-match dedupe on every slow-path edge, so
+    // the root edge allocates the natural 4.17.21 in its own node.
     let info = mk_info(&["4.17.21", "3.10.1"], &[]);
     let mut deps = HashMap::new();
     deps.insert("lodash".to_string(), ">=3.0.0".to_string());
@@ -1375,7 +1427,7 @@ fn process_edge_path_selector_splits_two_parents() {
     // Hand-seed both parents WITHOUT calling `seed_root_edges()`,
     // which would push the root>lodash edge first. Reverse order
     // (react edge enqueued before root edge) is what surfaces the
-    // pre-fix bug.
+    // override-leak regression.
     state.nodes.push(ResolvedNodeBuilder {
         canonical: CanonicalKey::Root,
         version: NpmVersion::new(0, 0, 0),
@@ -3602,6 +3654,348 @@ async fn fusion_pre_batches_worker_routed_npm_root_deps() {
         result.stage_timing.dispatcher_rpc_count, 1,
         "Worker-routed npm root metadata should batch into one dispatcher RPC"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_streaming_worker_batch_emits_selected_root_before_tail_metadata_finishes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep, timeout};
+
+    let _env = ScopedEnvVars::set(&[
+        ("LPM_WORKER_RANGE_AWARE_BATCH", "1"),
+        ("LPM_WORKER_STREAMING_BATCH", "1"),
+    ]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = vec![0u8; 8192];
+        let _ = stream.read(&mut request).await.unwrap();
+
+        let root_line = serde_json::json!({
+            "name": "proxy-stream-root",
+            "metadata": metadata_json("proxy-stream-root", &[("proxy-stream-tail", "^1.0.0")]),
+        })
+        .to_string()
+            + "\n";
+        let tail_line = serde_json::json!({
+            "name": "proxy-stream-tail",
+            "metadata": metadata_json("proxy-stream-tail", &[]),
+        })
+        .to_string()
+            + "\n";
+
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let root_header = format!("{:X}\r\n", root_line.len());
+        stream.write_all(root_header.as_bytes()).await.unwrap();
+        stream.write_all(root_line.as_bytes()).await.unwrap();
+        stream.write_all(b"\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+
+        sleep(Duration::from_millis(900)).await;
+
+        let tail_header = format!("{:X}\r\n", tail_line.len());
+        stream.write_all(tail_header.as_bytes()).await.unwrap();
+        stream.write_all(tail_line.as_bytes()).await.unwrap();
+        stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+    });
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(format!("http://{address}"))
+            .with_cache_dir(None),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut deps = HashMap::new();
+    deps.insert("proxy-stream-root".into(), "^1.0.0".into());
+    let resolver = resolve_greedy_fused_with_cache_options_policy_and_selected_events(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Proxy),
+        8,
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        true,
+        true,
+        ResolverPolicy::default(),
+        Some(tx),
+    );
+    tokio::pin!(resolver);
+
+    let event = timeout(Duration::from_millis(500), async {
+        tokio::select! {
+            event = rx.recv() => {
+                event.expect("selected-package channel should remain open")
+            }
+            _ = &mut resolver => {
+                panic!("resolver finished before root selected-package event");
+            }
+        }
+    })
+    .await
+    .expect("root selection should arrive before delayed tail metadata");
+    assert_eq!(event.name, "proxy-stream-root");
+    assert_eq!(event.version, "1.0.0");
+
+    let result = resolver.await.expect("streaming resolve should succeed");
+    let names: std::collections::HashSet<_> = result
+        .packages
+        .iter()
+        .map(|p| p.package.canonical_name())
+        .collect();
+    assert!(names.contains("proxy-stream-root"));
+    assert!(names.contains("proxy-stream-tail"));
+    assert_eq!(result.stage_timing.dispatcher_rpc_count, 1);
+
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_streaming_worker_batch_waits_when_partial_cache_misses_edge_range() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep};
+
+    let _env = ScopedEnvVars::set(&[
+        ("LPM_WORKER_RANGE_AWARE_BATCH", "1"),
+        ("LPM_WORKER_STREAMING_BATCH", "1"),
+    ]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = vec![0u8; 8192];
+        let _ = stream.read(&mut request).await.unwrap();
+
+        let lines = [
+            serde_json::json!({
+                "name": "proxy-partial-root",
+                "metadata": metadata_json("proxy-partial-root", &[
+                    ("aaa-first", "^1.0.0"),
+                    ("zzz-second", "^1.0.0"),
+                ]),
+            })
+            .to_string()
+                + "\n",
+            serde_json::json!({
+                "name": "aaa-first",
+                "metadata": metadata_json("aaa-first", &[("chalk", "^5.0.0")]),
+            })
+            .to_string()
+                + "\n",
+            serde_json::json!({
+                "name": "chalk",
+                "metadata": metadata_json_version("chalk", "5.6.2", &[]),
+            })
+            .to_string()
+                + "\n",
+            serde_json::json!({
+                "name": "zzz-second",
+                "metadata": metadata_json("zzz-second", &[("chalk", "^4.0.0")]),
+            })
+            .to_string()
+                + "\n",
+            serde_json::json!({
+                "name": "chalk",
+                "metadata": metadata_json_version("chalk", "4.1.2", &[]),
+            })
+            .to_string()
+                + "\n",
+        ];
+
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        for (index, line) in lines.iter().enumerate() {
+            if index == lines.len() - 1 {
+                sleep(Duration::from_millis(100)).await;
+            }
+            let header = format!("{:X}\r\n", line.len());
+            stream.write_all(header.as_bytes()).await.unwrap();
+            stream.write_all(line.as_bytes()).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+        }
+        stream.write_all(b"0\r\n\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+    });
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(format!("http://{address}"))
+            .with_cache_dir(None),
+    );
+    let mut deps = HashMap::new();
+    deps.insert("proxy-partial-root".into(), "^1.0.0".into());
+
+    let result = resolve_greedy_fused_with_cache_options_policy_and_selected_events(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Proxy),
+        8,
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        true,
+        true,
+        ResolverPolicy::default(),
+        None,
+    )
+    .await
+    .expect("partial streamed metadata should wait for a satisfying later entry");
+
+    let chalk_versions: std::collections::HashSet<_> = result
+        .packages
+        .iter()
+        .filter(|package| package.package.canonical_name() == "chalk")
+        .map(|package| package.version.to_string())
+        .collect();
+    assert!(chalk_versions.contains("5.6.2"));
+    assert!(chalk_versions.contains("4.1.2"));
+    assert_eq!(result.stage_timing.dispatcher_rpc_count, 1);
+
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_streaming_worker_batch_streams_follow_up_tail_batch() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, sleep, timeout};
+
+    let _env = ScopedEnvVars::set(&[
+        ("LPM_WORKER_RANGE_AWARE_BATCH", "1"),
+        ("LPM_WORKER_STREAMING_BATCH", "1"),
+    ]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for request_index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let _ = stream.read(&mut request).await.unwrap();
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            if request_index == 0 {
+                let root_line = serde_json::json!({
+                    "name": "proxy-tail-stream-root",
+                    "metadata": metadata_json("proxy-tail-stream-root", &[
+                        ("proxy-tail-stream-a", "^1.0.0"),
+                        ("proxy-tail-stream-b", "^1.0.0"),
+                    ]),
+                })
+                .to_string()
+                    + "\n";
+                let header = format!("{:X}\r\n", root_line.len());
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(root_line.as_bytes()).await.unwrap();
+                stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+                stream.flush().await.unwrap();
+                continue;
+            }
+
+            let tail_a = serde_json::json!({
+                "name": "proxy-tail-stream-a",
+                "metadata": metadata_json("proxy-tail-stream-a", &[]),
+            })
+            .to_string()
+                + "\n";
+            let tail_b = serde_json::json!({
+                "name": "proxy-tail-stream-b",
+                "metadata": metadata_json("proxy-tail-stream-b", &[]),
+            })
+            .to_string()
+                + "\n";
+
+            let tail_a_header = format!("{:X}\r\n", tail_a.len());
+            stream.write_all(tail_a_header.as_bytes()).await.unwrap();
+            stream.write_all(tail_a.as_bytes()).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+
+            sleep(Duration::from_millis(900)).await;
+
+            let tail_b_header = format!("{:X}\r\n", tail_b.len());
+            stream.write_all(tail_b_header.as_bytes()).await.unwrap();
+            stream.write_all(tail_b.as_bytes()).await.unwrap();
+            stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+        }
+    });
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(format!("http://{address}"))
+            .with_cache_dir(None),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut deps = HashMap::new();
+    deps.insert("proxy-tail-stream-root".into(), "^1.0.0".into());
+    let resolver = resolve_greedy_fused_with_cache_options_policy_and_selected_events(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Proxy),
+        8,
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        true,
+        true,
+        ResolverPolicy::default(),
+        Some(tx),
+    );
+    tokio::pin!(resolver);
+
+    let tail_event = timeout(Duration::from_millis(700), async {
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    let event = event.expect("selected-package channel should remain open");
+                    if event.name == "proxy-tail-stream-a" {
+                        break event;
+                    }
+                }
+                _ = &mut resolver => {
+                    panic!("resolver finished before streamed tail selected-package event");
+                }
+            }
+        }
+    })
+    .await
+    .expect("tail selection should arrive before delayed second tail metadata");
+    assert_eq!(tail_event.version, "1.0.0");
+
+    let result = resolver
+        .await
+        .expect("follow-up tail stream resolve should succeed");
+    let names: std::collections::HashSet<_> = result
+        .packages
+        .iter()
+        .map(|package| package.package.canonical_name())
+        .collect();
+    assert!(names.contains("proxy-tail-stream-root"));
+    assert!(names.contains("proxy-tail-stream-a"));
+    assert!(names.contains("proxy-tail-stream-b"));
+    assert_eq!(result.stage_timing.dispatcher_rpc_count, 2);
+
+    server.await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
