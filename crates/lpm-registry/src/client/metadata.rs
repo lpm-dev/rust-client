@@ -8,6 +8,7 @@ struct NdjsonBatchEntry {
 
 struct NdjsonBatchEntryStream {
     response: reqwest::Response,
+    cache_entries: bool,
     buffer: Vec<u8>,
     scan_from: usize,
     bytes_read: u64,
@@ -20,7 +21,7 @@ struct NdjsonBatchEntryStream {
 }
 
 impl NdjsonBatchEntryStream {
-    fn new(response: reqwest::Response) -> Result<Self, LpmError> {
+    fn new(response: reqwest::Response, cache_entries: bool) -> Result<Self, LpmError> {
         if let Some(declared) = response.content_length()
             && declared as usize > MAX_METADATA_BYTES
         {
@@ -30,6 +31,7 @@ impl NdjsonBatchEntryStream {
         }
         Ok(Self {
             response,
+            cache_entries,
             buffer: Vec::new(),
             scan_from: 0,
             bytes_read: 0,
@@ -149,10 +151,12 @@ impl NdjsonBatchEntryStream {
             return None;
         }
 
-        let cache_key = batch_metadata_cache_key(&name);
-        let write_start = std::time::Instant::now();
-        client.write_metadata_cache(&cache_key, &meta, None);
-        self.cache_write_ns += write_start.elapsed().as_nanos();
+        if self.cache_entries {
+            let cache_key = batch_metadata_cache_key(&name);
+            let write_start = std::time::Instant::now();
+            client.write_metadata_cache(&cache_key, &meta, None);
+            self.cache_write_ns += write_start.elapsed().as_nanos();
+        }
         self.received += 1;
         Some((name, meta))
     }
@@ -212,11 +216,13 @@ impl BatchMetadataEntryStream<'_> {
         client: &RegistryClient,
         response: reqwest::Response,
         rpc_start: std::time::Instant,
+        cache_entries: bool,
     ) -> Result<BatchMetadataEntryStream<'_>, LpmError> {
         Ok(BatchMetadataEntryStream {
             client,
             inner: BatchMetadataEntryStreamInner::Ndjson(Box::new(NdjsonBatchEntryStream::new(
                 response,
+                cache_entries,
             )?)),
             rpc_start,
             rpc_recorded: false,
@@ -261,6 +267,46 @@ fn batch_metadata_cache_key(name: &str) -> String {
 
 fn batch_metadata_entry_matches_name(name: &str, meta: &PackageMetadata) -> bool {
     meta.name == name || meta.versions.values().any(|version| version.name == name)
+}
+
+fn merge_batch_package_metadata(existing: &mut PackageMetadata, incoming: PackageMetadata) {
+    let incoming_latest_version = incoming.latest_version;
+    existing.description = incoming.description.or_else(|| existing.description.take());
+    existing.modified = incoming.modified.or_else(|| existing.modified.take());
+    existing.downloads = incoming.downloads.or(existing.downloads);
+    existing.distribution_mode = incoming
+        .distribution_mode
+        .or_else(|| existing.distribution_mode.take());
+    existing.package_type = incoming
+        .package_type
+        .or_else(|| existing.package_type.take());
+    existing.ecosystem = incoming.ecosystem.or_else(|| existing.ecosystem.take());
+    existing.dist_tags.extend(incoming.dist_tags);
+    existing.versions.extend(incoming.versions);
+    existing.time.extend(incoming.time);
+
+    if let Some(latest) = highest_metadata_version(&existing.versions) {
+        existing
+            .dist_tags
+            .insert("latest".to_string(), latest.clone());
+        existing.latest_version = Some(latest);
+    } else if existing.latest_version.is_none() {
+        existing.latest_version = incoming_latest_version;
+    }
+}
+
+fn highest_metadata_version(
+    versions: &std::collections::HashMap<String, VersionMetadata>,
+) -> Option<String> {
+    versions
+        .keys()
+        .filter_map(|version| {
+            lpm_semver::Version::parse(version)
+                .ok()
+                .map(|parsed| (parsed, version))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, version)| version.clone())
 }
 
 impl RegistryClient {
@@ -553,6 +599,7 @@ impl RegistryClient {
             package_specs,
             release_age_cutoff_unix,
         );
+        let cache_batch_entries = package_specs.is_empty();
         let rpc_start = std::time::Instant::now();
         let response = match self.send_batch_metadata_response(&body).await {
             Ok(response) => response,
@@ -569,9 +616,12 @@ impl RegistryClient {
             .to_string();
 
         if content_type.contains("application/x-ndjson") {
-            BatchMetadataEntryStream::ndjson(self, response, rpc_start)
+            BatchMetadataEntryStream::ndjson(self, response, rpc_start, cache_batch_entries)
         } else {
-            let map = match self.parse_json_batch(response).await {
+            let map = match self
+                .parse_json_batch_with_cache(response, cache_batch_entries)
+                .await
+            {
                 Ok(map) => map,
                 Err(error) => {
                     crate::timing::record_rpc(rpc_start.elapsed());
@@ -619,9 +669,11 @@ impl RegistryClient {
                 .to_string();
 
             if content_type.contains("application/x-ndjson") {
-                self.parse_ndjson_batch(response).await
+                self.parse_ndjson_batch_with_cache(response, package_specs.is_empty())
+                    .await
             } else {
-                self.parse_json_batch(response).await
+                self.parse_json_batch_with_cache(response, package_specs.is_empty())
+                    .await
             }
         }
         .await;
@@ -713,22 +765,31 @@ impl RegistryClient {
     /// Parse an NDJSON batch response. Each line is:
     /// `{"name":"lodash","metadata":{...}}\n`. Returns the
     /// fully-populated map.
-    pub(super) async fn parse_ndjson_batch(
+    async fn parse_ndjson_batch_with_cache(
         &self,
         response: reqwest::Response,
+        cache_entries: bool,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let mut map = std::collections::HashMap::new();
-        let mut entries = NdjsonBatchEntryStream::new(response)?;
+        let mut entries = NdjsonBatchEntryStream::new(response, cache_entries)?;
         while let Some((name, meta)) = entries.next(self).await? {
-            map.insert(name, meta);
+            match map.entry(name) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    merge_batch_package_metadata(entry.get_mut(), meta);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(meta);
+                }
+            }
         }
         Ok(map)
     }
 
     /// Parse a legacy JSON batch response: `{ "packages": { "name": {...} } }`
-    pub(super) async fn parse_json_batch(
+    async fn parse_json_batch_with_cache(
         &self,
         response: reqwest::Response,
+        cache_entries: bool,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let result: serde_json::Value = parse_capped_metadata(response, "batch metadata").await?;
 
@@ -744,8 +805,10 @@ impl RegistryClient {
                     continue;
                 }
 
-                let cache_key = batch_metadata_cache_key(name);
-                self.write_metadata_cache(&cache_key, &meta, None);
+                if cache_entries {
+                    let cache_key = batch_metadata_cache_key(name);
+                    self.write_metadata_cache(&cache_key, &meta, None);
+                }
                 map.insert(name.clone(), meta);
             }
         }

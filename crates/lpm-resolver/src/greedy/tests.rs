@@ -117,6 +117,8 @@ fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageI
         modified: None,
         modified_unix: None,
         trust_metadata_complete: false,
+        versions_complete: true,
+        covered_ranges: HashSet::new(),
         versions: parsed,
         deps: deps_map,
         peer_deps: HashMap::new(),
@@ -142,6 +144,75 @@ fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageI
             .collect(),
         aliases: HashMap::new(),
     }
+}
+
+fn edge_for_range(name: &str, range: &str) -> Edge {
+    Edge {
+        parent: 0,
+        local_name: name.to_string(),
+        canonical: CanonicalKey::npm(name),
+        range: NpmRange::parse(range).expect("valid range"),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    }
+}
+
+#[test]
+fn partial_worker_cache_refetches_for_uncovered_overlapping_range() {
+    let mut info = mk_info(&["4.1.2"], &[]);
+    info.versions_complete = false;
+    info.covered_ranges.insert("^4.0.0".to_string());
+
+    assert!(partial_worker_cache_needs_full_metadata(
+        &info,
+        &edge_for_range("shared", "*")
+    ));
+}
+
+#[test]
+fn partial_worker_cache_serves_worker_covered_range() {
+    let mut info = mk_info(&["4.1.2"], &[]);
+    info.versions_complete = false;
+    info.covered_ranges.insert("^4.0.0".to_string());
+
+    assert!(!partial_worker_cache_needs_full_metadata(
+        &info,
+        &edge_for_range("shared", "^4.0.0")
+    ));
+}
+
+#[test]
+fn merging_partial_versions_drops_package_level_completeness() {
+    let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    let canonical = CanonicalKey::npm("merge-me");
+
+    let mut full = mk_info(&["2.0.0"], &[]);
+    full.trust_metadata_complete = true;
+    insert_or_merge_cached_package_info(&shared_cache, canonical.clone(), Arc::new(full));
+
+    let mut partial = mk_info(&["3.0.0"], &[]);
+    partial.versions_complete = false;
+    partial.covered_ranges.insert("^3.0.0".to_string());
+    let merged = insert_or_merge_cached_package_info(&shared_cache, canonical, Arc::new(partial));
+
+    assert!(!merged.versions_complete);
+    assert!(!merged.trust_metadata_complete);
+    assert!(merged.covered_ranges.contains("^3.0.0"));
+    assert!(
+        merged
+            .versions
+            .iter()
+            .any(|version| version.to_string() == "2.0.0")
+    );
+    assert!(
+        merged
+            .versions
+            .iter()
+            .any(|version| version.to_string() == "3.0.0")
+    );
 }
 
 #[test]
@@ -3863,7 +3934,130 @@ async fn fusion_streaming_worker_batch_waits_when_partial_cache_misses_edge_rang
         .collect();
     assert!(chalk_versions.contains("5.6.2"));
     assert!(chalk_versions.contains("4.1.2"));
+    for version in ["5.6.2", "4.1.2"] {
+        let package = result
+            .packages
+            .iter()
+            .find(|package| {
+                package.package.canonical_name() == "chalk"
+                    && package.version.to_string() == version
+            })
+            .expect("chalk version should be resolved");
+        assert!(
+            package.tarball_url.is_some(),
+            "chalk@{version} should keep tarball URL after merging partial metadata"
+        );
+        assert!(
+            package.integrity.is_some(),
+            "chalk@{version} should keep integrity after merging partial metadata"
+        );
+    }
     assert_eq!(result.stage_timing.dispatcher_rpc_count, 1);
+
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_streaming_worker_batch_refetches_full_metadata_for_late_peer_range() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let _env = ScopedEnvVars::set(&[
+        ("LPM_WORKER_RANGE_AWARE_BATCH", "1"),
+        ("LPM_WORKER_STREAMING_BATCH", "1"),
+    ]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut root_meta = metadata_json("proxy-peer-root", &[("shared-peer", "^5.0.0")]);
+    root_meta["versions"]["1.0.0"]["peerDependencies"] =
+        serde_json::json!({ "shared-peer": "^4.0.0" });
+    let streamed_shared = metadata_json_version("shared-peer", "5.0.0", &[]);
+    let mut full_shared = metadata_json_version("shared-peer", "5.0.0", &[]);
+    let shared_v4 = metadata_json_version("shared-peer", "4.0.0", &[]);
+    full_shared["versions"]["4.0.0"] = shared_v4["versions"]["4.0.0"].clone();
+    full_shared["time"]["4.0.0"] = shared_v4["time"]["4.0.0"].clone();
+    let body = [
+        serde_json::json!({
+            "name": "proxy-peer-root",
+            "metadata": root_meta,
+        })
+        .to_string(),
+        serde_json::json!({
+            "name": "shared-peer",
+            "metadata": streamed_shared,
+        })
+        .to_string(),
+    ]
+    .join("\n")
+        + "\n";
+    let full_shared_body = full_shared.to_string();
+    let server = tokio::spawn(async move {
+        for request_index in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            if request_index == 0 {
+                assert!(request.starts_with("POST /api/registry/batch-metadata "));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let header = format!("{:X}\r\n", body.len());
+                stream.write_all(header.as_bytes()).await.unwrap();
+                stream.write_all(body.as_bytes()).await.unwrap();
+                stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+                stream.flush().await.unwrap();
+            } else {
+                assert!(request.starts_with("GET /api/registry/shared-peer "));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    full_shared_body.len(),
+                    full_shared_body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        }
+    });
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(format!("http://{address}"))
+            .with_cache_dir(None),
+    );
+    let mut deps = HashMap::new();
+    deps.insert("proxy-peer-root".into(), "^1.0.0".into());
+
+    let result = resolve_greedy_fused_with_cache_options_policy_and_selected_events(
+        client,
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Proxy),
+        8,
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        true,
+        true,
+        ResolverPolicy::default(),
+        None,
+    )
+    .await
+    .expect(
+        "late peer range should refetch full metadata instead of trusting a pruned cache entry",
+    );
+
+    let shared_versions: std::collections::HashSet<_> = result
+        .packages
+        .iter()
+        .filter(|package| package.package.canonical_name() == "shared-peer")
+        .map(|package| package.version.to_string())
+        .collect();
+    assert!(shared_versions.contains("5.0.0"));
+    assert!(shared_versions.contains("4.0.0"));
+    assert_eq!(result.stage_timing.dispatcher_rpc_count, 2);
 
     server.await.unwrap();
 }

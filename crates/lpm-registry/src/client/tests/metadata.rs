@@ -1,5 +1,24 @@
 use super::*;
 
+fn test_metadata_json_version(name: &str, version: &str) -> String {
+    serde_json::json!({
+        "name": name,
+        "dist-tags": { "latest": version },
+        "versions": {
+            version: {
+                "name": name,
+                "version": version,
+                "dist": {
+                    "tarball": "https://example.com/pkg.tgz",
+                    "integrity": "sha512-test"
+                }
+            }
+        },
+        "time": { version: "2025-01-01T00:00:00.000Z" }
+    })
+    .to_string()
+}
+
 #[tokio::test]
 #[ignore = "requires network + auth — run with --ignored"]
 async fn fetch_package_metadata() {
@@ -571,6 +590,144 @@ async fn batch_metadata_deep_sends_range_aware_package_specs_when_present() {
 
     assert_eq!(result.len(), 1);
     assert_eq!(result[valid_name].name, valid_name);
+    assert!(
+        client.read_metadata_cache("npm:vite").is_none(),
+        "range-aware batch responses may be pruned and must not populate the full metadata cache"
+    );
+}
+
+#[tokio::test]
+async fn batch_metadata_range_aware_stream_does_not_cache_pruned_packuments() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let valid_name = "vite";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = vec![0u8; 4096];
+        let read = stream.read(&mut request).await.unwrap();
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.contains("\"rangeAware\":true"));
+
+        let valid_metadata: serde_json::Value =
+            serde_json::from_str(&test_metadata_json(valid_name)).expect("valid metadata json");
+        let body = format!(
+            "{}\n",
+            serde_json::json!({
+                "name": valid_name,
+                "metadata": valid_metadata,
+            })
+        );
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(body.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+
+    let (client, _tmp) = client_with_mock_server(&format!("http://{address}"));
+
+    let mut stream = client
+        .batch_metadata_deep_with_release_age_packages_and_package_specs_stream(
+            &["vite".to_string()],
+            &[],
+            false,
+            &[("vite".to_string(), "^5.0.0".to_string())],
+            None,
+        )
+        .await
+        .expect("range-aware stream should open");
+
+    let entry = stream
+        .next()
+        .await
+        .expect("range-aware stream entry should parse")
+        .expect("range-aware stream should yield metadata");
+
+    assert_eq!(entry.0, valid_name);
+    assert!(
+        stream
+            .next()
+            .await
+            .expect("range-aware stream should finish")
+            .is_none()
+    );
+    assert!(
+        client.read_metadata_cache("npm:vite").is_none(),
+        "range-aware streamed responses may be pruned and must not populate the full metadata cache"
+    );
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn batch_metadata_range_aware_ndjson_merges_duplicate_package_entries() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = vec![0u8; 4096];
+        let read = stream.read(&mut request).await.unwrap();
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.contains("\"rangeAware\":true"));
+
+        let chalk_5: serde_json::Value =
+            serde_json::from_str(&test_metadata_json_version("chalk", "5.6.2"))
+                .expect("valid metadata json");
+        let chalk_4: serde_json::Value =
+            serde_json::from_str(&test_metadata_json_version("chalk", "4.1.2"))
+                .expect("valid metadata json");
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::json!({ "name": "chalk", "metadata": chalk_5 }),
+            serde_json::json!({ "name": "chalk", "metadata": chalk_4 })
+        );
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(body.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+
+    let (client, _tmp) = client_with_mock_server(&format!("http://{address}"));
+    let result = client
+        .batch_metadata_deep_with_release_age_packages_and_package_specs(
+            &["chalk".to_string()],
+            &[],
+            false,
+            &[
+                ("chalk".to_string(), "^5.0.0".to_string()),
+                ("chalk".to_string(), "^4.0.0".to_string()),
+            ],
+            None,
+        )
+        .await
+        .expect("range-aware NDJSON batch should merge duplicate package entries");
+
+    let chalk = result
+        .get("chalk")
+        .expect("chalk metadata should be present");
+    assert!(chalk.versions.contains_key("5.6.2"));
+    assert!(chalk.versions.contains_key("4.1.2"));
+    assert_eq!(
+        chalk.dist_tags.get("latest").map(String::as_str),
+        Some("5.6.2")
+    );
+    assert!(
+        client.read_metadata_cache("npm:chalk").is_none(),
+        "range-aware duplicate entries are partial and should not populate the full metadata cache"
+    );
+
+    server.await.unwrap();
 }
 
 #[tokio::test]

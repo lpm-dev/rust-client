@@ -20,13 +20,19 @@ use super::prelude::*;
 pub(crate) fn parse_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
 ) -> CachedPackageInfo {
-    parse_metadata_to_cache_info_inner(metadata, false)
+    parse_metadata_to_cache_info_inner(metadata, false, true)
+}
+
+pub(crate) fn parse_partial_metadata_to_cache_info(
+    metadata: &lpm_registry::PackageMetadata,
+) -> CachedPackageInfo {
+    parse_metadata_to_cache_info_inner(metadata, false, false)
 }
 
 pub(crate) fn parse_full_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
 ) -> CachedPackageInfo {
-    parse_metadata_to_cache_info_inner(metadata, true)
+    parse_metadata_to_cache_info_inner(metadata, true, true)
 }
 
 pub(crate) fn merge_release_times_into_cache_info(
@@ -46,6 +52,7 @@ pub(crate) fn merge_release_times_into_cache_info(
 fn parse_metadata_to_cache_info_inner(
     metadata: &lpm_registry::PackageMetadata,
     trust_metadata_complete: bool,
+    versions_complete: bool,
 ) -> CachedPackageInfo {
     let version_count = metadata.versions.len();
     let mut dependency_entry_count = 0usize;
@@ -236,6 +243,8 @@ fn parse_metadata_to_cache_info_inner(
         modified: metadata.modified.clone(),
         modified_unix: metadata.modified.as_deref().and_then(parse_npm_time_unix),
         trust_metadata_complete,
+        versions_complete,
+        covered_ranges: HashSet::new(),
         versions,
         deps,
         peer_deps,

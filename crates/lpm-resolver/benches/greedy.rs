@@ -94,6 +94,8 @@ fn make_graph(n: usize) -> (SharedCache, HashMap<String, String>) {
             modified: None,
             modified_unix: None,
             trust_metadata_complete: false,
+            versions_complete: true,
+            covered_ranges: std::collections::HashSet::new(),
             versions,
             deps,
             peer_deps: HashMap::new(),

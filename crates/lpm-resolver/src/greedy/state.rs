@@ -668,6 +668,8 @@ mod tests {
             modified: None,
             modified_unix: None,
             trust_metadata_complete: false,
+            versions_complete: true,
+            covered_ranges: HashSet::new(),
             versions: vec![NpmVersion::parse("1.0.0").expect("valid version")],
             deps: HashMap::new(),
             peer_deps: HashMap::new(),

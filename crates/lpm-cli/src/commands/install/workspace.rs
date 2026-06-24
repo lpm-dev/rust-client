@@ -293,6 +293,8 @@ pub(super) fn workspace_member_cache_info(
         modified: Some("1970-01-01T00:00:00.000Z".to_string()),
         modified_unix: Some(0),
         trust_metadata_complete: true,
+        versions_complete: true,
+        covered_ranges: std::collections::HashSet::new(),
         versions: vec![version],
         deps: deps_by_version,
         peer_deps,

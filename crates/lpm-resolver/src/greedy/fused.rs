@@ -2,13 +2,13 @@ use super::edge::process_edge_with_preferred;
 use super::manifest::{
     FetchResult, FetchedMetadata, MetadataFetchCompletion, complete_metadata_fetch,
     ensure_policy_metadata_for_cached_manifest, fetch_metadata_for_resolver_with_trace_detail,
-    parse_fetched_metadata,
+    insert_or_merge_cached_package_info, parse_fetched_metadata, parse_partial_fetched_metadata,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
 use super::state::{ResolveState, selected_package_cardinality};
 use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version};
-use super::types::Edge;
+use super::types::{Edge, PeerRequirement};
 use crate::resolve::SelectedPackageEvent;
 use std::cell::Cell;
 
@@ -79,8 +79,11 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                 info: info_arc,
                 ..
             } = fetched;
-            self.shared_cache
-                .insert(canonical.clone(), info_arc.clone());
+            insert_or_merge_cached_package_info(
+                self.shared_cache,
+                canonical.clone(),
+                info_arc.clone(),
+            );
             self.dispatcher_rpc_count
                 .set(self.dispatcher_rpc_count.get() + 1);
             if let (Some(tx), Some(speculation)) = (self.spec_tx, speculation)
@@ -156,7 +159,11 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                         let FetchedMetadata {
                             speculation, info, ..
                         } = fetched;
-                        self.shared_cache.insert(canonical.clone(), info);
+                        insert_or_merge_cached_package_info(
+                            self.shared_cache,
+                            canonical.clone(),
+                            info,
+                        );
                         if let (Some(tx), Some(speculation)) = (self.spec_tx, speculation)
                             && tx.try_send((canonical.to_string(), speculation)).is_ok()
                         {
@@ -280,6 +287,47 @@ fn worker_package_names_from_specs(package_specs: &[(String, String)]) -> Vec<St
     names
 }
 
+fn covered_ranges_for_name(package_specs: &[(String, String)], name: &str) -> Vec<String> {
+    package_specs
+        .iter()
+        .filter(|(spec_name, _)| spec_name == name)
+        .map(|(_, range)| range.clone())
+        .collect()
+}
+
+fn extend_covered_ranges_from_metadata(
+    package_specs: &mut Vec<(String, String)>,
+    metadata: &lpm_registry::PackageMetadata,
+) {
+    for version in metadata.versions.values() {
+        for (name, range) in &version.dependencies {
+            push_covered_range(package_specs, name, range);
+        }
+        for (name, range) in &version.optional_dependencies {
+            push_covered_range(package_specs, name, range);
+        }
+    }
+}
+
+fn push_covered_range(package_specs: &mut Vec<(String, String)>, name: &str, range: &str) {
+    let (package_name, package_range) = crate::ranges::parse_npm_alias(range).map_or_else(
+        || (name.to_string(), range.to_string()),
+        |alias| (alias.target, alias.range),
+    );
+    if !matches!(
+        CanonicalKey::from_dep_name(&package_name),
+        CanonicalKey::Npm { .. }
+    ) {
+        return;
+    }
+    if package_specs.iter().any(|(existing_name, existing_range)| {
+        existing_name == &package_name && existing_range == &package_range
+    }) {
+        return;
+    }
+    package_specs.push((package_name, package_range));
+}
+
 fn worker_package_specs_from_parked_edges(
     candidates: &[(CanonicalKey, String)],
     parked: &AHashMap<CanonicalKey, Vec<Edge>>,
@@ -298,6 +346,94 @@ fn worker_package_specs_from_parked_edges(
         }
     }
     specs
+}
+
+async fn hydrate_partial_worker_peer_cache(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    shared_cache: &SharedCache,
+    policy: &ResolverPolicy,
+    peer_requirements: &[PeerRequirement],
+    trace_metadata_fetches: bool,
+) -> Result<u64, ResolveError> {
+    if peer_requirements.is_empty() {
+        return Ok(0);
+    }
+
+    let mut grouped: AHashMap<CanonicalKey, Vec<&PeerRequirement>> = AHashMap::new();
+    for req in peer_requirements {
+        grouped.entry(req.canonical.clone()).or_default().push(req);
+    }
+    let mut canonicals: Vec<CanonicalKey> = grouped.keys().cloned().collect();
+    canonicals.sort_by_key(|canonical| canonical.to_string());
+
+    let mut fetched_count = 0;
+    for canonical in canonicals {
+        let CanonicalKey::Npm { name } = &canonical else {
+            continue;
+        };
+        if !matches!(
+            route_table.route_for_package(name),
+            UpstreamRoute::LpmWorker
+        ) {
+            continue;
+        }
+        let Some(info) = shared_cache
+            .get(&canonical)
+            .map(|entry| entry.value().clone())
+        else {
+            continue;
+        };
+        let Some(reqs) = grouped.get(&canonical) else {
+            continue;
+        };
+        if cached_info_satisfies_peer_requirements(&info, reqs) {
+            continue;
+        }
+        let fetched = fetch_metadata_for_resolver_with_trace_detail(
+            client,
+            route_table,
+            &canonical,
+            policy,
+            false,
+            trace_metadata_fetches,
+        )
+        .await?;
+        shared_cache.insert(canonical, fetched.info);
+        fetched_count += 1;
+    }
+    Ok(fetched_count)
+}
+
+fn cached_info_satisfies_peer_requirements(
+    info: &CachedPackageInfo,
+    reqs: &[&PeerRequirement],
+) -> bool {
+    info.versions.iter().any(|version| {
+        reqs.iter().all(|req| req.range.satisfies(version))
+            && (info.platform.is_empty()
+                || info
+                    .platform
+                    .get(&version.to_string())
+                    .is_none_or(crate::provider::is_platform_compatible))
+    })
+}
+
+pub(super) fn partial_worker_cache_needs_full_metadata(
+    info: &CachedPackageInfo,
+    edge: &Edge,
+) -> bool {
+    if info.versions_complete {
+        return false;
+    }
+    if let Some(exact) = edge.range.exact_version() {
+        return !info.versions.contains(&exact);
+    }
+    !info.covered_ranges.contains(edge.range.raw())
+        || !info
+            .versions
+            .iter()
+            .any(|version| edge.range.satisfies(version))
 }
 
 /// Fused dispatcher: greedy resolver IS the fetch dispatcher. Replaces the
@@ -545,6 +681,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
         tokio::task::JoinSet::new();
     let mut worker_batch_stream = None;
+    let mut worker_batch_stream_package_specs: Vec<(String, String)> = Vec::new();
     let mut worker_stream_can_batch_waiting = false;
     let mut worker_stream_waiting: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
 
@@ -609,6 +746,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                 Ok(stream) => {
                     dispatcher_rpc_count += 1;
                     worker_batch_stream = Some(stream);
+                    worker_batch_stream_package_specs = worker_root_package_specs.clone();
                     worker_stream_can_batch_waiting = true;
                 }
                 Err(e) => {
@@ -647,6 +785,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                     // RPCs (not packages); record exactly 1 for the batch
                     // — keeps the metric semantics stable across arms.
                     dispatcher_rpc_count += 1;
+                    let mut batch_package_specs = worker_root_package_specs.clone();
+                    for meta in batch.values() {
+                        extend_covered_ranges_from_metadata(&mut batch_package_specs, meta);
+                    }
                     for (name, meta) in batch {
                         let canonical = crate::package::CanonicalKey::from_dep_name(&name);
                         if matches!(canonical, crate::package::CanonicalKey::Root) {
@@ -658,12 +800,20 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         ) {
                             continue;
                         }
-                        let fetched =
-                            parse_fetched_metadata(meta, spec_tx.is_some(), trace_metadata_fetches);
+                        let fetched = if worker_root_package_specs.is_empty() {
+                            parse_fetched_metadata(meta, spec_tx.is_some(), trace_metadata_fetches)
+                        } else {
+                            parse_partial_fetched_metadata(
+                                meta,
+                                spec_tx.is_some(),
+                                trace_metadata_fetches,
+                                covered_ranges_for_name(&batch_package_specs, &name),
+                            )
+                        };
                         let FetchedMetadata {
                             speculation, info, ..
                         } = fetched;
-                        shared_cache.insert(canonical.clone(), info);
+                        insert_or_merge_cached_package_info(&shared_cache, canonical.clone(), info);
                         if let (Some(tx), Some(speculation)) = (spec_tx.as_ref(), speculation)
                             && tx.try_send((canonical.to_string(), speculation)).is_ok()
                         {
@@ -698,22 +848,18 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
             // refcount bump on the Arc<CachedPackageInfo>. The shard
             // lock is released before `process_edge` mutates state.
             if let Some(info_arc) = shared_cache.get(&edge.canonical).map(|e| e.value().clone()) {
-                if worker_batch_stream.is_some()
-                    && !info_arc
-                        .versions
-                        .iter()
-                        .any(|version| edge.range.satisfies(version))
+                if range_aware_worker_batch
+                    && partial_worker_cache_needs_full_metadata(&info_arc, &edge)
+                    && let CanonicalKey::Npm { name } = &edge.canonical
                     && matches!(
-                        &edge.canonical,
-                        CanonicalKey::Npm { name }
-                            if matches!(
-                                route_table.route_for_package(name),
-                                UpstreamRoute::LpmWorker
-                            )
+                        route_table.route_for_package(name),
+                        UpstreamRoute::LpmWorker
                     )
                 {
+                    let worker_name = name.clone();
                     let canonical = edge.canonical.clone();
-                    if inflight.insert(canonical.clone()) && trace_metadata_fetches {
+                    let new_fetch = inflight.insert(canonical.clone());
+                    if new_fetch && trace_metadata_fetches {
                         state.work_stats.record_metadata_edge_miss(
                             &canonical,
                             &edge.range,
@@ -726,7 +872,21 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         }
                     }
                     parked.entry(canonical.clone()).or_default().push(edge);
-                    worker_stream_waiting.insert(canonical);
+                    if worker_batch_stream.is_some() {
+                        worker_stream_waiting.insert(canonical);
+                    } else if new_fetch {
+                        if !worker_batch_disabled.get() {
+                            worker_batch_candidates.push((canonical, worker_name));
+                        } else {
+                            spawn_metadata_fetch_job(
+                                &mut metadata_jobs,
+                                &metadata_dispatch,
+                                canonical,
+                                spec_tx.is_some(),
+                            );
+                            dispatcher_rpc_count += 1;
+                        }
+                    }
                     continue;
                 }
                 let info_arc = ensure_policy_metadata_for_cached_manifest(
@@ -821,6 +981,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                     Ok(stream) => {
                         dispatcher_rpc_count += 1;
                         worker_batch_stream = Some(stream);
+                        worker_batch_stream_package_specs = worker_package_specs.clone();
                         worker_stream_can_batch_waiting = false;
                         worker_stream_waiting.extend(
                             worker_batch_candidates
@@ -871,6 +1032,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                     Ok(batch) => {
                         dispatcher_rpc_count += 1;
                         let mut returned = AHashSet::with_capacity(batch.len());
+                        let mut batch_package_specs = worker_package_specs.clone();
+                        for meta in batch.values() {
+                            extend_covered_ranges_from_metadata(&mut batch_package_specs, meta);
+                        }
                         for (name, meta) in batch {
                             let canonical = crate::package::CanonicalKey::from_dep_name(&name);
                             if matches!(canonical, crate::package::CanonicalKey::Root) {
@@ -884,11 +1049,20 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                             }
                             returned.insert(canonical.clone());
                             inflight.remove(&canonical);
-                            let fetched = parse_fetched_metadata(
-                                meta,
-                                spec_tx.is_some(),
-                                trace_metadata_fetches,
-                            );
+                            let fetched = if worker_package_specs.is_empty() {
+                                parse_fetched_metadata(
+                                    meta,
+                                    spec_tx.is_some(),
+                                    trace_metadata_fetches,
+                                )
+                            } else {
+                                parse_partial_fetched_metadata(
+                                    meta,
+                                    spec_tx.is_some(),
+                                    trace_metadata_fetches,
+                                    covered_ranges_for_name(&batch_package_specs, &name),
+                                )
+                            };
                             let mut completion = MetadataFetchCompletion {
                                 shared_cache: &shared_cache,
                                 route_table: &route_table,
@@ -1015,10 +1189,17 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         {
                             worker_stream_waiting.remove(&canonical);
                             inflight.remove(&canonical);
-                            let fetched = parse_fetched_metadata(
+                            let covered_ranges =
+                                covered_ranges_for_name(&worker_batch_stream_package_specs, &name);
+                            extend_covered_ranges_from_metadata(
+                                &mut worker_batch_stream_package_specs,
+                                &meta,
+                            );
+                            let fetched = parse_partial_fetched_metadata(
                                 meta,
                                 spec_tx.is_some(),
                                 trace_metadata_fetches,
+                                covered_ranges,
                             );
                             let mut completion = MetadataFetchCompletion {
                                 shared_cache: &shared_cache,
@@ -1050,6 +1231,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
 
             if worker_stream_finished {
                 worker_batch_stream = None;
+                worker_batch_stream_package_specs.clear();
                 if !worker_stream_waiting.is_empty() {
                     let waiting_candidates: Vec<(CanonicalKey, String)> = worker_stream_waiting
                         .iter()
@@ -1079,6 +1261,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                                 Ok(stream) => {
                                     dispatcher_rpc_count += 1;
                                     worker_batch_stream = Some(stream);
+                                    worker_batch_stream_package_specs = worker_package_specs;
                                     worker_stream_can_batch_waiting = false;
                                     continue;
                                 }
@@ -1115,6 +1298,18 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                  (parked_keys={:?})",
                 parked.keys().collect::<Vec<_>>()
             );
+
+            if range_aware_worker_batch {
+                dispatcher_rpc_count += hydrate_partial_worker_peer_cache(
+                    &client,
+                    &route_table,
+                    &shared_cache,
+                    &policy,
+                    &state.peer_requirements,
+                    trace_metadata_fetches,
+                )
+                .await?;
+            }
 
             // Peer-drain pass. The fetch closure consults `shared_cache`
             // first (hot path — manifests for peer canonicals are usually
@@ -1166,8 +1361,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
                         )
                         .await?;
                         let info_arc = fetched.info;
-                        shared_cache.insert(canonical.clone(), info_arc.clone());
-                        Ok(info_arc)
+                        Ok(insert_or_merge_cached_package_info(
+                            &shared_cache,
+                            canonical.clone(),
+                            info_arc,
+                        ))
                     }
                 },
             )
