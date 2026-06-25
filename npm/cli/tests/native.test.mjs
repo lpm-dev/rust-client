@@ -31,6 +31,10 @@ test("published wrapper manifest stays dependency-free", () => {
   assert.equal(manifest.scripts?.install, undefined);
   assert.equal(manifest.scripts?.postinstall, "node scripts/install-binary.js");
   assert.ok(manifest.files.includes("scripts"));
+  assert.deepEqual(manifest.bin, {
+    lpm: "bin/lpm",
+    lpx: "bin/lpx",
+  });
   assert.deepEqual(Object.keys(manifest.optionalDependencies).sort(), [
     "@lpm-registry/cli-darwin-arm64",
     "@lpm-registry/cli-darwin-x64",
@@ -155,7 +159,7 @@ test("unsupported platforms fail before package resolution", () => {
 
 test("lpm wrapper forwards argv to LPM_BINARY_PATH", () => {
   const recorder = makeRecorderBinary();
-  const result = spawnSync(process.execPath, ["bin/lpm.js", "self-update", "--json"], {
+  const result = spawnSync(process.execPath, ["bin/lpm", "self-update", "--json"], {
     cwd: wrapperRoot,
     env: {
       ...process.env,
@@ -171,6 +175,40 @@ test("lpm wrapper forwards argv to LPM_BINARY_PATH", () => {
 });
 
 test("lpx wrapper runs custom LPM_BINARY_PATH through dlx", () => {
+  const recorder = makeRecorderBinary();
+  const result = spawnSync(process.execPath, ["bin/lpx", "cowsay", "hello"], {
+    cwd: wrapperRoot,
+    env: {
+      ...process.env,
+      LPM_BINARY_PATH: recorder.binaryPath,
+      LPM_RECORDER_OUTPUT: recorder.outputPath,
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(fs.readFileSync(recorder.outputPath, "utf8"));
+  assert.deepEqual(payload.argv, ["dlx", "cowsay", "hello"]);
+});
+
+test("legacy lpm.js wrapper still forwards argv to LPM_BINARY_PATH", () => {
+  const recorder = makeRecorderBinary();
+  const result = spawnSync(process.execPath, ["bin/lpm.js", "self-update", "--json"], {
+    cwd: wrapperRoot,
+    env: {
+      ...process.env,
+      LPM_BINARY_PATH: recorder.binaryPath,
+      LPM_RECORDER_OUTPUT: recorder.outputPath,
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(fs.readFileSync(recorder.outputPath, "utf8"));
+  assert.deepEqual(payload.argv, ["self-update", "--json"]);
+});
+
+test("legacy lpx.js wrapper still preserves dlx argv behavior", () => {
   const recorder = makeRecorderBinary();
   const result = spawnSync(process.execPath, ["bin/lpx.js", "cowsay", "hello"], {
     cwd: wrapperRoot,
@@ -212,11 +250,19 @@ test("postinstall validates and hard-links unix binaries into bin targets", () =
   );
   assert.equal(
     fs.statSync(path.join(tree.packageDir, "lpm")).ino,
-    fs.statSync(path.join(tree.wrapperRoot, "bin", "lpm.js")).ino,
+    fs.statSync(path.join(tree.wrapperRoot, "bin", "lpm")).ino,
   );
   assert.equal(
     fs.statSync(path.join(tree.packageDir, "lpx")).ino,
-    fs.statSync(path.join(tree.wrapperRoot, "bin", "lpx.js")).ino,
+    fs.statSync(path.join(tree.wrapperRoot, "bin", "lpx")).ino,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"),
+    tree.lpmShim,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpx.js"), "utf8"),
+    tree.lpxShim,
   );
 });
 
@@ -253,18 +299,20 @@ test("postinstall copies unix binaries when hard-linking is unavailable", () => 
     ],
   );
   assert.equal(
-    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"),
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm"), "utf8"),
     fs.readFileSync(path.join(tree.packageDir, "lpm"), "utf8"),
+  );
+  assert.equal(
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"),
+    tree.lpmShim,
   );
 });
 
-test("postinstall keeps windows JS shims and stages local exe binaries", () => {
+test("postinstall keeps windows extensionless JS shims and stages local exe binaries", () => {
   const tree = makeInstallTree("win32-x64", {
     version: "3.0.0",
     packageBinaryNames: ["lpm.exe", "lpx.exe"],
   });
-  const lpmShim = fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8");
-  const lpxShim = fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpx.js"), "utf8");
 
   const result = installNativeBinaries({
     wrapperRoot: tree.wrapperRoot,
@@ -283,8 +331,16 @@ test("postinstall keeps windows JS shims and stages local exe binaries", () => {
       ["lpx", "copy"],
     ],
   );
-  assert.equal(fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"), lpmShim);
-  assert.equal(fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpx.js"), "utf8"), lpxShim);
+  assert.equal(fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm"), "utf8"), tree.lpmShim);
+  assert.equal(fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpx"), "utf8"), tree.lpxShim);
+  assert.equal(
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"),
+    tree.legacyLpmShim,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpx.js"), "utf8"),
+    tree.legacyLpxShim,
+  );
   assert.equal(
     fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.exe"), "utf8"),
     fs.readFileSync(path.join(tree.packageDir, "lpm.exe"), "utf8"),
@@ -296,7 +352,6 @@ test("postinstall validation failure leaves JS shims in place", () => {
     version: "4.0.0",
     packageBinaryNames: ["lpm", "lpx"],
   });
-  const shim = fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8");
 
   assert.throws(
     () =>
@@ -311,7 +366,11 @@ test("postinstall validation failure leaves JS shims in place", () => {
     /reported version/,
   );
 
-  assert.equal(fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"), shim);
+  assert.equal(fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm"), "utf8"), tree.lpmShim);
+  assert.equal(
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"),
+    tree.legacyLpmShim,
+  );
 });
 
 function makePackageTree(platform) {
@@ -348,8 +407,14 @@ function makeInstallTree(platform, { version, packageBinaryNames }) {
     path.join(wrapperRoot, "package.json"),
     JSON.stringify({ name: "@lpm-registry/cli", version }),
   );
-  fs.writeFileSync(path.join(wrapperRoot, "bin", "lpm.js"), "#!/usr/bin/env node\n");
-  fs.writeFileSync(path.join(wrapperRoot, "bin", "lpx.js"), "#!/usr/bin/env node\n");
+  const lpmShim = "#!/usr/bin/env node\nimport { runNativeCommand } from './native.js';\nrunNativeCommand('lpm');\n";
+  const lpxShim = "#!/usr/bin/env node\nimport { runNativeCommand } from './native.js';\nrunNativeCommand('lpx');\n";
+  const legacyLpmShim = "#!/usr/bin/env node\nimport { runNativeCommand } from './native.js';\nrunNativeCommand('lpm');\n";
+  const legacyLpxShim = "#!/usr/bin/env node\nimport { runNativeCommand } from './native.js';\nrunNativeCommand('lpx');\n";
+  fs.writeFileSync(path.join(wrapperRoot, "bin", "lpm"), lpmShim);
+  fs.writeFileSync(path.join(wrapperRoot, "bin", "lpx"), lpxShim);
+  fs.writeFileSync(path.join(wrapperRoot, "bin", "lpm.js"), legacyLpmShim);
+  fs.writeFileSync(path.join(wrapperRoot, "bin", "lpx.js"), legacyLpxShim);
   fs.writeFileSync(
     path.join(packageDir, "package.json"),
     JSON.stringify({ name: `@lpm-registry/cli-${platform}`, version }),
@@ -358,7 +423,7 @@ function makeInstallTree(platform, { version, packageBinaryNames }) {
     fs.writeFileSync(path.join(packageDir, name), `native ${name} ${version}\n`);
     fs.chmodSync(path.join(packageDir, name), 0o755);
   }
-  return { root, wrapperRoot, packageDir };
+  return { root, wrapperRoot, packageDir, lpmShim, lpxShim, legacyLpmShim, legacyLpxShim };
 }
 
 function createVersionSpawn(stdout) {

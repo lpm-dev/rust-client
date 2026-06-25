@@ -17,8 +17,8 @@
     "private-packages"
   ],
   "bin": {
-    "lpm": "bin/lpm.js",
-    "lpx": "bin/lpx.js"
+    "lpm": "bin/lpm",
+    "lpx": "bin/lpx"
   },
   "files": [
     "bin",

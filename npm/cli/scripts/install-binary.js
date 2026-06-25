@@ -160,7 +160,7 @@ export function stageOptimizedBinary({ source, target, platform, fsModule = fs }
 }
 
 function optimizedTargetPath(wrapperRoot, platform, command) {
-  const filename = platform === "win32" ? `${command}.exe` : `${command}.js`;
+  const filename = platform === "win32" ? `${command}.exe` : command;
   return path.join(wrapperRoot, "bin", filename);
 }
 
