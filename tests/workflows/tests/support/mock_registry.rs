@@ -207,6 +207,45 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_npm_firewall_block(&self, name: &str, version: &str) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/npm-firewall/verdicts"))
+            .and(body_string_contains(format!("\"name\":\"{name}\"")))
+            .and(body_string_contains(format!("\"version\":\"{version}\"")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "requestId": "test-firewall-block",
+                "policyMode": "enforce",
+                "summary": {
+                    "total": 1,
+                    "allow": 0,
+                    "warn": 0,
+                    "block": 1,
+                    "unknown": 0,
+                    "matched": 1
+                },
+                "decisions": [{
+                    "decisionId": "dec_test_block",
+                    "name": name,
+                    "version": version,
+                    "action": "block",
+                    "verdict": "malicious",
+                    "reason": "test blocked package",
+                    "matchSource": "package",
+                    "matchedKey": format!("package:npm:{name}@{version}"),
+                    "policyMode": "enforce",
+                    "enqueueScan": false,
+                    "scannedAt": null,
+                    "scanRunId": null,
+                    "reportPath": null,
+                    "confidence": 1.0
+                }]
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a `/api/registry/-/whoami` endpoint returning a test user.
     pub async fn with_whoami(&self, username: &str, email: &str) -> &Self {
         Mock::given(method("GET"))
@@ -953,6 +992,17 @@ impl MockRegistry {
     /// Equivalent to `format!("{}{}", mock.url(), MockRegistry::tarball_path(name, version))`.
     pub fn tarball_url(&self, name: &str, version: &str) -> String {
         format!("{}{}", self.server.uri(), Self::tarball_path(name, version))
+    }
+
+    pub async fn tarball_request_count(&self, name: &str, version: &str) -> usize {
+        let path = Self::tarball_path(name, version);
+        self.server()
+            .received_requests()
+            .await
+            .expect("wiremock request log must be available")
+            .into_iter()
+            .filter(|request| request.url.path() == path)
+            .count()
     }
 
     pub fn register_tarball_bytes(&self, name: &str, version: &str, tarball_bytes: &[u8]) {

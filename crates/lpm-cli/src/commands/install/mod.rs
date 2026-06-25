@@ -49,7 +49,15 @@ mod workspace;
 use catalog::*;
 use fetch::*;
 use fetch_overlap::*;
-use firewall::*;
+use firewall::{
+    NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode, NpmFirewallPreflightJoin,
+    NpmFirewallPreflightStats, finish_npm_firewall_preflight, npm_firewall_chunk_size_from_env,
+    run_npm_firewall_preflight, spawn_chunked_npm_firewall_preflight,
+};
+pub(crate) use firewall::{
+    NpmFirewallMaterializationPackage, registry_materialization_route_is_public_npm,
+    run_npm_firewall_materialization_preflight,
+};
 use gitignore::*;
 pub use gitignore::{
     ensure_lpm_hoisted_gitignore, ensure_lpm_wrappers_gitignore, ensure_skills_gitignore,

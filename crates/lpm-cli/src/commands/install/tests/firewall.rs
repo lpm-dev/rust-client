@@ -1,4 +1,9 @@
 use super::*;
+use crate::commands::install::firewall::{
+    DEFAULT_NPM_FIREWALL_CHUNK_SIZE, NpmFirewallLookupMode, NpmFirewallPreflightStats,
+    npm_firewall_chunk_size, npm_firewall_package, npm_firewall_package_from_selected_event,
+};
+use crate::npm_firewall_config::NpmFirewallMode;
 
 fn package_with_source(name: &str, source: &str) -> InstallPackage {
     InstallPackage {
@@ -19,6 +24,10 @@ fn package_with_source(name: &str, source: &str) -> InstallPackage {
         tarball_url: Some("https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz".to_string()),
         metadata_checked_for_tarball: true,
     }
+}
+
+fn firewall_client() -> lpm_registry::RegistryClient {
+    lpm_registry::RegistryClient::new().with_base_url("https://lpm.dev")
 }
 
 #[test]
@@ -211,11 +220,13 @@ fn npm_firewall_stats_serializes_timing_and_verdict_counts() {
 #[test]
 fn npm_firewall_package_includes_public_npm_registry_package() {
     let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let client = firewall_client();
     let package = package_with_source("left-pad", "registry+https://registry.npmjs.org");
 
     let verdict_package = npm_firewall_package(
         &package,
         &route_table,
+        &client,
         NpmFirewallLookupMode::PackageAndIntegrity,
     )
     .expect("public npm package is eligible");
@@ -230,6 +241,7 @@ fn npm_firewall_package_includes_public_npm_registry_package() {
 
 #[test]
 fn npm_firewall_package_includes_public_npm_registry_from_npmrc() {
+    let client = firewall_client();
     for (registry, source) in [
         (
             "https://registry.npmjs.org/",
@@ -263,6 +275,7 @@ fn npm_firewall_package_includes_public_npm_registry_from_npmrc() {
         let verdict_package = npm_firewall_package(
             &package,
             &route_table,
+            &client,
             NpmFirewallLookupMode::PackageAndIntegrity,
         )
         .expect("explicit public npm registry is eligible");
@@ -273,13 +286,36 @@ fn npm_firewall_package_includes_public_npm_registry_from_npmrc() {
 }
 
 #[test]
+fn npm_firewall_package_includes_public_npm_routed_through_lpm_proxy() {
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let client = firewall_client();
+    let package = package_with_source("left-pad", "registry+https://lpm.dev");
+
+    let verdict_package = npm_firewall_package(
+        &package,
+        &route_table,
+        &client,
+        NpmFirewallLookupMode::PackageOnly,
+    )
+    .expect("public npm through lpm.dev proxy is eligible");
+
+    assert_eq!(verdict_package.name, "left-pad");
+    assert_eq!(verdict_package.version, "1.0.0");
+}
+
+#[test]
 fn npm_firewall_package_can_omit_integrity_for_package_only_lookup() {
     let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let client = firewall_client();
     let package = package_with_source("left-pad", "registry+https://registry.npmjs.org");
 
-    let verdict_package =
-        npm_firewall_package(&package, &route_table, NpmFirewallLookupMode::PackageOnly)
-            .expect("public npm package is eligible");
+    let verdict_package = npm_firewall_package(
+        &package,
+        &route_table,
+        &client,
+        NpmFirewallLookupMode::PackageOnly,
+    )
+    .expect("public npm package is eligible");
 
     assert_eq!(verdict_package.name, "left-pad");
     assert_eq!(verdict_package.integrity.as_deref(), None);
@@ -288,12 +324,31 @@ fn npm_firewall_package_can_omit_integrity_for_package_only_lookup() {
 #[test]
 fn npm_firewall_package_skips_custom_registry_package() {
     let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let client = firewall_client();
     let package = package_with_source("private-pkg", "registry+https://registry.internal.test");
 
     assert!(
         npm_firewall_package(
             &package,
             &route_table,
+            &client,
+            NpmFirewallLookupMode::PackageAndIntegrity
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn npm_firewall_package_skips_lpm_same_origin_custom_registry_package() {
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let client = firewall_client();
+    let package = package_with_source("private-pkg", "registry+https://lpm.dev/private-registry");
+
+    assert!(
+        npm_firewall_package(
+            &package,
+            &route_table,
+            &client,
             NpmFirewallLookupMode::PackageAndIntegrity
         )
         .is_none()
@@ -303,12 +358,14 @@ fn npm_firewall_package_skips_custom_registry_package() {
 #[test]
 fn npm_firewall_package_skips_lpm_package() {
     let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let client = firewall_client();
     let package = package_with_source("@lpm.dev/private", "registry+https://lpm.dev");
 
     assert!(
         npm_firewall_package(
             &package,
             &route_table,
+            &client,
             NpmFirewallLookupMode::PackageAndIntegrity
         )
         .is_none()
@@ -318,6 +375,7 @@ fn npm_firewall_package_skips_lpm_package() {
 #[test]
 fn npm_firewall_package_from_selected_event_uses_package_only_lookup() {
     let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let client = firewall_client();
     let event = lpm_resolver::SelectedPackageEvent {
         name: "left-pad".to_string(),
         version: "1.0.0".to_string(),
@@ -331,6 +389,7 @@ fn npm_firewall_package_from_selected_event_uses_package_only_lookup() {
     let verdict_package = npm_firewall_package_from_selected_event(
         &event,
         &route_table,
+        &client,
         NpmFirewallLookupMode::PackageOnly,
     )
     .expect("public npm package is eligible");
@@ -342,6 +401,7 @@ fn npm_firewall_package_from_selected_event_uses_package_only_lookup() {
 
 #[test]
 fn npm_firewall_package_from_selected_event_includes_public_npm_registry_from_npmrc() {
+    let client = firewall_client();
     for registry in [
         "https://registry.npmjs.org/",
         "https://registry.npmjs.org:443/",
@@ -368,6 +428,7 @@ fn npm_firewall_package_from_selected_event_includes_public_npm_registry_from_np
         let verdict_package = npm_firewall_package_from_selected_event(
             &event,
             &route_table,
+            &client,
             NpmFirewallLookupMode::PackageOnly,
         )
         .expect("explicit public npm registry is eligible");
@@ -380,6 +441,7 @@ fn npm_firewall_package_from_selected_event_includes_public_npm_registry_from_np
 #[test]
 fn npm_firewall_package_from_selected_event_skips_incompatible_platform_package() {
     let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let client = firewall_client();
     let event = lpm_resolver::SelectedPackageEvent {
         name: "left-pad".to_string(),
         version: "1.0.0".to_string(),
@@ -398,6 +460,7 @@ fn npm_firewall_package_from_selected_event_skips_incompatible_platform_package(
         npm_firewall_package_from_selected_event(
             &event,
             &route_table,
+            &client,
             NpmFirewallLookupMode::PackageAndIntegrity
         )
         .is_none()

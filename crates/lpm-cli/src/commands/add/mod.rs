@@ -10,6 +10,10 @@ mod target;
 
 pub use security::print_security_warnings;
 
+use crate::commands::install::{
+    NpmFirewallMaterializationPackage, registry_materialization_route_is_public_npm,
+    run_npm_firewall_materialization_preflight,
+};
 use crate::prompt::prompt_err;
 use crate::{install_ui, output};
 use conflict::{ConflictAction, handle_file_conflict};
@@ -157,6 +161,32 @@ pub async fn run(
     let ver_meta = metadata
         .version(&version)
         .ok_or_else(|| LpmError::NotFound(format!("version {version} not found")))?;
+    let integrity = ver_meta.integrity_or_shasum();
+    let target_route_name = target.route_name();
+    let firewall_packages = match &target {
+        AddTarget::Npm { .. }
+            if registry_materialization_route_is_public_npm(
+                &route_table,
+                client,
+                &target_route_name,
+            ) =>
+        {
+            vec![NpmFirewallMaterializationPackage::new(
+                &metadata.name,
+                &version,
+                integrity.as_deref(),
+                metadata.time.get(&version).map(String::as_str),
+            )]
+        }
+        AddTarget::Npm { .. } | AddTarget::Lpm(_) => Vec::new(),
+    };
+    let firewall_json = run_npm_firewall_materialization_preflight(
+        client,
+        project_dir,
+        &firewall_packages,
+        json_output,
+    )
+    .await?;
 
     if !json_output {
         install_ui::phase(&format!(
@@ -185,7 +215,7 @@ pub async fn run(
     // SHA-512 hash already computed during download. Slow path: stream-
     // verify from the temp file (covers non-sha512 expected values).
     // Mirrors install.rs:8156-8170.
-    if let Some(integrity) = ver_meta.integrity_or_shasum() {
+    if let Some(integrity) = integrity {
         let integrity = integrity.as_ref();
         if downloaded.sri != integrity
             && let Err(e) = lpm_extractor::verify_integrity_file(downloaded.file.path(), integrity)
@@ -843,7 +873,7 @@ pub async fn run(
 
     // Output.
     if json_output {
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "success": true,
             "package": {
                 "name": target.json_name(),
@@ -867,6 +897,9 @@ pub async fn run(
             "warnings": [],
             "errors": [],
         });
+        if let Some(firewall_json) = firewall_json {
+            json["firewall"] = firewall_json;
+        }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         if ver_meta.has_security_issues() {

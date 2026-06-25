@@ -12,6 +12,44 @@ const ENV_EXPERIMENT_NPM_FIREWALL_CHUNK_SIZE: &str = "LPM_EXPERIMENT_NPM_FIREWAL
 pub(super) const DEFAULT_NPM_FIREWALL_CHUNK_SIZE: usize = 64;
 const NPM_FIREWALL_OFFLINE_HINT: &str = "npm firewall verdict preflight requires network access; set [firewall].mode = \"off\" or run online";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NpmFirewallMaterializationPackage {
+    name: String,
+    version: String,
+    integrity: Option<String>,
+    published_at: Option<String>,
+}
+
+impl NpmFirewallMaterializationPackage {
+    pub(crate) fn new(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        integrity: Option<&str>,
+        published_at: Option<&str>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            integrity: integrity.map(str::to_string),
+            published_at: published_at.map(str::to_string),
+        }
+    }
+
+    fn to_batch_package(&self, lookup_mode: NpmFirewallLookupMode) -> NpmFirewallBatchPackage {
+        NpmFirewallBatchPackage {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            integrity: lookup_mode
+                .include_integrity()
+                .then(|| self.integrity.clone())
+                .flatten(),
+            published_at: self.published_at.clone(),
+        }
+    }
+}
+
+pub(crate) type NpmFirewallMaterializationJson = Option<serde_json::Value>;
+
 impl NpmFirewallMode {
     pub(super) fn auth_posture(self) -> AuthPosture {
         match self {
@@ -414,8 +452,13 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
             }
             stats.offline_skipped = true;
             while let Some(event) = selected_rx.recv().await {
-                if npm_firewall_package_from_selected_event(&event, &route_table, lookup_mode)
-                    .is_some()
+                if npm_firewall_package_from_selected_event(
+                    &event,
+                    &route_table,
+                    client.as_ref(),
+                    lookup_mode,
+                )
+                .is_some()
                 {
                     stats.checked_count = stats.checked_count.saturating_add(1);
                 }
@@ -445,6 +488,7 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                                 &mut chunk,
                                 event,
                                 &route_table,
+                                client.as_ref(),
                                 lookup_mode,
                             );
                             if chunk.len() >= chunk_size {
@@ -517,10 +561,11 @@ fn push_firewall_chunk_event(
     chunk: &mut FirewallSelectedChunk,
     event: lpm_resolver::SelectedPackageEvent,
     route_table: &RouteTable,
+    client: &RegistryClient,
     lookup_mode: NpmFirewallLookupMode,
 ) {
     if let Some(verdict_package) =
-        npm_firewall_package_from_selected_event(&event, route_table, lookup_mode)
+        npm_firewall_package_from_selected_event(&event, route_table, client, lookup_mode)
     {
         chunk.verdict_packages.push(verdict_package);
     }
@@ -755,7 +800,7 @@ pub(super) fn finish_npm_firewall_preflight(
     if matches!(stats.mode, NpmFirewallMode::Report) {
         if !json_output && (blocked_count > 0 || warned_count > 0) {
             output::warn(&format!(
-                "npm firewall report found {} blocked and {} warned package(s); install continues because report mode is active.",
+                "npm firewall report found {} blocked and {} warned package(s); command continues because report mode is active.",
                 blocked_count, warned_count
             ));
             print_firewall_decisions(&blocked);
@@ -798,7 +843,8 @@ pub(super) async fn run_npm_firewall_preflight(
     offline: bool,
     json_output: bool,
 ) -> Result<NpmFirewallPreflightStats, LpmError> {
-    let verdict_packages = npm_firewall_packages(packages, route_table, lookup_mode);
+    let verdict_packages =
+        npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
     let result = request_npm_firewall_preflight(
         mode,
         lookup_mode,
@@ -813,11 +859,14 @@ pub(super) async fn run_npm_firewall_preflight(
 pub(super) fn npm_firewall_packages(
     packages: &[InstallPackage],
     route_table: &RouteTable,
+    client: &RegistryClient,
     lookup_mode: NpmFirewallLookupMode,
 ) -> Vec<NpmFirewallBatchPackage> {
     let mut verdict_packages = Vec::with_capacity(packages.len());
     for package in packages {
-        if let Some(verdict_package) = npm_firewall_package(package, route_table, lookup_mode) {
+        if let Some(verdict_package) =
+            npm_firewall_package(package, route_table, client, lookup_mode)
+        {
             verdict_packages.push(verdict_package);
         }
     }
@@ -827,6 +876,7 @@ pub(super) fn npm_firewall_packages(
 pub(super) fn npm_firewall_package_from_selected_event(
     event: &lpm_resolver::SelectedPackageEvent,
     route_table: &RouteTable,
+    client: &RegistryClient,
     lookup_mode: NpmFirewallLookupMode,
 ) -> Option<NpmFirewallBatchPackage> {
     if event.is_lpm {
@@ -839,7 +889,7 @@ pub(super) fn npm_firewall_package_from_selected_event(
     {
         return None;
     }
-    if !route_is_public_npm(route_table, &event.name) {
+    if !route_is_public_npm(route_table, client, &event.name) {
         return None;
     }
     Some(NpmFirewallBatchPackage {
@@ -856,12 +906,18 @@ pub(super) fn npm_firewall_package_from_selected_event(
 pub(super) fn npm_firewall_package(
     package: &InstallPackage,
     _route_table: &RouteTable,
+    client: &RegistryClient,
     lookup_mode: NpmFirewallLookupMode,
 ) -> Option<NpmFirewallBatchPackage> {
+    if package.is_lpm || lpm_common::package_name::is_lpm_package(&package.name) {
+        return None;
+    }
     let Ok(lpm_lockfile::Source::Registry { url }) = package.source_kind() else {
         return None;
     };
-    if !crate::npm_public_source::is_public_npm_origin(&url) {
+    if !crate::npm_public_source::is_public_npm_origin(&url)
+        && !crate::npm_public_source::is_lpm_registry_origin(&url, client)
+    {
         return None;
     }
     Some(NpmFirewallBatchPackage {
@@ -875,14 +931,102 @@ pub(super) fn npm_firewall_package(
     })
 }
 
-fn route_is_public_npm(route_table: &RouteTable, name: &str) -> bool {
+fn route_is_public_npm(route_table: &RouteTable, client: &RegistryClient, name: &str) -> bool {
+    if lpm_common::package_name::is_lpm_package(name) {
+        return false;
+    }
     match route_table.route_for_package(name) {
-        UpstreamRoute::NpmDirect => true,
+        UpstreamRoute::NpmDirect | UpstreamRoute::LpmWorker => true,
         UpstreamRoute::Custom { target, .. } => {
             crate::npm_public_source::is_public_npm_origin(&target.base_url)
+                || crate::npm_public_source::is_lpm_registry_origin(&target.base_url, client)
         }
-        UpstreamRoute::LpmWorker => false,
     }
+}
+
+pub(crate) fn registry_materialization_route_is_public_npm(
+    route_table: &RouteTable,
+    client: &RegistryClient,
+    name: &str,
+) -> bool {
+    if lpm_common::package_name::is_lpm_package(name) {
+        return false;
+    }
+    match route_table.route_for_package(name) {
+        UpstreamRoute::NpmDirect | UpstreamRoute::LpmWorker => true,
+        UpstreamRoute::Custom { target, .. } => {
+            crate::npm_public_source::is_public_npm_origin(&target.base_url)
+                || crate::npm_public_source::is_lpm_registry_origin(&target.base_url, client)
+        }
+    }
+}
+
+pub(crate) async fn run_npm_firewall_materialization_preflight(
+    client: &RegistryClient,
+    project_dir: &Path,
+    packages: &[NpmFirewallMaterializationPackage],
+    json_output: bool,
+) -> Result<NpmFirewallMaterializationJson, LpmError> {
+    let global_config = crate::commands::config::GlobalConfig::load_checked()?;
+    let mode =
+        crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
+    let lookup_mode = NpmFirewallLookupMode::from_env();
+    let mut verdict_packages = Vec::with_capacity(packages.len());
+    for package in packages {
+        verdict_packages.push(package.to_batch_package(lookup_mode));
+    }
+    let result = request_npm_firewall_preflight(
+        mode,
+        lookup_mode,
+        Arc::new(client.clone_with_config()),
+        verdict_packages,
+        false,
+    )
+    .await?;
+    let firewall_json = npm_firewall_materialization_json(&result);
+    finish_npm_firewall_preflight(result, json_output).map(|_| firewall_json)
+}
+
+fn npm_firewall_materialization_json(
+    result: &NpmFirewallPreflightResult,
+) -> NpmFirewallMaterializationJson {
+    if !result.stats.mode.is_enabled() {
+        return None;
+    }
+
+    let mut json = result.stats.to_json();
+    if let Some(report_error) = &result.report_error {
+        json["report_error"] = serde_json::Value::String(report_error.clone());
+    }
+    if !result.decisions.is_empty() {
+        json["decisions"] = serde_json::Value::Array(
+            result
+                .decisions
+                .iter()
+                .map(npm_firewall_decision_json)
+                .collect(),
+        );
+    }
+    Some(json)
+}
+
+fn npm_firewall_decision_json(decision: &NpmFirewallDecision) -> serde_json::Value {
+    serde_json::json!({
+        "decision_id": &decision.decision_id,
+        "name": &decision.name,
+        "version": &decision.version,
+        "action": decision.action.as_str(),
+        "verdict": &decision.verdict,
+        "reason": &decision.reason,
+        "match_source": &decision.match_source,
+        "matched_key": &decision.matched_key,
+        "policy_mode": &decision.policy_mode,
+        "enqueue_scan": decision.enqueue_scan,
+        "scanned_at": &decision.scanned_at,
+        "scan_run_id": &decision.scan_run_id,
+        "report_path": &decision.report_path,
+        "confidence": decision.confidence,
+    })
 }
 
 fn print_firewall_decisions(decisions: &[&NpmFirewallDecision]) {

@@ -42,23 +42,38 @@ pub(crate) fn is_public_npm_origin(url: &str) -> bool {
     })
 }
 
-fn is_lpm_worker_origin(url: &str) -> bool {
+pub(crate) fn is_lpm_worker_origin(url: &str) -> bool {
     let lower = url.trim_end_matches('/').to_ascii_lowercase();
     matches!(lower.as_str(), "https://lpm.dev")
 }
 
-fn is_lpm_registry_origin(url: &str, client: &lpm_registry::RegistryClient) -> bool {
-    is_lpm_worker_origin(url) || same_origin(url, client.base_url())
+pub(crate) fn is_lpm_registry_origin(url: &str, client: &lpm_registry::RegistryClient) -> bool {
+    let Ok(candidate) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    if candidate.query().is_some() || candidate.fragment().is_some() {
+        return false;
+    }
+    if is_lpm_worker_origin(candidate.as_str()) {
+        return true;
+    }
+
+    let Ok(base) = reqwest::Url::parse(client.base_url().trim()) else {
+        return false;
+    };
+    if candidate.origin().ascii_serialization() != base.origin().ascii_serialization() {
+        return false;
+    }
+
+    is_root_path(candidate.path()) || is_lpm_npm_proxy_registry_path(candidate.path())
 }
 
-fn same_origin(left: &str, right: &str) -> bool {
-    let Ok(left) = reqwest::Url::parse(left) else {
-        return false;
-    };
-    let Ok(right) = reqwest::Url::parse(right) else {
-        return false;
-    };
-    left.origin().ascii_serialization() == right.origin().ascii_serialization()
+fn is_root_path(path: &str) -> bool {
+    path.trim_end_matches('/').is_empty()
+}
+
+fn is_lpm_npm_proxy_registry_path(path: &str) -> bool {
+    path.trim_end_matches('/') == "/api/registry"
 }
 
 #[cfg(test)]
@@ -117,14 +132,33 @@ mod tests {
 
     #[test]
     fn lpm_registry_source_recognises_current_base_url_origin() {
-        let client =
-            lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:4873/api/registry");
+        let client = lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:4873");
         assert!(is_lpm_registry_origin("http://127.0.0.1:4873", &client));
         assert!(is_lpm_registry_origin(
             "http://127.0.0.1:4873/api/registry",
             &client,
         ));
+        assert!(is_lpm_registry_origin(
+            "http://127.0.0.1:4873/api/registry/",
+            &client,
+        ));
         assert!(!is_lpm_registry_origin("http://127.0.0.1:4874", &client,));
+    }
+
+    #[test]
+    fn lpm_registry_source_rejects_same_origin_custom_registry_paths() {
+        let client = lpm_registry::RegistryClient::new().with_base_url("https://lpm.dev");
+        for registry in [
+            "https://lpm.dev/private-registry",
+            "https://lpm.dev/api/registry-private",
+            "https://lpm.dev/api/registry?tenant=private",
+            "https://lpm.dev/api/registry#private",
+        ] {
+            assert!(
+                !is_lpm_registry_origin(registry, &client),
+                "{registry} must not be treated as the lpm.dev npm proxy"
+            );
+        }
     }
 
     #[test]
@@ -146,8 +180,8 @@ mod tests {
     fn configured_lpm_registry_source_with_tarball_uses_proxy_metadata() {
         let client = lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:4873");
         let lockfile = lockfile_with_source(
-            "registry+http://127.0.0.1:4873",
-            Some("http://127.0.0.1:4873/tarballs/ms/-/ms-2.1.3.tgz"),
+            "registry+http://127.0.0.1:4873/api/registry",
+            Some("http://127.0.0.1:4873/api/registry/tarballs/ms/-/ms-2.1.3.tgz"),
         );
         assert_eq!(
             lockfile_npm_metadata_source(Some(&lockfile), "ms", &client),
