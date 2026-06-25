@@ -52,11 +52,12 @@ use fetch_overlap::*;
 use firewall::{
     NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode, NpmFirewallPreflightJoin,
     NpmFirewallPreflightStats, finish_npm_firewall_preflight, npm_firewall_chunk_size_from_env,
-    run_npm_firewall_preflight, spawn_chunked_npm_firewall_preflight,
+    npm_firewall_has_packages, run_npm_firewall_preflight, spawn_chunked_npm_firewall_preflight,
 };
 pub(crate) use firewall::{
-    NpmFirewallMaterializationPackage, registry_materialization_route_is_public_npm,
-    run_npm_firewall_materialization_preflight,
+    NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,
+    registry_materialization_route_is_public_npm,
+    run_prepared_npm_firewall_materialization_preflight,
 };
 use gitignore::*;
 pub use gitignore::{
@@ -3091,10 +3092,21 @@ async fn run_with_options_under_store_lock(
                     // need their own "Resolved in Xms" beat — the count is
                     // the signal, the timing lands in the verbose footer.
                     let reported_install_count = requested_add_count.unwrap_or(packages.len());
-                    install_ui::phase(&format!(
+                    let firewall_active = npm_firewall_mode.is_enabled()
+                        && npm_firewall_has_packages(
+                            &packages,
+                            &route_table,
+                            arc_client.as_ref(),
+                            npm_firewall_lookup_mode,
+                        );
+                    let install_message = format!(
                         "Installing {} {}",
                         reported_install_count.to_string().bold(),
                         install_ui::packages_word(reported_install_count),
+                    );
+                    install_ui::phase(&install_ui::with_firewall_badge(
+                        install_message,
+                        firewall_active,
                     ));
                     //surface best-effort peer-conflict reports as
                     // warnings so the user knows which transitive

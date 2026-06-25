@@ -50,6 +50,18 @@ impl NpmFirewallMaterializationPackage {
 
 pub(crate) type NpmFirewallMaterializationJson = Option<serde_json::Value>;
 
+pub(crate) struct NpmFirewallMaterializationPreflight {
+    mode: NpmFirewallMode,
+    lookup_mode: NpmFirewallLookupMode,
+    verdict_packages: Vec<NpmFirewallBatchPackage>,
+}
+
+impl NpmFirewallMaterializationPreflight {
+    pub(crate) fn is_active(&self) -> bool {
+        self.mode.is_enabled() && !self.verdict_packages.is_empty()
+    }
+}
+
 impl NpmFirewallMode {
     pub(super) fn auth_posture(self) -> AuthPosture {
         match self {
@@ -873,6 +885,17 @@ pub(super) fn npm_firewall_packages(
     verdict_packages
 }
 
+pub(super) fn npm_firewall_has_packages(
+    packages: &[InstallPackage],
+    route_table: &RouteTable,
+    client: &RegistryClient,
+    lookup_mode: NpmFirewallLookupMode,
+) -> bool {
+    packages
+        .iter()
+        .any(|package| npm_firewall_package(package, route_table, client, lookup_mode).is_some())
+}
+
 pub(super) fn npm_firewall_package_from_selected_event(
     event: &lpm_resolver::SelectedPackageEvent,
     route_table: &RouteTable,
@@ -910,6 +933,9 @@ pub(super) fn npm_firewall_package(
     lookup_mode: NpmFirewallLookupMode,
 ) -> Option<NpmFirewallBatchPackage> {
     if package.is_lpm || lpm_common::package_name::is_lpm_package(&package.name) {
+        return None;
+    }
+    if !package_platform_compatible(package) {
         return None;
     }
     let Ok(lpm_lockfile::Source::Registry { url }) = package.source_kind() else {
@@ -961,12 +987,11 @@ pub(crate) fn registry_materialization_route_is_public_npm(
     }
 }
 
-pub(crate) async fn run_npm_firewall_materialization_preflight(
-    client: &RegistryClient,
+pub(crate) fn prepare_npm_firewall_materialization_preflight(
     project_dir: &Path,
     packages: &[NpmFirewallMaterializationPackage],
     json_output: bool,
-) -> Result<NpmFirewallMaterializationJson, LpmError> {
+) -> Result<NpmFirewallMaterializationPreflight, LpmError> {
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     let mode =
         crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
@@ -975,11 +1000,23 @@ pub(crate) async fn run_npm_firewall_materialization_preflight(
     for package in packages {
         verdict_packages.push(package.to_batch_package(lookup_mode));
     }
-    let result = request_npm_firewall_preflight(
+    Ok(NpmFirewallMaterializationPreflight {
         mode,
         lookup_mode,
-        Arc::new(client.clone_with_config()),
         verdict_packages,
+    })
+}
+
+pub(crate) async fn run_prepared_npm_firewall_materialization_preflight(
+    client: &RegistryClient,
+    preflight: NpmFirewallMaterializationPreflight,
+    json_output: bool,
+) -> Result<NpmFirewallMaterializationJson, LpmError> {
+    let result = request_npm_firewall_preflight(
+        preflight.mode,
+        preflight.lookup_mode,
+        Arc::new(client.clone_with_config()),
+        preflight.verdict_packages,
         false,
     )
     .await?;

@@ -1,6 +1,7 @@
 use crate::commands::install::{
-    NpmFirewallMaterializationPackage, registry_materialization_route_is_public_npm,
-    run_npm_firewall_materialization_preflight,
+    NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,
+    registry_materialization_route_is_public_npm,
+    run_prepared_npm_firewall_materialization_preflight,
 };
 use crate::commands::registry_reads::{
     RoutedPackageRef, fetch_routed_package_metadata, normalize_package_version_input,
@@ -72,17 +73,26 @@ pub async fn run(
         }
         _ => Vec::new(),
     };
-    let firewall_json = run_npm_firewall_materialization_preflight(
-        &context.client,
+    let firewall_preflight = prepare_npm_firewall_materialization_preflight(
         project_dir,
         &firewall_packages,
         json_output,
-    )
-    .await?;
+    )?;
 
     if !json_output {
-        install_ui::phase(&format!("Downloading {package_name}@{version_key}"));
+        let download_message = format!("Downloading {package_name}@{version_key}");
+        install_ui::phase(&install_ui::with_firewall_badge(
+            download_message,
+            firewall_preflight.is_active(),
+        ));
     }
+
+    let firewall_json = run_prepared_npm_firewall_materialization_preflight(
+        &context.client,
+        firewall_preflight,
+        json_output,
+    )
+    .await?;
 
     let downloaded = context
         .client

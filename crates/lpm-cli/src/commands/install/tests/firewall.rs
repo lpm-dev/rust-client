@@ -373,6 +373,28 @@ fn npm_firewall_package_skips_lpm_package() {
 }
 
 #[test]
+fn npm_firewall_package_skips_incompatible_platform_package() {
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let client = firewall_client();
+    let mut package = package_with_source("left-pad", "registry+https://registry.npmjs.org");
+    package.platform = Some(lpm_resolver::PlatformMeta {
+        os: vec!["definitely-not-this-os".to_string()],
+        cpu: Vec::new(),
+        libc: Vec::new(),
+    });
+
+    assert!(
+        npm_firewall_package(
+            &package,
+            &route_table,
+            &client,
+            NpmFirewallLookupMode::PackageAndIntegrity
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn npm_firewall_package_from_selected_event_uses_package_only_lookup() {
     let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
     let client = firewall_client();

@@ -3,7 +3,7 @@ mod support;
 use lpm_common::LpmRoot;
 use std::time::{Duration, SystemTime};
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry, write_npm_firewall_global_config};
 
 fn seed_dlx_cache(
     project: &TempProject,
@@ -277,6 +277,43 @@ async fn dlx_bare_package_uses_project_lockfile_version_before_registry_latest()
     assert!(
         stderr.contains("sha512-"),
         "dlx should print the lockfile-selected package integrity; stderr:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn dlx_cache_install_shows_firewall_active_badge_when_public_npm_verdicts_are_checked() {
+    let project = TempProject::empty(r#"{"name":"dlx-firewall","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mount_published_dlx_tool(
+        &mock,
+        "dlx-firewall-tool",
+        "1.0.0",
+        &iso8601_n_secs_ago(172_800),
+    )
+    .await;
+    mock.with_npm_firewall_block("dlx-firewall-tool", "1.0.0")
+        .await;
+    write_npm_firewall_global_config(&project, "report");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["dlx", "dlx-firewall-tool@1.0.0"])
+        .output()
+        .expect("failed to run lpm dlx with firewall report");
+
+    assert!(
+        output.status.success(),
+        "report-mode firewall dlx must continue\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Installing 1 package - 🔥 LPM Firewall active"),
+        "firewall-active dlx cache install must show the badge; got:\n{combined}"
     );
 }
 

@@ -246,6 +246,10 @@ async fn fetch_firewall_enforce_blocks_public_npm_lockfile_package_before_tarbal
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
+        combined.contains("Fetching 1 package(s) from lpm.lock - 🔥 LPM Firewall active"),
+        "firewall-active fetch must show the badge; got:\n{combined}"
+    );
+    assert!(
         combined.contains("blocked by LPM npm firewall"),
         "error must name the firewall block; got:\n{combined}"
     );

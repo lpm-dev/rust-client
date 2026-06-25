@@ -319,6 +319,10 @@ async fn download_firewall_enforce_blocks_public_npm_package_before_tarball_fetc
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
+        combined.contains("Downloading blocked-download@1.0.0 - 🔥 LPM Firewall active"),
+        "firewall-active download must show the badge; got:\n{combined}"
+    );
+    assert!(
         combined.contains("blocked by LPM npm firewall"),
         "error must name the firewall block; got:\n{combined}"
     );

@@ -58,9 +58,10 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         return Ok(());
     }
 
-    whoami_ui::header(display_name);
+    whoami_ui::detail("username", display_name);
     if let Some(email_str) = email {
-        whoami_ui::detail("email", email_str);
+        let masked_email = mask_email_for_display(email_str);
+        whoami_ui::detail("email", &masked_email);
     }
 
     // Plan & Pool
@@ -258,6 +259,24 @@ fn format_plan_tier(tier: &str) -> String {
     }
 }
 
+fn mask_email_for_display(email: &str) -> String {
+    let Some((local, domain)) = email.split_once('@') else {
+        return email.to_string();
+    };
+    if local.is_empty() || domain.is_empty() {
+        return email.to_string();
+    }
+
+    let mut chars = local.chars();
+    let Some(first) = chars.next() else {
+        return email.to_string();
+    };
+    match chars.next_back() {
+        Some(last) => format!("{first}...{last}@{domain}"),
+        None => format!("{first}...@{domain}"),
+    }
+}
+
 fn with_usage_bar(mut message: String, used: u64, limit: u64) -> String {
     let bar = install_ui::usage_bar(used, limit, 10);
     if !bar.is_empty() {
@@ -311,6 +330,24 @@ mod tests {
             login_command_for_registry("https://registry.example.com"),
             "`lpm login --registry https://registry.example.com`"
         );
+    }
+
+    #[test]
+    fn mask_email_for_display_keeps_domain_and_edges_of_local_part() {
+        assert_eq!(
+            mask_email_for_display("tolgaergin@gmail.com"),
+            "t...n@gmail.com"
+        );
+    }
+
+    #[test]
+    fn mask_email_for_display_handles_single_character_local_part() {
+        assert_eq!(mask_email_for_display("t@gmail.com"), "t...@gmail.com");
+    }
+
+    #[test]
+    fn mask_email_for_display_leaves_non_email_values_unchanged() {
+        assert_eq!(mask_email_for_display("tolga"), "tolga");
     }
 
     #[tokio::test]

@@ -9,10 +9,6 @@ pub fn done(message: &str) {
     install_ui::done(message);
 }
 
-pub fn header(message: &str) {
-    eprintln!("{message}");
-}
-
 pub fn phase(message: &str) {
     install_ui::phase(message);
 }

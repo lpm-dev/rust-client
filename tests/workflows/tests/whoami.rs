@@ -122,10 +122,11 @@ async fn whoami_human_output_uses_slim_account_summary() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("testuser")
-            && stderr.contains("email          test@example.com")
+        stderr.contains("username       testuser")
+            && stderr.contains("email          t...t@example.com")
+            && !stderr.contains("email          test@example.com")
             && !stderr.contains("Logged in as"),
-        "authenticated whoami should render the bare identity header and email detail, got:\n{stderr}"
+        "authenticated whoami should render aligned username and masked email details, got:\n{stderr}"
     );
     assert!(
         stderr.contains("plan           Pro"),

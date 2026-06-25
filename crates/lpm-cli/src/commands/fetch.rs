@@ -1,5 +1,6 @@
 use crate::commands::install::{
-    NpmFirewallMaterializationPackage, run_npm_firewall_materialization_preflight,
+    NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,
+    run_prepared_npm_firewall_materialization_preflight,
 };
 use crate::install_ui;
 use lpm_common::{LpmError, LpmRoot};
@@ -138,10 +139,21 @@ pub async fn run(
         .is_v2()
         .then(|| Arc::new(lpm_store::v2::Store::from_lpm_root(&lpm_root)));
 
+    let firewall_packages = npm_firewall_packages_for_fetch_targets(&targets, client);
+    let firewall_preflight = prepare_npm_firewall_materialization_preflight(
+        project_dir,
+        &firewall_packages,
+        json_output,
+    )?;
+
     if !json_output {
-        install_ui::phase(&format!(
+        let fetch_message = format!(
             "Fetching {} package(s) from lpm.lock",
             install_ui::yellow(&targets.len().to_string())
+        );
+        install_ui::phase(&install_ui::with_firewall_badge(
+            fetch_message,
+            firewall_preflight.is_active(),
         ));
         install_ui::detail(&format!(
             "    {} {}",
@@ -150,11 +162,9 @@ pub async fn run(
         ));
     }
 
-    let firewall_packages = npm_firewall_packages_for_fetch_targets(&targets, client);
-    let firewall_json = run_npm_firewall_materialization_preflight(
+    let firewall_json = run_prepared_npm_firewall_materialization_preflight(
         client,
-        project_dir,
-        &firewall_packages,
+        firewall_preflight,
         json_output,
     )
     .await?;

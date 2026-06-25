@@ -271,6 +271,14 @@ pub fn phase(msg: &str) {
     emit_line(LineKind::Phase, msg);
 }
 
+pub fn with_firewall_badge(message: String, active: bool) -> String {
+    if active {
+        format!("{message} - 🔥 LPM Firewall active")
+    } else {
+        message
+    }
+}
+
 /// Short, user-facing form of a registry URL. Strips the `registry.`
 /// subdomain prefix so `https://registry.npmjs.org/` renders as
 /// `npmjs.org`. Falls back to a stable `"registry"` label when the URL
