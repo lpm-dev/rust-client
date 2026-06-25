@@ -130,7 +130,34 @@ const POPULAR_PACKAGES: &[&str] = &[
     "cypress",
 ];
 
-const KNOWN_LEGITIMATE_COLLISIONS: &[&str] = &["prism", "prismjs"];
+const KNOWN_LEGITIMATE_COLLISIONS: &[&str] = &[
+    "canvafy",
+    "canvg",
+    "chat",
+    "croact",
+    "deps",
+    "enquirer",
+    "eslintcc",
+    "esplint",
+    "evnty",
+    "globo",
+    "json-web-token",
+    "negotiate",
+    "never",
+    "ngreact",
+    "oxlint",
+    "prism",
+    "prismjs",
+    "storyblok",
+    "sveld",
+    "ts-extras",
+    "ttypescript",
+    "type-fns",
+    "typeit",
+    "typeon",
+    "uuid4",
+    "vike",
+];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TyposquatTechnique {
@@ -356,6 +383,42 @@ mod tests {
     #[test]
     fn no_warn_known_legitimate_prismjs_package() {
         assert_eq!(check_typosquatting("prismjs"), None);
+    }
+
+    #[test]
+    fn no_warn_popular_clean_packages_that_resemble_other_popular_packages() {
+        for package in [
+            "chat",
+            "enquirer",
+            "canvg",
+            "canvafy",
+            "croact",
+            "deps",
+            "oxlint",
+            "eslintcc",
+            "evnty",
+            "storyblok",
+            "typeit",
+            "esplint",
+            "globo",
+            "json-web-token",
+            "negotiate",
+            "never",
+            "ngreact",
+            "sveld",
+            "ts-extras",
+            "ttypescript",
+            "type-fns",
+            "typeon",
+            "uuid4",
+            "vike",
+        ] {
+            assert_eq!(
+                check_typosquatting(package),
+                None,
+                "{package} is a popular package and must not be reported as a typo"
+            );
+        }
     }
 
     #[test]

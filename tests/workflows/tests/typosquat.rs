@@ -271,6 +271,128 @@ async fn install_json_allows_known_legitimate_prismjs_package() {
 }
 
 #[tokio::test]
+async fn install_json_allows_exact_inquirer_package() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("inquirer", "1.0.0");
+    mock.with_package("inquirer", "1.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-inquirer-exact",
+            "version":"1.0.0",
+            "dependencies":{}
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "inquirer",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install inquirer");
+
+    assert!(
+        output.status.success(),
+        "exact inquirer install should pass typosquat guard\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert!(project.read_file("package.json").contains("inquirer"));
+    assert!(project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
+async fn install_json_allows_popular_clean_enquirer_package() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("enquirer", "1.0.0");
+    mock.with_package("enquirer", "1.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-enquirer-legitimate",
+            "version":"1.0.0",
+            "dependencies":{}
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "enquirer",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install enquirer");
+
+    assert!(
+        output.status.success(),
+        "popular clean enquirer install should pass typosquat guard\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert_ne!(
+        json.get("error_code"),
+        Some(&serde_json::json!("typosquat_suspected"))
+    );
+    assert!(project.read_file("package.json").contains("enquirer"));
+    assert!(project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
+async fn install_json_allows_popular_clean_chat_package() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("chat", "1.0.0");
+    mock.with_package("chat", "1.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"typosquat-chat-legitimate",
+            "version":"1.0.0",
+            "dependencies":{}
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "chat",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install chat");
+
+    assert!(
+        output.status.success(),
+        "popular clean chat install should pass typosquat guard\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], true);
+    assert_ne!(
+        json.get("error_code"),
+        Some(&serde_json::json!("typosquat_suspected"))
+    );
+    assert!(project.read_file("package.json").contains("chat"));
+    assert!(project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
 async fn install_ci_replay_allows_suspicious_direct_dependency_already_locked() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("axois", "1.0.0");
