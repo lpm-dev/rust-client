@@ -92,6 +92,8 @@ struct FetchJsonSummary {
     counts: FetchCounts,
     packages: Vec<FetchPackageResult>,
     elapsed_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    firewall: Option<serde_json::Value>,
 }
 
 pub async fn run(
@@ -148,8 +150,8 @@ pub async fn run(
         ));
     }
 
-    let firewall_packages = npm_firewall_packages_for_fetch_targets(&targets);
-    run_npm_firewall_materialization_preflight(
+    let firewall_packages = npm_firewall_packages_for_fetch_targets(&targets, client);
+    let firewall_json = run_npm_firewall_materialization_preflight(
         client,
         project_dir,
         &firewall_packages,
@@ -192,6 +194,7 @@ pub async fn run(
             counts,
             packages: results,
             elapsed_ms: started.elapsed().as_millis(),
+            firewall: firewall_json,
         };
         println!("{}", serde_json::to_string_pretty(&summary).unwrap());
     } else {
@@ -352,21 +355,93 @@ fn is_cached(
 
 fn npm_firewall_packages_for_fetch_targets(
     targets: &[FetchTarget],
+    client: &RegistryClient,
 ) -> Vec<NpmFirewallMaterializationPackage> {
     let mut packages = Vec::with_capacity(targets.len());
     for target in targets {
-        if let FetchSource::Registry { registry_url, .. } = &target.source
-            && crate::npm_public_source::is_public_npm_origin(registry_url)
-        {
-            packages.push(NpmFirewallMaterializationPackage::new(
+        match &target.source {
+            FetchSource::Registry {
+                registry_url,
+                tarball_url,
+            } if registry_source_is_public_npm_package(
                 &target.name,
                 &target.version,
-                Some(&target.integrity),
-                None,
-            ));
+                registry_url,
+                tarball_url,
+                client,
+            ) =>
+            {
+                packages.push(NpmFirewallMaterializationPackage::new(
+                    &target.name,
+                    &target.version,
+                    Some(&target.integrity),
+                    None,
+                ));
+            }
+            FetchSource::RemoteTarball { url }
+                if is_canonical_public_npm_tarball(&target.name, &target.version, url) =>
+            {
+                packages.push(NpmFirewallMaterializationPackage::new(
+                    &target.name,
+                    &target.version,
+                    Some(&target.integrity),
+                    None,
+                ));
+            }
+            _ => {}
         }
     }
     packages
+}
+
+fn registry_source_is_public_npm_package(
+    name: &str,
+    version: &str,
+    registry_url: &str,
+    tarball_url: &str,
+    client: &RegistryClient,
+) -> bool {
+    if lpm_common::package_name::is_lpm_package(name) {
+        return false;
+    }
+    crate::npm_public_source::is_public_npm_origin(registry_url)
+        || crate::npm_public_source::is_lpm_registry_origin(registry_url, client)
+        || (registry_url == "legacy" && is_canonical_public_npm_tarball(name, version, tarball_url))
+}
+
+fn is_canonical_public_npm_tarball(name: &str, version: &str, url: &str) -> bool {
+    if lpm_common::package_name::is_lpm_package(name)
+        || !crate::npm_public_source::is_public_npm_origin(url)
+    {
+        return false;
+    }
+
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    if parsed.query().is_some() {
+        return false;
+    }
+
+    let filename_name = name.rsplit('/').next().unwrap_or(name);
+    let expected_file = format!("{filename_name}-{version}.tgz");
+    let expected_plain_path = format!("{name}/-/{expected_file}");
+    let expected_encoded_path = format!("{}/-/{}", npm_package_path_encoded(name), expected_file);
+    let path = parsed.path().trim_start_matches('/');
+
+    path == expected_plain_path || path.eq_ignore_ascii_case(&expected_encoded_path)
+}
+
+fn npm_package_path_encoded(name: &str) -> String {
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        match byte {
+            b'@' => encoded.push_str("%40"),
+            b'/' => encoded.push_str("%2F"),
+            _ => encoded.push(byte as char),
+        }
+    }
+    encoded
 }
 
 fn result_for(target: &FetchTarget, status: FetchPackageStatus) -> FetchPackageResult {
@@ -605,5 +680,69 @@ mod tests {
         let err = classify_package(&package, &FetchPlatform::parse("linux/x64/glibc").unwrap())
             .unwrap_err();
         assert!(err.to_string().contains("missing tarball URL"));
+    }
+
+    #[test]
+    fn canonical_public_npm_tarball_matches_unscoped_package_url() {
+        assert!(is_canonical_public_npm_tarball(
+            "ms",
+            "2.1.3",
+            "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"
+        ));
+    }
+
+    #[test]
+    fn canonical_public_npm_tarball_matches_scoped_package_url() {
+        assert!(is_canonical_public_npm_tarball(
+            "@scope/pkg",
+            "1.2.3",
+            "https://registry.npmjs.org/@scope/pkg/-/pkg-1.2.3.tgz"
+        ));
+    }
+
+    #[test]
+    fn canonical_public_npm_tarball_rejects_mismatched_version() {
+        assert!(!is_canonical_public_npm_tarball(
+            "ms",
+            "2.1.3",
+            "https://registry.npmjs.org/ms/-/ms-2.1.4.tgz"
+        ));
+    }
+
+    #[test]
+    fn fetch_targets_include_canonical_public_npm_tarballs_in_firewall_preflight() {
+        let targets = vec![FetchTarget {
+            name: "ms".to_string(),
+            version: "2.1.3".to_string(),
+            integrity: "sha512-test".to_string(),
+            source: FetchSource::RemoteTarball {
+                url: "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz".to_string(),
+            },
+        }];
+        let client = RegistryClient::new();
+
+        let packages = npm_firewall_packages_for_fetch_targets(&targets, &client);
+
+        assert_eq!(packages.len(), 1);
+    }
+
+    #[test]
+    fn classify_package_keeps_canonical_public_npm_tarball_as_remote_target() {
+        let mut package = locked_package();
+        package.name = "ms".to_string();
+        package.version = "2.1.3".to_string();
+        package.source = Some("tarball+https://registry.npmjs.org/ms/-/ms-2.1.3.tgz".to_string());
+        package.tarball = None;
+
+        let FetchPlan::Fetch(target) =
+            classify_package(&package, &FetchPlatform::parse("linux/x64/glibc").unwrap()).unwrap()
+        else {
+            panic!("canonical public npm tarball must be fetched");
+        };
+
+        assert_eq!(
+            target.source.url(),
+            "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"
+        );
     }
 }

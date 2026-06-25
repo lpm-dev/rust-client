@@ -198,6 +198,14 @@ pub fn write_npm_firewall_global_config(project: &TempProject, mode: &str) {
     .expect("write isolated npm firewall config");
 }
 
+pub fn write_lpm_proxy_npmrc(project: &TempProject, registry_url: &str) {
+    let registry_url = registry_url.trim_end_matches('/');
+    project.write_file(
+        ".npmrc",
+        &format!("registry={registry_url}/api/registry/\n"),
+    );
+}
+
 /// Write a signed approved machine posture with a specific typosquat
 /// guard floor for workflow scenarios that intentionally exercise an
 /// approved machine-wide typosquat setting.

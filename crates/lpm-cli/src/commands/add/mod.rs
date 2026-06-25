@@ -165,7 +165,11 @@ pub async fn run(
     let target_route_name = target.route_name();
     let firewall_packages = match &target {
         AddTarget::Npm { .. }
-            if registry_materialization_route_is_public_npm(&route_table, &target_route_name) =>
+            if registry_materialization_route_is_public_npm(
+                &route_table,
+                client,
+                &target_route_name,
+            ) =>
         {
             vec![NpmFirewallMaterializationPackage::new(
                 &metadata.name,
@@ -176,7 +180,7 @@ pub async fn run(
         }
         AddTarget::Npm { .. } | AddTarget::Lpm(_) => Vec::new(),
     };
-    run_npm_firewall_materialization_preflight(
+    let firewall_json = run_npm_firewall_materialization_preflight(
         client,
         project_dir,
         &firewall_packages,
@@ -869,7 +873,7 @@ pub async fn run(
 
     // Output.
     if json_output {
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "success": true,
             "package": {
                 "name": target.json_name(),
@@ -893,6 +897,9 @@ pub async fn run(
             "warnings": [],
             "errors": [],
         });
+        if let Some(firewall_json) = firewall_json {
+            json["firewall"] = firewall_json;
+        }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         if ver_meta.has_security_issues() {

@@ -28,7 +28,9 @@ mod support;
 
 use serde_json::json;
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry, write_npm_firewall_global_config};
+use support::{
+    TempProject, lpm_with_registry, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
+};
 
 /// Assemble a source-package tarball: `lpm.config.json` at the root
 /// (which makes `lpm add` treat the package as a source delivery) plus
@@ -239,6 +241,7 @@ async fn lpm_add_firewall_enforce_blocks_source_package_before_tarball_fetch() {
 
     let project =
         TempProject::empty(r#"{"name":"add-firewall","version":"1.0.0","dependencies":{}}"#);
+    write_lpm_proxy_npmrc(&project, &mock.url());
     write_npm_firewall_global_config(&project, "enforce");
 
     let output = lpm_with_registry(&project, &mock.url())

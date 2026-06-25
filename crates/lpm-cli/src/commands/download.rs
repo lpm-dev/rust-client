@@ -57,7 +57,11 @@ pub async fn run(
 
     let firewall_packages = match &package_ref {
         RoutedPackageRef::Registry(route_name)
-            if registry_materialization_route_is_public_npm(&context.route_table, route_name) =>
+            if registry_materialization_route_is_public_npm(
+                &context.route_table,
+                &context.client,
+                route_name,
+            ) =>
         {
             vec![NpmFirewallMaterializationPackage::new(
                 &package_name,
@@ -68,7 +72,7 @@ pub async fn run(
         }
         _ => Vec::new(),
     };
-    run_npm_firewall_materialization_preflight(
+    let firewall_json = run_npm_firewall_materialization_preflight(
         &context.client,
         project_dir,
         &firewall_packages,
@@ -131,7 +135,7 @@ pub async fn run(
             |_| target_dir.display().to_string(),
             |p| p.display().to_string(),
         );
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "success": true,
             "package": package_name,
             "version": version_key,
@@ -143,6 +147,9 @@ pub async fn run(
             "files_extracted": files.len(),
             "elapsed_secs": (elapsed.as_millis() as f64) / 1000.0,
         });
+        if let Some(firewall_json) = firewall_json {
+            json["firewall"] = firewall_json;
+        }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
         eprintln!(

@@ -71,6 +71,46 @@ fn rewrite_lockfile_registry_sources_to_public_npm(project: &TempProject) {
     let _ = std::fs::remove_file(lockfile_path.with_extension("lockb"));
 }
 
+fn rewrite_lockfile_registry_source_to_legacy_public_npm_tarball(project: &TempProject) {
+    let lockfile_path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("lockfile should parse");
+    let package = lockfile
+        .packages
+        .iter_mut()
+        .find(|package| package.name == "ms" && package.version == "2.1.3")
+        .expect("seed lockfile should contain ms@2.1.3");
+    package.source = None;
+    package.tarball = Some(format!(
+        "{}/ms/-/ms-2.1.3.tgz",
+        lpm_common::NPM_REGISTRY_URL.trim_end_matches('/')
+    ));
+    lockfile
+        .write_to_file(&lockfile_path)
+        .expect("rewrite lockfile as legacy public npm tarball row");
+    let _ = std::fs::remove_file(lockfile_path.with_extension("lockb"));
+}
+
+fn rewrite_lockfile_registry_source_to_canonical_public_npm_tarball(project: &TempProject) {
+    let lockfile_path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("lockfile should parse");
+    let package = lockfile
+        .packages
+        .iter_mut()
+        .find(|package| package.name == "ms" && package.version == "2.1.3")
+        .expect("seed lockfile should contain ms@2.1.3");
+    package.source = Some(format!(
+        "tarball+{}/ms/-/ms-2.1.3.tgz",
+        lpm_common::NPM_REGISTRY_URL.trim_end_matches('/')
+    ));
+    package.tarball = None;
+    lockfile
+        .write_to_file(&lockfile_path)
+        .expect("rewrite lockfile as canonical public npm tarball row");
+    let _ = std::fs::remove_file(lockfile_path.with_extension("lockb"));
+}
+
 async fn tarball_request_count(mock: &MockRegistry, name: &str, version: &str) -> usize {
     let path = MockRegistry::tarball_path(name, version);
     mock.server()
@@ -217,6 +257,78 @@ async fn fetch_firewall_enforce_blocks_public_npm_lockfile_package_before_tarbal
     assert!(
         !package_store_dir(&project, "ms", "2.1.3").exists(),
         "blocked fetch must not populate the package store"
+    );
+}
+
+#[tokio::test]
+async fn fetch_firewall_enforce_blocks_legacy_public_npm_tarball_before_download() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let lockfile = seed_lockfile(&mock).await;
+    let project = project_with_lockfile(&lockfile);
+    rewrite_lockfile_registry_source_to_legacy_public_npm_tarball(&project);
+    write_npm_firewall_global_config(&project, "enforce");
+    mock.with_npm_firewall_block("ms", "2.1.3").await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["fetch"])
+        .output()
+        .expect("failed to run lpm fetch with legacy public npm tarball");
+
+    assert!(
+        !output.status.success(),
+        "firewall enforce must block legacy fetch:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("blocked by LPM npm firewall"),
+        "error must name the firewall block; got:\n{combined}"
+    );
+    assert!(
+        !package_store_dir(&project, "ms", "2.1.3").exists(),
+        "blocked legacy fetch must not populate the package store"
+    );
+}
+
+#[tokio::test]
+async fn fetch_firewall_enforce_blocks_canonical_public_npm_tarball_before_download() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let lockfile = seed_lockfile(&mock).await;
+    let project = project_with_lockfile(&lockfile);
+    rewrite_lockfile_registry_source_to_canonical_public_npm_tarball(&project);
+    write_npm_firewall_global_config(&project, "enforce");
+    mock.with_npm_firewall_block("ms", "2.1.3").await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["fetch"])
+        .output()
+        .expect("failed to run lpm fetch with canonical public npm tarball");
+
+    assert!(
+        !output.status.success(),
+        "firewall enforce must block canonical npm tarball fetch:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("blocked by LPM npm firewall"),
+        "error must name the firewall block; got:\n{combined}"
+    );
+    assert!(
+        !package_store_dir(&project, "ms", "2.1.3").exists(),
+        "blocked canonical npm tarball fetch must not populate the package store"
     );
 }
 
