@@ -96,6 +96,42 @@ async fn setup_local_json_writes_scoped_config_gitignore_and_read_only_token() {
 }
 
 #[tokio::test]
+async fn setup_local_proxy_flag_is_rejected_before_token_request() {
+    let project = TempProject::empty(r#"{"name":"web app","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local", "--proxy"])
+        .output()
+        .expect("failed to run lpm setup local --proxy");
+
+    assert!(
+        !output.status.success(),
+        "lpm setup local --proxy must be rejected"
+    );
+    assert!(
+        !project.file_exists(".npmrc"),
+        "rejected --proxy setup must not write .npmrc"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--proxy"),
+        "rejection must name the removed flag, got:\n{stderr}"
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests.is_empty(),
+        "rejected --proxy setup must not request a token"
+    );
+}
+
+#[tokio::test]
 async fn setup_local_non_json_output_uses_current_command_name() {
     let project = TempProject::empty(r#"{"name":"web app","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

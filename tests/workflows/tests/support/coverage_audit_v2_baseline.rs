@@ -994,10 +994,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 41: lpm setup ci npmrc (.npmrc CI gen) ──
     SurfaceV2 {
         id: 41,
-        scenarios: 3,
+        scenarios: 4,
         failure_modes_tested: &[
             "default writes scoped registry line to .npmrc",
-            "--proxy writes non-scoped registry line",
+            "removed --proxy flag is rejected before .npmrc write",
+            "legacy proxy config is ignored",
             "JSON envelope carries path + content + flag state",
         ],
         failure_modes_known: &[
@@ -1007,14 +1008,17 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup against an .npmrc that already has conflicting scoped entries",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/setup_ci.rs", 3)],
+        scenarios_by_file: &[("tests/workflows/tests/setup_ci.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 42: lpm setup local ──
     SurfaceV2 {
         id: 42,
-        scenarios: 1,
-        failure_modes_tested: &["writes scoped config + gitignore + read-only token"],
+        scenarios: 2,
+        failure_modes_tested: &[
+            "writes scoped config + gitignore + read-only token",
+            "removed --proxy flag is rejected before token request",
+        ],
         failure_modes_known: &[
             ".npmrc path is symlink outside project",
             "concurrent setup local writes",
@@ -1022,7 +1026,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "setup local when project root is a git submodule",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/setup_local.rs", 1)],
+        scenarios_by_file: &[("tests/workflows/tests/setup_local.rs", 2)],
         last_audited_at: "2026-05-14",
     },
     // ── id 43: lpm config get ──

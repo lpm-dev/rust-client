@@ -5,7 +5,8 @@
 //! covers the non-OIDC branches that don't need a real CI environment:
 //!
 //! - scoped registry config (default)
-//! - `--proxy` widens to "all npm traffic through lpm.dev"
+//! - removed `--proxy` flag is rejected before writing `.npmrc`
+//! - legacy `proxy = true` config no longer widens `.npmrc`
 //! - `--registry <url>` overrides the registry URL
 //! - JSON envelope shape (path, content, uses_env_var, oidc, proxy)
 //! - missing-token fallback uses the `${LPM_TOKEN}` placeholder
@@ -106,7 +107,7 @@ fn setup_ci_color_output_uses_plain_file_and_cyan_env_var() {
 }
 
 #[test]
-fn setup_ci_proxy_flag_writes_non_scoped_registry_line() {
+fn setup_ci_proxy_flag_is_rejected_before_dot_npmrc_is_written() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
 
     let output = lpm(&project)
@@ -121,38 +122,57 @@ fn setup_ci_proxy_flag_writes_non_scoped_registry_line() {
         .output()
         .expect("failed to run lpm setup ci npmrc --proxy");
 
-    assert!(output.status.success(), "lpm setup ci npmrc --proxy failed");
-
-    let npmrc =
-        std::fs::read_to_string(project.path().join(".npmrc")).expect("setup ci must write .npmrc");
-    // `--proxy` mode: bare `registry=` (catches all packages), NOT scoped.
     assert!(
-        npmrc.contains("registry=https://lpm.example.test/api/registry/"),
-        ".npmrc must use the unscoped registry line under --proxy, got:\n{npmrc}",
+        !output.status.success(),
+        "lpm setup ci npmrc --proxy must be rejected"
     );
     assert!(
-        !npmrc.contains("@lpm.dev:registry="),
-        ".npmrc must NOT use the scoped form under --proxy, got:\n{npmrc}",
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.trim().is_empty(),
-        "human setup ci --proxy should not write to stdout, got:\n{stdout}"
+        !project.file_exists(".npmrc"),
+        "rejected --proxy setup must not write .npmrc"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✓ Generated .npmrc"),
-        "human setup ci --proxy should report file generation with the slim done line, got:\n{stderr}"
+        stderr.contains("--proxy"),
+        "rejection must name the removed flag, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn setup_ci_ignores_legacy_proxy_config_when_writing_dot_npmrc() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).expect("create isolated lpm home");
+    std::fs::write(lpm_dir.join("config.toml"), "proxy = true\n")
+        .expect("write legacy proxy config");
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("failed to run lpm setup ci npmrc");
+
+    assert!(
+        output.status.success(),
+        "lpm setup ci npmrc failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let npmrc =
+        std::fs::read_to_string(project.path().join(".npmrc")).expect("setup ci must write .npmrc");
+    assert!(
+        npmrc.contains("@lpm.dev:registry=https://lpm.example.test/api/registry/"),
+        "legacy proxy config must not widen setup output, got:\n{npmrc}",
     );
     assert!(
-        stderr.contains("› Using proxy mode — all npm traffic routed through lpm.dev."),
-        "human setup ci --proxy should report proxy mode on a slim phase line, got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("! No token found — .npmrc uses ${LPM_TOKEN} placeholder."),
-        "human setup ci --proxy should surface the placeholder warning on stderr, got:\n{stderr}"
+        !npmrc.lines().any(|line| line.starts_with("registry=")),
+        "legacy proxy config must not write a bare registry line, got:\n{npmrc}",
     );
 }
 
@@ -170,7 +190,6 @@ fn setup_ci_json_envelope_carries_path_content_and_flag_state() {
             "setup",
             "ci",
             "npmrc",
-            "--proxy",
         ])
         .output()
         .expect("failed to run lpm setup ci npmrc --json");
@@ -182,7 +201,7 @@ fn setup_ci_json_envelope_carries_path_content_and_flag_state() {
         .unwrap_or_else(|e| panic!("setup ci --json must be valid JSON: {e}\n---\n{stdout}"));
 
     assert_eq!(envelope["success"], serde_json::json!(true));
-    assert_eq!(envelope["proxy"], serde_json::json!(true));
+    assert_eq!(envelope["proxy"], serde_json::json!(false));
     assert_eq!(envelope["oidc"], serde_json::json!(false));
     assert_eq!(envelope["uses_env_var"], serde_json::json!(true));
     assert_eq!(envelope["storage_backend"], serde_json::Value::Null);
@@ -198,8 +217,8 @@ fn setup_ci_json_envelope_carries_path_content_and_flag_state() {
         .as_str()
         .expect("content must be a string");
     assert!(
-        content.contains("registry=https://lpm.example.test/api/registry/"),
-        "envelope content must include the unscoped registry line under --proxy, got:\n{content}",
+        content.contains("@lpm.dev:registry=https://lpm.example.test/api/registry/"),
+        "envelope content must include the scoped registry line, got:\n{content}",
     );
 }
 
