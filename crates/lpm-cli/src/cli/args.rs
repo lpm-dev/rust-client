@@ -2822,12 +2822,8 @@ pub(crate) enum SetupAction {
         #[arg(long)]
         oidc: bool,
 
-        /// Route all npm traffic through lpm.dev (Pro/Org feature for dependency visibility).
-        #[arg(long, conflicts_with = "scoped")]
-        proxy: bool,
-
         /// Use scoped registry (`@lpm.dev:registry=`). This is the default.
-        #[arg(long, conflicts_with = "proxy")]
+        #[arg(long)]
         scoped: bool,
     },
 
@@ -2837,12 +2833,8 @@ pub(crate) enum SetupAction {
         #[arg(short = 'd', long, default_value = "30")]
         days: u32,
 
-        /// Route all npm traffic through lpm.dev (Pro/Org feature for dependency visibility).
-        #[arg(long, conflicts_with = "scoped")]
-        proxy: bool,
-
         /// Use scoped registry (`@lpm.dev:registry=`). This is the default.
-        #[arg(long, conflicts_with = "proxy")]
+        #[arg(long)]
         scoped: bool,
     },
 }

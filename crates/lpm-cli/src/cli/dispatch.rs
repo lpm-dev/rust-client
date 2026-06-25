@@ -1327,7 +1327,6 @@ async fn async_main() -> Result<()> {
                 env,
                 registry: setup_registry,
                 oidc,
-                proxy,
                 scoped: _,
             } => {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -1340,10 +1339,7 @@ async fn async_main() -> Result<()> {
                 match target {
                     "npmrc" => {
                         let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
-                        let cfg = commands::config::GlobalConfig::load();
-                        let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
-                        commands::setup::run(effective_registry, &cwd, cli.json, oidc, eff_proxy)
-                            .await
+                        commands::setup::run(effective_registry, &cwd, cli.json, oidc).await
                     }
                     "github-actions" | "github" | "gha" => {
                         commands::setup::run_ci_platform(target, &cwd, &env)?;
@@ -1358,16 +1354,9 @@ async fn async_main() -> Result<()> {
                     ))),
                 }
             }
-            SetupAction::Local {
-                days,
-                proxy,
-                scoped: _,
-            } => {
+            SetupAction::Local { days, scoped: _ } => {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                let cfg = commands::config::GlobalConfig::load();
-                let eff_proxy = proxy || cfg.get_bool("proxy").unwrap_or(false);
-                commands::npmrc::run(&client, &cwd, registry_url, days, eff_proxy, cli.json)
-                    .await
+                commands::npmrc::run(&client, &cwd, registry_url, days, cli.json).await
             }
         },
         Commands::TokenRotate => commands::token::run_rotate(&client, registry_url, cli.json).await,

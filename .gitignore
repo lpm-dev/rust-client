@@ -15,6 +15,7 @@ AGENTS
 # `bench/perf-results/dhat-*.json` ARE committed (e.g. dhat-main-baseline,
 # dhat-post-trials-XX) and serve as historical reference points.
 /dhat-heap.json
+/bench/perf-results/*/
 /bench/project
 /bench/.audit-cold
 /bench/.audit-home

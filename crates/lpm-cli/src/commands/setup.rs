@@ -60,14 +60,12 @@ fn setup_storage_status(token: Option<&ResolvedSetupBearer>) -> lpm_auth::AuthSt
 ///
 /// Flags:
 /// - `--oidc`: Exchange an OIDC token from the CI environment instead of using stored auth.
-/// - `--proxy`: Route ALL npm traffic through lpm.dev (Pro/Org feature for dependency visibility).
 /// - `--registry` / `-r`: Override the registry URL.
 pub async fn run(
     registry_url: &str,
     project_dir: &Path,
     json_output: bool,
     use_oidc: bool,
-    proxy: bool,
 ) -> Result<(), LpmError> {
     // Resolve token: OIDC exchange > stored token > env var > placeholder.
     // SessionManager handles `LPM_TOKEN` fallback internally,
@@ -99,11 +97,7 @@ pub async fn run(
         .trim_start_matches("https://")
         .trim_start_matches("http://");
 
-    let registry_line = if proxy {
-        format!("registry={}/api/registry/", registry_url)
-    } else {
-        format!("@lpm.dev:registry={}/api/registry/", registry_url)
-    };
+    let registry_line = format!("@lpm.dev:registry={}/api/registry/", registry_url);
 
     let npmrc_content = format!(
         "//{}/:_authToken={}\n{}\n",
@@ -130,7 +124,7 @@ pub async fn run(
             "content": safe_content,
             "uses_env_var": uses_env,
             "oidc": use_oidc,
-            "proxy": proxy,
+            "proxy": false,
             "storage_backend": storage_status.backend_json_value(),
             "storage_degraded": storage_status.degraded,
             "note": if uses_env { "" } else { "JSON content uses ${LPM_TOKEN} placeholder; the on-disk .npmrc carries the actual token at 0o600." },
@@ -160,9 +154,6 @@ pub async fn run(
 
         if use_oidc && token.is_some() {
             install_ui::phase("Using OIDC-exchanged token.");
-        }
-        if proxy {
-            install_ui::phase("Using proxy mode — all npm traffic routed through lpm.dev.");
         }
 
         if uses_env {
