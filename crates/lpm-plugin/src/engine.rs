@@ -13,16 +13,16 @@ const ENGINE_VERSION_CACHE_FILE_NAME: &str = ".version-cache.json";
 const MAX_ENGINE_DOWNLOAD_SIZE: usize = 150 * 1024 * 1024;
 const MANAGED_ENGINE_TOOL_NAMES: &[&str] = &["rolldown"];
 const MANAGED_TOOL_NPM_REGISTRY_ENV: &str = "LPM_MANAGED_TOOL_NPM_REGISTRY";
-const ROLLDOWN_VERSION: &str = "1.1.1";
-const ROLLDOWN_ROOT_TARBALL_URL: &str = "https://registry.npmjs.org/rolldown/-/rolldown-1.1.1.tgz";
-const ROLLDOWN_ROOT_TARBALL_INTEGRITY: &str = "sha512-IN750c0p+s3jqJIsFLRZrQazmbAB1kkQDTtQjSt/gbS2ywLhlv4R5Shazer0FZKmuo/BsO3/w2UoYnUjuOZqHg==";
+const ROLLDOWN_VERSION: &str = "1.1.3";
+const ROLLDOWN_ROOT_TARBALL_URL: &str = "https://registry.npmjs.org/rolldown/-/rolldown-1.1.3.tgz";
+const ROLLDOWN_ROOT_TARBALL_INTEGRITY: &str = "sha512-1F1eEtUBtFvcGm1HQ9TiUIUHPQG7mSAODrhIzjxoUEFuo8OcbrGLiVLkevNgj84TE4lnHvnumwFjhJO5Eu135g==";
 const ROLLDOWN_PLUGINUTILS_TARBALL_URL: &str =
     "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.1.tgz";
 const ROLLDOWN_PLUGINUTILS_TARBALL_INTEGRITY: &str = "sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==";
 const OXC_TYPES_TARBALL_URL: &str =
-    "https://registry.npmjs.org/@oxc-project/types/-/types-0.135.0.tgz";
-const OXC_TYPES_TARBALL_INTEGRITY: &str = "sha512-wR+xRdFkUBMvcAjBJ2q2kcZM6d+DKu2NgoOyxZgYwZdLhmiv6+rnO8PZ/P68kMiZtIKm+pW7zyEJ4kSOs0vo+Q==";
-const TSGO_VERSION: &str = "7.0.0-dev.20260615.1";
+    "https://registry.npmjs.org/@oxc-project/types/-/types-0.137.0.tgz";
+const OXC_TYPES_TARBALL_INTEGRITY: &str = "sha512-WT+Gb24i8hmvo85AIv2oEYouEXkRlKAlT9WaCa3TfLgNCN+GhrJOGZuIlMouAh38Qe4QOx26eUOVsq70qXrywA==";
+const TSGO_VERSION: &str = "7.0.0-dev.20260626.1";
 
 #[derive(Debug, Clone, Copy)]
 struct EngineInstallAsset {
@@ -166,8 +166,8 @@ static TSGO_ASSETS: &[EnginePlatformAsset] = &[
         entry_rel_path: "lib/tsgo",
         packages: &[EngineInstallAsset {
             install_subdir: "",
-            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-darwin-arm64/-/native-preview-darwin-arm64-7.0.0-dev.20260615.1.tgz",
-            tarball_integrity: "sha512-EHrtoVGEEhIhsnGe+b8w0FoM9JfIw5SkoPwO8ifaU0PrYm2UbyPbj2I2hOTxtk458t0irvGz2+8cshylBRbKng==",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-darwin-arm64/-/native-preview-darwin-arm64-7.0.0-dev.20260626.1.tgz",
+            tarball_integrity: "sha512-VDPHf8RZRzsBH6cgArK1u9sH8MODMNkvkNczEt1EXpOLfZeplIhcpKld5Zc9Da8/S9YB4768rjfBkdFokxBu+Q==",
         }],
     },
     EnginePlatformAsset {
@@ -175,8 +175,8 @@ static TSGO_ASSETS: &[EnginePlatformAsset] = &[
         entry_rel_path: "lib/tsgo",
         packages: &[EngineInstallAsset {
             install_subdir: "",
-            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-darwin-x64/-/native-preview-darwin-x64-7.0.0-dev.20260615.1.tgz",
-            tarball_integrity: "sha512-BcDA56hkk6mrUpysaOVvrdACoX5d2SF1JTwHMoNjT1KysBicExS2wlH0eN0L01iDeqtB73XHl7A4zrKFmKzrBg==",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-darwin-x64/-/native-preview-darwin-x64-7.0.0-dev.20260626.1.tgz",
+            tarball_integrity: "sha512-bi7iQZe2A90cFJ3EQnigezEI7F0e5vX6E/QUGluQ1mKZmcbbQCdAwDMDQFV8Z6w3xNrk9AYyNQbvq0DtzJX46w==",
         }],
     },
     EnginePlatformAsset {
@@ -184,8 +184,8 @@ static TSGO_ASSETS: &[EnginePlatformAsset] = &[
         entry_rel_path: "lib/tsgo",
         packages: &[EngineInstallAsset {
             install_subdir: "",
-            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-x64/-/native-preview-linux-x64-7.0.0-dev.20260615.1.tgz",
-            tarball_integrity: "sha512-/QDmRWt6abB7fw3yMchjlyDXej/7Dr8mYG4wvGGf6c1hc5Il5UpDQWNHejatdeKvAu+sszz8JhTuL8et47fTTg==",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-x64/-/native-preview-linux-x64-7.0.0-dev.20260626.1.tgz",
+            tarball_integrity: "sha512-4o80l1+RoJLkR1G4KOZjTYN1yOAGbq0K2CAP0zF35MPnD8O559Tw8OMuYA+XPpEFE0fkb7mmcxL8J9cxM/kAbw==",
         }],
     },
     EnginePlatformAsset {
@@ -193,8 +193,8 @@ static TSGO_ASSETS: &[EnginePlatformAsset] = &[
         entry_rel_path: "lib/tsgo",
         packages: &[EngineInstallAsset {
             install_subdir: "",
-            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-arm/-/native-preview-linux-arm-7.0.0-dev.20260615.1.tgz",
-            tarball_integrity: "sha512-YRXRS/7ZqrDKXBJhFQcZiOdnHRuRbWoL/QkggpoGfhIuSAh4HvTU0WEUnPM+jRnH2kUMfsSgd8EAnPvmuP7/VA==",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-arm/-/native-preview-linux-arm-7.0.0-dev.20260626.1.tgz",
+            tarball_integrity: "sha512-ilB0Ew5GWLrqMklNVrMdCEyNePypoEMnd4l5aUopnDRebgtXmtu0RE2GDl9LOTZ1BwlbXsuYAkEHt18Ta25hxg==",
         }],
     },
     EnginePlatformAsset {
@@ -202,8 +202,8 @@ static TSGO_ASSETS: &[EnginePlatformAsset] = &[
         entry_rel_path: "lib/tsgo",
         packages: &[EngineInstallAsset {
             install_subdir: "",
-            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-arm64/-/native-preview-linux-arm64-7.0.0-dev.20260615.1.tgz",
-            tarball_integrity: "sha512-TDAlBpyYCF7Z+ELTH+1tabDE6W3shl+H+Z+nmzaQio1I8pFvbwt2iLlE0Rc9CpRdIeaqr0ppMEgXHoeV3fZFWA==",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-linux-arm64/-/native-preview-linux-arm64-7.0.0-dev.20260626.1.tgz",
+            tarball_integrity: "sha512-/iptuCYiucdY0HK0nE5ydRjIx0KOf3AY7fieRaQHA4X9/s4ey37rc/58aBX3dtx0x2EhlzpXT5f0ikYY65Zynw==",
         }],
     },
     EnginePlatformAsset {
@@ -211,8 +211,8 @@ static TSGO_ASSETS: &[EnginePlatformAsset] = &[
         entry_rel_path: "lib/tsgo.exe",
         packages: &[EngineInstallAsset {
             install_subdir: "",
-            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-win32-x64/-/native-preview-win32-x64-7.0.0-dev.20260615.1.tgz",
-            tarball_integrity: "sha512-4cSCpXG7um18nwmLdU/SjoTv3OcO38/ufTiy1oWVccgGHLJqppiOP9/o+ElKIWhvrp78IaGy8+h3YqEjQ4/pcQ==",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-win32-x64/-/native-preview-win32-x64-7.0.0-dev.20260626.1.tgz",
+            tarball_integrity: "sha512-Iuf5nqTY4m5kxEvraDpieEf0XS6gDdjBBkw3g74pseznhpMeDFzgRvVCbSaf2pdjBNGugZbiBDVTEOclmD9cjA==",
         }],
     },
     EnginePlatformAsset {
@@ -220,8 +220,8 @@ static TSGO_ASSETS: &[EnginePlatformAsset] = &[
         entry_rel_path: "lib/tsgo.exe",
         packages: &[EngineInstallAsset {
             install_subdir: "",
-            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-win32-arm64/-/native-preview-win32-arm64-7.0.0-dev.20260615.1.tgz",
-            tarball_integrity: "sha512-WTJOLoe2rxT0W1i8ndWk2MKrakxRFNki537JZxvKAmSTbyOZznHlW3O3dbryUtTBYA716DDqS3ci24kuIfvBdg==",
+            tarball_url: "https://registry.npmjs.org/@typescript/native-preview-win32-arm64/-/native-preview-win32-arm64-7.0.0-dev.20260626.1.tgz",
+            tarball_integrity: "sha512-xHxewRWY74zJnwt4bj+Kdf6Owfs6L0Fbggb37psSa6CvofqcvSI3AyuwiBNjC0T8Eb/d/BMMXttbPJ4XXqMpXQ==",
         }],
     },
 ];
@@ -248,8 +248,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-darwin-arm64",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.1.1.tgz",
-                tarball_integrity: "sha512-rRZRPy/Ynb+Mxu0O6tfPldHeDgAn0sRij+IOUy6sFdUlv3hArGW/DloE3GfAxtqpOJuRNgF74Nr5gM4xBeU2jQ==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.1.3.tgz",
+                tarball_integrity: "sha512-0NwgwsjM7LrsuVnXMK3koTpagBNOhloc/BNjKqZjv4V5zI5r13qx69uVhRx+o5Z0yy4Hzq+lpy7TAgUG/ocvrw==",
             },
         ],
     },
@@ -274,8 +274,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-darwin-x64",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.1.1.tgz",
-                tarball_integrity: "sha512-/MtefPxhKPyWWFM8L45OWiEqRf+eSU2Qv9ZAyTaoZOoGcoPKxbbhjTJO2/U2IThv0uDZ4NWHc3/oTsR6IEOtww==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.1.3.tgz",
+                tarball_integrity: "sha512-YtiBp4disu6V560loT6PjMdiRaWmVvDNrUunAalbiFx2ggeJwxdAsgZMcoGP17uyAsTwAj5V1niksxlHnVQ1Sw==",
             },
         ],
     },
@@ -300,8 +300,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-linux-x64-gnu",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.1.1.tgz",
-                tarball_integrity: "sha512-NwX/wspnq4vYyMFsqbYvzums3ki/Tk8FZbMzMAovPDp3OfLeYKby/D+9osokadXuYEV3OvpeHlwnr/bG8QMixA==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.1.3.tgz",
+                tarball_integrity: "sha512-JJpqs8bRGITDOdbkNKnlojzBabbOHrqjSvDr0IVsZObE1lBcPjxItUEY9eWIDbxaJ3cGrXPWGfGkIxFijg/URg==",
             },
         ],
     },
@@ -326,8 +326,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-linux-arm64-gnu",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.1.1.tgz",
-                tarball_integrity: "sha512-at2EO4o7D/PJLC4Xik16bU4CcjQE2tSv1LfqMA0TRYQYQihRm3gZeDB8xaX28A9SFedibcAk5DeMCKt4REKG0A==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.1.3.tgz",
+                tarball_integrity: "sha512-50jD0uUwLvur7Zz9LHz17kaAdTPjn5wN93hEgjvmYFRZwiR7ZJYovTd5ipyWJDAnXKvZ+wgc+/Ika6dwSF5OcA==",
             },
         ],
     },
@@ -352,8 +352,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-win32-x64-msvc",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.1.1.tgz",
-                tarball_integrity: "sha512-MUvC/HLXVjzkQkWiExdVTEEWf0py+GfWm8WKSZsekG3ih6a21iy0BHPF07X3JIf3ifoklZXTIaHTLPBgH1C3dw==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.1.3.tgz",
+                tarball_integrity: "sha512-OL4OMk7UPXOeVGGd3qo5zJyPIljf4AFgk5QAkPPS+OoLuOOozhuaQGC18MxVTnw/06q93gShAJzlwnSCY9YtqA==",
             },
         ],
     },
@@ -378,8 +378,8 @@ static ROLLDOWN_ASSETS: &[EnginePlatformAsset] = &[
             },
             EngineInstallAsset {
                 install_subdir: "node_modules/@rolldown/binding-win32-arm64-msvc",
-                tarball_url: "https://registry.npmjs.org/@rolldown/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.1.1.tgz",
-                tarball_integrity: "sha512-4psXSh63mSbwJF+mB8/9yfUUEzBiHYcUjxa32EO9ZwKy0Ypwjcg4F10D8SvVXgd+isy2UUUjF9HJJnDu1T/4Gg==",
+                tarball_url: "https://registry.npmjs.org/@rolldown/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.1.3.tgz",
+                tarball_integrity: "sha512-2DrEfhluH9yhiaFApmsjsjwrSYbNcY1oFTzYSP1a535jDbV98zCFanA/96TBUd0iDFcxGmw9QRExwGCXz3U+/g==",
             },
         ],
     },
