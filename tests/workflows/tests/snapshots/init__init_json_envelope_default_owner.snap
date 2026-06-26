@@ -5,7 +5,14 @@ expression: envelope
 ---
 {
   "success": true,
+  "target": "lpm",
   "name": "@lpm.dev/neo.package",
   "version": "1.0.0",
-  "path": "[PACKAGE_JSON]"
+  "path": "[PACKAGE_JSON]",
+  "package_manager": "lpm@[VERSION]",
+  "agents_path": "[AGENTS_MD]",
+  "agents_status": "created",
+  "lpm_json_path": null,
+  "lpm_json_status": "skipped",
+  "gitattributes_ready": true
 }

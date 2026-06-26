@@ -7,7 +7,8 @@ use crate::{
 };
 
 use super::args::{
-    Cli, Commands, DoctorAction, LinkerCli, OutdatedRegistryScope, SetupAction, StageCommands,
+    Cli, Commands, DoctorAction, InitPackageTargetCli, LinkerCli, OutdatedRegistryScope,
+    SetupAction, StageCommands,
 };
 use super::format::{argv_has_global_registry_flag, exit_with_lpm_error, parse_cli_or_exit};
 use super::helpers::{
@@ -1395,9 +1396,35 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::upgrade::run(&client, &cwd, major, dry_run, interactive, yes, cli.json).await
         }
-        Commands::Init { yes } => {
+        Commands::Init {
+            yes,
+            lpm,
+            npm,
+            name,
+            owner,
+            no_agents,
+        } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::init::run(&client, &cwd, yes, cli.json).await
+            let target = if lpm {
+                Some(InitPackageTargetCli::Lpm)
+            } else if npm {
+                Some(InitPackageTargetCli::Npm)
+            } else {
+                None
+            };
+            commands::init::run(
+                &client,
+                &cwd,
+                commands::init::InitOptions {
+                    yes,
+                    target,
+                    name: name.as_deref(),
+                    owner: owner.as_deref(),
+                    write_agents: !no_agents,
+                    json_output: cli.json,
+                },
+            )
+            .await
         }
         Commands::Config {
             action,

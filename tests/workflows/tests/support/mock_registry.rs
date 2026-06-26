@@ -73,6 +73,26 @@ impl RegistrySigningFixture {
     }
 }
 
+fn whoami_response(username: &str, email: &str) -> serde_json::Value {
+    serde_json::json!({
+        "username": email,
+        "profile_username": username,
+        "email": email,
+        "plan_tier": "pro",
+        "mfa_enabled": false,
+        "has_pool_access": true,
+        "usage": {
+            "storage_bytes": 1024 * 1024 * 50,
+            "private_packages": 3
+        },
+        "limits": {
+            "storageBytes": 1024 * 1024 * 500,
+            "privatePackages": 100
+        },
+        "organizations": []
+    })
+}
+
 impl MockRegistry {
     /// Start a new mock registry on a random port.
     pub async fn start() -> Self {
@@ -250,23 +270,27 @@ impl MockRegistry {
     pub async fn with_whoami(&self, username: &str, email: &str) -> &Self {
         Mock::given(method("GET"))
             .and(path("/api/registry/-/whoami"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "username": email,
-                "profile_username": username,
-                "email": email,
-                "plan_tier": "pro",
-                "mfa_enabled": false,
-                "has_pool_access": true,
-                "usage": {
-                    "storage_bytes": 1024 * 1024 * 50,
-                    "private_packages": 3
-                },
-                "limits": {
-                    "storageBytes": 1024 * 1024 * 500,
-                    "privatePackages": 100
-                },
-                "organizations": []
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(whoami_response(username, email)),
+            )
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    /// Mount a `/api/registry/-/whoami` endpoint with an explicit expected call count.
+    pub async fn with_whoami_expected(
+        &self,
+        username: &str,
+        email: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/whoami"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(whoami_response(username, email)),
+            )
+            .expect(expected_calls)
             .mount(&self.server)
             .await;
         self

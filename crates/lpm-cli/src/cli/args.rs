@@ -94,6 +94,12 @@ pub(crate) enum CheckEngine {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum InitPackageTargetCli {
+    Lpm,
+    Npm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum BundleFormat {
     Esm,
     Cjs,
@@ -1093,11 +1099,27 @@ pub(crate) enum Commands {
         yes: bool,
     },
 
-    /// Initialize a new LPM package.
+    /// Initialize a new package.
     Init {
         /// Skip prompts, use defaults.
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Create an lpm.dev package (`@lpm.dev/<owner>.<name>`).
+        #[arg(long, conflicts_with = "npm")]
+        lpm: bool,
+        /// Create an npm-compatible package name and publish config.
+        #[arg(long, conflicts_with = "lpm")]
+        npm: bool,
+        /// Package name to write. For lpm.dev, this is the package half unless
+        /// an `@lpm.dev/<owner>.<name>` value is provided.
+        #[arg(long)]
+        name: Option<String>,
+        /// lpm.dev owner or organization slug. Used only for lpm.dev packages.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Do not create or update AGENTS.md.
+        #[arg(long)]
+        no_agents: bool,
     },
 
     /// Manage CLI configuration.
