@@ -269,6 +269,11 @@ async fn lpm_add_firewall_enforce_blocks_source_package_before_tarball_fetch() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
+        combined
+            .contains("Downloading source package blocked-source@1.0.0 - 🔥 LPM Firewall active"),
+        "firewall-active source download must show the badge; got:\n{combined}"
+    );
+    assert!(
         combined.contains("blocked by LPM npm firewall"),
         "error must name the firewall block; got:\n{combined}"
     );

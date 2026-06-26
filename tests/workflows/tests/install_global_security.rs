@@ -37,7 +37,7 @@ mod support;
 use support::assertions;
 use support::build_state::seed_global_install_blocked_state_with_tier;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry, write_npm_firewall_global_config};
 
 const GLOBAL_E2E_PKG: &str = "@lpm.dev/acme.global-tool";
 const GLOBAL_E2E_COMMAND: &str = "acme-global-tool";
@@ -45,6 +45,7 @@ const GLOBAL_E2E_APPROVED_VERSION: &str = "1.0.0";
 const GLOBAL_E2E_CANDIDATE_VERSION: &str = "1.0.1";
 const GLOBAL_E2E_PUBLISHER: &str = "github:acme/global-tool";
 const GLOBAL_E2E_WORKFLOW_PATH: &str = ".github/workflows/publish.yml";
+const GLOBAL_NPM_FIREWALL_PKG: &str = "global-firewall-tool";
 
 /// ISO-8601 UTC timestamp `n_secs` ago. Mirrors the release-age helper in
 /// `install.rs`; kept local so this workflow test is standalone.
@@ -471,6 +472,53 @@ async fn install_global_min_release_age_cli_override_blocks_fresh_package() {
     assert!(
         combined.contains("259200"),
         "output must render the effective 72h=259200s window; got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn install_global_shows_firewall_active_badge_when_public_npm_verdicts_are_checked() {
+    let project = TempProject::empty(r#"{ "name": "global-firewall-test", "version": "0.0.0" }"#);
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": GLOBAL_NPM_FIREWALL_PKG,
+            "version": "1.0.0",
+            "bin": {
+                "global-firewall-tool": "bin/global-firewall-tool.js"
+            }
+        }),
+        &[(
+            "bin/global-firewall-tool.js",
+            br#"#!/usr/bin/env node
+console.log('global-firewall-tool');
+"#,
+        )],
+    )
+    .await;
+    mock.with_npm_firewall_block(GLOBAL_NPM_FIREWALL_PKG, "1.0.0")
+        .await;
+    write_npm_firewall_global_config(&project, "report");
+
+    let spec = format!("{GLOBAL_NPM_FIREWALL_PKG}@1.0.0");
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["install", "-g", &spec])
+        .output()
+        .expect("spawn lpm install -g with firewall report");
+
+    assert!(
+        out.status.success(),
+        "report-mode firewall global install must continue\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("LPM Firewall active"),
+        "firewall-active global install must show the badge; got:\n{combined}"
     );
 }
 

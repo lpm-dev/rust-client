@@ -11,8 +11,9 @@ mod target;
 pub use security::print_security_warnings;
 
 use crate::commands::install::{
-    NpmFirewallMaterializationPackage, registry_materialization_route_is_public_npm,
-    run_npm_firewall_materialization_preflight,
+    NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,
+    registry_materialization_route_is_public_npm,
+    run_prepared_npm_firewall_materialization_preflight,
 };
 use crate::prompt::prompt_err;
 use crate::{install_ui, output};
@@ -180,20 +181,29 @@ pub async fn run(
         }
         AddTarget::Npm { .. } | AddTarget::Lpm(_) => Vec::new(),
     };
-    let firewall_json = run_npm_firewall_materialization_preflight(
-        client,
+    let firewall_preflight = prepare_npm_firewall_materialization_preflight(
         project_dir,
         &firewall_packages,
         json_output,
-    )
-    .await?;
+    )?;
 
     if !json_output {
-        install_ui::phase(&format!(
+        let download_message = format!(
             "Downloading source package {}",
             install_ui::yellow(&format!("{}@{version}", target.display()))
+        );
+        install_ui::phase(&install_ui::with_firewall_badge(
+            download_message,
+            firewall_preflight.is_active(),
         ));
     }
+
+    let firewall_json = run_prepared_npm_firewall_materialization_preflight(
+        client,
+        firewall_preflight,
+        json_output,
+    )
+    .await?;
 
     // File-spool tarball download.
     // Uses `download_tarball_routed` so:

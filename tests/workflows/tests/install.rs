@@ -3484,6 +3484,96 @@ async fn install_offline_firewall_report_relinks_and_reports_offline_skip_json()
 }
 
 #[tokio::test]
+async fn install_package_shows_firewall_active_badge_when_public_npm_verdicts_are_checked() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("firewall-install", "1.0.0");
+    mock.with_package("firewall-install", "1.0.0", &tarball)
+        .await;
+    mock.with_npm_firewall_block("firewall-install", "1.0.0")
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "firewall-install-badge",
+        "version": "1.0.0"
+    }"#,
+    );
+    write_npm_firewall_global_config(&project, "report");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "firewall-install@1.0.0",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run install with firewall report");
+
+    assert!(
+        output.status.success(),
+        "report-mode firewall install must continue\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Installing 1 package - 🔥 LPM Firewall active"),
+        "firewall-active install must show the badge; got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn install_package_omits_firewall_badge_when_firewall_is_off() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("plain-install", "1.0.0");
+    mock.with_package("plain-install", "1.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "plain-install-badge",
+        "version": "1.0.0"
+    }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "plain-install@1.0.0",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run install with firewall off");
+
+    assert!(
+        output.status.success(),
+        "firewall-off install must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Installing 1 package"),
+        "install must still show the normal install phase; got:\n{combined}"
+    );
+    assert!(
+        !combined.contains("LPM Firewall active"),
+        "firewall-off install must not show the firewall badge; got:\n{combined}"
+    );
+}
+
+#[tokio::test]
 async fn install_offline_firewall_enforce_fails_closed_before_linking() {
     let project = warm_public_npm_lockfile_project_for_offline_firewall("enforce").await;
 

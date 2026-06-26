@@ -7,6 +7,7 @@
 mod support;
 
 use support::assertions::{JsonType, assert_json_field, parse_json_output};
+use support::auth_state::write_credentials_store;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
 
@@ -69,7 +70,46 @@ async fn health_json_has_required_fields() {
     assert_eq!(json["healthy"], true);
 }
 
-// ─── lpm whoami --json ───────────────────────────────────────────
+// ─── lpm whoami ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn whoami_human_output_aligns_username_and_masks_email() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "testuser@example.com").await;
+    write_credentials_store(
+        project.home(),
+        &serde_json::json!({
+            mock.url(): "test-token-123",
+        }),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["whoami"])
+        .output()
+        .expect("failed to run lpm whoami");
+
+    assert!(
+        output.status.success(),
+        "lpm whoami failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("  username       testuser"),
+        "human whoami output must align username with detail rows; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("  email          t...r@example.com"),
+        "human whoami output must mask email addresses; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("testuser@example.com"),
+        "human whoami output must not print the full email address; got:\n{stderr}"
+    );
+}
 
 #[tokio::test]
 async fn whoami_json_has_required_fields() {
@@ -92,9 +132,11 @@ async fn whoami_json_has_required_fields() {
     let json = parse_json_output(&output.stdout);
     assert_json_field(&json, "success", JsonType::Bool);
     assert_json_field(&json, "username", JsonType::String);
+    assert_json_field(&json, "email", JsonType::String);
 
     assert_eq!(json["success"], true);
     assert_eq!(json["username"], "testuser");
+    assert_eq!(json["email"], "test@example.com");
 }
 
 // ─── lpm health --json (unhealthy) ──────────────────────────────
