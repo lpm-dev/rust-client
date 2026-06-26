@@ -933,6 +933,7 @@ async fn reconcile_install(client: &RegistryClient, project_dir: &Path) -> Resul
         false,
         false,
         false,
+        false,
         &[],
     )
     .await

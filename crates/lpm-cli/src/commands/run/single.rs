@@ -569,6 +569,7 @@ pub async fn dlx(
             false, // no_sandbox
             false, // verbose: internal pipeline, no user-facing Done footer
             false, // audit_after_install: internal pipeline never runs audit
+            false, // timing: dlx does not expose install's --timing flag
             &[],
         )
         .await?;

@@ -372,7 +372,7 @@ async fn install_default_policy_json_suggests_approve_scripts_for_blocked_packag
     );
 
     let envelope = parse_last_json_object(&output.stdout, &output.stderr);
-    assert_eq!(envelope["schema_version"], serde_json::json!(1));
+    assert_eq!(envelope["schema_version"], serde_json::json!(2));
     assert!(
         envelope["blocked_count"]
             .as_u64()

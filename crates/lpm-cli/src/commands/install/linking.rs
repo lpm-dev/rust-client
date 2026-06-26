@@ -191,6 +191,7 @@ pub(super) async fn run_link_and_finish(
     auto_build: bool,
     no_sandbox: bool,
     strict_sandbox: bool,
+    emit_timing: bool,
     compatibility_bin_names: &[String],
 ) -> Result<(), LpmError> {
     crate::security_floor::clear_recorded_suppressions();
@@ -491,6 +492,8 @@ pub(super) async fn run_link_and_finish(
             .collect();
 
         let mut json = serde_json::json!({
+            "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
+            "success": true,
             "packages": pkg_list,
             "count": packages.len(),
             "downloaded": downloaded,
@@ -512,6 +515,9 @@ pub(super) async fn run_link_and_finish(
             "warnings": [],
             "errors": [],
         });
+        if !emit_timing && let Some(obj) = json.as_object_mut() {
+            obj.remove("timing");
+        }
         // invariant: surface workspace member deps that
         // were linked locally instead of going through the registry.
         if !workspace_member_deps.is_empty() {
