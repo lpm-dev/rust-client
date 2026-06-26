@@ -4,6 +4,7 @@ assertion_line: 630
 expression: envelope
 ---
 {
+  "schema_version": 1,
   "success": true,
   "packages": [
     {

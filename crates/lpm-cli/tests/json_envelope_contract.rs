@@ -145,6 +145,12 @@ fn json_dispatch_early_error_emits_envelope_on_stdout() {
             "case={}: envelope must carry success=false; full envelope={envelope}",
             case.arm,
         );
+        assert_eq!(
+            envelope["schema_version"],
+            serde_json::json!(1),
+            "case={}: envelope must carry shared error schema_version=1; full envelope={envelope}",
+            case.arm,
+        );
 
         let error_msg = envelope["error"]
             .as_str()
@@ -191,6 +197,13 @@ fn json_envelope_failure_exit_code_mirrors_success_field() {
             envelope["success"],
             serde_json::json!(false),
             "case={}: precondition: envelope must report failure on this path \
+             (stderr={stderr:?})",
+            case.arm,
+        );
+        assert_eq!(
+            envelope["schema_version"],
+            serde_json::json!(1),
+            "case={}: precondition: envelope must expose shared error schema_version=1 \
              (stderr={stderr:?})",
             case.arm,
         );

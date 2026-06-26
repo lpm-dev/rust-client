@@ -119,6 +119,7 @@ fn json_parse_error_emits_single_usage_envelope() {
 
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout should be one JSON envelope");
+    assert_eq!(envelope["schema_version"], serde_json::json!(1));
     assert_eq!(envelope["success"], serde_json::json!(false));
     assert_eq!(envelope["error_code"], serde_json::json!("usage"));
     assert_eq!(envelope["kind"], serde_json::json!("invalid_value"));

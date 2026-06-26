@@ -21,6 +21,7 @@ fn install_json_rejects_new_cli_arg_typosquat_before_manifest_mutation() {
         String::from_utf8_lossy(&output.stderr)
     );
     let json = parse_json_output(&output.stdout);
+    assert_eq!(json["schema_version"], serde_json::json!(1));
     assert_eq!(json["error_code"], "typosquat_suspected");
     assert_eq!(json["error"]["findings"][0]["package"], "axois");
     assert_eq!(json["error"]["findings"][0]["similar_to"], "axios");
@@ -28,6 +29,7 @@ fn install_json_rejects_new_cli_arg_typosquat_before_manifest_mutation() {
         json["error"]["findings"][0]["technique"],
         "adjacent_transposition"
     );
+    assert_eq!(json["next_steps"][0]["command"], "lpm install axios");
     assert!(
         !project.read_file("package.json").contains("axois"),
         "guard must run before package.json is mutated"
@@ -37,6 +39,7 @@ fn install_json_rejects_new_cli_arg_typosquat_before_manifest_mutation() {
     snapshot["error"]["config_path"] = serde_json::json!("[PROJECT]/lpm.toml");
     insta::assert_json_snapshot!(snapshot, @r###"
         {
+          "schema_version": 1,
           "success": false,
           "error_code": "typosquat_suspected",
           "error": {
@@ -53,7 +56,13 @@ fn install_json_rejects_new_cli_arg_typosquat_before_manifest_mutation() {
             "config_path": "[PROJECT]/lpm.toml",
             "allow_example": "[[policy.typosquat.allow]]\npackage = \"axois\"\nsimilar-to = \"axios\"\nreason = \"Intentional package\"",
             "suggested_command": "lpm install axios"
-          }
+          },
+          "next_steps": [
+            {
+              "description": "Install the suggested package",
+              "command": "lpm install axios"
+            }
+          ]
         }
         "###);
 }

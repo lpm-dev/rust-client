@@ -75,7 +75,11 @@ pub(super) fn exit_with_lpm_error(
 }
 
 fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>) {
-    let mut object = serde_json::Map::with_capacity(8);
+    let mut object = serde_json::Map::with_capacity(9);
+    object.insert(
+        "schema_version".to_owned(),
+        serde_json::json!(crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION),
+    );
     object.insert("success".to_owned(), serde_json::json!(false));
     object.insert("error_code".to_owned(), serde_json::json!("usage"));
     object.insert(
@@ -117,7 +121,7 @@ fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>) {
 }
 
 fn print_json_error(error: &lpm_common::LpmError) {
-    let json = match error {
+    let mut json = match error {
         lpm_common::LpmError::Resolution(context) => {
             let mut detail = serde_json::Map::with_capacity(12);
             detail.insert("code".to_owned(), serde_json::json!("RESOLUTION_FAILED"));
@@ -158,12 +162,14 @@ fn print_json_error(error: &lpm_common::LpmError) {
                 detail.insert("derivation".to_owned(), serde_json::json!(derivation));
             }
             serde_json::json!({
+                "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
                 "success": false,
                 "error_code": error.error_code(),
                 "error": serde_json::Value::Object(detail),
             })
         }
         lpm_common::LpmError::TyposquatSuspected(context) => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
             "error_code": "typosquat_suspected",
             "error": {
@@ -181,6 +187,7 @@ fn print_json_error(error: &lpm_common::LpmError) {
             project_root,
             suggested_command,
         } => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
             "error_code": "security_approval_required",
             "error": {
@@ -192,12 +199,42 @@ fn print_json_error(error: &lpm_common::LpmError) {
             }
         }),
         _ => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
             "error": format!("{error}"),
             "error_code": error.error_code(),
         }),
     };
+    if let Some(next_steps) = next_steps_for_error(error) {
+        json["next_steps"] = next_steps;
+    }
     println!("{}", serde_json::to_string_pretty(&json).unwrap());
+}
+
+fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Value> {
+    match error {
+        lpm_common::LpmError::AuthRequired => Some(crate::json_contract::command_next_steps(
+            "Authenticate with LPM",
+            "lpm login",
+        )),
+        lpm_common::LpmError::SessionExpired => Some(crate::json_contract::command_next_steps(
+            "Re-authenticate with LPM",
+            "lpm login",
+        )),
+        lpm_common::LpmError::TyposquatSuspected(context) => {
+            context.suggested_command.as_deref().map(|command| {
+                crate::json_contract::command_next_steps("Install the suggested package", command)
+            })
+        }
+        lpm_common::LpmError::SecurityApprovalRequired {
+            suggested_command: Some(command),
+            ..
+        } => Some(crate::json_contract::command_next_steps(
+            "Approve the requested security change",
+            command,
+        )),
+        _ => None,
+    }
 }
 
 fn render_slim_clap_error(error: &clap::Error, help_hint: Option<&str>) {

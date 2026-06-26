@@ -1543,6 +1543,7 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
 
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("install --json stdout must be valid JSON; got non-JSON output (mixed with logs?)");
+    assert_eq!(envelope["schema_version"], serde_json::json!(1));
     assert_eq!(envelope["overrides_fingerprint"], serde_json::Value::Null);
     assert_eq!(envelope["patches_fingerprint"], serde_json::Value::Null);
     assert_eq!(envelope["blocked_set_fingerprint"], serde_json::Value::Null);

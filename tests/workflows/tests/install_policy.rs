@@ -354,6 +354,45 @@ async fn install_default_policy_blocks_postinstall_scripts() {
 }
 
 #[tokio::test]
+async fn install_default_policy_json_suggests_approve_scripts_for_blocked_packages() {
+    let project = empty_project_with_dep("scripted-pkg");
+    let mock = MockRegistry::start().await;
+    mount_scripted_pkg(&mock, "scripted-pkg").await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "install"])
+        .output()
+        .expect("failed to run lpm --json install");
+
+    assert!(
+        output.status.success(),
+        "default-policy install with blocked scripts must still succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope = parse_last_json_object(&output.stdout, &output.stderr);
+    assert_eq!(envelope["schema_version"], serde_json::json!(1));
+    assert!(
+        envelope["blocked_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "default-policy JSON must report blocked script packages; got {envelope}",
+    );
+    assert!(
+        envelope["blocked_packages"]
+            .as_array()
+            .is_some_and(|packages| !packages.is_empty()),
+        "default-policy JSON must list blocked script packages; got {envelope}",
+    );
+    assert_eq!(
+        envelope["next_steps"][0]["description"],
+        "Review blocked lifecycle scripts"
+    );
+    assert_eq!(envelope["next_steps"][0]["command"], "lpm approve-scripts");
+}
+
+#[tokio::test]
 async fn install_default_policy_prints_approve_scripts_hint_after_done_summary() {
     let project = empty_project_with_dep("scripted-pkg");
     let mock = MockRegistry::start().await;
@@ -480,6 +519,10 @@ async fn install_policy_allow_reports_no_blocked_packages_after_running_dependen
         envelope["blocked_packages"],
         serde_json::json!([]),
         "successful allow-policy auto-build must clear blocked package JSON: {envelope}",
+    );
+    assert!(
+        envelope.get("next_steps").is_none(),
+        "allow-policy JSON must not suggest approve-scripts when nothing is blocked: {envelope}",
     );
 
     let build_state: serde_json::Value =
