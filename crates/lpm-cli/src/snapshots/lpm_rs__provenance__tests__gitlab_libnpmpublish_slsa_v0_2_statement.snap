@@ -1,0 +1,77 @@
+---
+source: crates/lpm-cli/src/provenance.rs
+expression: json
+---
+{
+  "_type": "https://in-toto.io/Statement/v0.1",
+  "subject": [
+    {
+      "name": "pkg:npm/pkg@1.0.0",
+      "digest": {
+        "sha512": "abc123"
+      }
+    }
+  ],
+  "predicateType": "https://slsa.dev/provenance/v0.2",
+  "predicate": {
+    "builder": {
+      "id": "https://gitlab.com/owner/repo/-/runners/789"
+    },
+    "buildType": "https://github.com/npm/cli/gitlab/v0alpha1",
+    "invocation": {
+      "configSource": {
+        "uri": "git+https://gitlab.com/owner/repo",
+        "digest": {
+          "sha1": "fedcba9876543210"
+        },
+        "entryPoint": "publish"
+      },
+      "parameters": {
+        "CI": "true",
+        "CI_API_V4_URL": "https://gitlab.com/api/v4",
+        "CI_COMMIT_SHA": "fedcba9876543210",
+        "CI_CONFIG_PATH": ".gitlab-ci.yml",
+        "CI_JOB_ID": "456",
+        "CI_JOB_NAME": "publish",
+        "CI_JOB_URL": "https://gitlab.com/owner/repo/-/jobs/456",
+        "CI_PIPELINE_ID": "123",
+        "CI_PROJECT_PATH": "owner/repo",
+        "CI_PROJECT_URL": "https://gitlab.com/owner/repo",
+        "CI_RUNNER_DESCRIPTION": "shared-runner",
+        "CI_RUNNER_ID": "789",
+        "CI_SERVER_URL": "https://gitlab.com",
+        "GITLAB_CI": "true"
+      },
+      "environment": {
+        "name": "shared-runner",
+        "architecture": "linux/amd64",
+        "server": "https://gitlab.com",
+        "project": "owner/repo",
+        "job": {
+          "id": "456"
+        },
+        "pipeline": {
+          "id": "123",
+          "ref": ".gitlab-ci.yml"
+        }
+      }
+    },
+    "metadata": {
+      "buildInvocationId": "https://gitlab.com/owner/repo/-/jobs/456",
+      "completeness": {
+        "parameters": true,
+        "environment": true,
+        "materials": false
+      },
+      "reproducible": false
+    },
+    "materials": [
+      {
+        "uri": "git+https://gitlab.com/owner/repo",
+        "digest": {
+          "sha1": "fedcba9876543210"
+        }
+      }
+    ]
+  }
+}

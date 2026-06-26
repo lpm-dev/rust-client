@@ -189,6 +189,8 @@ tracy = ["dep:tracing-tracy"]
 # Experimental metadata transport benchmark. Requires:
 # RUSTFLAGS='--cfg reqwest_unstable' cargo build --release -p lpm-cli --features experimental-http3
 experimental-http3 = ["lpm-registry/experimental-http3"]
+# Internal loopback-only Sigstore seam for workflow tests.
+internal-test-sigstore-mock = []
 
 [dependencies.dhat]
 version = "0.3"
@@ -201,6 +203,7 @@ optional = true
 [dev-dependencies]
 wiremock = "0.6"
 assert_cmd = "2"
+insta = { version = "1", features = ["json"] }
 
 # Phase 46 P4 Chunk 2: generate synthetic x509 certs with URI SANs in
 # unit tests so the SAN-extractor is exercised against deterministic

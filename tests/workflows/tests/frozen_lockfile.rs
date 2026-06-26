@@ -3,7 +3,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry};
 
 async fn mount_ms(mock: &MockRegistry) {
     let tarball = make_tarball("ms", "2.1.3");
@@ -24,6 +24,25 @@ async fn install_once(project: &TempProject, mock: &MockRegistry) {
     assert!(
         output.status.success(),
         "initial install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn install_workspace_once(project: &TempProject) {
+    let output = lpm(project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run initial workspace lpm install");
+
+    assert!(
+        output.status.success(),
+        "initial workspace install failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -299,5 +318,128 @@ async fn lpm_ci_json_reports_success_envelope_without_rewriting_lockfile() {
     assert!(
         envelope.get("timing").is_some(),
         "lpm --json ci success envelope must include timing, got: {envelope}"
+    );
+}
+
+#[test]
+fn lpm_ci_accepts_workspace_member_trusted_dependencies_without_rewriting_lockfiles() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-frozen-trust-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "lpm": {
+    "trustedDependencies": ["esbuild"]
+  }
+}"#,
+    );
+
+    install_workspace_once(&project);
+    let lock_before = project.read_file("lpm.lock");
+    let lockb_before = std::fs::read(project.path().join("lpm.lockb")).ok();
+
+    let output = lpm(&project)
+        .args([
+            "ci",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run lpm ci for workspace trust regression");
+
+    assert!(
+        output.status.success(),
+        "lpm ci must accept member-level trust config after a clean install:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        project.read_file("lpm.lock"),
+        lock_before,
+        "workspace trust-only frozen replay must not rewrite lpm.lock"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lockb")).ok(),
+        lockb_before,
+        "workspace trust-only frozen replay must not rewrite lpm.lockb"
+    );
+}
+
+#[test]
+fn lpm_ci_replays_workspace_member_manifest_change_when_lockfile_can_satisfy_link() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-frozen-member-drift-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "foo": "workspace:*" }
+}"#,
+    );
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{ "name": "foo", "version": "1.0.0" }"#,
+    );
+    project.write_file(
+        "packages/bar/package.json",
+        r#"{ "name": "bar", "version": "1.0.0" }"#,
+    );
+
+    install_workspace_once(&project);
+    assert!(
+        project.path().join("node_modules/foo").exists(),
+        "initial install must link the direct workspace dependency"
+    );
+    assert!(
+        !project.path().join("node_modules/bar").exists(),
+        "bar is not reachable before foo declares it"
+    );
+    let lock_before = project.read_file("lpm.lock");
+
+    project.write_file(
+        "packages/foo/package.json",
+        r#"{
+  "name": "foo",
+  "version": "1.0.0",
+  "dependencies": { "bar": "workspace:*" }
+}"#,
+    );
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before frozen replay");
+
+    let output = lpm(&project)
+        .args([
+            "ci",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("failed to run lpm ci after member manifest edit");
+
+    assert!(
+        output.status.success(),
+        "lpm ci must replay a workspace-member-only manifest edit when all links are locally satisfiable:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.path().join("node_modules/bar").exists(),
+        "frozen replay must materialize the newly reachable workspace sibling"
+    );
+    assert_eq!(
+        project.read_file("lpm.lock"),
+        lock_before,
+        "locally satisfiable workspace link replay must not rewrite lpm.lock"
     );
 }

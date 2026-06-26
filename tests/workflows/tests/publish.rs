@@ -4,15 +4,68 @@
 
 mod support;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
+use sha2::{Digest, Sha512};
 use support::assertions::parse_json_output;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const NPM_ID_TOKEN: &str = "publish-oidc-id-token";
 const OIDC_NPM_TOKEN: &str = "publish-oidc-exchanged-token";
 const CUSTOM_REGISTRY_TOKEN: &str = "publish-custom-registry-token";
+const SIGSTORE_PEM_CERT_LEAF: &str =
+    "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n";
+const SIGSTORE_PEM_CERT_ROOT: &str =
+    "-----BEGIN CERTIFICATE-----\nZGVm\n-----END CERTIFICATE-----\n";
+
+fn unsigned_sigstore_jwt(payload: serde_json::Value) -> String {
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 =
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("serialize JWT payload"));
+    let sig_b64 = URL_SAFE_NO_PAD.encode(b"workflow-test-signature");
+    format!("{header_b64}.{payload_b64}.{sig_b64}")
+}
+
+async fn mount_sigstore_publish_mocks(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/api/v2/signingCert"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!("{SIGSTORE_PEM_CERT_LEAF}{SIGSTORE_PEM_CERT_ROOT}").into_bytes(),
+            "application/pem-certificate-chain",
+        ))
+        .expect(1)
+        .mount(server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/log/entries"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "uuid": {
+                "logIndex": 123,
+                "integratedTime": 1700000000_i64,
+                "logID": "workflow-test-log",
+                "body": BASE64.encode(b"workflow-test-canonicalized-body"),
+                "verification": {
+                    "inclusionPromise": {
+                        "signedEntryTimestamp": BASE64.encode(b"workflow-test-set")
+                    },
+                    "inclusionProof": {
+                        "checkpoint": "rekor.sigstore.dev - 1\n124\nabc=\n\n",
+                        "hashes": ["aa", "bb"],
+                        "logIndex": 123,
+                        "rootHash": "rootabc",
+                        "treeSize": 124
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
 
 // ─── Dry Run ─────────────────────────────────────────────────────
 
@@ -497,6 +550,163 @@ async fn publish_npm_uses_trusted_publishing_token_exchange() {
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["results"][0]["registry"], serde_json::json!("npm"));
     assert_eq!(envelope["results"][0]["auth"], serde_json::json!("oidc"));
+}
+
+#[tokio::test]
+async fn publish_npm_generated_provenance_attaches_sigstore_bundle_to_registry_put() {
+    let mock = MockRegistry::start().await;
+    let sigstore = MockServer::start().await;
+    mount_sigstore_publish_mocks(&sigstore).await;
+    let package = "generated-provenance-pkg";
+    let registry_token = "generated-provenance-token";
+    Mock::given(method("PUT"))
+        .and(path(format!("/{package}")))
+        .and(header("authorization", format!("Bearer {registry_token}")))
+        .and(header("npm-command", "publish"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.0.0",
+        "description": "generated npm provenance workflow test",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"registry":"{}","access":"public"}}}}}}"#,
+            mock.url()
+        ),
+    );
+
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &mock.url(),
+            "--token",
+            registry_token,
+        ])
+        .output()
+        .expect("failed to store custom registry token");
+    assert!(
+        login.status.success(),
+        "custom registry login must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&login.stdout),
+        String::from_utf8_lossy(&login.stderr),
+    );
+
+    let sigstore_jwt = unsigned_sigstore_jwt(serde_json::json!({
+        "iss": "https://gitlab.com",
+        "sub": "project_path:owner/repo:ref_type:branch:ref:main",
+        "aud": "sigstore"
+    }));
+
+    let output = lpm(&project)
+        .env("LPM_INTERNAL_TEST_SIGSTORE_FULCIO_URL", sigstore.uri())
+        .env("LPM_INTERNAL_TEST_SIGSTORE_REKOR_URL", sigstore.uri())
+        .env("SIGSTORE_ID_TOKEN", sigstore_jwt)
+        .env("CI", "true")
+        .env("GITLAB_CI", "true")
+        .env("CI_PROJECT_URL", "https://gitlab.com/owner/repo")
+        .env("CI_PROJECT_PATH", "owner/repo")
+        .env("CI_COMMIT_SHA", "fedcba9876543210")
+        .env("CI_CONFIG_PATH", ".gitlab-ci.yml")
+        .env("CI_JOB_ID", "456")
+        .env("CI_JOB_NAME", "publish")
+        .env("CI_JOB_URL", "https://gitlab.com/owner/repo/-/jobs/456")
+        .env("CI_PIPELINE_ID", "123")
+        .env("CI_RUNNER_ID", "789")
+        .env("CI_RUNNER_DESCRIPTION", "shared-runner")
+        .env("CI_RUNNER_EXECUTABLE_ARCH", "linux/amd64")
+        .env("CI_SERVER_URL", "https://gitlab.com")
+        .args(["--json", "publish", "--npm", "--provenance", "--yes"])
+        .output()
+        .expect("failed to run lpm publish --npm --provenance");
+
+    assert!(
+        output.status.success(),
+        "npm publish with generated provenance must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    let publish_request = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .unwrap_or_else(|| panic!("expected npm publish PUT request, got {}", requests.len()));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&publish_request.body).expect("publish payload must be JSON");
+
+    let attachments = payload["_attachments"]
+        .as_object()
+        .unwrap_or_else(|| panic!("publish payload must include attachments: {payload:#}"));
+    let tarball_name = format!("{package}-1.0.0.tgz");
+    let tarball_attachment = attachments
+        .get(&tarball_name)
+        .unwrap_or_else(|| panic!("publish payload must include {tarball_name}: {payload:#}"));
+    let tarball_data = BASE64
+        .decode(
+            tarball_attachment["data"]
+                .as_str()
+                .expect("tarball attachment must carry base64 data"),
+        )
+        .expect("tarball attachment data must decode");
+    let tarball_sha512 = hex::encode(Sha512::digest(&tarball_data));
+
+    let sigstore_name = format!("{package}-1.0.0.sigstore");
+    let sigstore_attachment = attachments
+        .get(&sigstore_name)
+        .unwrap_or_else(|| panic!("publish payload must include {sigstore_name}: {payload:#}"));
+    assert_eq!(
+        sigstore_attachment["content_type"],
+        "application/vnd.dev.sigstore.bundle+json;version=0.2"
+    );
+    let bundle: serde_json::Value = serde_json::from_str(
+        sigstore_attachment["data"]
+            .as_str()
+            .expect("sigstore attachment must carry bundle JSON"),
+    )
+    .expect("sigstore attachment data must parse as JSON");
+    let statement_bytes = BASE64
+        .decode(
+            bundle["dsseEnvelope"]["payload"]
+                .as_str()
+                .expect("DSSE envelope must carry a payload"),
+        )
+        .expect("DSSE payload must decode");
+    let statement: serde_json::Value =
+        serde_json::from_slice(&statement_bytes).expect("DSSE payload must be JSON");
+
+    assert_eq!(
+        bundle["dsseEnvelope"]["payloadType"],
+        "application/vnd.in-toto+json"
+    );
+    assert_eq!(
+        statement["subject"][0]["name"],
+        format!("pkg:npm/{package}@1.0.0")
+    );
+    assert_eq!(statement["subject"][0]["digest"]["sha512"], tarball_sha512);
+    assert_eq!(
+        bundle["verificationMaterial"]["tlogEntries"][0]["logIndex"],
+        "123"
+    );
+    assert_eq!(
+        payload["versions"]["1.0.0"]["_npmProvenanceAttestations"]["dsseEnvelope"]["payload"],
+        bundle["dsseEnvelope"]["payload"]
+    );
 }
 
 #[tokio::test]
