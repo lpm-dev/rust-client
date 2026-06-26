@@ -115,6 +115,7 @@ async fn run_global_under_store_lock(
             // happens here regardless of the flag.
             let body = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
+                "success": true,
                 "command": "approve-scripts",
                 "scope": "global",
                 "dry_run": dry_run,
@@ -240,6 +241,7 @@ pub(super) fn print_global_list(
             .collect();
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
+            "success": true,
             "command": "approve-scripts",
             "scope": "global",
             "dry_run": dry_run,
@@ -394,6 +396,26 @@ pub(super) fn rerun_next_step_json(origins: &[String]) -> serde_json::Value {
     })
 }
 
+pub(super) fn rerun_next_steps_json(origins: &[String]) -> serde_json::Value {
+    if origins.is_empty() {
+        return crate::json_contract::command_next_steps(
+            "List affected global packages",
+            "lpm approve-scripts --global --list",
+        );
+    }
+
+    let mut steps = Vec::with_capacity(origins.len());
+    for origin in origins {
+        let description = format!("Reinstall {origin} to run approved scripts");
+        let command = format!("lpm uninstall -g {origin} && lpm install -g {origin}");
+        steps.push(crate::json_contract::command_next_step(
+            &description,
+            &command,
+        ));
+    }
+    serde_json::Value::Array(steps)
+}
+
 /// `--yes` implementation: approve every row in the aggregate in one
 /// transactional write under the global tx lock. Loud — emits a warning
 /// banner in non-JSON mode; in JSON mode surfaces the warning via the
@@ -524,6 +546,7 @@ pub(super) async fn run_global_bulk_yes(
             .collect();
         let mut body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
+            "success": true,
             "command": "approve-scripts",
             "scope": "global",
             "dry_run": dry_run,
@@ -542,6 +565,9 @@ pub(super) async fn run_global_bulk_yes(
             body.as_object_mut()
                 .unwrap()
                 .insert("next_step".into(), rerun_next_step_json(&origins));
+            body.as_object_mut()
+                .unwrap()
+                .insert("next_steps".into(), rerun_next_steps_json(&origins));
         }
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
     } else if dry_run {
@@ -689,6 +715,7 @@ pub(super) async fn run_global_named(
         }
         let mut body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
+            "success": true,
             "command": "approve-scripts",
             "scope": "global",
             "dry_run": dry_run,
@@ -705,6 +732,9 @@ pub(super) async fn run_global_named(
             body.as_object_mut()
                 .unwrap()
                 .insert("next_step".into(), rerun_next_step_json(&origins));
+            body.as_object_mut()
+                .unwrap()
+                .insert("next_steps".into(), rerun_next_steps_json(&origins));
         }
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
     } else if dry_run {

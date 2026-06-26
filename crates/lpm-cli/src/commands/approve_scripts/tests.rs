@@ -2271,6 +2271,23 @@ fn print_global_list_handles_empty_aggregate_without_panicking() {
     print_global_list(&agg, false, true, true);
 }
 
+#[test]
+fn rerun_next_steps_json_returns_reinstall_commands_for_global_origins() {
+    let origins = vec!["eslint".to_string(), "typescript".to_string()];
+    let steps = global::rerun_next_steps_json(&origins);
+    let steps = steps.as_array().expect("next_steps must be an array");
+
+    assert_eq!(steps.len(), 2);
+    assert_eq!(
+        steps[0]["command"].as_str(),
+        Some("lpm uninstall -g eslint && lpm install -g eslint")
+    );
+    assert_eq!(
+        steps[1]["command"].as_str(),
+        Some("lpm uninstall -g typescript && lpm install -g typescript")
+    );
+}
+
 /// `--yes` writes every aggregate row into the global trust file
 /// AND surfaces a `warnings` entry in JSON mode so agents can
 /// detect bulk-approval flows.

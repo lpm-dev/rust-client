@@ -442,6 +442,7 @@ async fn run_under_store_lock(
             // presence is a schema-level consistency guarantee.
             let body = serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
+                "success": true,
                 "command": "approve-scripts",
                 "dry_run": dry_run,
                 "blocked_count": 0,

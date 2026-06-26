@@ -145,8 +145,10 @@ async fn run_patch_inner(name: String, version: String, json_output: bool) -> Re
             "staging_dir": staging_path.display().to_string(),
             "package_dir": dest.display().to_string(),
             "next_steps": [
-                "Edit files in the package_dir",
-                format!("Run: lpm patch-commit {}", staging_path.display()),
+                {
+                    "description": "Commit the patch after editing package_dir",
+                    "command": format!("lpm patch-commit {}", staging_path.display()),
+                },
             ],
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap());

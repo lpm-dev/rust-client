@@ -24,7 +24,7 @@ use support::assertions;
 use support::build_state::{
     seed_blocked_build_state_with_real_hash, seed_global_install_blocked_state_with_real_hash,
 };
-use support::{TempProject, lpm};
+use support::{TempProject, lpm, write_signed_unlock};
 
 // ─── Project-mode fixture helpers ───────────────────────────────────────
 
@@ -137,6 +137,7 @@ fn approve_scripts_yes_dry_run_does_not_mutate_package_json_and_json_carries_fla
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("valid JSON on stdout expected: {e}\nstdout:\n{stdout}"));
+    assert_eq!(parsed["success"].as_bool(), Some(true));
     assert_eq!(parsed["dry_run"].as_bool(), Some(true));
     assert_eq!(parsed["approved_count"].as_u64(), Some(1));
 
@@ -151,6 +152,38 @@ fn approve_scripts_yes_dry_run_does_not_mutate_package_json_and_json_carries_fla
     assert!(
         first_msg.contains("DRY RUN"),
         "--yes warning must reframe as DRY RUN under --dry-run; warning={first_msg}"
+    );
+}
+
+#[test]
+fn approve_scripts_yes_json_reports_rebuild_next_step_when_approved() {
+    let project = TempProject::empty("");
+    write_project_no_trusted_deps(&project);
+    seed_blocked_build_state_with_real_hash(&project, "some-blocked-pkg", "1.0.0");
+    write_signed_unlock(&project, &["trust-bulk-approve"]);
+
+    let out = lpm(&project)
+        .args(["--json", "approve-scripts", "--yes"])
+        .output()
+        .expect("spawn lpm approve-scripts --yes");
+    assert!(
+        out.status.success(),
+        "--yes --json must exit 0 after signed unlock; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(parsed["success"].as_bool(), Some(true));
+    assert_eq!(parsed["approved_count"].as_u64(), Some(1));
+    assert_eq!(
+        parsed["next_steps"][0]["description"].as_str(),
+        Some("Run approved lifecycle scripts")
+    );
+    assert_eq!(
+        parsed["next_steps"][0]["command"].as_str(),
+        Some("lpm rebuild")
     );
 }
 
@@ -253,6 +286,7 @@ fn approve_scripts_empty_blocked_set_envelope_carries_dry_run_flag() {
     assert!(out_off.status.success());
     let parsed_off: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out_off.stdout).trim()).unwrap();
+    assert_eq!(parsed_off["success"].as_bool(), Some(true));
     assert_eq!(parsed_off["blocked_count"].as_u64(), Some(0));
     assert_eq!(parsed_off["dry_run"].as_bool(), Some(false));
 
@@ -319,6 +353,7 @@ fn approve_scripts_global_yes_dry_run_does_not_mutate_trust_file_and_json_carrie
 
     let parsed: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(parsed["success"].as_bool(), Some(true));
     assert_eq!(parsed["dry_run"].as_bool(), Some(true));
     assert_eq!(parsed["scope"].as_str(), Some("global"));
     assert_eq!(parsed["approved_count"].as_u64(), Some(1));
@@ -819,6 +854,7 @@ fn approve_scripts_list_json_emits_structured_version_diff_on_script_hash_drift(
         panic!("approve-scripts --list --json must be parseable: {e}\nstdout:\n{stdout}")
     });
 
+    assert_eq!(parsed["success"].as_bool(), Some(true));
     assert_eq!(parsed["schema_version"].as_u64(), Some(3));
     let blocked = parsed["blocked"]
         .as_array()
@@ -1272,6 +1308,7 @@ fn approve_scripts_list_json_emits_exactly_one_valid_json_payload_on_stdout() {
     let stdout_clean = strip_ansi(&String::from_utf8_lossy(&out.stdout));
     let parsed: serde_json::Value = serde_json::from_str(&stdout_clean)
         .unwrap_or_else(|e| panic!("stdout must be valid JSON: {e}\nstdout:\n{stdout_clean}"));
+    assert_eq!(parsed["success"].as_bool(), Some(true));
     assert_eq!(parsed["schema_version"].as_u64(), Some(3));
     assert!(
         !stdout_clean.contains("WARN"),
