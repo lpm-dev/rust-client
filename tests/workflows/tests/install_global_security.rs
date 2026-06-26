@@ -254,6 +254,12 @@ fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &s
             .is_some_and(|command| command.contains("--global")),
         "global approval envelope must suggest a --global unlock; got {envelope}",
     );
+    assert!(
+        envelope["next_steps"][0]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--global")),
+        "global approval envelope must expose a top-level --global next step; got {envelope}",
+    );
 }
 
 /// Seed a global manifest + per-install build-state so

@@ -1165,6 +1165,7 @@ async fn run_with_options_under_store_lock(
             // of which fast-path was taken. Stages are zero because no real work
             // ran — the entire pipeline was skipped.
             let mut json = serde_json::json!({
+                           "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
                            "success": true,
                            "up_to_date": true,
                            "duration_ms": total_ms as u64,
@@ -1724,6 +1725,7 @@ async fn run_with_options_under_store_lock(
         let total_ms = elapsed.as_millis();
         if json_output {
             let mut json = serde_json::json!({
+                           "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
                            "success": true,
                            "no_dependencies": true,
                            "duration_ms": total_ms as u64,
@@ -5853,6 +5855,7 @@ async fn run_with_options_under_store_lock(
             .collect();
 
         let mut json = serde_json::json!({
+                   "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
                    "success": true,
                    "packages": pkg_list,
                    "count": packages.len(),
@@ -6305,6 +6308,12 @@ async fn run_with_options_under_store_lock(
                 })
                 .collect(),
         );
+        if !blocked_capture.state.blocked_packages.is_empty() {
+            json["next_steps"] = crate::json_contract::command_next_steps(
+                "Review blocked lifecycle scripts",
+                "lpm approve-scripts",
+            );
+        }
         if let Some(counts) = &audit_summary_for_envelope {
             json["audit_summary"] = serde_json::to_value(counts).unwrap_or(serde_json::Value::Null);
         }

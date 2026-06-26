@@ -145,6 +145,18 @@ pub fn assert_security_approval_required(output: &std::process::Output) -> serde
     );
     assert_eq!(
         parsed
+            .get("schema_version")
+            .and_then(|value| value.as_u64()),
+        Some(1),
+        "security approval envelope must carry schema_version=1; got {parsed}",
+    );
+    assert_eq!(
+        parsed.get("error_code").and_then(|value| value.as_str()),
+        Some("security_approval_required"),
+        "security approval envelope must carry top-level error_code; got {parsed}",
+    );
+    assert_eq!(
+        parsed
             .get("error")
             .and_then(|value| value.get("code"))
             .and_then(|value| value.as_str()),

@@ -19,6 +19,7 @@ mod import_rewriter;
 pub mod install_state;
 pub mod install_ui;
 pub mod intelligence;
+mod json_contract;
 mod linker_config;
 mod manifest_tx;
 pub mod migration_warnings;

@@ -508,16 +508,15 @@ async fn auth_required_json_error() {
 
     assert!(!output.status.success());
 
-    // Even on error, --json should produce parseable JSON
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
-
-    // The error should be in some structured form
-    assert!(
-        combined.contains("error") || combined.contains("Unauthorized") || combined.contains("401"),
-        "expected error info in output, got:\nstdout: {stdout}\nstderr: {stderr}"
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["schema_version"], serde_json::json!(1));
+    assert_eq!(json["error_code"], "auth_required");
+    assert_eq!(
+        json["next_steps"][0]["description"],
+        "Authenticate with LPM"
     );
+    assert_eq!(json["next_steps"][0]["command"], "lpm login");
 }
 
 // ─── provenance.verified envelope shape ─────────────────────────────
