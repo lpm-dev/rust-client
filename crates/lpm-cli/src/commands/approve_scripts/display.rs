@@ -236,6 +236,7 @@ pub(super) fn print_listing(
     if json_output {
         let body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
+            "success": true,
             "command": "approve-scripts",
             "mode": "list",
             "dry_run": dry_run,
@@ -338,8 +339,9 @@ pub(super) fn print_summary(
                 "message": "trustedDependencies was upgraded from the legacy array form to the rich map form"
             }));
         }
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
+            "success": true,
             "command": "approve-scripts",
             "mode": if yes_flag { "yes" } else { "interactive" },
             "dry_run": dry_run,
@@ -368,6 +370,15 @@ pub(super) fn print_summary(
             "warnings": warnings,
             "errors": [],
         });
+        if !dry_run && !approved.is_empty() {
+            body.as_object_mut().unwrap().insert(
+                "next_steps".into(),
+                crate::json_contract::command_next_steps(
+                    "Run approved lifecycle scripts",
+                    "lpm rebuild",
+                ),
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&body).unwrap());
     } else {
         println!();

@@ -118,6 +118,16 @@ fn patch_extracts_to_temp_dir_with_breadcrumb() {
     assert_eq!(parsed["success"], serde_json::json!(true));
     assert_eq!(parsed["name"].as_str(), Some("lodash"));
     assert_eq!(parsed["version"].as_str(), Some("4.17.21"));
+    assert_eq!(
+        parsed["next_steps"][0]["description"].as_str(),
+        Some("Commit the patch after editing package_dir")
+    );
+    assert!(
+        parsed["next_steps"][0]["command"]
+            .as_str()
+            .is_some_and(|command| command.starts_with("lpm patch-commit ")),
+        "patch JSON must expose a runnable patch-commit next step: {parsed}",
+    );
 
     let staging = PathBuf::from(
         parsed["staging_dir"]
