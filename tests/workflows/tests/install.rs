@@ -1490,9 +1490,9 @@ async fn install_single_package_via_mock_registry() {
 /// dashboard / CI integrations that consume it: top-level
 /// `success` / `count` / `packages[]` / `up_to_date` etc. plus the
 /// per-package shape under `packages`. Highly-variable fields
-/// (`duration_ms`, the entire `timing` sub-tree, integrity hashes,
-/// resolver-internal counters) are redacted to keep the snapshot
-/// stable across runs and across resolver-internal refactors.
+/// (`duration_ms`, integrity hashes, resolver-internal counters) are
+/// redacted to keep the snapshot stable across runs and across
+/// resolver-internal refactors.
 #[tokio::test]
 async fn install_json_envelope_with_one_package_matches_snapshot() {
     let mock = MockRegistry::start().await;
@@ -1543,41 +1543,14 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
 
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("install --json stdout must be valid JSON; got non-JSON output (mixed with logs?)");
-    assert_eq!(envelope["schema_version"], serde_json::json!(1));
+    assert_eq!(envelope["schema_version"], serde_json::json!(2));
+    assert!(
+        envelope.get("timing").is_none(),
+        "default install --json must omit opt-in timing diagnostics; got {envelope:#}"
+    );
     assert_eq!(envelope["overrides_fingerprint"], serde_json::Value::Null);
     assert_eq!(envelope["patches_fingerprint"], serde_json::Value::Null);
     assert_eq!(envelope["blocked_set_fingerprint"], serde_json::Value::Null);
-
-    let waterfall = &envelope["timing"]["waterfall"];
-    assert!(
-        waterfall.is_object(),
-        "install --json must emit timing.waterfall; got {envelope:#}"
-    );
-    assert!(
-        envelope["timing"].get("detail").is_none(),
-        "install --json must omit timing.detail unless LPM_TIMING_DETAIL is set; got {envelope:#}"
-    );
-    assert!(
-        waterfall.get("detail").is_none(),
-        "install --json must not nest detail under timing.waterfall by default; got {envelope:#}"
-    );
-    let segment = |key: &str| {
-        waterfall[key]
-            .as_u64()
-            .unwrap_or_else(|| panic!("timing.waterfall.{key} missing or non-number: {waterfall}"))
-    };
-    let segment_sum = segment("setup_ms")
-        + segment("resolve_ms")
-        + segment("pre_fetch_ms")
-        + segment("fetch_ms")
-        + segment("pre_link_ms")
-        + segment("link_ms")
-        + segment("tail_ms");
-    assert_eq!(
-        segment_sum,
-        segment("total_ms"),
-        "timing.waterfall segments must sum to total_ms"
-    );
 
     insta::with_settings!({
         filters => vec![
@@ -1593,7 +1566,6 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
             // High-variance numeric / hash fields — locking values would
             // make the snapshot a flake magnet.
             ".duration_ms" => "[DURATION]",
-            ".timing" => "[TIMING]",
             ".packages[].integrity" => "[INTEGRITY]",
             ".packages[].duration_ms" => "[DURATION]",
             // Resolver-arm telemetry counters vary by route mode + arm.
@@ -1601,6 +1573,86 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
             ".cache" => "[CACHE]",
         });
     });
+}
+
+#[tokio::test]
+async fn install_json_timing_flag_exposes_waterfall_without_detail() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"timing-flag-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--json",
+            "--timing",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run lpm install --json --timing");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "install --json --timing failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_str(&stdout).expect("install --json --timing must emit parseable JSON");
+
+    assert_eq!(envelope["schema_version"], serde_json::json!(2));
+    assert!(
+        envelope["timing"]["waterfall"].is_object(),
+        "--timing must emit timing.waterfall; got {envelope:#}"
+    );
+    assert!(
+        envelope["timing"].get("detail").is_none(),
+        "--timing alone must not emit timing.detail; got {envelope:#}"
+    );
+}
+
+#[tokio::test]
+async fn install_json_timing_env_exposes_waterfall_without_detail() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{"name":"timing-env-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TIMING", "1")
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run LPM_TIMING=1 lpm install --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "LPM_TIMING=1 install --json failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("LPM_TIMING=1 install --json must emit parseable JSON");
+
+    assert_eq!(envelope["schema_version"], serde_json::json!(2));
+    assert!(
+        envelope["timing"]["waterfall"].is_object(),
+        "LPM_TIMING=1 must emit timing.waterfall; got {envelope:#}"
+    );
+    assert!(
+        envelope["timing"].get("detail").is_none(),
+        "LPM_TIMING=1 must not emit timing.detail; got {envelope:#}"
+    );
 }
 
 #[tokio::test]
@@ -2034,6 +2086,7 @@ async fn install_experimental_spike_replays_frozen_lockfile_and_emits_json() {
         .args([
             "install",
             "--json",
+            "--timing",
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
@@ -2083,6 +2136,7 @@ async fn install_experimental_spike_live_graph_requires_benchmark_ack() {
         .args([
             "install",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -2129,6 +2183,7 @@ async fn install_experimental_spike_live_graph_requires_parity_deny() {
         .args([
             "install",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -2172,6 +2227,7 @@ async fn install_experimental_spike_lockfile_graph_requires_lockfile_gates() {
         .args([
             "install",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -2218,6 +2274,7 @@ async fn install_experimental_spike_live_graph_does_not_write_install_hash() {
         .args([
             "install",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -2303,6 +2360,7 @@ async fn install_experimental_spike_live_graph_applies_patched_dependencies() {
         .args([
             "install",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -2422,6 +2480,7 @@ async fn install_experimental_spike_live_graph_preserves_platform_skipped_option
         .args([
             "install",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -2494,6 +2553,7 @@ async fn install_experimental_spike_live_graph_accepts_overrides_with_parity_den
         .args([
             "install",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -2573,6 +2633,7 @@ async fn install_experimental_spike_live_graph_links_file_source_with_transitive
         .args([
             "install",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -2640,6 +2701,7 @@ async fn install_experimental_spike_live_graph_links_workspace_member_source() {
         .args([
             "install",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -3001,6 +3063,7 @@ async fn install_json_output_contains_package_list() {
         .args([
             "install",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",
@@ -3260,6 +3323,7 @@ async fn install_up_to_date_json_includes_flag() {
     assert!(output.status.success());
 
     let json = assertions::parse_json_output(&output.stdout);
+    assert_eq!(json["schema_version"], serde_json::json!(2));
     assert_eq!(json["success"], true);
     assert_eq!(json["up_to_date"], true);
     assertions::assert_json_field(&json, "duration_ms", assertions::JsonType::Number);
@@ -3278,6 +3342,72 @@ async fn install_up_to_date_json_includes_flag() {
     assert!(
         json["timing"]["detail"]["trace"]["slow_packages"].is_object(),
         "trace mode must include empty slow-package buckets on the fast path; got {json:#}"
+    );
+}
+
+#[tokio::test]
+async fn install_fast_lane_json_omits_timing_by_default() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("ms", "2.1.3");
+    mock.with_package("ms", "2.1.3", &tarball).await;
+
+    let batch_meta = serde_json::json!({
+        "name": "ms",
+        "dist-tags": { "latest": "2.1.3" },
+        "versions": {
+            "2.1.3": {
+                "name": "ms",
+                "version": "2.1.3",
+                "dist": {
+                    "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
+                    "integrity": compute_integrity(&tarball),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { "2.1.3": "2025-01-01T00:00:00.000Z" }
+    });
+    mock.with_batch_metadata(vec![batch_meta]).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "fast-lane-json-lean-test",
+        "version": "1.0.0",
+        "dependencies": {
+            "ms": "^2.1.3"
+        }
+    }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--json"])
+        .output()
+        .expect("failed to run fast-lane install --json");
+    assert!(
+        output.status.success(),
+        "fast-lane install --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = assertions::parse_json_output(&output.stdout);
+    assert_eq!(json["schema_version"], serde_json::json!(2));
+    assert_eq!(json["success"], serde_json::json!(true));
+    assert_eq!(json["up_to_date"], serde_json::json!(true));
+    assertions::assert_json_field(&json, "duration_ms", assertions::JsonType::Number);
+    assert!(
+        json.get("timing").is_none(),
+        "fast-lane install --json must omit timing by default; got {json:#}"
     );
 }
 
@@ -3457,6 +3587,7 @@ async fn install_offline_firewall_report_relinks_and_reports_offline_skip_json()
             "install",
             "--offline",
             "--json",
+            "--timing",
             "--no-security-summary",
             "--no-skills",
             "--no-editor-setup",

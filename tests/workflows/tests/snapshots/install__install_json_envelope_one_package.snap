@@ -1,10 +1,10 @@
 ---
 source: tests/workflows/tests/install.rs
-assertion_line: 630
+assertion_line: 1565
 expression: envelope
 ---
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "success": true,
   "packages": [
     {
@@ -21,10 +21,6 @@ expression: envelope
   "symlinked": 2,
   "used_lockfile": false,
   "duration_ms": "[DURATION]",
-  "timing": "[TIMING]",
-  "warnings": [],
-  "errors": [],
-  "peer_conflicts": [],
   "peer_issues": {
     "missing": [],
     "bad": [],
@@ -36,6 +32,9 @@ expression: envelope
     "intersections_count": 0,
     "total_count": 0
   },
+  "warnings": [],
+  "errors": [],
+  "peer_conflicts": [],
   "overrides_count": 0,
   "overrides_fingerprint": null,
   "applied_patches": [],

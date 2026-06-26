@@ -46,7 +46,7 @@ pub(crate) fn run() -> Result<()> {
     // check. The install-state check also tries an mtime short-circuit
     // first, which skips both the lpm.lock read and the SHA-256 pass
     // when the manifest/lockfile mtimes are unchanged.
-    if let Some(json_mode) = install_state::argv_qualifies_for_fast_lane()
+    if let Some(fast_lane) = install_state::argv_qualifies_for_fast_lane()
         && let Ok(cwd) = std::env::current_dir()
     {
         // Start timing BEFORE any disk work, matching install.rs which
@@ -54,7 +54,7 @@ pub(crate) fn run() -> Result<()> {
         let start = std::time::Instant::now();
 
         let pkg_content_opt = std::fs::read_to_string(cwd.join("package.json")).ok();
-        let workspace_json_output = json_mode
+        let workspace_json_output = fast_lane.json
             && (pkg_content_opt
                 .as_deref()
                 .is_some_and(install_state::is_workspace_root_content)
@@ -63,24 +63,34 @@ pub(crate) fn run() -> Result<()> {
         if !workspace_json_output && let Some(pkg_content) = pkg_content_opt.as_deref() {
             let state = install_state::check_install_state_with_content(&cwd, pkg_content);
             if state.up_to_date {
-                if let Err(error) = ensure_fast_lane_firewall_posture(&cwd, json_mode) {
-                    exit_with_lpm_error(&error, json_mode, lpm_common::DEFAULT_REGISTRY_URL);
+                if let Err(error) = ensure_fast_lane_firewall_posture(&cwd, fast_lane.json) {
+                    exit_with_lpm_error(&error, fast_lane.json, lpm_common::DEFAULT_REGISTRY_URL);
                 }
                 let elapsed_ms = start.elapsed().as_millis();
-                if json_mode {
+                if fast_lane.json {
+                    let schema_version = crate::json_contract::INSTALL_JSON_SCHEMA_VERSION;
+                    let timing_requested =
+                        crate::json_contract::install_timing_requested(fast_lane.timing);
                     // Hand-formatted to match `serde_json::to_string_pretty`
                     // output for the `install.rs` up-to-date object —
                     // avoids constructing a `serde_json::Value` on the
-                    // hot path. Shape pinned by the up-to-date fast-path
-                    // branch in `install.rs` (`success + up_to_date +
-                    // duration_ms + timing{resolve/fetch/link/total}`).
-                    println!(
-                        "{{\n  \"success\": true,\n  \"up_to_date\": true,\n  \
-                         \"duration_ms\": {elapsed_ms},\n  \"timing\": {{\n    \
-                         \"resolve_ms\": 0,\n    \"fetch_ms\": 0,\n    \
-                         \"link_ms\": 0,\n    \"total_ms\": {elapsed_ms}\n  \
-                         }}\n}}"
-                    );
+                    // hot path.
+                    if timing_requested {
+                        println!(
+                            "{{\n  \"schema_version\": {schema_version},\n  \
+                             \"success\": true,\n  \"up_to_date\": true,\n  \
+                             \"duration_ms\": {elapsed_ms},\n  \"timing\": {{\n    \
+                             \"resolve_ms\": 0,\n    \"fetch_ms\": 0,\n    \
+                             \"link_ms\": 0,\n    \"total_ms\": {elapsed_ms}\n  \
+                             }}\n}}"
+                        );
+                    } else {
+                        println!(
+                            "{{\n  \"schema_version\": {schema_version},\n  \
+                             \"success\": true,\n  \"up_to_date\": true,\n  \
+                             \"duration_ms\": {elapsed_ms}\n}}"
+                        );
+                    }
                 } else {
                     output::success(&format!("up to date ({elapsed_ms}ms)"));
                 }
@@ -424,6 +434,7 @@ async fn async_main() -> Result<()> {
             no_skills,
             no_editor_setup,
             no_security_summary,
+            timing,
             auto_build,
             no_engine_strict,
             audit_after_install,
@@ -809,6 +820,7 @@ async fn async_main() -> Result<()> {
                         no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
                     let eff_no_sec =
                         no_security_summary || cfg.get_bool("noSecuritySummary").unwrap_or(false);
+                    let eff_timing = timing;
                     let eff_auto_build = auto_build || cfg.get_bool("autoBuild").unwrap_or(false);
                     // Top-level dispatch passes ONLY the CLI flag through;
                     // `~/.lpm/config.toml > linker`, `LPM_LINKER`, and
@@ -856,6 +868,7 @@ async fn async_main() -> Result<()> {
                         no_sandbox,
                         cli.verbose,
                         eff_audit_after_install,
+                        eff_timing,
                         &[],
                     )
                     .await?;
@@ -894,6 +907,7 @@ async fn async_main() -> Result<()> {
                     no_sandbox,
                     cli.verbose,
                     eff_audit_after_install,
+                    timing,
                 )
                 .await
             } else {
@@ -934,6 +948,7 @@ async fn async_main() -> Result<()> {
                         no_sandbox,
                         cli.verbose,
                         eff_audit_after_install,
+                        timing,
                     )
                     .await
                 } else {
@@ -960,6 +975,7 @@ async fn async_main() -> Result<()> {
                         no_sandbox,
                         cli.verbose,
                         eff_audit_after_install,
+                        timing,
                     )
                     .await
                 }
@@ -2326,6 +2342,7 @@ async fn async_main() -> Result<()> {
                 no_sandbox,
                 cli.verbose,
                 eff_audit_after_install,
+                false,
                 &[],
             )
             .await?;

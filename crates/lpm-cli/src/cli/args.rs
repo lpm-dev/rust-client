@@ -519,6 +519,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         no_security_summary: bool,
 
+        /// Include install timing diagnostics in `--json` output.
+        #[arg(long)]
+        timing: bool,
+
         /// Automatically run `lpm rebuild` for trusted packages after install.
         ///
         /// Redundant under `--policy=allow` / `--yolo` (auto-build fires
@@ -3637,6 +3641,17 @@ mod tests {
         match cli.command.expect("test parse missing subcommand") {
             Commands::Install { workspace_root, .. } => {
                 assert!(workspace_root, "--workspace-root must enable the flag");
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn install_timing_flag_parses() {
+        let cli = Cli::try_parse_from(["lpm", "install", "--json", "--timing"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Install { timing, .. } => {
+                assert!(timing, "--timing must enable install timing diagnostics");
             }
             _ => panic!("expected Install command"),
         }

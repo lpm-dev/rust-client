@@ -903,6 +903,7 @@ pub async fn run_add_packages(
     verbose: bool,
     // forwarded resolved audit-after-install boolean — see [`run_with_options`].
     audit_after_install: bool,
+    timing: bool,
 ) -> Result<(), LpmError> {
     let reviewed = crate::typosquat_guard::guard_explicit_package_specs(
         project_dir,
@@ -1058,6 +1059,7 @@ pub async fn run_add_packages(
             no_sandbox,
             verbose,
             audit_after_install,
+            timing,
             &[],
         )
         .await?;
@@ -1145,6 +1147,7 @@ pub async fn run_install_filtered_add(
     verbose: bool,
     // forwarded resolved audit-after-install boolean — see [`run_with_options`].
     audit_after_install: bool,
+    timing: bool,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -1439,6 +1442,7 @@ pub async fn run_install_filtered_add(
                 no_sandbox,
                 verbose,
                 audit_after_install,
+                timing,
                 &[],
             )
             .await;

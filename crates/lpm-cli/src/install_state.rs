@@ -871,7 +871,7 @@ pub fn write_install_hash(
 
 /// Pre-clap argv gate for the top-of-main fast lane.
 ///
-/// Returns `Some(json_mode)` if the fast lane should attempt the check.
+/// Returns `Some(mode)` if the fast lane should attempt the check.
 /// Returns `None` if any disqualifying flag or argument is present.
 ///
 /// Recognized install subcommands: "install", "i" (visible_alias).
@@ -880,7 +880,13 @@ pub fn write_install_hash(
 /// the full pipeline. This guarantees the fast lane never produces wrong
 /// results — false negatives (falling through) are safe, false positives
 /// (exiting early when we shouldn't) are not.
-pub fn argv_qualifies_for_fast_lane() -> Option<bool> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FastLaneMode {
+    pub json: bool,
+    pub timing: bool,
+}
+
+pub fn argv_qualifies_for_fast_lane() -> Option<FastLaneMode> {
     if ci_env_is_truthy() {
         return None;
     }
@@ -895,12 +901,18 @@ pub fn argv_qualifies_for_fast_lane() -> Option<bool> {
         .map(|a| a.to_str())
         .collect::<Option<Vec<_>>>()?;
 
-    let mut json_mode = false;
+    fast_lane_mode_from_args(&args)
+}
+
+fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
+    let mut json = false;
+    let mut timing = false;
     let mut found_install = false;
 
-    for arg in &args {
+    for arg in args {
         match *arg {
-            "--json" => json_mode = true,
+            "--json" => json = true,
+            "--timing" if found_install => timing = true,
 
             // Global flags that change registry/auth behavior → disqualify.
             // --token and --registry take a value: disqualify on the flag itself.
@@ -956,7 +968,11 @@ pub fn argv_qualifies_for_fast_lane() -> Option<bool> {
         }
     }
 
-    if found_install { Some(json_mode) } else { None }
+    if found_install {
+        Some(FastLaneMode { json, timing })
+    } else {
+        None
+    }
 }
 
 pub(crate) fn ci_env_is_truthy() -> bool {
@@ -1016,6 +1032,22 @@ mod tests {
         );
         fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
         dir
+    }
+
+    #[test]
+    fn fast_lane_mode_from_args_accepts_timing_after_install() {
+        assert_eq!(
+            fast_lane_mode_from_args(&["--json", "install", "--timing"]),
+            Some(FastLaneMode {
+                json: true,
+                timing: true
+            })
+        );
+    }
+
+    #[test]
+    fn fast_lane_mode_from_args_rejects_timing_before_install() {
+        assert_eq!(fast_lane_mode_from_args(&["--timing", "install"]), None);
     }
 
     #[test]

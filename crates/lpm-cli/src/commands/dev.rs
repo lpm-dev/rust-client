@@ -1576,6 +1576,7 @@ async fn auto_install_if_stale(
             false, // no_sandbox
             false, // verbose: internal pipeline, no user-facing Done footer
             false, // audit_after_install: internal pipeline never runs audit
+            false, // timing: dev auto-install does not expose install's --timing flag
             compatibility_bin_names,
         )
         .await

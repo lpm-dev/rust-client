@@ -215,6 +215,7 @@ pub async fn run_fix(
         false, // no_sandbox
         false, // verbose
         false, // audit_after_install
+        false, // timing
         &[],
     )
     .await;

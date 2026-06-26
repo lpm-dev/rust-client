@@ -785,6 +785,7 @@ pub async fn run_with_options(
     // block and emits a one-line advisory (or attaches `audit_summary`
     // to the JSON envelope). Audit results NEVER fail the install.
     audit_after_install: bool,
+    timing: bool,
     compatibility_bin_names: &[String],
 ) -> Result<(), LpmError> {
     let lpm_root = lpm_common::LpmRoot::from_env()?;
@@ -817,6 +818,7 @@ pub async fn run_with_options(
         no_sandbox,
         verbose,
         audit_after_install,
+        timing,
         compatibility_bin_names,
         lpm_root,
     )
@@ -853,6 +855,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     no_sandbox: bool,
     verbose: bool,
     audit_after_install: bool,
+    timing: bool,
     compatibility_bin_names: &[String],
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
@@ -898,6 +901,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             no_sandbox,
             verbose,
             audit_after_install,
+            timing,
             compatibility_bin_names,
             &lpm_root,
         ),
@@ -945,6 +949,7 @@ async fn run_with_options_under_store_lock(
     verbose: bool,
     // Resolved audit-after-install boolean — see [`run_with_options`].
     audit_after_install: bool,
+    timing: bool,
     compatibility_bin_names: &[String],
     lpm_root: &lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
@@ -954,6 +959,7 @@ async fn run_with_options_under_store_lock(
     crate::build_state::reset_write_timing();
     crate::security_floor::clear_recorded_suppressions();
     let timing_detail_mode = TimingDetailMode::from_env();
+    let emit_timing = crate::json_contract::install_timing_requested(timing);
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     let verify_registry_signatures = registry_signature_verification_enabled(&global_config);
     let registry_signature_timings = timing_detail_mode
@@ -1199,6 +1205,9 @@ async fn run_with_options_under_store_lock(
                     wf_setup_install_state_ms,
                     0,
                 );
+            }
+            if !emit_timing && let Some(obj) = json.as_object_mut() {
+                obj.remove("timing");
             }
             // surface workspace target set for agents.
             if let Some(targets) = target_set {
@@ -1760,6 +1769,9 @@ async fn run_with_options_under_store_lock(
                     wf_setup_route_table_ms,
                 );
             }
+            if !emit_timing && let Some(obj) = json.as_object_mut() {
+                obj.remove("timing");
+            }
             if let Some(targets) = target_set {
                 json["target_set"] = serde_json::Value::Array(
                     targets.iter().map(|s| serde_json::json!(s)).collect(),
@@ -2147,6 +2159,7 @@ async fn run_with_options_under_store_lock(
             auto_build,
             no_sandbox,
             strict_sandbox,
+            emit_timing,
             compatibility_bin_names,
         )
         .await;
@@ -6188,6 +6201,9 @@ async fn run_with_options_under_store_lock(
                 });
             }
             json["timing"]["detail"] = detail;
+        }
+        if !emit_timing && let Some(obj) = json.as_object_mut() {
+            obj.remove("timing");
         }
         // surface workspace target set for agents.
         // None for legacy/standalone callers; Some(...) for the filtered path.

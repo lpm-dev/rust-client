@@ -314,10 +314,11 @@ async fn lpm_ci_json_reports_success_envelope_without_rewriting_lockfile() {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("lpm --json ci must emit valid JSON: {e}\n---\n{stdout}"));
+    assert_eq!(envelope["schema_version"], serde_json::json!(2));
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert!(
-        envelope.get("timing").is_some(),
-        "lpm --json ci success envelope must include timing, got: {envelope}"
+        envelope.get("timing").is_none(),
+        "lpm --json ci success envelope must omit opt-in timing by default, got: {envelope}"
     );
 }
 
