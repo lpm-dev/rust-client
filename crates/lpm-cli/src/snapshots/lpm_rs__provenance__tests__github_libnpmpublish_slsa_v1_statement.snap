@@ -1,0 +1,51 @@
+---
+source: crates/lpm-cli/src/provenance.rs
+expression: json
+---
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    {
+      "name": "pkg:npm/pkg@1.0.0",
+      "digest": {
+        "sha512": "abc123"
+      }
+    }
+  ],
+  "predicateType": "https://slsa.dev/provenance/v1",
+  "predicate": {
+    "buildDefinition": {
+      "buildType": "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1",
+      "externalParameters": {
+        "workflow": {
+          "ref": "refs/tags/v1.2.3",
+          "repository": "https://github.com/owner/repo",
+          "path": ".github/workflows/publish.yml"
+        }
+      },
+      "internalParameters": {
+        "github": {
+          "event_name": "release",
+          "repository_id": "100",
+          "repository_owner_id": "200"
+        }
+      },
+      "resolvedDependencies": [
+        {
+          "uri": "git+https://github.com/owner/repo@refs/tags/v1.2.3",
+          "digest": {
+            "gitCommit": "0123456789abcdef"
+          }
+        }
+      ]
+    },
+    "runDetails": {
+      "builder": {
+        "id": "https://github.com/actions/runner/github-hosted"
+      },
+      "metadata": {
+        "invocationId": "https://github.com/owner/repo/actions/runs/123/attempts/2"
+      }
+    }
+  }
+}
