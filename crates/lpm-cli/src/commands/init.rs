@@ -20,7 +20,7 @@ This project uses lpm.
 - Install dependencies with `lpm install`.
 - Add source packages with `lpm add <package>`.
 - Run scripts with `lpm run <script>`.
-- Keep `lpm.lock` and `lpm.lockb` in sync by using lpm commands.
+- Use `--json` when you need machine-readable output from lpm commands.
 - CLI docs: https://cli.lpm.dev/
 <!-- lpm:init:end -->
 ";
@@ -634,6 +634,8 @@ mod tests {
 
         assert!(updated.contains("This project uses lpm."));
         assert!(updated.contains("## After\nkeep"));
+        assert!(updated.contains("Use `--json` when you need machine-readable output"));
+        assert!(!updated.contains("Keep `lpm.lock`"));
         assert!(!updated.contains("\nold\n"));
     }
 
@@ -645,5 +647,6 @@ mod tests {
         assert!(updated.contains(AGENTS_START_MARKER));
         assert!(updated.contains("Install dependencies with `lpm install`."));
         assert!(updated.contains("Add source packages with `lpm add <package>`."));
+        assert!(updated.contains("Use `--json` when you need machine-readable output"));
     }
 }

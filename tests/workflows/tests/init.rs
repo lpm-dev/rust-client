@@ -139,6 +139,10 @@ async fn init_yes_json_uses_profile_username_and_creates_gitattributes() {
         "init must write the AGENTS.md lpm hint"
     );
     assert!(
+        !project.file_exists("CLAUDE.md"),
+        "init must not create provider-specific agent files"
+    );
+    assert!(
         project.file_exists(".gitattributes"),
         "init must pre-create .gitattributes"
     );
@@ -226,6 +230,14 @@ async fn init_npm_yes_writes_npm_name_publish_config_and_agents_hint() {
     assert!(
         agents.contains("Install dependencies with `lpm install`."),
         "AGENTS.md must teach agents to use lpm, got:\n{agents}"
+    );
+    assert!(
+        agents.contains("Use `--json` when you need machine-readable output from lpm commands."),
+        "AGENTS.md must teach agents to prefer JSON when parsing lpm output, got:\n{agents}"
+    );
+    assert!(
+        !agents.contains("Keep `lpm.lock`"),
+        "AGENTS.md must not imply agents manually sync lockfiles, got:\n{agents}"
     );
 }
 
