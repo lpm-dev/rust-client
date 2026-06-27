@@ -1,6 +1,7 @@
 //! Append-only JSONL audit trail for trust-store and CA mutations.
 //!
-//! Path: `~/.lpm/audit/cert.jsonl` (overridable via `LPM_CERT_AUDIT_DIR` for tests).
+//! Path: `~/.lpm/audit/cert.jsonl` (debug/test builds can override it via
+//! `LPM_CERT_AUDIT_DIR`).
 //! Dir mode 0o700, file mode 0o600 (Unix). One event per line, RFC 3339 timestamp.
 //! Best-effort fsync: losing the last entry on hard crash is acceptable for this
 //! audit trail.
@@ -114,10 +115,12 @@ struct AuditEnvelope {
     action: AuditAction,
 }
 
-/// Resolve the audit log path. Honors `LPM_CERT_AUDIT_DIR` when set (tests), falls
-/// back to `~/.lpm/audit/cert.jsonl`.
+/// Resolve the audit log path. Debug/test builds honor `LPM_CERT_AUDIT_DIR`;
+/// release builds fall back to `~/.lpm/audit/cert.jsonl`.
 pub fn audit_log_path() -> Result<PathBuf, LpmError> {
-    if let Some(override_dir) = std::env::var_os(AUDIT_DIR_ENV) {
+    if crate::test_env_overrides_enabled()
+        && let Some(override_dir) = std::env::var_os(AUDIT_DIR_ENV)
+    {
         return Ok(PathBuf::from(override_dir).join("cert.jsonl"));
     }
     let home = dirs::home_dir()
@@ -179,18 +182,21 @@ pub fn append_best_effort(action: AuditAction) {
 mod tests {
     use super::*;
 
+    #[cfg(debug_assertions)]
     fn with_audit_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
         let dir = tempfile::tempdir().unwrap();
         let _guard = EnvGuard::set(AUDIT_DIR_ENV, dir.path());
         f(dir.path())
     }
 
+    #[cfg(debug_assertions)]
     fn read_lines(audit_dir: &std::path::Path) -> Vec<String> {
         let log = audit_dir.join("cert.jsonl");
         let s = std::fs::read_to_string(&log).unwrap_or_default();
         s.lines().map(|l| l.to_string()).collect()
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn append_creates_dir_and_file_at_0700_and_0600() {
         let _serial = serial_lock();
@@ -216,6 +222,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn append_writes_one_line_per_event_with_ts_and_action() {
         let _serial = serial_lock();
@@ -256,6 +263,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn append_records_failure_with_error_string() {
         let _serial = serial_lock();
@@ -275,6 +283,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn append_records_rotate_sequence_with_complete() {
         let _serial = serial_lock();
@@ -317,6 +326,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn append_best_effort_swallows_on_error_directory_unwriteable() {
         let _serial = serial_lock();
@@ -330,6 +340,18 @@ mod tests {
             validity_days: 825,
             name_constraints: false,
         });
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn audit_dir_env_is_ignored_in_release_builds() {
+        let _serial = serial_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set(AUDIT_DIR_ENV, dir.path());
+
+        let path = audit_log_path().unwrap();
+
+        assert_ne!(path, dir.path().join("cert.jsonl"));
     }
 
     fn serial_lock() -> std::sync::MutexGuard<'static, ()> {

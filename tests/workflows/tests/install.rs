@@ -825,9 +825,8 @@ async fn install_audit_after_install_failure_does_not_fail_install() {
     // `run_with_options_under_store_lock` owns this contract; this
     // test pins it.
     //
-    // Failure injection uses `LPM_TEST_AUDIT_AFTER_INSTALL_FAIL=1` +
-    // `LPM_TEST_MODE=1` (the latter is implicit in debug builds via
-    // `cfg!(debug_assertions)`). The trigger is owned by
+    // Failure injection uses `LPM_TEST_AUDIT_AFTER_INSTALL_FAIL=1`,
+    // honored only by debug builds. The trigger is owned by
     // `maybe_test_audit_after_install_should_fail` in install.rs.
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("ms", "2.1.3");
@@ -839,7 +838,6 @@ async fn install_audit_after_install_failure_does_not_fail_install() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env("LPM_TEST_MODE", "1")
         .env("LPM_TEST_AUDIT_AFTER_INSTALL_FAIL", "1")
         .args([
             "--json",

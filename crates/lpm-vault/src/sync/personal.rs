@@ -830,6 +830,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn pull_raw_times_out_when_server_stalls() {
         let _guard = env_lock_guard();

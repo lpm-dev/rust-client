@@ -19,7 +19,7 @@ fn route_for_project(host: &str, upstream_port: u16, project_dir: &Path) -> Rout
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, debug_assertions))]
 async fn cert_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
     use std::sync::OnceLock;
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -28,7 +28,7 @@ async fn cert_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, debug_assertions))]
 async fn setup_cert_home() -> (tempfile::TempDir, tokio::sync::MutexGuard<'static, ()>) {
     let guard = cert_env_guard().await;
     let home = tempfile::tempdir().unwrap();
@@ -625,7 +625,7 @@ fn tls_cert_store_loads_project_leaf_for_registered_host() {
     assert!(store.get("api.localhost").is_none());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, debug_assertions))]
 #[tokio::test]
 async fn tls_control_daemon_prepares_project_leaf_when_route_registers() {
     let (_home, _guard) = setup_cert_home().await;

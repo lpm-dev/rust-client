@@ -80,6 +80,9 @@ pub(super) async fn read_verified_response(
 }
 
 pub(super) fn sync_request_timeout(default: std::time::Duration) -> std::time::Duration {
+    if !cfg!(debug_assertions) {
+        return default;
+    }
     match std::env::var("LPM_TEST_SYNC_TIMEOUT_MS") {
         Ok(value) => value
             .parse::<u64>()
@@ -155,5 +158,22 @@ mod tests {
             err.contains("declared length"),
             "expected pre-stream rejection, got: {err}"
         );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn sync_request_timeout_ignores_env_in_release_builds() {
+        let _guard = crate::test_env_lock::acquire_env_lock();
+        let original_timeout = std::env::var_os("LPM_TEST_SYNC_TIMEOUT_MS");
+        unsafe { std::env::set_var("LPM_TEST_SYNC_TIMEOUT_MS", "50") };
+
+        let timeout = sync_request_timeout(std::time::Duration::from_secs(30));
+
+        match original_timeout {
+            Some(value) => unsafe { std::env::set_var("LPM_TEST_SYNC_TIMEOUT_MS", value) },
+            None => unsafe { std::env::remove_var("LPM_TEST_SYNC_TIMEOUT_MS") },
+        }
+
+        assert_eq!(timeout, std::time::Duration::from_secs(30));
     }
 }

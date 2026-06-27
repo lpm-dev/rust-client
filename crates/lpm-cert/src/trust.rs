@@ -18,6 +18,9 @@ const TEST_TRUST_STORE_DIR_ENV: &str = "LPM_CERT_TEST_TRUST_STORE_DIR";
 const LINUX_TRUST_STORE_PATH: &str = "/usr/local/share/ca-certificates/lpm-local-ca.crt";
 
 fn test_trust_store_dir() -> Option<std::path::PathBuf> {
+    if !crate::test_env_overrides_enabled() {
+        return None;
+    }
     std::env::var_os(TEST_TRUST_STORE_DIR_ENV).map(std::path::PathBuf::from)
 }
 
@@ -641,6 +644,7 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
         assert_eq!(tps.len(), 2);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn is_ca_installed_uses_fingerprint_via_test_backend() {
         let _serial = serial_lock();
@@ -665,6 +669,7 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn uninstall_preserves_lookalike_with_different_fingerprint() {
         let _serial = serial_lock();
@@ -686,6 +691,17 @@ SHA-256 hash: 1122334455667788990011223344556677889900112233445566778899001122
             is_ca_installed(&real_path).unwrap(),
             "uninstall keyed by a non-matching fingerprint must leave the real CA alone"
         );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn test_trust_store_env_is_ignored_in_release_builds() {
+        let _serial = serial_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set(TEST_TRUST_STORE_DIR_ENV, dir.path());
+
+        assert_eq!(test_trust_store_path(), None);
+        assert_ne!(crate::trust_store_label(), "test");
     }
 
     /// Tests that mutate `LPM_CERT_TEST_TRUST_STORE_DIR` lock this mutex so they
