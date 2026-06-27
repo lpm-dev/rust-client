@@ -962,8 +962,9 @@ fn assert_lockfile_well_formed_or_absent(project_dir: &std::path::Path, context:
 /// **What this test does NOT cover.** Workspace path
 /// (`run_install_filtered_add`) and `lpm add` have separate
 /// transaction sites; the hook is wired only in `run_add_packages`
-/// today. Phase-2 follow-up if needed — A.1's race surface used
+/// today. Follow-up if needed — A.1's race surface used
 /// `run_add_packages` so this is the highest-value first wiring.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn install_panics_mid_pipeline_rollback_restores_manifest() {
     let mock = MockRegistry::start().await;
@@ -1095,9 +1096,11 @@ async fn install_panics_mid_pipeline_rollback_restores_manifest() {
 // Helper trait — workflow tests use this in a couple of places to
 // avoid repeating `.windows()` boilerplate. Tight scope: just for
 // substring check on byte slices.
+#[cfg(debug_assertions)]
 trait ContainsSubslice {
     fn contains_subslice(&self, needle: &[u8]) -> bool;
 }
+#[cfg(debug_assertions)]
 impl ContainsSubslice for [u8] {
     fn contains_subslice(&self, needle: &[u8]) -> bool {
         self.windows(needle.len()).any(|w| w == needle)
@@ -1294,6 +1297,7 @@ async fn install_retries_tarball_5xx_until_success() {
 ///   (~28s elapsed) — which is the whole point of finding #78.
 /// - Tarball attempts ≥ 4 — proves the retry loop ran the full
 ///   schedule, not just one attempt.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn tarball_503_exhausts_retries_fails_with_http_status() {
     use std::sync::Arc;
@@ -2831,6 +2835,7 @@ async fn malformed_registry_json_fails_without_manifest_or_lockfile_mutation() {
 /// not exercised here; that scenario is covered by E.2
 /// (`install_with_stale_install_hash_re_resolves_and_refetches`),
 /// which pins the recovery path with a planted stale hash.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn install_panics_after_install_hash_write_rollback_invalidates_hash() {
     let mock = MockRegistry::start().await;

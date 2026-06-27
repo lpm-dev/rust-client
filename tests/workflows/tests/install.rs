@@ -815,6 +815,7 @@ async fn install_audit_after_install_enabled_via_config_file() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn install_audit_after_install_failure_does_not_fail_install() {
     // Locks the "audit findings are informational only" contract.
