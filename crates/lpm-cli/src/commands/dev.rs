@@ -2478,6 +2478,7 @@ mod tests {
                 Some(std::ffi::OsString::from(home.path().as_os_str())),
             ),
             ("LPM_LINKER", None),
+            (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
             ("LPM_TOKEN", None),
             ("NPM_TOKEN", None),
             ("GITHUB_ACTIONS", None),
