@@ -433,11 +433,18 @@ pub async fn pull_env(
 mod tests {
     use super::*;
     use crate::signature;
-    use crate::sync::test_support::{IsolatedVaultKeyEnv, env_lock_guard, signed_ok_response};
+    #[cfg(debug_assertions)]
+    use crate::sync::test_support::IsolatedVaultKeyEnv;
+    #[cfg(debug_assertions)]
+    use crate::sync::test_support::{env_lock_guard, signed_ok_response};
+    #[cfg(debug_assertions)]
     use std::sync::{Arc, Mutex as StdMutex};
     use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    #[cfg(debug_assertions)]
+    use wiremock::{Request, Respond};
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn pull_attempts_migration_repush_after_legacy_decrypt() {
         // When the cloud blob is encrypted with the legacy token-derived key
@@ -524,6 +531,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn pull_succeeds_even_when_migration_repush_fails() {
         // Migration is best-effort: a pull must still return Ok with the
@@ -579,6 +587,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn push_raw_returns_plain_text_conflict_body_on_non_json_error() {
         let _guard = env_lock_guard();
@@ -691,6 +700,7 @@ mod tests {
     /// not run on them — error formatting from the body proceeds normally.
     /// This guards against a regression where the helper accidentally
     /// requires a signature on every response.
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn push_does_not_require_signature_on_error_responses() {
         let _guard = env_lock_guard();
@@ -729,6 +739,7 @@ mod tests {
 
     /// Push success path must verify the signature before returning the
     /// PushResponse. Mirror of the pull test on the response-write surface.
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn push_rejects_unsigned_success_response() {
         let _guard = env_lock_guard();
@@ -785,6 +796,7 @@ mod tests {
         assert!(err.contains(signature::SIGNATURE_HEADER));
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn pull_env_returns_empty_for_non_default_legacy_flat_vault() {
         let _guard = env_lock_guard();
@@ -930,6 +942,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn push_raw_surfaces_expected_version_required_hint_on_409() {
         // Pins the wire-level contract between the server's

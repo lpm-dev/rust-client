@@ -782,6 +782,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn data_key_decrypts_existing_file_blob_after_promotion_without_reencrypting() {
         with_temp_vault_home(|_| {
@@ -842,6 +843,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn storage_backend_reports_native_when_native_key_exists_with_stale_file_key() {
         with_temp_vault_home(|_| {

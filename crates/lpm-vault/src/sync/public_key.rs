@@ -513,7 +513,9 @@ pub async fn ensure_public_key(registry_url: &str, auth_token: &str) -> Result<[
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use crate::sync::test_support::{IsolatedVaultKeyEnv, env_lock_guard};
+    #[cfg(debug_assertions)]
+    use crate::sync::test_support::IsolatedVaultKeyEnv;
+    use crate::sync::test_support::env_lock_guard;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -695,6 +697,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn classify_public_key_state_matches_when_server_key_equals_local() {
         let _guard = env_lock_guard();
@@ -724,6 +727,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn classify_public_key_state_needs_initial_set_when_server_returns_null() {
         let _guard = env_lock_guard();
@@ -748,6 +752,7 @@ mod tests {
         ));
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn classify_public_key_state_rotation_required_when_server_key_differs() {
         // Critical regression guard: the previous `ensure_public_key`
@@ -785,6 +790,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn classify_public_key_state_propagates_server_errors_instead_of_collapsing() {
         // The prior `get_my_public_key` mapped 401/500 to `Ok(None)`,
@@ -808,6 +814,7 @@ mod tests {
         assert!(err.contains("500"), "got: {err}");
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn pending_key_lifecycle_round_trips_through_create_read_promote() {
         // Create → read → promote, verifying that promote leaves the
@@ -855,6 +862,7 @@ mod tests {
         assert_eq!(live.public_key_b64, pending.public_key_b64);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn pending_key_discard_removes_orphan_without_touching_live() {
         let _guard = env_lock_guard();
@@ -878,6 +886,7 @@ mod tests {
         assert_eq!(live_after.public_key_b64, live.public_key_b64);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn pending_key_promote_when_no_pending_is_explicit_error() {
         let _guard = env_lock_guard();

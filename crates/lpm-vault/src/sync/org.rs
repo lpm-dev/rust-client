@@ -307,13 +307,19 @@ pub async fn push_org(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(debug_assertions)]
     use crate::signature;
+    #[cfg(debug_assertions)]
     use crate::sync::test_support::env_lock_guard;
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+    #[cfg(debug_assertions)]
     use std::sync::{Arc, Mutex as StdMutex};
+    #[cfg(debug_assertions)]
     use wiremock::matchers::{body_string_contains, header, method, path};
+    #[cfg(debug_assertions)]
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+    #[cfg(debug_assertions)]
     #[test]
     fn push_org_with_keys_regenerates_corrupted_forced_file_key_and_skips_members_without_keys() {
         let _guard = env_lock_guard();
@@ -463,6 +469,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn push_org_with_keys_round_trips_name_and_schema_metadata() {
         // Org pushes used to omit `name` + `schema` from the request body, so
@@ -623,6 +630,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn push_org_with_keys_omits_metadata_fields_when_caller_passes_none() {
         // Symmetry with the round-trip test above: when no metadata is

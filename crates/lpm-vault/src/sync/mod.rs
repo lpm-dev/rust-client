@@ -40,7 +40,9 @@ pub use step_up::{
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    #[cfg(debug_assertions)]
     use crate::signature;
+    #[cfg(debug_assertions)]
     use wiremock::ResponseTemplate;
 
     /// Acquire the crate-wide env-mutation lock so this module's
@@ -59,6 +61,7 @@ pub(crate) mod test_support {
     /// for signed vault endpoints — body bytes plus matching X-LPM-Signature
     /// header. Tests that drive `pull*`/`push*` for `auth_token` must use
     /// this helper or the response fails verification.
+    #[cfg(debug_assertions)]
     pub(crate) fn signed_ok_response(
         body: serde_json::Value,
         auth_token: &str,
@@ -79,12 +82,14 @@ pub(crate) mod test_support {
     /// Caller must already hold `env_lock_guard()` — this struct does not
     /// acquire it. The async tests in this module take `env_lock`
     /// immediately and the lock guard outlives this struct.
+    #[cfg(debug_assertions)]
     pub(crate) struct IsolatedVaultKeyEnv {
         _tmp: tempfile::TempDir,
         prior_home: Option<crate::test_env_lock::HomeEnvSnapshot>,
         prior_force_file: Option<std::ffi::OsString>,
     }
 
+    #[cfg(debug_assertions)]
     impl IsolatedVaultKeyEnv {
         pub(crate) fn new() -> Self {
             let tmp = tempfile::tempdir().expect("tempdir for vault key isolation");
@@ -103,6 +108,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(debug_assertions)]
     impl Drop for IsolatedVaultKeyEnv {
         fn drop(&mut self) {
             // SAFETY: still inside the env_lock-protected section.
