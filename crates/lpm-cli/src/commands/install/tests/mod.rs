@@ -19,6 +19,30 @@ fn confirm_prompt_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
 }
 
+#[cfg(not(debug_assertions))]
+#[test]
+fn lpm_test_mode_does_not_enable_panic_injection_in_release_builds() {
+    let _env = crate::test_env::ScopedEnv::set([
+        ("LPM_TEST_MODE", "1".into()),
+        ("LPM_TEST_PANIC_AT", "after-stage".into()),
+    ]);
+
+    let result = std::panic::catch_unwind(|| maybe_test_panic("after-stage"));
+
+    assert!(result.is_ok());
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn lpm_test_mode_does_not_enable_audit_failure_injection_in_release_builds() {
+    let _env = crate::test_env::ScopedEnv::set([
+        ("LPM_TEST_MODE", "1".into()),
+        ("LPM_TEST_AUDIT_AFTER_INSTALL_FAIL", "1".into()),
+    ]);
+
+    assert!(!maybe_test_audit_after_install_should_fail());
+}
+
 #[cfg(unix)]
 struct StdinSwapGuard {
     original_stdin_fd: std::os::fd::RawFd,

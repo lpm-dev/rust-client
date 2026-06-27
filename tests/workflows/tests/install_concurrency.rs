@@ -927,7 +927,7 @@ fn assert_lockfile_well_formed_or_absent(project_dir: &std::path::Path, context:
 /// E.1/E.2/E.3) but the panic-rollback path was unprovable. The
 /// `maybe_test_panic(stage)` hook at [install.rs](../../../crates/lpm-cli/src/commands/install.rs)
 /// reads `LPM_TEST_PANIC_AT` and panics deterministically when the
-/// stage matches, gated to debug builds OR `LPM_TEST_MODE=1` so
+/// stage matches. The hook is honored only by debug builds so
 /// production is immune. Wired stages: `after-snapshot`, `after-stage`,
 /// `after-install`, `after-finalize`.
 ///
@@ -962,8 +962,9 @@ fn assert_lockfile_well_formed_or_absent(project_dir: &std::path::Path, context:
 /// **What this test does NOT cover.** Workspace path
 /// (`run_install_filtered_add`) and `lpm add` have separate
 /// transaction sites; the hook is wired only in `run_add_packages`
-/// today. Phase-2 follow-up if needed — A.1's race surface used
+/// today. Follow-up if needed — A.1's race surface used
 /// `run_add_packages` so this is the highest-value first wiring.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn install_panics_mid_pipeline_rollback_restores_manifest() {
     let mock = MockRegistry::start().await;
@@ -1000,8 +1001,7 @@ async fn install_panics_mid_pipeline_rollback_restores_manifest() {
 
     let output = lpm_with_registry(&project, &mock.url())
         // Trigger the panic at the after-stage point. The hook is
-        // gated to debug builds OR LPM_TEST_MODE=1; debug is the
-        // default for `cargo nextest run`.
+        // debug-build-only; debug is the default for `cargo nextest run`.
         .env("LPM_TEST_PANIC_AT", "after-stage")
         .args(install_args_with(&["rollback-pkg@1.0.0"]))
         .output()
@@ -1096,9 +1096,11 @@ async fn install_panics_mid_pipeline_rollback_restores_manifest() {
 // Helper trait — workflow tests use this in a couple of places to
 // avoid repeating `.windows()` boilerplate. Tight scope: just for
 // substring check on byte slices.
+#[cfg(debug_assertions)]
 trait ContainsSubslice {
     fn contains_subslice(&self, needle: &[u8]) -> bool;
 }
+#[cfg(debug_assertions)]
 impl ContainsSubslice for [u8] {
     fn contains_subslice(&self, needle: &[u8]) -> bool {
         self.windows(needle.len()).any(|w| w == needle)
@@ -1278,8 +1280,8 @@ async fn install_retries_tarball_5xx_until_success() {
 /// docstring). To keep the test in the workflow-suite's <5s
 /// determinism budget, the test sets `LPM_RETRY_BACKOFF_MS_OVERRIDE=10`
 /// on the lpm subprocess. The override is honored by `backoff_delay`
-/// AND the 429 `Retry-After` sleep, gated to debug builds OR
-/// `LPM_TEST_MODE=1` so production retry policy is immune.
+/// AND the 429 `Retry-After` sleep. The override is honored only by
+/// debug builds so production retry policy is immune.
 ///
 /// Pinned contract:
 ///
@@ -1295,6 +1297,7 @@ async fn install_retries_tarball_5xx_until_success() {
 ///   (~28s elapsed) — which is the whole point of finding #78.
 /// - Tarball attempts ≥ 4 — proves the retry loop ran the full
 ///   schedule, not just one attempt.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn tarball_503_exhausts_retries_fails_with_http_status() {
     use std::sync::Arc;
@@ -1361,8 +1364,8 @@ async fn tarball_503_exhausts_retries_fails_with_http_status() {
     let output = lpm_with_registry(&project, &mock.url())
         // shrink the retry-backoff schedule from
         // exponential 1+2+4+8s → flat 10ms so retry exhaustion fits
-        // in the <5s test budget. Honored only in debug builds OR
-        // when LPM_TEST_MODE=1 — production retry policy unaffected.
+        // in the <5s test budget. Honored only in debug builds —
+        // production retry policy unaffected.
         .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "10")
         .args(install_args_with(&["doomed-pkg@1.0.0"]))
         .output()
@@ -2832,6 +2835,7 @@ async fn malformed_registry_json_fails_without_manifest_or_lockfile_mutation() {
 /// not exercised here; that scenario is covered by E.2
 /// (`install_with_stale_install_hash_re_resolves_and_refetches`),
 /// which pins the recovery path with a planted stale hash.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn install_panics_after_install_hash_write_rollback_invalidates_hash() {
     let mock = MockRegistry::start().await;

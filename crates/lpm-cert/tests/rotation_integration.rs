@@ -4,6 +4,8 @@
 //! trust-store / audit / projects-index env vars can be mutated without racing
 //! other tests.
 
+#![cfg(debug_assertions)]
+
 use lpm_cert::{audit, cert, paths, projects, rotate, trust};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,

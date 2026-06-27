@@ -20,6 +20,10 @@ pub mod trust;
 use lpm_common::LpmError;
 use std::path::Path;
 
+pub(crate) fn test_env_overrides_enabled() -> bool {
+    cfg!(debug_assertions)
+}
+
 /// Write sensitive key material to a file with restricted permissions (0o600) from creation.
 ///
 /// On Unix, the existing file (if any) is removed before `create_new` opens it with
@@ -54,7 +58,7 @@ pub fn write_key_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// Static label for the platform's trust store, used as the `store` field in audit
 /// events. Lowercase + kebab to match the strings logged by other LPM subsystems.
 pub fn trust_store_label() -> &'static str {
-    if std::env::var_os("LPM_CERT_TEST_TRUST_STORE_DIR").is_some() {
+    if test_env_overrides_enabled() && std::env::var_os("LPM_CERT_TEST_TRUST_STORE_DIR").is_some() {
         return "test";
     }
     #[cfg(target_os = "macos")]

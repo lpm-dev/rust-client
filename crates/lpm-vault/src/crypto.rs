@@ -88,6 +88,9 @@ pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
 }
 
 fn force_file_wrapping_key() -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     matches!(
         std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
@@ -568,6 +571,7 @@ mod tests {
     /// the lock with `lib.rs::tests::with_forced_file_vault_backend`
     /// is what closes the parallel-cascade where one module's tests
     /// would mutate env while another module's tests were mid-flight.
+    #[cfg(debug_assertions)]
     struct IsolatedVaultEnv {
         _tmp: tempfile::TempDir,
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -575,6 +579,7 @@ mod tests {
         prior_force_file: Option<std::ffi::OsString>,
     }
 
+    #[cfg(debug_assertions)]
     impl IsolatedVaultEnv {
         fn new() -> Self {
             let guard = crate::test_env_lock::acquire_env_lock();
@@ -595,6 +600,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     impl Drop for IsolatedVaultEnv {
         fn drop(&mut self) {
             // SAFETY: still holding the shared env-lock via `_guard`.
@@ -608,6 +614,25 @@ mod tests {
                 prior_home.restore();
             }
         }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn force_file_wrapping_key_ignores_env_in_release_builds() {
+        let _guard = crate::test_env_lock::acquire_env_lock();
+        let prior = std::env::var_os("LPM_FORCE_FILE_VAULT");
+        unsafe {
+            std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+        }
+        let forced = force_file_wrapping_key();
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var("LPM_FORCE_FILE_VAULT", value),
+                None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
+            }
+        }
+
+        assert!(!forced);
     }
 
     #[test]
@@ -653,6 +678,7 @@ mod tests {
         assert!(unwrap_key(&key2, &wrapped).is_err());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn wrapping_key_independent_of_token() {
         let _env = IsolatedVaultEnv::new();
@@ -673,6 +699,7 @@ mod tests {
         assert_ne!(key1, legacy_b);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn wrapping_key_roundtrip() {
         let _env = IsolatedVaultEnv::new();
@@ -689,6 +716,7 @@ mod tests {
         assert_eq!(unwrapped, aes_key);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn wrapping_key_persists() {
         let _env = IsolatedVaultEnv::new();
@@ -698,6 +726,7 @@ mod tests {
         assert_eq!(key1, key2, "wrapping key must persist between calls");
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn vault_sync_round_trip_new_key() {
         let _env = IsolatedVaultEnv::new();
@@ -715,6 +744,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn vault_sync_legacy_migration() {
         let _env = IsolatedVaultEnv::new();
@@ -737,6 +767,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn vault_sync_token_rotation_does_not_break_new_key() {
         let _env = IsolatedVaultEnv::new();

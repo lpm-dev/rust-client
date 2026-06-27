@@ -763,6 +763,7 @@ mod tests {
     // within one module.
 
     /// Clean up Keychain items created by a test (prevents Keychain pollution).
+    #[cfg(debug_assertions)]
     fn cleanup_vault(project_dir: &Path) {
         if let Some(vault_id) = vault_id::read_vault_id(project_dir) {
             #[cfg(target_os = "macos")]
@@ -775,6 +776,7 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     fn with_forced_file_vault_backend<T>(test: impl FnOnce() -> T) -> T {
         let _lock = crate::test_env_lock::acquire_env_lock();
         let temp_home = tempfile::tempdir().expect("create temp HOME");
@@ -886,6 +888,7 @@ KEY3=no-quotes"#;
         assert_eq!(content.matches(".env.local").count(), 1);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn set_and_get_all_round_trip() {
         with_forced_file_vault_backend(|| {
@@ -908,6 +911,7 @@ KEY3=no-quotes"#;
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn delete_secrets() {
         with_forced_file_vault_backend(|| {
@@ -926,6 +930,7 @@ KEY3=no-quotes"#;
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn list_keys_sorted() {
         with_forced_file_vault_backend(|| {
@@ -951,6 +956,7 @@ KEY3=no-quotes"#;
         assert!(secrets.is_empty());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn import_and_export_round_trip() {
         with_forced_file_vault_backend(|| {
@@ -973,6 +979,7 @@ KEY3=no-quotes"#;
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn import_and_export_round_trip_multiline_secret() {
         with_forced_file_vault_backend(|| {
@@ -1058,6 +1065,7 @@ KEY3=no-quotes"#;
         assert!(err.contains("env keys must match"));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn set_accepts_canonical_env_var_names() {
         with_forced_file_vault_backend(|| {
@@ -1080,7 +1088,7 @@ KEY3=no-quotes"#;
     /// On Unix the file must be created at 0o600 — default-umask
     /// writes (typically 0o644) would expose credentials to every
     /// other local uid on shared hosts.
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     #[test]
     fn export_env_file_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -1103,6 +1111,7 @@ KEY3=no-quotes"#;
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn import_no_overwrite() {
         with_forced_file_vault_backend(|| {
@@ -1124,6 +1133,7 @@ KEY3=no-quotes"#;
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn import_with_overwrite() {
         with_forced_file_vault_backend(|| {
@@ -1144,6 +1154,7 @@ KEY3=no-quotes"#;
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn import_adds_to_gitignore() {
         with_forced_file_vault_backend(|| {
@@ -1168,6 +1179,7 @@ KEY3=no-quotes"#;
     /// Mirrors `tests/workflows/tests/env_vault.rs::
     /// env_pull_overwrites_local_state_with_remote_environments` at the
     /// storage layer (no subprocess, no mock registry).
+    #[cfg(debug_assertions)]
     #[test]
     fn replace_all_environments_drops_local_only_envs_and_overwrites_each_env() {
         let _lock = crate::test_env_lock::acquire_env_lock();

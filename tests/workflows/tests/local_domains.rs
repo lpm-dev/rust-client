@@ -1,3 +1,5 @@
+#![cfg(debug_assertions)]
+
 mod support;
 
 #[cfg(unix)]

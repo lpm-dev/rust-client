@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+const GRACE_FILE_ENV: &str = "LPM_CERT_GRACE_FILE";
+
 /// Hard cap on `keep_old_trusted_days` per plan: 90 days.
 pub const MAX_GRACE_DAYS: u32 = 90;
 
@@ -470,7 +472,9 @@ pub struct GraceEntry {
 }
 
 pub fn grace_file_path() -> Result<PathBuf, LpmError> {
-    if let Some(p) = std::env::var_os("LPM_CERT_GRACE_FILE") {
+    if crate::test_env_overrides_enabled()
+        && let Some(p) = std::env::var_os(GRACE_FILE_ENV)
+    {
         return Ok(PathBuf::from(p));
     }
     let home = dirs::home_dir()
@@ -552,6 +556,7 @@ pub fn drop_grace_entry(fingerprint: &str) -> Result<bool, LpmError> {
 mod tests {
     use super::*;
 
+    #[cfg(debug_assertions)]
     fn parse_rfc3339(s: &str) -> time::OffsetDateTime {
         time::OffsetDateTime::parse(s, &Rfc3339).unwrap()
     }
@@ -564,12 +569,13 @@ mod tests {
         assert!(o.extra_projects.is_empty());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn grace_entries_round_trip() {
         let _serial = serial_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cert-grace.json");
-        let _g = EnvGuard::set("LPM_CERT_GRACE_FILE", &path);
+        let _g = EnvGuard::set(GRACE_FILE_ENV, &path);
 
         schedule_grace("AA:BB", "2026-08-01T00:00:00Z").unwrap();
         schedule_grace("CC:DD", "2026-09-01T00:00:00Z").unwrap();
@@ -581,12 +587,13 @@ mod tests {
         assert_eq!(removed.year(), 2026);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn schedule_grace_replaces_existing_fingerprint() {
         let _serial = serial_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cert-grace.json");
-        let _g = EnvGuard::set("LPM_CERT_GRACE_FILE", &path);
+        let _g = EnvGuard::set(GRACE_FILE_ENV, &path);
 
         schedule_grace("AA:BB", "2026-08-01T00:00:00Z").unwrap();
         schedule_grace("AA:BB", "2026-12-01T00:00:00Z").unwrap();
@@ -595,12 +602,13 @@ mod tests {
         assert_eq!(entries[0].removes_at, "2026-12-01T00:00:00Z");
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn drop_grace_entry_removes_only_named() {
         let _serial = serial_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cert-grace.json");
-        let _g = EnvGuard::set("LPM_CERT_GRACE_FILE", &path);
+        let _g = EnvGuard::set(GRACE_FILE_ENV, &path);
 
         schedule_grace("AA:BB", "2026-08-01T00:00:00Z").unwrap();
         schedule_grace("CC:DD", "2026-09-01T00:00:00Z").unwrap();
@@ -611,14 +619,26 @@ mod tests {
         assert_eq!(entries[0].fingerprint, "CC:DD");
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn drop_grace_entry_returns_false_when_absent() {
         let _serial = serial_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cert-grace.json");
-        let _g = EnvGuard::set("LPM_CERT_GRACE_FILE", &path);
+        let _g = EnvGuard::set(GRACE_FILE_ENV, &path);
 
         assert!(!drop_grace_entry("ZZ:ZZ").unwrap());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn grace_file_env_is_ignored_in_release_builds() {
+        let _serial = serial_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cert-grace.json");
+        let _guard = EnvGuard::set(GRACE_FILE_ENV, &path);
+
+        assert_ne!(grace_file_path().unwrap(), path);
     }
 
     fn serial_lock() -> std::sync::MutexGuard<'static, ()> {

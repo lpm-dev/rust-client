@@ -77,7 +77,7 @@ const APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION: u32 = 1;
 const AUDIT_EVENT_SCHEMA_VERSION: u32 = 1;
 const AUDIT_HEAD_SCHEMA_VERSION: u32 = 1;
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 const SECURITY_POLICY_PATH_ENV: &str = "LPM_SECURITY_POLICY_PATH";
 #[cfg(test)]
 const TEST_SECRET_ENV: &str = "LPM_TEST_SECURITY_SECRET_HEX";
@@ -87,7 +87,7 @@ const TEST_AUTH_RESULT_ENV: &str = "LPM_TEST_SECURITY_AUTH_RESULT";
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
 fn force_file_audit_head_backend() -> bool {
-    if !cfg!(debug_assertions) {
+    if !cfg!(any(debug_assertions, test)) {
         return false;
     }
     matches!(
@@ -143,7 +143,7 @@ fn keyring_account(base: &str) -> Result<String, lpm_common::LpmError> {
 
 #[allow(unused_imports)]
 mod prelude {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, test))]
     pub(super) use super::SECURITY_POLICY_PATH_ENV;
     pub(super) use super::{
         APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION, APPROVED_POSTURE_SCHEMA_VERSION,

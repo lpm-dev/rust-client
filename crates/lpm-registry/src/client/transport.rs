@@ -488,11 +488,9 @@ pub(super) fn parse_retry_after(response: &reqwest::Response) -> u64 {
 /// attempt 0 → 1s, attempt 1 → 2s, attempt 2 → 4s, capped at 10s.
 ///
 /// **Test-only override** ([`backoff_override`]): when
-/// `LPM_RETRY_BACKOFF_MS_OVERRIDE` is set AND we're in a debug build OR
-/// `LPM_TEST_MODE=1` is set, the override value (in ms) is returned
-/// instead of the exponential schedule. Production retry policy is
-/// immune — the env is silently ignored under release builds without
-/// the explicit `LPM_TEST_MODE=1` opt-in.
+/// `LPM_RETRY_BACKOFF_MS_OVERRIDE` is set AND we're in a debug build,
+/// the override value (in ms) is returned instead of the exponential
+/// schedule. Production retry policy is immune.
 pub(super) fn backoff_delay(attempt: u32) -> Duration {
     if let Some(d) = backoff_override() {
         return d;
@@ -508,7 +506,7 @@ pub(super) fn backoff_delay(attempt: u32) -> Duration {
 ///
 /// 1. `LPM_RETRY_BACKOFF_MS_OVERRIDE` env var is set to a parseable u64.
 /// 2. The build is `debug_assertions` (i.e., `cargo build` /
-///    `cargo test` / `cargo nextest`) OR `LPM_TEST_MODE=1`.
+///    `cargo test` / `cargo nextest`).
 /// 3. The parsed value fits a `Duration::from_millis(...)` (always
 ///    true for u64).
 ///
@@ -522,16 +520,76 @@ pub(super) fn backoff_delay(attempt: u32) -> Duration {
 /// 429-flood test would still hang on the server-supplied
 /// `Retry-After` header.
 pub(super) fn backoff_override() -> Option<Duration> {
-    let allowed = cfg!(debug_assertions)
-        || std::env::var("LPM_TEST_MODE")
-            .ok()
-            .as_deref()
-            .is_some_and(|v| v == "1");
-    if !allowed {
+    if !cfg!(debug_assertions) {
         return None;
     }
     std::env::var("LPM_RETRY_BACKOFF_MS_OVERRIDE")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_millis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct ScopedEnv {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl ScopedEnv {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let previous = vars
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in vars {
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.iter().rev() {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn lpm_test_mode_does_not_enable_backoff_override_in_release_builds() {
+        let _lock = env_lock();
+        let _env = ScopedEnv::set(&[
+            ("LPM_TEST_MODE", "1"),
+            ("LPM_RETRY_BACKOFF_MS_OVERRIDE", "10"),
+        ]);
+
+        assert_eq!(backoff_override(), None);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn backoff_override_honors_retry_override_in_debug_builds() {
+        let _lock = env_lock();
+        let _env = ScopedEnv::set(&[("LPM_RETRY_BACKOFF_MS_OVERRIDE", "10")]);
+
+        assert_eq!(backoff_override(), Some(Duration::from_millis(10)));
+    }
 }

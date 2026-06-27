@@ -589,11 +589,9 @@ fn compare_option(
 
 /// Test-only deterministic-panic injection hook.
 ///
-/// argument AND the build is `cfg!(debug_assertions)` OR
-/// `LPM_TEST_MODE=1`, panics with a recognizable message that
-/// includes the stage name. Production builds without
-/// `LPM_TEST_MODE=1` silently treat this as a no-op — the env is
-/// read but never honored.
+/// In debug builds only, when `LPM_TEST_PANIC_AT` matches the stage
+/// argument, panics with a recognizable message that includes the stage
+/// name. Release builds silently treat this as a no-op.
 ///
 /// **Why a panic, not an error.** The hook exists to drive workflow
 /// tests that pin the [`crate::manifest_tx::ManifestTransaction`]
@@ -625,12 +623,7 @@ fn compare_option(
 /// Used by [B.4](../../../tests/workflows/tests/install_concurrency.rs)
 /// (`install_panics_mid_pipeline_rollback_restores_manifest`).
 fn maybe_test_panic(stage: &str) {
-    let allowed = cfg!(debug_assertions)
-        || std::env::var("LPM_TEST_MODE")
-            .ok()
-            .as_deref()
-            .is_some_and(|v| v == "1");
-    if !allowed {
+    if !cfg!(debug_assertions) {
         return;
     }
     if std::env::var("LPM_TEST_PANIC_AT").as_deref() == Ok(stage) {
@@ -648,16 +641,10 @@ fn maybe_test_panic(stage: &str) {
 /// 0" contract without depending on a real audit failure mode
 /// (network outage, store-lock contention, lockfile corruption).
 ///
-/// Gated the same way as [`maybe_test_panic`]: enabled in debug
-/// builds OR when `LPM_TEST_MODE=1` is exported. Production release
-/// builds never honor the trigger env even if it's set.
+/// Gated the same way as [`maybe_test_panic`]: enabled only in debug
+/// builds. Production release builds never honor the trigger env.
 fn maybe_test_audit_after_install_should_fail() -> bool {
-    let allowed = cfg!(debug_assertions)
-        || std::env::var("LPM_TEST_MODE")
-            .ok()
-            .as_deref()
-            .is_some_and(|v| v == "1");
-    if !allowed {
+    if !cfg!(debug_assertions) {
         return false;
     }
     std::env::var("LPM_TEST_AUDIT_AFTER_INSTALL_FAIL").as_deref() == Ok("1")

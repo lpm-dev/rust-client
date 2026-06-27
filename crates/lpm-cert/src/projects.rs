@@ -11,16 +11,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+const PROJECTS_INDEX_ENV: &str = "LPM_CERT_PROJECTS_INDEX";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct IndexFile {
     /// Absolute paths of project directories where `ensure_https` succeeded.
     projects: BTreeSet<String>,
 }
 
-/// Path to the projects index file: `~/.lpm/cert-projects.json` (overridable via
-/// `LPM_CERT_PROJECTS_INDEX` for tests).
+/// Path to the projects index file: `~/.lpm/cert-projects.json`. Debug/test
+/// builds can override it via `LPM_CERT_PROJECTS_INDEX`.
 pub fn index_path() -> Result<PathBuf, LpmError> {
-    if let Some(p) = std::env::var_os("LPM_CERT_PROJECTS_INDEX") {
+    if crate::test_env_overrides_enabled()
+        && let Some(p) = std::env::var_os(PROJECTS_INDEX_ENV)
+    {
         return Ok(PathBuf::from(p));
     }
     let home = dirs::home_dir()
@@ -98,14 +102,16 @@ pub fn project_has_leaf(project_dir: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(debug_assertions)]
     fn with_index<T>(f: impl FnOnce(&Path) -> T) -> T {
         let _serial = serial_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cert-projects.json");
-        let _g = EnvGuard::set("LPM_CERT_PROJECTS_INDEX", &path);
+        let _g = EnvGuard::set(PROJECTS_INDEX_ENV, &path);
         f(dir.path())
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn record_and_list_roundtrip() {
         with_index(|root| {
@@ -118,6 +124,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn record_is_idempotent() {
         with_index(|root| {
@@ -129,6 +136,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn forget_removes_project() {
         with_index(|root| {
@@ -140,6 +148,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn list_returns_stable_order() {
         with_index(|root| {
@@ -158,11 +167,23 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn list_missing_file_returns_empty() {
         with_index(|_root| {
             assert!(list().unwrap().is_empty());
         });
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn projects_index_env_is_ignored_in_release_builds() {
+        let _serial = serial_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cert-projects.json");
+        let _guard = EnvGuard::set(PROJECTS_INDEX_ENV, &path);
+
+        assert_ne!(index_path().unwrap(), path);
     }
 
     fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
