@@ -4,7 +4,9 @@ use tempfile::tempdir;
 
 fn with_test_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
     let policy_path = dir.join("managed-security-policy.toml");
+    let lpm_home = dir.join("lpm-home");
     let _env = crate::test_env::ScopedEnv::update([
+        ("LPM_HOME", Some(lpm_home.as_os_str().to_owned())),
         (SECURITY_DIR_ENV, Some(dir.as_os_str().to_owned())),
         (
             SECURITY_POLICY_PATH_ENV,
@@ -22,6 +24,7 @@ fn with_test_env<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
         ),
         ("LPM_NPM_FIREWALL", None),
         ("LPM_EXPERIMENT_NPM_FIREWALL", None),
+        ("LPM_PROVENANCE_ENFORCE", None),
         ("LPM_FORCE_FILE_VAULT", None),
     ]);
     f()

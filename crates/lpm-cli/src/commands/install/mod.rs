@@ -961,6 +961,8 @@ async fn run_with_options_under_store_lock(
     let timing_detail_mode = TimingDetailMode::from_env();
     let emit_timing = crate::json_contract::install_timing_requested(timing);
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
+    let object_integrity_policy =
+        crate::commands::config::resolve_object_integrity_policy(&global_config)?;
     let verify_registry_signatures = registry_signature_verification_enabled(&global_config);
     let registry_signature_timings = timing_detail_mode
         .enabled()
@@ -1124,24 +1126,24 @@ async fn run_with_options_under_store_lock(
     let requested_v2_mode = lpm_store::StoreVersion::from_env().is_v2();
 
     // Fast-exit: if package.json + lockfile haven't changed AND the
-    // resolved linker matches the one used for the prior install, skip
-    // the entire install pipeline. Two stats + one read + one SHA-256
-    // hash ≈ 1-2ms vs 82ms for a full warm install.
+    // resolved linker and object-integrity policy match the prior
+    // install, skip the entire install pipeline. Two stats + one read
+    // + one SHA-256 hash ≈ 1-2ms vs 82ms for a full warm install.
     // --force bypasses this check to force a full re-install.
     //
-    // Linker freshness: `check_install_state_with_linker` folds the
-    // mode into the hash so a post-install flip of `LPM_LINKER` /
-    // `~/.lpm/config.toml > linker` invalidates the cache. The mtime
-    // fast path also reads the `l:<mode>` line written by
-    // `write_install_hash` to detect the same flip without re-hashing.
+    // Linker/integrity freshness: the install-state check folds both
+    // resolved config values into the hash. The mtime fast path also
+    // reads the `l:<mode>` and `i:<source|tree>` lines to detect the same
+    // flips without re-hashing.
     // Strict peer mode runs a fresh peer check because the fast path
     // does not have the resolver metadata needed to prove the tree is clean.
     let pkg_content_for_state = std::fs::read_to_string(&pkg_json_path).unwrap_or_default();
     let setup_state_t = Instant::now();
-    let install_state = crate::install_state::check_install_state_with_linker(
+    let install_state = crate::install_state::check_install_state_with_linker_and_integrity(
         project_dir,
         &pkg_content_for_state,
         linker_mode,
+        object_integrity_policy,
     );
     let wf_setup_install_state_ms = setup_state_t.elapsed().as_millis();
     let compatibility_bins_ready = !requested_v2_mode
@@ -1161,7 +1163,7 @@ async fn run_with_options_under_store_lock(
             false
         };
         if catalogs_cleaned {
-            write_post_install_v6_hash(project_dir, linker_mode);
+            write_post_install_hash(project_dir, linker_mode, object_integrity_policy);
         }
         let elapsed = start.elapsed();
         let total_ms = elapsed.as_millis();
@@ -1803,7 +1805,7 @@ async fn run_with_options_under_store_lock(
         // post-removal state so a future freshness check sees a
         // consistent fingerprint instead of the pre-removal hash.
         materialize_empty_install_artifacts(project_dir)?;
-        write_post_install_v6_hash(project_dir, linker_mode);
+        write_post_install_hash(project_dir, linker_mode, object_integrity_policy);
         return Ok(());
     }
 
@@ -2036,7 +2038,12 @@ async fn run_with_options_under_store_lock(
 
         // Verify all packages are in the global store
         let store = PackageStore::from_root(lpm_root);
-        let store_v2 = requested_v2_mode.then(|| lpm_store::v2::Store::from_lpm_root(lpm_root));
+        let store_v2 = requested_v2_mode.then(|| {
+            lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+                lpm_root,
+                object_integrity_policy,
+            )
+        });
         let mut missing = Vec::new();
         for p in &locked {
             // Source-aware existence check for the offline gate.
@@ -2156,6 +2163,7 @@ async fn run_with_options_under_store_lock(
             script_policy_override,
             lpm_root,
             &global_config,
+            object_integrity_policy,
             auto_build,
             no_sandbox,
             strict_sandbox,
@@ -2299,9 +2307,12 @@ async fn run_with_options_under_store_lock(
     // allocation-free.
     let store_version = lpm_store::StoreVersion::from_env();
     let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> = if store_version.is_v2() {
-        Some(std::sync::Arc::new(lpm_store::v2::Store::from_lpm_root(
-            lpm_root,
-        )))
+        Some(std::sync::Arc::new(
+            lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+                lpm_root,
+                object_integrity_policy,
+            ),
+        ))
     } else {
         None
     };
@@ -5739,6 +5750,7 @@ async fn run_with_options_under_store_lock(
             &link_targets,
             linker_mode,
             lpm_root,
+            object_integrity_policy,
             pkg.name.as_deref(),
             compatibility_bin_names,
         )?;
@@ -6560,7 +6572,7 @@ async fn run_with_options_under_store_lock(
     // delegated to `write_install_hash`, which also captures
     // manifest mtimes into the v2 file format so the next up-to-date
     // check can take the mtime fast path.
-    write_post_install_v6_hash(project_dir, linker_mode);
+    write_post_install_hash(project_dir, linker_mode, object_integrity_policy);
 
     // Register the project in the machine-global known-projects registry.
     // `lpm cache prune` walks this set to

@@ -9,6 +9,20 @@ use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot};
 use std::io::IsTerminal;
 
+const FIREWALL_GUIDED_MENU_LABEL: &str = "Firewall for npm";
+const FIREWALL_WIZARD_PROMPT: &str = "How should LPM handle firewall verdicts for npm packages?";
+const FIREWALL_OFF_HINT: &str = "default; use direct npm metadata and tarballs only";
+const FIREWALL_REPORT_HINT: &str = "warn without blocking install";
+const FIREWALL_ENFORCE_HINT: &str = "block packages marked malicious by firewall.lpm.dev";
+const INTEGRITY_KEY: &str = "integrity";
+const INTEGRITY_VALUES: [&str; 2] = ["source", "tree"];
+const INTEGRITY_GUIDED_MENU_LABEL: &str = "Store integrity";
+const INTEGRITY_WIZARD_PROMPT: &str = "How should LPM verify reused package store objects?";
+const INTEGRITY_SOURCE_HINT: &str =
+    "default; verify source identity without rehashing expanded files";
+const INTEGRITY_TREE_HINT: &str =
+    "stricter; rehash expanded files to detect local store tampering/corruption";
+
 /// CLI configuration management.
 ///
 /// Stores config in ~/.lpm/config.toml (user/machine config).
@@ -17,7 +31,7 @@ use std::io::IsTerminal;
 /// Bare `lpm config` opens a guided editor that routes into the focused
 /// wizards below. The direct forms stay available for scripts and deep links.
 ///
-/// Beyond `get`/`set`/`delete`/`list`, ten focused wizards live here:
+/// Beyond `get`/`set`/`delete`/`list`, eleven focused wizards live here:
 /// - `lpm config scripts` owns `script-policy = deny | triage | allow`.
 /// - `lpm config triage` owns `triage-advisor = none | claude-cli | codex | ollama`.
 /// - `lpm config sandbox` owns `[sandbox] mode = default | strict | none`.
@@ -30,12 +44,14 @@ use std::io::IsTerminal;
 /// - `lpm config typosquat` owns `typosquat-guard = default | on | off`
 ///   (operator persistent toggle for suspicious package-name analysis).
 /// - `lpm config firewall` owns `[firewall] mode = off | report | enforce`
-///   (operator persistent toggle for lpm.dev firewall verdict checks).
+///   (operator persistent toggle for npm package firewall verdict checks).
+/// - `lpm config integrity` owns `integrity = source | tree`
+///   (operator preference for v2 expanded-store object validation).
 /// - `lpm config release-age` owns `minimum-release-age-secs = <seconds>`
 ///   via human-friendly duration inputs.
 /// - `lpm config release-age-policy` owns `release-age-policy = direct | strict`.
 ///
-/// All ten default to interactive in a TTY; `--set <value>` is the
+/// All eleven default to interactive in a TTY; `--set <value>` is the
 /// non-interactive setter required for CI / scripted setup.
 pub async fn run(
     action: Option<&str>,
@@ -73,6 +89,9 @@ pub async fn run(
     }
     if action == "firewall" {
         return run_firewall_wizard(&config_path, set, json_output).await;
+    }
+    if action == "integrity" {
+        return run_integrity_wizard(&config_path, set, json_output).await;
     }
     if action == "release-age" {
         return run_release_age_wizard(&config_path, set, json_output).await;
@@ -150,6 +169,9 @@ pub async fn run(
                     })?;
                 }
                 TRUST_POLICY_KEY => validate_trust_policy_value(value)?,
+                INTEGRITY_KEY => {
+                    parse_integrity_policy_selection(value)?;
+                }
                 TYPOSQUAT_GUARD_KEY => {
                     let requested = parse_typosquat_guard_selection(value)?;
                     let global = global_config_view_from_value(&config);
@@ -195,6 +217,12 @@ pub async fn run(
                                 .as_str()
                                 .to_string(),
                         )
+                    } else if key == INTEGRITY_KEY {
+                        toml::Value::String(
+                            parse_integrity_policy_selection(value)?
+                                .as_str()
+                                .to_string(),
+                        )
                     } else if key == TYPOSQUAT_GUARD_KEY {
                         toml::Value::String(
                             parse_typosquat_guard_selection(value)?.as_str().to_string(),
@@ -214,6 +242,12 @@ pub async fn run(
                 } else if key == RELEASE_AGE_POLICY_KEY {
                     serde_json::Value::String(
                         crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
+                            .as_str()
+                            .to_string(),
+                    )
+                } else if key == INTEGRITY_KEY {
+                    serde_json::Value::String(
+                        parse_integrity_policy_selection(value)?
                             .as_str()
                             .to_string(),
                     )
@@ -335,7 +369,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, release-age, release-age-policy"
+                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy"
             )));
         }
     }
@@ -407,8 +441,13 @@ async fn run_guided_config_menu(
             )
             .item(
                 "firewall",
-                "npm firewall",
+                FIREWALL_GUIDED_MENU_LABEL,
                 format!("current: {}", summary.firewall_mode),
+            )
+            .item(
+                "integrity",
+                INTEGRITY_GUIDED_MENU_LABEL,
+                format!("current: {}", summary.integrity_mode),
             )
             .item(
                 "release-age",
@@ -436,6 +475,7 @@ async fn run_guided_config_menu(
             "trust-policy" => run_trust_policy_wizard(config_path, None, false).await?,
             "typosquat" => run_typosquat_wizard(config_path, None, false).await?,
             "firewall" => run_firewall_wizard(config_path, None, false).await?,
+            "integrity" => run_integrity_wizard(config_path, None, false).await?,
             "release-age" => run_release_age_wizard(config_path, None, false).await?,
             "release-age-policy" => run_release_age_policy_wizard(config_path, None, false).await?,
             "done" => return Ok(()),
@@ -469,6 +509,7 @@ struct GuidedConfigSummary {
     trust_policy: String,
     typosquat_guard: String,
     firewall_mode: String,
+    integrity_mode: String,
     release_age: String,
     release_age_policy: String,
 }
@@ -499,6 +540,7 @@ fn read_guided_config_summary(
             config_path,
         )?),
         firewall_mode: format_current_firewall_mode(read_firewall_mode(config_path)?),
+        integrity_mode: format_current_integrity_policy(read_integrity_policy(config_path)?),
         release_age: format_current_release_age(read_release_age_override(config_path)?),
         release_age_policy: read_release_age_policy_override(config_path)?
             .unwrap_or_default()
@@ -746,6 +788,21 @@ impl GlobalConfig {
     pub(crate) fn get_typosquat_guard_mode(&self) -> Option<TyposquatGuardSelection> {
         self.get_str(TYPOSQUAT_GUARD_KEY)
             .and_then(TyposquatGuardSelection::parse)
+    }
+
+    pub(crate) fn get_integrity_policy(
+        &self,
+    ) -> Result<Option<lpm_store::v2::ObjectIntegrityPolicy>, LpmError> {
+        let Some(value) = self.get_value(INTEGRITY_KEY) else {
+            return Ok(None);
+        };
+        let Some(raw) = value.as_str() else {
+            return Err(LpmError::Registry(format!(
+                "invalid `{INTEGRITY_KEY}`; must be one of: {}",
+                INTEGRITY_VALUES.join(" | ")
+            )));
+        };
+        parse_integrity_policy_selection(raw).map(Some)
     }
 
     /// Get a value that should be an array of strings, returning the
@@ -1367,6 +1424,17 @@ fn validate_trust_policy_value(value: &str) -> Result<(), LpmError> {
     }
 }
 
+fn parse_integrity_policy_selection(
+    input: &str,
+) -> Result<lpm_store::v2::ObjectIntegrityPolicy, LpmError> {
+    lpm_store::v2::ObjectIntegrityPolicy::parse(input).ok_or_else(|| {
+        LpmError::Registry(format!(
+            "invalid integrity mode '{input}'; must be one of: {}",
+            INTEGRITY_VALUES.join(" | ")
+        ))
+    })
+}
+
 fn parse_typosquat_guard_selection(input: &str) -> Result<TyposquatGuardSelection, LpmError> {
     TyposquatGuardSelection::parse(input).ok_or_else(|| {
         LpmError::Registry(format!(
@@ -1469,26 +1537,13 @@ async fn run_firewall_wizard(
             "  current: {}",
             format_current_firewall_mode(Some(current)).cyan()
         );
-        let new_value: &str =
-            cliclack::select("How should LPM handle lpm.dev npm firewall verdicts?")
-                .item(
-                    "off",
-                    "off",
-                    "default; direct npm metadata and tarballs only",
-                )
-                .item(
-                    "report",
-                    "report",
-                    "check selected packages and warn without blocking install",
-                )
-                .item(
-                    "enforce",
-                    "enforce",
-                    "block packages marked malicious by lpm.dev firewall",
-                )
-                .initial_value(current.as_str())
-                .interact()
-                .map_err(prompt_err)?;
+        let new_value: &str = cliclack::select(FIREWALL_WIZARD_PROMPT)
+            .item("off", "off", FIREWALL_OFF_HINT)
+            .item("report", "report", FIREWALL_REPORT_HINT)
+            .item("enforce", "enforce", FIREWALL_ENFORCE_HINT)
+            .initial_value(current.as_str())
+            .interact()
+            .map_err(prompt_err)?;
         parse_firewall_mode_selection(new_value)?
     };
 
@@ -1594,6 +1649,93 @@ fn announce_firewall_mode_set(mode: NpmFirewallMode, json_output: bool) {
             "Set {FIREWALL_CONFIG_PATH} = {}",
             mode.as_str().bold()
         ));
+    }
+}
+
+async fn run_integrity_wizard(
+    config_path: &std::path::Path,
+    set: Option<&str>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let policy = if let Some(value) = set {
+        parse_integrity_policy_selection(value)?
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err(LpmError::Registry(
+                "lpm config integrity requires a TTY; use `--set source|tree` instead".to_string(),
+            ));
+        }
+
+        let current = read_integrity_policy(config_path)?
+            .unwrap_or(lpm_store::v2::ObjectIntegrityPolicy::Source);
+        println!();
+        println!("  current: {}", current.as_str().cyan());
+        let new_value: &str = cliclack::select(INTEGRITY_WIZARD_PROMPT)
+            .item("source", "source", INTEGRITY_SOURCE_HINT)
+            .item("tree", "tree", INTEGRITY_TREE_HINT)
+            .initial_value(current.as_str())
+            .interact()
+            .map_err(prompt_err)?;
+        parse_integrity_policy_selection(new_value)?
+    };
+
+    persist_integrity_policy(config_path, policy)?;
+    announce_integrity_policy_set(policy, json_output);
+    Ok(())
+}
+
+fn read_integrity_policy(
+    config_path: &std::path::Path,
+) -> Result<Option<lpm_store::v2::ObjectIntegrityPolicy>, LpmError> {
+    let cfg = read_config(config_path)?;
+    let table = match cfg {
+        toml::Value::Table(table) => table,
+        _ => return Ok(None),
+    };
+    GlobalConfig { table }.get_integrity_policy()
+}
+
+pub(crate) fn resolve_object_integrity_policy(
+    global: &GlobalConfig,
+) -> Result<lpm_store::v2::ObjectIntegrityPolicy, LpmError> {
+    if let Ok(value) = std::env::var(lpm_store::v2::ENV_V2_OBJECT_INTEGRITY) {
+        return Ok(lpm_store::v2::ObjectIntegrityPolicy::from_env_value(Some(
+            value.as_str(),
+        )));
+    }
+    Ok(global
+        .get_integrity_policy()?
+        .unwrap_or(lpm_store::v2::ObjectIntegrityPolicy::Source))
+}
+
+fn persist_integrity_policy(
+    config_path: &std::path::Path,
+    policy: lpm_store::v2::ObjectIntegrityPolicy,
+) -> Result<(), LpmError> {
+    persist_string(config_path, INTEGRITY_KEY, policy.as_str())
+}
+
+fn format_current_integrity_policy(
+    current: Option<lpm_store::v2::ObjectIntegrityPolicy>,
+) -> String {
+    current
+        .unwrap_or(lpm_store::v2::ObjectIntegrityPolicy::Source)
+        .as_str()
+        .to_string()
+}
+
+fn announce_integrity_policy_set(policy: lpm_store::v2::ObjectIntegrityPolicy, json_output: bool) {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                INTEGRITY_KEY: policy.as_str(),
+            }))
+            .unwrap()
+        );
+    } else {
+        install_ui::done(&format!("Set {INTEGRITY_KEY} = {}", policy.as_str().bold()));
     }
 }
 
@@ -2326,6 +2468,44 @@ mod wizard_tests {
     }
 
     #[test]
+    fn firewall_wizard_copy_uses_npm_package_language() {
+        assert_eq!(
+            (
+                FIREWALL_GUIDED_MENU_LABEL,
+                FIREWALL_WIZARD_PROMPT,
+                FIREWALL_OFF_HINT,
+                FIREWALL_REPORT_HINT,
+                FIREWALL_ENFORCE_HINT,
+            ),
+            (
+                "Firewall for npm",
+                "How should LPM handle firewall verdicts for npm packages?",
+                "default; use direct npm metadata and tarballs only",
+                "warn without blocking install",
+                "block packages marked malicious by firewall.lpm.dev",
+            )
+        );
+    }
+
+    #[test]
+    fn integrity_wizard_copy_uses_store_object_language() {
+        assert_eq!(
+            (
+                INTEGRITY_GUIDED_MENU_LABEL,
+                INTEGRITY_WIZARD_PROMPT,
+                INTEGRITY_SOURCE_HINT,
+                INTEGRITY_TREE_HINT,
+            ),
+            (
+                "Store integrity",
+                "How should LPM verify reused package store objects?",
+                "default; verify source identity without rehashing expanded files",
+                "stricter; rehash expanded files to detect local store tampering/corruption",
+            )
+        );
+    }
+
+    #[test]
     fn guided_config_summary_uses_product_defaults_when_unset() {
         let (_dir, path, _env) = tmp_config();
 
@@ -2342,6 +2522,7 @@ mod wizard_tests {
                 trust_policy: "off".to_string(),
                 typosquat_guard: "default (enabled)".to_string(),
                 firewall_mode: "off".to_string(),
+                integrity_mode: "source".to_string(),
                 release_age: "default (1d)".to_string(),
                 release_age_policy: "direct".to_string(),
             }
@@ -2359,6 +2540,7 @@ triage-advisor = "codex"
 signatures = true
 trust-policy = "no-downgrade"
 typosquat-guard = "off"
+integrity = "tree"
 minimum-release-age-secs = "259200"
 release-age-policy = "strict"
 
@@ -2387,6 +2569,7 @@ mode = "enforce"
                 trust_policy: "no-downgrade".to_string(),
                 typosquat_guard: "off".to_string(),
                 firewall_mode: "enforce".to_string(),
+                integrity_mode: "tree".to_string(),
                 release_age: "3d".to_string(),
                 release_age_policy: "strict".to_string(),
             }
@@ -2777,6 +2960,91 @@ mode = "enforce"
         assert_eq!(
             firewall.get("note").and_then(|v| v.as_str()),
             Some("keep-me")
+        );
+    }
+
+    #[tokio::test]
+    async fn integrity_wizard_set_persists_each_valid_mode() {
+        for mode in ["source", "tree"] {
+            let (_dir, path, _env) = tmp_config();
+
+            run_integrity_wizard(&path, Some(mode), true).await.unwrap();
+
+            assert_eq!(
+                read_integrity_policy(&path).unwrap(),
+                Some(parse_integrity_policy_selection(mode).unwrap()),
+                "integrity mode '{mode}' must persist",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn integrity_wizard_set_rejects_invalid_mode_without_persisting() {
+        let (_dir, path, _env) = tmp_config();
+
+        let err = run_integrity_wizard(&path, Some("expanded"), true)
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid integrity mode 'expanded'; must be one of: source | tree"),
+            "got: {msg}"
+        );
+        assert!(read_integrity_policy(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_object_integrity_policy_defaults_to_source() {
+        let _env = crate::test_env::ScopedEnv::update([(
+            lpm_store::v2::ENV_V2_OBJECT_INTEGRITY,
+            None::<std::ffi::OsString>,
+        )]);
+        let cfg = GlobalConfig {
+            table: toml::map::Map::new(),
+        };
+
+        assert_eq!(
+            resolve_object_integrity_policy(&cfg).unwrap(),
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+        );
+    }
+
+    #[test]
+    fn resolve_object_integrity_policy_reads_config_tree() {
+        let _env = crate::test_env::ScopedEnv::update([(
+            lpm_store::v2::ENV_V2_OBJECT_INTEGRITY,
+            None::<std::ffi::OsString>,
+        )]);
+        let mut table = toml::map::Map::new();
+        table.insert(
+            INTEGRITY_KEY.to_string(),
+            toml::Value::String("tree".to_string()),
+        );
+        let cfg = GlobalConfig { table };
+
+        assert_eq!(
+            resolve_object_integrity_policy(&cfg).unwrap(),
+            lpm_store::v2::ObjectIntegrityPolicy::Tree,
+        );
+    }
+
+    #[test]
+    fn resolve_object_integrity_policy_prefers_env_override_over_config() {
+        let _env = crate::test_env::ScopedEnv::update([(
+            lpm_store::v2::ENV_V2_OBJECT_INTEGRITY,
+            Some(std::ffi::OsString::from("source")),
+        )]);
+        let mut table = toml::map::Map::new();
+        table.insert(
+            INTEGRITY_KEY.to_string(),
+            toml::Value::String("tree".to_string()),
+        );
+        let cfg = GlobalConfig { table };
+
+        assert_eq!(
+            resolve_object_integrity_policy(&cfg).unwrap(),
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
         );
     }
 

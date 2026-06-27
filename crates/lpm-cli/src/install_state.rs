@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
+use lpm_store::v2::ObjectIntegrityPolicy;
+
 /// Atomically write a small state file with owner-only perms (0o600 on Unix).
 ///
 /// `install-hash` is the freshness short-circuit `lpm dev` and the
@@ -113,46 +115,75 @@ pub struct InstallState {
 // linker change without recomputing the full hash. Same upgrade
 // posture as v3→v4→v5: existing v5 hashes mismatch on first read and
 // trigger one full re-resolve, after which the v6 cache is warm.
-const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v6\x00";
+//
+// **v7 — v2 object integrity policy folds into the hash.** Pre-v7,
+// switching from `source` to `tree` integrity could leave a warm bare
+// install exiting before reusable v2 objects were checked with the
+// stricter tree policy. v7 also adds an `i:<source|tree>` install-hash
+// line so the mtime fast path detects the same flip without rehashing.
+const INSTALL_HASH_SCHEMA_TAG: &[u8] = b"lpm-install-hash-v7\x00";
 
 /// Compute the install hash from raw file contents — back-compat shim
 /// that defaults file/link bytes to empty AND linker mode to the
 /// active default. Used by test fixtures and `dev.rs`'s
 /// deterministic-hash unit tests where the linker is not under test.
-/// Production callers use [`compute_install_hash_v6`] directly.
+/// Production callers use [`compute_install_hash_v7`] directly.
 ///
 /// flipped [`LinkerMode::default`] from Isolated to
 /// Hoisted; this shim follows the flip so callers expecting "the hash
 /// for a default install" get the post-4f shape.
 pub fn compute_install_hash(pkg_content: &str, lock_content: &str) -> String {
-    compute_install_hash_v6(
+    compute_install_hash_v7(
         pkg_content,
         lock_content,
         &[],
         lpm_linker::LinkerMode::default(),
+        ObjectIntegrityPolicy::Source,
     )
 }
 
-/// Same shape as [`compute_install_hash_v6`] minus the linker arg —
+/// Same shape as [`compute_install_hash_v7`] minus the linker and
+/// integrity-policy args —
 /// retained ONLY to keep the v3 name available to callers that
 /// explicitly want the active default. Behaves identically to
-/// `compute_install_hash_v6(..., LinkerMode::default())`. New code
-/// should call `compute_install_hash_v6` and pass the resolved mode.
+/// `compute_install_hash_v7(..., LinkerMode::default(),
+/// ObjectIntegrityPolicy::Source)`. New code should call
+/// `compute_install_hash_v7` and pass the resolved mode and policy.
 pub fn compute_install_hash_v3(
     pkg_content: &str,
     lock_content: &str,
     file_link_manifests: &[u8],
 ) -> String {
-    compute_install_hash_v6(
+    compute_install_hash_v7(
         pkg_content,
         lock_content,
         file_link_manifests,
         lpm_linker::LinkerMode::default(),
+        ObjectIntegrityPolicy::Source,
+    )
+}
+
+/// Back-compat shim for callers that only key on the linker dimension.
+/// New production code should call [`compute_install_hash_v7`] and pass
+/// the resolved object integrity policy.
+pub fn compute_install_hash_v6(
+    pkg_content: &str,
+    lock_content: &str,
+    file_link_manifests: &[u8],
+    linker_mode: lpm_linker::LinkerMode,
+) -> String {
+    compute_install_hash_v7(
+        pkg_content,
+        lock_content,
+        file_link_manifests,
+        linker_mode,
+        ObjectIntegrityPolicy::Source,
     )
 }
 
 /// Full install hash with manifest content + lockfile + file/link
-/// manifests + resolved linker mode folded in.
+/// manifests + resolved linker mode + resolved v2 object integrity
+/// policy folded in.
 ///
 /// Including linker in the hash closes the post-install env/config
 /// freshness gap: if a user runs `lpm install` once with the default
@@ -160,17 +191,21 @@ pub fn compute_install_hash_v3(
 /// stayed the same and the "up to date" fast-exit fired — leaving
 /// the project on isolated despite the requested switch. v6 keys the
 /// hash on the resolved linker so any flip invalidates the cache.
+/// Including integrity policy does the same for `source` ↔ `tree`
+/// switches.
 ///
 /// Order discipline: `schema_tag || pkg || \0 || lock || \0 || flb ||
-/// \0 || linker`. Each section is preceded by an explicit `\0` domain
+/// \0 || linker || \0 || integrity_policy`. Each section is separated
+/// by an explicit `\0` domain
 /// separator so a future caller can't construct an ambiguous input.
 /// The linker byte is the canonical string from [`LinkerMode::as_str`]
 /// (`"isolated"` or `"hoisted"`).
-pub fn compute_install_hash_v6(
+pub fn compute_install_hash_v7(
     pkg_content: &str,
     lock_content: &str,
     file_link_manifests: &[u8],
     linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(INSTALL_HASH_SCHEMA_TAG);
@@ -181,6 +216,8 @@ pub fn compute_install_hash_v6(
     hasher.update(file_link_manifests);
     hasher.update(b"\x00");
     hasher.update(linker_mode.as_str().as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(object_integrity_policy.as_str().as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -436,12 +473,22 @@ pub fn check_install_state(project_dir: &Path) -> InstallState {
         Ok(mode) => mode,
         Err(_) => return invalid_linker_state(project_dir, &pkg_content),
     };
+    let object_integrity_policy =
+        match crate::commands::config::resolve_object_integrity_policy(&cfg) {
+            Ok(policy) => policy,
+            Err(_) => return invalid_integrity_state(project_dir, &pkg_content, linker_mode),
+        };
 
     // Single mtime probe lives inside `check_install_state_with_linker`
     // — no pre-delegation probe here, otherwise the stale path would
     // pay the same filesystem checks twice (once on the early bail,
     // once after delegation re-runs them).
-    check_install_state_with_linker(project_dir, &pkg_content, linker_mode)
+    check_install_state_with_linker_and_integrity(
+        project_dir,
+        &pkg_content,
+        linker_mode,
+        object_integrity_policy,
+    )
 }
 
 /// Same semantics as [`check_install_state`] but accepts a pre-read
@@ -463,7 +510,17 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
         Ok(mode) => mode,
         Err(_) => return invalid_linker_state(project_dir, pkg_content),
     };
-    check_install_state_with_linker(project_dir, pkg_content, linker_mode)
+    let object_integrity_policy =
+        match crate::commands::config::resolve_object_integrity_policy(&cfg) {
+            Ok(policy) => policy,
+            Err(_) => return invalid_integrity_state(project_dir, pkg_content, linker_mode),
+        };
+    check_install_state_with_linker_and_integrity(
+        project_dir,
+        pkg_content,
+        linker_mode,
+        object_integrity_policy,
+    )
 }
 
 /// Invalid-linker freshness signal. Shared by [`check_install_state`]
@@ -482,11 +539,32 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
 fn invalid_linker_state(project_dir: &Path, pkg_content: &str) -> InstallState {
     let lock_content = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
     let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
-    let placeholder = compute_install_hash_v6(
+    let placeholder = compute_install_hash_v7(
         pkg_content,
         &lock_content,
         &file_link_bytes,
         lpm_linker::LinkerMode::Isolated,
+        ObjectIntegrityPolicy::Source,
+    );
+    InstallState {
+        up_to_date: false,
+        hash: Some(placeholder),
+    }
+}
+
+fn invalid_integrity_state(
+    project_dir: &Path,
+    pkg_content: &str,
+    linker_mode: lpm_linker::LinkerMode,
+) -> InstallState {
+    let lock_content = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
+    let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
+    let placeholder = compute_install_hash_v7(
+        pkg_content,
+        &lock_content,
+        &file_link_bytes,
+        linker_mode,
+        ObjectIntegrityPolicy::Source,
     );
     InstallState {
         up_to_date: false,
@@ -503,10 +581,33 @@ pub fn check_install_state_with_linker(
     pkg_content: &str,
     linker_mode: lpm_linker::LinkerMode,
 ) -> InstallState {
+    check_install_state_with_linker_and_integrity(
+        project_dir,
+        pkg_content,
+        linker_mode,
+        ObjectIntegrityPolicy::Source,
+    )
+}
+
+/// Same as [`check_install_state_with_linker`] but also accepts the
+/// resolved v2 object integrity policy. Used by the install pipeline,
+/// which already resolved both config dimensions and needs the
+/// freshness check to invalidate when either one changes.
+pub fn check_install_state_with_linker_and_integrity(
+    project_dir: &Path,
+    pkg_content: &str,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
+) -> InstallState {
     // mtime short-circuit also applies here. The caller may have
     // already read pkg.json for an earlier check, but the fast path still
     // skips the read of lpm.lock + the SHA-256 pass.
-    if let Some(state) = try_mtime_fast_path(project_dir, pkg_content, linker_mode) {
+    if let Some(state) = try_mtime_fast_path(
+        project_dir,
+        pkg_content,
+        linker_mode,
+        object_integrity_policy,
+    ) {
         return state;
     }
 
@@ -521,8 +622,13 @@ pub fn check_install_state_with_linker(
     // projects without local-source deps — matches the v2 semantic
     // (modulo the schema-tag bump invalidating v2 caches once).
     let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
-    let current_hash =
-        compute_install_hash_v6(pkg_content, &lock_content, &file_link_bytes, linker_mode);
+    let current_hash = compute_install_hash_v7(
+        pkg_content,
+        &lock_content,
+        &file_link_bytes,
+        linker_mode,
+        object_integrity_policy,
+    );
 
     // Validate that package.json parses into the typed PackageJson struct —
     // the same deserialization the full install path uses via read_package_json().
@@ -655,6 +761,7 @@ fn try_mtime_fast_path(
     project_dir: &Path,
     pkg_content: &str,
     linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
 ) -> Option<InstallState> {
     let nm = project_dir.join("node_modules");
     if !nm.exists() {
@@ -710,14 +817,20 @@ fn try_mtime_fast_path(
     let stored_pkg_ns: u64 = pkg_ns_str.parse().ok()?;
     let stored_lock_ns: u64 = lock_ns_str.parse().ok()?;
 
-    // v6: the install-hash gains an `l:<linker_mode>` line so the mtime
-    // fast path can detect a post-install env/config linker flip
-    // without recomputing the full SHA-256 over the manifest. Absent
-    // line → legacy v5-or-earlier file → bail to slow path; the v6
-    // schema tag will then mismatch and force re-install.
+    // v7: the install-hash carries `l:<linker_mode>` and
+    // `i:<source|tree>` lines so the mtime fast path can detect
+    // post-install config flips without recomputing the full SHA-256.
+    // Missing metadata means a legacy file; bail to the slow path where
+    // the schema tag mismatch forces re-install.
     let linker_line = lines.next()?;
     let stored_linker = linker_line.strip_prefix("l:")?;
     if stored_linker != linker_mode.as_str() {
+        return None;
+    }
+
+    let integrity_line = lines.next()?;
+    let stored_integrity_policy = integrity_line.strip_prefix("i:")?;
+    if stored_integrity_policy != object_integrity_policy.as_str() {
         return None;
     }
 
@@ -797,11 +910,27 @@ fn binary_lockfile_is_older_than_toml(lockfile_path: &Path, binary_path: &Path) 
     }
 }
 
-/// Write `.lpm/install-hash` in the v6 format (hash line + mtime line +
-/// linker line). Callers provide the pre-computed hash AND the linker
-/// mode that was effective for the install — both are needed so the
-/// mtime fast path can detect a post-install env/config linker flip
-/// without recomputing the full SHA-256.
+/// Write `.lpm/install-hash` using the default source-integrity policy.
+/// Production install code should use [`write_install_hash_with_integrity`]
+/// after resolving the effective config chain.
+pub fn write_install_hash(
+    project_dir: &Path,
+    hash: &str,
+    linker_mode: lpm_linker::LinkerMode,
+) -> std::io::Result<()> {
+    write_install_hash_with_integrity(
+        project_dir,
+        hash,
+        linker_mode,
+        ObjectIntegrityPolicy::Source,
+    )
+}
+
+/// Write `.lpm/install-hash` in the v7 format (hash line + mtime line +
+/// linker line + integrity-policy line). Callers provide the pre-computed
+/// hash, the linker mode, and the v2 object integrity policy that were
+/// effective for the install. The metadata lets the mtime fast path detect
+/// config flips without recomputing the full SHA-256.
 ///
 /// On any failure reading an mtime (typically missing lpm.lock on a
 /// dependency-less project), falls back to a `0` sentinel. A mismatch
@@ -811,10 +940,11 @@ fn binary_lockfile_is_older_than_toml(lockfile_path: &Path, binary_path: &Path) 
 /// Writes `.lpm/install-hash` atomically via `fs::write`, same as the
 /// prior byte-string-only writes — the ManifestTransaction snapshot
 /// machinery is unaffected.
-pub fn write_install_hash(
+pub fn write_install_hash_with_integrity(
     project_dir: &Path,
     hash: &str,
     linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
 ) -> std::io::Result<()> {
     let pkg_ns = mtime_ns(&project_dir.join("package.json")).unwrap_or(0);
     let lock_ns = mtime_ns(&project_dir.join("lpm.lock")).unwrap_or(0);
@@ -822,7 +952,9 @@ pub fn write_install_hash(
     let hash_dir = project_dir.join(".lpm");
     std::fs::create_dir_all(&hash_dir)?;
     let linker_str = linker_mode.as_str();
-    let content = format!("{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\n");
+    let integrity_policy_str = object_integrity_policy.as_str();
+    let content =
+        format!("{hash}\nm:{pkg_ns}:{lock_ns}\nl:{linker_str}\ni:{integrity_policy_str}\n");
     write_state_file_owner_only(&hash_dir.join("install-hash"), content.as_bytes())?;
 
     // day-3 (F7a) + round-6 audit response — manage the
@@ -1016,7 +1148,10 @@ mod tests {
     use tempfile::TempDir;
 
     fn scoped_home_for(_path: &Path) -> crate::test_env::ScopedEnv {
-        crate::test_env::ScopedEnv::update([("LPM_LINKER", None)])
+        crate::test_env::ScopedEnv::update([
+            ("LPM_LINKER", None),
+            (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
+        ])
     }
 
     fn setup_up_to_date_project() -> TempDir {
@@ -1225,23 +1360,29 @@ mod tests {
         // that any accidental change to `INSTALL_HASH_SCHEMA_TAG` — or
         // removal of the `hasher.update(tag)` line — makes this test
         // fail loudly. The expected value below was computed from
-        //   SHA256("lpm-install-hash-v6\x00" || "pkg" || "\x00" || "lock"
-        //          || "\x00" || "\x00" || "isolated")
-        // at the time the schema was bumped to v6 (post-install linker
-        // freshness fold).
+        //   SHA256("lpm-install-hash-v7\x00" || "pkg" || "\x00" || "lock"
+        //          || "\x00" || "\x00" || "isolated" || "\x00" || "source")
+        // at the time the schema was bumped to v7 (post-install integrity
+        // policy freshness fold).
         //
         // note: `compute_install_hash` now defaults
         // to `LinkerMode::default()` which flipped to Hoisted in 4f.
         // To keep this test schema-pinned (not coupled to whichever
-        // linker is the default), call `compute_install_hash_v6`
-        // explicitly with `LinkerMode::Isolated` — the value used at
+        // linker or integrity policy is the default), call
+        // `compute_install_hash_v7` explicitly with the values used at
         // the time the schema was last bumped. Updating this constant
         // is a deliberate act that must accompany any schema-version
         // bump.
-        let actual = compute_install_hash_v6("pkg", "lock", &[], lpm_linker::LinkerMode::Isolated);
-        let expected_v6 = "3adc9b6970027883b955378cd3dc894ff3a40df5875b4f3150e42254d04b623e";
+        let actual = compute_install_hash_v7(
+            "pkg",
+            "lock",
+            &[],
+            lpm_linker::LinkerMode::Isolated,
+            ObjectIntegrityPolicy::Source,
+        );
+        let expected_v7 = "1bd14c557eafec6535482053c19242bd1db14950b961c64b41b6ed4c558a5630";
         assert_eq!(
-            actual, expected_v6,
+            actual, expected_v7,
             "install-hash schema tag drift — bump INSTALL_HASH_SCHEMA_TAG and update this test \
              together. Current tag must produce the pinned hash for the fixed inputs."
         );
@@ -1431,11 +1572,11 @@ mod tests {
     }
 
     #[test]
-    fn write_install_hash_produces_v6_format() {
-        // Contract: file content is hash + mtime line + linker line.
+    fn write_install_hash_produces_v7_format() {
+        // Contract: file content is hash + mtime line + linker line + integrity line.
         // Pins the on-disk format so a v1 reader still gets the hash on
-        // line 1 (legacy compat), AND the v6 mtime fast-path can detect
-        // a post-install linker flip without recomputing the full hash.
+        // line 1 (legacy compat), AND the mtime fast-path can detect
+        // post-install config flips without recomputing the full hash.
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         let _home = scoped_home_for(p);
@@ -1459,6 +1600,11 @@ mod tests {
         assert_eq!(
             linker_line, "l:hoisted",
             "expected linker line `l:hoisted`, got {linker_line:?}"
+        );
+        let integrity_line = lines.next().unwrap();
+        assert_eq!(
+            integrity_line, "i:source",
+            "expected integrity line `i:source`, got {integrity_line:?}"
         );
     }
 
@@ -1527,6 +1673,29 @@ mod tests {
     }
 
     #[test]
+    fn integrity_policy_folds_into_install_hash() {
+        let source = compute_install_hash_v7(
+            "pkg",
+            "lock",
+            &[],
+            lpm_linker::LinkerMode::Isolated,
+            ObjectIntegrityPolicy::Source,
+        );
+        let tree = compute_install_hash_v7(
+            "pkg",
+            "lock",
+            &[],
+            lpm_linker::LinkerMode::Isolated,
+            ObjectIntegrityPolicy::Tree,
+        );
+        assert_ne!(
+            source, tree,
+            "v7 must distinguish object integrity policies so a source/tree config flip \
+             cannot reuse the prior install freshness state"
+        );
+    }
+
+    #[test]
     fn mtime_fast_path_bails_when_stored_linker_differs() {
         // Pin: an install-hash file whose stored linker line says
         // `l:isolated` must NOT short-circuit a freshness check that
@@ -1542,18 +1711,76 @@ mod tests {
         write_install_hash(p, "deadbeef", lpm_linker::LinkerMode::Isolated).unwrap();
         // Mtime fast path with matching linker → up_to_date.
         let pkg_content = fs::read_to_string(p.join("package.json")).unwrap();
-        let same = try_mtime_fast_path(p, &pkg_content, lpm_linker::LinkerMode::Isolated);
+        let same = try_mtime_fast_path(
+            p,
+            &pkg_content,
+            lpm_linker::LinkerMode::Isolated,
+            ObjectIntegrityPolicy::Source,
+        );
         assert!(
             same.is_some_and(|s| s.up_to_date),
             "matching linker should keep up_to_date=true on the fast path"
         );
         // Mtime fast path with FLIPPED linker → bails (returns None).
-        let flipped = try_mtime_fast_path(p, &pkg_content, lpm_linker::LinkerMode::Hoisted);
+        let flipped = try_mtime_fast_path(
+            p,
+            &pkg_content,
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+        );
         assert!(
             flipped.is_none(),
             "stored linker `isolated` must NOT short-circuit a check \
              resolving to `hoisted` — the freshness gate is the load-\
              bearing seam for env/config-driven layout flips"
+        );
+    }
+
+    #[test]
+    fn integrity_policy_flip_invalidates_matching_install_state() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        let package_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
+        let lock = "lock-content";
+        fs::write(p.join("package.json"), package_json).unwrap();
+        fs::write(p.join("lpm.lock"), lock).unwrap();
+        fs::create_dir_all(p.join("node_modules")).unwrap();
+
+        let source_hash = compute_install_hash_v7(
+            package_json,
+            lock,
+            &[],
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+        );
+        write_install_hash_with_integrity(
+            p,
+            &source_hash,
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+        )
+        .unwrap();
+
+        let source_state = check_install_state_with_linker_and_integrity(
+            p,
+            package_json,
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+        );
+        assert!(
+            source_state.up_to_date,
+            "matching source policy should keep the install state warm"
+        );
+
+        let tree_state = check_install_state_with_linker_and_integrity(
+            p,
+            package_json,
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Tree,
+        );
+        assert!(
+            !tree_state.up_to_date,
+            "switching to tree integrity must force the install pipeline to run"
         );
     }
 

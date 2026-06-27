@@ -1125,7 +1125,7 @@ pub(crate) enum Commands {
     /// Manage CLI configuration.
     Config {
         /// Action: get, set, delete, list, scripts, triage, sandbox,
-        /// sigstore, signatures, trust-policy, typosquat, firewall, release-age, release-age-policy.
+        /// sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy.
         /// Omit to open the guided configuration editor.
         action: Option<String>,
         /// Config key (for get/set/delete).
@@ -1134,7 +1134,7 @@ pub(crate) enum Commands {
         value: Option<String>,
         /// Non-interactive value for the `scripts` / `triage` /
         /// `sandbox` / `sigstore` / `signatures` / `trust-policy` /
-        /// `typosquat` / `firewall` / `release-age` / `release-age-policy` wizards. Required when stdin is not
+        /// `typosquat` / `firewall` / `integrity` / `release-age` / `release-age-policy` wizards. Required when stdin is not
         /// a TTY. Examples:
         ///   `lpm config scripts --set triage`
         ///   `lpm config triage --set claude-cli`
@@ -1144,6 +1144,7 @@ pub(crate) enum Commands {
         ///   `lpm config trust-policy --set no-downgrade`
         ///   `lpm config typosquat --set default`
         ///   `lpm config firewall --set enforce`
+        ///   `lpm config integrity --set tree`
         ///   `lpm config release-age --set 3d`
         ///   `lpm config release-age-policy --set strict`
         #[arg(long = "set", value_name = "VALUE")]

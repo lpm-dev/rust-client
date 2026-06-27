@@ -131,11 +131,15 @@ pub(super) fn relink_bins_after_lifecycle_build(
     link_targets: &[LinkTarget],
     linker_mode: lpm_linker::LinkerMode,
     lpm_root: &lpm_common::LpmRoot,
+    object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     self_package_name: Option<&str>,
     compatibility_bin_names: &[String],
 ) -> Result<usize, LpmError> {
     let result = if lpm_store::StoreVersion::from_env().is_v2() {
-        let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
+        let store_v2 = lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+            lpm_root,
+            object_integrity_policy,
+        );
         let v2_targets = build_v2_targets(packages, link_targets)?;
         lpm_linker::v2::finalize_existing_link_entries_with_compatibility_bin_names(
             project_dir,
@@ -188,6 +192,7 @@ pub(super) async fn run_link_and_finish(
     script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     lpm_root: &lpm_common::LpmRoot,
     global_config: &crate::commands::config::GlobalConfig,
+    object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
     auto_build: bool,
     no_sandbox: bool,
     strict_sandbox: bool,
@@ -246,7 +251,10 @@ pub(super) async fn run_link_and_finish(
 
     let link_start = Instant::now();
     let mut link_result = if lpm_store::StoreVersion::from_env().is_v2() {
-        let store_v2 = lpm_store::v2::Store::from_lpm_root(lpm_root);
+        let store_v2 = lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+            lpm_root,
+            object_integrity_policy,
+        );
         let v2_targets = build_v2_targets(&packages, &link_targets)?;
         lpm_linker::v2::link_packages_v2(
             project_dir,
@@ -419,6 +427,7 @@ pub(super) async fn run_link_and_finish(
             &link_targets,
             linker_mode,
             lpm_root,
+            object_integrity_policy,
             pkg.name.as_deref(),
             compatibility_bin_names,
         )?;

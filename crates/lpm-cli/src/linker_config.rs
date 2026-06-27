@@ -167,10 +167,10 @@ pub(crate) fn resolve_effective_linker_with_source(
 ///
 /// **Two-stage parse invariant.** The silent `Isolated` fallback below
 /// is safe because of an upstream contract: `lpm install` only ever
-/// writes a v6 install-hash via `write_post_install_v6_hash` AFTER
+/// writes the install-hash via `write_post_install_hash` AFTER
 /// `read_package_json` has already succeeded with the typed
 /// `PackageJson` parse (install fails fast otherwise). So whenever the
-/// mtime fast path finds a matching v6 hash on disk, the manifest at
+/// mtime fast path finds a matching install hash on disk, the manifest at
 /// that mtime DID typed-parse at install time. The fast path can
 /// trust mtime as a content proxy without re-running the typed parse.
 /// The slow path's own typed-parse guard at
