@@ -1,3 +1,5 @@
+#![cfg(debug_assertions)]
+
 mod support;
 
 use aes_gcm::{

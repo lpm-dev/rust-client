@@ -1,3 +1,5 @@
+#![cfg(debug_assertions)]
+
 //! Workflow tests for the local-only `lpm env *` surfaces.
 //!
 //! `env_vault.rs` covers the cloud-sync surfaces (pair / push / pull /

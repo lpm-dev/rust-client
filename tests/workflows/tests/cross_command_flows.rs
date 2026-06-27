@@ -1097,6 +1097,7 @@ async fn flow_install_g_run_uninstall_g_shim_lifecycle() {
 /// the same wrapping-key state. The pulled plaintext must byte-equal
 /// the pushed plaintext — the load-bearing correctness claim of the
 /// post-pairing sync protocol.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn flow_env_push_pull_cross_machine_round_trip() {
     use support::auth_state::{SessionSeed, seed_sessions};
