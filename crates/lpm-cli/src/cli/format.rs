@@ -445,38 +445,28 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             )));
             lines
         }
+        lpm_common::LpmError::NpmFirewallEntitlementRequired {
+            message,
+            reason,
+            entitlement_source,
+        } => entitlement_error_lines(
+            "NPM firewall access denied",
+            message,
+            reason.as_deref(),
+            entitlement_source.as_deref(),
+            "Use a Pro/org token for npm firewall checks, or set [firewall].mode = \"off\".",
+        ),
         lpm_common::LpmError::UpstreamProxyEntitlementRequired {
             message,
             reason,
             entitlement_source,
-        } => {
-            let mut lines = vec![
-                SlimErrorLine::Failed("Upstream npm proxy access denied".to_owned()),
-                SlimErrorLine::Detail(format!("  {} {message}", install_ui::dim("reason"))),
-            ];
-            if let Some(reason) = reason {
-                lines.push(SlimErrorLine::Detail(format!(
-                    "  {} {}",
-                    install_ui::dim("policy"),
-                    install_ui::cyan(reason)
-                )));
-            }
-            if let Some(entitlement_source) = entitlement_source {
-                lines.push(SlimErrorLine::Detail(format!(
-                    "  {} {}",
-                    install_ui::dim("entitlement"),
-                    install_ui::cyan(entitlement_source)
-                )));
-            }
-            lines.push(SlimErrorLine::Detail(format!(
-                "  {} {}",
-                install_ui::dim("hint"),
-                install_ui::dim(
-                    "Use a Pro/org token, or route standalone npm packages directly to npm."
-                )
-            )));
-            lines
-        }
+        } => entitlement_error_lines(
+            "Upstream npm proxy access denied",
+            message,
+            reason.as_deref(),
+            entitlement_source.as_deref(),
+            "Use a Pro/org token, or route standalone npm packages directly to npm.",
+        ),
         lpm_common::LpmError::NotFound(reason) => {
             diagnostic_lines("Not found", Some(reason), error)
         }
@@ -673,6 +663,39 @@ fn diagnostic_lines(
         push_multiline_detail(&mut lines, "reason", reason);
     }
     push_diagnostic_help(&mut lines, error);
+    lines
+}
+
+fn entitlement_error_lines(
+    title: &str,
+    message: &str,
+    reason: Option<&str>,
+    entitlement_source: Option<&str>,
+    hint: &str,
+) -> Vec<SlimErrorLine> {
+    let mut lines = vec![
+        SlimErrorLine::Failed(title.to_owned()),
+        SlimErrorLine::Detail(format!("  {} {message}", install_ui::dim("reason"))),
+    ];
+    if let Some(reason) = reason {
+        lines.push(SlimErrorLine::Detail(format!(
+            "  {} {}",
+            install_ui::dim("policy"),
+            install_ui::cyan(reason)
+        )));
+    }
+    if let Some(entitlement_source) = entitlement_source {
+        lines.push(SlimErrorLine::Detail(format!(
+            "  {} {}",
+            install_ui::dim("entitlement"),
+            install_ui::cyan(entitlement_source)
+        )));
+    }
+    lines.push(SlimErrorLine::Detail(format!(
+        "  {} {}",
+        install_ui::dim("hint"),
+        install_ui::dim(hint)
+    )));
     lines
 }
 
@@ -940,6 +963,30 @@ mod tests {
         assert_eq!(
             plain[3],
             "  hint Use a Pro/org token, or route standalone npm packages directly to npm."
+        );
+    }
+
+    #[test]
+    fn slim_error_lines_render_firewall_entitlement_denial_as_contract_rows() {
+        let error = lpm_common::LpmError::NpmFirewallEntitlementRequired {
+            message: "A Pro account or active org membership is required.".into(),
+            reason: Some("personal_plan_not_eligible".into()),
+            entitlement_source: Some("personal".into()),
+        };
+
+        let lines = slim_error_lines(&error);
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(plain[0], "NPM firewall access denied");
+        assert_eq!(
+            plain[1],
+            "  reason A Pro account or active org membership is required."
+        );
+        assert_eq!(plain[2], "  policy personal_plan_not_eligible");
+        assert_eq!(plain[3], "  entitlement personal");
+        assert_eq!(
+            plain[4],
+            "  hint Use a Pro/org token for npm firewall checks, or set [firewall].mode = \"off\"."
         );
     }
 

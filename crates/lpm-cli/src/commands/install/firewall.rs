@@ -65,8 +65,8 @@ impl NpmFirewallMaterializationPreflight {
 impl NpmFirewallMode {
     pub(super) fn auth_posture(self) -> AuthPosture {
         match self {
-            Self::Off | Self::Report => AuthPosture::AnonymousPreferred,
-            Self::Enforce => AuthPosture::AuthRequired,
+            Self::Off => AuthPosture::AnonymousPreferred,
+            Self::Report | Self::Enforce => AuthPosture::AuthRequired,
         }
     }
 }
@@ -628,15 +628,11 @@ async fn request_firewall_chunk(
                 events,
                 response: None,
                 elapsed_ms: started.elapsed().as_millis(),
-                report_error: Some(format!(
-                    "npm firewall verdict preflight failed in report mode: {error}"
-                )),
+                report_error: Some(npm_firewall_preflight_report_error(error)),
             });
         }
         Err(error) => {
-            return Err(LpmError::Registry(format!(
-                "npm firewall verdict preflight failed: {error}"
-            )));
+            return Err(npm_firewall_preflight_enforce_error(error));
         }
     };
     Ok(FirewallChunkResult {
@@ -645,6 +641,35 @@ async fn request_firewall_chunk(
         elapsed_ms: started.elapsed().as_millis(),
         report_error: None,
     })
+}
+
+fn npm_firewall_preflight_report_error(error: LpmError) -> String {
+    let error = normalize_npm_firewall_preflight_error(error);
+    format!("npm firewall verdict preflight failed in report mode: {error}")
+}
+
+fn npm_firewall_preflight_enforce_error(error: LpmError) -> LpmError {
+    match normalize_npm_firewall_preflight_error(error) {
+        error @ (LpmError::AuthRequired
+        | LpmError::SessionExpired
+        | LpmError::NpmFirewallEntitlementRequired { .. }) => error,
+        error => LpmError::Registry(format!("npm firewall verdict preflight failed: {error}")),
+    }
+}
+
+fn normalize_npm_firewall_preflight_error(error: LpmError) -> LpmError {
+    match error {
+        LpmError::UpstreamProxyEntitlementRequired {
+            message,
+            reason,
+            entitlement_source,
+        } => LpmError::NpmFirewallEntitlementRequired {
+            message,
+            reason,
+            entitlement_source,
+        },
+        error => error,
+    }
 }
 
 fn apply_firewall_chunk_result(
@@ -753,15 +778,11 @@ pub(super) async fn request_npm_firewall_preflight(
             return Ok(NpmFirewallPreflightResult {
                 stats,
                 decisions: Vec::new(),
-                report_error: Some(format!(
-                    "npm firewall verdict preflight failed in report mode: {error}"
-                )),
+                report_error: Some(npm_firewall_preflight_report_error(error)),
             });
         }
         Err(error) => {
-            return Err(LpmError::Registry(format!(
-                "npm firewall verdict preflight failed: {error}"
-            )));
+            return Err(npm_firewall_preflight_enforce_error(error));
         }
     };
     stats.batch_ms = started.elapsed().as_millis();

@@ -218,6 +218,16 @@ pub(super) fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
                     .map(str::to_owned),
             })
         }
+        "npm_firewall_entitlement_required" => {
+            let message = json_string_field(&value, "message")
+                .unwrap_or("A Pro account or active org membership is required.");
+            Some(LpmError::NpmFirewallEntitlementRequired {
+                message: message.to_owned(),
+                reason: json_string_field(&value, "reason").map(str::to_owned),
+                entitlement_source: json_string_field(&value, "entitlementSource")
+                    .map(str::to_owned),
+            })
+        }
         _ => None,
     }
 }
