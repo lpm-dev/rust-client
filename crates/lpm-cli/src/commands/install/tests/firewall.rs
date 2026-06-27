@@ -2,6 +2,7 @@ use super::*;
 use crate::commands::install::firewall::{
     DEFAULT_NPM_FIREWALL_CHUNK_SIZE, NpmFirewallLookupMode, NpmFirewallPreflightStats,
     npm_firewall_chunk_size, npm_firewall_package, npm_firewall_package_from_selected_event,
+    request_npm_firewall_preflight,
 };
 use crate::npm_firewall_config::NpmFirewallMode;
 
@@ -101,15 +102,71 @@ fn npm_firewall_mode_disables_tarball_prefetch_when_enabled() {
 }
 
 #[test]
-fn npm_firewall_mode_uses_auth_only_for_enforce_mode() {
+fn npm_firewall_mode_requires_auth_for_report_and_enforce() {
     assert_eq!(
         NpmFirewallMode::Report.auth_posture(),
-        lpm_registry::client::AuthPosture::AnonymousPreferred
+        lpm_registry::client::AuthPosture::AuthRequired
     );
     assert_eq!(
         NpmFirewallMode::Enforce.auth_posture(),
         lpm_registry::client::AuthPosture::AuthRequired
     );
+}
+
+#[tokio::test]
+async fn enforce_firewall_preflight_maps_legacy_entitlement_denial_to_firewall_error() {
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "upstream_proxy_entitlement_required",
+            "message": "A Pro account or active org membership is required.",
+            "reason": "personal_plan_not_eligible",
+            "entitlementSource": "personal"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = request_npm_firewall_preflight(
+        NpmFirewallMode::Enforce,
+        NpmFirewallLookupMode::PackageOnly,
+        client,
+        vec![lpm_registry::client::NpmFirewallBatchPackage {
+            name: "left-pad".to_string(),
+            version: "1.3.0".to_string(),
+            integrity: None,
+            published_at: None,
+        }],
+        false,
+    )
+    .await;
+
+    match result {
+        Err(lpm_common::LpmError::NpmFirewallEntitlementRequired {
+            message,
+            reason,
+            entitlement_source,
+        }) => {
+            assert_eq!(
+                message,
+                "A Pro account or active org membership is required."
+            );
+            assert_eq!(reason.as_deref(), Some("personal_plan_not_eligible"));
+            assert_eq!(entitlement_source.as_deref(), Some("personal"));
+        }
+        other => panic!("expected firewall entitlement error, got {other:?}"),
+    }
 }
 
 #[test]

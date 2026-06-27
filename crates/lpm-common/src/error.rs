@@ -272,6 +272,17 @@ pub enum LpmError {
         match_source: Option<String>,
     },
 
+    #[error("LPM npm firewall access denied: {message}")]
+    #[diagnostic(
+        code(lpm::npm_firewall_entitlement_required),
+        help("Use a Pro/org token for npm firewall checks, or set [firewall].mode = \"off\".")
+    )]
+    NpmFirewallEntitlementRequired {
+        message: String,
+        reason: Option<String>,
+        entitlement_source: Option<String>,
+    },
+
     #[error("LPM upstream npm proxy access denied: {message}")]
     #[diagnostic(
         code(lpm::upstream_proxy_entitlement_required),
@@ -529,6 +540,7 @@ impl LpmError {
             LpmError::SessionExpired => "session_expired",
             LpmError::Forbidden(_) => "forbidden",
             LpmError::NpmFirewallBlocked { .. } => "npm_firewall_blocked",
+            LpmError::NpmFirewallEntitlementRequired { .. } => "npm_firewall_entitlement_required",
             LpmError::UpstreamProxyEntitlementRequired { .. } => {
                 "upstream_proxy_entitlement_required"
             }
@@ -686,6 +698,11 @@ mod tests {
                 decision_id: Some("decision-1".into()),
                 match_source: Some("package".into()),
             },
+            LpmError::NpmFirewallEntitlementRequired {
+                message: "A Pro account or active org membership is required.".into(),
+                reason: Some("personal_plan_not_eligible".into()),
+                entitlement_source: None,
+            },
             LpmError::UpstreamProxyEntitlementRequired {
                 message: "A Pro account or active org membership is required.".into(),
                 reason: Some("personal_plan_not_eligible".into()),
@@ -802,6 +819,15 @@ mod tests {
             }
             .error_code(),
             "npm_firewall_blocked"
+        );
+        assert_eq!(
+            LpmError::NpmFirewallEntitlementRequired {
+                message: "A Pro account or active org membership is required.".into(),
+                reason: Some("personal_plan_not_eligible".into()),
+                entitlement_source: None,
+            }
+            .error_code(),
+            "npm_firewall_entitlement_required"
         );
         assert_eq!(
             LpmError::UpstreamProxyEntitlementRequired {

@@ -121,6 +121,54 @@ async fn npm_firewall_batch_verdicts_sends_bearer_auth_header_when_token_is_pres
 }
 
 #[tokio::test]
+async fn npm_firewall_batch_verdicts_maps_firewall_entitlement_denial() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("firewall-token");
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "npm_firewall_entitlement_required",
+            "message": "A Pro account or active org membership is required.",
+            "reason": "personal_plan_not_eligible",
+            "entitlementSource": "personal"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .npm_firewall_batch_verdicts(&[NpmFirewallBatchPackage {
+            name: "left-pad".to_string(),
+            version: "1.3.0".to_string(),
+            integrity: None,
+            published_at: None,
+        }])
+        .await;
+
+    match result {
+        Err(LpmError::NpmFirewallEntitlementRequired {
+            message,
+            reason,
+            entitlement_source,
+        }) => {
+            assert_eq!(
+                message,
+                "A Pro account or active org membership is required."
+            );
+            assert_eq!(reason.as_deref(), Some("personal_plan_not_eligible"));
+            assert_eq!(entitlement_source.as_deref(), Some("personal"));
+        }
+        other => panic!("expected typed firewall entitlement error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn npm_firewall_batch_verdicts_rejects_unknown_action() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
