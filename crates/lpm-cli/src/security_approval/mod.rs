@@ -77,7 +77,7 @@ const APPROVED_GLOBAL_TRUST_STATE_SCHEMA_VERSION: u32 = 1;
 const AUDIT_EVENT_SCHEMA_VERSION: u32 = 1;
 const AUDIT_HEAD_SCHEMA_VERSION: u32 = 1;
 
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 const SECURITY_POLICY_PATH_ENV: &str = "LPM_SECURITY_POLICY_PATH";
 #[cfg(test)]
 const TEST_SECRET_ENV: &str = "LPM_TEST_SECURITY_SECRET_HEX";

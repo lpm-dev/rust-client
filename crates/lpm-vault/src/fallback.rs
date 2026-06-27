@@ -97,6 +97,9 @@ fn debug_native_write_error() -> Option<String> {
 }
 
 fn use_fast_test_scrypt() -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     matches!(
         std::env::var("LPM_TEST_FAST_SCRYPT").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE")
@@ -717,6 +720,25 @@ mod tests {
             Ok(value) => value,
             Err(panic) => std::panic::resume_unwind(panic),
         }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn fast_scrypt_env_is_ignored_in_release_builds() {
+        let _lock = crate::test_env_lock::acquire_env_lock();
+        let original_fast_scrypt = std::env::var_os("LPM_TEST_FAST_SCRYPT");
+        unsafe {
+            std::env::set_var("LPM_TEST_FAST_SCRYPT", "1");
+        }
+        let fast_scrypt = use_fast_test_scrypt();
+        unsafe {
+            match original_fast_scrypt {
+                Some(value) => std::env::set_var("LPM_TEST_FAST_SCRYPT", value),
+                None => std::env::remove_var("LPM_TEST_FAST_SCRYPT"),
+            }
+        }
+
+        assert!(!fast_scrypt);
     }
 
     #[test]

@@ -88,6 +88,9 @@ pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
 }
 
 fn force_file_wrapping_key() -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     matches!(
         std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
@@ -608,6 +611,25 @@ mod tests {
                 prior_home.restore();
             }
         }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn force_file_wrapping_key_ignores_env_in_release_builds() {
+        let _guard = crate::test_env_lock::acquire_env_lock();
+        let prior = std::env::var_os("LPM_FORCE_FILE_VAULT");
+        unsafe {
+            std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+        }
+        let forced = force_file_wrapping_key();
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var("LPM_FORCE_FILE_VAULT", value),
+                None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
+            }
+        }
+
+        assert!(!forced);
     }
 
     #[test]

@@ -441,6 +441,9 @@ pub async fn get_org_member_keys(
 /// warning on those targets.
 #[cfg(target_os = "macos")]
 fn force_file_x25519_keypair() -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
     matches!(
         std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
@@ -513,6 +516,25 @@ mod tests {
     use crate::sync::test_support::{IsolatedVaultKeyEnv, env_lock_guard};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    #[test]
+    fn force_file_x25519_keypair_ignores_env_in_release_builds() {
+        let _guard = env_lock_guard();
+        let prior = std::env::var_os("LPM_FORCE_FILE_VAULT");
+        unsafe {
+            std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+        }
+        let forced = force_file_x25519_keypair();
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var("LPM_FORCE_FILE_VAULT", value),
+                None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
+            }
+        }
+
+        assert!(!forced);
+    }
 
     #[tokio::test]
     async fn get_my_public_key_returns_err_on_non_2xx() {
