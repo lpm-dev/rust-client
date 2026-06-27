@@ -31,11 +31,6 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
-  # Opt in to Node.js 24 for all JavaScript actions ahead of GitHub's
-  # 2026-06-02 forced-default (Node 20 removal on 2026-09-16). Suppresses
-  # the "Node.js 20 actions are deprecated" deprecation annotation on
-  # every run. Safe no-op after the forced-default date.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   verify:
@@ -52,7 +47,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry
@@ -68,12 +63,12 @@ jobs:
         uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
 
       - name: Install Node 22
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "22"
 
       - name: Cache npm (Verdaccio test harness)
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.npm
           key: ${{ runner.os }}-npm-verdaccio-${{ hashFiles('tests/workflows/tests/support/verdaccio.rs') }}
@@ -337,14 +332,14 @@ jobs:
           }
 
       - name: Upload artifact
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ matrix.binary }}
           path: ${{ matrix.binary }}
 
       - name: Upload helper artifact (Windows)
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: lpm-sandbox-helper-win32-x64.exe
           path: lpm-sandbox-helper-win32-x64.exe
@@ -363,15 +358,42 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: write
       id-token: write
       attestations: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          path: binaries
-          merge-multiple: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf artifact-downloads binaries
+          mkdir -p artifact-downloads binaries
+          gh run download "$GITHUB_RUN_ID" --dir artifact-downloads
+
+          count=0
+          for artifact_file in artifact-downloads/*/*; do
+            if [ ! -f "$artifact_file" ]; then
+              continue
+            fi
+
+            filename="$(basename "$artifact_file")"
+            if [ -e "binaries/$filename" ]; then
+              echo "::error::Duplicate release artifact filename: $filename"
+              exit 1
+            fi
+
+            cp "$artifact_file" "binaries/$filename"
+            count=$((count + 1))
+          done
+
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No release artifacts were downloaded."
+            exit 1
+          fi
+
+          find binaries -maxdepth 1 -type f -printf '%f\n' | sort
 
       - name: Generate SHA256SUMS.txt
         working-directory: binaries
@@ -400,7 +422,7 @@ jobs:
 
       - name: Attest SHA256SUMS.txt via Sigstore
         id: attest
-        uses: actions/attest-build-provenance@173725a1209d09b31f9d30a3890cf2757ebbff0d # v2
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
           subject-path: binaries/SHA256SUMS.txt
 
@@ -408,7 +430,7 @@ jobs:
         run: cp "${{ steps.attest.outputs.bundle-path }}" binaries/SHA256SUMS.txt.sigstore
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d # v3
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
           files: binaries/*
@@ -423,19 +445,46 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      actions: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          path: binaries
-          merge-multiple: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf artifact-downloads binaries
+          mkdir -p artifact-downloads binaries
+          gh run download "$GITHUB_RUN_ID" --dir artifact-downloads
+
+          count=0
+          for artifact_file in artifact-downloads/*/*; do
+            if [ ! -f "$artifact_file" ]; then
+              continue
+            fi
+
+            filename="$(basename "$artifact_file")"
+            if [ -e "binaries/$filename" ]; then
+              echo "::error::Duplicate release artifact filename: $filename"
+              exit 1
+            fi
+
+            cp "$artifact_file" "binaries/$filename"
+            count=$((count + 1))
+          done
+
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No release artifacts were downloaded."
+            exit 1
+          fi
+
+          find binaries -maxdepth 1 -type f -printf '%f\n' | sort
 
       - name: Bootstrap npm 11 (required for trusted publishers OIDC)
         run: |
@@ -494,7 +543,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -652,7 +701,7 @@ jobs:
           echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
 
       - name: Update Homebrew tap
-        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           repository: lpm-dev/homebrew-lpm
