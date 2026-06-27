@@ -3914,6 +3914,277 @@ async fn install_v2_tree_integrity_cache_hit_repairs_tampered_object_before_link
 }
 
 #[tokio::test]
+async fn install_source_policy_migrates_legacy_tree_link_entry_without_stale_warning() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("is-number", "7.0.0");
+    mock.with_package("is-number", "7.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "v2-link-warning-migration",
+        "version": "1.0.0",
+        "dependencies": {
+            "is-number": "7.0.0"
+        }
+    }"#,
+    );
+
+    let legacy = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_V2_OBJECT_INTEGRITY", "tree")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to seed legacy tree-mode v2 install");
+    assert!(
+        legacy.status.success(),
+        "legacy tree-mode v2 install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&legacy.stdout),
+        String::from_utf8_lossy(&legacy.stderr)
+    );
+    let sri = compute_integrity(&tarball);
+    let v2_store = lpm_store::v2::Store::at_with_object_integrity_policy(
+        project.home().join(".lpm/store/v2"),
+        lpm_store::v2::ObjectIntegrityPolicy::Tree,
+    );
+    assert!(
+        v2_store.reusable_object(&sri).unwrap().is_some(),
+        "seeded tree-mode object must be reusable before source-policy migration"
+    );
+
+    let nm = project.path().join("node_modules");
+    if nm.exists() {
+        std::fs::remove_dir_all(&nm).unwrap();
+    }
+
+    let migrated = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_V2_OBJECT_INTEGRITY", "source")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to migrate legacy tree-mode v2 link entry");
+    let stdout = String::from_utf8_lossy(&migrated.stdout);
+    let stderr = String::from_utf8_lossy(&migrated.stderr);
+    assert!(
+        migrated.status.success(),
+        "source-mode v2 install should migrate the legacy link entry\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for warning in [
+        "v2 store: treating object as unusable",
+        "v2 store: removing incomplete or unverifiable object",
+        "v2 store: incomplete or stale link entry",
+    ] {
+        assert!(
+            !stderr.contains(warning),
+            "legacy migration must stay out of user-facing v2 store warnings\nmatched: {warning}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assertions::assert_in_node_modules(project.path(), "is-number");
+}
+
+#[tokio::test]
+async fn install_tree_policy_migrates_snapshotful_source_object_without_refetch_or_stale_warning() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("is-number", "7.0.0");
+    mock.with_package("is-number", "7.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "v2-source-to-tree-migration",
+        "version": "1.0.0",
+        "dependencies": {
+            "is-number": "7.0.0"
+        }
+    }"#,
+    );
+
+    let source = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_V2_OBJECT_INTEGRITY", "source")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to seed source-mode v2 install");
+    assert!(
+        source.status.success(),
+        "source-mode v2 install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&source.stdout),
+        String::from_utf8_lossy(&source.stderr)
+    );
+    let seed_tarball_requests = mock.tarball_request_count("is-number", "7.0.0").await;
+    assert_eq!(
+        seed_tarball_requests, 1,
+        "source-mode seed should download the package exactly once"
+    );
+    let sri = compute_integrity(&tarball);
+    let v2_store = lpm_store::v2::Store::at_with_object_integrity_policy(
+        project.home().join(".lpm/store/v2"),
+        lpm_store::v2::ObjectIntegrityPolicy::Source,
+    );
+    let object_dir = v2_store.paths().object_dir(&sri).unwrap();
+    let object_snapshot = object_dir.join(".lpm-tree-snapshot.json");
+    assert!(
+        v2_store.reusable_object(&sri).unwrap().is_some(),
+        "seeded source-mode object must be reusable before tree-policy migration"
+    );
+    assert!(
+        object_snapshot.is_file(),
+        "source-mode objects must carry a tree baseline for later tree-policy migration"
+    );
+
+    let nm = project.path().join("node_modules");
+    if nm.exists() {
+        std::fs::remove_dir_all(&nm).unwrap();
+    }
+
+    let migrated = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_V2_OBJECT_INTEGRITY", "tree")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to migrate source-mode v2 link entry");
+    let stdout = String::from_utf8_lossy(&migrated.stdout);
+    let stderr = String::from_utf8_lossy(&migrated.stderr);
+    assert!(
+        migrated.status.success(),
+        "tree-mode v2 install should migrate the source link entry\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        mock.tarball_request_count("is-number", "7.0.0").await,
+        seed_tarball_requests,
+        "snapshotful source-to-tree migration must reuse the existing object without refetching"
+    );
+    for warning in [
+        "v2 store: treating object as unusable",
+        "v2 store: removing incomplete or unverifiable object",
+        "v2 store: incomplete or stale link entry",
+    ] {
+        assert!(
+            !stderr.contains(warning),
+            "source-to-tree migration must stay out of user-facing v2 store warnings\nmatched: {warning}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assertions::assert_in_node_modules(project.path(), "is-number");
+}
+
+#[tokio::test]
+async fn install_tree_policy_refetches_snapshotless_source_object_without_stale_warning() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("is-number", "7.0.0");
+    mock.with_package("is-number", "7.0.0", &tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "v2-snapshotless-source-to-tree-migration",
+        "version": "1.0.0",
+        "dependencies": {
+            "is-number": "7.0.0"
+        }
+    }"#,
+    );
+
+    let source = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_V2_OBJECT_INTEGRITY", "source")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to seed source-mode v2 install");
+    assert!(
+        source.status.success(),
+        "source-mode v2 install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&source.stdout),
+        String::from_utf8_lossy(&source.stderr)
+    );
+    let seed_tarball_requests = mock.tarball_request_count("is-number", "7.0.0").await;
+    assert_eq!(
+        seed_tarball_requests, 1,
+        "source-mode seed should download the package exactly once"
+    );
+    let sri = compute_integrity(&tarball);
+    let v2_store = lpm_store::v2::Store::at_with_object_integrity_policy(
+        project.home().join(".lpm/store/v2"),
+        lpm_store::v2::ObjectIntegrityPolicy::Source,
+    );
+    let object_dir = v2_store.paths().object_dir(&sri).unwrap();
+    let object_snapshot = object_dir.join(".lpm-tree-snapshot.json");
+    std::fs::remove_file(&object_snapshot).unwrap();
+    assert!(
+        v2_store.reusable_object(&sri).unwrap().is_some(),
+        "seeded snapshotless source-mode object must still satisfy source policy"
+    );
+    assert!(
+        !object_snapshot.exists(),
+        "test setup must simulate the legacy snapshotless source-object shape"
+    );
+
+    let nm = project.path().join("node_modules");
+    if nm.exists() {
+        std::fs::remove_dir_all(&nm).unwrap();
+    }
+
+    let migrated = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .env("LPM_V2_OBJECT_INTEGRITY", "tree")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to repair snapshotless source-mode v2 object");
+    let stdout = String::from_utf8_lossy(&migrated.stdout);
+    let stderr = String::from_utf8_lossy(&migrated.stderr);
+    assert!(
+        migrated.status.success(),
+        "tree-mode v2 install should repair the snapshotless source object\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        mock.tarball_request_count("is-number", "7.0.0").await,
+        seed_tarball_requests + 1,
+        "snapshotless source objects need fresh tarball bytes before tree-policy reuse"
+    );
+    for warning in [
+        "v2 store: treating object as unusable",
+        "v2 store: removing incomplete or unverifiable object",
+        "v2 store: incomplete or stale link entry",
+    ] {
+        assert!(
+            !stderr.contains(warning),
+            "snapshotless source repair must stay out of user-facing v2 store warnings\nmatched: {warning}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    assertions::assert_in_node_modules(project.path(), "is-number");
+    assert!(
+        object_snapshot.is_file(),
+        "fresh repair must restore the tree snapshot baseline"
+    );
+}
+
+#[tokio::test]
 async fn install_without_harness_overrides_uses_shipped_v2_layout() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("is-number", "7.0.0");
