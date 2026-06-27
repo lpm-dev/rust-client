@@ -48,7 +48,8 @@ pub use link_meta::{
 };
 pub use platform::PlatformTuple;
 pub use store::{
-    COMPAT_ISLAND_COMPLETE_FILENAME, CompatIslandKeyEntry, DepLink, ExtractedObject,
-    FreshObjectIntegrity, LinkEntry, LinkEntryRequest, LinkEntryTimings, ReusableObject,
-    ReusableObjectCheckTimings, Store, StoreV2Paths, VerifiedObjectIntegrity, compat_island_key,
+    COMPAT_ISLAND_COMPLETE_FILENAME, CompatIslandKeyEntry, DepLink, ENV_V2_OBJECT_INTEGRITY,
+    ExtractedObject, FreshObjectIntegrity, LinkEntry, LinkEntryRequest, LinkEntryTimings,
+    ObjectIntegrityPolicy, ReusableObject, ReusableObjectCheckTimings, Store, StoreV2Paths,
+    VerifiedObjectIntegrity, compat_island_key,
 };

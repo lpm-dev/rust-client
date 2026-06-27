@@ -115,7 +115,7 @@ const TREE_SNAPSHOT_FILENAME: &str = ".lpm-tree-snapshot.json";
 const TREE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const TREE_SNAPSHOT_MAX_BYTES: u64 = 4096;
 const ENV_V2_FINALIZE_PERMITS: &str = "LPM_V2_FINALIZE_PERMITS";
-const ENV_V2_OBJECT_INTEGRITY: &str = "LPM_V2_OBJECT_INTEGRITY";
+pub const ENV_V2_OBJECT_INTEGRITY: &str = "LPM_V2_OBJECT_INTEGRITY";
 
 static V2_FINALIZE_LIMITER: OnceLock<Option<Arc<FinalizePermitLimiter>>> = OnceLock::new();
 
@@ -195,13 +195,28 @@ fn v2_finalize_limiter() -> Option<&'static FinalizePermitLimiter> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ObjectIntegrityPolicy {
+pub enum ObjectIntegrityPolicy {
     Tree,
     Source,
 }
 
 impl ObjectIntegrityPolicy {
-    fn from_env_value(value: Option<&str>) -> Self {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            value if value.eq_ignore_ascii_case("source") => Some(Self::Source),
+            value if value.eq_ignore_ascii_case("tree") => Some(Self::Tree),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::Source => "source",
+        }
+    }
+
+    pub fn from_env_value(value: Option<&str>) -> Self {
         match value.map(str::trim) {
             Some(value) if value.eq_ignore_ascii_case("tree") => Self::Tree,
             Some(value)
@@ -217,7 +232,7 @@ impl ObjectIntegrityPolicy {
     }
 }
 
-fn object_integrity_policy() -> ObjectIntegrityPolicy {
+fn object_integrity_policy_from_env() -> ObjectIntegrityPolicy {
     ObjectIntegrityPolicy::from_env_value(std::env::var(ENV_V2_OBJECT_INTEGRITY).ok().as_deref())
 }
 
@@ -619,26 +634,50 @@ pub struct LinkEntryTimings {
 #[derive(Debug, Clone)]
 pub struct Store {
     paths: StoreV2Paths,
+    object_integrity_policy: ObjectIntegrityPolicy,
 }
 
 impl Store {
     /// Resolve the v2 store from the given LPM home.
     pub fn from_lpm_root(lpm_root: &LpmRoot) -> Self {
+        Self::from_lpm_root_with_object_integrity_policy(
+            lpm_root,
+            object_integrity_policy_from_env(),
+        )
+    }
+
+    pub fn from_lpm_root_with_object_integrity_policy(
+        lpm_root: &LpmRoot,
+        object_integrity_policy: ObjectIntegrityPolicy,
+    ) -> Self {
         Self {
             paths: StoreV2Paths::from_lpm_root(lpm_root),
+            object_integrity_policy,
         }
     }
 
     /// Mount the store at an arbitrary path (test seam).
     pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self::at_with_object_integrity_policy(root, object_integrity_policy_from_env())
+    }
+
+    pub fn at_with_object_integrity_policy(
+        root: impl Into<PathBuf>,
+        object_integrity_policy: ObjectIntegrityPolicy,
+    ) -> Self {
         Self {
             paths: StoreV2Paths::at(root),
+            object_integrity_policy,
         }
     }
 
     /// The path helper this Store wraps.
     pub fn paths(&self) -> &StoreV2Paths {
         &self.paths
+    }
+
+    pub fn object_integrity_policy(&self) -> ObjectIntegrityPolicy {
+        self.object_integrity_policy
     }
 
     /// Ensure the cached compatibility-island root exists with store-tier
@@ -662,7 +701,7 @@ impl Store {
 
     /// Return the object directory plus the verified object digest.
     pub fn reusable_object(&self, sri: &str) -> Result<Option<ReusableObject>, LpmError> {
-        self.reusable_object_with_policy(sri, object_integrity_policy())
+        self.reusable_object_with_policy(sri, self.object_integrity_policy)
     }
 
     fn reusable_object_with_policy(
@@ -690,7 +729,7 @@ impl Store {
         &self,
         sri: &str,
     ) -> Result<(Option<ReusableObject>, ReusableObjectCheckTimings), LpmError> {
-        self.reusable_object_with_timings_and_policy(sri, object_integrity_policy())
+        self.reusable_object_with_timings_and_policy(sri, self.object_integrity_policy)
     }
 
     fn reusable_object_with_timings_and_policy(
@@ -763,7 +802,7 @@ impl Store {
         sri: &str,
         tarball_data: &[u8],
     ) -> Result<(PathBuf, StageTimings), LpmError> {
-        self.extract_object_with_timings_and_policy(sri, tarball_data, object_integrity_policy())
+        self.extract_object_with_timings_and_policy(sri, tarball_data, self.object_integrity_policy)
             .map(|(object, timings)| (object.path, timings))
     }
 
@@ -776,7 +815,7 @@ impl Store {
         sri: &str,
         tarball_data: &[u8],
     ) -> Result<(ExtractedObject, StageTimings), LpmError> {
-        self.extract_object_with_timings_and_policy(sri, tarball_data, object_integrity_policy())
+        self.extract_object_with_timings_and_policy(sri, tarball_data, self.object_integrity_policy)
     }
 
     fn extract_object_with_timings_and_policy(
@@ -994,7 +1033,7 @@ impl Store {
         self.extract_object_from_bytes_with_policy(
             tarball_data,
             expected_integrity,
-            object_integrity_policy(),
+            self.object_integrity_policy,
         )
     }
 
@@ -1060,7 +1099,7 @@ impl Store {
     /// - On any error mid-way, the tmp dir is cleaned up before
     ///   returning.
     pub fn populate_link_entry(&self, request: LinkEntryRequest) -> Result<LinkEntry, LpmError> {
-        self.populate_link_entry_inner(request, None, None, object_integrity_policy())
+        self.populate_link_entry_inner(request, None, None, self.object_integrity_policy)
     }
 
     /// Populate a link entry using a previously verified object digest.
@@ -1073,7 +1112,7 @@ impl Store {
             request,
             Some(verified_object_integrity),
             None,
-            object_integrity_policy(),
+            self.object_integrity_policy,
         )
     }
 
@@ -1111,7 +1150,7 @@ impl Store {
             request,
             Some(fresh_object.object_integrity.as_verified()),
             Some(&fresh_object.object_integrity),
-            object_integrity_policy(),
+            self.object_integrity_policy,
         )
     }
 
@@ -1474,7 +1513,7 @@ impl Store {
 
     /// Return the current content digest for a populated link entry.
     pub fn link_entry_content_integrity(&self, key: &GraphKey) -> Result<String, LpmError> {
-        self.link_entry_content_integrity_with_policy(key, object_integrity_policy())
+        self.link_entry_content_integrity_with_policy(key, self.object_integrity_policy)
     }
 
     fn link_entry_content_integrity_with_policy(
@@ -1551,7 +1590,7 @@ impl Store {
         v1_pkg_dir: &Path,
         sri: &str,
     ) -> Result<PathBuf, LpmError> {
-        let policy = object_integrity_policy();
+        let policy = self.object_integrity_policy;
         let object_dir = self.paths.object_dir(sri)?;
         if object_dir.exists()
             && object_dir_is_reusable_or_remove(
@@ -3440,6 +3479,20 @@ mod tests {
             ObjectIntegrityPolicy::from_env_value(Some("")),
             ObjectIntegrityPolicy::Source
         );
+    }
+
+    #[test]
+    fn object_integrity_policy_parse_accepts_only_config_modes() {
+        assert_eq!(
+            ObjectIntegrityPolicy::parse("source"),
+            Some(ObjectIntegrityPolicy::Source)
+        );
+        assert_eq!(
+            ObjectIntegrityPolicy::parse(" tree "),
+            Some(ObjectIntegrityPolicy::Tree)
+        );
+        assert_eq!(ObjectIntegrityPolicy::parse("sri"), None);
+        assert_eq!(ObjectIntegrityPolicy::parse("unknown"), None);
     }
 
     #[test]

@@ -961,6 +961,8 @@ async fn run_with_options_under_store_lock(
     let timing_detail_mode = TimingDetailMode::from_env();
     let emit_timing = crate::json_contract::install_timing_requested(timing);
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
+    let object_integrity_policy =
+        crate::commands::config::resolve_object_integrity_policy(&global_config)?;
     let verify_registry_signatures = registry_signature_verification_enabled(&global_config);
     let registry_signature_timings = timing_detail_mode
         .enabled()
@@ -2036,7 +2038,12 @@ async fn run_with_options_under_store_lock(
 
         // Verify all packages are in the global store
         let store = PackageStore::from_root(lpm_root);
-        let store_v2 = requested_v2_mode.then(|| lpm_store::v2::Store::from_lpm_root(lpm_root));
+        let store_v2 = requested_v2_mode.then(|| {
+            lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+                lpm_root,
+                object_integrity_policy,
+            )
+        });
         let mut missing = Vec::new();
         for p in &locked {
             // Source-aware existence check for the offline gate.
@@ -2156,6 +2163,7 @@ async fn run_with_options_under_store_lock(
             script_policy_override,
             lpm_root,
             &global_config,
+            object_integrity_policy,
             auto_build,
             no_sandbox,
             strict_sandbox,
@@ -2299,9 +2307,12 @@ async fn run_with_options_under_store_lock(
     // allocation-free.
     let store_version = lpm_store::StoreVersion::from_env();
     let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> = if store_version.is_v2() {
-        Some(std::sync::Arc::new(lpm_store::v2::Store::from_lpm_root(
-            lpm_root,
-        )))
+        Some(std::sync::Arc::new(
+            lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+                lpm_root,
+                object_integrity_policy,
+            ),
+        ))
     } else {
         None
     };
@@ -5739,6 +5750,7 @@ async fn run_with_options_under_store_lock(
             &link_targets,
             linker_mode,
             lpm_root,
+            object_integrity_policy,
             pkg.name.as_deref(),
             compatibility_bin_names,
         )?;
