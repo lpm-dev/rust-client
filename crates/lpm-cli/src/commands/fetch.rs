@@ -135,9 +135,7 @@ pub async fn run(
 
     let lpm_root = LpmRoot::from_env()?;
     let store = PackageStore::from_root(&lpm_root);
-    let store_v2 = lpm_store::StoreVersion::from_env()
-        .is_v2()
-        .then(|| Arc::new(lpm_store::v2::Store::from_lpm_root(&lpm_root)));
+    let store_v2 = v2_store_for_fetch(&lpm_root)?;
 
     let firewall_packages = npm_firewall_packages_for_fetch_targets(&targets, client);
     let firewall_preflight = prepare_npm_firewall_materialization_preflight(
@@ -225,6 +223,31 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn v2_store_for_fetch(lpm_root: &LpmRoot) -> Result<Option<Arc<lpm_store::v2::Store>>, LpmError> {
+    if !lpm_store::StoreVersion::from_env().is_v2() {
+        return Ok(None);
+    }
+    let global_config = crate::commands::config::GlobalConfig::load_checked()?;
+    Ok(Some(configured_v2_store_for_fetch(
+        lpm_root,
+        &global_config,
+    )?))
+}
+
+fn configured_v2_store_for_fetch(
+    lpm_root: &LpmRoot,
+    global_config: &crate::commands::config::GlobalConfig,
+) -> Result<Arc<lpm_store::v2::Store>, LpmError> {
+    let object_integrity_policy =
+        crate::commands::config::resolve_object_integrity_policy(global_config)?;
+    Ok(Arc::new(
+        lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+            lpm_root,
+            object_integrity_policy,
+        ),
+    ))
 }
 
 async fn fetch_one(
@@ -734,6 +757,27 @@ mod tests {
         let packages = npm_firewall_packages_for_fetch_targets(&targets, &client);
 
         assert_eq!(packages.len(), 1);
+    }
+
+    #[test]
+    fn v2_store_for_fetch_uses_persisted_integrity_policy() {
+        let _env =
+            crate::test_env::ScopedEnv::update([(lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None)]);
+        let root_dir = tempfile::tempdir().unwrap();
+        let lpm_root = LpmRoot::from_dir(root_dir.path());
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "integrity".to_string(),
+            toml::Value::String("tree".to_string()),
+        );
+        let global_config = crate::commands::config::GlobalConfig::from_table(table);
+
+        let store = configured_v2_store_for_fetch(&lpm_root, &global_config).unwrap();
+
+        assert_eq!(
+            store.object_integrity_policy(),
+            lpm_store::v2::ObjectIntegrityPolicy::Tree
+        );
     }
 
     #[test]

@@ -2443,19 +2443,19 @@ mod tests {
     }
 
     /// Dev composed contract: `auto_install_if_stale` MUST leave a
-    /// v6-shaped `.lpm/install-hash` on disk (3 lines: hash + `m:` +
-    /// `l:`). Pre-fix dev wrote a competing bare single-line hash
-    /// post-install, clobbering the v6 mtime / linker metadata that
+    /// v7-shaped `.lpm/install-hash` on disk (4 lines: hash + `m:` +
+    /// `l:` + `i:`). Pre-fix dev wrote a competing bare single-line hash
+    /// post-install, clobbering the v7 mtime / config metadata that
     /// `run_with_options` had just written; the post-fix design
     /// delegates the entire write to the install pipeline. This test
     /// exercises the real seam — calls `auto_install_if_stale` against
     /// an empty-deps project (no network needed; the install pipeline
     /// short-circuits at the empty-deps branch), then asserts the
-    /// install-hash file is v6 shape. A future regression that
+    /// install-hash file is v7 shape. A future regression that
     /// reintroduces a parallel bare-hash overwrite in `auto_install_if_stale`
     /// (or anywhere else in the dev flow) fails here immediately.
     #[tokio::test]
-    async fn auto_install_if_stale_writes_v6_install_hash_for_empty_deps() {
+    async fn auto_install_if_stale_writes_v7_install_hash_for_empty_deps() {
         // Isolate every env var the install pipeline reads so a
         // developer's exported state can't pollute the test. `LPM_HOME`
         // redirects the store + cache + global config away from the
@@ -2505,7 +2505,7 @@ mod tests {
             "auto_install_if_stale must succeed on empty-deps project, got: {result:?}"
         );
 
-        // Load-bearing pin: install-hash on disk has v6 shape (3 lines).
+        // Load-bearing pin: install-hash on disk has v7 shape (4 lines).
         // A regression that reintroduces `fs::write(install_hash, &bare_hash)`
         // anywhere in the dev path — inside auto_install_if_stale or a
         // helper it calls — fails the line-count assertion here.
@@ -2514,8 +2514,8 @@ mod tests {
         let lines: Vec<&str> = on_disk.lines().collect();
         assert_eq!(
             lines.len(),
-            3,
-            "install-hash MUST be v6 (3 lines: hash + m: + l:), got:\n{on_disk}\n\
+            4,
+            "install-hash MUST be v7 (4 lines: hash + m: + l: + i:), got:\n{on_disk}\n\
              A bare-hash overwrite anywhere in the dev path would fail here."
         );
         assert_eq!(lines[0].len(), 64, "line 1 must be a SHA-256 hex hash");
@@ -2537,8 +2537,9 @@ mod tests {
             "line 3 must be linker, got {:?}",
             lines[2]
         );
+        assert_eq!(lines[3], "i:source", "line 4 must be integrity policy");
 
-        // Round-trip: needs_install reads the v6 shape as up-to-date.
+        // Round-trip: needs_install reads the v7 shape as up-to-date.
         let (stale_after, hash) = needs_install(p);
         assert!(
             !stale_after,
