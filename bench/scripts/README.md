@@ -11,7 +11,7 @@ It provides:
 - isolated temp project, `HOME`, package-manager cache, and `LPM_HOME`
 - cold mode and warm-cache mode
 - round-robin interleaving by sample to reduce live-network bias
-- configurable sample count, fixtures, package managers, lpm routes, and lpm env cells
+- configurable sample count, fixtures, package managers, lpm routes, lpm firewall modes, and lpm env cells
 - JSON, Markdown, stdout/stderr, resolved fixture source, and per-run metrics artifacts
 - expected/unexpected warning classification for known noisy installs
 - top-package sweeps from a package-name file with offset/limit chunking
@@ -43,7 +43,7 @@ node bench/scripts/run-install-readiness.mjs \
   --modes cold,warm
 ```
 
-Capture a one-off direct-vs-proxy reference without paying that cost on every
+Capture a one-off firewall-enabled reference without paying that cost on every
 knob run:
 
 ```bash
@@ -52,8 +52,11 @@ node bench/scripts/run-install-readiness.mjs \
   --fixtures dogfood,nest,vitepress \
   --managers lpm \
   --modes cold,warm \
-  --lpm-routes direct,proxy
+  --lpm-firewall-modes off,report
 ```
+
+Use `--lpm-firewall-modes off,enforce` for the fail-closed gate when the
+benchmark environment has LPM auth, for example through `LPM_TOKEN`.
 
 Capture an apples-to-apples package-manager reference snapshot when needed:
 
@@ -126,8 +129,9 @@ fixtures for focused checks and top-package sweeps.
 the full heavy graph used by the recent installer measurements. If the cache
 is absent, the harness falls back to a generated VitePress install fixture.
 
-For production-default decisions, keep competitor and proxy runs as reference
-snapshots. Normal knob work should usually compare current lpm against one
+For production-default decisions, keep competitor and firewall-enabled runs as
+reference snapshots. Legacy proxy routes remain available for focused routing
+checks, but normal knob work should usually compare current lpm against one
 candidate lpm cell, with 5+ samples and round-robin ordering.
 
 Every install subprocess has a timeout, defaulting to 10 minutes. Override it
