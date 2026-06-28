@@ -1,7 +1,9 @@
 mod support;
 
 use support::assertions::{JsonType, assert_json_field, parse_json_output};
-use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
+use support::mock_registry::{
+    MockRegistry, compute_integrity, make_tarball, make_tarball_with_files,
+};
 use support::{
     TempProject, lpm_with_registry, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
 };
@@ -281,6 +283,55 @@ async fn download_positional_npm_version_spec_resolves_requested_version() {
         serde_json::from_str(&project.read_file("inline-version-out/package.json"))
             .expect("download must extract a valid package.json");
     assert_eq!(package_json["version"], "0.14.3");
+}
+
+#[tokio::test]
+async fn download_json_rejects_case_fold_path_collision_without_extracting_files() {
+    let project = TempProject::empty(r#"{"name": "test", "version": "1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_with_files(
+        "casefold-download",
+        "1.0.0",
+        &[("context.md", b"lowercase"), ("CONTEXT.md", b"uppercase")],
+    );
+    mock.with_package("casefold-download", "1.0.0", &tarball)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "download",
+            "casefold-download",
+            "--version",
+            "1.0.0",
+            "--json",
+            "--output",
+            "casefold-out",
+        ])
+        .output()
+        .expect("failed to run lpm download for case-fold collision tarball");
+
+    assert!(
+        !output.status.success(),
+        "lpm download must reject tarballs with case-fold path collisions:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["success"], false);
+    let error = json["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("JSON error must be a string: {json:#}"));
+    assert!(
+        error.contains("case-fold path collision in tarball: CONTEXT.md conflicts with context.md"),
+        "JSON error must preserve the scanner-visible case-fold collision diagnostic: {json:#}"
+    );
+    assert!(
+        !project.file_exists("casefold-out/package.json")
+            && !project.file_exists("casefold-out/index.js")
+            && !project.file_exists("casefold-out/context.md")
+            && !project.file_exists("casefold-out/CONTEXT.md"),
+        "failed download must not leave extracted package files behind"
+    );
 }
 
 #[tokio::test]
