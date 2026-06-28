@@ -64,38 +64,47 @@ pub(crate) fn run() -> Result<()> {
         if !workspace_json_output && let Some(pkg_content) = pkg_content_opt.as_deref() {
             let state = install_state::check_install_state_with_content(&cwd, pkg_content);
             if state.up_to_date {
-                if let Err(error) = ensure_fast_lane_firewall_posture(&cwd, fast_lane.json) {
-                    exit_with_lpm_error(&error, fast_lane.json, lpm_common::DEFAULT_REGISTRY_URL);
-                }
-                let elapsed_ms = start.elapsed().as_millis();
-                if fast_lane.json {
-                    let schema_version = crate::json_contract::INSTALL_JSON_SCHEMA_VERSION;
-                    let timing_requested =
-                        crate::json_contract::install_timing_requested(fast_lane.timing);
-                    // Hand-formatted to match `serde_json::to_string_pretty`
-                    // output for the `install.rs` up-to-date object —
-                    // avoids constructing a `serde_json::Value` on the
-                    // hot path.
-                    if timing_requested {
-                        println!(
-                            "{{\n  \"schema_version\": {schema_version},\n  \
-                             \"success\": true,\n  \"up_to_date\": true,\n  \
-                             \"duration_ms\": {elapsed_ms},\n  \"timing\": {{\n    \
-                             \"resolve_ms\": 0,\n    \"fetch_ms\": 0,\n    \
-                             \"link_ms\": 0,\n    \"total_ms\": {elapsed_ms}\n  \
-                             }}\n}}"
-                        );
-                    } else {
-                        println!(
-                            "{{\n  \"schema_version\": {schema_version},\n  \
-                             \"success\": true,\n  \"up_to_date\": true,\n  \
-                             \"duration_ms\": {elapsed_ms}\n}}"
+                match check_fast_lane_admission(&cwd, fast_lane.json) {
+                    Ok(FastLaneAdmission::ExitAllowed) => {
+                        let elapsed_ms = start.elapsed().as_millis();
+                        if fast_lane.json {
+                            let schema_version = crate::json_contract::INSTALL_JSON_SCHEMA_VERSION;
+                            let timing_requested =
+                                crate::json_contract::install_timing_requested(fast_lane.timing);
+                            // Hand-formatted to match `serde_json::to_string_pretty`
+                            // output for the `install.rs` up-to-date object —
+                            // avoids constructing a `serde_json::Value` on the
+                            // hot path.
+                            if timing_requested {
+                                println!(
+                                    "{{\n  \"schema_version\": {schema_version},\n  \
+                                     \"success\": true,\n  \"up_to_date\": true,\n  \
+                                     \"duration_ms\": {elapsed_ms},\n  \"timing\": {{\n    \
+                                     \"resolve_ms\": 0,\n    \"fetch_ms\": 0,\n    \
+                                     \"link_ms\": 0,\n    \"total_ms\": {elapsed_ms}\n  \
+                                     }}\n}}"
+                                );
+                            } else {
+                                println!(
+                                    "{{\n  \"schema_version\": {schema_version},\n  \
+                                     \"success\": true,\n  \"up_to_date\": true,\n  \
+                                     \"duration_ms\": {elapsed_ms}\n}}"
+                                );
+                            }
+                        } else {
+                            output::success(&format!("up to date ({elapsed_ms}ms)"));
+                        }
+                        std::process::exit(0);
+                    }
+                    Ok(FastLaneAdmission::NeedsInstallPipeline) => {}
+                    Err(error) => {
+                        exit_with_lpm_error(
+                            &error,
+                            fast_lane.json,
+                            lpm_common::DEFAULT_REGISTRY_URL,
                         );
                     }
-                } else {
-                    output::success(&format!("up to date ({elapsed_ms}ms)"));
                 }
-                std::process::exit(0);
             }
         }
     }
@@ -124,13 +133,24 @@ pub(crate) fn run() -> Result<()> {
     runtime.block_on(async_main())
 }
 
-fn ensure_fast_lane_firewall_posture(
+enum FastLaneAdmission {
+    ExitAllowed,
+    NeedsInstallPipeline,
+}
+
+fn check_fast_lane_admission(
     project_dir: &std::path::Path,
     json_output: bool,
-) -> Result<(), lpm_common::LpmError> {
+) -> Result<FastLaneAdmission, lpm_common::LpmError> {
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
-    Ok(())
+    let policy_extension_configs =
+        crate::commands::install::policy_extensions::load_policy_extension_configs(&global_config)?;
+    if policy_extension_configs.is_empty() {
+        Ok(FastLaneAdmission::ExitAllowed)
+    } else {
+        Ok(FastLaneAdmission::NeedsInstallPipeline)
+    }
 }
 
 async fn async_main() -> Result<()> {
@@ -1440,6 +1460,10 @@ async fn async_main() -> Result<()> {
                 cli.json,
             )
             .await
+        }
+        Commands::Policy { action } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::policy::run(action, &cwd, cli.json).await
         }
         Commands::Security { action } => commands::security::run(&action, cli.json).await,
         Commands::Cache {

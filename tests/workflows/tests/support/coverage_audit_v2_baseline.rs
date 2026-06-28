@@ -3357,6 +3357,67 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/tidy.rs", 5)],
         last_audited_at: "2026-06-13",
     },
+    SurfaceV2 {
+        id: 155,
+        scenarios: 1,
+        failure_modes_tested: &[
+            "configured extension appears with command, mode, on-error, timeout, and events",
+            "JSON envelope is snapshot-pinned",
+        ],
+        failure_modes_known: &[
+            "disabled extension is omitted from active list",
+            "invalid policy config surfaces as command error",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/policy_extensions.rs", 1)],
+        last_audited_at: "2026-06-28",
+    },
+    SurfaceV2 {
+        id: 156,
+        scenarios: 1,
+        failure_modes_tested: &[
+            "configured extension contributes enabled, report, and enforce counters",
+            "JSON envelope is snapshot-pinned",
+        ],
+        failure_modes_known: &[
+            "multiple extensions with mixed modes",
+            "report-only warning diagnostics in status output",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/policy_extensions.rs", 1)],
+        last_audited_at: "2026-06-28",
+    },
+    SurfaceV2 {
+        id: 157,
+        scenarios: 1,
+        failure_modes_tested: &[
+            "unavailable extension command exits nonzero",
+            "JSON diagnostics envelope is snapshot-pinned",
+        ],
+        failure_modes_known: &[
+            "doctor scoped to one extension",
+            "invalid extension name diagnostics",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/policy_extensions.rs", 1)],
+        last_audited_at: "2026-06-28",
+    },
+    SurfaceV2 {
+        id: 158,
+        scenarios: 1,
+        failure_modes_tested: &[
+            "synthetic package candidate is sent to the named extension",
+            "warn decisions are returned in the JSON envelope",
+            "JSON envelope is snapshot-pinned",
+        ],
+        failure_modes_known: &[
+            "missing --package validation",
+            "extension block decision exit semantics",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/policy_extensions.rs", 1)],
+        last_audited_at: "2026-06-28",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

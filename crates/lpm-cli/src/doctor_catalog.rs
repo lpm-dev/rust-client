@@ -127,6 +127,7 @@ impl fmt::Display for Tier {
 pub enum Category {
     Infrastructure,
     Auth,
+    Policy,
     ProjectState,
     LpmJson,
     Runtime,
@@ -146,6 +147,7 @@ impl Category {
         match self {
             Category::Infrastructure => "Infrastructure",
             Category::Auth => "Auth",
+            Category::Policy => "Policy extensions",
             Category::ProjectState => "Project state",
             Category::LpmJson => "lpm.json",
             Category::Runtime => "Runtime",
@@ -387,6 +389,70 @@ pub static VAULT_STORAGE_UNAVAILABLE: CheckEntry = CheckEntry {
          data-key source.",
     remediation: "Unlock Secret Service/Credential Manager, repair the OS secure store, or restore \
          ~/.lpm/.vault-fallback-key from backup if this machine has not been promoted yet.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
+};
+
+// ──────────────────────────────────────────────────────────────────
+// Policy extensions
+// ──────────────────────────────────────────────────────────────────
+
+pub static POLICY_EXTENSIONS_NOT_CONFIGURED: CheckEntry = CheckEntry {
+    code: crate::commands::policy::POLICY_EXTENSIONS_NOT_CONFIGURED_CODE,
+    name: "Policy extensions",
+    category: Category::Policy,
+    tier: Tier::Fast,
+    description: "No install-time policy extensions are active in `~/.lpm/config.toml`.",
+    when_fires: "The `[policy.extensions]` table is absent or every entry is disabled.",
+    remediation: "No action. Configure `[policy.extensions.<name>]` to enable a local policy extension.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static POLICY_EXTENSIONS_CONFIGURED: CheckEntry = CheckEntry {
+    code: crate::commands::policy::POLICY_EXTENSIONS_CONFIGURED_CODE,
+    name: "Policy extensions",
+    category: Category::Policy,
+    tier: Tier::Fast,
+    description: "One or more install-time policy extensions are active.",
+    when_fires: "At least one enabled `[policy.extensions.<name>]` entry is present in `~/.lpm/config.toml`.",
+    remediation: "Run `lpm policy status` or `lpm policy doctor` for details.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static POLICY_EXTENSION_REPORT_MODE: CheckEntry = CheckEntry {
+    code: crate::commands::policy::POLICY_EXTENSION_REPORT_MODE_CODE,
+    name: "Policy extension",
+    category: Category::Policy,
+    tier: Tier::Fast,
+    description: "A configured policy extension is report-only.",
+    when_fires: "An enabled `[policy.extensions.<name>]` entry has `mode = \"report\"`.",
+    remediation: "Switch to `mode = \"enforce\"` when the policy is ready to block installs.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
+pub static POLICY_EXTENSION_COMMAND_UNAVAILABLE: CheckEntry = CheckEntry {
+    code: crate::commands::policy::POLICY_EXTENSION_COMMAND_UNAVAILABLE_CODE,
+    name: "Policy extension",
+    category: Category::Policy,
+    tier: Tier::Fast,
+    description: "A configured policy extension command cannot be found or executed.",
+    when_fires: "The command program is missing, not a file, or not executable on this host.",
+    remediation: "Fix `[policy.extensions.<name>].command` or install the referenced executable.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
+};
+
+pub static POLICY_EXTENSION_CONFIG_INVALID: CheckEntry = CheckEntry {
+    code: crate::commands::policy::POLICY_EXTENSION_CONFIG_INVALID_CODE,
+    name: "Policy extensions",
+    category: Category::Policy,
+    tier: Tier::Fast,
+    description: "Policy extension configuration is malformed.",
+    when_fires: "`~/.lpm/config.toml` cannot be read as a policy extension config or uses unsupported policy extension fields.",
+    remediation: "Fix the `[policy.extensions]` table, then rerun `lpm policy doctor`.",
     possible_severities: &[Severity::Fail],
     auto_fix: None,
 };
@@ -1846,6 +1912,12 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &VAULT_STORAGE_NATIVE,
     &VAULT_STORAGE_FALLBACK,
     &VAULT_STORAGE_UNAVAILABLE,
+    // Policy extensions
+    &POLICY_EXTENSIONS_NOT_CONFIGURED,
+    &POLICY_EXTENSIONS_CONFIGURED,
+    &POLICY_EXTENSION_REPORT_MODE,
+    &POLICY_EXTENSION_COMMAND_UNAVAILABLE,
+    &POLICY_EXTENSION_CONFIG_INVALID,
     // Project state
     &PACKAGE_JSON_PRESENT,
     &PACKAGE_JSON_MISSING,

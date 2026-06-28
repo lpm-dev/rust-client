@@ -13,6 +13,7 @@ mod install_fix;
 mod local_sources;
 mod lockfile;
 mod manifest;
+mod policy;
 mod runtime;
 mod sandbox;
 mod script_policy;
@@ -34,6 +35,7 @@ use self::lockfile::{
     fix_gitattributes,
 };
 use self::manifest::check_manifest_compat;
+use self::policy::check_policy_extensions;
 use self::runtime::{
     extract_node_spec_from_detail, get_system_bun_version, get_system_node_version,
 };
@@ -258,6 +260,7 @@ pub async fn run(
     }
 
     checks.push(vault_storage_check(lpm_vault::storage_backend()));
+    checks.extend(check_policy_extensions());
 
     // 3. Global store accessible?
     let store_result = PackageStore::default_location();
@@ -894,6 +897,7 @@ pub async fn run(
             .filter(|check| {
                 all || !matches!(check.severity, Severity::Pass)
                     || check.code() == doctor_catalog::LINKER_MODE_RESOLVED.code
+                    || check.code() == doctor_catalog::POLICY_EXTENSIONS_CONFIGURED.code
             })
             .collect();
         let name_width = visible_checks

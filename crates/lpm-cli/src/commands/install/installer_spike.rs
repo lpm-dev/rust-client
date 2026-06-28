@@ -34,6 +34,7 @@ pub(super) struct InstallerSpikeAdmission {
     pub(super) strict_integrity: bool,
     pub(super) force_security_floor: bool,
     pub(super) npm_firewall_enabled: bool,
+    pub(super) policy_extensions_enabled: bool,
     pub(super) auto_build: bool,
     pub(super) script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     pub(super) script_policy_is_default: bool,
@@ -135,6 +136,9 @@ fn unsupported_admission_reasons(
     }
     if admission.npm_firewall_enabled {
         reasons.push("npm firewall is not supported");
+    }
+    if admission.policy_extensions_enabled {
+        reasons.push("policy extensions are not supported");
     }
     if admission.auto_build
         || admission.script_policy_override.is_some()
@@ -3595,6 +3599,7 @@ mod tests {
             strict_integrity: false,
             force_security_floor: false,
             npm_firewall_enabled: false,
+            policy_extensions_enabled: false,
             auto_build: false,
             script_policy_override: None,
             script_policy_is_default: true,
@@ -3849,6 +3854,21 @@ mod tests {
         );
 
         assert_eq!(reasons, vec!["tarball source deps are not supported"]);
+    }
+
+    #[test]
+    fn admission_rejects_policy_extensions() {
+        let mut admission = benchmark_admission();
+        admission.policy_extensions_enabled = true;
+
+        let reasons = unsupported_admission_reasons(
+            admission,
+            InstallerSpikeGraphSource::Lockfile,
+            InstallerSpikeParityMode::Disabled,
+            true,
+        );
+
+        assert_eq!(reasons, vec!["policy extensions are not supported"]);
     }
 
     #[test]

@@ -55,6 +55,7 @@ const DEFAULT_FIXTURES = ['dogfood', 'nest', 'vitepress'];
 const DEFAULT_MANAGERS = ['lpm'];
 const DEFAULT_MODES = ['cold'];
 const DEFAULT_LPM_ROUTES = ['direct'];
+const DEFAULT_LPM_FIREWALL_MODES = ['off'];
 const EXPECTED_WARNING_PATTERNS = [
   {
     id: 'npm-bin-shadow',
@@ -98,6 +99,9 @@ const fixtures = topNpmFile
 const managers = parseList(args.managers ?? DEFAULT_MANAGERS.join(','), '--managers');
 const modes = parseModes(args.modes ?? DEFAULT_MODES.join(','));
 const lpmRoutes = parseLpmRoutes(args.lpmRoutes ?? DEFAULT_LPM_ROUTES.join(','));
+const lpmFirewallModes = parseLpmFirewallModes(
+  args.lpmFirewallModes ?? DEFAULT_LPM_FIREWALL_MODES.join(','),
+);
 const lpmCells = parseLpmCells(args.lpmCells);
 const lpmTyposquatGuard = args.lpmTyposquatGuard ?? (topNpmFile ? 'off' : 'default');
 const scriptPolicy = args.scriptPolicy ?? 'ignore';
@@ -115,7 +119,7 @@ validateManagers(managers);
 validateScriptPolicy(scriptPolicy);
 validateLpmTyposquatGuard(lpmTyposquatGuard);
 
-const runSpecs = buildRunSpecs(managers, lpmCells, lpmRoutes);
+const runSpecs = buildRunSpecs(managers, lpmCells, lpmRoutes, lpmFirewallModes);
 validateUniqueKeys('fixture', fixtures, (fixture) => fixture.name);
 validateUniqueKeys('run spec', runSpecs, (spec) => spec.id);
 const plan = {
@@ -124,6 +128,7 @@ const plan = {
   managers,
   modes,
   lpm_routes: lpmRoutes,
+  lpm_firewall_modes: lpmFirewallModes,
   lpm_cells: lpmCells.map((cell) => ({ name: cell.name, env: cell.env })),
   lpm_typosquat_guard: lpmTyposquatGuard,
   top_npm: topNpmFile
@@ -335,6 +340,7 @@ function measureInstall({
     manager: spec.manager,
     cell: spec.cellName,
     route: spec.route,
+    firewall_mode: spec.firewallMode,
     spec: spec.id,
     mode,
     counted,
@@ -373,6 +379,7 @@ function recordSkippedInstall({ sample, fixture, spec, mode, runDir, phase, reas
     manager: spec.manager,
     cell: spec.cellName,
     route: spec.route,
+    firewall_mode: spec.firewallMode,
     spec: spec.id,
     mode,
     counted: true,
@@ -641,7 +648,7 @@ function firstFinite(...values) {
   return undefined;
 }
 
-function buildRunSpecs(managers, cells, routes) {
+function buildRunSpecs(managers, cells, routes, firewallModes) {
   const specs = [];
   for (const manager of managers) {
     if (manager !== 'lpm') {
@@ -650,20 +657,27 @@ function buildRunSpecs(managers, cells, routes) {
         manager,
         cellName: 'default',
         route: 'default',
+        firewallMode: 'default',
         env: {},
       });
       continue;
     }
     for (const route of routes) {
-      for (const cell of cells) {
-        const suffix = [cell.name, route].filter((part) => part && part !== 'direct').join('-');
-        specs.push({
-          id: suffix ? `lpm-${suffix}` : 'lpm-current',
-          manager,
-          cellName: cell.name,
-          route,
-          env: cell.env,
-        });
+      for (const firewallMode of firewallModes) {
+        for (const cell of cells) {
+          const firewallSuffix = firewallMode === 'off' ? '' : `firewall-${firewallMode}`;
+          const suffix = [cell.name, route, firewallSuffix]
+            .filter((part) => part && part !== 'direct')
+            .join('-');
+          specs.push({
+            id: suffix ? `lpm-${suffix}` : 'lpm-current',
+            manager,
+            cellName: cell.name,
+            route,
+            firewallMode,
+            env: cell.env,
+          });
+        }
       }
     }
   }
@@ -694,6 +708,8 @@ function buildEnv({ homeDir, lpmHome, spec }) {
     'WINDIR',
     'COMSPEC',
     'PATHEXT',
+    'LPM_REGISTRY_URL',
+    'LPM_TOKEN',
   ];
   const env = {};
   for (const key of keep) {
@@ -725,6 +741,9 @@ function buildEnv({ homeDir, lpmHome, spec }) {
     }
     if (spec.route !== 'direct') {
       env.LPM_NPM_ROUTE = spec.route;
+    }
+    if (spec.firewallMode && spec.firewallMode !== 'off') {
+      env.LPM_NPM_FIREWALL = spec.firewallMode;
     }
     Object.assign(env, spec.env);
   }
@@ -782,6 +801,7 @@ function summarize(rows) {
       spec,
       cell: first.cell,
       route: first.route,
+      firewall_mode: first.firewall_mode,
       mode,
       samples: groupRows.length,
       successful_samples: successful.length,
@@ -988,6 +1008,7 @@ function parseArgs(argv) {
       ['--managers', 'managers'],
       ['--modes', 'modes'],
       ['--lpm-routes', 'lpmRoutes'],
+      ['--lpm-firewall-modes', 'lpmFirewallModes'],
       ['--lpm-typosquat-guard', 'lpmTyposquatGuard'],
       ['--output', 'output'],
       ['--lpm-bin', 'lpmBin'],
@@ -1170,6 +1191,37 @@ function parseLpmRoutes(raw) {
     }
   }
   return routes;
+}
+
+function parseLpmFirewallModes(raw) {
+  const modes = parseList(raw, '--lpm-firewall-modes').map(canonicalLpmFirewallMode);
+  validateUniqueKeys('lpm firewall mode', modes, (mode) => mode);
+  return modes;
+}
+
+function canonicalLpmFirewallMode(raw) {
+  switch (raw.trim().toLowerCase()) {
+    case 'off':
+    case 'false':
+    case '0':
+    case 'no':
+    case 'disabled':
+      return 'off';
+    case 'report':
+    case 'warn':
+      return 'report';
+    case 'enforce':
+    case 'enabled':
+    case 'on':
+    case 'true':
+    case '1':
+    case 'yes':
+    case 'deny':
+    case 'block':
+      return 'enforce';
+    default:
+      throw new Error(`unsupported lpm firewall mode: ${raw}`);
+  }
 }
 
 function validateManagers(managers) {
@@ -1479,6 +1531,23 @@ function isWarningLikeLine(line) {
 }
 
 function runSelfTests() {
+  assert.deepEqual(parseLpmFirewallModes('off,enabled,report'), ['off', 'enforce', 'report']);
+  assert.throws(() => parseLpmFirewallModes('enabled,enforce'), /duplicate lpm firewall mode/);
+  const firewallSpecs = buildRunSpecs(
+    ['lpm', 'bun'],
+    [{ name: 'current', env: {} }],
+    ['direct'],
+    ['off', 'enforce'],
+  );
+  assert.deepEqual(
+    firewallSpecs.map((spec) => [spec.id, spec.firewallMode]),
+    [
+      ['lpm-current', 'off'],
+      ['lpm-current-firewall-enforce', 'enforce'],
+      ['bun', 'default'],
+    ],
+  );
+
   const packageNameOnly = classifyInstallWarnings({
     stdout: JSON.stringify(
       {
@@ -1842,6 +1911,8 @@ Options:
       --managers LIST          lpm,bun,pnpm,npm (default: lpm)
       --modes LIST             cold,warm (default: cold)
       --lpm-routes LIST        direct,proxy for lpm runs (default: direct)
+      --lpm-firewall-modes LIST
+                               off,report,enforce for lpm runs (default: off)
       --lpm-cell NAME:ENV      Add an lpm env cell. Repeatable.
                                Example: --lpm-cell cap:LPM_V2_FINALIZE_PERMITS=2
       --lpm-typosquat-guard MODE
@@ -1860,8 +1931,11 @@ Examples:
   # Current lpm cold/warm reference.
   node bench/scripts/run-install-readiness.mjs --samples 10 --modes cold,warm
 
-  # One-off proxy reference.
-  node bench/scripts/run-install-readiness.mjs --samples 1 --lpm-routes proxy
+  # One-off firewall-enabled reference without fail-closed auth.
+  node bench/scripts/run-install-readiness.mjs --samples 1 --lpm-firewall-modes off,report
+
+  # Fail-closed firewall gate reference when LPM auth is available.
+  node bench/scripts/run-install-readiness.mjs --samples 1 --lpm-firewall-modes off,enforce
 
   # Apples-to-apples reference snapshot.
   node bench/scripts/run-install-readiness.mjs --samples 5 --managers lpm,bun,pnpm,npm

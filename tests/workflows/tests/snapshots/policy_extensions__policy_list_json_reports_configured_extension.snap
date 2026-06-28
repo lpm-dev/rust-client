@@ -1,0 +1,22 @@
+---
+source: tests/workflows/tests/policy_extensions.rs
+expression: normalize_policy_list_json(json)
+---
+{
+  "success": true,
+  "enabled_count": 1,
+  "extensions": [
+    {
+      "name": "fixture",
+      "command": [
+        "[POLICY_EXTENSION_FIXTURE]"
+      ],
+      "mode": "enforce",
+      "on_error": "block",
+      "timeout_ms": 5000,
+      "events": [
+        "package.candidate"
+      ]
+    }
+  ]
+}

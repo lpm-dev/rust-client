@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 154;
+pub const EXPECTED_SURFACE_COUNT: usize = 158;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -79,6 +79,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Query",
     "Rebuild",
     "Doctor",
+    "Policy",
     "SwiftRegistry",
     "Mcp",
     "Use",
@@ -1901,6 +1902,58 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/tidy.rs",
             "tests/workflows/tests/tidy.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 155,
+        name: "`lpm policy list`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/policy.rs",
+            "tests/workflows/tests/policy_extensions.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 156,
+        name: "`lpm policy status`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/policy.rs",
+            "tests/workflows/tests/policy_extensions.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 157,
+        name: "`lpm policy doctor [extension]`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/policy.rs",
+            "tests/workflows/tests/policy_extensions.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 158,
+        name: "`lpm policy test <extension>`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/policy.rs",
+            "tests/workflows/tests/policy_extensions.rs",
         ],
     },
 ];

@@ -1,0 +1,26 @@
+---
+source: tests/workflows/tests/policy_extensions.rs
+expression: json
+---
+{
+  "success": true,
+  "extension": "fixture",
+  "event": "package.candidate",
+  "package": {
+    "name": "react",
+    "version": "19.0.0"
+  },
+  "duration_ms": "[DURATION]",
+  "allow_count": 0,
+  "warn_count": 1,
+  "block_count": 0,
+  "decisions": [
+    {
+      "name": "react",
+      "version": "19.0.0",
+      "action": "warn",
+      "code": "fixture-warning",
+      "reason": "synthetic policy test"
+    }
+  ]
+}

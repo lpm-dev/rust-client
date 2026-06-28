@@ -9,6 +9,9 @@ publish = false
 [features]
 swift-tests = []
 
+[dependencies]
+serde_json = { workspace = true }
+
 # Phase 46.1.1: the `[[bin]] socket-probe` declared at the
 # bottom of this file pulls its source from
 # `crates/lpm-sandbox/src/bin/socket-probe.rs`. That source uses
@@ -27,7 +30,6 @@ predicates = "3"
 insta = { version = "1", features = ["json", "toml", "filters", "redactions"] }
 tempfile = "3"
 libc = "0.2"
-serde_json = { workspace = true }
 wiremock = "0.6"
 tokio = { version = "1", features = ["full"] }
 chrono = { workspace = true }
@@ -78,6 +80,10 @@ hmac = { workspace = true }
 [[bin]]
 name = "workflows-socket-probe"
 path = "../../crates/lpm-sandbox/src/bin/socket-probe.rs"
+
+[[bin]]
+name = "workflows-policy-extension"
+path = "src/bin/policy_extension_fixture.rs"
 
 [lints]
 workspace = true
