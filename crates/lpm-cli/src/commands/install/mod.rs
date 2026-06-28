@@ -37,6 +37,7 @@ mod manifest;
 mod package;
 mod patches;
 mod peer;
+pub(crate) mod policy_extensions;
 mod skills;
 mod source_resolution;
 mod state;
@@ -78,6 +79,11 @@ pub use manifest::{run_add_packages, run_install_filtered_add};
 use package::*;
 use patches::*;
 use peer::*;
+use policy_extensions::{
+    PolicyExtensionStats, load_policy_extension_configs,
+    policy_extensions_disable_tarball_prefetch,
+    reject_remote_tarball_url_deps_with_policy_extensions, run_policy_extensions,
+};
 use skills::*;
 use source_resolution::*;
 use state::*;
@@ -103,6 +109,14 @@ fn publish_ages_from_resolved_metadata(
         }
     }
     map
+}
+
+fn manifest_install_deps(pkg: &lpm_workspace::PackageJson) -> HashMap<String, String> {
+    let mut deps = pkg.dependencies.clone();
+    for (name, range) in &pkg.dev_dependencies {
+        deps.entry(name.clone()).or_insert_with(|| range.clone());
+    }
+    deps
 }
 
 fn release_age_policy_applies_to_install_package(
@@ -959,6 +973,7 @@ async fn run_with_options_under_store_lock(
         .then(crate::provenance_fetch::ProvenanceTimings::default);
     let npm_firewall_lookup_mode = NpmFirewallLookupMode::from_env();
     let npm_firewall_chunk_size = npm_firewall_chunk_size_from_env();
+    let policy_extension_configs = load_policy_extension_configs(&global_config)?;
     let mut slow_package_timings = SlowPackageTimings::default();
     let mut wf_tail_lockfile_write_ms = 0u128;
     let mut wf_tail_lockfile_write_count = 0u64;
@@ -1111,6 +1126,12 @@ async fn run_with_options_under_store_lock(
         configured_linker_mode
     };
     let requested_v2_mode = lpm_store::StoreVersion::from_env().is_v2();
+    let manifest_deps = manifest_install_deps(&pkg);
+    let production_dependency_names: HashSet<String> = pkg.dependencies.keys().cloned().collect();
+    reject_remote_tarball_url_deps_with_policy_extensions(
+        &policy_extension_configs,
+        &manifest_deps,
+    )?;
 
     // Fast-exit: if package.json + lockfile haven't changed AND the
     // resolved linker and object-integrity policy match the prior
@@ -1137,13 +1158,51 @@ async fn run_with_options_under_store_lock(
         || compatibility_bin_names.is_empty()
         || lpm_linker::v2::project_compatibility_bins_ready(project_dir, compatibility_bin_names);
     let cleanup_catalogs_in_pipeline = requested_add_count.is_none();
-    if !frozen_lockfile_active
+    let fast_path_base_eligible = !frozen_lockfile_active
         && !force
         && !offline
         && !strict_peer_dependencies
         && install_state.up_to_date
-        && compatibility_bins_ready
+        && compatibility_bins_ready;
+    let fast_path_policy_extension_stats =
+        if !fast_path_base_eligible || policy_extension_configs.is_empty() {
+            None
+        } else {
+            let gate_stats = GateStats::default();
+            if let Some(fast) = try_lockfile_fast_path(
+                &lockfile_path,
+                &manifest_deps,
+                &[],
+                client,
+                &gate_stats,
+                false,
+            ) {
+                let mut policy_packages = fast.packages;
+                if omit_policy.dev {
+                    filter_dev_packages(&mut policy_packages, &production_dependency_names);
+                }
+                filter_platform_packages(&mut policy_packages)?;
+                Some(
+                    run_policy_extensions(
+                        &policy_extension_configs,
+                        project_dir,
+                        &policy_packages,
+                        json_output,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            }
+        };
+    if fast_path_base_eligible
+        && (policy_extension_configs.is_empty() || fast_path_policy_extension_stats.is_some())
     {
+        let policy_extension_stats = if let Some(stats) = fast_path_policy_extension_stats {
+            stats
+        } else {
+            run_policy_extensions(&policy_extension_configs, project_dir, &[], json_output).await?
+        };
         let catalogs_cleaned = if cleanup_catalogs_in_pipeline {
             cleanup_unused_catalogs_after_install(project_dir)?
         } else {
@@ -1186,7 +1245,11 @@ async fn run_with_options_under_store_lock(
             // path runs no resolve, so no fresh conflict trace.
                            "peer_conflicts": [],
                            "peer_issues": peer_issues_json_value(&[], &[]),
+                           "security": {
+                               "policy_extensions": policy_extension_stats.to_json(),
+                           },
                        });
+            json["timing"]["policy_extensions"] = policy_extension_stats.to_json();
             if timing_detail_mode.enabled() {
                 json["timing"]["detail"] = setup_only_timing_detail_json(
                     timing_detail_mode,
@@ -1269,27 +1332,9 @@ async fn run_with_options_under_store_lock(
     // path. Surfaced on `timing.fetch_breakdown.tarball_url_gate`.
     let gate_stats = Arc::new(GateStats::default());
 
-    let mut deps = pkg.dependencies.clone();
-
-    // `lpm install` resolves BOTH `dependencies` and `devDependencies`,
-    // matching npm/pnpm/yarn semantics. Pre-only `dependencies`
-    // flowed through the pipeline, which silently no-op'd `lpm install -D`
-    // (the spec landed in the manifest but was never resolved or linked).
-    //
-    // Conflict rule: `dependencies` wins. npm treats the same key in both
-    // sections as malformed, and `dependencies` is the production contract —
-    // it should never be shadowed by a dev-only entry.
-    //
-    // `lpm deploy` strips `devDependencies` from the output manifest before
-    // re-entering this path, so the deploy closure stays prod-only. `--prod`
-    // / `--omit dev` still resolve the full graph for lockfile parity, then
-    // filter dev-only packages before linking.
-    for (name, range) in &pkg.dev_dependencies {
-        deps.entry(name.clone()).or_insert_with(|| range.clone());
-    }
+    let mut deps = manifest_deps.clone();
     reject_workspace_self_dependency(&pkg)?;
 
-    let production_dependency_names: HashSet<String> = pkg.dependencies.keys().cloned().collect();
     let declared_deps = deps.clone();
 
     // Resolve `catalog:` protocols and EXTRACT `workspace:*` member references
@@ -1446,6 +1491,7 @@ async fn run_with_options_under_store_lock(
         project_dir,
         json_output,
     );
+    reject_remote_tarball_url_deps_with_policy_extensions(&policy_extension_configs, &deps)?;
 
     let resolver_excludes = minimum_release_age_exclude
         .iter()
@@ -1714,6 +1760,8 @@ async fn run_with_options_under_store_lock(
         if cleanup_catalogs_in_pipeline {
             cleanup_unused_catalogs_after_install(project_dir)?;
         }
+        let policy_extension_stats =
+            run_policy_extensions(&policy_extension_configs, project_dir, &[], json_output).await?;
         // invariant: emit a proper JSON object even on the
         // empty-deps short-circuit so agents driving install always get a
         // parseable result. Previously this branch returned silently in JSON
@@ -1749,7 +1797,11 @@ async fn run_with_options_under_store_lock(
             // zero peer requirements means zero conflicts.
                            "peer_conflicts": [],
                            "peer_issues": peer_issues_json_value(&[], &[]),
+                           "security": {
+                               "policy_extensions": policy_extension_stats.to_json(),
+                           },
                        });
+            json["timing"]["policy_extensions"] = policy_extension_stats.to_json();
             if timing_detail_mode.enabled() {
                 json["timing"]["detail"] = setup_only_timing_detail_json(
                     timing_detail_mode,
@@ -2124,6 +2176,9 @@ async fn run_with_options_under_store_lock(
             json_output,
         )
         .await?;
+        let policy_extension_stats =
+            run_policy_extensions(&policy_extension_configs, project_dir, &locked, json_output)
+                .await?;
 
         // Go directly to link step (skip resolution and download).
         // forward the already-resolved
@@ -2142,6 +2197,7 @@ async fn run_with_options_under_store_lock(
             0,
             true,
             npm_firewall_stats,
+            policy_extension_stats,
             json_output,
             start,
             linker_mode,
@@ -2363,6 +2419,7 @@ async fn run_with_options_under_store_lock(
         strict_integrity,
         force_security_floor,
         npm_firewall_enabled: npm_firewall_mode.is_enabled(),
+        policy_extensions_enabled: !policy_extension_configs.is_empty(),
         auto_build,
         script_policy_override,
         script_policy_is_default: installer_spike_script_policy_is_default,
@@ -2680,9 +2737,12 @@ async fn run_with_options_under_store_lock(
                     // ── FUSION PATH ─────────────────────────────────────
                     let fetch_overlap_allowed_local =
                         fetch_overlap_enabled(fusion_enabled_local, force, omit_policy.dev);
-                    let fetch_overlap_downloads_during_resolve = fetch_overlap_allowed_local
-                        && !npm_firewall_mode.disables_tarball_prefetch();
-                    if npm_firewall_mode.is_enabled() && fetch_overlap_allowed_local {
+                    let preflight_disables_tarball_prefetch = npm_firewall_mode
+                        .disables_tarball_prefetch()
+                        || policy_extensions_disable_tarball_prefetch(&policy_extension_configs);
+                    let fetch_overlap_downloads_during_resolve =
+                        fetch_overlap_allowed_local && !preflight_disables_tarball_prefetch;
+                    if preflight_disables_tarball_prefetch && fetch_overlap_allowed_local {
                         post_firewall_fetch_overlap_allowed = true;
                     }
                     let npm_fanout = positive_usize_env_or_default(
@@ -2709,7 +2769,9 @@ async fn run_with_options_under_store_lock(
                         fetch_semaphore.clone(),
                         Some(Arc::new(Semaphore::new(speculation_permits))),
                         fetch_coord.clone(),
-                        if npm_firewall_mode.disables_tarball_prefetch() {
+                        if npm_firewall_mode.disables_tarball_prefetch()
+                            || policy_extensions_disable_tarball_prefetch(&policy_extension_configs)
+                        {
                             HashMap::new()
                         } else {
                             speculation_deps
@@ -2718,7 +2780,9 @@ async fn run_with_options_under_store_lock(
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
                     );
-                    let selected_package_tx = if fetch_overlap_allowed_local {
+                    let selected_package_fetch_overlap_allowed = fetch_overlap_allowed_local
+                        && !policy_extensions_disable_tarball_prefetch(&policy_extension_configs);
+                    let selected_package_tx = if selected_package_fetch_overlap_allowed {
                         if npm_firewall_mode.is_enabled() {
                             let (selected_tx, selected_rx) = tokio::sync::mpsc::unbounded_channel();
                             let (fetch_tx, fetch_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2880,7 +2944,9 @@ async fn run_with_options_under_store_lock(
                         fetch_semaphore.clone(),
                         None,
                         fetch_coord.clone(),
-                        if npm_firewall_mode.disables_tarball_prefetch() {
+                        if npm_firewall_mode.disables_tarball_prefetch()
+                            || policy_extensions_disable_tarball_prefetch(&policy_extension_configs)
+                        {
                             HashMap::new()
                         } else {
                             speculation_deps
@@ -3166,6 +3232,13 @@ async fn run_with_options_under_store_lock(
     }
     platform_skipped += filter_platform_packages(&mut packages)?;
 
+    let policy_extension_stats = run_policy_extensions(
+        &policy_extension_configs,
+        project_dir,
+        &packages,
+        json_output,
+    )
+    .await?;
     let npm_firewall_stats = if let Some(join) = npm_firewall_preflight_join.take() {
         let result = join.drain().await?;
         finish_npm_firewall_preflight(result, json_output)?
@@ -6121,6 +6194,11 @@ async fn run_with_options_under_store_lock(
                    "peer_conflicts": [],
                    "peer_issues": peer_issues_json_value(&[], &[]),
                });
+        json["security"] = serde_json::json!({
+            "firewall": npm_firewall_stats.to_json(),
+            "policy_extensions": policy_extension_stats.to_json(),
+        });
+        json["timing"]["policy_extensions"] = policy_extension_stats.to_json();
         if timing_detail_mode.enabled() {
             let build_state_write_timing = crate::build_state::snapshot_write_timing();
             let metadata_snapshots = timing_metadata_detail.as_deref().unwrap_or(&[]);
@@ -6152,6 +6230,7 @@ async fn run_with_options_under_store_lock(
                 ),
                 "security": {
                     "firewall": npm_firewall_stats.to_json(),
+                    "policy_extensions": policy_extension_stats.to_json(),
                     "registry_signatures": registry_signature_timings
                         .as_ref()
                         .map_or(serde_json::Value::Null, |timings| timings.to_json()),

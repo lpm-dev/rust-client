@@ -1,0 +1,26 @@
+---
+source: tests/workflows/tests/policy_extensions.rs
+expression: normalize_policy_doctor_json(json)
+---
+{
+  "enabled": true,
+  "enabled_count": 1,
+  "enforce_count": 1,
+  "report_count": 0,
+  "no_failures": false,
+  "has_warnings": false,
+  "diagnostics": [
+    {
+      "code": "policy_extensions_configured",
+      "severity": "pass",
+      "detail": "1 enabled (1 enforce, 0 report)"
+    },
+    {
+      "code": "policy_extension_command_unavailable",
+      "severity": "fail",
+      "detail": "`fixture` command unavailable: [MISSING_POLICY_EXTENSION]",
+      "extension": "fixture"
+    }
+  ],
+  "success": true
+}

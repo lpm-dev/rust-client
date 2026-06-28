@@ -179,6 +179,7 @@ pub(super) async fn run_link_and_finish(
     cached: usize,
     used_lockfile: bool,
     npm_firewall_stats: NpmFirewallPreflightStats,
+    policy_extension_stats: PolicyExtensionStats,
     json_output: bool,
     start: Instant,
     linker_mode: lpm_linker::LinkerMode,
@@ -515,11 +516,13 @@ pub(super) async fn run_link_and_finish(
             "timing": {
                 "firewall_batch_ms": npm_firewall_stats.batch_ms,
                 "firewall": npm_firewall_stats.to_json(),
+                "policy_extensions": policy_extension_stats.to_json(),
                 "link_ms": link_ms,
                 "total_ms": elapsed.as_millis(),
             },
             "security": {
                 "firewall": npm_firewall_stats.to_json(),
+                "policy_extensions": policy_extension_stats.to_json(),
             },
             "warnings": [],
             "errors": [],

@@ -40,6 +40,7 @@ pub mod outdated;
 pub mod pack;
 pub mod patch;
 pub mod plugin;
+pub mod policy;
 pub mod pool;
 pub mod ports;
 pub mod proxy;

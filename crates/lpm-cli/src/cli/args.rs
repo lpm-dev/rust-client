@@ -1151,6 +1151,12 @@ pub(crate) enum Commands {
         set: Option<String>,
     },
 
+    /// Inspect and test install-time policy extensions.
+    Policy {
+        #[command(subcommand)]
+        action: commands::policy::PolicyCmd,
+    },
+
     /// Manage temporary approvals for guarded security weakeners.
     Security {
         #[command(subcommand)]
