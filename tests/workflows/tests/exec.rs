@@ -448,6 +448,39 @@ fn exec_typescript_commonjs_file_ignores_type_only_exports_when_detecting_module
 }
 
 #[test]
+fn exec_typescript_commonjs_file_ignores_type_only_imports_when_detecting_module_format() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file("scripts/types.ts", "export type SeedMessage = string;\n");
+    project.write_file(
+        "scripts/seed.ts",
+        concat!(
+            "import type { SeedMessage } from './types';\n",
+            "const fs = require('node:fs');\n",
+            "const message: SeedMessage = fs.existsSync('package.json') ? 'import-type-commonjs-ts' : 'missing';\n",
+            "module.exports = { message };\n",
+            "console.log(module.exports.message);\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec on CommonJS TypeScript with import type");
+
+    assert!(
+        output.status.success(),
+        "type-only imports must not force CommonJS TypeScript into ESM:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("import-type-commonjs-ts"),
+        "CommonJS TypeScript with type-only imports must keep module available, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_typescript_commonjs_file_ignores_commented_esm_syntax_when_detecting_module_format() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file(
