@@ -365,6 +365,65 @@ fn exec_tsx_file_transforms_nested_jsx_children_after_whitespace() {
 }
 
 #[test]
+fn exec_tsx_file_transforms_jsx_inside_spread_attributes() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const view = <main {...{ child: <span id=\"x\" /> }} />;\n",
+            "console.log(JSON.stringify(view.props.child));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on spread-attribute TSX");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must transform JSX inside spread attributes:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""type":"span""#) && stdout.contains(r#""id":"x""#),
+        "exec must transform JSX nested inside spread attributes, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_tsx_file_preserves_spread_attribute_order() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const spreadWins = <main id=\"static\" {...{ id: 'spread' }} />;\n",
+            "const explicitWins = <main {...{ id: 'spread' }} id=\"static\" />;\n",
+            "console.log(`${spreadWins.props.id}:${explicitWins.props.id}`);\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on ordered spread attributes");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must preserve spread attribute order:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("spread:static"),
+        "exec must preserve JSX spread attribute override order, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_tsx_file_uses_project_local_tsx_when_node_cannot_load_lpm_runtime() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file("scripts/view.tsx", "export const view = <main />;\n");

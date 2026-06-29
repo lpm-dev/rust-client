@@ -416,8 +416,7 @@ class TsxParser {
   }
 
   readAttributes() {
-    const props = [];
-    const spreads = [];
+    const pieces = [];
     while (this.index < this.source.length) {
       this.skipWhitespace();
       if (this.peekAhead("/>") || this.peek() === ">") {
@@ -426,7 +425,7 @@ class TsxParser {
       if (this.peekAhead("{...")) {
         const spread = this.readBalanced("{", "}").slice(4, -1).trim();
         if (spread) {
-          spreads.push(spread);
+          pieces.push(this.transformExpression(spread));
         }
         continue;
       }
@@ -442,14 +441,13 @@ class TsxParser {
         this.skipWhitespace();
         value = this.readAttrValue();
       }
-      props.push(`${JSON.stringify(name)}: ${value}`);
+      pieces.push(`{ ${JSON.stringify(name)}: ${value} }`);
     }
 
-    const objectLiteral = props.length ? `{ ${props.join(", ")} }` : "{}";
-    if (spreads.length) {
-      return `Object.assign({}, ${spreads.join(", ")}, ${objectLiteral})`;
+    if (!pieces.length) {
+      return "null";
     }
-    return props.length ? objectLiteral : "null";
+    return `Object.assign({}, ${pieces.join(", ")})`;
   }
 
   readAttrValue() {
