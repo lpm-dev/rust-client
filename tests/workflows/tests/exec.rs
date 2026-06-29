@@ -204,6 +204,43 @@ fn exec_js_file_ignores_runtime_hook_env_secrets() {
 }
 
 #[test]
+fn exec_js_file_ignores_lowercase_runtime_hook_env_secrets() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/plain.js",
+        "if (process.env.node_options) process.exit(42);\nconsole.log('safe-js');\n",
+    );
+
+    let set_output = lpm(&project)
+        .args(["env", "set", "node_options=--require=./bad-preload.cjs"])
+        .output()
+        .expect("failed to write lowercase runtime-hook env secret");
+    assert!(
+        set_output.status.success(),
+        "env set must create the lowercase runtime-hook secret:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&set_output.stdout),
+        String::from_utf8_lossy(&set_output.stderr),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/plain.js"])
+        .output()
+        .expect("failed to run lpm exec with lowercase runtime-hook env secret");
+
+    assert!(
+        output.status.success(),
+        "lowercase runtime-hook env secrets must not reach JavaScript exec:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("safe-js"),
+        "JavaScript exec must ignore lowercase runtime-hook env secrets, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_js_file_ignores_node_options_from_env_schema_defaults() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file("bad-preload.cjs", "process.exit(99);\n");

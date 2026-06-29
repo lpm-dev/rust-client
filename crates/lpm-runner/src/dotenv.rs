@@ -328,13 +328,25 @@ pub fn load_env_from_chain(project_dir: &Path, file_chain: &[String]) -> HashMap
 }
 
 fn remove_dangerous_env_vars(vars: &mut HashMap<String, String>, source: &str) {
-    for &denied in DENIED_ENV_VARS {
-        if vars.remove(denied).is_some() {
+    let denied_keys: Vec<String> = vars
+        .keys()
+        .filter(|key| is_denied_env_var(key))
+        .cloned()
+        .collect();
+
+    for denied in denied_keys {
+        if vars.remove(&denied).is_some() {
             tracing::warn!(
                 "ignored dangerous env var '{denied}' from {source} — this variable cannot be set via LPM project env"
             );
         }
     }
+}
+
+fn is_denied_env_var(key: &str) -> bool {
+    DENIED_ENV_VARS
+        .iter()
+        .any(|denied| key.eq_ignore_ascii_case(denied))
 }
 
 /// Merge a single `.env` file into an existing map (overwriting existing keys).
@@ -573,20 +585,22 @@ mod tests {
     }
 
     #[test]
-    fn denied_vars_case_sensitive() {
-        // Denylist should be case-sensitive — ld_preload (lowercase) should pass
+    fn denied_env_vars_filtered_case_insensitively() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join(".env"),
-            "ld_preload=/lib.so\nLPM_TEST_CS_42=ok",
+            "ld_preload=/lib.so\nnode_options=--require=evil\nLPM_TEST_CS_42=ok",
         )
         .unwrap();
 
         let vars = load_env_files(dir.path(), None);
-        // lowercase variant is NOT in the denylist
         assert!(
-            vars.contains_key("ld_preload"),
-            "lowercase variant should pass through"
+            !vars.contains_key("ld_preload"),
+            "lowercase ld_preload should be denied"
+        );
+        assert!(
+            !vars.contains_key("node_options"),
+            "lowercase node_options should be denied"
         );
         assert!(vars.contains_key("LPM_TEST_CS_42"));
     }
