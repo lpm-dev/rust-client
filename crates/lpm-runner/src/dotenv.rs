@@ -15,6 +15,20 @@ use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::path::Path;
 
+const DENIED_ENV_VARS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "NODE_OPTIONS",
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TERM",
+];
+
 /// Load the fully-resolved environment for a project.
 ///
 /// This is the **single entry point** for all env loading in LPM. Used by
@@ -119,6 +133,8 @@ pub fn load_project_env_with_schema_validation(
         tracing::debug!("loaded {} env var(s) from vault", vault_vars.len());
         loaded.extend(vault_vars);
     }
+
+    remove_dangerous_env_vars(&mut loaded, "project env");
 
     // Validate against env schema (if defined in lpm.json)
     if validate_schema
@@ -264,29 +280,7 @@ pub fn load_env_files(project_dir: &Path, mode: Option<&str>) -> HashMap<String,
     // (process env takes precedence)
     merged.retain(|key, _| std::env::var(key).is_err());
 
-    // Remove dangerous env vars that should never come from .env files.
-    // These can be exploited to inject shared libraries, alter runtime behavior,
-    // or hijack PATH resolution even when the process env doesn't already set them.
-    const DENIED_ENV_VARS: &[&str] = &[
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-        "DYLD_FRAMEWORK_PATH",
-        "NODE_OPTIONS",
-        "PATH",
-        "HOME",
-        "USER",
-        "SHELL",
-        "TERM",
-    ];
-    for &denied in DENIED_ENV_VARS {
-        if merged.remove(denied).is_some() {
-            tracing::warn!(
-                "ignored dangerous env var '{denied}' from .env file — this variable cannot be set via .env"
-            );
-        }
-    }
+    remove_dangerous_env_vars(&mut merged, ".env file");
 
     merged
 }
@@ -315,29 +309,19 @@ pub fn load_env_from_chain(project_dir: &Path, file_chain: &[String]) -> HashMap
     // Filter out vars that already exist in process environment
     merged.retain(|key, _| std::env::var(key).is_err());
 
-    // Remove dangerous env vars
-    const DENIED_ENV_VARS: &[&str] = &[
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-        "DYLD_FRAMEWORK_PATH",
-        "NODE_OPTIONS",
-        "PATH",
-        "HOME",
-        "USER",
-        "SHELL",
-        "TERM",
-    ];
+    remove_dangerous_env_vars(&mut merged, ".env file");
+
+    merged
+}
+
+fn remove_dangerous_env_vars(vars: &mut HashMap<String, String>, source: &str) {
     for &denied in DENIED_ENV_VARS {
-        if merged.remove(denied).is_some() {
+        if vars.remove(denied).is_some() {
             tracing::warn!(
-                "ignored dangerous env var '{denied}' from .env file — this variable cannot be set via .env"
+                "ignored dangerous env var '{denied}' from {source} — this variable cannot be set via LPM project env"
             );
         }
     }
-
-    merged
 }
 
 /// Merge a single `.env` file into an existing map (overwriting existing keys).

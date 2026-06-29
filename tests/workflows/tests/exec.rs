@@ -130,6 +130,43 @@ fn exec_js_file_does_not_install_lpm_typescript_runtime() {
 }
 
 #[test]
+fn exec_js_file_ignores_node_options_from_env_secrets() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file("bad-preload.cjs", "process.exit(99);\n");
+    project.write_file("scripts/plain.js", "console.log('safe-js');\n");
+
+    let bad_preload = project.path().join("bad-preload.cjs");
+    let set_output = lpm(&project)
+        .args(["env", "set"])
+        .arg(format!("NODE_OPTIONS=--require={}", bad_preload.display()))
+        .output()
+        .expect("failed to write env secret");
+    assert!(
+        set_output.status.success(),
+        "env set must create the test secret:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&set_output.stdout),
+        String::from_utf8_lossy(&set_output.stderr),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/plain.js"])
+        .output()
+        .expect("failed to run lpm exec with env-secret NODE_OPTIONS");
+
+    assert!(
+        output.status.success(),
+        "env-secret NODE_OPTIONS must not hijack JavaScript exec:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("safe-js"),
+        "JavaScript exec must ignore NODE_OPTIONS from env secrets, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_missing_file_fails_before_runtime_execution() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
 
@@ -367,6 +404,32 @@ fn exec_typescript_file_treats_top_level_await_as_module() {
 }
 
 #[test]
+fn exec_typescript_file_treats_parenthesized_top_level_await_as_module() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/seed.ts",
+        "const value: string = (await Promise.resolve('parenthesized-top-level-await-ts'));\nconsole.log(value);\n",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec on parenthesized top-level-await TypeScript");
+
+    assert!(
+        output.status.success(),
+        "parenthesized top-level await must select ESM format for TypeScript:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("parenthesized-top-level-await-ts"),
+        "TypeScript with parenthesized top-level await must execute as ESM, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_typescript_file_treats_import_meta_as_module() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file(
@@ -389,6 +452,32 @@ fn exec_typescript_file_treats_import_meta_as_module() {
     assert!(
         stdout.contains("import-meta-ts"),
         "TypeScript with import.meta must execute as ESM, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_typescript_file_treats_multiline_named_export_as_module() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/seed.ts",
+        "const value: string = 'multiline-export-ts';\nexport\n{ value };\nconsole.log(value);\n",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec on multiline-export TypeScript");
+
+    assert!(
+        output.status.success(),
+        "multiline named exports must select ESM format for TypeScript:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("multiline-export-ts"),
+        "TypeScript with multiline named exports must execute as ESM, got:\n{stdout}"
     );
 }
 
