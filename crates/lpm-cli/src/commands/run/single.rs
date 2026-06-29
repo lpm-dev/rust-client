@@ -226,24 +226,129 @@ pub async fn exec(
     project_dir: &Path,
     file_path: &str,
     extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
 ) -> Result<(), LpmError> {
-    // `ensure_runtime` is still responsible for the user-visible runtime
-    // notice and auto-install path, but `exec_file` re-probes the effective
-    // PATH so it can choose between native TS, `--experimental-strip-types`,
-    // local `tsx`, and `npx tsx` using the actual `node` binary that will run.
-    let _ = ensure_runtime(project_dir).await;
-    let target = lpm_runner::exec::describe_exec_target(project_dir, file_path)?;
+    let bin_hint = ensure_runtime(project_dir).await;
+    let options = exec_options(env_mode, no_env_check, bin_hint);
+    exec_once(project_dir, file_path, extra_args, &options)
+}
+
+fn exec_once(
+    project_dir: &Path,
+    file_path: &str,
+    extra_args: &[String],
+    options: &lpm_runner::exec::ExecOptions,
+) -> Result<(), LpmError> {
+    let plan = lpm_runner::exec::build_exec_plan(project_dir, file_path, extra_args, options)?;
     install_ui::phase(&format!(
         "Executing {file_path} with {}",
-        install_ui::yellow(&target.runtime_label)
+        install_ui::yellow(&plan.runtime_label())
     ));
     let start = std::time::Instant::now();
-    lpm_runner::exec::exec_file(project_dir, file_path, extra_args)?;
+    lpm_runner::exec::execute_exec_plan(project_dir, &plan)?;
     install_ui::done(&format!(
         "Done · exited 0 in {}",
         install_ui::green(&install_ui::format_duration(start.elapsed())),
     ));
     Ok(())
+}
+
+pub async fn exec_watch(
+    project_dir: &Path,
+    file_path: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+) -> Result<(), LpmError> {
+    let bin_hint = ensure_runtime(project_dir).await;
+    let options = exec_options(env_mode, no_env_check, bin_hint);
+    let plan = lpm_runner::exec::build_exec_plan(project_dir, file_path, extra_args, &options)?;
+    let (watch_dir, input_globs) = exec_watch_scope(project_dir, &plan);
+
+    install_ui::phase(&format!("Watching {file_path} (Ctrl+C to stop)"));
+
+    let dir = project_dir.to_path_buf();
+    let file = file_path.to_string();
+    let plan_for_watch = plan;
+
+    lpm_task::watch::watch_and_run(
+        &watch_dir,
+        Box::new(move || {
+            let mut stderr = std::io::stderr();
+            if stderr.is_terminal() {
+                let _ = write!(stderr, "\x1B[2J\x1B[1;1H");
+                let _ = stderr.flush();
+            }
+
+            install_ui::phase(&format!(
+                "watch executing {} with {}",
+                install_ui::yellow(&file),
+                install_ui::yellow(&plan_for_watch.runtime_label())
+            ));
+            let start = std::time::Instant::now();
+
+            match lpm_runner::exec::execute_exec_plan(&dir, &plan_for_watch) {
+                Ok(()) => {
+                    install_ui::done(&format!(
+                        "{} completed in {}. Waiting for changes...",
+                        install_ui::yellow(&file),
+                        install_ui::green(&install_ui::format_duration(start.elapsed())),
+                    ));
+                }
+                Err(e) => {
+                    install_ui::failed(&format!(
+                        "{}: {}",
+                        install_ui::yellow(&file),
+                        lpm_common::sanitize_for_terminal(&e.to_string())
+                    ));
+                    install_ui::detail("  Waiting for changes...");
+                }
+            }
+        }),
+        &input_globs,
+        None,
+    )
+    .map_err(|e| LpmError::Script(format!("watch error: {e}")))?;
+
+    Ok(())
+}
+
+fn exec_options(
+    env_mode: Option<&str>,
+    no_env_check: bool,
+    managed_runtime_hint: lpm_runner::bin_path::ManagedRuntimeHint,
+) -> lpm_runner::exec::ExecOptions {
+    lpm_runner::exec::ExecOptions {
+        env_mode: env_mode.map(str::to_string),
+        no_env_check,
+        managed_runtime_hint,
+    }
+}
+
+fn exec_watch_scope(
+    project_dir: &Path,
+    plan: &lpm_runner::exec::ExecPlan,
+) -> (std::path::PathBuf, Vec<String>) {
+    if let Ok(relative) = plan.resolved_path.strip_prefix(project_dir) {
+        return (project_dir.to_path_buf(), vec![path_glob_string(relative)]);
+    }
+
+    let watch_dir = plan
+        .resolved_path
+        .parent()
+        .map_or_else(|| project_dir.to_path_buf(), Path::to_path_buf);
+    let input_globs = plan
+        .resolved_path
+        .file_name()
+        .map(|name| vec![name.to_string_lossy().replace('\\', "/")])
+        .unwrap_or_default();
+
+    (watch_dir, input_globs)
+}
+
+fn path_glob_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[derive(Clone, Debug)]

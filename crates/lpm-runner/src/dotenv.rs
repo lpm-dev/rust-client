@@ -32,6 +32,19 @@ pub fn load_project_env(
     project_dir: &Path,
     env_name: Option<&str>,
 ) -> Result<HashMap<String, String>, LpmError> {
+    load_project_env_with_schema_validation(
+        project_dir,
+        env_name,
+        !crate::script::should_skip_env_validation(),
+    )
+}
+
+/// Load the project environment with an explicit schema-validation setting.
+pub fn load_project_env_with_schema_validation(
+    project_dir: &Path,
+    env_name: Option<&str>,
+    validate_schema: bool,
+) -> Result<HashMap<String, String>, LpmError> {
     let lpm_config = lpm_json::read_lpm_json(project_dir).ok().flatten();
 
     // Validate env name to prevent path traversal
@@ -108,7 +121,7 @@ pub fn load_project_env(
     }
 
     // Validate against env schema (if defined in lpm.json)
-    if !crate::script::should_skip_env_validation()
+    if validate_schema
         && let Some(config) = &lpm_config
         && let Some(schema) = &config.env_schema
         && !schema.is_empty()
