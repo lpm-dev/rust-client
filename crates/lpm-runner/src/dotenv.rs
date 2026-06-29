@@ -15,6 +15,31 @@ use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::path::Path;
 
+const DENIED_ENV_VARS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "GIT_SSH_COMMAND",
+    "BASH_ENV",
+    "ENV",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TERM",
+];
+
 /// Load the fully-resolved environment for a project.
 ///
 /// This is the **single entry point** for all env loading in LPM. Used by
@@ -120,6 +145,8 @@ pub fn load_project_env_with_schema_validation(
         loaded.extend(vault_vars);
     }
 
+    remove_dangerous_env_vars(&mut loaded, "project env");
+
     // Validate against env schema (if defined in lpm.json)
     if validate_schema
         && let Some(config) = &lpm_config
@@ -133,6 +160,8 @@ pub fn load_project_env_with_schema_validation(
         }
         tracing::debug!("env schema validation passed ({} vars)", schema.len());
     }
+
+    remove_dangerous_env_vars(&mut loaded, "project env");
 
     Ok(loaded)
 }
@@ -264,29 +293,7 @@ pub fn load_env_files(project_dir: &Path, mode: Option<&str>) -> HashMap<String,
     // (process env takes precedence)
     merged.retain(|key, _| std::env::var(key).is_err());
 
-    // Remove dangerous env vars that should never come from .env files.
-    // These can be exploited to inject shared libraries, alter runtime behavior,
-    // or hijack PATH resolution even when the process env doesn't already set them.
-    const DENIED_ENV_VARS: &[&str] = &[
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-        "DYLD_FRAMEWORK_PATH",
-        "NODE_OPTIONS",
-        "PATH",
-        "HOME",
-        "USER",
-        "SHELL",
-        "TERM",
-    ];
-    for &denied in DENIED_ENV_VARS {
-        if merged.remove(denied).is_some() {
-            tracing::warn!(
-                "ignored dangerous env var '{denied}' from .env file — this variable cannot be set via .env"
-            );
-        }
-    }
+    remove_dangerous_env_vars(&mut merged, ".env file");
 
     merged
 }
@@ -315,29 +322,31 @@ pub fn load_env_from_chain(project_dir: &Path, file_chain: &[String]) -> HashMap
     // Filter out vars that already exist in process environment
     merged.retain(|key, _| std::env::var(key).is_err());
 
-    // Remove dangerous env vars
-    const DENIED_ENV_VARS: &[&str] = &[
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-        "DYLD_FRAMEWORK_PATH",
-        "NODE_OPTIONS",
-        "PATH",
-        "HOME",
-        "USER",
-        "SHELL",
-        "TERM",
-    ];
-    for &denied in DENIED_ENV_VARS {
-        if merged.remove(denied).is_some() {
+    remove_dangerous_env_vars(&mut merged, ".env file");
+
+    merged
+}
+
+fn remove_dangerous_env_vars(vars: &mut HashMap<String, String>, source: &str) {
+    let denied_keys: Vec<String> = vars
+        .keys()
+        .filter(|key| is_denied_env_var(key))
+        .cloned()
+        .collect();
+
+    for denied in denied_keys {
+        if vars.remove(&denied).is_some() {
             tracing::warn!(
-                "ignored dangerous env var '{denied}' from .env file — this variable cannot be set via .env"
+                "ignored dangerous env var '{denied}' from {source} — this variable cannot be set via LPM project env"
             );
         }
     }
+}
 
-    merged
+fn is_denied_env_var(key: &str) -> bool {
+    DENIED_ENV_VARS
+        .iter()
+        .any(|denied| key.eq_ignore_ascii_case(denied))
 }
 
 /// Merge a single `.env` file into an existing map (overwriting existing keys).
@@ -512,7 +521,7 @@ mod tests {
 
         fs::write(
 			dir.path().join(".env"),
-			"LD_PRELOAD=/evil.so\nDYLD_INSERT_LIBRARIES=/evil.dylib\nNODE_OPTIONS=--require=evil\nNORMAL_VAR=ok\nPATH=/malicious\nHOME=/fake",
+			"LD_PRELOAD=/evil.so\nLD_AUDIT=/audit.so\nDYLD_INSERT_LIBRARIES=/evil.dylib\nNODE_OPTIONS=--require=evil\nBASH_ENV=./bad-shell-env\nNORMAL_VAR=ok\nPATH=/malicious\nHOME=/fake",
 		)
 		.unwrap();
 
@@ -529,6 +538,8 @@ mod tests {
             !vars.contains_key("NODE_OPTIONS"),
             "NODE_OPTIONS should be denied"
         );
+        assert!(!vars.contains_key("LD_AUDIT"), "LD_AUDIT should be denied");
+        assert!(!vars.contains_key("BASH_ENV"), "BASH_ENV should be denied");
         assert!(!vars.contains_key("PATH"), "PATH should be denied");
         assert!(!vars.contains_key("HOME"), "HOME should be denied");
         assert_eq!(
@@ -574,20 +585,22 @@ mod tests {
     }
 
     #[test]
-    fn denied_vars_case_sensitive() {
-        // Denylist should be case-sensitive — ld_preload (lowercase) should pass
+    fn denied_env_vars_filtered_case_insensitively() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join(".env"),
-            "ld_preload=/lib.so\nLPM_TEST_CS_42=ok",
+            "ld_preload=/lib.so\nnode_options=--require=evil\nLPM_TEST_CS_42=ok",
         )
         .unwrap();
 
         let vars = load_env_files(dir.path(), None);
-        // lowercase variant is NOT in the denylist
         assert!(
-            vars.contains_key("ld_preload"),
-            "lowercase variant should pass through"
+            !vars.contains_key("ld_preload"),
+            "lowercase ld_preload should be denied"
+        );
+        assert!(
+            !vars.contains_key("node_options"),
+            "lowercase node_options should be denied"
         );
         assert!(vars.contains_key("LPM_TEST_CS_42"));
     }

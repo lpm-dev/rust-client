@@ -185,6 +185,14 @@ async fn async_main() -> Result<()> {
         std::process::exit(2);
     };
 
+    if matches!(&command, Commands::InternalTsTransform) {
+        if let Err(error) = lpm_runner::ts_transform::run_stdio() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
     // Set up tracing based on verbosity. Tracing is pinned to stderr so
     // stdout stays reserved for command output and `--json` remains a
     // single parseable document.
@@ -1792,15 +1800,32 @@ async fn async_main() -> Result<()> {
             env,
             file,
             no_env_check,
+            plain_node,
             watch,
             args,
         } => {
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if watch {
-                commands::run::exec_watch(&cwd, &file, &args, env.as_deref(), no_env_check).await
+                commands::run::exec_watch(
+                    &cwd,
+                    &file,
+                    &args,
+                    env.as_deref(),
+                    no_env_check,
+                    plain_node,
+                )
+                .await
             } else {
-                commands::run::exec(&cwd, &file, &args, env.as_deref(), no_env_check).await
+                commands::run::exec(
+                    &cwd,
+                    &file,
+                    &args,
+                    env.as_deref(),
+                    no_env_check,
+                    plain_node,
+                )
+                .await
             }
         }
         Commands::Dlx {
@@ -2690,6 +2715,7 @@ async fn async_main() -> Result<()> {
             update_check::refresh_cache_now().await;
             std::process::exit(0);
         }
+        Commands::InternalTsTransform => unreachable!("handled before async command dispatch"),
         Commands::External(args) => {
             // Try as package.json script shortcut: `lpm dev` → `lpm run dev`
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;

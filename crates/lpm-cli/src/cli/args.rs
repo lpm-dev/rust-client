@@ -1668,6 +1668,9 @@ pub(crate) enum Commands {
         /// Skip environment variable schema validation.
         #[arg(long)]
         no_env_check: bool,
+        /// Disable LPM's TypeScript runtime preload and child Node propagation.
+        #[arg(long = "plain-node", alias = "no-augment")]
+        plain_node: bool,
         /// Re-run on file changes.
         #[arg(long)]
         watch: bool,
@@ -2797,6 +2800,10 @@ pub(crate) enum Commands {
         hosts: Vec<String>,
     },
 
+    /// Hidden OXC transform helper for the LPM TypeScript runtime.
+    #[command(name = "internal-ts-transform", hide = true)]
+    InternalTsTransform,
+
     /// Generate a shell completion script.
     ///
     /// Pipe the output into your shell's completion-load path:
@@ -3319,6 +3326,28 @@ mod tests {
                 assert_eq!(file, "scripts/seed.ts");
                 assert!(watch);
                 assert!(args.is_empty());
+            }
+            _ => panic!("expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn exec_plain_node_flag_disables_augmentation() {
+        let cli = Cli::try_parse_from(["lpm", "exec", "--plain-node", "scripts/seed.ts"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Exec { plain_node, .. } => {
+                assert!(plain_node);
+            }
+            _ => panic!("expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn exec_no_augment_alias_disables_augmentation() {
+        let cli = Cli::try_parse_from(["lpm", "exec", "--no-augment", "scripts/seed.ts"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Exec { plain_node, .. } => {
+                assert!(plain_node);
             }
             _ => panic!("expected Exec command"),
         }

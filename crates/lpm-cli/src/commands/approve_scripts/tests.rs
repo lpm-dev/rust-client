@@ -667,6 +667,28 @@ async fn approve_scripts_specific_package_not_in_blocked_set_errors() {
 }
 
 #[tokio::test]
+async fn approve_scripts_unknown_package_errors_before_security_store_read() {
+    let _home_restore = RawEnvRestore::capture("LPM_HOME");
+    let _secret_restore = RawEnvRestore::capture(TEST_SECURITY_SECRET_ENV);
+    let _auth_restore = RawEnvRestore::capture(TEST_SECURITY_AUTH_RESULT_ENV);
+    let lpm_home = tempdir().unwrap();
+    unsafe {
+        std::env::set_var("LPM_HOME", lpm_home.path());
+        std::env::set_var(TEST_SECURITY_SECRET_ENV, "not-hex");
+        std::env::set_var(TEST_SECURITY_AUTH_RESULT_ENV, "error");
+    }
+
+    let dir = tempdir().unwrap();
+    write_default_manifest(dir.path());
+    write_state(dir.path(), vec![make_blocked("esbuild", "0.25.1")]);
+
+    let err = run(dir.path(), Some("not-installed"), false, false, false, true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not in the blocked set"));
+}
+
+#[tokio::test]
 async fn find_blocked_by_arg_handles_scoped_names_with_at_in_scope() {
     // Sanity check: a scoped name `@scope/pkg` should match the bare-name
     // path, not be misparsed as `name@version` with empty name. The

@@ -258,34 +258,12 @@ async fn run_under_store_lock(
     let baseline_index =
         crate::commands::audit::inventory::build_project_v2_baseline_index(project_dir, &lpm_root);
 
-    // ── pre-fetch provenance for the effective set ────
-    //
-    // Install does not fetch provenance; approve-scripts fetches the
-    // much smaller effective blocked set in parallel here, before any
-    // approval call site needs the value. The fetch overlaps with the
-    // user reading approval cards on the interactive path, and is
-    // bounded by the join_all fan-out on `--yes` bulk.
-    //
-    // `--list` is read-only — skip the fetch entirely; the listing
-    // doesn't materialize any binding so `provenance_at_approval` is
-    // never consulted. Empty effective set: skip too (no-op).
+    // Resolve the operator's provenance policy before branching. The
+    // side-effectful posture check and provenance fetch happen only after a
+    // live approval target is known, so read-only and invalid-package paths do
+    // not touch security approval storage.
     let (verify_policy, runtime_sigstore_source) = runtime_verify_policy_with_source();
     let runtime_enforce = verify_policy.enforce;
-    if !list && !dry_run && !effective_state.blocked_packages.is_empty() {
-        crate::security_approval::ensure_runtime_sigstore_posture(
-            project_dir,
-            json_output,
-            runtime_enforce,
-            runtime_sigstore_source,
-        )?;
-    }
-    let provenance_by_pkg: HashMap<(String, String), ProvenanceStatus> = if list
-        || effective_state.blocked_packages.is_empty()
-    {
-        HashMap::new()
-    } else {
-        fetch_provenance_for_effective_set(&effective_state.blocked_packages, &verify_policy).await
-    };
 
     // ── <pkg> argument: handled BEFORE the empty-effective short-circuit ──
     //
@@ -336,6 +314,17 @@ async fn run_under_store_lock(
                 )));
             }
         };
+
+        if !dry_run {
+            crate::security_approval::ensure_runtime_sigstore_posture(
+                project_dir,
+                json_output,
+                runtime_enforce,
+                runtime_sigstore_source,
+            )?;
+        }
+        let provenance_by_pkg =
+            fetch_provenance_for_effective_set(std::slice::from_ref(target), &verify_policy).await;
 
         let reviewed_by_prompt = !json_output && is_tty();
         let confirmed = if reviewed_by_prompt {
@@ -478,6 +467,17 @@ async fn run_under_store_lock(
     // Track outcomes for the summary / JSON output
     let mut approved: Vec<&BlockedPackage> = Vec::new();
     let mut skipped: Vec<&BlockedPackage> = Vec::new();
+
+    if !dry_run {
+        crate::security_approval::ensure_runtime_sigstore_posture(
+            project_dir,
+            json_output,
+            runtime_enforce,
+            runtime_sigstore_source,
+        )?;
+    }
+    let provenance_by_pkg =
+        fetch_provenance_for_effective_set(&effective_state.blocked_packages, &verify_policy).await;
 
     // ── --yes (bulk approve) ────────────────────────────────────────
 
