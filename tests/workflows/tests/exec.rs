@@ -977,6 +977,36 @@ fn exec_tsx_file_allows_user_symbol_named_binding() {
     );
 }
 
+#[test]
+fn exec_tsx_file_allows_user_global_this_named_binding() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const globalThis = { local: true };\n",
+            "const view = <main>{globalThis.local ? 'local-globalThis' : 'missing'}</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on TSX with user globalThis binding");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must not collide with user globalThis binding:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("local-globalThis"),
+        "exec must preserve user globalThis binding, got:\n{stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {

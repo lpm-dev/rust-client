@@ -488,7 +488,7 @@ function transformTsx(source) {
 
 function jsxHelper() {
   const factory = jsxFactoryExpression();
-  return `${factory} = ${factory} || ((type, props, ...children) => { const react = globalThis.React && globalThis.React.createElement; return react ? react(type, props, ...children) : ({ type, props: props || {}, children }); });`;
+  return `;${factory} = ${factory} || ((type, props, ...children) => { const __lpmGlobal = ${globalObjectExpression()}; const react = __lpmGlobal.React && __lpmGlobal.React.createElement; return react ? react(type, props, ...children) : ({ type, props: props || {}, children }); });`;
 }
 
 function injectJsxHelper(source) {
@@ -617,7 +617,12 @@ function directiveStatementEnd(source, start) {
 }
 
 function jsxFactoryExpression() {
-  return "globalThis[globalThis.Symbol.for(\"lpm.exec.jsx\")]";
+  const global = globalObjectExpression();
+  return `${global}[${global}.Symbol.for("lpm.exec.jsx")]`;
+}
+
+function globalObjectExpression() {
+  return "(() => {}).constructor(\"return this\")()";
 }
 
 class TsxParser {
