@@ -304,6 +304,67 @@ fn exec_tsx_file_preserves_typescript_generics_while_transforming_jsx() {
 }
 
 #[test]
+fn exec_tsx_file_transforms_jsx_inside_child_expressions() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const ok: boolean = true;\n",
+            "const view = <main>{ok && <span id=\"x\" />}</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on expression-nested TSX");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must transform JSX inside child expressions:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""type":"span""#) && stdout.contains(r#""id":"x""#),
+        "exec must transform JSX nested inside child expressions, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_tsx_file_transforms_nested_jsx_children_after_whitespace() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const view = <main>\n",
+            "  <span id=\"x\" />\n",
+            "</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on nested TSX children");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must transform nested JSX children after whitespace:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""type":"span""#) && stdout.contains(r#""id":"x""#),
+        "exec must transform nested JSX children after whitespace, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_tsx_file_uses_project_local_tsx_when_node_cannot_load_lpm_runtime() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file("scripts/view.tsx", "export const view = <main />;\n");

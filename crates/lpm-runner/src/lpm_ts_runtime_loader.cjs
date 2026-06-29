@@ -402,7 +402,7 @@ class TsxParser {
         const expr = this.readBalanced("{", "}");
         const inner = expr.slice(1, -1).trim();
         if (inner) {
-          children.push(inner);
+          children.push(this.transformExpression(inner));
         }
         continue;
       }
@@ -465,7 +465,8 @@ class TsxParser {
       return JSON.stringify(value);
     }
     if (quote === "{") {
-      return this.readBalanced("{", "}").slice(1, -1).trim() || "undefined";
+      const expression = this.readBalanced("{", "}").slice(1, -1).trim();
+      return expression ? this.transformExpression(expression) : "undefined";
     }
     if (this.startsJsx()) {
       return this.parseElement();
@@ -476,13 +477,20 @@ class TsxParser {
   readTextChild() {
     let text = "";
     while (this.index < this.source.length) {
-      if (this.startsJsx() || this.peek() === "{" || this.peekAhead("</")) {
+      if (this.startsJsx(true) || this.peek() === "{" || this.peekAhead("</")) {
         break;
       }
       text += this.source[this.index];
       this.index += 1;
     }
     return text;
+  }
+
+  transformExpression(expression) {
+    const parser = new TsxParser(expression);
+    const transformed = parser.transform();
+    this.sawJsx = this.sawJsx || parser.sawJsx;
+    return transformed;
   }
 
   readBalanced(open, close) {
