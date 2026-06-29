@@ -150,6 +150,8 @@ pub fn load_project_env_with_schema_validation(
         tracing::debug!("env schema validation passed ({} vars)", schema.len());
     }
 
+    remove_dangerous_env_vars(&mut loaded, "project env");
+
     Ok(loaded)
 }
 

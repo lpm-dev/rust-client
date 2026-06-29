@@ -167,6 +167,34 @@ fn exec_js_file_ignores_node_options_from_env_secrets() {
 }
 
 #[test]
+fn exec_js_file_ignores_node_options_from_env_schema_defaults() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file("bad-preload.cjs", "process.exit(99);\n");
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"NODE_OPTIONS":{"default":"--require=./bad-preload.cjs"}}}}"#,
+    );
+    project.write_file("scripts/plain.js", "console.log('safe-js');\n");
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/plain.js"])
+        .output()
+        .expect("failed to run lpm exec with env-schema NODE_OPTIONS default");
+
+    assert!(
+        output.status.success(),
+        "env-schema NODE_OPTIONS defaults must not hijack JavaScript exec:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("safe-js"),
+        "JavaScript exec must ignore NODE_OPTIONS from env schema defaults, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_missing_file_fails_before_runtime_execution() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
 
