@@ -274,6 +274,36 @@ fn exec_tsx_file_uses_lpm_runtime_without_project_local_tsx() {
 }
 
 #[test]
+fn exec_tsx_file_preserves_typescript_generics_while_transforming_jsx() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "function id<T>(value: T): T { return value; }\n",
+            "const view = <main id=\"root\">{id<string>('generic-tsx')}</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on generic TSX");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must preserve TypeScript generics:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""type":"main""#) && stdout.contains("generic-tsx"),
+        "exec must preserve TypeScript generics while transforming JSX, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_tsx_file_uses_project_local_tsx_when_node_cannot_load_lpm_runtime() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file("scripts/view.tsx", "export const view = <main />;\n");

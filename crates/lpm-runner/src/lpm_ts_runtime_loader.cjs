@@ -301,10 +301,67 @@ class TsxParser {
     return out;
   }
 
-  startsJsx() {
+  startsJsx(inChildren = false) {
     const ch = this.source[this.index];
     const next = this.source[this.index + 1];
-    return ch === "<" && (next === ">" || /[A-Za-z]/.test(next || ""));
+    if (ch !== "<") {
+      return false;
+    }
+    if (next === ">") {
+      return inChildren || this.canStartJsxExpression();
+    }
+    if (!/[A-Za-z]/.test(next || "")) {
+      return false;
+    }
+    return inChildren || (this.canStartJsxExpression() && this.looksLikeJsxTag());
+  }
+
+  canStartJsxExpression() {
+    const prev = this.previousSignificantIndex();
+    if (prev === -1) {
+      return true;
+    }
+
+    const ch = this.source[prev];
+    if ("({[=,:;?!&|+-*%^~".includes(ch)) {
+      return true;
+    }
+    if (ch === ">" && this.source[prev - 1] === "=") {
+      return true;
+    }
+
+    return ["return", "throw", "yield", "await", "case"].includes(this.previousWordAt(prev));
+  }
+
+  previousSignificantIndex() {
+    let cursor = this.index - 1;
+    while (cursor >= 0 && /\s/.test(this.source[cursor])) {
+      cursor -= 1;
+    }
+    return cursor;
+  }
+
+  previousWordAt(index) {
+    if (!/[A-Za-z0-9_$]/.test(this.source[index] || "")) {
+      return "";
+    }
+    let start = index;
+    while (start > 0 && /[A-Za-z0-9_$]/.test(this.source[start - 1])) {
+      start -= 1;
+    }
+    return this.source.slice(start, index + 1);
+  }
+
+  looksLikeJsxTag() {
+    if (this.peekAhead("<>")) {
+      return true;
+    }
+    let cursor = this.index + 1;
+    while (cursor < this.source.length && /[A-Za-z0-9_$:.-]/.test(this.source[cursor])) {
+      cursor += 1;
+    }
+    const delimiter = this.source[cursor] || "";
+    return delimiter === ">" || delimiter === "/" || /\s/.test(delimiter);
   }
 
   parseElement() {
@@ -337,7 +394,7 @@ class TsxParser {
         this.index += 3;
         break;
       }
-      if (this.startsJsx()) {
+      if (this.startsJsx(true)) {
         children.push(this.parseElement());
         continue;
       }
