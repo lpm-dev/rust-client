@@ -158,7 +158,52 @@ function nearestPackageType(filename) {
 }
 
 function hasEsmSyntax(source) {
-  return /^\s*(?:import|export)\s/m.test(source);
+  for (const line of source.split(/\r?\n/)) {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("import") && importStatementHasRuntime(trimmed)) {
+      return true;
+    }
+    if (trimmed.startsWith("export") && exportStatementHasRuntime(trimmed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function importStatementHasRuntime(statement) {
+  if (/^import\s+type\b/.test(statement)) {
+    return false;
+  }
+  if (/^import\s+\w+\s*=/.test(statement)) {
+    return false;
+  }
+  const named = statement.match(/^import\s*\{([^}]*)\}\s*from\b/);
+  if (named) {
+    return !allTypeSpecifiers(named[1]);
+  }
+  return /^import(?:\s|["'])/.test(statement);
+}
+
+function exportStatementHasRuntime(statement) {
+  if (/^export\s+(?:type|interface|declare)\b/.test(statement)) {
+    return false;
+  }
+  if (/^export\s*=/.test(statement)) {
+    return false;
+  }
+  const named = statement.match(/^export\s*\{([^}]*)\}/);
+  if (named && allTypeSpecifiers(named[1])) {
+    return false;
+  }
+  return /^export(?:\s|\*)/.test(statement);
+}
+
+function allTypeSpecifiers(specifiers) {
+  const parts = specifiers
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return parts.length > 0 && parts.every((part) => part === "type" || part.startsWith("type "));
 }
 
 function resolveSpecifier(specifier, parentURL) {
@@ -401,7 +446,7 @@ class TsxParser {
       if (this.peek() === "{") {
         const expr = this.readBalanced("{", "}");
         const inner = expr.slice(1, -1).trim();
-        if (inner) {
+        if (this.hasExpressionValue(inner)) {
           children.push(this.transformExpression(inner));
         }
         continue;
@@ -489,6 +534,37 @@ class TsxParser {
     const transformed = parser.transform();
     this.sawJsx = this.sawJsx || parser.sawJsx;
     return transformed;
+  }
+
+  hasExpressionValue(expression) {
+    let cursor = 0;
+    while (cursor < expression.length) {
+      if (/\s/.test(expression[cursor])) {
+        cursor += 1;
+        continue;
+      }
+      if (expression.startsWith("/*", cursor)) {
+        const end = expression.indexOf("*/", cursor + 2);
+        if (end === -1) {
+          return false;
+        }
+        cursor = end + 2;
+        continue;
+      }
+      if (expression.startsWith("//", cursor)) {
+        const lineFeed = expression.indexOf("\n", cursor + 2);
+        const carriageReturn = expression.indexOf("\r", cursor + 2);
+        const ends = [lineFeed, carriageReturn].filter((index) => index !== -1);
+        const end = ends.length ? Math.min(...ends) : -1;
+        if (end === -1) {
+          return false;
+        }
+        cursor = end + 1;
+        continue;
+      }
+      return true;
+    }
+    return false;
   }
 
   readBalanced(open, close) {

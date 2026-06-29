@@ -248,6 +248,37 @@ fn exec_typescript_file_uses_lpm_runtime_without_project_local_tsx() {
 }
 
 #[test]
+fn exec_typescript_commonjs_file_ignores_type_only_exports_when_detecting_module_format() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/seed.ts",
+        concat!(
+            "export type SeedMessage = string;\n",
+            "const fs = require('node:fs');\n",
+            "const message: SeedMessage = fs.existsSync('package.json') ? 'commonjs-ts' : 'missing';\n",
+            "console.log(message);\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec on CommonJS TypeScript");
+
+    assert!(
+        output.status.success(),
+        "type-only exports must not force CommonJS TypeScript into ESM:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("commonjs-ts"),
+        "CommonJS TypeScript with type-only exports must keep require available, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_tsx_file_uses_lpm_runtime_without_project_local_tsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file(
@@ -330,6 +361,35 @@ fn exec_tsx_file_transforms_jsx_inside_child_expressions() {
     assert!(
         stdout.contains(r#""type":"span""#) && stdout.contains(r#""id":"x""#),
         "exec must transform JSX nested inside child expressions, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_tsx_file_ignores_comment_only_child_expressions() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const view = <main>{/* hidden */}<span id=\"x\" /></main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on comment-child TSX");
+
+    assert!(
+        output.status.success(),
+        "comment-only JSX child expressions must not become empty call arguments:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""type":"span""#) && stdout.contains(r#""id":"x""#),
+        "exec must ignore comment-only JSX child expressions and keep following children, got:\n{stdout}"
     );
 }
 
