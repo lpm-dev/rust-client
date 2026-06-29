@@ -1658,15 +1658,21 @@ pub(crate) enum Commands {
         args: Vec<String>,
     },
 
-    /// Execute a file directly (auto-detects runtime: node for .js, tsx for .ts).
+    /// Execute a file directly (auto-detects runtime for JS/TS files).
     Exec {
+        /// Environment mode to load (e.g., staging loads .env.staging).
+        #[arg(long)]
+        env: Option<String>,
         /// File to execute (e.g., src/seed.ts, scripts/migrate.js).
         file: String,
         /// Skip environment variable schema validation.
         #[arg(long)]
         no_env_check: bool,
+        /// Re-run on file changes.
+        #[arg(long)]
+        watch: bool,
         /// Extra arguments passed to the file. Use -- to separate from lpm flags.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(num_args = 0..)]
         args: Vec<String>,
     },
 
@@ -3275,6 +3281,69 @@ mod tests {
                 assert!(watch);
             }
             _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn exec_env_flag_selects_env_mode() {
+        let cli =
+            Cli::try_parse_from(["lpm", "exec", "--env", "staging", "scripts/seed.ts"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Exec { env, file, .. } => {
+                assert_eq!(env.as_deref(), Some("staging"));
+                assert_eq!(file, "scripts/seed.ts");
+            }
+            _ => panic!("expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn exec_watch_flag_parses_before_file() {
+        let cli = Cli::try_parse_from(["lpm", "exec", "--watch", "scripts/seed.ts"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Exec { file, watch, .. } => {
+                assert_eq!(file, "scripts/seed.ts");
+                assert!(watch);
+            }
+            _ => panic!("expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn exec_watch_flag_parses_after_file() {
+        let cli = Cli::try_parse_from(["lpm", "exec", "scripts/seed.ts", "--watch"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Exec {
+                file, watch, args, ..
+            } => {
+                assert_eq!(file, "scripts/seed.ts");
+                assert!(watch);
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn exec_extra_args_after_separator_are_forwarded() {
+        let cli = Cli::try_parse_from(["lpm", "exec", "scripts/seed.ts", "--", "--flag", "value"])
+            .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Exec { args, .. } => {
+                assert_eq!(args, vec!["--flag", "value"]);
+            }
+            _ => panic!("expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn exec_bare_extra_args_are_forwarded() {
+        let cli = Cli::try_parse_from(["lpm", "exec", "scripts/seed.ts", "arg1", "arg2"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Exec { args, .. } => {
+                assert_eq!(args, vec!["arg1", "arg2"]);
+            }
+            _ => panic!("expected Exec command"),
         }
     }
 

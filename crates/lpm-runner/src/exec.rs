@@ -1,122 +1,206 @@
-//! Direct file execution: `lpm exec src/seed.ts`
+//! Direct file execution for `lpm exec src/seed.ts`.
 //!
-//! Detects the file type and delegates to the appropriate runtime:
-//! - `.js`, `.mjs`, `.cjs` → `node` (direct spawn, no shell)
-//! - `.ts`, `.tsx`, `.mts`, `.cts` → `node --experimental-strip-types` (Node ≥22.6),
-//!   `node` (Node ≥23.6, native), `tsx` (fallback), or `npx tsx` (last resort)
-//!
-//! Uses direct process spawn (`Command::new`) instead of `sh -c` for ~20ms savings.
+//! Execution is planned in explicit stages: resolve the target, classify the
+//! file, resolve the effective runtime, choose a strategy, then spawn the
+//! command directly without a shell.
 
-use crate::bin_path;
+use crate::bin_path::{self, ManagedRuntimeHint};
 use crate::dotenv;
 use lpm_common::LpmError;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+
+const SUPPORTED_FILE_TYPES: &str = ".js, .mjs, .cjs, .ts, .tsx, .mts, .cts";
 
 #[derive(Debug, Clone)]
 pub struct ExecTargetDescription {
     pub runtime_label: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExecOptions {
+    pub env_mode: Option<String>,
+    pub no_env_check: bool,
+    pub managed_runtime_hint: ManagedRuntimeHint,
+}
+
+impl Default for ExecOptions {
+    fn default() -> Self {
+        Self {
+            env_mode: None,
+            no_env_check: false,
+            managed_runtime_hint: ManagedRuntimeHint::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ExecFileKind {
+    JavaScript,
+    TypeScript,
+    Tsx,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ExecRuntime {
+    Node { version: Option<String> },
+    LocalTsx { binary: PathBuf },
+}
+
+impl ExecRuntime {
+    fn display_label(&self) -> String {
+        match self {
+            Self::Node { version } => version.as_deref().map_or_else(
+                || "Node.js".to_string(),
+                |version| format!("Node.js {version}"),
+            ),
+            Self::LocalTsx { .. } => "local tsx".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ExecStrategy {
+    Node,
+    NodeStripTypes,
+    LocalTsx { binary: PathBuf },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExecCommandPlan {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ExecPlan {
+    pub resolved_path: PathBuf,
+    pub file_kind: ExecFileKind,
+    pub runtime: ExecRuntime,
+    pub strategy: ExecStrategy,
+    pub command: ExecCommandPlan,
+    pub env_mode: Option<String>,
+    pub no_env_check: bool,
+}
+
+impl ExecPlan {
+    pub fn runtime_label(&self) -> String {
+        self.runtime.display_label()
+    }
+}
+
 pub fn describe_exec_target(
     project_dir: &Path,
     file_path: &str,
 ) -> Result<ExecTargetDescription, LpmError> {
-    let resolved = resolve_exec_path(project_dir, file_path)?;
-    let ext = resolved.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let runtime_info = detect_runtime(ext, project_dir)?;
+    describe_exec_target_with_options(project_dir, file_path, &ExecOptions::default())
+}
+
+pub fn describe_exec_target_with_options(
+    project_dir: &Path,
+    file_path: &str,
+    options: &ExecOptions,
+) -> Result<ExecTargetDescription, LpmError> {
+    let plan = build_exec_plan(project_dir, file_path, &[], options)?;
 
     Ok(ExecTargetDescription {
-        runtime_label: runtime_info.display_label(project_dir),
+        runtime_label: plan.runtime_label(),
+    })
+}
+
+/// Build the execution plan for a direct file target.
+pub fn build_exec_plan(
+    project_dir: &Path,
+    file_path: &str,
+    extra_args: &[String],
+    options: &ExecOptions,
+) -> Result<ExecPlan, LpmError> {
+    let resolved_path = resolve_exec_path(project_dir, file_path)?;
+    let file_kind = detect_file_kind(&resolved_path)?;
+    let path =
+        bin_path::build_path_with_bins_pre_resolved(project_dir, &options.managed_runtime_hint);
+    let node_version = detect_effective_node_version_with_path(&path);
+    let strategy = choose_exec_strategy(file_kind, project_dir, node_version.as_deref())?;
+    let runtime = runtime_for_strategy(&strategy, node_version);
+    let command = build_command_plan(&strategy, file_path, extra_args, path);
+
+    Ok(ExecPlan {
+        resolved_path,
+        file_kind,
+        runtime,
+        strategy,
+        command,
+        env_mode: options.env_mode.clone(),
+        no_env_check: options.no_env_check,
     })
 }
 
 /// Execute a file directly, auto-detecting the runtime.
 ///
-/// Uses direct process spawn (no shell intermediary) for lower overhead.
-///
-/// # Arguments
-/// * `project_dir` — project root (for PATH injection)
-/// * `file_path` — path to the file to execute (relative or absolute)
-/// * `extra_args` — additional arguments passed to the script
+/// Uses direct process spawning with no shell intermediary.
 pub fn exec_file(
     project_dir: &Path,
     file_path: &str,
     extra_args: &[String],
 ) -> Result<(), LpmError> {
-    let resolved = resolve_exec_path(project_dir, file_path)?;
-    let ext = resolved.extension().and_then(|e| e.to_str()).unwrap_or("");
+    exec_file_with_options(project_dir, file_path, extra_args, &ExecOptions::default())
+}
 
-    let runtime_info = detect_runtime(ext, project_dir)?;
-    // M21: warn loudly when we're about to fetch `tsx` (and its
-    // install scripts) from npm on first use. The user invoked
-    // `lpm exec foo.ts` and got consent for the file they typed,
-    // but not for downloading and running an arbitrary npm package
-    // as a side-effect. npx — not LPM — handles the fetch, so the
-    // triage gate doesn't fire. Surface the implicit-download to
-    // stderr so an attacker who poisoned the npm-registry view of
-    // `tsx` doesn't get free RCE just because someone ran an
-    // unrelated TypeScript file.
-    if runtime_info.binary == "npx" && runtime_info.flags.first().is_some_and(|f| f == "tsx") {
-        eprintln!(
-            "warning: no managed Node >=22.6 and no local tsx — falling back to \
-             `npx tsx`, which will download tsx from npm on first use. Install a \
-             managed Node (lpm use node@22.6+) or add tsx to your project to \
-             avoid the implicit npm fetch."
-        );
-    }
-    let path = bin_path::build_path_with_bins(project_dir);
-    let env_vars = dotenv::load_project_env(project_dir, None)?;
+pub fn exec_file_with_options(
+    project_dir: &Path,
+    file_path: &str,
+    extra_args: &[String],
+    options: &ExecOptions,
+) -> Result<(), LpmError> {
+    let plan = build_exec_plan(project_dir, file_path, extra_args, options)?;
+    execute_exec_plan(project_dir, &plan)
+}
 
-    // Direct spawn: Command::new(binary).args([flags..., file, extra_args...])
-    // Avoids `sh -c` overhead (~20ms savings).
-    let mut command = Command::new(&runtime_info.binary);
+pub fn execute_exec_plan(project_dir: &Path, plan: &ExecPlan) -> Result<(), LpmError> {
+    let env_vars = dotenv::load_project_env_with_schema_validation(
+        project_dir,
+        plan.env_mode.as_deref(),
+        !plan.no_env_check,
+    )?;
 
-    // Add runtime-specific flags (e.g., --experimental-strip-types)
-    for flag in &runtime_info.flags {
-        command.arg(flag);
-    }
-
+    let mut command = Command::new(&plan.command.program);
     command
-        .arg(file_path)
-        .args(extra_args)
+        .args(&plan.command.args)
         .current_dir(project_dir)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    // Inject .env vars, then set PATH AFTER to prevent .env from overriding it
     if !env_vars.is_empty() {
         command.envs(&env_vars);
     }
-    command.env("PATH", &path);
+    command.env("PATH", &plan.command.path);
 
     let status = command.status().map_err(|e| {
-        LpmError::Script(format!("failed to execute '{}': {e}", runtime_info.binary))
+        LpmError::Script(format!(
+            "failed to execute '{}': {e}",
+            plan.command.program.display()
+        ))
     })?;
 
     if !status.success() {
-        #[cfg(not(unix))]
-        let code = status.code().unwrap_or(1);
-        #[cfg(unix)]
-        let code = {
-            use std::os::unix::process::ExitStatusExt;
-            status
-                .code()
-                .unwrap_or_else(|| status.signal().map_or(1, |s| 128 + s))
-        };
-        return Err(LpmError::ExitCode(code));
+        return Err(LpmError::ExitCode(exit_code_from_status(&status)));
     }
 
     Ok(())
 }
 
-fn resolve_exec_path(project_dir: &Path, file_path: &str) -> Result<std::path::PathBuf, LpmError> {
+fn resolve_exec_path(project_dir: &Path, file_path: &str) -> Result<PathBuf, LpmError> {
     let file = Path::new(file_path);
     let resolved = if file.is_absolute() {
         file.to_path_buf()
     } else {
-        project_dir.join(file)
+        let mut path =
+            PathBuf::with_capacity(project_dir.as_os_str().len() + file.as_os_str().len() + 1);
+        path.push(project_dir);
+        path.push(file);
+        path
     };
 
     if !resolved.exists() {
@@ -129,82 +213,167 @@ fn resolve_exec_path(project_dir: &Path, file_path: &str) -> Result<std::path::P
     Ok(resolved)
 }
 
-/// Runtime detection result — binary to invoke and any flags needed.
-#[derive(Debug)]
-struct RuntimeInfo {
-    /// The binary to execute (e.g., "node", "tsx", "npx")
-    binary: String,
-    /// Extra flags before the file path (e.g., ["--experimental-strip-types"])
-    flags: Vec<String>,
-}
-
-impl RuntimeInfo {
-    fn display_label(&self, project_dir: &Path) -> String {
-        match self.binary.as_str() {
-            "node" => detect_effective_node_version(project_dir).map_or_else(
-                || "Node.js".to_string(),
-                |version| format!("Node.js {version}"),
-            ),
-            "npx" if self.flags.first().is_some_and(|flag| flag == "tsx") => "npx tsx".into(),
-            runtime => runtime.to_string(),
-        }
-    }
-}
-
-/// Detect which runtime to use based on file extension.
-///
-/// For TypeScript files, checks (in order):
-/// 1. Node ≥23.6 → native TypeScript (no flags needed)
-/// 2. Node ≥22.6 → `node --experimental-strip-types`
-/// 3. Local `tsx` in node_modules/.bin
-/// 4. `npx tsx` as last resort
-fn detect_runtime(ext: &str, project_dir: &Path) -> Result<RuntimeInfo, LpmError> {
+fn detect_file_kind(path: &Path) -> Result<ExecFileKind, LpmError> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
-        "js" | "mjs" | "cjs" => Ok(RuntimeInfo {
-            binary: "node".into(),
-            flags: vec![],
-        }),
-        "ts" | "tsx" | "mts" | "cts" => {
-            if let Some(node_version) = detect_effective_node_version(project_dir) {
-                let (major, minor) = parse_major_minor(&node_version);
-                if major > 23 || (major == 23 && minor >= 6) {
-                    return Ok(RuntimeInfo {
-                        binary: "node".into(),
-                        flags: vec![],
-                    });
-                }
-                if (major == 22 && minor >= 6) || (major == 23 && minor < 6) {
-                    return Ok(RuntimeInfo {
-                        binary: "node".into(),
-                        flags: vec!["--experimental-strip-types".into()],
-                    });
-                }
-            }
-
-            // Check if tsx is available in node_modules/.bin
-            let tsx_bin = project_dir.join("node_modules/.bin/tsx");
-            if tsx_bin.exists() {
-                return Ok(RuntimeInfo {
-                    binary: "tsx".into(),
-                    flags: vec![],
-                });
-            }
-
-            // Fall back to npx tsx
-            Ok(RuntimeInfo {
-                binary: "npx".into(),
-                flags: vec!["tsx".into()],
-            })
+        "js" | "mjs" | "cjs" => Ok(ExecFileKind::JavaScript),
+        "ts" | "mts" | "cts" => Ok(ExecFileKind::TypeScript),
+        "tsx" => Ok(ExecFileKind::Tsx),
+        _ => {
+            let file_type = if ext.is_empty() {
+                "with no extension".to_string()
+            } else {
+                format!("'.{ext}'")
+            };
+            Err(LpmError::Script(format!(
+                "unsupported file type {file_type} - supported: {SUPPORTED_FILE_TYPES}"
+            )))
         }
-        _ => Err(LpmError::Script(format!(
-            "unsupported file type '.{ext}' — supported: .js, .ts, .tsx, .mjs, .cjs, .mts, .cts"
-        ))),
     }
+}
+
+fn choose_exec_strategy(
+    file_kind: ExecFileKind,
+    project_dir: &Path,
+    node_version: Option<&str>,
+) -> Result<ExecStrategy, LpmError> {
+    match file_kind {
+        ExecFileKind::JavaScript => Ok(ExecStrategy::Node),
+        ExecFileKind::TypeScript => {
+            if let Some(version) = node_version
+                && let Some(strategy) = node_typescript_strategy(version)
+            {
+                return Ok(strategy);
+            }
+
+            if let Some(binary) = find_local_tsx_binary(project_dir) {
+                return Ok(ExecStrategy::LocalTsx { binary });
+            }
+
+            Err(no_safe_typescript_runtime_error(node_version))
+        }
+        ExecFileKind::Tsx => {
+            if let Some(binary) = find_local_tsx_binary(project_dir) {
+                return Ok(ExecStrategy::LocalTsx { binary });
+            }
+
+            Err(no_safe_tsx_runtime_error(node_version))
+        }
+    }
+}
+
+fn node_typescript_strategy(version: &str) -> Option<ExecStrategy> {
+    let (major, minor) = parse_major_minor(version);
+    if major > 23 || (major == 23 && minor >= 6) || (major == 22 && minor >= 18) {
+        return Some(ExecStrategy::Node);
+    }
+    if (major == 22 && minor >= 6) || major == 23 {
+        return Some(ExecStrategy::NodeStripTypes);
+    }
+    None
+}
+
+fn runtime_for_strategy(strategy: &ExecStrategy, node_version: Option<String>) -> ExecRuntime {
+    match strategy {
+        ExecStrategy::Node | ExecStrategy::NodeStripTypes => ExecRuntime::Node {
+            version: node_version,
+        },
+        ExecStrategy::LocalTsx { binary } => ExecRuntime::LocalTsx {
+            binary: binary.clone(),
+        },
+    }
+}
+
+fn build_command_plan(
+    strategy: &ExecStrategy,
+    file_path: &str,
+    extra_args: &[String],
+    path: String,
+) -> ExecCommandPlan {
+    let mut args = Vec::with_capacity(extra_args.len() + 2);
+    let program = match strategy {
+        ExecStrategy::Node => PathBuf::from("node"),
+        ExecStrategy::NodeStripTypes => {
+            args.push("--experimental-strip-types".to_string());
+            PathBuf::from("node")
+        }
+        ExecStrategy::LocalTsx { binary } => binary.clone(),
+    };
+    args.push(file_path.to_string());
+    args.extend(extra_args.iter().cloned());
+
+    ExecCommandPlan {
+        program,
+        args,
+        path,
+    }
+}
+
+fn find_local_tsx_binary(project_dir: &Path) -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["tsx.cmd", "tsx.exe", "tsx"]
+    } else {
+        &["tsx"]
+    };
+
+    for bin_dir in bin_path::find_bin_dirs(project_dir) {
+        for name in names {
+            let candidate = bin_dir.join(name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn no_safe_typescript_runtime_error(node_version: Option<&str>) -> LpmError {
+    let runtime_detail = node_version.map_or_else(
+        || "no compatible Node.js runtime was detected".to_string(),
+        |version| format!("detected Node.js {version}, which cannot safely execute TypeScript"),
+    );
+    LpmError::Script(format!(
+        "{runtime_detail}. LPM will not fall back to `npx tsx` because that can download and execute npm code outside LPM's install-policy/security model. Run `lpm use node@22.6+` or install and pin a local `tsx` dev dependency with LPM, then retry."
+    ))
+}
+
+fn no_safe_tsx_runtime_error(node_version: Option<&str>) -> LpmError {
+    let runtime_detail = node_version.map_or_else(
+        || "no compatible TSX runtime was detected".to_string(),
+        |version| {
+            format!(
+                "detected Node.js {version}, but Node.js built-in TypeScript execution does not support .tsx files"
+            )
+        },
+    );
+    LpmError::Script(format!(
+        "{runtime_detail}. TSX requires a project-local `tsx` runtime. LPM will not fall back to `npx tsx` because that can download and execute npm code outside LPM's install-policy/security model. Install and pin a local `tsx` dev dependency with LPM, then retry."
+    ))
 }
 
 /// Detect the Node.js version that `lpm exec` will actually see on PATH.
+#[cfg(test)]
 fn detect_effective_node_version(project_dir: &Path) -> Option<String> {
     let path = bin_path::build_path_with_bins(project_dir);
+    detect_effective_node_version_with_path(&path)
+}
+
+fn detect_effective_node_version_with_path(path: &str) -> Option<String> {
     let output = Command::new("node")
         .arg("--version")
         .env("PATH", path)
@@ -227,12 +396,26 @@ fn detect_effective_node_version(project_dir: &Path) -> Option<String> {
     }
 }
 
-/// Parse major.minor from a version string like "22.6.0" → (22, 6).
+/// Parse major.minor from a version string like "22.6.0" into (22, 6).
 fn parse_major_minor(version: &str) -> (u32, u32) {
     let mut parts = version.trim_start_matches('v').split('.');
     let major = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     (major, minor)
+}
+
+#[cfg(not(unix))]
+fn exit_code_from_status(status: &ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
+#[cfg(unix)]
+fn exit_code_from_status(status: &ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+
+    status
+        .code()
+        .unwrap_or_else(|| status.signal().map_or(1, |signal| 128 + signal))
 }
 
 #[cfg(test)]
@@ -241,17 +424,18 @@ mod tests {
     use std::fs;
 
     #[cfg(unix)]
-    fn make_executable(path: &std::path::Path) {
+    fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
 
-        let mut perms = std::fs::metadata(path)
-            .expect("script must exist")
-            .permissions();
+        let mut perms = fs::metadata(path).expect("script must exist").permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).expect("failed to mark script executable");
+        fs::set_permissions(path, perms).expect("failed to mark script executable");
     }
 
-    fn write_fake_node(project_dir: &std::path::Path, version: &str) {
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) {}
+
+    fn write_fake_node(project_dir: &Path, version: &str) {
         let bin_dir = project_dir.join("node_modules/.bin");
         fs::create_dir_all(&bin_dir).unwrap();
 
@@ -269,18 +453,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exec_js_file() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("package.json"), "{}").unwrap();
-        fs::write(dir.path().join("hello.js"), "console.log('hello')").unwrap();
+    fn write_local_tsx(project_dir: &Path) -> PathBuf {
+        let bin_dir = project_dir.join("node_modules/.bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let tsx_path = if cfg!(windows) {
+            bin_dir.join("tsx.cmd")
+        } else {
+            bin_dir.join("tsx")
+        };
+        let script = if cfg!(windows) {
+            "@echo off\r\necho tsx\r\n"
+        } else {
+            "#!/bin/sh\necho tsx\n"
+        };
+        fs::write(&tsx_path, script).unwrap();
+        make_executable(&tsx_path);
+        tsx_path
+    }
 
-        let result = exec_file(dir.path(), "hello.js", &[]);
-        assert!(result.is_ok());
+    fn write_project_file(project_dir: &Path, file_name: &str) {
+        fs::write(project_dir.join("package.json"), "{}").unwrap();
+        fs::write(project_dir.join(file_name), "console.log('hello')").unwrap();
     }
 
     #[test]
-    fn exec_js_with_extra_args() {
+    fn exec_file_runs_javascript_with_node() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_file(dir.path(), "hello.js");
+
+        let result = exec_file(dir.path(), "hello.js", &[]);
+        assert!(result.is_ok(), "JavaScript exec should run through node");
+    }
+
+    #[test]
+    fn exec_file_forwards_extra_args_to_javascript() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
         fs::write(
@@ -297,136 +503,160 @@ mod tests {
     }
 
     #[test]
-    fn exec_missing_file_errors() {
+    fn build_exec_plan_errors_when_target_file_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
 
-        let result = exec_file(dir.path(), "nonexistent.js", &[]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
+        let err = build_exec_plan(dir.path(), "nonexistent.js", &[], &ExecOptions::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 
     #[test]
-    fn exec_unsupported_ext_errors() {
+    fn build_exec_plan_errors_when_extension_is_unsupported() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
         fs::write(dir.path().join("data.csv"), "a,b,c").unwrap();
 
-        let result = exec_file(dir.path(), "data.csv", &[]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unsupported"));
+        let err =
+            build_exec_plan(dir.path(), "data.csv", &[], &ExecOptions::default()).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(".csv"),
+            "error should mention the extension"
+        );
+        assert!(
+            message.contains(".ts"),
+            "error should list supported file types"
+        );
     }
 
     #[test]
-    fn detect_runtime_js() {
+    fn build_exec_plan_uses_node_for_javascript_files() {
         let dir = tempfile::tempdir().unwrap();
-        let r = detect_runtime("js", dir.path()).unwrap();
-        assert_eq!(r.binary, "node");
-        assert!(r.flags.is_empty());
+        write_project_file(dir.path(), "hello.mjs");
 
-        let r = detect_runtime("mjs", dir.path()).unwrap();
-        assert_eq!(r.binary, "node");
+        let plan = build_exec_plan(dir.path(), "hello.mjs", &[], &ExecOptions::default()).unwrap();
 
-        let r = detect_runtime("cjs", dir.path()).unwrap();
-        assert_eq!(r.binary, "node");
+        assert_eq!(plan.file_kind, ExecFileKind::JavaScript);
+        assert_eq!(plan.strategy, ExecStrategy::Node);
+        assert_eq!(plan.command.program, PathBuf::from("node"));
     }
 
     #[test]
-    fn detect_runtime_ts_fallback() {
+    fn build_exec_plan_uses_native_node_typescript_when_available() {
         let dir = tempfile::tempdir().unwrap();
-        write_fake_node(dir.path(), "v20.5.0");
-
-        let r = detect_runtime("ts", dir.path()).unwrap();
-        assert_eq!(r.binary, "npx");
-        assert_eq!(r.flags, vec!["tsx"]);
-    }
-
-    #[test]
-    fn detect_runtime_ts_with_local_tsx() {
-        let dir = tempfile::tempdir().unwrap();
-        write_fake_node(dir.path(), "v20.5.0");
-
-        let tsx_bin = dir.path().join("node_modules/.bin/tsx");
-        fs::create_dir_all(tsx_bin.parent().unwrap()).unwrap();
-        fs::write(&tsx_bin, "#!/bin/sh\necho tsx").unwrap();
-
-        let r = detect_runtime("ts", dir.path()).unwrap();
-        assert_eq!(r.binary, "tsx");
-        assert!(r.flags.is_empty());
-    }
-
-    #[test]
-    fn detect_runtime_ts_uses_path_node_native_typescript_when_available() {
-        let dir = tempfile::tempdir().unwrap();
+        write_project_file(dir.path(), "hello.ts");
         write_fake_node(dir.path(), "v23.6.0");
 
-        let r = detect_runtime("ts", dir.path()).unwrap();
-        assert_eq!(r.binary, "node");
-        assert!(r.flags.is_empty());
+        let plan = build_exec_plan(dir.path(), "hello.ts", &[], &ExecOptions::default()).unwrap();
+
+        assert_eq!(plan.file_kind, ExecFileKind::TypeScript);
+        assert_eq!(plan.strategy, ExecStrategy::Node);
+        assert_eq!(plan.command.args, vec!["hello.ts"]);
     }
 
     #[test]
-    fn detect_runtime_ts_uses_path_node_strip_types_when_available() {
+    fn build_exec_plan_uses_strip_types_for_node_22_6_typescript() {
         let dir = tempfile::tempdir().unwrap();
+        write_project_file(dir.path(), "hello.ts");
         write_fake_node(dir.path(), "v22.6.0");
 
-        let r = detect_runtime("ts", dir.path()).unwrap();
-        assert_eq!(r.binary, "node");
-        assert_eq!(r.flags, vec!["--experimental-strip-types"]);
+        let plan = build_exec_plan(dir.path(), "hello.ts", &[], &ExecOptions::default()).unwrap();
+
+        assert_eq!(plan.strategy, ExecStrategy::NodeStripTypes);
+        assert_eq!(
+            plan.command.args,
+            vec!["--experimental-strip-types", "hello.ts"]
+        );
     }
 
     #[test]
-    fn parse_major_minor_versions() {
-        assert_eq!(parse_major_minor("22.6.0"), (22, 6));
-        assert_eq!(parse_major_minor("23.6.1"), (23, 6));
-        assert_eq!(parse_major_minor("20.20.2"), (20, 20));
-        assert_eq!(parse_major_minor("24.0.0"), (24, 0));
-    }
-
-    #[test]
-    fn detect_runtime_ts_with_node_236_plus() {
-        // Simulate Node 23.6+ pinned via lpm.json
+    fn build_exec_plan_uses_native_node_typescript_for_node_22_18() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("lpm.json"),
-            r#"{"runtime": {"node": "23.6.0"}}"#,
-        )
-        .unwrap();
+        write_project_file(dir.path(), "hello.ts");
+        write_fake_node(dir.path(), "v22.18.0");
 
-        // This test only verifies detection logic.
-        // If 23.6.0 is not installed, it falls through to tsx/npx.
-        let r = detect_runtime("ts", dir.path()).unwrap();
-        // Result depends on whether 23.6.0 is installed,
-        // so we just assert it doesn't error.
-        assert!(!r.binary.is_empty());
-    }
+        let plan = build_exec_plan(dir.path(), "hello.ts", &[], &ExecOptions::default()).unwrap();
 
-    // --- Version check edge cases ---
-
-    #[test]
-    fn parse_major_minor_edge_cases() {
-        // Single component
-        assert_eq!(parse_major_minor("22"), (22, 0));
-        // Empty string
-        assert_eq!(parse_major_minor(""), (0, 0));
-        // Non-numeric
-        assert_eq!(parse_major_minor("abc.def"), (0, 0));
-        // Leading v — matches `node --version` output.
-        assert_eq!(parse_major_minor("v22.6.0"), (22, 6));
+        assert_eq!(plan.strategy, ExecStrategy::Node);
+        assert_eq!(plan.command.args, vec!["hello.ts"]);
     }
 
     #[test]
-    fn detect_runtime_unsupported_ext_has_helpful_message() {
+    fn build_exec_plan_uses_local_tsx_when_node_cannot_run_typescript() {
         let dir = tempfile::tempdir().unwrap();
-        let err = detect_runtime("py", dir.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains(".py"), "error should mention the extension");
-        assert!(msg.contains(".js"), "error should list supported types");
-        assert!(msg.contains(".ts"), "error should list supported types");
+        write_project_file(dir.path(), "hello.ts");
+        write_fake_node(dir.path(), "v20.5.0");
+        let tsx_path = write_local_tsx(dir.path());
+
+        let plan = build_exec_plan(dir.path(), "hello.ts", &[], &ExecOptions::default()).unwrap();
+
+        assert_eq!(
+            plan.strategy,
+            ExecStrategy::LocalTsx {
+                binary: tsx_path.clone()
+            }
+        );
+        assert_eq!(plan.command.program, tsx_path);
     }
 
     #[test]
-    fn exec_relative_path_resolves_against_project_dir() {
+    fn build_exec_plan_uses_local_tsx_for_tsx_even_when_node_supports_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_file(dir.path(), "view.tsx");
+        write_fake_node(dir.path(), "v22.18.0");
+        let tsx_path = write_local_tsx(dir.path());
+
+        let plan = build_exec_plan(dir.path(), "view.tsx", &[], &ExecOptions::default()).unwrap();
+
+        assert_eq!(
+            plan.strategy,
+            ExecStrategy::LocalTsx {
+                binary: tsx_path.clone()
+            }
+        );
+        assert_eq!(plan.command.program, tsx_path);
+    }
+
+    #[test]
+    fn build_exec_plan_refuses_tsx_without_local_tsx() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_file(dir.path(), "view.tsx");
+        write_fake_node(dir.path(), "v22.18.0");
+
+        let err =
+            build_exec_plan(dir.path(), "view.tsx", &[], &ExecOptions::default()).unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("TSX requires a project-local `tsx`"),
+            "TSX fallback error must explain the local tsx requirement: {message}"
+        );
+    }
+
+    #[test]
+    fn build_exec_plan_refuses_typescript_without_safe_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_file(dir.path(), "hello.ts");
+        write_fake_node(dir.path(), "v20.5.0");
+
+        let err =
+            build_exec_plan(dir.path(), "hello.ts", &[], &ExecOptions::default()).unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("will not fall back to `npx tsx`"),
+            "TypeScript fallback error must explain why npx is refused: {message}"
+        );
+        assert!(
+            message.contains("lpm use node@22.6+"),
+            "TypeScript fallback error must suggest a managed Node runtime: {message}"
+        );
+    }
+
+    #[test]
+    fn build_exec_plan_preserves_relative_file_argument() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
 
@@ -434,36 +664,54 @@ mod tests {
         fs::create_dir_all(&src_dir).unwrap();
         fs::write(src_dir.join("script.js"), "console.log('nested')").unwrap();
 
-        // Relative path without ./ prefix
-        let result = exec_file(dir.path(), "src/script.js", &[]);
-        assert!(
-            result.is_ok(),
-            "relative path should resolve against project dir"
-        );
+        let plan =
+            build_exec_plan(dir.path(), "src/script.js", &[], &ExecOptions::default()).unwrap();
+
+        assert_eq!(plan.command.args, vec!["src/script.js"]);
     }
 
     #[test]
-    fn exec_relative_path_with_dot_slash() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("package.json"), "{}").unwrap();
-        fs::write(dir.path().join("hello.js"), "console.log('hello')").unwrap();
-
-        // Relative path with ./ prefix
-        let result = exec_file(dir.path(), "./hello.js", &[]);
-        assert!(result.is_ok(), "./relative path should also work");
-    }
-
-    #[test]
-    fn exec_failing_script_returns_exit_code() {
+    fn exec_file_returns_exit_code_from_failing_script() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("package.json"), "{}").unwrap();
         fs::write(dir.path().join("fail.js"), "process.exit(42)").unwrap();
 
-        let result = exec_file(dir.path(), "fail.js", &[]);
-        assert!(result.is_err());
-        match result.unwrap_err() {
+        let err = exec_file(dir.path(), "fail.js", &[]).unwrap_err();
+
+        match err {
             LpmError::ExitCode(code) => assert_eq!(code, 42),
             other => panic!("expected ExitCode(42), got: {other}"),
         }
+    }
+
+    #[test]
+    fn parse_major_minor_accepts_node_version_shapes() {
+        assert_eq!(parse_major_minor("22.6.0"), (22, 6));
+        assert_eq!(parse_major_minor("v23.6.1"), (23, 6));
+        assert_eq!(parse_major_minor("20.20.2"), (20, 20));
+        assert_eq!(parse_major_minor("24"), (24, 0));
+        assert_eq!(parse_major_minor("abc.def"), (0, 0));
+    }
+
+    #[test]
+    fn describe_exec_target_uses_the_planned_runtime_label() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_file(dir.path(), "hello.ts");
+        write_fake_node(dir.path(), "v23.6.0");
+
+        let target = describe_exec_target(dir.path(), "hello.ts").unwrap();
+
+        assert_eq!(target.runtime_label, "Node.js v23.6.0");
+    }
+
+    #[test]
+    fn detect_effective_node_version_reads_the_exec_path_node() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_node(dir.path(), "v22.9.0");
+
+        assert_eq!(
+            detect_effective_node_version(dir.path()).as_deref(),
+            Some("v22.9.0")
+        );
     }
 }

@@ -1789,13 +1789,19 @@ async fn async_main() -> Result<()> {
             }
         }
         Commands::Exec {
+            env,
             file,
             no_env_check,
+            watch,
             args,
         } => {
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::run::exec(&cwd, &file, &args).await
+            if watch {
+                commands::run::exec_watch(&cwd, &file, &args, env.as_deref(), no_env_check).await
+            } else {
+                commands::run::exec(&cwd, &file, &args, env.as_deref(), no_env_check).await
+            }
         }
         Commands::Dlx {
             package,
