@@ -5,7 +5,7 @@ const path = require("node:path");
 const { pathToFileURL, fileURLToPath } = require("node:url");
 const vm = require("node:vm");
 
-const RUNTIME_VERSION = "2";
+const RUNTIME_VERSION = "3";
 const TS_EXT_RE = /\.(?:ts|tsx|mts|cts)$/;
 const JS_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json"];
 const PROJECT_DIR = path.resolve(process.env.LPM_TS_RUNTIME_PROJECT_DIR || process.cwd());

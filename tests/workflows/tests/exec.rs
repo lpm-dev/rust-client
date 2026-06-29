@@ -1007,6 +1007,91 @@ fn exec_tsx_file_allows_user_global_this_named_binding() {
     );
 }
 
+#[test]
+fn exec_tsx_file_ignores_stale_transform_cache_after_runtime_output_changes() {
+    use sha2::{Digest, Sha256};
+
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    let source = concat!(
+        "const globalThis = { local: true };\n",
+        "const view = <main>{globalThis.local ? 'local-globalThis' : 'missing'}</main>;\n",
+        "console.log(JSON.stringify(view));\n",
+    );
+    project.write_file("scripts/view.tsx", source);
+
+    let node_identity = std::process::Command::new("node")
+        .args([
+            "-e",
+            "console.log(process.versions.node);console.log(process.platform);console.log(process.arch);",
+        ])
+        .output()
+        .expect("failed to read node cache identity");
+    assert!(
+        node_identity.status.success(),
+        "node cache identity probe failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&node_identity.stdout),
+        String::from_utf8_lossy(&node_identity.stderr),
+    );
+    let identity = String::from_utf8(node_identity.stdout).expect("node identity must be utf8");
+    let mut identity_lines = identity.lines();
+    let node_version = identity_lines.next().expect("node version line");
+    let node_platform = identity_lines.next().expect("node platform line");
+    let node_arch = identity_lines.next().expect("node arch line");
+    let filename = std::fs::canonicalize(project.path().join("scripts/view.tsx"))
+        .expect("canonicalize TSX script path");
+    let filename = filename.to_string_lossy();
+    let tsconfig_fingerprint = format!("{:x}", Sha256::digest(b"{}"));
+
+    let mut cache_key = Sha256::new();
+    let cache_parts = [
+        "2",
+        node_version,
+        node_platform,
+        node_arch,
+        filename.as_ref(),
+        &tsconfig_fingerprint,
+        source,
+    ];
+    for (index, part) in cache_parts.iter().enumerate() {
+        cache_key.update(part.as_bytes());
+        if index + 1 != cache_parts.len() {
+            cache_key.update(b"\0");
+        }
+    }
+    let cache_key = format!("{:x}", cache_key.finalize());
+    let cache_dir = project
+        .home()
+        .join(".lpm/cache/exec-ts-runtime/v1/transform-cache");
+    std::fs::create_dir_all(&cache_dir).expect("create stale transform cache dir");
+    std::fs::write(
+        cache_dir.join(format!("{cache_key}.js")),
+        concat!(
+            "globalThis[globalThis.Symbol.for(\"lpm.exec.jsx\")] = globalThis[globalThis.Symbol.for(\"lpm.exec.jsx\")] || ((type, props, ...children) => ({ type, props: props || {}, children }));\n",
+            "const globalThis = { local: true };\n",
+            "const view = globalThis[globalThis.Symbol.for(\"lpm.exec.jsx\")](\"main\", null, globalThis.local ? 'local-globalThis' : 'missing');\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    )
+    .expect("write stale transform cache entry");
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec with stale transform cache");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must ignore stale transform cache entries:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("local-globalThis"),
+        "exec must ignore stale transform cache entries after runtime output changes, got:\n{stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {
