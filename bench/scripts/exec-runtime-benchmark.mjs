@@ -616,7 +616,6 @@ function renderMarkdown(report) {
   }
   lines.push("");
   lines.push("Skipped local tsx rows are benchmark-only comparisons; the harness never installs or fetches tsx.");
-  lines.push("");
   return `${lines.join("\n")}\n`;
 }
 
