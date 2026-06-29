@@ -728,6 +728,38 @@ fn exec_tsx_file_preserves_generic_arrows_with_literal_delimiters_while_transfor
     );
 }
 
+#[test]
+fn exec_tsx_file_preserves_generic_arrows_with_regex_defaults_while_transforming_jsx() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            r"const id = <T extends string>(value = /\)/): T => value.source as T;",
+            "\n",
+            r"const view = <main>{id(/regex-default/)}</main>;",
+            "\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on generic TSX with regex defaults");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must preserve generic arrows with regex defaults:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""type":"main""#) && stdout.contains("regex-default"),
+        "exec must preserve generic arrows with regex defaults while transforming JSX, got:\n{stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {

@@ -161,7 +161,7 @@ function hasEsmSyntax(source) {
   if (scriptSyntaxRequiresModule(source)) {
     return true;
   }
-  for (const line of sourceWithoutCommentsAndStrings(source).split(/\r?\n/)) {
+  for (const line of sourceSyntaxMask(source).split(/\r?\n/)) {
     const trimmed = line.trimStart();
     if (trimmed.startsWith("import") && importStatementHasRuntime(trimmed)) {
       return true;
@@ -190,7 +190,7 @@ function scriptSyntaxRequiresModule(source) {
   }
 }
 
-function sourceWithoutCommentsAndStrings(source) {
+function sourceSyntaxMask(source) {
   let out = "";
   let index = 0;
   while (index < source.length) {
@@ -240,8 +240,97 @@ function sourceWithoutCommentsAndStrings(source) {
       }
       continue;
     }
+    if (ch === "/" && canStartRegexLiteral(out)) {
+      const regexEnd = regexLiteralEnd(source, index);
+      if (regexEnd !== -1) {
+        out += maskSourceSegment(source, index, regexEnd);
+        index = regexEnd;
+        continue;
+      }
+    }
     out += ch;
     index += 1;
+  }
+  return out;
+}
+
+function canStartRegexLiteral(maskedPrefix) {
+  let cursor = maskedPrefix.length - 1;
+  while (cursor >= 0 && /\s/.test(maskedPrefix[cursor])) {
+    cursor -= 1;
+  }
+  if (cursor < 0) {
+    return true;
+  }
+
+  const ch = maskedPrefix[cursor];
+  if ("({[=,:;?!&|+-*%^~<>".includes(ch)) {
+    return true;
+  }
+  if (!/[A-Za-z0-9_$]/.test(ch)) {
+    return false;
+  }
+
+  let start = cursor;
+  while (start > 0 && /[A-Za-z0-9_$]/.test(maskedPrefix[start - 1])) {
+    start -= 1;
+  }
+  return [
+    "await",
+    "case",
+    "delete",
+    "do",
+    "else",
+    "in",
+    "instanceof",
+    "of",
+    "return",
+    "throw",
+    "typeof",
+    "void",
+    "yield",
+  ].includes(maskedPrefix.slice(start, cursor + 1));
+}
+
+function regexLiteralEnd(source, start) {
+  let cursor = start + 1;
+  let inClass = false;
+  while (cursor < source.length) {
+    const ch = source[cursor];
+    if (ch === "\n" || ch === "\r") {
+      return -1;
+    }
+    if (ch === "\\") {
+      cursor += 2;
+      continue;
+    }
+    if (ch === "[") {
+      inClass = true;
+      cursor += 1;
+      continue;
+    }
+    if (ch === "]" && inClass) {
+      inClass = false;
+      cursor += 1;
+      continue;
+    }
+    if (ch === "/" && !inClass) {
+      cursor += 1;
+      while (cursor < source.length && /[A-Za-z]/.test(source[cursor])) {
+        cursor += 1;
+      }
+      return cursor;
+    }
+    cursor += 1;
+  }
+  return -1;
+}
+
+function maskSourceSegment(source, start, end) {
+  let out = "";
+  for (let cursor = start; cursor < end; cursor += 1) {
+    const ch = source[cursor];
+    out += ch === "\n" || ch === "\r" ? ch : " ";
   }
   return out;
 }
@@ -404,7 +493,7 @@ function jsxHelper() {
 class TsxParser {
   constructor(source) {
     this.source = source;
-    this.syntax = sourceWithoutCommentsAndStrings(source);
+    this.syntax = sourceSyntaxMask(source);
     this.index = 0;
     this.sawJsx = false;
   }
