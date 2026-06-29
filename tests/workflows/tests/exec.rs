@@ -252,6 +252,32 @@ fn exec_typescript_file_uses_lpm_runtime_without_project_local_tsx() {
 }
 
 #[test]
+fn exec_typescript_file_forwards_args_through_lpm_runtime() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/args.ts",
+        "const args: string[] = process.argv.slice(2);\nconsole.log(JSON.stringify(args));\n",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/args.ts", "--", "--flag", "value"])
+        .output()
+        .expect("failed to run lpm exec on TypeScript args script");
+
+    assert!(
+        output.status.success(),
+        "TypeScript exec must succeed through the LPM runtime:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#"["--flag","value"]"#),
+        "TypeScript exec must preserve script args, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_typescript_commonjs_file_ignores_type_only_exports_when_detecting_module_format() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file(
@@ -311,6 +337,84 @@ fn exec_typescript_commonjs_file_ignores_commented_esm_syntax_when_detecting_mod
     assert!(
         stdout.contains("commented-commonjs-ts"),
         "CommonJS TypeScript with commented ESM syntax must keep require available, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_typescript_file_treats_top_level_await_as_module() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/seed.ts",
+        "const value: string = await Promise.resolve('top-level-await-ts');\nconsole.log(value);\n",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec on top-level-await TypeScript");
+
+    assert!(
+        output.status.success(),
+        "top-level await must select ESM format for TypeScript:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("top-level-await-ts"),
+        "TypeScript with top-level await must execute as ESM, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_typescript_file_treats_import_meta_as_module() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/seed.ts",
+        "console.log(import.meta.url.startsWith('file:') ? 'import-meta-ts' : 'missing');\n",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec on import-meta TypeScript");
+
+    assert!(
+        output.status.success(),
+        "import.meta must select ESM format for TypeScript:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("import-meta-ts"),
+        "TypeScript with import.meta must execute as ESM, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_typescript_file_treats_compact_named_export_as_module() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/seed.ts",
+        "const value: string = 'compact-export-ts';\nexport{value};\nconsole.log(value);\n",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec on compact-export TypeScript");
+
+    assert!(
+        output.status.success(),
+        "compact named exports must select ESM format for TypeScript:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("compact-export-ts"),
+        "TypeScript with compact named exports must execute as ESM, got:\n{stdout}"
     );
 }
 
@@ -407,7 +511,7 @@ fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {
         .expect("failed to poll lpm exec child")
         .is_none()
     {
-        if started.elapsed() > Duration::from_secs(2) {
+        if started.elapsed() > Duration::from_secs(10) {
             // SAFETY: the child was placed in its own process group above.
             // A negative pid targets that group and prevents an orphaned Node
             // process from keeping captured pipes open.

@@ -3,8 +3,9 @@ const fs = require("node:fs");
 const moduleApi = require("node:module");
 const path = require("node:path");
 const { pathToFileURL, fileURLToPath } = require("node:url");
+const vm = require("node:vm");
 
-const RUNTIME_VERSION = "1";
+const RUNTIME_VERSION = "2";
 const TS_EXT_RE = /\.(?:ts|tsx|mts|cts)$/;
 const JS_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json"];
 const PROJECT_DIR = path.resolve(process.env.LPM_TS_RUNTIME_PROJECT_DIR || process.cwd());
@@ -42,18 +43,19 @@ moduleApi.registerHooks({
     }
 
     const source = fs.readFileSync(filename, "utf8");
-    const format = moduleFormat(filename, source);
+    const transformedSource = loadTransformedSource(filename, source);
+    const format = moduleFormat(filename, transformedSource);
     return {
       format,
-      source: loadTransformedSource(filename, source, format),
+      source: transformedSource,
       shortCircuit: true,
     };
   },
 });
 
-function loadTransformedSource(filename, source, format) {
-  const key = cacheKey(filename, source, format);
-  const cachePath = path.join(CACHE_DIR, `${key}.${format === "commonjs" ? "cjs" : "mjs"}`);
+function loadTransformedSource(filename, source) {
+  const key = cacheKey(filename, source);
+  const cachePath = path.join(CACHE_DIR, `${key}.js`);
 
   try {
     return fs.readFileSync(cachePath, "utf8");
@@ -83,7 +85,7 @@ function transformSource(filename, source) {
   });
 }
 
-function cacheKey(filename, source, format) {
+function cacheKey(filename, source) {
   const hash = crypto.createHash("sha256");
   hash.update(RUNTIME_VERSION);
   hash.update("\0");
@@ -92,8 +94,6 @@ function cacheKey(filename, source, format) {
   hash.update(process.platform);
   hash.update("\0");
   hash.update(process.arch);
-  hash.update("\0");
-  hash.update(format);
   hash.update("\0");
   hash.update(filename);
   hash.update("\0");
@@ -123,7 +123,7 @@ function stripJsonComments(text) {
     .replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
-function moduleFormat(filename, source) {
+function moduleFormat(filename, transformedSource) {
   if (filename.endsWith(".mts")) {
     return "module";
   }
@@ -134,7 +134,7 @@ function moduleFormat(filename, source) {
   if (packageType === "module") {
     return "module";
   }
-  if (hasEsmSyntax(source)) {
+  if (hasEsmSyntax(transformedSource)) {
     return "module";
   }
   return "commonjs";
@@ -158,6 +158,9 @@ function nearestPackageType(filename) {
 }
 
 function hasEsmSyntax(source) {
+  if (scriptSyntaxRequiresModule(source)) {
+    return true;
+  }
   for (const line of sourceWithoutCommentsAndStrings(source).split(/\r?\n/)) {
     const trimmed = line.trimStart();
     if (trimmed.startsWith("import") && importStatementHasRuntime(trimmed)) {
@@ -168,6 +171,23 @@ function hasEsmSyntax(source) {
     }
   }
   return false;
+}
+
+function scriptSyntaxRequiresModule(source) {
+  try {
+    new vm.Script(source, { filename: "lpm-exec-runtime-format-check.js" });
+    return false;
+  } catch (error) {
+    if (!error || error.name !== "SyntaxError") {
+      return false;
+    }
+    const message = String(error.message || "");
+    return (
+      message.includes("Cannot use import statement outside a module") ||
+      message.includes("Cannot use 'import.meta' outside a module") ||
+      message.includes("top level bodies of modules")
+    );
+  }
 }
 
 function sourceWithoutCommentsAndStrings(source) {
@@ -248,8 +268,8 @@ function exportStatementHasRuntime(statement) {
     return false;
   }
   const named = statement.match(/^export\s*\{([^}]*)\}/);
-  if (named && allTypeSpecifiers(named[1])) {
-    return false;
+  if (named) {
+    return !allTypeSpecifiers(named[1]);
   }
   return /^export(?:\s|\*)/.test(statement);
 }
