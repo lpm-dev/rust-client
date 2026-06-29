@@ -12,9 +12,10 @@ const ROOT = path.resolve(SCRIPT_DIR, "../..");
 const BENCH_DIR = path.join(ROOT, "bench");
 const RESULTS_DIR = path.join(BENCH_DIR, "perf-results");
 const TIMESTAMP = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
-const ITERATIONS = positiveInt(process.env.ITERATIONS, 10);
+const ITERATIONS = positiveInt(process.env.ITERATIONS, 30);
 const WARMUP_ITERATIONS = positiveInt(process.env.WARMUP_ITERATIONS, 1);
 const MODULE_COUNTS = numberList(process.env.MODULE_COUNTS, [1, 10, 100]);
+const EXPLICIT_LPM_BIN = Boolean(process.env.LPM_BIN);
 const LPM_BIN = path.resolve(process.env.LPM_BIN || path.join(ROOT, "target/release/lpm-rs"));
 const MARKDOWN_OUT = path.resolve(
   process.env.OUT || process.env.MARKDOWN_OUT || path.join(RESULTS_DIR, `exec-runtime-suite-${TIMESTAMP}.md`),
@@ -26,11 +27,18 @@ const LOCAL_TSX_BIN = process.env.LOCAL_TSX_BIN ? path.resolve(process.env.LOCAL
 const KEEP_WORK = truthy(process.env.KEEP_BENCH_WORK);
 const SCENARIO_FILTER = process.env.SCENARIOS ? new RegExp(process.env.SCENARIOS) : null;
 
-if (!fs.existsSync(LPM_BIN)) {
+if (EXPLICIT_LPM_BIN) {
+  if (!executable(LPM_BIN)) {
+    throw new Error(`explicit LPM_BIN is not executable: ${LPM_BIN}`);
+  }
+} else {
   runChecked("cargo", ["build", "--release", "--locked", "-p", "lpm-cli", "--bin", "lpm-rs"], {
     cwd: ROOT,
     stdio: "inherit",
   });
+  if (!executable(LPM_BIN)) {
+    throw new Error(`release lpm-rs binary was not built at ${LPM_BIN}`);
+  }
 }
 
 fs.mkdirSync(RESULTS_DIR, { recursive: true });
@@ -73,7 +81,8 @@ try {
 function collectMetadata() {
   return {
     generatedAt: new Date().toISOString(),
-    gitSha: commandOutput("git", ["rev-parse", "--short", "HEAD"], ROOT) || "unknown",
+    sourceGitSha: commandOutput("git", ["rev-parse", "--short", "HEAD"], ROOT) || "unknown",
+    lpmBinarySource: EXPLICIT_LPM_BIN ? "explicit LPM_BIN" : "rebuilt release binary",
     iterations: ITERATIONS,
     warmupIterations: WARMUP_ITERATIONS,
     moduleCounts: MODULE_COUNTS,
@@ -584,11 +593,12 @@ function renderMarkdown(report) {
   const metadata = report.metadata;
   lines.push("# lpm exec runtime benchmark suite", "");
   lines.push(`- Date: \`${metadata.generatedAt}\``);
-  lines.push(`- Git SHA: \`${metadata.gitSha}\``);
+  lines.push(`- Source Git SHA: \`${metadata.sourceGitSha}\``);
   lines.push(`- Iterations: \`${metadata.iterations}\``);
   lines.push(`- Warmup iterations: \`${metadata.warmupIterations}\``);
   lines.push(`- Module counts: \`${metadata.moduleCounts.join(", ")}\``);
   lines.push(`- Binary: \`${metadata.lpmBinary}\``);
+  lines.push(`- Binary source: \`${metadata.lpmBinarySource}\``);
   lines.push(`- LPM: \`${metadata.lpmVersion}\``);
   lines.push(`- Node: \`${metadata.nodeVersion}\``);
   lines.push(
