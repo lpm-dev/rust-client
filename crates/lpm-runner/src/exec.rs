@@ -354,6 +354,10 @@ fn choose_exec_strategy(
                 return Ok(strategy);
             }
 
+            if options.plain_node {
+                return Err(no_plain_node_typescript_runtime_error(node_version));
+            }
+
             if let Some(binary) = find_local_tsx_binary(project_dir) {
                 return Ok(ExecStrategy::LocalTsx { binary });
             }
@@ -644,6 +648,16 @@ fn no_safe_typescript_runtime_error(node_version: Option<&str>) -> LpmError {
     );
     LpmError::Script(format!(
         "{runtime_detail}. LPM will not fall back to `npx tsx` because that can download and execute npm code outside LPM's install-policy/security model. Run `lpm use node@22.18+` to use the LPM-owned TS runtime, or install and pin a local `tsx` dev dependency with LPM, then retry."
+    ))
+}
+
+fn no_plain_node_typescript_runtime_error(node_version: Option<&str>) -> LpmError {
+    let runtime_detail = node_version.map_or_else(
+        || "no compatible Node.js runtime was detected".to_string(),
+        |version| format!("detected Node.js {version}, which cannot execute TypeScript directly"),
+    );
+    LpmError::Script(format!(
+        "{runtime_detail}. `--plain-node` disables the LPM TS runtime and project-local TypeScript tools, so LPM will not run project-local `tsx`. Run without `--plain-node`, use `lpm use node@22.18+` for Node's built-in TypeScript support, or invoke an explicit local tool yourself."
     ))
 }
 
@@ -1049,6 +1063,23 @@ mod tests {
                 .child_propagation,
             ChildPropagationMode::Disabled
         ));
+    }
+
+    #[test]
+    fn build_exec_plan_plain_node_refuses_local_tsx_for_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        write_project_file(dir.path(), "hello.ts");
+        write_fake_node(dir.path(), "v20.5.0");
+        write_local_tsx(dir.path());
+        let options = plain_node_options(dir.path());
+
+        let err = build_exec_plan(dir.path(), "hello.ts", &[], &options).unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("--plain-node"),
+            "plain-node TypeScript error must explain that local tsx is disabled: {message}"
+        );
     }
 
     #[test]

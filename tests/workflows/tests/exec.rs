@@ -1027,6 +1027,34 @@ fn exec_plain_node_disables_typescript_child_augmentation() {
 }
 
 #[test]
+fn exec_plain_node_refuses_project_local_tsx_for_typescript() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file("scripts/seed.ts", "console.log('seed');\n");
+    write_fake_node(&project, "v20.5.0");
+    write_fake_tsx(&project);
+
+    let output = lpm(&project)
+        .args(["exec", "--plain-node", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec --plain-node on TypeScript");
+
+    assert!(
+        !output.status.success(),
+        "--plain-node must not fall back to project-local tsx for TypeScript"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("local-tsx"),
+        "--plain-node must not invoke project-local tsx, got:\n{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--plain-node"),
+        "plain-node TypeScript refusal must explain the selected mode, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn exec_strips_inherited_node_options_before_installing_lpm_runtime() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file("bad-preload.cjs", "process.exit(99);\n");
