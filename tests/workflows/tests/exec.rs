@@ -760,6 +760,40 @@ fn exec_tsx_file_preserves_generic_arrows_with_regex_defaults_while_transforming
     );
 }
 
+#[test]
+fn exec_tsx_file_preserves_regex_literals_inside_jsx_braces() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            r"const spread = /\}/.test('}') ? { role: 'presentation' } : {};",
+            "\n",
+            r"const view = <main data-ok={/\}/.test('}') ? 'attr-regex' : 'missing'} {...spread}>{/\}/.test('}') ? 'child-regex' : 'missing'}</main>;",
+            "\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on TSX with regex literals inside braces");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must preserve regex literals inside JSX braces:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""data-ok":"attr-regex""#)
+            && stdout.contains(r#""role":"presentation""#)
+            && stdout.contains("child-regex"),
+        "exec must preserve regex literals inside JSX braces, got:\n{stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {

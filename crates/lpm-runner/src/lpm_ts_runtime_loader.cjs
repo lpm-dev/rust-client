@@ -240,7 +240,7 @@ function sourceSyntaxMask(source) {
       }
       continue;
     }
-    if (ch === "/" && canStartRegexLiteral(out)) {
+    if (ch === "/" && next !== ">" && source[index - 1] !== "<" && canStartRegexLiteral(out)) {
       const regexEnd = regexLiteralEnd(source, index);
       if (regexEnd !== -1) {
         out += maskSourceSegment(source, index, regexEnd);
@@ -852,25 +852,14 @@ class TsxParser {
     this.expect(open);
     let depth = 1;
     let out = open;
-    let quote = null;
     while (this.index < this.source.length && depth > 0) {
       const ch = this.source[this.index];
+      const syntaxCh = this.syntax[this.index];
       out += ch;
       this.index += 1;
-      if (quote) {
-        if (ch === "\\") {
-          out += this.source[this.index] || "";
-          this.index += 1;
-        } else if (ch === quote) {
-          quote = null;
-        }
-        continue;
-      }
-      if (ch === "\"" || ch === "'" || ch === "`") {
-        quote = ch;
-      } else if (ch === open) {
+      if (syntaxCh === open) {
         depth += 1;
-      } else if (ch === close) {
+      } else if (syntaxCh === close) {
         depth -= 1;
       }
     }
