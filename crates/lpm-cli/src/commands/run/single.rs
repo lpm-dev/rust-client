@@ -270,7 +270,7 @@ pub async fn exec_watch(
 
     let dir = project_dir.to_path_buf();
     let file = file_path.to_string();
-    let plan_for_watch = plan.clone();
+    let plan_for_watch = plan;
 
     lpm_task::watch::watch_and_run(
         &watch_dir,
