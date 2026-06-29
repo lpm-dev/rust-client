@@ -695,6 +695,39 @@ fn exec_tsx_file_preserves_constrained_generic_arrows_while_transforming_jsx() {
     );
 }
 
+#[test]
+fn exec_tsx_file_preserves_generic_arrows_with_literal_delimiters_while_transforming_jsx() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const defaulted = <T extends string>(value = ')'): T => value as T;\n",
+            "const constrained = <T extends '>'>(value: T): T => value;\n",
+            "const view = <main>{defaulted('default-param')}{constrained('>')}</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on generic TSX with literal delimiters");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must preserve generic arrows with literal delimiters:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""type":"main""#)
+            && stdout.contains("default-param")
+            && stdout.contains(r#"">""#),
+        "exec must preserve generic arrows with literal delimiters while transforming JSX, got:\n{stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {

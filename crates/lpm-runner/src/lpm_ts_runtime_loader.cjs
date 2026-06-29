@@ -404,6 +404,7 @@ function jsxHelper() {
 class TsxParser {
   constructor(source) {
     this.source = source;
+    this.syntax = sourceWithoutCommentsAndStrings(source);
     this.index = 0;
     this.sawJsx = false;
   }
@@ -495,7 +496,7 @@ class TsxParser {
     }
 
     let cursor = this.skipWhitespaceFrom(typeParamsEnd + 1);
-    if (this.source[cursor] !== "(") {
+    if (this.syntax[cursor] !== "(") {
       return false;
     }
 
@@ -505,10 +506,10 @@ class TsxParser {
     }
 
     cursor = this.skipWhitespaceFrom(paramsEnd + 1);
-    if (this.source.startsWith("=>", cursor)) {
+    if (this.syntax.startsWith("=>", cursor)) {
       return true;
     }
-    if (this.source[cursor] !== ":") {
+    if (this.syntax[cursor] !== ":") {
       return false;
     }
 
@@ -523,12 +524,12 @@ class TsxParser {
         bracketDepth === 0 &&
         braceDepth === 0 &&
         angleDepth === 0 &&
-        this.source.startsWith("=>", cursor)
+        this.syntax.startsWith("=>", cursor)
       ) {
         return true;
       }
 
-      const ch = this.source[cursor];
+      const ch = this.syntax[cursor];
       if (ch === "(") parenDepth += 1;
       else if (ch === ")" && parenDepth > 0) parenDepth -= 1;
       else if (ch === "[") bracketDepth += 1;
@@ -554,7 +555,7 @@ class TsxParser {
   findMatchingAngle(start) {
     let depth = 0;
     for (let cursor = start; cursor < this.source.length; cursor += 1) {
-      const ch = this.source[cursor];
+      const ch = this.syntax[cursor];
       if (ch === "<") {
         depth += 1;
       } else if (ch === ">") {
@@ -570,7 +571,7 @@ class TsxParser {
   findMatchingPair(start, open, close) {
     let depth = 0;
     for (let cursor = start; cursor < this.source.length; cursor += 1) {
-      const ch = this.source[cursor];
+      const ch = this.syntax[cursor];
       if (ch === open) {
         depth += 1;
       } else if (ch === close) {
@@ -584,7 +585,7 @@ class TsxParser {
   }
 
   skipWhitespaceFrom(cursor) {
-    while (cursor < this.source.length && /\s/.test(this.source[cursor])) {
+    while (cursor < this.source.length && /\s/.test(this.syntax[cursor])) {
       cursor += 1;
     }
     return cursor;
