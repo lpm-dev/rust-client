@@ -18,10 +18,21 @@ use std::path::Path;
 const DENIED_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
+    "LD_AUDIT",
     "DYLD_INSERT_LIBRARIES",
     "DYLD_LIBRARY_PATH",
     "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
     "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "GIT_SSH_COMMAND",
+    "BASH_ENV",
+    "ENV",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
     "PATH",
     "HOME",
     "USER",
@@ -498,7 +509,7 @@ mod tests {
 
         fs::write(
 			dir.path().join(".env"),
-			"LD_PRELOAD=/evil.so\nDYLD_INSERT_LIBRARIES=/evil.dylib\nNODE_OPTIONS=--require=evil\nNORMAL_VAR=ok\nPATH=/malicious\nHOME=/fake",
+			"LD_PRELOAD=/evil.so\nLD_AUDIT=/audit.so\nDYLD_INSERT_LIBRARIES=/evil.dylib\nNODE_OPTIONS=--require=evil\nBASH_ENV=./bad-shell-env\nNORMAL_VAR=ok\nPATH=/malicious\nHOME=/fake",
 		)
 		.unwrap();
 
@@ -515,6 +526,8 @@ mod tests {
             !vars.contains_key("NODE_OPTIONS"),
             "NODE_OPTIONS should be denied"
         );
+        assert!(!vars.contains_key("LD_AUDIT"), "LD_AUDIT should be denied");
+        assert!(!vars.contains_key("BASH_ENV"), "BASH_ENV should be denied");
         assert!(!vars.contains_key("PATH"), "PATH should be denied");
         assert!(!vars.contains_key("HOME"), "HOME should be denied");
         assert_eq!(
