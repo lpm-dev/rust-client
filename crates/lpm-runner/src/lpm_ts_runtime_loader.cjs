@@ -483,11 +483,112 @@ function transformTsx(source) {
   if (!parser.sawJsx) {
     return body;
   }
-  return `${jsxHelper()}\n${body}`;
+  return injectJsxHelper(body);
 }
 
 function jsxHelper() {
-  return "const __lpmJsx = globalThis.__lpmJsx || (globalThis.__lpmJsx = (type, props, ...children) => { const react = globalThis.React && globalThis.React.createElement; return react ? react(type, props, ...children) : ({ type, props: props || {}, children }); });";
+  const factory = jsxFactoryExpression();
+  return `${factory} = ${factory} || ((type, props, ...children) => { const react = globalThis.React && globalThis.React.createElement; return react ? react(type, props, ...children) : ({ type, props: props || {}, children }); });`;
+}
+
+function injectJsxHelper(source) {
+  const index = jsxHelperInsertionIndex(source);
+  const before = source.slice(0, index);
+  const after = source.slice(index);
+  const separator = before && !before.endsWith("\n") ? "\n" : "";
+  return `${before}${separator}${jsxHelper()}\n${after}`;
+}
+
+function jsxHelperInsertionIndex(source) {
+  let cursor = 0;
+  if (source.startsWith("#!")) {
+    const newline = source.indexOf("\n");
+    cursor = newline === -1 ? source.length : newline + 1;
+  }
+
+  let insertion = cursor;
+  while (cursor < source.length) {
+    const directiveStart = skipWhitespaceAndComments(source, cursor);
+    const directiveEnd = directiveStatementEnd(source, directiveStart);
+    if (directiveEnd === -1) {
+      return insertion;
+    }
+    cursor = directiveEnd;
+    insertion = cursor;
+  }
+  return insertion;
+}
+
+function skipWhitespaceAndComments(source, start) {
+  let cursor = start;
+  while (cursor < source.length) {
+    if (/\s/.test(source[cursor])) {
+      cursor += 1;
+      continue;
+    }
+    if (source.startsWith("//", cursor)) {
+      cursor += 2;
+      while (cursor < source.length && source[cursor] !== "\n" && source[cursor] !== "\r") {
+        cursor += 1;
+      }
+      continue;
+    }
+    if (source.startsWith("/*", cursor)) {
+      const end = source.indexOf("*/", cursor + 2);
+      if (end === -1) {
+        return cursor;
+      }
+      cursor = end + 2;
+      continue;
+    }
+    return cursor;
+  }
+  return cursor;
+}
+
+function directiveStatementEnd(source, start) {
+  const quote = source[start];
+  if (quote !== "\"" && quote !== "'") {
+    return -1;
+  }
+  let cursor = start + 1;
+  while (cursor < source.length) {
+    const ch = source[cursor];
+    if (ch === "\n" || ch === "\r") {
+      return -1;
+    }
+    cursor += 1;
+    if (ch === "\\") {
+      cursor += 1;
+      continue;
+    }
+    if (ch === quote) {
+      break;
+    }
+  }
+  if (cursor > source.length || source[cursor - 1] !== quote) {
+    return -1;
+  }
+  while (cursor < source.length && (source[cursor] === " " || source[cursor] === "\t")) {
+    cursor += 1;
+  }
+  if (source[cursor] === ";") {
+    return cursor + 1;
+  }
+  if (cursor >= source.length) {
+    return cursor;
+  }
+  if (source[cursor] === "\r") {
+    return source[cursor + 1] === "\n" ? cursor + 2 : cursor + 1;
+  }
+  if (source[cursor] === "\n") {
+    return cursor + 1;
+  }
+  return -1;
+}
+
+function jsxFactoryExpression() {
+  return "globalThis[globalThis.Symbol.for(\"lpm.exec.jsx\")]";
 }
 
 class TsxParser {
@@ -685,18 +786,18 @@ class TsxParser {
     if (this.peek() === ">") {
       this.index += 1;
       const children = this.parseChildren("");
-      return `__lpmJsx(${JSON.stringify("Fragment")}, null${children})`;
+      return `${jsxFactoryExpression()}(${JSON.stringify("Fragment")}, null${children})`;
     }
 
     const tag = this.readTagName();
     const attrs = this.readAttributes();
     if (this.peekAhead("/>")) {
       this.index += 2;
-      return `__lpmJsx(${tagExpression(tag)}, ${attrs})`;
+      return `${jsxFactoryExpression()}(${tagExpression(tag)}, ${attrs})`;
     }
     this.expect(">");
     const children = this.parseChildren(tag);
-    return `__lpmJsx(${tagExpression(tag)}, ${attrs}${children})`;
+    return `${jsxFactoryExpression()}(${tagExpression(tag)}, ${attrs}${children})`;
   }
 
   parseChildren(tag) {

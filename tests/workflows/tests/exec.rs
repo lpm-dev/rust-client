@@ -794,6 +794,127 @@ fn exec_tsx_file_preserves_regex_literals_inside_jsx_braces() {
     );
 }
 
+#[test]
+fn exec_tsx_file_preserves_hashbang_before_injected_jsx_helper() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "#!/usr/bin/env node\n",
+            "const view = <main>hashbang-tsx</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on hashbang TSX");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must keep hashbang first:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hashbang-tsx"),
+        "exec must preserve hashbang TSX execution, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_tsx_file_preserves_strict_directive_before_injected_jsx_helper() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "\"use strict\";\n",
+            "function strictThis() { return this === undefined ? 'strict-mode' : 'sloppy-mode'; }\n",
+            "const view = <main>{strictThis()}</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on strict TSX");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must keep strict directive first:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("strict-mode") && !stdout.contains("sloppy-mode"),
+        "exec must preserve strict directive semantics, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_tsx_file_allows_user_jsx_helper_named_binding() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const __lpmJsx = () => 'user-helper';\n",
+            "const view = <main>{__lpmJsx()}</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on TSX with user helper binding");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must not collide with user __lpmJsx binding:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("user-helper"),
+        "exec must preserve user __lpmJsx binding, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_tsx_file_allows_user_symbol_named_binding() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const Symbol = { for: () => 'user-symbol' };\n",
+            "const view = <main>{Symbol.for()}</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on TSX with user Symbol binding");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must not collide with user Symbol binding:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("user-symbol"),
+        "exec must preserve user Symbol binding, got:\n{stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {
