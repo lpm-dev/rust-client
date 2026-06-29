@@ -665,6 +665,36 @@ fn exec_tsx_file_preserves_typescript_generics_while_transforming_jsx() {
     );
 }
 
+#[test]
+fn exec_tsx_file_preserves_constrained_generic_arrows_while_transforming_jsx() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const id = <T extends string>(value: T): T => value;\n",
+            "const view = <main>{id('constrained-generic-tsx')}</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on constrained generic TSX");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must preserve constrained generic arrows:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""type":"main""#) && stdout.contains("constrained-generic-tsx"),
+        "exec must preserve constrained generic arrows while transforming JSX, got:\n{stdout}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {

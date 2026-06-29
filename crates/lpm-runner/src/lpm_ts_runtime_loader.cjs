@@ -434,6 +434,9 @@ class TsxParser {
     if (!/[A-Za-z]/.test(next || "")) {
       return false;
     }
+    if (!inChildren && this.looksLikeTypeParameterListBeforeArrow()) {
+      return false;
+    }
     return inChildren || (this.canStartJsxExpression() && this.looksLikeJsxTag());
   }
 
@@ -483,6 +486,108 @@ class TsxParser {
     }
     const delimiter = this.source[cursor] || "";
     return delimiter === ">" || delimiter === "/" || /\s/.test(delimiter);
+  }
+
+  looksLikeTypeParameterListBeforeArrow() {
+    const typeParamsEnd = this.findMatchingAngle(this.index);
+    if (typeParamsEnd === -1) {
+      return false;
+    }
+
+    let cursor = this.skipWhitespaceFrom(typeParamsEnd + 1);
+    if (this.source[cursor] !== "(") {
+      return false;
+    }
+
+    const paramsEnd = this.findMatchingPair(cursor, "(", ")");
+    if (paramsEnd === -1) {
+      return false;
+    }
+
+    cursor = this.skipWhitespaceFrom(paramsEnd + 1);
+    if (this.source.startsWith("=>", cursor)) {
+      return true;
+    }
+    if (this.source[cursor] !== ":") {
+      return false;
+    }
+
+    cursor += 1;
+    let parenDepth = 0;
+    let bracketDepth = 0;
+    let braceDepth = 0;
+    let angleDepth = 0;
+    while (cursor < this.source.length) {
+      if (
+        parenDepth === 0 &&
+        bracketDepth === 0 &&
+        braceDepth === 0 &&
+        angleDepth === 0 &&
+        this.source.startsWith("=>", cursor)
+      ) {
+        return true;
+      }
+
+      const ch = this.source[cursor];
+      if (ch === "(") parenDepth += 1;
+      else if (ch === ")" && parenDepth > 0) parenDepth -= 1;
+      else if (ch === "[") bracketDepth += 1;
+      else if (ch === "]" && bracketDepth > 0) bracketDepth -= 1;
+      else if (ch === "{") braceDepth += 1;
+      else if (ch === "}" && braceDepth > 0) braceDepth -= 1;
+      else if (ch === "<") angleDepth += 1;
+      else if (ch === ">" && angleDepth > 0) angleDepth -= 1;
+      else if (
+        (ch === ";" || ch === "\n" || ch === "\r") &&
+        parenDepth === 0 &&
+        bracketDepth === 0 &&
+        braceDepth === 0 &&
+        angleDepth === 0
+      ) {
+        return false;
+      }
+      cursor += 1;
+    }
+    return false;
+  }
+
+  findMatchingAngle(start) {
+    let depth = 0;
+    for (let cursor = start; cursor < this.source.length; cursor += 1) {
+      const ch = this.source[cursor];
+      if (ch === "<") {
+        depth += 1;
+      } else if (ch === ">") {
+        depth -= 1;
+        if (depth === 0) {
+          return cursor;
+        }
+      }
+    }
+    return -1;
+  }
+
+  findMatchingPair(start, open, close) {
+    let depth = 0;
+    for (let cursor = start; cursor < this.source.length; cursor += 1) {
+      const ch = this.source[cursor];
+      if (ch === open) {
+        depth += 1;
+      } else if (ch === close) {
+        depth -= 1;
+        if (depth === 0) {
+          return cursor;
+        }
+      }
+    }
+    return -1;
+  }
+
+  skipWhitespaceFrom(cursor) {
+    while (cursor < this.source.length && /\s/.test(this.source[cursor])) {
+      cursor += 1;
+    }
+    return cursor;
   }
 
   parseElement() {
