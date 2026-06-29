@@ -288,21 +288,23 @@ function addTsComparisonScenarios(scenarios, options) {
 }
 
 function addOxcHelperScenario(scenarios, options) {
-  scenarios.push({
-    id: `lpm-${options.fixture}`,
-    runner: "lpm-oxc-helper",
-    fixture: options.fixture,
-    label: options.label,
-    entryKind: options.entryKind,
-    format: options.format,
-    projectMode: options.projectMode,
-    moduleCount: options.moduleCount,
-    helperInvocations: options.moduleCount,
-    cacheModes: ["none"],
-    createProject: options.createProject,
-    entry: "internal-ts-transform",
-    helperFiles: (projectDir) => helperModuleFiles(projectDir, options.ext, options.moduleCount),
-  });
+  for (const runner of ["lpm-oxc-helper", "lpm-oxc-helper-persistent"]) {
+    scenarios.push({
+      id: runner === "lpm-oxc-helper" ? `lpm-${options.fixture}` : `lpm-persistent-${options.fixture}`,
+      runner,
+      fixture: options.fixture,
+      label: options.label,
+      entryKind: options.entryKind,
+      format: options.format,
+      projectMode: options.projectMode,
+      moduleCount: options.moduleCount,
+      helperInvocations: options.moduleCount,
+      cacheModes: ["none"],
+      createProject: options.createProject,
+      entry: runner === "lpm-oxc-helper" ? "internal-ts-transform" : "internal-ts-transform --persistent",
+      helperFiles: (projectDir) => helperModuleFiles(projectDir, options.ext, options.moduleCount),
+    });
+  }
 }
 
 function runnerUnavailableReason(runner) {
@@ -323,7 +325,7 @@ function measureScenario(scenario, projectDir, cacheMode) {
   if (unavailableReason) {
     return skippedResult(scenario, cacheMode, unavailableReason);
   }
-  if (scenario.runner === "lpm-oxc-helper") {
+  if (scenario.runner === "lpm-oxc-helper" || scenario.runner === "lpm-oxc-helper-persistent") {
     return measureOxcHelperScenario(scenario, projectDir, cacheMode);
   }
 
@@ -370,13 +372,15 @@ function measureOxcHelperScenario(scenario, projectDir, cacheMode) {
   removeTree(envRoot);
   const env = benchmarkEnv(envRoot);
   const inputs = helperTransformInputs(scenario, projectDir);
+  const runHelperInputs =
+    scenario.runner === "lpm-oxc-helper-persistent" ? runHelperInputsPersistentOnce : runHelperInputsOnce;
   if (inputs.length === 0) {
     return failedResult(scenario, cacheMode, "helper scenario did not produce transform inputs");
   }
 
   try {
     for (let i = 0; i < WARMUP_ITERATIONS; i += 1) {
-      const failed = runHelperInputsOnce(inputs, projectDir, env);
+      const failed = runHelperInputs(inputs, projectDir, env);
       if (failed) {
         throw new Error(failed);
       }
@@ -388,7 +392,7 @@ function measureOxcHelperScenario(scenario, projectDir, cacheMode) {
   const samples = [];
   for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
     const started = process.hrtime.bigint();
-    const failed = runHelperInputsOnce(inputs, projectDir, env);
+    const failed = runHelperInputs(inputs, projectDir, env);
     const elapsedNs = process.hrtime.bigint() - started;
     if (failed) {
       return failedResult(scenario, cacheMode, failed, samples);
@@ -437,6 +441,42 @@ function runHelperInputsOnce(inputs, projectDir, env) {
   return "";
 }
 
+function runHelperInputsPersistentOnce(inputs, projectDir, env) {
+  const run = childProcess.spawnSync(LPM_BIN, ["internal-ts-transform", "--persistent"], {
+    cwd: projectDir,
+    env,
+    input: `${inputs.join("\n")}\n`,
+    encoding: "utf8",
+    maxBuffer: MAX_TRANSFORM_OUTPUT_BYTES,
+    windowsHide: true,
+  });
+  if (run.status !== 0 || run.error) {
+    return failureDetail(run, `${LPM_BIN} internal-ts-transform --persistent`);
+  }
+
+  const lines = String(run.stdout || "")
+    .split(/\r?\n/)
+    .filter(Boolean);
+  if (lines.length !== inputs.length) {
+    return `expected ${inputs.length} persistent helper responses, got ${lines.length}`;
+  }
+  for (const line of lines) {
+    let response;
+    try {
+      response = JSON.parse(line);
+    } catch (error) {
+      return `persistent helper returned invalid JSON: ${error.message}`;
+    }
+    if (response.error) {
+      return `persistent helper returned error: ${response.error}`;
+    }
+    if (response.schemaVersion !== TRANSFORM_PROTOCOL_VERSION || typeof response.code !== "string") {
+      return "persistent helper returned an invalid response envelope";
+    }
+  }
+  return "";
+}
+
 function prepareCacheState(scenario, cacheMode, projectDir, envRoot, env, command) {
   if (cacheMode === "none") {
     return;
@@ -454,7 +494,7 @@ function prepareCacheState(scenario, cacheMode, projectDir, envRoot, env, comman
 
 function resetColdCache(scenario, envRoot) {
   if (scenario.runner === "lpm") {
-    removeTree(path.join(envRoot, "lpm-home/cache/exec-ts-runtime/v2/transform-cache"));
+    removeTree(path.join(envRoot, "lpm-home/cache/exec-ts-runtime/v3/transform-cache"));
     return;
   }
   if (scenario.runner === "nub") {
@@ -934,7 +974,7 @@ function renderMarkdown(report) {
     `Cold clears the runner's transform cache before every measured run. Warm runs ${metadata.warmupIterations} unmeasured warmup iteration(s) and then reuses that cache.`,
   );
   lines.push(
-    "`lpm-oxc-helper` rows run `lpm-rs internal-ts-transform` directly through the same stdin/stdout JSON protocol the LPM TS loader uses on cache misses.",
+    "`lpm-oxc-helper` rows run one transform helper process per file. `lpm-oxc-helper-persistent` rows run one `internal-ts-transform --persistent` process for the whole module set.",
   );
   lines.push("");
   lines.push(

@@ -18,8 +18,9 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 
 const SUPPORTED_FILE_TYPES: &str = ".js, .mjs, .cjs, .ts, .tsx, .mts, .cts";
-const LPM_TS_RUNTIME_LOADER_VERSION: &str = "2";
+const LPM_TS_RUNTIME_LOADER_VERSION: &str = "3";
 const LPM_TS_RUNTIME_LOADER_SOURCE: &str = include_str!("lpm_ts_runtime_loader.cjs");
+const LPM_TS_RUNTIME_WORKER_SOURCE: &str = include_str!("lpm_ts_runtime_worker.cjs");
 const LPM_TS_RUNTIME_NODE_OPTIONS_PREFIX: &str = "--disable-warning=ExperimentalWarning";
 
 #[derive(Debug, Clone)]
@@ -440,7 +441,6 @@ fn lpm_ts_runtime_root(options: &ExecOptions) -> Result<PathBuf, LpmError> {
 }
 
 fn ensure_lpm_ts_runtime_loader(runtime_root: &Path) -> Result<PathBuf, LpmError> {
-    let loader_path = runtime_root.join("lpm-ts-runtime-loader.cjs");
     fs::create_dir_all(runtime_root).map_err(|e| {
         LpmError::Script(format!(
             "failed to create LPM TS runtime cache at {}: {e}",
@@ -448,46 +448,70 @@ fn ensure_lpm_ts_runtime_loader(runtime_root: &Path) -> Result<PathBuf, LpmError
         ))
     })?;
 
-    let desired_hash = sha256_hex(LPM_TS_RUNTIME_LOADER_SOURCE.as_bytes());
-    let needs_write = match fs::read(&loader_path) {
+    let loader_path = ensure_lpm_ts_runtime_asset(
+        runtime_root,
+        "lpm-ts-runtime-loader.cjs",
+        LPM_TS_RUNTIME_LOADER_SOURCE,
+        "loader",
+    )?;
+    ensure_lpm_ts_runtime_asset(
+        runtime_root,
+        "lpm-ts-runtime-worker.cjs",
+        LPM_TS_RUNTIME_WORKER_SOURCE,
+        "worker",
+    )?;
+
+    Ok(loader_path)
+}
+
+fn ensure_lpm_ts_runtime_asset(
+    runtime_root: &Path,
+    file_name: &str,
+    source: &str,
+    label: &str,
+) -> Result<PathBuf, LpmError> {
+    let asset_path = runtime_root.join(file_name);
+    let desired_hash = sha256_hex(source.as_bytes());
+    let needs_write = match fs::read(&asset_path) {
         Ok(existing) => sha256_hex(&existing) != desired_hash,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => {
             return Err(LpmError::Script(format!(
-                "failed to read LPM TS runtime loader at {}: {e}",
-                loader_path.display()
+                "failed to read LPM TS runtime {label} at {}: {e}",
+                asset_path.display()
             )));
         }
     };
 
     if needs_write {
-        let tmp_path =
-            runtime_root.join(format!(".lpm-ts-runtime-loader.{}.tmp", std::process::id()));
+        let tmp_path = runtime_root.join(format!(
+            ".lpm-ts-runtime-{label}.{}.tmp",
+            std::process::id()
+        ));
         {
             let mut file = fs::File::create(&tmp_path).map_err(|e| {
                 LpmError::Script(format!(
-                    "failed to stage LPM TS runtime loader at {}: {e}",
+                    "failed to stage LPM TS runtime {label} at {}: {e}",
                     tmp_path.display()
                 ))
             })?;
-            file.write_all(LPM_TS_RUNTIME_LOADER_SOURCE.as_bytes())
-                .map_err(|e| {
-                    LpmError::Script(format!(
-                        "failed to write LPM TS runtime loader at {}: {e}",
-                        tmp_path.display()
-                    ))
-                })?;
+            file.write_all(source.as_bytes()).map_err(|e| {
+                LpmError::Script(format!(
+                    "failed to write LPM TS runtime {label} at {}: {e}",
+                    tmp_path.display()
+                ))
+            })?;
         }
-        fs::rename(&tmp_path, &loader_path).map_err(|e| {
+        fs::rename(&tmp_path, &asset_path).map_err(|e| {
             let _ = fs::remove_file(&tmp_path);
             LpmError::Script(format!(
-                "failed to install LPM TS runtime loader at {}: {e}",
-                loader_path.display()
+                "failed to install LPM TS runtime {label} at {}: {e}",
+                asset_path.display()
             ))
         })?;
     }
 
-    Ok(loader_path)
+    Ok(asset_path)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

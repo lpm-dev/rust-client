@@ -185,8 +185,13 @@ async fn async_main() -> Result<()> {
         std::process::exit(2);
     };
 
-    if matches!(&command, Commands::InternalTsTransform) {
-        if let Err(error) = lpm_runner::ts_transform::run_stdio() {
+    if let Commands::InternalTsTransform { persistent } = &command {
+        let result = if *persistent {
+            lpm_runner::ts_transform::run_persistent_stdio()
+        } else {
+            lpm_runner::ts_transform::run_stdio()
+        };
+        if let Err(error) = result {
             eprintln!("{error}");
             std::process::exit(1);
         }
@@ -2715,7 +2720,7 @@ async fn async_main() -> Result<()> {
             update_check::refresh_cache_now().await;
             std::process::exit(0);
         }
-        Commands::InternalTsTransform => unreachable!("handled before async command dispatch"),
+        Commands::InternalTsTransform { .. } => unreachable!("handled before async command dispatch"),
         Commands::External(args) => {
             // Try as package.json script shortcut: `lpm dev` → `lpm run dev`
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
