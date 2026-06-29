@@ -228,9 +228,10 @@ pub async fn exec(
     extra_args: &[String],
     env_mode: Option<&str>,
     no_env_check: bool,
+    plain_node: bool,
 ) -> Result<(), LpmError> {
     let bin_hint = ensure_runtime(project_dir).await;
-    let options = exec_options(env_mode, no_env_check, bin_hint);
+    let options = exec_options(env_mode, no_env_check, plain_node, bin_hint);
     exec_once(project_dir, file_path, extra_args, &options)
 }
 
@@ -260,9 +261,10 @@ pub async fn exec_watch(
     extra_args: &[String],
     env_mode: Option<&str>,
     no_env_check: bool,
+    plain_node: bool,
 ) -> Result<(), LpmError> {
     let bin_hint = ensure_runtime(project_dir).await;
-    let options = exec_options(env_mode, no_env_check, bin_hint);
+    let options = exec_options(env_mode, no_env_check, plain_node, bin_hint);
     let plan = lpm_runner::exec::build_exec_plan(project_dir, file_path, extra_args, &options)?;
     let (watch_dir, input_globs) = exec_watch_scope(project_dir, &plan);
 
@@ -317,12 +319,15 @@ pub async fn exec_watch(
 fn exec_options(
     env_mode: Option<&str>,
     no_env_check: bool,
+    plain_node: bool,
     managed_runtime_hint: lpm_runner::bin_path::ManagedRuntimeHint,
 ) -> lpm_runner::exec::ExecOptions {
     lpm_runner::exec::ExecOptions {
         env_mode: env_mode.map(str::to_string),
         no_env_check,
         managed_runtime_hint,
+        plain_node,
+        runtime_cache_root: None,
     }
 }
 

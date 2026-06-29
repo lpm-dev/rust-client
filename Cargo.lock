@@ -3479,6 +3479,7 @@ dependencies = [
 name = "lpm-runner"
 version = "0.64.0"
 dependencies = [
+ "hex",
  "libc",
  "lpm-cert",
  "lpm-common",
@@ -3491,6 +3492,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "tempfile",
  "toml",
