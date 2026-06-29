@@ -35,3 +35,4 @@ pub mod script;
 pub mod service_graph;
 pub mod shell;
 pub mod task_graph;
+pub mod ts_transform;

@@ -2800,6 +2800,10 @@ pub(crate) enum Commands {
         hosts: Vec<String>,
     },
 
+    /// Hidden OXC transform helper for the LPM TypeScript runtime.
+    #[command(name = "internal-ts-transform", hide = true)]
+    InternalTsTransform,
+
     /// Generate a shell completion script.
     ///
     /// Pipe the output into your shell's completion-load path:

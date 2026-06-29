@@ -18,7 +18,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 
 const SUPPORTED_FILE_TYPES: &str = ".js, .mjs, .cjs, .ts, .tsx, .mts, .cts";
-const LPM_TS_RUNTIME_LOADER_VERSION: &str = "1";
+const LPM_TS_RUNTIME_LOADER_VERSION: &str = "2";
 const LPM_TS_RUNTIME_LOADER_SOURCE: &str = include_str!("lpm_ts_runtime_loader.cjs");
 const LPM_TS_RUNTIME_NODE_OPTIONS_PREFIX: &str = "--disable-warning=ExperimentalWarning";
 
@@ -63,6 +63,7 @@ pub enum ExecRuntime {
     LpmTsRuntime {
         node_version: Option<String>,
         loader: PathBuf,
+        transformer: PathBuf,
     },
     LocalTsx {
         binary: PathBuf,
@@ -89,8 +90,14 @@ impl ExecRuntime {
 pub enum ExecStrategy {
     Node,
     NodeStripTypes,
-    LpmTsRuntime { loader: PathBuf, cache_dir: PathBuf },
-    LocalTsx { binary: PathBuf },
+    LpmTsRuntime {
+        loader: PathBuf,
+        cache_dir: PathBuf,
+        transformer: PathBuf,
+    },
+    LocalTsx {
+        binary: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -390,8 +397,17 @@ fn lpm_typescript_strategy(
     let runtime_root = lpm_ts_runtime_root(options)?;
     let loader = ensure_lpm_ts_runtime_loader(&runtime_root)?;
     let cache_dir = runtime_root.join("transform-cache");
+    let transformer = std::env::current_exe().map_err(|e| {
+        LpmError::Script(format!(
+            "failed to resolve LPM TS runtime transformer executable: {e}"
+        ))
+    })?;
 
-    Ok(Some(ExecStrategy::LpmTsRuntime { loader, cache_dir }))
+    Ok(Some(ExecStrategy::LpmTsRuntime {
+        loader,
+        cache_dir,
+        transformer,
+    }))
 }
 
 fn supports_lpm_ts_runtime(node_version: Option<&str>) -> bool {
@@ -506,9 +522,14 @@ fn runtime_for_strategy(strategy: &ExecStrategy, node_version: Option<String>) -
         ExecStrategy::Node | ExecStrategy::NodeStripTypes => ExecRuntime::Node {
             version: node_version,
         },
-        ExecStrategy::LpmTsRuntime { loader, .. } => ExecRuntime::LpmTsRuntime {
+        ExecStrategy::LpmTsRuntime {
+            loader,
+            transformer,
+            ..
+        } => ExecRuntime::LpmTsRuntime {
             node_version,
             loader: loader.clone(),
+            transformer: transformer.clone(),
         },
         ExecStrategy::LocalTsx { binary } => ExecRuntime::LocalTsx {
             binary: binary.clone(),
@@ -546,7 +567,11 @@ fn build_command_plan(
             );
             (node.to_command_plan(), Some(node))
         }
-        ExecStrategy::LpmTsRuntime { loader, cache_dir } => {
+        ExecStrategy::LpmTsRuntime {
+            loader,
+            cache_dir,
+            transformer,
+        } => {
             let node_options = lpm_ts_runtime_node_options(loader);
             let node = build_node_launch_config(
                 file_path,
@@ -561,6 +586,14 @@ fn build_command_plan(
                     (
                         "LPM_TS_RUNTIME_CACHE_DIR".to_string(),
                         cache_dir.to_string_lossy().to_string(),
+                    ),
+                    (
+                        "LPM_TS_RUNTIME_TRANSFORMER".to_string(),
+                        transformer.to_string_lossy().to_string(),
+                    ),
+                    (
+                        "LPM_TS_RUNTIME_PROTOCOL_VERSION".to_string(),
+                        crate::ts_transform::TRANSFORM_PROTOCOL_VERSION.to_string(),
                     ),
                     ("NODE_OPTIONS".to_string(), node_options),
                 ],

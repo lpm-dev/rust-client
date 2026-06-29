@@ -55,6 +55,64 @@ fn write_fake_tsx(project: &TempProject) {
     make_executable(&tsx_path);
 }
 
+fn write_fake_react_runtime(project: &TempProject) {
+    project.write_file(
+        "node_modules/react/package.json",
+        concat!(
+            "{",
+            r#""name":"react","#,
+            r#""version":"0.0.0","#,
+            r#""type":"commonjs","#,
+            r#""exports":{"." : {"import":"./index.mjs","require":"./index.js"},"./jsx-runtime":{"import":"./jsx-runtime.mjs","require":"./jsx-runtime.js"}}"#,
+            "}",
+        ),
+    );
+    project.write_file(
+        "node_modules/react/jsx-runtime.js",
+        concat!(
+            "const Fragment = 'Fragment';\n",
+            "function jsx(type, props, key) { return { type, props: props || {}, key: key ?? null }; }\n",
+            "exports.Fragment = Fragment;\n",
+            "exports.jsx = jsx;\n",
+            "exports.jsxs = jsx;\n",
+        ),
+    );
+    project.write_file(
+        "node_modules/react/jsx-runtime.mjs",
+        concat!(
+            "export const Fragment = 'Fragment';\n",
+            "export function jsx(type, props, key) { return { type, props: props || {}, key: key ?? null }; }\n",
+            "export const jsxs = jsx;\n",
+        ),
+    );
+    project.write_file(
+        "node_modules/react/index.js",
+        concat!(
+            "function createElement(type, props, ...children) {\n",
+            "  const next = Object.assign({}, props || {});\n",
+            "  if (children.length === 1) next.children = children[0];\n",
+            "  else if (children.length > 1) next.children = children;\n",
+            "  return { type, props: next, key: next.key ?? null };\n",
+            "}\n",
+            "module.exports = { createElement, Fragment: 'Fragment' };\n",
+            "module.exports.default = module.exports;\n",
+        ),
+    );
+    project.write_file(
+        "node_modules/react/index.mjs",
+        concat!(
+            "export const Fragment = 'Fragment';\n",
+            "export function createElement(type, props, ...children) {\n",
+            "  const next = Object.assign({}, props || {});\n",
+            "  if (children.length === 1) next.children = children[0];\n",
+            "  else if (children.length > 1) next.children = children;\n",
+            "  return { type, props: next, key: next.key ?? null };\n",
+            "}\n",
+            "export default { createElement, Fragment };\n",
+        ),
+    );
+}
+
 #[test]
 fn exec_js_file_loads_dotenv_and_forwards_args() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
@@ -391,6 +449,50 @@ fn exec_typescript_file_uses_lpm_runtime_without_project_local_tsx() {
 }
 
 #[test]
+fn exec_typescript_transform_cache_contains_inline_source_map() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/seed.ts",
+        "const message: string = 'source-map-ts';\nconsole.log(message);\n",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec on TypeScript");
+
+    assert!(
+        output.status.success(),
+        "managed TypeScript exec must succeed before checking source maps:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let cache_dir = project
+        .home()
+        .join(".lpm/cache/exec-ts-runtime/v2/transform-cache");
+    let mut found_source_map = false;
+    for entry in std::fs::read_dir(&cache_dir).expect("transform cache dir must exist") {
+        let entry = entry.expect("cache entry must be readable");
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("cache entry must be utf8 JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&text).expect("cache entry must be JSON");
+        found_source_map |= json["code"]
+            .as_str()
+            .is_some_and(|code| code.contains("sourceMappingURL=data:application/json"));
+    }
+
+    assert!(
+        found_source_map,
+        "transform cache must store code with an inline source map"
+    );
+}
+
+#[test]
 fn exec_typescript_file_forwards_args_through_lpm_runtime() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file(
@@ -643,8 +745,66 @@ fn exec_typescript_file_treats_compact_named_export_as_module() {
 }
 
 #[test]
+fn exec_mts_file_runs_as_esm_through_lpm_runtime() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/module.mts",
+        "export const value: string = 'managed-mts';\nconsole.log(value);\n",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/module.mts"])
+        .output()
+        .expect("failed to run lpm exec on MTS");
+
+    assert!(
+        output.status.success(),
+        "managed MTS exec must run as ESM:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("managed-mts"),
+        "MTS execution must preserve ESM semantics, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_cts_file_runs_as_commonjs_through_lpm_runtime() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/common.cts",
+        concat!(
+            "const fs = require('node:fs');\n",
+            "const value: string = fs.existsSync('package.json') ? 'managed-cts' : 'missing';\n",
+            "module.exports = { value };\n",
+            "console.log(module.exports.value);\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/common.cts"])
+        .output()
+        .expect("failed to run lpm exec on CTS");
+
+    assert!(
+        output.status.success(),
+        "managed CTS exec must run as CommonJS:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("managed-cts"),
+        "CTS execution must preserve CommonJS semantics, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_tsx_file_uses_lpm_runtime_without_project_local_tsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         "const view = <main id=\"root\">hello</main>;\nconsole.log(JSON.stringify(view));\n",
@@ -669,8 +829,73 @@ fn exec_tsx_file_uses_lpm_runtime_without_project_local_tsx() {
 }
 
 #[test]
+fn exec_tsx_file_transforms_jsx_fragments_with_project_react_runtime() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "const view = <><span id=\"x\" />fragment-text</>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on TSX fragment");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must transform JSX fragments:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""type":"Fragment""#)
+            && stdout.contains(r#""type":"span""#)
+            && stdout.contains("fragment-text"),
+        "exec must transform JSX fragments through the project React runtime, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_tsx_file_honors_classic_react_import_when_configured() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
+    project.write_file("tsconfig.json", r#"{"compilerOptions":{"jsx":"react"}}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "import React from 'react';\n",
+            "const view = <main id=\"classic\">classic-react</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on classic React TSX");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must honor classic React imports when tsconfig requests them:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(r#""id":"classic""#) && stdout.contains("classic-react"),
+        "exec must use local React import semantics for classic TSX, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_tsx_file_preserves_typescript_generics_while_transforming_jsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -701,6 +926,7 @@ fn exec_tsx_file_preserves_typescript_generics_while_transforming_jsx() {
 #[test]
 fn exec_tsx_file_preserves_constrained_generic_arrows_while_transforming_jsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -731,6 +957,7 @@ fn exec_tsx_file_preserves_constrained_generic_arrows_while_transforming_jsx() {
 #[test]
 fn exec_tsx_file_preserves_generic_arrows_with_literal_delimiters_while_transforming_jsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -764,6 +991,7 @@ fn exec_tsx_file_preserves_generic_arrows_with_literal_delimiters_while_transfor
 #[test]
 fn exec_tsx_file_preserves_generic_arrows_with_regex_defaults_while_transforming_jsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -796,6 +1024,7 @@ fn exec_tsx_file_preserves_generic_arrows_with_regex_defaults_while_transforming
 #[test]
 fn exec_tsx_file_preserves_regex_literals_inside_jsx_braces() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -828,8 +1057,9 @@ fn exec_tsx_file_preserves_regex_literals_inside_jsx_braces() {
 }
 
 #[test]
-fn exec_tsx_file_preserves_hashbang_before_injected_jsx_helper() {
+fn exec_tsx_file_preserves_hashbang_while_transforming_jsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -858,8 +1088,9 @@ fn exec_tsx_file_preserves_hashbang_before_injected_jsx_helper() {
 }
 
 #[test]
-fn exec_tsx_file_preserves_strict_directive_before_injected_jsx_helper() {
+fn exec_tsx_file_preserves_strict_directive_while_transforming_jsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -889,8 +1120,9 @@ fn exec_tsx_file_preserves_strict_directive_before_injected_jsx_helper() {
 }
 
 #[test]
-fn exec_tsx_file_preserves_strict_directive_with_line_comment_before_injected_jsx_helper() {
+fn exec_tsx_file_preserves_strict_directive_with_line_comment_while_transforming_jsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -920,8 +1152,9 @@ fn exec_tsx_file_preserves_strict_directive_with_line_comment_before_injected_js
 }
 
 #[test]
-fn exec_tsx_file_preserves_strict_directive_with_block_comment_before_injected_jsx_helper() {
+fn exec_tsx_file_preserves_strict_directive_with_block_comment_while_transforming_jsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -953,6 +1186,7 @@ fn exec_tsx_file_preserves_strict_directive_with_block_comment_before_injected_j
 #[test]
 fn exec_tsx_file_allows_user_jsx_helper_named_binding() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -983,6 +1217,7 @@ fn exec_tsx_file_allows_user_jsx_helper_named_binding() {
 #[test]
 fn exec_tsx_file_allows_user_symbol_named_binding() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -1013,6 +1248,7 @@ fn exec_tsx_file_allows_user_symbol_named_binding() {
 #[test]
 fn exec_tsx_file_allows_user_global_this_named_binding() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -1042,9 +1278,8 @@ fn exec_tsx_file_allows_user_global_this_named_binding() {
 
 #[test]
 fn exec_tsx_file_ignores_stale_transform_cache_after_runtime_output_changes() {
-    use sha2::{Digest, Sha256};
-
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     let source = concat!(
         "const globalThis = { local: true };\n",
         "const view = <main>{globalThis.local ? 'local-globalThis' : 'missing'}</main>;\n",
@@ -1052,60 +1287,41 @@ fn exec_tsx_file_ignores_stale_transform_cache_after_runtime_output_changes() {
     );
     project.write_file("scripts/view.tsx", source);
 
-    let node_identity = std::process::Command::new("node")
-        .args([
-            "-e",
-            "console.log(process.versions.node);console.log(process.platform);console.log(process.arch);",
-        ])
+    let first_output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
         .output()
-        .expect("failed to read node cache identity");
+        .expect("failed to populate LPM TS transform cache");
     assert!(
-        node_identity.status.success(),
-        "node cache identity probe failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&node_identity.stdout),
-        String::from_utf8_lossy(&node_identity.stderr),
+        first_output.status.success(),
+        "initial managed TSX exec must populate transform cache:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first_output.stdout),
+        String::from_utf8_lossy(&first_output.stderr),
     );
-    let identity = String::from_utf8(node_identity.stdout).expect("node identity must be utf8");
-    let mut identity_lines = identity.lines();
-    let node_version = identity_lines.next().expect("node version line");
-    let node_platform = identity_lines.next().expect("node platform line");
-    let node_arch = identity_lines.next().expect("node arch line");
-    let filename = std::fs::canonicalize(project.path().join("scripts/view.tsx"))
-        .expect("canonicalize TSX script path");
-    let filename = filename.to_string_lossy();
-    let tsconfig_fingerprint = format!("{:x}", Sha256::digest(b"{}"));
-
-    let mut cache_key = Sha256::new();
-    let cache_parts = [
-        "2",
-        node_version,
-        node_platform,
-        node_arch,
-        filename.as_ref(),
-        &tsconfig_fingerprint,
-        source,
-    ];
-    for (index, part) in cache_parts.iter().enumerate() {
-        cache_key.update(part.as_bytes());
-        if index + 1 != cache_parts.len() {
-            cache_key.update(b"\0");
-        }
-    }
-    let cache_key = format!("{:x}", cache_key.finalize());
     let cache_dir = project
         .home()
-        .join(".lpm/cache/exec-ts-runtime/v1/transform-cache");
-    std::fs::create_dir_all(&cache_dir).expect("create stale transform cache dir");
-    std::fs::write(
-        cache_dir.join(format!("{cache_key}.js")),
-        concat!(
-            "globalThis[globalThis.Symbol.for(\"lpm.exec.jsx\")] = globalThis[globalThis.Symbol.for(\"lpm.exec.jsx\")] || ((type, props, ...children) => ({ type, props: props || {}, children }));\n",
-            "const globalThis = { local: true };\n",
-            "const view = globalThis[globalThis.Symbol.for(\"lpm.exec.jsx\")](\"main\", null, globalThis.local ? 'local-globalThis' : 'missing');\n",
-            "console.log(JSON.stringify(view));\n",
-        ),
-    )
-    .expect("write stale transform cache entry");
+        .join(".lpm/cache/exec-ts-runtime/v2/transform-cache");
+    let mut corrupted_entries = 0;
+    for entry in std::fs::read_dir(&cache_dir).expect("transform cache dir must exist") {
+        let entry = entry.expect("cache entry must be readable");
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            let text = std::fs::read_to_string(&path).expect("cache entry must be utf8 JSON");
+            let mut json: serde_json::Value =
+                serde_json::from_str(&text).expect("cache entry must be JSON");
+            json["runtimeVersion"] = serde_json::json!("stale-runtime");
+            json["code"] = serde_json::json!("throw new Error('stale cache was trusted');\n");
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&json).expect("serialize stale cache"),
+            )
+            .expect("rewrite stale cache entry");
+            corrupted_entries += 1;
+        }
+    }
+    assert!(
+        corrupted_entries > 0,
+        "initial run must create at least one transform cache entry"
+    );
 
     let output = lpm(&project)
         .args(["exec", "scripts/view.tsx"])
@@ -1131,6 +1347,7 @@ fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {
     use std::os::unix::process::CommandExt;
 
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         "const view = <main><span></main>;\nconsole.log(view);\n",
@@ -1192,14 +1409,16 @@ fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Invalid TSX"),
-        "mismatched TSX closing tags must report a TSX syntax error, got:\n{stderr}"
+        stderr.contains("LPM OXC TypeScript parse failed")
+            && stderr.contains("Expected corresponding JSX closing tag"),
+        "mismatched TSX closing tags must report an OXC JSX syntax error, got:\n{stderr}"
     );
 }
 
 #[test]
 fn exec_tsx_file_transforms_jsx_inside_child_expressions() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -1230,6 +1449,7 @@ fn exec_tsx_file_transforms_jsx_inside_child_expressions() {
 #[test]
 fn exec_tsx_file_ignores_comment_only_child_expressions() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -1259,6 +1479,7 @@ fn exec_tsx_file_ignores_comment_only_child_expressions() {
 #[test]
 fn exec_tsx_file_transforms_nested_jsx_children_after_whitespace() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -1290,6 +1511,7 @@ fn exec_tsx_file_transforms_nested_jsx_children_after_whitespace() {
 #[test]
 fn exec_tsx_file_transforms_jsx_inside_spread_attributes() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -1319,6 +1541,7 @@ fn exec_tsx_file_transforms_jsx_inside_spread_attributes() {
 #[test]
 fn exec_tsx_file_preserves_spread_attribute_order() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    write_fake_react_runtime(&project);
     project.write_file(
         "scripts/view.tsx",
         concat!(
@@ -1543,6 +1766,33 @@ fn exec_strips_inherited_node_options_before_installing_lpm_runtime() {
     assert!(
         stdout.contains("scrubbed-node-options"),
         "managed TS runtime must still run after scrubbing NODE_OPTIONS, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_project_env_cannot_replace_lpm_transformer_helper() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(".env", "LPM_TS_RUNTIME_TRANSFORMER=/definitely/not/lpm\n");
+    project.write_file(
+        "scripts/seed.ts",
+        "const message: string = 'controlled-transformer';\nconsole.log(message);\n",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec with project env transformer override");
+
+    assert!(
+        output.status.success(),
+        "project env must not replace the controlled LPM transformer helper:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("controlled-transformer"),
+        "managed TS runtime must use LPM's transformer helper, got:\n{stdout}"
     );
 }
 

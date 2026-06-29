@@ -1,28 +1,40 @@
+const childProcess = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const moduleApi = require("node:module");
 const path = require("node:path");
 const { pathToFileURL, fileURLToPath } = require("node:url");
-const vm = require("node:vm");
 
-const RUNTIME_VERSION = "3";
+const RUNTIME_VERSION = "4";
+const TRANSFORM_PROTOCOL_VERSION = 1;
+const CACHE_ENTRY_SCHEMA_VERSION = 1;
 const TS_EXT_RE = /\.(?:ts|tsx|mts|cts)$/;
 const JS_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json"];
 const PROJECT_DIR = path.resolve(process.env.LPM_TS_RUNTIME_PROJECT_DIR || process.cwd());
 const CACHE_DIR =
   process.env.LPM_TS_RUNTIME_CACHE_DIR ||
   path.join(PROJECT_DIR, ".lpm", "exec-ts-runtime-cache");
+const TRANSFORMER = process.env.LPM_TS_RUNTIME_TRANSFORMER;
+const MAX_TRANSFORM_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 if (typeof moduleApi.registerHooks !== "function") {
   throw new Error("LPM TS runtime requires Node.js module.registerHooks support. Run `lpm use node@22.18+`.");
 }
 
-if (typeof moduleApi.stripTypeScriptTypes !== "function") {
-  throw new Error("LPM TS runtime requires Node.js module.stripTypeScriptTypes support. Run `lpm use node@22.18+`.");
+if (!TRANSFORMER) {
+  throw new Error("LPM TS runtime could not find its OXC transformer helper. Run this file through `lpm exec`.");
+}
+
+if (
+  process.env.LPM_TS_RUNTIME_PROTOCOL_VERSION &&
+  Number(process.env.LPM_TS_RUNTIME_PROTOCOL_VERSION) !== TRANSFORM_PROTOCOL_VERSION
+) {
+  throw new Error("LPM TS runtime helper protocol mismatch. Re-run `lpm exec` so LPM can refresh the runtime.");
 }
 
 const tsconfig = loadTsconfig(PROJECT_DIR);
-const tsconfigFingerprint = hashJson(tsconfig.compilerOptions || {});
+const compilerOptions = tsconfig.compilerOptions || {};
+const tsconfigFingerprint = hashJson(compilerOptions);
 
 moduleApi.registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -43,8 +55,8 @@ moduleApi.registerHooks({
     }
 
     const source = fs.readFileSync(filename, "utf8");
-    const transformedSource = loadTransformedSource(filename, source);
-    const format = moduleFormat(filename, transformedSource);
+    const format = moduleFormat(filename, source);
+    const transformedSource = loadTransformedSource(filename, source, format);
     return {
       format,
       source: transformedSource,
@@ -53,58 +65,148 @@ moduleApi.registerHooks({
   },
 });
 
-function loadTransformedSource(filename, source) {
-  const key = cacheKey(filename, source);
-  const cachePath = path.join(CACHE_DIR, `${key}.js`);
-
-  try {
-    return fs.readFileSync(cachePath, "utf8");
-  } catch (error) {
-    if (!error || error.code !== "ENOENT") {
-      throw error;
-    }
+function loadTransformedSource(filename, source, format) {
+  const options = transformOptionsFor(format);
+  const key = cacheKey(filename, source, format, options);
+  const cachePath = path.join(CACHE_DIR, `${key}.json`);
+  const cached = readCacheEntry(cachePath, key);
+  if (cached) {
+    return cached;
   }
 
-  const transformed = transformSource(filename, source);
+  const transformed = transformSource(filename, source, format, options);
   fs.mkdirSync(CACHE_DIR, { recursive: true });
   const tmp = `${cachePath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, transformed);
+  const envelope = {
+    schemaVersion: CACHE_ENTRY_SCHEMA_VERSION,
+    cacheKey: key,
+    runtimeVersion: RUNTIME_VERSION,
+    protocolVersion: TRANSFORM_PROTOCOL_VERSION,
+    filename,
+    code: transformed,
+  };
+  fs.writeFileSync(tmp, JSON.stringify(envelope));
   fs.renameSync(tmp, cachePath);
   return transformed;
 }
 
-function transformSource(filename, source) {
-  let transformed = source;
-  if (filename.endsWith(".tsx")) {
-    transformed = transformTsx(transformed);
+function readCacheEntry(cachePath, expectedKey) {
+  let raw;
+  try {
+    raw = fs.readFileSync(cachePath, "utf8");
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
   }
-  return moduleApi.stripTypeScriptTypes(transformed, {
-    mode: "transform",
+
+  let entry;
+  try {
+    entry = JSON.parse(raw);
+  } catch (_error) {
+    return null;
+  }
+
+  if (
+    entry &&
+    entry.schemaVersion === CACHE_ENTRY_SCHEMA_VERSION &&
+    entry.cacheKey === expectedKey &&
+    entry.runtimeVersion === RUNTIME_VERSION &&
+    entry.protocolVersion === TRANSFORM_PROTOCOL_VERSION &&
+    typeof entry.code === "string"
+  ) {
+    return entry.code;
+  }
+  return null;
+}
+
+function transformSource(filename, source, format, options) {
+  const request = {
+    schemaVersion: TRANSFORM_PROTOCOL_VERSION,
+    filename,
+    source,
+    format,
     sourceMap: true,
-    sourceUrl: filename,
+    options,
+  };
+  const result = childProcess.spawnSync(TRANSFORMER, ["internal-ts-transform"], {
+    input: JSON.stringify(request),
+    encoding: "utf8",
+    maxBuffer: MAX_TRANSFORM_OUTPUT_BYTES,
+    windowsHide: true,
+  });
+
+  if (result.error) {
+    throw new Error(`LPM OXC TypeScript transform failed to start: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const stderr = String(result.stderr || "").trim();
+    const stdout = String(result.stdout || "").trim();
+    const detail = stderr || stdout || `exit status ${result.status}`;
+    throw new Error(`LPM OXC TypeScript transform failed for ${filename}:\n${detail}`);
+  }
+
+  let response;
+  try {
+    response = JSON.parse(result.stdout);
+  } catch (error) {
+    throw new Error(`LPM OXC TypeScript transform returned invalid JSON for ${filename}: ${error.message}`);
+  }
+  if (
+    !response ||
+    response.schemaVersion !== TRANSFORM_PROTOCOL_VERSION ||
+    typeof response.code !== "string"
+  ) {
+    throw new Error(`LPM OXC TypeScript transform returned an invalid response for ${filename}`);
+  }
+  return response.code;
+}
+
+function transformOptionsFor(format) {
+  const jsx = {
+    runtime: "automatic",
+    development: compilerOptions.jsx === "react-jsxdev",
+  };
+  if (compilerOptions.jsx === "react" || compilerOptions.jsxFactory || compilerOptions.jsxFragmentFactory) {
+    jsx.runtime = "classic";
+  }
+  if (typeof compilerOptions.jsxImportSource === "string") {
+    jsx.importSource = compilerOptions.jsxImportSource;
+  }
+  if (typeof compilerOptions.jsxFactory === "string") {
+    jsx.pragma = compilerOptions.jsxFactory;
+  }
+  if (typeof compilerOptions.jsxFragmentFactory === "string") {
+    jsx.pragmaFrag = compilerOptions.jsxFragmentFactory;
+  }
+  return {
+    format,
+    jsx,
+  };
+}
+
+function cacheKey(filename, source, format, options) {
+  return hashJson({
+    runtimeVersion: RUNTIME_VERSION,
+    protocolVersion: TRANSFORM_PROTOCOL_VERSION,
+    nodeVersion: process.versions.node,
+    platform: process.platform,
+    arch: process.arch,
+    filename,
+    tsconfigFingerprint,
+    format,
+    options,
+    sourceHash: hashString(source),
   });
 }
 
-function cacheKey(filename, source) {
-  const hash = crypto.createHash("sha256");
-  hash.update(RUNTIME_VERSION);
-  hash.update("\0");
-  hash.update(process.versions.node);
-  hash.update("\0");
-  hash.update(process.platform);
-  hash.update("\0");
-  hash.update(process.arch);
-  hash.update("\0");
-  hash.update(filename);
-  hash.update("\0");
-  hash.update(tsconfigFingerprint);
-  hash.update("\0");
-  hash.update(source);
-  return hash.digest("hex");
+function hashString(value) {
+  return crypto.createHash("sha256").update(value).digest("hex");
 }
 
 function hashJson(value) {
-  return crypto.createHash("sha256").update(JSON.stringify(value || {})).digest("hex");
+  return hashString(JSON.stringify(value || {}));
 }
 
 function loadTsconfig(projectDir) {
@@ -123,7 +225,7 @@ function stripJsonComments(text) {
     .replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
-function moduleFormat(filename, transformedSource) {
+function moduleFormat(filename, source) {
   if (filename.endsWith(".mts")) {
     return "module";
   }
@@ -134,10 +236,7 @@ function moduleFormat(filename, transformedSource) {
   if (packageType === "module") {
     return "module";
   }
-  if (hasEsmSyntax(transformedSource)) {
-    return "module";
-  }
-  return "commonjs";
+  return hasEsmSyntax(source) ? "module" : "commonjs";
 }
 
 function nearestPackageType(filename) {
@@ -158,36 +257,169 @@ function nearestPackageType(filename) {
 }
 
 function hasEsmSyntax(source) {
-  if (scriptSyntaxRequiresModule(source)) {
-    return true;
-  }
-  for (const line of sourceSyntaxMask(source).split(/\r?\n/)) {
-    const trimmed = line.trimStart();
-    if (trimmed.startsWith("import") && importStatementHasRuntime(trimmed)) {
-      return true;
+  const masked = sourceSyntaxMask(source);
+  return (
+    hasImportMetaSyntax(masked) ||
+    hasTopLevelAwaitSyntax(masked) ||
+    hasRuntimeImportSyntax(masked) ||
+    hasRuntimeExportSyntax(masked)
+  );
+}
+
+function hasImportMetaSyntax(source) {
+  let index = 0;
+  while ((index = findWord(source, "import", index)) !== -1) {
+    let cursor = skipWhitespace(source, index + "import".length);
+    if (source[cursor] === ".") {
+      cursor = skipWhitespace(source, cursor + 1);
+      if (startsWordAt(source, cursor, "meta")) {
+        return true;
+      }
     }
-    if (trimmed.startsWith("export") && exportStatementHasRuntime(trimmed)) {
+    index += "import".length;
+  }
+  return false;
+}
+
+function hasTopLevelAwaitSyntax(source) {
+  let curlyDepth = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const ch = source[index];
+    if (ch === "{") {
+      curlyDepth += 1;
+      continue;
+    }
+    if (ch === "}") {
+      curlyDepth = Math.max(0, curlyDepth - 1);
+      continue;
+    }
+    if (curlyDepth === 0 && startsWordAt(source, index, "await")) {
       return true;
     }
   }
   return false;
 }
 
-function scriptSyntaxRequiresModule(source) {
-  try {
-    new vm.Script(source, { filename: "lpm-exec-runtime-format-check.js" });
-    return false;
-  } catch (error) {
-    if (!error || error.name !== "SyntaxError") {
-      return false;
+function hasRuntimeImportSyntax(source) {
+  let index = 0;
+  while ((index = findWord(source, "import", index)) !== -1) {
+    let cursor = skipWhitespace(source, index + "import".length);
+    const ch = source[cursor];
+    if (ch === "(" || ch === ".") {
+      index += "import".length;
+      continue;
     }
-    const message = String(error.message || "");
-    return (
-      message.includes("Cannot use import statement outside a module") ||
-      message.includes("Cannot use 'import.meta' outside a module") ||
-      message.includes("top level bodies of modules")
-    );
+    if (startsWordAt(source, cursor, "type")) {
+      index += "import".length;
+      continue;
+    }
+    const importEquals = readIdentifier(source, cursor);
+    if (importEquals) {
+      const afterIdentifier = skipWhitespace(source, importEquals.end);
+      if (source[afterIdentifier] === "=") {
+        index += "import".length;
+        continue;
+      }
+    }
+    if (ch === "{") {
+      const end = matchingBraceEnd(source, cursor);
+      if (end !== -1 && allTypeSpecifiers(source.slice(cursor + 1, end))) {
+        index = end + 1;
+        continue;
+      }
+    }
+    return true;
   }
+  return false;
+}
+
+function hasRuntimeExportSyntax(source) {
+  let index = 0;
+  while ((index = findWord(source, "export", index)) !== -1) {
+    let cursor = skipWhitespace(source, index + "export".length);
+    if (
+      startsWordAt(source, cursor, "type") ||
+      startsWordAt(source, cursor, "interface") ||
+      startsWordAt(source, cursor, "declare")
+    ) {
+      index += "export".length;
+      continue;
+    }
+    if (source[cursor] === "=") {
+      index += "export".length;
+      continue;
+    }
+    if (source[cursor] === "{") {
+      const end = matchingBraceEnd(source, cursor);
+      if (end !== -1 && allTypeSpecifiers(source.slice(cursor + 1, end))) {
+        index = end + 1;
+        continue;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+function findWord(source, word, start) {
+  let index = start;
+  while ((index = source.indexOf(word, index)) !== -1) {
+    if (startsWordAt(source, index, word)) {
+      return index;
+    }
+    index += word.length;
+  }
+  return -1;
+}
+
+function startsWordAt(source, index, word) {
+  return (
+    source.startsWith(word, index) &&
+    !isIdentifierChar(source[index - 1] || "") &&
+    !isIdentifierChar(source[index + word.length] || "")
+  );
+}
+
+function readIdentifier(source, index) {
+  if (!/[A-Za-z_$]/.test(source[index] || "")) {
+    return null;
+  }
+  let end = index + 1;
+  while (/[A-Za-z0-9_$]/.test(source[end] || "")) {
+    end += 1;
+  }
+  return { value: source.slice(index, end), end };
+}
+
+function skipWhitespace(source, index) {
+  let cursor = index;
+  while (cursor < source.length && /\s/.test(source[cursor])) {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function matchingBraceEnd(source, start) {
+  let depth = 0;
+  for (let index = start; index < source.length; index += 1) {
+    if (source[index] === "{") {
+      depth += 1;
+    } else if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+  return -1;
+}
+
+function allTypeSpecifiers(specifiers) {
+  const parts = specifiers
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return parts.length > 0 && parts.every((part) => part === "type" || part.startsWith("type "));
 }
 
 function sourceSyntaxMask(source) {
@@ -335,40 +567,8 @@ function maskSourceSegment(source, start, end) {
   return out;
 }
 
-function importStatementHasRuntime(statement) {
-  if (/^import\s+type\b/.test(statement)) {
-    return false;
-  }
-  if (/^import\s+\w+\s*=/.test(statement)) {
-    return false;
-  }
-  const named = statement.match(/^import\s*\{([^}]*)\}\s*from\b/);
-  if (named) {
-    return !allTypeSpecifiers(named[1]);
-  }
-  return /^import(?:\s|["'])/.test(statement);
-}
-
-function exportStatementHasRuntime(statement) {
-  if (/^export\s+(?:type|interface|declare)\b/.test(statement)) {
-    return false;
-  }
-  if (/^export\s*=/.test(statement)) {
-    return false;
-  }
-  const named = statement.match(/^export\s*\{([^}]*)\}/);
-  if (named) {
-    return !allTypeSpecifiers(named[1]);
-  }
-  return /^export(?:\s|\*)/.test(statement);
-}
-
-function allTypeSpecifiers(specifiers) {
-  const parts = specifiers
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean);
-  return parts.length > 0 && parts.every((part) => part === "type" || part.startsWith("type "));
+function isIdentifierChar(ch) {
+  return /[A-Za-z0-9_$]/.test(ch);
 }
 
 function resolveSpecifier(specifier, parentURL) {
@@ -389,7 +589,7 @@ function resolveSpecifier(specifier, parentURL) {
     return pathMatch;
   }
 
-  const baseUrl = tsconfig.compilerOptions && tsconfig.compilerOptions.baseUrl;
+  const baseUrl = compilerOptions.baseUrl;
   if (typeof baseUrl === "string" && baseUrl.length > 0) {
     const baseMatch = resolveCandidate(path.resolve(PROJECT_DIR, baseUrl, specifier));
     if (baseMatch) {
@@ -401,9 +601,8 @@ function resolveSpecifier(specifier, parentURL) {
 }
 
 function resolveTsconfigPath(specifier) {
-  const options = tsconfig.compilerOptions || {};
-  const paths = options.paths || {};
-  const baseUrl = typeof options.baseUrl === "string" ? options.baseUrl : ".";
+  const paths = compilerOptions.paths || {};
+  const baseUrl = typeof compilerOptions.baseUrl === "string" ? compilerOptions.baseUrl : ".";
   const baseDir = path.resolve(PROJECT_DIR, baseUrl);
 
   for (const [pattern, targets] of Object.entries(paths)) {
@@ -475,575 +674,4 @@ function isDirectory(candidate) {
   } catch (_error) {
     return false;
   }
-}
-
-function transformTsx(source) {
-  const parser = new TsxParser(source);
-  const body = parser.transform();
-  if (!parser.sawJsx) {
-    return body;
-  }
-  return injectJsxHelper(body);
-}
-
-function jsxHelper() {
-  const factory = jsxFactoryExpression();
-  return `;${factory} = ${factory} || ((type, props, ...children) => { const __lpmGlobal = ${globalObjectExpression()}; const react = __lpmGlobal.React && __lpmGlobal.React.createElement; return react ? react(type, props, ...children) : ({ type, props: props || {}, children }); });`;
-}
-
-function injectJsxHelper(source) {
-  const index = jsxHelperInsertionIndex(source);
-  const before = source.slice(0, index);
-  const after = source.slice(index);
-  const separator = before && !before.endsWith("\n") ? "\n" : "";
-  return `${before}${separator}${jsxHelper()}\n${after}`;
-}
-
-function jsxHelperInsertionIndex(source) {
-  let cursor = 0;
-  if (source.startsWith("#!")) {
-    const newline = source.indexOf("\n");
-    cursor = newline === -1 ? source.length : newline + 1;
-  }
-
-  let insertion = cursor;
-  while (cursor < source.length) {
-    const directiveStart = skipWhitespaceAndComments(source, cursor);
-    const directiveEnd = directiveStatementEnd(source, directiveStart);
-    if (directiveEnd === -1) {
-      return insertion;
-    }
-    cursor = directiveEnd;
-    insertion = cursor;
-  }
-  return insertion;
-}
-
-function skipWhitespaceAndComments(source, start) {
-  let cursor = start;
-  while (cursor < source.length) {
-    if (/\s/.test(source[cursor])) {
-      cursor += 1;
-      continue;
-    }
-    if (source.startsWith("//", cursor)) {
-      cursor += 2;
-      while (cursor < source.length && source[cursor] !== "\n" && source[cursor] !== "\r") {
-        cursor += 1;
-      }
-      continue;
-    }
-    if (source.startsWith("/*", cursor)) {
-      const end = source.indexOf("*/", cursor + 2);
-      if (end === -1) {
-        return cursor;
-      }
-      cursor = end + 2;
-      continue;
-    }
-    return cursor;
-  }
-  return cursor;
-}
-
-function directiveStatementEnd(source, start) {
-  const quote = source[start];
-  if (quote !== "\"" && quote !== "'") {
-    return -1;
-  }
-  let cursor = start + 1;
-  while (cursor < source.length) {
-    const ch = source[cursor];
-    if (ch === "\n" || ch === "\r") {
-      return -1;
-    }
-    cursor += 1;
-    if (ch === "\\") {
-      cursor += 1;
-      continue;
-    }
-    if (ch === quote) {
-      break;
-    }
-  }
-  if (cursor > source.length || source[cursor - 1] !== quote) {
-    return -1;
-  }
-  while (cursor < source.length) {
-    if (source[cursor] === " " || source[cursor] === "\t") {
-      cursor += 1;
-      continue;
-    }
-    if (source.startsWith("//", cursor)) {
-      cursor += 2;
-      while (cursor < source.length && source[cursor] !== "\n" && source[cursor] !== "\r") {
-        cursor += 1;
-      }
-      if (source[cursor] === "\r") {
-        return source[cursor + 1] === "\n" ? cursor + 2 : cursor + 1;
-      }
-      if (source[cursor] === "\n") {
-        return cursor + 1;
-      }
-      return cursor;
-    }
-    if (source.startsWith("/*", cursor)) {
-      const end = source.indexOf("*/", cursor + 2);
-      if (end === -1) {
-        return -1;
-      }
-      const comment = source.slice(cursor + 2, end);
-      cursor = end + 2;
-      if (comment.includes("\n") || comment.includes("\r")) {
-        return cursor;
-      }
-      continue;
-    }
-    break;
-  }
-  if (source[cursor] === ";") {
-    return cursor + 1;
-  }
-  if (cursor >= source.length) {
-    return cursor;
-  }
-  if (source[cursor] === "\r") {
-    return source[cursor + 1] === "\n" ? cursor + 2 : cursor + 1;
-  }
-  if (source[cursor] === "\n") {
-    return cursor + 1;
-  }
-  return -1;
-}
-
-function jsxFactoryExpression() {
-  const global = globalObjectExpression();
-  return `${global}[${global}.Symbol.for("lpm.exec.jsx")]`;
-}
-
-function globalObjectExpression() {
-  return "(() => {}).constructor(\"return this\")()";
-}
-
-class TsxParser {
-  constructor(source) {
-    this.source = source;
-    this.syntax = sourceSyntaxMask(source);
-    this.index = 0;
-    this.sawJsx = false;
-  }
-
-  transform() {
-    let out = "";
-    while (this.index < this.source.length) {
-      if (this.startsJsx()) {
-        this.sawJsx = true;
-        out += this.parseElement();
-      } else {
-        out += this.source[this.index];
-        this.index += 1;
-      }
-    }
-    return out;
-  }
-
-  startsJsx(inChildren = false) {
-    const ch = this.source[this.index];
-    const next = this.source[this.index + 1];
-    if (ch !== "<") {
-      return false;
-    }
-    if (next === ">") {
-      return inChildren || this.canStartJsxExpression();
-    }
-    if (!/[A-Za-z]/.test(next || "")) {
-      return false;
-    }
-    if (!inChildren && this.looksLikeTypeParameterListBeforeArrow()) {
-      return false;
-    }
-    return inChildren || (this.canStartJsxExpression() && this.looksLikeJsxTag());
-  }
-
-  canStartJsxExpression() {
-    const prev = this.previousSignificantIndex();
-    if (prev === -1) {
-      return true;
-    }
-
-    const ch = this.source[prev];
-    if ("({[=,:;?!&|+-*%^~".includes(ch)) {
-      return true;
-    }
-    if (ch === ">" && this.source[prev - 1] === "=") {
-      return true;
-    }
-
-    return ["return", "throw", "yield", "await", "case"].includes(this.previousWordAt(prev));
-  }
-
-  previousSignificantIndex() {
-    let cursor = this.index - 1;
-    while (cursor >= 0 && /\s/.test(this.source[cursor])) {
-      cursor -= 1;
-    }
-    return cursor;
-  }
-
-  previousWordAt(index) {
-    if (!/[A-Za-z0-9_$]/.test(this.source[index] || "")) {
-      return "";
-    }
-    let start = index;
-    while (start > 0 && /[A-Za-z0-9_$]/.test(this.source[start - 1])) {
-      start -= 1;
-    }
-    return this.source.slice(start, index + 1);
-  }
-
-  looksLikeJsxTag() {
-    if (this.peekAhead("<>")) {
-      return true;
-    }
-    let cursor = this.index + 1;
-    while (cursor < this.source.length && /[A-Za-z0-9_$:.-]/.test(this.source[cursor])) {
-      cursor += 1;
-    }
-    const delimiter = this.source[cursor] || "";
-    return delimiter === ">" || delimiter === "/" || /\s/.test(delimiter);
-  }
-
-  looksLikeTypeParameterListBeforeArrow() {
-    const typeParamsEnd = this.findMatchingAngle(this.index);
-    if (typeParamsEnd === -1) {
-      return false;
-    }
-
-    let cursor = this.skipWhitespaceFrom(typeParamsEnd + 1);
-    if (this.syntax[cursor] !== "(") {
-      return false;
-    }
-
-    const paramsEnd = this.findMatchingPair(cursor, "(", ")");
-    if (paramsEnd === -1) {
-      return false;
-    }
-
-    cursor = this.skipWhitespaceFrom(paramsEnd + 1);
-    if (this.syntax.startsWith("=>", cursor)) {
-      return true;
-    }
-    if (this.syntax[cursor] !== ":") {
-      return false;
-    }
-
-    cursor += 1;
-    let parenDepth = 0;
-    let bracketDepth = 0;
-    let braceDepth = 0;
-    let angleDepth = 0;
-    while (cursor < this.source.length) {
-      if (
-        parenDepth === 0 &&
-        bracketDepth === 0 &&
-        braceDepth === 0 &&
-        angleDepth === 0 &&
-        this.syntax.startsWith("=>", cursor)
-      ) {
-        return true;
-      }
-
-      const ch = this.syntax[cursor];
-      if (ch === "(") parenDepth += 1;
-      else if (ch === ")" && parenDepth > 0) parenDepth -= 1;
-      else if (ch === "[") bracketDepth += 1;
-      else if (ch === "]" && bracketDepth > 0) bracketDepth -= 1;
-      else if (ch === "{") braceDepth += 1;
-      else if (ch === "}" && braceDepth > 0) braceDepth -= 1;
-      else if (ch === "<") angleDepth += 1;
-      else if (ch === ">" && angleDepth > 0) angleDepth -= 1;
-      else if (
-        (ch === ";" || ch === "\n" || ch === "\r") &&
-        parenDepth === 0 &&
-        bracketDepth === 0 &&
-        braceDepth === 0 &&
-        angleDepth === 0
-      ) {
-        return false;
-      }
-      cursor += 1;
-    }
-    return false;
-  }
-
-  findMatchingAngle(start) {
-    let depth = 0;
-    for (let cursor = start; cursor < this.source.length; cursor += 1) {
-      const ch = this.syntax[cursor];
-      if (ch === "<") {
-        depth += 1;
-      } else if (ch === ">") {
-        depth -= 1;
-        if (depth === 0) {
-          return cursor;
-        }
-      }
-    }
-    return -1;
-  }
-
-  findMatchingPair(start, open, close) {
-    let depth = 0;
-    for (let cursor = start; cursor < this.source.length; cursor += 1) {
-      const ch = this.syntax[cursor];
-      if (ch === open) {
-        depth += 1;
-      } else if (ch === close) {
-        depth -= 1;
-        if (depth === 0) {
-          return cursor;
-        }
-      }
-    }
-    return -1;
-  }
-
-  skipWhitespaceFrom(cursor) {
-    while (cursor < this.source.length && /\s/.test(this.syntax[cursor])) {
-      cursor += 1;
-    }
-    return cursor;
-  }
-
-  parseElement() {
-    this.expect("<");
-    if (this.peek() === ">") {
-      this.index += 1;
-      const children = this.parseChildren("");
-      return `${jsxFactoryExpression()}(${JSON.stringify("Fragment")}, null${children})`;
-    }
-
-    const tag = this.readTagName();
-    const attrs = this.readAttributes();
-    if (this.peekAhead("/>")) {
-      this.index += 2;
-      return `${jsxFactoryExpression()}(${tagExpression(tag)}, ${attrs})`;
-    }
-    this.expect(">");
-    const children = this.parseChildren(tag);
-    return `${jsxFactoryExpression()}(${tagExpression(tag)}, ${attrs}${children})`;
-  }
-
-  parseChildren(tag) {
-    const children = [];
-    let closed = false;
-    while (this.index < this.source.length) {
-      if (tag && this.peekAhead(`</${tag}>`)) {
-        this.index += tag.length + 3;
-        closed = true;
-        break;
-      }
-      if (!tag && this.peekAhead("</>")) {
-        this.index += 3;
-        closed = true;
-        break;
-      }
-      if (this.peekAhead("</")) {
-        throw new Error(`Invalid TSX near offset ${this.index}: unexpected closing tag`);
-      }
-      if (this.startsJsx(true)) {
-        children.push(this.parseElement());
-        continue;
-      }
-      if (this.peek() === "{") {
-        const expr = this.readBalanced("{", "}");
-        const inner = expr.slice(1, -1).trim();
-        if (this.hasExpressionValue(inner)) {
-          children.push(this.transformExpression(inner));
-        }
-        continue;
-      }
-      const text = this.readTextChild();
-      const normalized = text.replace(/\s+/g, " ").trim();
-      if (normalized) {
-        children.push(JSON.stringify(normalized));
-      }
-    }
-    if (!closed) {
-      const closing = tag ? `</${tag}>` : "</>";
-      throw new Error(`Invalid TSX near offset ${this.index}: expected ${closing}`);
-    }
-    return children.length ? `, ${children.join(", ")}` : "";
-  }
-
-  readAttributes() {
-    const pieces = [];
-    while (this.index < this.source.length) {
-      this.skipWhitespace();
-      if (this.peekAhead("/>") || this.peek() === ">") {
-        break;
-      }
-      if (this.peekAhead("{...")) {
-        const spread = this.readBalanced("{", "}").slice(4, -1).trim();
-        if (spread) {
-          pieces.push(this.transformExpression(spread));
-        }
-        continue;
-      }
-
-      const name = this.readAttrName();
-      if (!name) {
-        break;
-      }
-      this.skipWhitespace();
-      let value = "true";
-      if (this.peek() === "=") {
-        this.index += 1;
-        this.skipWhitespace();
-        value = this.readAttrValue();
-      }
-      pieces.push(`{ ${JSON.stringify(name)}: ${value} }`);
-    }
-
-    if (!pieces.length) {
-      return "null";
-    }
-    return `Object.assign({}, ${pieces.join(", ")})`;
-  }
-
-  readAttrValue() {
-    const quote = this.peek();
-    if (quote === "\"" || quote === "'") {
-      this.index += 1;
-      let value = "";
-      while (this.index < this.source.length && this.peek() !== quote) {
-        value += this.source[this.index];
-        this.index += 1;
-      }
-      this.expect(quote);
-      return JSON.stringify(value);
-    }
-    if (quote === "{") {
-      const expression = this.readBalanced("{", "}").slice(1, -1).trim();
-      return expression ? this.transformExpression(expression) : "undefined";
-    }
-    if (this.startsJsx()) {
-      return this.parseElement();
-    }
-    return this.readAttrName() || "undefined";
-  }
-
-  readTextChild() {
-    let text = "";
-    while (this.index < this.source.length) {
-      if (this.startsJsx(true) || this.peek() === "{" || this.peekAhead("</")) {
-        break;
-      }
-      text += this.source[this.index];
-      this.index += 1;
-    }
-    return text;
-  }
-
-  transformExpression(expression) {
-    const parser = new TsxParser(expression);
-    const transformed = parser.transform();
-    this.sawJsx = this.sawJsx || parser.sawJsx;
-    return transformed;
-  }
-
-  hasExpressionValue(expression) {
-    let cursor = 0;
-    while (cursor < expression.length) {
-      if (/\s/.test(expression[cursor])) {
-        cursor += 1;
-        continue;
-      }
-      if (expression.startsWith("/*", cursor)) {
-        const end = expression.indexOf("*/", cursor + 2);
-        if (end === -1) {
-          return false;
-        }
-        cursor = end + 2;
-        continue;
-      }
-      if (expression.startsWith("//", cursor)) {
-        const lineFeed = expression.indexOf("\n", cursor + 2);
-        const carriageReturn = expression.indexOf("\r", cursor + 2);
-        const ends = [lineFeed, carriageReturn].filter((index) => index !== -1);
-        const end = ends.length ? Math.min(...ends) : -1;
-        if (end === -1) {
-          return false;
-        }
-        cursor = end + 1;
-        continue;
-      }
-      return true;
-    }
-    return false;
-  }
-
-  readBalanced(open, close) {
-    this.expect(open);
-    let depth = 1;
-    let out = open;
-    while (this.index < this.source.length && depth > 0) {
-      const ch = this.source[this.index];
-      const syntaxCh = this.syntax[this.index];
-      out += ch;
-      this.index += 1;
-      if (syntaxCh === open) {
-        depth += 1;
-      } else if (syntaxCh === close) {
-        depth -= 1;
-      }
-    }
-    return out;
-  }
-
-  readTagName() {
-    let name = "";
-    while (this.index < this.source.length && /[A-Za-z0-9_$:.-]/.test(this.peek())) {
-      name += this.peek();
-      this.index += 1;
-    }
-    return name;
-  }
-
-  readAttrName() {
-    let name = "";
-    while (this.index < this.source.length && /[A-Za-z0-9_$:.-]/.test(this.peek())) {
-      name += this.peek();
-      this.index += 1;
-    }
-    return name;
-  }
-
-  skipWhitespace() {
-    while (/\s/.test(this.peek() || "")) {
-      this.index += 1;
-    }
-  }
-
-  peek() {
-    return this.source[this.index];
-  }
-
-  peekAhead(text) {
-    return this.source.startsWith(text, this.index);
-  }
-
-  expect(text) {
-    if (!this.peekAhead(text)) {
-      throw new Error(`Invalid TSX near offset ${this.index}: expected ${text}`);
-    }
-    this.index += text.length;
-  }
-}
-
-function tagExpression(tag) {
-  if (!tag || /^[a-z]/.test(tag) || tag.includes("-") || tag.includes(":")) {
-    return JSON.stringify(tag);
-  }
-  return tag;
 }
