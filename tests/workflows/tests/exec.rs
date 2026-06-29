@@ -856,6 +856,68 @@ fn exec_tsx_file_preserves_strict_directive_before_injected_jsx_helper() {
 }
 
 #[test]
+fn exec_tsx_file_preserves_strict_directive_with_line_comment_before_injected_jsx_helper() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "\"use strict\" // strict prologue comment\n",
+            "function strictThis() { return this === undefined ? 'strict-line-comment' : 'sloppy-mode'; }\n",
+            "const view = <main>{strictThis()}</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on strict TSX with line comment");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must keep strict directive with line comment first:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("strict-line-comment") && !stdout.contains("sloppy-mode"),
+        "exec must preserve strict directive line-comment semantics, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_tsx_file_preserves_strict_directive_with_block_comment_before_injected_jsx_helper() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        concat!(
+            "\"use strict\" /* strict prologue comment */;\n",
+            "function strictThis() { return this === undefined ? 'strict-block-comment' : 'sloppy-mode'; }\n",
+            "const view = <main>{strictThis()}</main>;\n",
+            "console.log(JSON.stringify(view));\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/view.tsx"])
+        .output()
+        .expect("failed to run lpm exec on strict TSX with block comment");
+
+    assert!(
+        output.status.success(),
+        "managed TSX exec must keep strict directive with block comment first:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("strict-block-comment") && !stdout.contains("sloppy-mode"),
+        "exec must preserve strict directive block-comment semantics, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_tsx_file_allows_user_jsx_helper_named_binding() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file(

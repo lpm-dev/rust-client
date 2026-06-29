@@ -569,8 +569,37 @@ function directiveStatementEnd(source, start) {
   if (cursor > source.length || source[cursor - 1] !== quote) {
     return -1;
   }
-  while (cursor < source.length && (source[cursor] === " " || source[cursor] === "\t")) {
-    cursor += 1;
+  while (cursor < source.length) {
+    if (source[cursor] === " " || source[cursor] === "\t") {
+      cursor += 1;
+      continue;
+    }
+    if (source.startsWith("//", cursor)) {
+      cursor += 2;
+      while (cursor < source.length && source[cursor] !== "\n" && source[cursor] !== "\r") {
+        cursor += 1;
+      }
+      if (source[cursor] === "\r") {
+        return source[cursor + 1] === "\n" ? cursor + 2 : cursor + 1;
+      }
+      if (source[cursor] === "\n") {
+        return cursor + 1;
+      }
+      return cursor;
+    }
+    if (source.startsWith("/*", cursor)) {
+      const end = source.indexOf("*/", cursor + 2);
+      if (end === -1) {
+        return -1;
+      }
+      const comment = source.slice(cursor + 2, end);
+      cursor = end + 2;
+      if (comment.includes("\n") || comment.includes("\r")) {
+        return cursor;
+      }
+      continue;
+    }
+    break;
   }
   if (source[cursor] === ";") {
     return cursor + 1;
