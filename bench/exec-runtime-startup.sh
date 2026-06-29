@@ -18,10 +18,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$PROJECT/scripts" "$(dirname "$OUT")"
+mkdir -p "$PROJECT/scripts" "$PROJECT/node_modules/react" "$(dirname "$OUT")"
 cat > "$PROJECT/package.json" <<'JSON'
 {"name":"lpm-exec-bench","version":"0.0.0"}
 JSON
+cat > "$PROJECT/node_modules/react/package.json" <<'JSON'
+{"name":"react","version":"0.0.0","type":"commonjs","exports":{"./jsx-runtime":{"import":"./jsx-runtime.mjs","require":"./jsx-runtime.js"}}}
+JSON
+cat > "$PROJECT/node_modules/react/jsx-runtime.js" <<'JS'
+function jsx(type, props, key) {
+  return { type, props: props || {}, key: key ?? null };
+}
+exports.Fragment = "Fragment";
+exports.jsx = jsx;
+exports.jsxs = jsx;
+JS
+cat > "$PROJECT/node_modules/react/jsx-runtime.mjs" <<'JS'
+export const Fragment = "Fragment";
+export function jsx(type, props, key) {
+  return { type, props: props || {}, key: key ?? null };
+}
+export const jsxs = jsx;
+JS
 cat > "$PROJECT/scripts/noop.js" <<'JS'
 console.log("js");
 JS
