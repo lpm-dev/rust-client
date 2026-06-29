@@ -158,7 +158,7 @@ function nearestPackageType(filename) {
 }
 
 function hasEsmSyntax(source) {
-  for (const line of source.split(/\r?\n/)) {
+  for (const line of sourceWithoutCommentsAndStrings(source).split(/\r?\n/)) {
     const trimmed = line.trimStart();
     if (trimmed.startsWith("import") && importStatementHasRuntime(trimmed)) {
       return true;
@@ -168,6 +168,62 @@ function hasEsmSyntax(source) {
     }
   }
   return false;
+}
+
+function sourceWithoutCommentsAndStrings(source) {
+  let out = "";
+  let index = 0;
+  while (index < source.length) {
+    const ch = source[index];
+    const next = source[index + 1];
+    if (ch === "/" && next === "/") {
+      out += "  ";
+      index += 2;
+      while (index < source.length && source[index] !== "\n" && source[index] !== "\r") {
+        out += " ";
+        index += 1;
+      }
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      out += "  ";
+      index += 2;
+      while (index < source.length) {
+        if (source[index] === "*" && source[index + 1] === "/") {
+          out += "  ";
+          index += 2;
+          break;
+        }
+        out += source[index] === "\n" || source[index] === "\r" ? source[index] : " ";
+        index += 1;
+      }
+      continue;
+    }
+    if (ch === "\"" || ch === "'" || ch === "`") {
+      const quote = ch;
+      out += " ";
+      index += 1;
+      while (index < source.length) {
+        const current = source[index];
+        out += current === "\n" || current === "\r" ? current : " ";
+        index += 1;
+        if (current === "\\") {
+          if (index < source.length) {
+            out += source[index] === "\n" || source[index] === "\r" ? source[index] : " ";
+            index += 1;
+          }
+          continue;
+        }
+        if (current === quote) {
+          break;
+        }
+      }
+      continue;
+    }
+    out += ch;
+    index += 1;
+  }
+  return out;
 }
 
 function importStatementHasRuntime(statement) {
@@ -430,14 +486,20 @@ class TsxParser {
 
   parseChildren(tag) {
     const children = [];
+    let closed = false;
     while (this.index < this.source.length) {
       if (tag && this.peekAhead(`</${tag}>`)) {
         this.index += tag.length + 3;
+        closed = true;
         break;
       }
       if (!tag && this.peekAhead("</>")) {
         this.index += 3;
+        closed = true;
         break;
+      }
+      if (this.peekAhead("</")) {
+        throw new Error(`Invalid TSX near offset ${this.index}: unexpected closing tag`);
       }
       if (this.startsJsx(true)) {
         children.push(this.parseElement());
@@ -456,6 +518,10 @@ class TsxParser {
       if (normalized) {
         children.push(JSON.stringify(normalized));
       }
+    }
+    if (!closed) {
+      const closing = tag ? `</${tag}>` : "</>";
+      throw new Error(`Invalid TSX near offset ${this.index}: expected ${closing}`);
     }
     return children.length ? `, ${children.join(", ")}` : "";
   }

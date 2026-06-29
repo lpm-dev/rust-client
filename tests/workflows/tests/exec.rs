@@ -1,6 +1,10 @@
 mod support;
 
 use std::path::Path;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+#[cfg(unix)]
+use support::lpm_spawnable;
 use support::{TempProject, lpm};
 
 #[cfg(unix)]
@@ -279,6 +283,38 @@ fn exec_typescript_commonjs_file_ignores_type_only_exports_when_detecting_module
 }
 
 #[test]
+fn exec_typescript_commonjs_file_ignores_commented_esm_syntax_when_detecting_module_format() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/seed.ts",
+        concat!(
+            "/*\n",
+            "export const sample = 1;\n",
+            "*/\n",
+            "const fs = require('node:fs');\n",
+            "console.log(fs.existsSync('package.json') ? 'commented-commonjs-ts' : 'missing');\n",
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec on commented CommonJS TypeScript");
+
+    assert!(
+        output.status.success(),
+        "commented ESM syntax must not force CommonJS TypeScript into ESM:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("commented-commonjs-ts"),
+        "CommonJS TypeScript with commented ESM syntax must keep require available, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_tsx_file_uses_lpm_runtime_without_project_local_tsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file(
@@ -331,6 +367,78 @@ fn exec_tsx_file_preserves_typescript_generics_while_transforming_jsx() {
     assert!(
         stdout.contains(r#""type":"main""#) && stdout.contains("generic-tsx"),
         "exec must preserve TypeScript generics while transforming JSX, got:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {
+    use std::os::unix::process::CommandExt;
+
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/view.tsx",
+        "const view = <main><span></main>;\nconsole.log(view);\n",
+    );
+
+    let mut command = lpm_spawnable(&project);
+    command.args(["exec", "scripts/view.tsx"]);
+    // SAFETY: this test-only pre-exec hook only moves the child process into
+    // its own process group before it can spawn Node, so timeout cleanup can
+    // kill the whole group without touching the test runner.
+    unsafe {
+        command.pre_exec(|| {
+            // SAFETY: `setpgid(0, 0)` applies to the just-forked child before
+            // exec and uses no borrowed memory from the parent process.
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+
+    let mut child = command
+        .spawn()
+        .expect("failed to spawn lpm exec on mismatched TSX");
+    let started = Instant::now();
+    while child
+        .try_wait()
+        .expect("failed to poll lpm exec child")
+        .is_none()
+    {
+        if started.elapsed() > Duration::from_secs(2) {
+            // SAFETY: the child was placed in its own process group above.
+            // A negative pid targets that group and prevents an orphaned Node
+            // process from keeping captured pipes open.
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let output = child
+                .wait_with_output()
+                .expect("failed to collect killed lpm exec output");
+            panic!(
+                "mismatched TSX closing tags must fail without hanging:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect lpm exec output");
+    assert!(
+        !output.status.success(),
+        "mismatched TSX closing tags must fail:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Invalid TSX"),
+        "mismatched TSX closing tags must report a TSX syntax error, got:\n{stderr}"
     );
 }
 
