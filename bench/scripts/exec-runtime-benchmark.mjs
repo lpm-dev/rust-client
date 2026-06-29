@@ -15,6 +15,8 @@ const TIMESTAMP = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}
 const ITERATIONS = positiveInt(process.env.ITERATIONS, 30);
 const WARMUP_ITERATIONS = positiveInt(process.env.WARMUP_ITERATIONS, 1);
 const MODULE_COUNTS = numberList(process.env.MODULE_COUNTS, [1, 10, 100]);
+const TRANSFORM_PROTOCOL_VERSION = 1;
+const MAX_TRANSFORM_OUTPUT_BYTES = 64 * 1024 * 1024;
 const EXPLICIT_LPM_BIN = Boolean(process.env.LPM_BIN);
 const LPM_BIN = path.resolve(process.env.LPM_BIN || path.join(ROOT, "target/release/lpm-rs"));
 const EXPLICIT_NODE_BIN = Boolean(process.env.NODE_BIN);
@@ -174,6 +176,55 @@ function buildScenarios() {
           jsBaseline: true,
         }),
     });
+
+    addOxcHelperScenario(scenarios, {
+      fixture: `oxc-helper-ts-cjs-files-${moduleCount}`,
+      label: "LPM OXC helper TS CJS",
+      entryKind: "ts",
+      format: "commonjs",
+      projectMode: "commonjs-omitted",
+      moduleCount,
+      ext: ".ts",
+      createProject: (projectDir) =>
+        createTsProject(projectDir, {
+          ext: ".ts",
+          format: "commonjs",
+          projectMode: "commonjs-omitted",
+          moduleCount,
+        }),
+    });
+
+    addOxcHelperScenario(scenarios, {
+      fixture: `oxc-helper-ts-esm-files-${moduleCount}`,
+      label: "LPM OXC helper TS ESM",
+      entryKind: "ts",
+      format: "module",
+      projectMode: "module",
+      moduleCount,
+      ext: ".ts",
+      createProject: (projectDir) =>
+        createTsProject(projectDir, {
+          ext: ".ts",
+          format: "module",
+          projectMode: "module",
+          moduleCount,
+        }),
+    });
+
+    addOxcHelperScenario(scenarios, {
+      fixture: `oxc-helper-tsx-esm-files-${moduleCount}`,
+      label: "LPM OXC helper TSX ESM",
+      entryKind: "tsx",
+      format: "module",
+      projectMode: "module",
+      moduleCount,
+      ext: ".tsx",
+      createProject: (projectDir) =>
+        createTsxProject(projectDir, {
+          projectMode: "module",
+          moduleCount,
+        }),
+    });
   }
 
   scenarios.push({
@@ -236,6 +287,24 @@ function addTsComparisonScenarios(scenarios, options) {
   }
 }
 
+function addOxcHelperScenario(scenarios, options) {
+  scenarios.push({
+    id: `lpm-${options.fixture}`,
+    runner: "lpm-oxc-helper",
+    fixture: options.fixture,
+    label: options.label,
+    entryKind: options.entryKind,
+    format: options.format,
+    projectMode: options.projectMode,
+    moduleCount: options.moduleCount,
+    helperInvocations: options.moduleCount,
+    cacheModes: ["none"],
+    createProject: options.createProject,
+    entry: "internal-ts-transform",
+    helperFiles: (projectDir) => helperModuleFiles(projectDir, options.ext, options.moduleCount),
+  });
+}
+
 function runnerUnavailableReason(runner) {
   if (runner === "bun" && !executable(BUN_BIN)) {
     return "BUN_BIN is unset or bun was not found on PATH";
@@ -253,6 +322,9 @@ function measureScenario(scenario, projectDir, cacheMode) {
   const unavailableReason = runnerUnavailableReason(scenario.runner);
   if (unavailableReason) {
     return skippedResult(scenario, cacheMode, unavailableReason);
+  }
+  if (scenario.runner === "lpm-oxc-helper") {
+    return measureOxcHelperScenario(scenario, projectDir, cacheMode);
   }
 
   const envRoot = path.join(workRoot, "env", `${scenario.id}-${cacheMode}`);
@@ -291,6 +363,78 @@ function measureScenario(scenario, projectDir, cacheMode) {
   }
 
   return passedResult(scenario, cacheMode, samples);
+}
+
+function measureOxcHelperScenario(scenario, projectDir, cacheMode) {
+  const envRoot = path.join(workRoot, "env", `${scenario.id}-${cacheMode}`);
+  removeTree(envRoot);
+  const env = benchmarkEnv(envRoot);
+  const inputs = helperTransformInputs(scenario, projectDir);
+  if (inputs.length === 0) {
+    return failedResult(scenario, cacheMode, "helper scenario did not produce transform inputs");
+  }
+
+  try {
+    for (let i = 0; i < WARMUP_ITERATIONS; i += 1) {
+      const failed = runHelperInputsOnce(inputs, projectDir, env);
+      if (failed) {
+        throw new Error(failed);
+      }
+    }
+  } catch (error) {
+    return failedResult(scenario, cacheMode, `warmup failed: ${error.message}`);
+  }
+
+  const samples = [];
+  for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
+    const started = process.hrtime.bigint();
+    const failed = runHelperInputsOnce(inputs, projectDir, env);
+    const elapsedNs = process.hrtime.bigint() - started;
+    if (failed) {
+      return failedResult(scenario, cacheMode, failed, samples);
+    }
+    samples.push(Number(elapsedNs) / 1_000_000);
+  }
+
+  return passedResult(scenario, cacheMode, samples);
+}
+
+function helperTransformInputs(scenario, projectDir) {
+  return scenario.helperFiles(projectDir).map((filename) => {
+    const source = fs.readFileSync(filename, "utf8");
+    return JSON.stringify({
+      schemaVersion: TRANSFORM_PROTOCOL_VERSION,
+      filename,
+      source,
+      format: scenario.format,
+      sourceMap: true,
+      options: {
+        format: scenario.format,
+        jsx: {
+          runtime: "automatic",
+          development: false,
+          importSource: "react",
+        },
+      },
+    });
+  });
+}
+
+function runHelperInputsOnce(inputs, projectDir, env) {
+  for (const input of inputs) {
+    const run = childProcess.spawnSync(LPM_BIN, ["internal-ts-transform"], {
+      cwd: projectDir,
+      env,
+      input,
+      encoding: "utf8",
+      maxBuffer: MAX_TRANSFORM_OUTPUT_BYTES,
+      windowsHide: true,
+    });
+    if (run.status !== 0 || run.error) {
+      return failureDetail(run, `${LPM_BIN} internal-ts-transform`);
+    }
+  }
+  return "";
 }
 
 function prepareCacheState(scenario, cacheMode, projectDir, envRoot, env, command) {
@@ -394,6 +538,14 @@ function benchmarkEnv(envRoot) {
   env.FORCE_COLOR = "0";
   env.CI = "1";
   return env;
+}
+
+function helperModuleFiles(projectDir, ext, moduleCount) {
+  const files = [];
+  for (let i = 0; i < moduleCount; i += 1) {
+    files.push(path.join(projectDir, `scripts/module-${i}${ext}`));
+  }
+  return files;
 }
 
 function createTsProject(projectDir, options) {
@@ -666,6 +818,7 @@ function createFakeReactRuntime(projectDir) {
 
 function passedResult(scenario, cacheMode, samples) {
   const stats = statsFor(samples);
+  const helperInvocations = scenario.helperInvocations || 0;
   return {
     runner: scenario.runner,
     scenario: scenario.id,
@@ -678,12 +831,21 @@ function passedResult(scenario, cacheMode, samples) {
     projectMode: scenario.projectMode,
     entryKind: scenario.entryKind,
     entry: scenario.entry,
+    helperInvocations,
     iterations: ITERATIONS,
+    ...(helperInvocations > 0
+      ? {
+          avgPerHelperInvocationMs: round(stats.avgMs / helperInvocations),
+          p50PerHelperInvocationMs: round(stats.p50Ms / helperInvocations),
+          p95PerHelperInvocationMs: round(stats.p95Ms / helperInvocations),
+        }
+      : {}),
     ...stats,
   };
 }
 
 function failedResult(scenario, cacheMode, reason, samples = []) {
+  const helperInvocations = scenario.helperInvocations || 0;
   return {
     runner: scenario.runner,
     scenario: scenario.id,
@@ -697,11 +859,13 @@ function failedResult(scenario, cacheMode, reason, samples = []) {
     projectMode: scenario.projectMode,
     entryKind: scenario.entryKind,
     entry: scenario.entry,
+    helperInvocations,
     iterations: samples.length,
   };
 }
 
 function skippedResult(scenario, cacheMode, reason) {
+  const helperInvocations = scenario.helperInvocations || 0;
   return {
     runner: scenario.runner,
     scenario: scenario.id,
@@ -715,6 +879,7 @@ function skippedResult(scenario, cacheMode, reason) {
     projectMode: scenario.projectMode,
     entryKind: scenario.entryKind,
     entry: scenario.entry,
+    helperInvocations,
     iterations: 0,
   };
 }
@@ -768,11 +933,14 @@ function renderMarkdown(report) {
   lines.push(
     `Cold clears the runner's transform cache before every measured run. Warm runs ${metadata.warmupIterations} unmeasured warmup iteration(s) and then reuses that cache.`,
   );
+  lines.push(
+    "`lpm-oxc-helper` rows run `lpm-rs internal-ts-transform` directly through the same stdin/stdout JSON protocol the LPM TS loader uses on cache misses.",
+  );
   lines.push("");
   lines.push(
-    "| Runner | Fixture | Entry | Cache | Modules | Format | Project mode | Status | Iterations | Avg ms | Min ms | P50 ms | P95 ms | Max ms |",
+    "| Runner | Fixture | Entry | Cache | Modules | Helper calls | Format | Project mode | Status | Iterations | Avg ms | Min ms | P50 ms | P50/call ms | P95 ms | Max ms |",
   );
-  lines.push("| --- | --- | --- | --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+  lines.push("| --- | --- | --- | --- | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
   for (const result of report.results) {
     lines.push(renderResultRow(result));
   }
@@ -791,10 +959,12 @@ function renderResultRow(result) {
       result.entry,
       result.cacheMode,
       result.moduleCount,
+      result.helperInvocations || "-",
       result.format,
       result.projectMode,
       `${result.status}: ${escapeCell(result.reason || "")}`,
       result.iterations,
+      "-",
       "-",
       "-",
       "-",
@@ -808,6 +978,7 @@ function renderResultRow(result) {
     result.entry,
     result.cacheMode,
     result.moduleCount,
+    result.helperInvocations || "-",
     result.format,
     result.projectMode,
     result.status,
@@ -815,6 +986,7 @@ function renderResultRow(result) {
     result.avgMs.toFixed(2),
     result.minMs.toFixed(2),
     result.p50Ms.toFixed(2),
+    result.p50PerHelperInvocationMs ? result.p50PerHelperInvocationMs.toFixed(2) : "-",
     result.p95Ms.toFixed(2),
     result.maxMs.toFixed(2),
   ].join(" | ").replace(/^/, "| ").replace(/$/, " |");
@@ -822,8 +994,11 @@ function renderResultRow(result) {
 
 function printProgress(result) {
   if (result.status === "pass") {
+    const helperSuffix = result.p50PerHelperInvocationMs
+      ? ` p50/call=${result.p50PerHelperInvocationMs.toFixed(2)}ms`
+      : "";
     console.log(
-      `${result.scenario} ${result.cacheMode}: avg=${result.avgMs.toFixed(2)}ms p50=${result.p50Ms.toFixed(2)}ms p95=${result.p95Ms.toFixed(2)}ms`,
+      `${result.scenario} ${result.cacheMode}: avg=${result.avgMs.toFixed(2)}ms p50=${result.p50Ms.toFixed(2)}ms p95=${result.p95Ms.toFixed(2)}ms${helperSuffix}`,
     );
     return;
   }
