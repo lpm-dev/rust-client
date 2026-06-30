@@ -74,8 +74,88 @@ where
     };
     if stem == std::ffi::OsStr::new("lpx") {
         args.insert(1, std::ffi::OsString::from("dlx"));
+        return args;
     }
+    insert_run_file_command_for_naked_source(&mut args);
     args
+}
+
+fn insert_run_file_command_for_naked_source(args: &mut Vec<std::ffi::OsString>) {
+    let mut index = 1;
+    let mut insert_at = None;
+
+    while index < args.len() {
+        let arg = args[index].as_os_str();
+        if arg == std::ffi::OsStr::new("--") {
+            return;
+        }
+
+        if let Some(skip) = top_level_global_flag_width(arg) {
+            index += skip;
+            continue;
+        }
+
+        if let Some(skip) = run_file_flag_width(arg) {
+            insert_at.get_or_insert(index);
+            index += skip;
+            continue;
+        }
+
+        if is_naked_source_target(arg) {
+            args.insert(
+                insert_at.unwrap_or(index),
+                std::ffi::OsString::from("__run-file"),
+            );
+        }
+        return;
+    }
+}
+
+fn top_level_global_flag_width(arg: &std::ffi::OsStr) -> Option<usize> {
+    match arg.to_str()? {
+        "--json" | "--verbose" | "--insecure" | "-V" | "-v" => Some(1),
+        "--registry" | "--token" | "--color" => Some(2),
+        value
+            if value.starts_with("--registry=")
+                || value.starts_with("--token=")
+                || value.starts_with("--color=") =>
+        {
+            Some(1)
+        }
+        _ => None,
+    }
+}
+
+fn run_file_flag_width(arg: &std::ffi::OsStr) -> Option<usize> {
+    match arg.to_str()? {
+        "--watch" | "--no-env-check" | "--plain-node" | "--no-augment" => Some(1),
+        "--env" => Some(2),
+        value if value.starts_with("--env=") => Some(1),
+        _ => None,
+    }
+}
+
+fn is_naked_source_target(arg: &std::ffi::OsStr) -> bool {
+    let path = std::path::Path::new(arg);
+    has_supported_source_extension(path) || is_path_like(arg)
+}
+
+fn has_supported_source_extension(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("js" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
+    )
+}
+
+fn is_path_like(arg: &std::ffi::OsStr) -> bool {
+    let Some(value) = arg.to_str() else {
+        return false;
+    };
+    value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('/')
+        || value.contains('/')
+        || value.contains('\\')
 }
 
 pub(super) fn argv_requests_json(args: &[std::ffi::OsString]) -> bool {
@@ -602,6 +682,72 @@ mod tests {
 
         assert_eq!(package, "cowsay");
         assert_eq!(args, vec!["--version"]);
+    }
+
+    #[test]
+    fn args_for_cli_parse_maps_naked_source_file_to_hidden_run_file_command() {
+        let args = args_for_cli_parse(
+            ["lpm", "scripts/seed.ts", "--", "--flag"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Commands::RunFile { file, args, .. }) = cli.command else {
+            panic!("naked source file must parse as hidden run-file command");
+        };
+
+        assert_eq!(file, "scripts/seed.ts");
+        assert_eq!(args, vec!["--flag"]);
+    }
+
+    #[test]
+    fn args_for_cli_parse_maps_leading_run_file_flags_to_hidden_run_file_command() {
+        let args = args_for_cli_parse(
+            ["lpm", "--watch", "--env", "staging", "scripts/seed.ts"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Commands::RunFile {
+            file, env, watch, ..
+        }) = cli.command
+        else {
+            panic!("leading source-file flags must parse as hidden run-file command");
+        };
+
+        assert_eq!(file, "scripts/seed.ts");
+        assert_eq!(env.as_deref(), Some("staging"));
+        assert!(watch);
+    }
+
+    #[test]
+    fn args_for_cli_parse_leaves_script_shortcuts_as_external_commands() {
+        let args = args_for_cli_parse(
+            ["lpm", "storybook"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Commands::External(args)) = cli.command else {
+            panic!("bare script shortcut must stay an external command");
+        };
+
+        assert_eq!(args, vec!["storybook"]);
+    }
+
+    #[test]
+    fn args_for_cli_parse_does_not_rewrite_explicit_run_command() {
+        let args = args_for_cli_parse(
+            ["lpm", "run", "scripts/seed.ts"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Commands::Run { scripts, .. }) = cli.command else {
+            panic!("explicit run command must stay a script invocation");
+        };
+
+        assert_eq!(scripts, vec!["scripts/seed.ts"]);
     }
 
     #[test]

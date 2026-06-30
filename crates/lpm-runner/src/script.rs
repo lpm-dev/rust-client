@@ -18,7 +18,8 @@ use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_workspace::read_package_json;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Global flag to skip env schema validation (set by `--no-env-check`).
@@ -530,6 +531,153 @@ pub fn run_command_with_envs(
     Ok(())
 }
 
+/// Build a direct process command for a project-local binary.
+///
+/// Resolves `command_name` only from `node_modules/.bin` directories discovered
+/// from `project_dir` upward. The caller gets npm/pnpm-style local-bin PATH
+/// precedence without a fallback to arbitrary system PATH executables.
+pub fn build_local_bin_command(
+    project_dir: &Path,
+    command_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<Command, LpmError> {
+    let bin_path = resolve_local_bin_path(project_dir, command_name)?;
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint);
+    let env_vars =
+        dotenv::load_project_env_with_schema_validation(project_dir, env_mode, !no_env_check)?;
+
+    let mut command = Command::new(&bin_path);
+    shell::strip_inherited_env_hooks(&mut command);
+    command
+        .args(extra_args)
+        .current_dir(project_dir)
+        .env("PATH", &path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if !env_vars.is_empty() {
+        command.envs(&env_vars);
+    }
+
+    Ok(command)
+}
+
+/// Execute a project-local binary directly, with LPM env and PATH handling.
+pub fn run_local_bin(
+    project_dir: &Path,
+    command_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<(), LpmError> {
+    let mut command = build_local_bin_command(
+        project_dir,
+        command_name,
+        extra_args,
+        env_mode,
+        no_env_check,
+        bin_hint,
+    )?;
+    let status = command
+        .status()
+        .map_err(|e| LpmError::Script(format!("failed to execute '{command_name}': {e}")))?;
+
+    if !status.success() {
+        return Err(LpmError::ExitCode(shell::exit_code(&status)));
+    }
+
+    Ok(())
+}
+
+fn resolve_local_bin_path(project_dir: &Path, command_name: &str) -> Result<PathBuf, LpmError> {
+    if command_name.trim().is_empty() {
+        return Err(LpmError::Script(
+            "`lpm exec` requires a project-local binary name".into(),
+        ));
+    }
+    if is_path_like_command(command_name) {
+        return Err(LpmError::Script(format!(
+            "`lpm exec` runs project-local binaries, not file paths. Use `lpm {command_name}` to run a JS/TS source file directly."
+        )));
+    }
+
+    let bin_dirs = bin_path::find_bin_dirs(project_dir);
+    let candidate_names = local_bin_candidate_names(command_name);
+    for bin_dir in &bin_dirs {
+        for candidate_name in &candidate_names {
+            let candidate = bin_dir.join(candidate_name);
+            if is_executable_file(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    let searched = if bin_dirs.is_empty() {
+        "no node_modules/.bin directories were found".to_string()
+    } else {
+        format!(
+            "searched {}",
+            bin_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Err(LpmError::Script(format!(
+        "project-local binary '{command_name}' was not found ({searched}). Run `lpm install` to link dependencies, or use `lpm dlx <pkg>` to run a package without adding it to the project."
+    )))
+}
+
+fn is_path_like_command(command_name: &str) -> bool {
+    command_name.contains('/')
+        || command_name.contains('\\')
+        || Path::new(command_name).is_absolute()
+}
+
+fn local_bin_candidate_names(command_name: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let path = Path::new(command_name);
+        if path.extension().is_some() {
+            return vec![command_name.to_string()];
+        }
+        return ["cmd", "exe", "bat", ""]
+            .iter()
+            .map(|ext| {
+                if ext.is_empty() {
+                    command_name.to_string()
+                } else {
+                    format!("{command_name}.{ext}")
+                }
+            })
+            .collect();
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![command_name.to_string()]
+    }
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
 /// Run an explicit command with tee-captured output (for caching).
 pub fn run_command_captured(
     project_dir: &Path,
@@ -844,6 +992,36 @@ mod tests {
     use crate::bin_path::ManagedRuntimeHint::Unknown;
     use std::fs;
 
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) {}
+
+    fn write_local_bin(project_dir: &Path, name: &str) -> PathBuf {
+        let bin_dir = project_dir.join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let bin_path = if cfg!(windows) {
+            bin_dir.join(format!("{name}.cmd"))
+        } else {
+            bin_dir.join(name)
+        };
+        let script = if cfg!(windows) {
+            "@echo off\r\necho local-bin %*\r\n"
+        } else {
+            "#!/bin/sh\necho local-bin \"$@\"\n"
+        };
+        fs::write(&bin_path, script).unwrap();
+        make_executable(&bin_path);
+        bin_path
+    }
+
     #[test]
     fn run_simple_script() {
         let dir = tempfile::tempdir().unwrap();
@@ -884,6 +1062,97 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("nonexistent"));
         assert!(err.contains("build"));
+    }
+
+    #[test]
+    fn build_local_bin_command_resolves_project_bin_without_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let bin_path = write_local_bin(dir.path(), "eslint");
+
+        let command = build_local_bin_command(
+            dir.path(),
+            "eslint",
+            &["--fix".into(), "src/index.ts".into()],
+            None,
+            false,
+            &Unknown,
+        )
+        .unwrap();
+
+        assert_eq!(command.get_program(), bin_path.as_os_str());
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["--fix", "src/index.ts"]);
+    }
+
+    #[test]
+    fn build_local_bin_command_keeps_shell_metacharacters_as_args() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        write_local_bin(dir.path(), "tool");
+
+        let command = build_local_bin_command(
+            dir.path(),
+            "tool",
+            &["; touch pwned".into(), "$(whoami)".into()],
+            None,
+            false,
+            &Unknown,
+        )
+        .unwrap();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args, vec!["; touch pwned", "$(whoami)"]);
+    }
+
+    #[test]
+    fn build_local_bin_command_rejects_path_like_command_names() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+
+        let err =
+            build_local_bin_command(dir.path(), "scripts/seed.ts", &[], None, false, &Unknown)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("Use `lpm scripts/seed.ts`"));
+    }
+
+    #[test]
+    fn build_local_bin_command_errors_when_project_bin_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+
+        let err =
+            build_local_bin_command(dir.path(), "eslint", &[], None, false, &Unknown).unwrap_err();
+
+        assert!(err.to_string().contains("project-local binary 'eslint'"));
+    }
+
+    #[test]
+    fn build_local_bin_command_strips_credential_and_hijack_env_carriers() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        write_local_bin(dir.path(), "tool");
+
+        let command =
+            build_local_bin_command(dir.path(), "tool", &[], None, false, &Unknown).unwrap();
+        let stripped = command
+            .get_envs()
+            .filter_map(|(key, value)| if value.is_none() { key.to_str() } else { None })
+            .collect::<Vec<_>>();
+
+        for required in ["LPM_TOKEN", "NODE_OPTIONS", "BASH_ENV", "GIT_SSH_COMMAND"] {
+            assert!(
+                stripped.contains(&required),
+                "local-bin exec must strip {required}"
+            );
+        }
     }
 
     #[test]

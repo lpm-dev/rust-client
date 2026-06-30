@@ -55,6 +55,23 @@ fn write_fake_tsx(project: &TempProject) {
     make_executable(&tsx_path);
 }
 
+fn write_fake_local_bin(project: &TempProject, name: &str, unix_body: &str, windows_body: &str) {
+    let bin_path = if cfg!(windows) {
+        project.path().join(format!("node_modules/.bin/{name}.cmd"))
+    } else {
+        project.path().join(format!("node_modules/.bin/{name}"))
+    };
+    std::fs::create_dir_all(bin_path.parent().expect("fake bin has parent"))
+        .expect("create fake bin dir");
+    let script = if cfg!(windows) {
+        windows_body
+    } else {
+        unix_body
+    };
+    std::fs::write(&bin_path, script).expect("write fake local bin");
+    make_executable(&bin_path);
+}
+
 fn transform_cache_dir(project: &TempProject) -> PathBuf {
     let runtime_root = project.home().join(".lpm/cache/exec-ts-runtime");
     let mut candidates = std::fs::read_dir(&runtime_root)
@@ -134,6 +151,97 @@ fn write_fake_react_runtime(project: &TempProject) {
 }
 
 #[test]
+fn exec_runs_project_local_binary_with_env_and_args() {
+    let project = TempProject::empty(r#"{"name":"exec-bin-test","version":"1.0.0"}"#);
+    project.write_file(".env", "EXEC_BIN_MESSAGE=from-env\n");
+    write_fake_local_bin(
+        &project,
+        "say-env",
+        "#!/bin/sh\necho \"$EXEC_BIN_MESSAGE $1 $2\"\n",
+        "@echo off\r\necho %EXEC_BIN_MESSAGE% %1 %2\r\n",
+    );
+
+    let output = lpm(&project)
+        .args(["exec", "say-env", "--flag", "value"])
+        .output()
+        .expect("failed to run project-local binary via lpm exec");
+
+    assert!(
+        output.status.success(),
+        "lpm exec must run the project-local binary:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("from-env --flag value"),
+        "local binary must receive project env and forwarded args, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn exec_errors_when_project_local_binary_is_missing() {
+    let project = TempProject::empty(r#"{"name":"exec-bin-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["exec", "missing-bin"])
+        .output()
+        .expect("failed to run lpm exec on a missing local binary");
+
+    assert!(!output.status.success(), "missing local binary must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("project-local binary 'missing-bin'"),
+        "missing local-bin error must explain the lookup scope, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn exec_rejects_source_file_paths_without_compatibility_alias() {
+    let project = TempProject::empty(r#"{"name":"exec-bin-test","version":"1.0.0"}"#);
+    project.write_file("scripts/seed.ts", "console.log('seed');\n");
+
+    let output = lpm(&project)
+        .args(["exec", "scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm exec on a source-file path");
+
+    assert!(
+        !output.status.success(),
+        "lpm exec must not keep the unshipped source-file alias"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Use `lpm scripts/seed.ts`"),
+        "source-file alias rejection must point at naked file execution, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn naked_bare_word_still_runs_script_shortcut() {
+    let project = TempProject::empty(
+        r#"{"name":"exec-bin-test","version":"1.0.0","scripts":{"storybook":"echo script-shortcut"}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["storybook"])
+        .output()
+        .expect("failed to run script shortcut");
+
+    assert!(
+        output.status.success(),
+        "bare script shortcut must still run package script:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("script-shortcut"),
+        "bare word must stay a script shortcut unless it looks like a source file, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_js_file_loads_dotenv_and_forwards_args() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file(".env", "EXEC_MESSAGE=hello-from-dotenv\n");
@@ -149,7 +257,7 @@ fn exec_js_file_loads_dotenv_and_forwards_args() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/echo.js", "--", "--flag", "value"])
+        .args(["scripts/echo.js", "--", "--flag", "value"])
         .output()
         .expect("failed to run lpm exec");
 
@@ -185,7 +293,7 @@ fn exec_js_file_does_not_install_lpm_typescript_runtime() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/plain.js"])
+        .args(["scripts/plain.js"])
         .output()
         .expect("failed to run lpm exec on JavaScript");
 
@@ -227,7 +335,7 @@ fn exec_js_file_ignores_node_options_from_env_secrets() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/plain.js"])
+        .args(["scripts/plain.js"])
         .output()
         .expect("failed to run lpm exec with env-secret NODE_OPTIONS");
 
@@ -264,7 +372,7 @@ fn exec_js_file_ignores_runtime_hook_env_secrets() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/plain.js"])
+        .args(["scripts/plain.js"])
         .output()
         .expect("failed to run lpm exec with runtime-hook env secret");
 
@@ -301,7 +409,7 @@ fn exec_js_file_ignores_lowercase_runtime_hook_env_secrets() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/plain.js"])
+        .args(["scripts/plain.js"])
         .output()
         .expect("failed to run lpm exec with lowercase runtime-hook env secret");
 
@@ -329,7 +437,7 @@ fn exec_js_file_ignores_node_options_from_env_schema_defaults() {
     project.write_file("scripts/plain.js", "console.log('safe-js');\n");
 
     let output = lpm(&project)
-        .args(["exec", "scripts/plain.js"])
+        .args(["scripts/plain.js"])
         .output()
         .expect("failed to run lpm exec with env-schema NODE_OPTIONS default");
 
@@ -351,7 +459,7 @@ fn exec_missing_file_fails_before_runtime_execution() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["exec", "scripts/missing.js"])
+        .args(["scripts/missing.js"])
         .output()
         .expect("failed to run lpm exec on a missing file");
 
@@ -372,7 +480,7 @@ fn exec_env_flag_loads_selected_env_file() {
     project.write_file("scripts/env.js", "console.log(process.env.EXEC_MESSAGE);\n");
 
     let output = lpm(&project)
-        .args(["exec", "--env", "staging", "scripts/env.js"])
+        .args(["--env", "staging", "scripts/env.js"])
         .output()
         .expect("failed to run lpm exec --env");
 
@@ -399,7 +507,7 @@ fn exec_no_env_check_skips_schema_validation() {
     project.write_file("scripts/noop.js", "console.log('ok');\n");
 
     let output = lpm(&project)
-        .args(["exec", "--no-env-check", "scripts/noop.js"])
+        .args(["--no-env-check", "scripts/noop.js"])
         .output()
         .expect("failed to run lpm exec --no-env-check");
 
@@ -418,7 +526,7 @@ fn exec_typescript_without_safe_runtime_refuses_npx_tsx() {
     write_fake_node(&project, "v20.5.0");
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on TypeScript without safe runtime");
 
@@ -446,7 +554,7 @@ fn exec_typescript_file_uses_lpm_runtime_without_project_local_tsx() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on TypeScript");
 
@@ -477,7 +585,7 @@ fn exec_typescript_transform_cache_contains_inline_source_map() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on TypeScript");
 
@@ -519,7 +627,7 @@ fn exec_typescript_file_forwards_args_through_lpm_runtime() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/args.ts", "--", "--flag", "value"])
+        .args(["scripts/args.ts", "--", "--flag", "value"])
         .output()
         .expect("failed to run lpm exec on TypeScript args script");
 
@@ -550,7 +658,7 @@ fn exec_typescript_commonjs_file_ignores_type_only_exports_when_detecting_module
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on CommonJS TypeScript");
 
@@ -583,7 +691,7 @@ fn exec_typescript_commonjs_file_ignores_type_only_imports_when_detecting_module
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on CommonJS TypeScript with import type");
 
@@ -615,7 +723,7 @@ fn exec_typescript_commonjs_file_ignores_commented_esm_syntax_when_detecting_mod
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on commented CommonJS TypeScript");
 
@@ -641,7 +749,7 @@ fn exec_typescript_file_treats_top_level_await_as_module() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on top-level-await TypeScript");
 
@@ -667,7 +775,7 @@ fn exec_typescript_file_treats_parenthesized_top_level_await_as_module() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on parenthesized top-level-await TypeScript");
 
@@ -693,7 +801,7 @@ fn exec_typescript_file_treats_import_meta_as_module() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on import-meta TypeScript");
 
@@ -719,7 +827,7 @@ fn exec_typescript_file_treats_multiline_named_export_as_module() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on multiline-export TypeScript");
 
@@ -745,7 +853,7 @@ fn exec_typescript_file_treats_compact_named_export_as_module() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec on compact-export TypeScript");
 
@@ -771,7 +879,7 @@ fn exec_mts_file_runs_as_esm_through_lpm_runtime() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/module.mts"])
+        .args(["scripts/module.mts"])
         .output()
         .expect("failed to run lpm exec on MTS");
 
@@ -802,7 +910,7 @@ fn exec_cts_file_runs_as_commonjs_through_lpm_runtime() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/common.cts"])
+        .args(["scripts/common.cts"])
         .output()
         .expect("failed to run lpm exec on CTS");
 
@@ -829,7 +937,7 @@ fn exec_tsx_file_uses_lpm_runtime_without_project_local_tsx() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on TSX");
 
@@ -859,7 +967,7 @@ fn exec_tsx_file_transforms_jsx_fragments_with_project_react_runtime() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on TSX fragment");
 
@@ -893,7 +1001,7 @@ fn exec_tsx_file_honors_classic_react_import_when_configured() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on classic React TSX");
 
@@ -924,7 +1032,7 @@ fn exec_tsx_file_preserves_typescript_generics_while_transforming_jsx() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on generic TSX");
 
@@ -955,7 +1063,7 @@ fn exec_tsx_file_preserves_constrained_generic_arrows_while_transforming_jsx() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on constrained generic TSX");
 
@@ -987,7 +1095,7 @@ fn exec_tsx_file_preserves_generic_arrows_with_literal_delimiters_while_transfor
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on generic TSX with literal delimiters");
 
@@ -1022,7 +1130,7 @@ fn exec_tsx_file_preserves_generic_arrows_with_regex_defaults_while_transforming
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on generic TSX with regex defaults");
 
@@ -1055,7 +1163,7 @@ fn exec_tsx_file_preserves_regex_literals_inside_jsx_braces() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on TSX with regex literals inside braces");
 
@@ -1088,7 +1196,7 @@ fn exec_tsx_file_preserves_hashbang_while_transforming_jsx() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on hashbang TSX");
 
@@ -1120,7 +1228,7 @@ fn exec_tsx_file_preserves_strict_directive_while_transforming_jsx() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on strict TSX");
 
@@ -1152,7 +1260,7 @@ fn exec_tsx_file_preserves_strict_directive_with_line_comment_while_transforming
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on strict TSX with line comment");
 
@@ -1184,7 +1292,7 @@ fn exec_tsx_file_preserves_strict_directive_with_block_comment_while_transformin
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on strict TSX with block comment");
 
@@ -1215,7 +1323,7 @@ fn exec_tsx_file_allows_user_jsx_helper_named_binding() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on TSX with user helper binding");
 
@@ -1246,7 +1354,7 @@ fn exec_tsx_file_allows_user_symbol_named_binding() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on TSX with user Symbol binding");
 
@@ -1277,7 +1385,7 @@ fn exec_tsx_file_allows_user_global_this_named_binding() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on TSX with user globalThis binding");
 
@@ -1306,7 +1414,7 @@ fn exec_tsx_file_ignores_stale_transform_cache_after_runtime_output_changes() {
     project.write_file("scripts/view.tsx", source);
 
     let first_output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to populate LPM TS transform cache");
     assert!(
@@ -1340,7 +1448,7 @@ fn exec_tsx_file_ignores_stale_transform_cache_after_runtime_output_changes() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec with stale transform cache");
 
@@ -1370,7 +1478,7 @@ fn exec_tsx_file_reports_mismatched_closing_tags_without_hanging() {
     );
 
     let mut command = lpm_spawnable(&project);
-    command.args(["exec", "scripts/view.tsx"]);
+    command.args(["scripts/view.tsx"]);
     // SAFETY: this test-only pre-exec hook only moves the child process into
     // its own process group before it can spawn Node, so timeout cleanup can
     // kill the whole group without touching the test runner.
@@ -1445,7 +1553,7 @@ fn exec_tsx_file_transforms_jsx_inside_child_expressions() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on expression-nested TSX");
 
@@ -1475,7 +1583,7 @@ fn exec_tsx_file_ignores_comment_only_child_expressions() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on comment-child TSX");
 
@@ -1507,7 +1615,7 @@ fn exec_tsx_file_transforms_nested_jsx_children_after_whitespace() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on nested TSX children");
 
@@ -1537,7 +1645,7 @@ fn exec_tsx_file_transforms_jsx_inside_spread_attributes() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on spread-attribute TSX");
 
@@ -1568,7 +1676,7 @@ fn exec_tsx_file_preserves_spread_attribute_order() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on ordered spread attributes");
 
@@ -1593,7 +1701,7 @@ fn exec_tsx_file_uses_project_local_tsx_when_node_cannot_load_lpm_runtime() {
     write_fake_tsx(&project);
 
     let output = lpm(&project)
-        .args(["exec", "scripts/view.tsx"])
+        .args(["scripts/view.tsx"])
         .output()
         .expect("failed to run lpm exec on TSX with local tsx");
 
@@ -1639,7 +1747,7 @@ fn exec_typescript_parent_spawns_typescript_child_with_lpm_runtime() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/parent.ts"])
+        .args(["scripts/parent.ts"])
         .output()
         .expect("failed to run lpm exec parent TypeScript script");
 
@@ -1671,7 +1779,7 @@ fn exec_typescript_parent_spawns_javascript_child_with_lpm_runtime() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/parent.ts"])
+        .args(["scripts/parent.ts"])
         .output()
         .expect("failed to run lpm exec parent TypeScript script");
 
@@ -1713,7 +1821,7 @@ fn exec_plain_node_disables_typescript_child_augmentation() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "--plain-node", "scripts/parent.ts"])
+        .args(["--plain-node", "scripts/parent.ts"])
         .output()
         .expect("failed to run lpm exec --plain-node");
 
@@ -1733,7 +1841,7 @@ fn exec_plain_node_refuses_project_local_tsx_for_typescript() {
     write_fake_tsx(&project);
 
     let output = lpm(&project)
-        .args(["exec", "--plain-node", "scripts/seed.ts"])
+        .args(["--plain-node", "scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec --plain-node on TypeScript");
 
@@ -1768,7 +1876,7 @@ fn exec_strips_inherited_node_options_before_installing_lpm_runtime() {
             "NODE_OPTIONS",
             format!("--require={}", bad_preload.display()),
         )
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec with inherited NODE_OPTIONS");
 
@@ -1795,7 +1903,7 @@ fn exec_project_env_cannot_replace_lpm_transformer_helper() {
     );
 
     let output = lpm(&project)
-        .args(["exec", "scripts/seed.ts"])
+        .args(["scripts/seed.ts"])
         .output()
         .expect("failed to run lpm exec with project env transformer override");
 
@@ -1817,7 +1925,7 @@ fn exec_missing_file_under_json_emits_error_envelope_on_stdout() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args(["--json", "exec", "scripts/missing.js"])
+        .args(["--json", "scripts/missing.js"])
         .output()
         .expect("failed to run lpm --json exec on a missing file");
 

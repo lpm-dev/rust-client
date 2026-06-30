@@ -86,7 +86,7 @@ fn json_contract_statuses_are_fully_accounted_for() {
 
     assert_eq!(
         not_applicable.len(),
-        4,
+        5,
         "the intentionally non-JSON surface set changed; update v2 KEEP_NONE rationale rows:\n{}",
         not_applicable.join("\n")
     );
@@ -186,36 +186,36 @@ fn supplemental_references(surface_id: u16) -> &'static [&'static str] {
         64 => &["crates/lpm-cli/src/commands/audit/mod.rs"],
         66 => &["crates/lpm-cli/src/commands/query.rs"],
         84 => &["crates/lpm-cli/src/commands/run/mod.rs"],
-        88 | 89 => &["crates/lpm-cli/src/commands/tools.rs"],
-        97 => &[
+        89 | 90 => &["crates/lpm-cli/src/commands/tools.rs"],
+        98 => &[
             "crates/lpm-cli/src/commands/env/inventory.rs",
             "crates/lpm-cli/src/commands/env/local.rs",
         ],
-        98 => &["crates/lpm-cli/src/commands/env/local.rs"],
-        99 => &[
+        99 => &["crates/lpm-cli/src/commands/env/local.rs"],
+        100 => &[
             "crates/lpm-cli/src/commands/env/inventory.rs",
             "crates/lpm-cli/src/commands/env/local.rs",
             "crates/lpm-cli/src/commands/env/schema.rs",
         ],
-        100 => &[
+        101 => &[
             "crates/lpm-cli/src/commands/env/remote.rs",
             "crates/lpm-cli/src/commands/env/schema.rs",
         ],
-        102 => &["crates/lpm-cli/src/commands/env/remote.rs"],
-        105 => &[
+        103 => &["crates/lpm-cli/src/commands/env/remote.rs"],
+        106 => &[
             "crates/lpm-cli/src/commands/env/platform.rs",
             "crates/lpm-cli/src/commands/env/remote.rs",
             "crates/lpm-cli/src/commands/env/rotation.rs",
         ],
-        110 => &["crates/lpm-cli/src/commands/dev.rs"],
-        117 => &["tests/workflows/tests/ports.rs"],
-        119 | 120 => &["crates/lpm-cli/src/commands/tunnel.rs"],
-        124 => &[
+        111 => &["crates/lpm-cli/src/commands/dev.rs"],
+        118 => &["tests/workflows/tests/ports.rs"],
+        120 | 121 => &["crates/lpm-cli/src/commands/tunnel.rs"],
+        125 => &[
             "crates/lpm-cli/src/commands/migrate_overrides.rs",
             "crates/lpm-cli/src/commands/migrate_patches.rs",
         ],
-        127 => &["crates/lpm-cli/src/update_check.rs"],
-        131 => &["crates/lpm-cli/src/commands/use.rs"],
+        128 => &["crates/lpm-cli/src/update_check.rs"],
+        132 => &["crates/lpm-cli/src/commands/use.rs"],
         _ => &[],
     }
 }

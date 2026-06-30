@@ -1865,7 +1865,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/run.rs", 7)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 85: lpm exec <file> ──
+    // ── id 85: lpm <file> ──
     SurfaceV2 {
         id: 85,
         scenarios: 3,
@@ -1877,16 +1877,34 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         failure_modes_known: &[
             "file permission denied",
             "symlink escape in exec path",
-            "exec under sandbox / strict-egress mode",
-            "exec of a file with shebang resolving to an absent interpreter",
+            "source-file execution under sandbox / strict-egress mode",
+            "source-file execution of a file with shebang resolving to an absent interpreter",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[("tests/workflows/tests/exec.rs", 3)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 86: lpm dlx <pkg> ──
+    // ── id 86: lpm exec <bin> ──
     SurfaceV2 {
         id: 86,
+        scenarios: 3,
+        failure_modes_tested: &[
+            "runs project-local binary with project env and forwarded args",
+            "missing project-local binary fails without system PATH fallback",
+            "source-file path is rejected with the naked-file command hint",
+        ],
+        failure_modes_known: &[
+            "Windows .cmd argument escaping parity",
+            "workspace member vs root .bin precedence",
+            "local binary receiving managed runtime PATH under pinned Node",
+        ],
+        json_contract_depth: JsonContractDepth::None,
+        scenarios_by_file: &[("tests/workflows/tests/exec.rs", 3)],
+        last_audited_at: "2026-06-30",
+    },
+    // ── id 87: lpm dlx <pkg> ──
+    SurfaceV2 {
+        id: 87,
         scenarios: 2,
         failure_modes_tested: &[
             "cache hit executes cached binary + refreshes TTL",
@@ -1902,9 +1920,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/dlx.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 87: lpm lint ──
+    // ── id 88: lpm lint ──
     SurfaceV2 {
-        id: 87,
+        id: 88,
         scenarios: 5,
         failure_modes_tested: &[
             "filter typo without fail-flag exits zero",
@@ -1923,9 +1941,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/tools.rs", 5)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 88: lpm fmt (write) ──
+    // ── id 89: lpm fmt (write) ──
     SurfaceV2 {
-        id: 88,
+        id: 89,
         scenarios: 3,
         failure_modes_tested: &[
             "filter typo without fail-flag exits zero",
@@ -1942,9 +1960,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/tools.rs", 3)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 89: lpm fmt --check ──
+    // ── id 90: lpm fmt --check ──
     SurfaceV2 {
-        id: 89,
+        id: 90,
         scenarios: 1,
         failure_modes_tested: &["--check flag accepted alongside --filter"],
         failure_modes_known: &[
@@ -1957,9 +1975,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/tools.rs", 1)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 90: lpm check ──
+    // ── id 91: lpm check ──
     SurfaceV2 {
-        id: 90,
+        id: 91,
         scenarios: 11,
         failure_modes_tested: &[
             "workspace JSON emits valid envelope per member",
@@ -1987,9 +2005,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         last_audited_at: "2026-05-14",
     },
-    // ── id 91: lpm test ──
+    // ── id 92: lpm test ──
     SurfaceV2 {
-        id: 91,
+        id: 92,
         scenarios: 7,
         failure_modes_tested: &[
             "filter typo with fail-flag exits nonzero",
@@ -2010,9 +2028,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/tools.rs", 7)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 92: lpm bench ──
+    // ── id 93: lpm bench ──
     SurfaceV2 {
-        id: 92,
+        id: 93,
         scenarios: 3,
         failure_modes_tested: &[
             "multi-member watch rejected with count",
@@ -2029,10 +2047,10 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/tools.rs", 3)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 93: lpm ci ──
+    // ── id 94: lpm ci ──
     //
     SurfaceV2 {
-        id: 93,
+        id: 94,
         scenarios: 3,
         failure_modes_tested: &[
             "missing lockfile fails as a frozen install",
@@ -2052,9 +2070,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         last_audited_at: "2026-05-14",
     },
-    // ── id 94: lpm setup ci github-actions ──
+    // ── id 95: lpm setup ci github-actions ──
     SurfaceV2 {
-        id: 94,
+        id: 95,
         scenarios: 2,
         failure_modes_tested: &[
             "uses project vault id + requested env name",
@@ -2070,9 +2088,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/ci.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 95: lpm setup ci gitlab ──
+    // ── id 96: lpm setup ci gitlab ──
     SurfaceV2 {
-        id: 95,
+        id: 96,
         scenarios: 4,
         failure_modes_tested: &[
             "gitlab emits id-tokens block + authorization command",
@@ -2091,9 +2109,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/ci.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 96: lpm env init ──
+    // ── id 97: lpm env init ──
     SurfaceV2 {
-        id: 96,
+        id: 97,
         scenarios: 2,
         failure_modes_tested: &[
             "vault initialization happens implicitly on first `env set`",
@@ -2109,9 +2127,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 97: lpm env ls / list ──
+    // ── id 98: lpm env ls / list ──
     SurfaceV2 {
-        id: 97,
+        id: 98,
         scenarios: 1,
         failure_modes_tested: &[
             "list JSON envelope carries keys",
@@ -2127,9 +2145,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 1)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 98: lpm env set / get / delete ──
+    // ── id 99: lpm env set / get / delete ──
     SurfaceV2 {
-        id: 98,
+        id: 99,
         scenarios: 6,
         failure_modes_tested: &[
             "set persists key/value + get reveals",
@@ -2149,9 +2167,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 6)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 99: lpm env import / export / print / copy ──
+    // ── id 100: lpm env import / export / print / copy ──
     SurfaceV2 {
-        id: 99,
+        id: 100,
         scenarios: 4,
         failure_modes_tested: &[
             "import from dotenv populates vault (envelope: success + imported count)",
@@ -2169,9 +2187,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 100: lpm env diff / validate / check ──
+    // ── id 101: lpm env diff / validate / check ──
     SurfaceV2 {
-        id: 100,
+        id: 101,
         scenarios: 4,
         failure_modes_tested: &[
             "diff local-vs-local reports added/removed/changed keys",
@@ -2188,9 +2206,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_local.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 101: lpm env push / pull (cloud) ──
+    // ── id 102: lpm env push / pull (cloud) ──
     SurfaceV2 {
-        id: 101,
+        id: 102,
         scenarios: 10,
         failure_modes_tested: &[
             "pull overwrites local state with remote environments",
@@ -2217,9 +2235,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         last_audited_at: "2026-05-14",
     },
-    // ── id 102: lpm env share ──
+    // ── id 103: lpm env share ──
     SurfaceV2 {
-        id: 102,
+        id: 103,
         scenarios: 2,
         failure_modes_tested: &[
             "share --force fails before vault or network access",
@@ -2235,9 +2253,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 2)],
         last_audited_at: "2026-06-11",
     },
-    // ── id 103: lpm env pair ──
+    // ── id 104: lpm env pair ──
     SurfaceV2 {
-        id: 103,
+        id: 104,
         scenarios: 9,
         failure_modes_tested: &[
             "uppercases code + approves browser pairing",
@@ -2260,9 +2278,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 9)],
         last_audited_at: "2026-05-20",
     },
-    // ── id 104: lpm env unpair ──
+    // ── id 105: lpm env unpair ──
     SurfaceV2 {
-        id: 104,
+        id: 105,
         scenarios: 5,
         failure_modes_tested: &[
             "requires session-based login",
@@ -2283,9 +2301,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         last_audited_at: "2026-05-14",
     },
-    // ── id 105: lpm env connect / status / log / rotate-key / list-remote ──
+    // ── id 106: lpm env connect / status / log / rotate-key / list-remote ──
     SurfaceV2 {
-        id: 105,
+        id: 106,
         scenarios: 5,
         failure_modes_tested: &[
             "connect --json success envelope carries success + status + platform",
@@ -2305,9 +2323,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 5)],
         last_audited_at: "2026-06-11",
     },
-    // ── id 106: lpm env oidc allow ──
+    // ── id 107: lpm env oidc allow ──
     SurfaceV2 {
-        id: 106,
+        id: 107,
         scenarios: 7,
         failure_modes_tested: &[
             "missing repo emits JSON error",
@@ -2327,9 +2345,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 7)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 107: lpm env oidc list ──
+    // ── id 108: lpm env oidc list ──
     SurfaceV2 {
-        id: 107,
+        id: 108,
         scenarios: 2,
         failure_modes_tested: &["without vault emits JSON error", "emits JSON response"],
         failure_modes_known: &[
@@ -2341,9 +2359,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 108: lpm env oidc pull ──
+    // ── id 109: lpm env oidc pull ──
     SurfaceV2 {
-        id: 108,
+        id: 109,
         scenarios: 1,
         failure_modes_tested: &["exchange-error emits JSON error"],
         failure_modes_known: &[
@@ -2355,7 +2373,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 1)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 109: lpm dev ──
+    // ── id 110: lpm dev ──
     //
     // KEEP_NONE rationale: `lpm dev` boots a long-running orchestrator
     // (HTTPS server, tunnel, dashboard) and streams progress / logs to
@@ -2366,7 +2384,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // human formatter intentionally — `lpm dev --help` is for humans
     // reading at a terminal, not for machine consumers. Not a gap.
     SurfaceV2 {
-        id: 109,
+        id: 110,
         scenarios: 1,
         failure_modes_tested: &["dev help emits command usage + flags"],
         failure_modes_known: &[
@@ -2379,7 +2397,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 1)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 110: lpm dev --tunnel / --https / --network ──
+    // ── id 111: lpm dev --tunnel / --https / --network ──
     //
     // KEEP_NONE rationale: same surface shape as id 109 — long-running
     // orchestrator with streaming stdout, no envelope contract. The
@@ -2388,7 +2406,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // expiry, TLS cert generation failure, port-in-use) surface
     // mid-stream and don't fit the single-envelope shape. Not a gap.
     SurfaceV2 {
-        id: 110,
+        id: 111,
         scenarios: 1,
         failure_modes_tested: &["dev help surfaces --tunnel / --https / --network in flag list"],
         failure_modes_known: &[
@@ -2401,9 +2419,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 1)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 111: lpm cert status / trust / uninstall / generate ──
+    // ── id 112: lpm cert status / trust / uninstall / generate ──
     SurfaceV2 {
-        id: 111,
+        id: 112,
         scenarios: 4,
         failure_modes_tested: &[
             "status JSON reports absent CA + project cert",
@@ -2420,9 +2438,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/cert.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 112: lpm graph (tree default) ──
+    // ── id 113: lpm graph (tree default) ──
     SurfaceV2 {
-        id: 112,
+        id: 113,
         scenarios: 4,
         failure_modes_tested: &[
             "--depth truncates JSON format",
@@ -2440,9 +2458,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/graph.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 113: lpm graph --format json ──
+    // ── id 114: lpm graph --format json ──
     SurfaceV2 {
-        id: 113,
+        id: 114,
         scenarios: 2,
         failure_modes_tested: &[
             "--format json envelope matches snapshot",
@@ -2457,9 +2475,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/graph.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 114: lpm graph --format html ──
+    // ── id 115: lpm graph --format html ──
     SurfaceV2 {
-        id: 114,
+        id: 115,
         scenarios: 4,
         failure_modes_tested: &[
             "html writes to .lpm dir + respects --no-open",
@@ -2477,9 +2495,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/graph.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 115: lpm graph --format dot / mermaid / stats ──
+    // ── id 116: lpm graph --format dot / mermaid / stats ──
     SurfaceV2 {
-        id: 115,
+        id: 116,
         scenarios: 4,
         failure_modes_tested: &[
             "--format dot emits valid dot syntax to stdout",
@@ -2496,9 +2514,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/graph.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 116: lpm graph --why <pkg> ──
+    // ── id 117: lpm graph --why <pkg> ──
     SurfaceV2 {
-        id: 116,
+        id: 117,
         scenarios: 7,
         failure_modes_tested: &[
             "--why human output shows override trace",
@@ -2518,9 +2536,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/graph.rs", 7)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 117: lpm ports list / all / inspect / kill / reset ──
+    // ── id 118: lpm ports list / all / inspect / kill / reset ──
     SurfaceV2 {
-        id: 117,
+        id: 118,
         scenarios: 43,
         failure_modes_tested: &[
             "list JSON reports free + in-use services",
@@ -2567,9 +2585,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         last_audited_at: "2026-06-01",
     },
-    // ── id 118: lpm tunnel <port> (start) ──
+    // ── id 119: lpm tunnel <port> (start) ──
     SurfaceV2 {
-        id: 118,
+        id: 119,
         scenarios: 2,
         failure_modes_tested: &[
             "tunnel help emits action summary",
@@ -2585,9 +2603,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 119: lpm tunnel claim / unclaim / list / domains ──
+    // ── id 120: lpm tunnel claim / unclaim / list / domains ──
     SurfaceV2 {
-        id: 119,
+        id: 120,
         scenarios: 3,
         failure_modes_tested: &[
             "claim without auth fails with clear message",
@@ -2604,9 +2622,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 3)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 120: lpm tunnel inspect / replay / log ──
+    // ── id 121: lpm tunnel inspect / replay / log ──
     SurfaceV2 {
-        id: 120,
+        id: 121,
         scenarios: 2,
         failure_modes_tested: &[
             "action enumeration is reachable via tunnel help",
@@ -2622,9 +2640,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 121: lpm migrate (auto-detect npm/yarn/pnpm/bun) ──
+    // ── id 122: lpm migrate (auto-detect npm/yarn/pnpm/bun) ──
     SurfaceV2 {
-        id: 121,
+        id: 122,
         scenarios: 16,
         failure_modes_tested: &[
             "npm creates lockfile",
@@ -2654,9 +2672,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/migrate.rs", 16)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 122: lpm migrate --rollback ──
+    // ── id 123: lpm migrate --rollback ──
     SurfaceV2 {
-        id: 122,
+        id: 123,
         scenarios: 1,
         failure_modes_tested: &[
             "rollback restores original",
@@ -2672,9 +2690,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/migrate.rs", 1)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 123: lpm migrate --dry-run ──
+    // ── id 124: lpm migrate --dry-run ──
     SurfaceV2 {
-        id: 123,
+        id: 124,
         scenarios: 3,
         failure_modes_tested: &[
             "dry-run does not write lockfile",
@@ -2693,9 +2711,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         last_audited_at: "2026-05-14",
     },
-    // ── id 124: lpm migrate --ci / --no-npmrc ──
+    // ── id 125: lpm migrate --ci / --no-npmrc ──
     SurfaceV2 {
-        id: 124,
+        id: 125,
         scenarios: 4,
         failure_modes_tested: &[
             "--ci generates workflow template file",
@@ -2713,9 +2731,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/migrate.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 125: lpm vault open / update / version ──
+    // ── id 126: lpm vault open / update / version ──
     SurfaceV2 {
-        id: 125,
+        id: 126,
         scenarios: 5,
         failure_modes_tested: &[
             "open on non-macos fails with unsupported message",
@@ -2735,9 +2753,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/vault.rs", 5)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 126: lpm self-update ──
+    // ── id 127: lpm self-update ──
     SurfaceV2 {
-        id: 126,
+        id: 127,
         scenarios: 2,
         failure_modes_tested: &[
             "cache hit with matching latest reports up-to-date",
@@ -2753,7 +2771,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/self_update.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 127: lpm internal-update-check (hidden) ──
+    // ── id 128: lpm internal-update-check (hidden) ──
     //
     // KEEP_NONE rationale: this is a hidden, fire-and-forget background
     // updater spawned by the parent `lpm` process. Its only side effect
@@ -2764,7 +2782,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // parent to filter it out — both defeat the "silent background
     // worker" contract. Not a gap.
     SurfaceV2 {
-        id: 127,
+        id: 128,
         scenarios: 2,
         failure_modes_tested: &[
             "hidden command exits zero even offline",
@@ -2779,9 +2797,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 128: lpm swift-registry ──
+    // ── id 129: lpm swift-registry ──
     SurfaceV2 {
-        id: 128,
+        id: 129,
         scenarios: 4,
         failure_modes_tested: &[
             "swift-registry help works",
@@ -2798,9 +2816,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/swift.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 129: lpm mcp setup / remove / status ──
+    // ── id 130: lpm mcp setup / remove / status ──
     SurfaceV2 {
-        id: 129,
+        id: 130,
         scenarios: 4,
         failure_modes_tested: &[
             "status on fresh home succeeds",
@@ -2818,9 +2836,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/mcp.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 130: lpm use node@<v> ──
+    // ── id 131: lpm use node@<v> ──
     SurfaceV2 {
-        id: 130,
+        id: 131,
         scenarios: 3,
         failure_modes_tested: &[
             "install unsupported runtime fails before network call",
@@ -2837,9 +2855,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/use.rs", 3)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 131: lpm use --list ──
+    // ── id 132: lpm use --list ──
     SurfaceV2 {
-        id: 131,
+        id: 132,
         scenarios: 4,
         failure_modes_tested: &[
             "list on empty runtime succeeds with empty set",
@@ -2856,7 +2874,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/use.rs", 4)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 132: lpm completions <shell> ──
+    // ── id 133: lpm completions <shell> ──
     //
     // KEEP_NONE rationale: this surface emits a shell completion
     // script (bash function, zsh _lpm definition, fish/PowerShell
@@ -2869,7 +2887,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // a much larger refactor. Not a gap. See finding #76 for the broader
     // clap-vs-envelope routing story.
     SurfaceV2 {
-        id: 132,
+        id: 133,
         scenarios: 3,
         failure_modes_tested: &[
             "zsh stdout uses lpm bin name + lists live commands",
@@ -2885,9 +2903,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/completions.rs", 3)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 133: lpm schema lpm.json ──
+    // ── id 134: lpm schema lpm.json ──
     SurfaceV2 {
-        id: 133,
+        id: 134,
         scenarios: 2,
         failure_modes_tested: &[
             "emits valid JSON schema to stdout",
@@ -2902,9 +2920,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/schema.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 134: lpm schema lpm.config.json ──
+    // ── id 135: lpm schema lpm.config.json ──
     SurfaceV2 {
-        id: 134,
+        id: 135,
         scenarios: 2,
         failure_modes_tested: &[
             "emits hand-authored schema with $id",
@@ -2919,9 +2937,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/schema.rs", 2)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 135: lpm strict-ssl warning (cross-cmd installer warning) ──
+    // ── id 136: lpm strict-ssl warning (cross-cmd installer warning) ──
     SurfaceV2 {
-        id: 135,
+        id: 136,
         scenarios: 3,
         failure_modes_tested: &[
             "strict-ssl=false emits loud warning with source citation",
@@ -2937,7 +2955,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/install.rs", 3)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 136: lpm install pnpm migration warnings ──
+    // ── id 137: lpm install pnpm migration warnings ──
     //
     // Carved out of id 12 during the 2026-05-14 v2 partition pass.
     // These tests exercise install's cross-tool-input behavior: when a
@@ -2950,7 +2968,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // list with cross-tool concerns that have no bearing on the
     // lockfile fast-path.
     SurfaceV2 {
-        id: 136,
+        id: 137,
         scenarios: 8,
         failure_modes_tested: &[
             "warns when pnpm overrides dropped during migration",
@@ -2972,7 +2990,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/install.rs", 8)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 137: lpm install linker validation (LPM_LINKER) ──
+    // ── id 138: lpm install linker validation (LPM_LINKER) ──
     //
     // Carved out of id 12 during the 2026-05-14 v2 partition pass.
     // These tests exercise install's config-validation contract for
@@ -2983,7 +3001,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // value between runs must invalidate the install-hash so the next
     // install actually re-links rather than skipping under up-to-date.
     SurfaceV2 {
-        id: 137,
+        id: 138,
         scenarios: 6,
         failure_modes_tested: &[
             "rejects unknown LPM_LINKER value with loud error",
@@ -3003,9 +3021,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/install.rs", 6)],
         last_audited_at: "2026-05-14",
     },
-    // ── id 138: lpm bundle ──
+    // ── id 139: lpm bundle ──
     SurfaceV2 {
-        id: 138,
+        id: 139,
         scenarios: 3,
         failure_modes_tested: &[
             "single-package bundle reuses seeded managed rolldown engine",
@@ -3022,9 +3040,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/bundle.rs", 3)],
         last_audited_at: "2026-05-25",
     },
-    // ── id 139: lpm pack ──
+    // ── id 140: lpm pack ──
     SurfaceV2 {
-        id: 139,
+        id: 140,
         scenarios: 3,
         failure_modes_tested: &[
             "single-package pack runs the project-local tsdown binary with forwarded flags",
@@ -3040,9 +3058,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/pack.rs", 3)],
         last_audited_at: "2026-05-25",
     },
-    // ── id 140: lpm catalog list --unused ──
+    // ── id 141: lpm catalog list --unused ──
     SurfaceV2 {
-        id: 140,
+        id: 141,
         scenarios: 1,
         failure_modes_tested: &[
             "unused default catalog entries reported",
@@ -3058,9 +3076,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/pnpm_compat_catalog.rs", 1)],
         last_audited_at: "2026-05-28",
     },
-    // ── id 141: lpm catalog show --resolved ──
+    // ── id 142: lpm catalog show --resolved ──
     SurfaceV2 {
-        id: 141,
+        id: 142,
         scenarios: 1,
         failure_modes_tested: &[
             "resolved catalog snapshot reports catalog name",
@@ -3077,9 +3095,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/pnpm_compat_catalog.rs", 1)],
         last_audited_at: "2026-05-28",
     },
-    // ── id 142: lpm patch-remove <selector> ──
+    // ── id 143: lpm patch-remove <selector> ──
     SurfaceV2 {
-        id: 142,
+        id: 143,
         scenarios: 7,
         failure_modes_tested: &[
             "exact key removes manifest entry and deletes unshared patch file",
@@ -3103,9 +3121,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         last_audited_at: "2026-05-29",
     },
-    // ── id 143: lpm sbom ──
+    // ── id 144: lpm sbom ──
     SurfaceV2 {
-        id: 143,
+        id: 144,
         scenarios: 6,
         failure_modes_tested: &[
             "CycloneDX output includes lockfile dependency graph",
@@ -3129,9 +3147,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         last_audited_at: "2026-05-29",
     },
-    // ── id 144: lpm proxy status / list / start / stop ──
+    // ── id 145: lpm proxy status / list / start / stop ──
     SurfaceV2 {
-        id: 144,
+        id: 145,
         scenarios: 70,
         failure_modes_tested: &[
             "status/list JSON reports absent daemon with clean stderr",
@@ -3178,9 +3196,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         ],
         last_audited_at: "2026-06-01",
     },
-    // ── id 145: lpm hosts clean ──
+    // ── id 146: lpm hosts clean ──
     SurfaceV2 {
-        id: 145,
+        id: 146,
         scenarios: 13,
         failure_modes_tested: &[
             "removes multiple LPM-managed hosts-file blocks while preserving unmanaged lines",
@@ -3210,7 +3228,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-01",
     },
     SurfaceV2 {
-        id: 146,
+        id: 147,
         scenarios: 4,
         failure_modes_tested: &[
             "posts npm-compatible payload to stage endpoint",
@@ -3231,7 +3249,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-04",
     },
     SurfaceV2 {
-        id: 147,
+        id: 148,
         scenarios: 1,
         failure_modes_tested: &["dry-run performs no npm registry requests"],
         failure_modes_known: &[
@@ -3243,7 +3261,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-04",
     },
     SurfaceV2 {
-        id: 148,
+        id: 149,
         scenarios: 3,
         failure_modes_tested: &[
             "filtered list returns JSON envelope",
@@ -3260,7 +3278,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-04",
     },
     SurfaceV2 {
-        id: 149,
+        id: 150,
         scenarios: 1,
         failure_modes_tested: &["stage view returns JSON envelope for a valid UUID"],
         failure_modes_known: &[
@@ -3273,7 +3291,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-04",
     },
     SurfaceV2 {
-        id: 150,
+        id: 151,
         scenarios: 1,
         failure_modes_tested: &["approve sends supplied OTP to approve endpoint"],
         failure_modes_known: &[
@@ -3286,7 +3304,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-04",
     },
     SurfaceV2 {
-        id: 151,
+        id: 152,
         scenarios: 1,
         failure_modes_tested: &["reject sends supplied OTP to delete endpoint"],
         failure_modes_known: &[
@@ -3299,7 +3317,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-04",
     },
     SurfaceV2 {
-        id: 152,
+        id: 153,
         scenarios: 1,
         failure_modes_tested: &[
             "download writes tarball using manifest-derived filename and JSON envelope",
@@ -3314,7 +3332,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-04",
     },
     SurfaceV2 {
-        id: 153,
+        id: 154,
         scenarios: 6,
         failure_modes_tested: &[
             "lockfile-only fetch works without package.json",
@@ -3337,7 +3355,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-13",
     },
     SurfaceV2 {
-        id: 154,
+        id: 155,
         scenarios: 5,
         failure_modes_tested: &[
             "report-only tidy exits 1 on unused dependency and phantom import findings",
@@ -3358,7 +3376,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-13",
     },
     SurfaceV2 {
-        id: 155,
+        id: 156,
         scenarios: 1,
         failure_modes_tested: &[
             "configured extension appears with command, mode, on-error, timeout, and events",
@@ -3373,7 +3391,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-28",
     },
     SurfaceV2 {
-        id: 156,
+        id: 157,
         scenarios: 1,
         failure_modes_tested: &[
             "configured extension contributes enabled, report, and enforce counters",
@@ -3388,7 +3406,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-28",
     },
     SurfaceV2 {
-        id: 157,
+        id: 158,
         scenarios: 1,
         failure_modes_tested: &[
             "unavailable extension command exits nonzero",
@@ -3403,7 +3421,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         last_audited_at: "2026-06-28",
     },
     SurfaceV2 {
-        id: 158,
+        id: 159,
         scenarios: 1,
         failure_modes_tested: &[
             "synthetic package candidate is sent to the named extension",

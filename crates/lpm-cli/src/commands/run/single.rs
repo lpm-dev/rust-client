@@ -221,8 +221,34 @@ pub fn run_watch(
     Ok(())
 }
 
-/// Execute a file directly, auto-detecting the runtime.
+/// Run a project-local binary from node_modules/.bin.
 pub async fn exec(
+    project_dir: &Path,
+    command_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+) -> Result<(), LpmError> {
+    let bin_hint = ensure_runtime(project_dir).await;
+    install_ui::phase(&format!("Executing {}", install_ui::yellow(command_name)));
+    let start = std::time::Instant::now();
+    lpm_runner::script::run_local_bin(
+        project_dir,
+        command_name,
+        extra_args,
+        env_mode,
+        no_env_check,
+        &bin_hint,
+    )?;
+    install_ui::done(&format!(
+        "Done · exited 0 in {}",
+        install_ui::green(&install_ui::format_duration(start.elapsed())),
+    ));
+    Ok(())
+}
+
+/// Execute a source file directly, auto-detecting the runtime.
+pub async fn run_file(
     project_dir: &Path,
     file_path: &str,
     extra_args: &[String],
@@ -255,7 +281,7 @@ fn exec_once(
     Ok(())
 }
 
-pub async fn exec_watch(
+pub async fn run_file_watch(
     project_dir: &Path,
     file_path: &str,
     extra_args: &[String],
