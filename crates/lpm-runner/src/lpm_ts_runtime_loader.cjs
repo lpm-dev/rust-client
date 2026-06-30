@@ -17,17 +17,29 @@ const CACHE_DIR =
   path.join(PROJECT_DIR, ".lpm", "exec-ts-runtime-cache");
 const TRANSFORMER = process.env.LPM_TS_RUNTIME_TRANSFORMER;
 const WORKER_PATH = path.join(__dirname, "lpm-ts-runtime-worker.cjs");
+const TRACE_ENABLED = process.env.LPM_TS_RUNTIME_TRACE === "1";
+let TRACE_FILE = TRACE_ENABLED ? process.env.LPM_TS_RUNTIME_TRACE_FILE : "";
 const MAX_TRANSFORM_OUTPUT_BYTES = 64 * 1024 * 1024;
 const PERSISTENT_TRANSFORM_TIMEOUT_MS = 120 * 1000;
+const INLINE_REQUEST_BUFFER_BYTES = 256 * 1024;
+const INLINE_RESPONSE_BUFFER_BYTES = 4 * 1024 * 1024;
 const STATE_IDLE = 0;
 const STATE_REQUEST = 1;
 const STATE_RESPONSE = 2;
+const MODE_NONE = 0;
+const MODE_INLINE = 1;
+const MODE_FILE = 2;
 const CONTROL_STATE = 0;
 const CONTROL_REQUEST_ID = 1;
 const CONTROL_SHUTDOWN = 2;
+const CONTROL_REQUEST_MODE = 3;
+const CONTROL_REQUEST_BYTES = 4;
+const CONTROL_RESPONSE_MODE = 5;
+const CONTROL_RESPONSE_BYTES = 6;
 
 let persistentTransformClient = null;
 let persistentTransformUnavailable = false;
+let traceFd = null;
 
 if (typeof moduleApi.registerHooks !== "function") {
   throw new Error("LPM TS runtime requires Node.js module.registerHooks support. Run `lpm use node@22.18+`.");
@@ -50,7 +62,15 @@ const tsconfigFingerprint = hashJson(compilerOptions);
 
 moduleApi.registerHooks({
   resolve(specifier, context, nextResolve) {
+    const traceStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
     const mapped = resolveSpecifier(specifier, context.parentURL);
+    if (TRACE_ENABLED) {
+      traceEvent("resolve", traceStart, {
+        specifier,
+        parentURL: context.parentURL || "",
+        result: mapped ? mapped.fileUrl || mapped : "next",
+      });
+    }
     if (mapped) {
       return { url: mapped.fileUrl || pathToFileURL(mapped).href, shortCircuit: true };
     }
@@ -66,9 +86,21 @@ moduleApi.registerHooks({
       return nextLoad(url, context);
     }
 
+    const loadStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
+    const readStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
     const source = fs.readFileSync(filename, "utf8");
+    if (TRACE_ENABLED) {
+      traceEvent("source_read", readStart, { filename, bytes: Buffer.byteLength(source) });
+    }
+    const formatStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
     const format = moduleFormat(filename, source);
+    if (TRACE_ENABLED) {
+      traceEvent("module_format", formatStart, { filename, format });
+    }
     const transformedSource = loadTransformedSource(filename, source, format);
+    if (TRACE_ENABLED) {
+      traceEvent("load_hook", loadStart, { filename, format });
+    }
     return {
       format,
       source: transformedSource,
@@ -79,14 +111,36 @@ moduleApi.registerHooks({
 
 function loadTransformedSource(filename, source, format) {
   const options = transformOptionsFor(format);
+  const cacheKeyStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
   const key = cacheKey(filename, source, format, options);
+  if (TRACE_ENABLED) {
+    traceEvent("cache_key", cacheKeyStart, { filename, format, key });
+  }
   const cachePath = path.join(CACHE_DIR, `${key}.json`);
+  const cacheLookupStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
   const cached = readCacheEntry(cachePath, key);
+  if (TRACE_ENABLED) {
+    traceEvent("cache_lookup", cacheLookupStart, {
+      filename,
+      cachePath,
+      hit: cached !== null,
+    });
+  }
   if (cached) {
     return cached;
   }
 
+  const transformStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
   const transformed = transformSource(filename, source, format, options);
+  if (TRACE_ENABLED) {
+    traceEvent("transform_roundtrip", transformStart, {
+      filename,
+      format,
+      bytesIn: Buffer.byteLength(source),
+      bytesOut: Buffer.byteLength(transformed),
+    });
+  }
+  const cacheWriteStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
   fs.mkdirSync(CACHE_DIR, { recursive: true });
   const tmp = `${cachePath}.${process.pid}.tmp`;
   const envelope = {
@@ -99,6 +153,13 @@ function loadTransformedSource(filename, source, format) {
   };
   fs.writeFileSync(tmp, JSON.stringify(envelope));
   fs.renameSync(tmp, cachePath);
+  if (TRACE_ENABLED) {
+    traceEvent("cache_write", cacheWriteStart, {
+      filename,
+      cachePath,
+      bytes: Buffer.byteLength(transformed),
+    });
+  }
   return transformed;
 }
 
@@ -205,26 +266,42 @@ function transformSourceWithPersistentHelper(request, filename) {
   const requestPath = path.join(client.sessionDir, `request-${requestId}.json`);
   const responsePath = path.join(client.sessionDir, `response-${requestId}.json`);
   const requestTmpPath = `${requestPath}.${process.pid}.tmp`;
+  const requestJson = JSON.stringify(request);
+  const requestPayload = Buffer.from(requestJson);
+  const requestMode = requestPayload.length <= client.requestBuffer.byteLength ? MODE_INLINE : MODE_FILE;
   let resetToIdle = false;
+  const transportStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
+  let responseMode = MODE_NONE;
+  let responseBytes = 0;
 
   try {
     if (Atomics.load(client.control, CONTROL_STATE) !== STATE_IDLE) {
       throw persistentTransportError("LPM TS runtime persistent helper is not idle");
     }
 
-    fs.writeFileSync(requestTmpPath, JSON.stringify(request), { encoding: "utf8", mode: 0o600 });
-    fs.renameSync(requestTmpPath, requestPath);
+    Atomics.store(client.control, CONTROL_RESPONSE_MODE, MODE_NONE);
+    Atomics.store(client.control, CONTROL_RESPONSE_BYTES, 0);
+    if (requestMode === MODE_INLINE) {
+      client.requestBytes.set(requestPayload);
+    } else {
+      fs.writeFileSync(requestTmpPath, requestJson, { encoding: "utf8", mode: 0o600 });
+      fs.renameSync(requestTmpPath, requestPath);
+    }
 
     Atomics.store(client.control, CONTROL_REQUEST_ID, requestId);
+    Atomics.store(client.control, CONTROL_REQUEST_MODE, requestMode);
+    Atomics.store(client.control, CONTROL_REQUEST_BYTES, requestPayload.length);
     Atomics.store(client.control, CONTROL_STATE, STATE_REQUEST);
     Atomics.notify(client.control, CONTROL_STATE, 1);
 
     waitForPersistentResponse(client, filename);
     resetToIdle = true;
 
+    responseMode = Atomics.load(client.control, CONTROL_RESPONSE_MODE);
+    responseBytes = Atomics.load(client.control, CONTROL_RESPONSE_BYTES);
     let response;
     try {
-      response = JSON.parse(fs.readFileSync(responsePath, "utf8"));
+      response = JSON.parse(readPersistentResponse(client, responsePath, responseMode, responseBytes));
     } catch (error) {
       throw persistentTransportError(`LPM OXC TypeScript transform returned invalid JSON for ${filename}: ${error.message}`);
     }
@@ -241,12 +318,25 @@ function transformSourceWithPersistentHelper(request, filename) {
     if (typeof response.code !== "string") {
       throw persistentTransportError(`LPM OXC TypeScript transform returned an invalid response for ${filename}`);
     }
+    if (TRACE_ENABLED) {
+      traceEvent("persistent_transport", transportStart, {
+        filename,
+        requestMode: modeName(requestMode),
+        responseMode: modeName(responseMode),
+        requestBytes: requestPayload.length,
+        responseBytes,
+      });
+    }
     return response.code;
   } finally {
     try {
       fs.rmSync(requestTmpPath, { force: true });
-      fs.rmSync(requestPath, { force: true });
-      fs.rmSync(responsePath, { force: true });
+      if (requestMode === MODE_FILE) {
+        fs.rmSync(requestPath, { force: true });
+      }
+      if (responseMode === MODE_FILE) {
+        fs.rmSync(responsePath, { force: true });
+      }
     } catch (_error) {
       // Best-effort cleanup for short-lived IPC files.
     }
@@ -255,6 +345,16 @@ function transformSourceWithPersistentHelper(request, filename) {
       Atomics.notify(client.control, CONTROL_STATE, 1);
     }
   }
+}
+
+function readPersistentResponse(client, responsePath, responseMode, responseBytes) {
+  if (responseMode === MODE_INLINE) {
+    return Buffer.from(client.responseBytes.subarray(0, responseBytes)).toString("utf8");
+  }
+  if (responseMode === MODE_FILE) {
+    return fs.readFileSync(responsePath, "utf8");
+  }
+  throw persistentTransportError("LPM OXC TypeScript persistent helper did not publish a response");
 }
 
 function ensurePersistentTransformClient() {
@@ -281,20 +381,30 @@ function ensurePersistentTransformClient() {
   );
   fs.mkdirSync(sessionDir, { recursive: true });
 
-  const sharedBuffer = new SharedArrayBuffer(3 * Int32Array.BYTES_PER_ELEMENT);
+  const sharedBuffer = new SharedArrayBuffer(7 * Int32Array.BYTES_PER_ELEMENT);
+  const requestBuffer = new SharedArrayBuffer(INLINE_REQUEST_BUFFER_BYTES);
+  const responseBuffer = new SharedArrayBuffer(INLINE_RESPONSE_BUFFER_BYTES);
   const control = new Int32Array(sharedBuffer);
   const client = {
     control,
     nextRequestId: 0,
+    requestBuffer,
+    requestBytes: new Uint8Array(requestBuffer),
+    responseBuffer,
+    responseBytes: new Uint8Array(responseBuffer),
     sessionDir,
     worker: null,
   };
 
   try {
     client.worker = new Worker(WORKER_PATH, {
+      execArgv: [],
+      env: persistentWorkerEnv(),
       workerData: {
         sessionDir,
         sharedBuffer,
+        requestBuffer,
+        responseBuffer,
         transformer: TRANSFORMER,
         protocolVersion: TRANSFORM_PROTOCOL_VERSION,
         maxTransformOutputBytes: MAX_TRANSFORM_OUTPUT_BYTES,
@@ -318,6 +428,22 @@ function ensurePersistentTransformClient() {
   process.once("exit", shutdownPersistentTransformClient);
   persistentTransformClient = client;
   return client;
+}
+
+function persistentWorkerEnv() {
+  const env = { ...process.env };
+  delete env.NODE_OPTIONS;
+  return env;
+}
+
+function modeName(mode) {
+  if (mode === MODE_INLINE) {
+    return "inline";
+  }
+  if (mode === MODE_FILE) {
+    return "file";
+  }
+  return "none";
 }
 
 function waitForPersistentResponse(client, filename) {
@@ -415,10 +541,18 @@ function hashJson(value) {
 
 function loadTsconfig(projectDir) {
   const tsconfigPath = path.join(projectDir, "tsconfig.json");
+  const traceStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
   try {
     const text = fs.readFileSync(tsconfigPath, "utf8");
-    return JSON.parse(stripJsonComments(text));
+    const parsed = JSON.parse(stripJsonComments(text));
+    if (TRACE_ENABLED) {
+      traceEvent("tsconfig_load", traceStart, { tsconfigPath, found: true });
+    }
+    return parsed;
   } catch (_error) {
+    if (TRACE_ENABLED) {
+      traceEvent("tsconfig_load", traceStart, { tsconfigPath, found: false });
+    }
     return {};
   }
 }
@@ -788,7 +922,15 @@ function resolveSpecifier(specifier, parentURL) {
     return resolveCandidate(path.resolve(parentDir, specifier));
   }
 
+  const pathLookupStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
   const pathMatch = resolveTsconfigPath(specifier);
+  if (TRACE_ENABLED) {
+    traceEvent("tsconfig_paths", pathLookupStart, {
+      specifier,
+      hit: pathMatch !== null,
+      result: pathMatch || "",
+    });
+  }
   if (pathMatch) {
     return pathMatch;
   }
@@ -878,4 +1020,50 @@ function isDirectory(candidate) {
   } catch (_error) {
     return false;
   }
+}
+
+function traceEvent(phase, startNs, fields) {
+  if (!TRACE_ENABLED) {
+    return;
+  }
+  const event = {
+    event: "lpm_ts_runtime",
+    phase,
+    pid: process.pid,
+    durationNs: Number(process.hrtime.bigint() - startNs),
+    ...fields,
+  };
+  traceWrite(`${JSON.stringify(event)}\n`);
+}
+
+function traceWrite(line) {
+  if (TRACE_FILE) {
+    try {
+      if (traceFd === null) {
+        traceFd = fs.openSync(TRACE_FILE, "a", 0o600);
+        process.once("exit", closeTraceFile);
+      }
+      fs.writeSync(traceFd, line);
+      return;
+    } catch (_error) {
+      TRACE_FILE = "";
+    }
+  }
+  try {
+    process.stderr.write(line);
+  } catch (_error) {
+    // Tracing is diagnostic-only; runtime behavior must not depend on stderr.
+  }
+}
+
+function closeTraceFile() {
+  if (traceFd === null) {
+    return;
+  }
+  try {
+    fs.closeSync(traceFd);
+  } catch (_error) {
+    // Ignore close failures for diagnostic trace output.
+  }
+  traceFd = null;
 }

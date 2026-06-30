@@ -549,7 +549,7 @@ function commandForScenario(scenario, projectDir) {
   }
   return {
     program: LPM_BIN,
-    args: ["exec", scenario.entry],
+    args: [scenario.entry],
   };
 }
 
@@ -945,7 +945,7 @@ function percentile(sorted, p) {
 function renderMarkdown(report) {
   const lines = [];
   const metadata = report.metadata;
-  lines.push("# lpm exec runtime benchmark suite", "");
+  lines.push("# lpm source runtime benchmark suite", "");
   lines.push(`- Date: \`${metadata.generatedAt}\``);
   lines.push(`- Source Git SHA: \`${metadata.sourceGitSha}\``);
   lines.push(`- Iterations: \`${metadata.iterations}\``);
