@@ -721,6 +721,29 @@ mod tests {
     }
 
     #[test]
+    fn args_for_cli_parse_maps_trailing_run_file_flags_to_hidden_run_file_command() {
+        let args = args_for_cli_parse(
+            ["lpm", "scripts/seed.ts", "--env", "staging", "--plain-node"]
+                .into_iter()
+                .map(std::ffi::OsString::from),
+        );
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Commands::RunFile {
+            file,
+            env,
+            plain_node,
+            ..
+        }) = cli.command
+        else {
+            panic!("trailing source-file flags must parse as hidden run-file command");
+        };
+
+        assert_eq!(file, "scripts/seed.ts");
+        assert_eq!(env.as_deref(), Some("staging"));
+        assert!(plain_node);
+    }
+
+    #[test]
     fn args_for_cli_parse_leaves_script_shortcuts_as_external_commands() {
         let args = args_for_cli_parse(
             ["lpm", "storybook"]
