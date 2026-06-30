@@ -212,7 +212,7 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) {
           env:
             LPM_VAULT_ID: {VAULT_ID}
         - name: Deploy
-          run: lpm exec -- ./deploy.sh"
+          run: lpm run deploy"
             .replace("{ENV}", env_mode)
             .replace("{VAULT_ID}", &vault_id)
             .dimmed()
@@ -245,7 +245,7 @@ fn setup_gitlab_ci(env_mode: &str) {
   script:
     - npm install -g @lpm-registry/cli
     - lpm env pull --oidc --env={ENV} --output=.env
-    - lpm exec -- ./deploy.sh"
+    - lpm run deploy"
             .replace("{ENV}", env_mode)
             .dimmed()
     );

@@ -1,4 +1,4 @@
-//! Direct file execution for `lpm exec src/seed.ts`.
+//! Direct file execution for `lpm src/seed.ts`.
 //!
 //! Execution is planned in explicit stages: resolve the target, classify the
 //! file, resolve the effective runtime, choose a strategy, then spawn the
@@ -738,7 +738,7 @@ fn no_safe_tsx_runtime_error(node_version: Option<&str>, plain_node: bool) -> Lp
     ))
 }
 
-/// Detect the Node.js version that `lpm exec` will actually see on PATH.
+/// Detect the Node.js version that direct file execution will actually see on PATH.
 #[cfg(test)]
 fn detect_effective_node_version(project_dir: &Path) -> Option<String> {
     let path = bin_path::build_path_with_bins(project_dir);

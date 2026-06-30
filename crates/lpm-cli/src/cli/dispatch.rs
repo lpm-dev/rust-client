@@ -1803,6 +1803,15 @@ async fn async_main() -> Result<()> {
         }
         Commands::Exec {
             env,
+            no_env_check,
+            command,
+            args,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::run::exec(&cwd, &command, &args, env.as_deref(), no_env_check).await
+        }
+        Commands::RunFile {
+            env,
             file,
             no_env_check,
             plain_node,
@@ -1812,7 +1821,7 @@ async fn async_main() -> Result<()> {
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             if watch {
-                commands::run::exec_watch(
+                commands::run::run_file_watch(
                     &cwd,
                     &file,
                     &args,
@@ -1822,7 +1831,7 @@ async fn async_main() -> Result<()> {
                 )
                 .await
             } else {
-                commands::run::exec(
+                commands::run::run_file(
                     &cwd,
                     &file,
                     &args,
