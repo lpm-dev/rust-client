@@ -34,6 +34,16 @@ pub struct TsTransformResponse {
     pub code: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistentTsTransformResponse {
+    schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum TsModuleFormat {
@@ -100,6 +110,66 @@ pub fn run_stdio() -> Result<(), LpmError> {
         .write_all(b"\n")
         .map_err(|e| LpmError::Script(format!("failed to write LPM TS transform response: {e}")))?;
     Ok(())
+}
+
+pub fn run_persistent_stdio() -> Result<(), LpmError> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    run_persistent_stdio_with(stdin.lock(), stdout.lock())
+}
+
+fn run_persistent_stdio_with<R, W>(mut reader: R, mut writer: W) -> Result<(), LpmError>
+where
+    R: std::io::BufRead,
+    W: std::io::Write,
+{
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line).map_err(|e| {
+            LpmError::Script(format!("failed to read LPM TS transform request: {e}"))
+        })?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+
+        let request_json = line.trim_end_matches(['\r', '\n']);
+        if request_json.is_empty() {
+            continue;
+        }
+
+        let response = match serde_json::from_str::<TsTransformRequest>(request_json) {
+            Ok(request) => match transform_request(&request) {
+                Ok(response) => PersistentTsTransformResponse {
+                    schema_version: response.schema_version,
+                    code: Some(response.code),
+                    error: None,
+                },
+                Err(error) => persistent_error_response(error.to_string()),
+            },
+            Err(error) => persistent_error_response(format!(
+                "failed to decode LPM TS transform request: {error}"
+            )),
+        };
+
+        serde_json::to_writer(&mut writer, &response).map_err(|e| {
+            LpmError::Script(format!("failed to encode LPM TS transform response: {e}"))
+        })?;
+        writer.write_all(b"\n").map_err(|e| {
+            LpmError::Script(format!("failed to write LPM TS transform response: {e}"))
+        })?;
+        writer.flush().map_err(|e| {
+            LpmError::Script(format!("failed to flush LPM TS transform response: {e}"))
+        })?;
+    }
+}
+
+fn persistent_error_response(message: String) -> PersistentTsTransformResponse {
+    PersistentTsTransformResponse {
+        schema_version: TRANSFORM_PROTOCOL_VERSION,
+        code: None,
+        error: Some(message),
+    }
 }
 
 pub fn transform_request(request: &TsTransformRequest) -> Result<TsTransformResponse, LpmError> {
@@ -247,6 +317,7 @@ fn default_source_map() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn transform(source: &str, filename: &str, format: TsModuleFormat) -> String {
         let request = TsTransformRequest {
@@ -315,6 +386,96 @@ mod tests {
         assert!(
             !code.contains("export {};"),
             "CommonJS output must not retain OXC's empty ESM marker, got:\n{code}"
+        );
+    }
+
+    fn persistent_request(source: &str, filename: &str, format: &str) -> String {
+        json!({
+            "schemaVersion": TRANSFORM_PROTOCOL_VERSION,
+            "filename": filename,
+            "source": source,
+            "format": format,
+            "sourceMap": false,
+            "options": {
+                "jsx": {
+                    "runtime": "automatic",
+                    "development": false
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn run_persistent_stdio_returns_one_response_per_request_line() {
+        let input = format!(
+            "{}\n{}\n",
+            persistent_request(
+                "const one: number = 1;\nconsole.log(one);\n",
+                "one.ts",
+                "commonjs"
+            ),
+            persistent_request(
+                "const two: number = 2;\nconsole.log(two);\n",
+                "two.ts",
+                "commonjs"
+            )
+        );
+        let mut output = Vec::new();
+
+        run_persistent_stdio_with(std::io::Cursor::new(input), &mut output)
+            .expect("persistent transform session should succeed");
+
+        let text = String::from_utf8(output).expect("persistent response should be utf8");
+        let responses = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid response"))
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert!(
+            responses.iter().all(|response| {
+                response["schemaVersion"] == TRANSFORM_PROTOCOL_VERSION
+                    && response["code"]
+                        .as_str()
+                        .is_some_and(|code| code.contains("const"))
+                    && response.get("error").is_none()
+            }),
+            "persistent responses must all be successful, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn run_persistent_stdio_reports_malformed_request_without_closing_session() {
+        let input = format!(
+            "{{not json}}\n{}\n",
+            persistent_request(
+                "const value: string = 'ok';\nconsole.log(value);\n",
+                "ok.ts",
+                "commonjs"
+            )
+        );
+        let mut output = Vec::new();
+
+        run_persistent_stdio_with(std::io::Cursor::new(input), &mut output)
+            .expect("persistent transform session should recover from bad request");
+
+        let text = String::from_utf8(output).expect("persistent response should be utf8");
+        let responses = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid response"))
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert!(
+            responses[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("failed to decode")),
+            "first response must describe malformed input, got:\n{text}"
+        );
+        assert!(
+            responses[1]["code"]
+                .as_str()
+                .is_some_and(|code| code.contains("const value = \"ok\";")),
+            "second response must prove the session stayed open, got:\n{text}"
         );
     }
 }

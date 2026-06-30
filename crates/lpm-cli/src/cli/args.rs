@@ -2802,7 +2802,10 @@ pub(crate) enum Commands {
 
     /// Hidden OXC transform helper for the LPM TypeScript runtime.
     #[command(name = "internal-ts-transform", hide = true)]
-    InternalTsTransform,
+    InternalTsTransform {
+        #[arg(long, hide = true)]
+        persistent: bool,
+    },
 
     /// Generate a shell completion script.
     ///

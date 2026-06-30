@@ -4,8 +4,9 @@ const fs = require("node:fs");
 const moduleApi = require("node:module");
 const path = require("node:path");
 const { pathToFileURL, fileURLToPath } = require("node:url");
+const { Worker } = require("node:worker_threads");
 
-const RUNTIME_VERSION = "4";
+const RUNTIME_VERSION = "5";
 const TRANSFORM_PROTOCOL_VERSION = 1;
 const CACHE_ENTRY_SCHEMA_VERSION = 1;
 const TS_EXT_RE = /\.(?:ts|tsx|mts|cts)$/;
@@ -15,7 +16,18 @@ const CACHE_DIR =
   process.env.LPM_TS_RUNTIME_CACHE_DIR ||
   path.join(PROJECT_DIR, ".lpm", "exec-ts-runtime-cache");
 const TRANSFORMER = process.env.LPM_TS_RUNTIME_TRANSFORMER;
+const WORKER_PATH = path.join(__dirname, "lpm-ts-runtime-worker.cjs");
 const MAX_TRANSFORM_OUTPUT_BYTES = 64 * 1024 * 1024;
+const PERSISTENT_TRANSFORM_TIMEOUT_MS = 120 * 1000;
+const STATE_IDLE = 0;
+const STATE_REQUEST = 1;
+const STATE_RESPONSE = 2;
+const CONTROL_STATE = 0;
+const CONTROL_REQUEST_ID = 1;
+const CONTROL_SHUTDOWN = 2;
+
+let persistentTransformClient = null;
+let persistentTransformUnavailable = false;
 
 if (typeof moduleApi.registerHooks !== "function") {
   throw new Error("LPM TS runtime requires Node.js module.registerHooks support. Run `lpm use node@22.18+`.");
@@ -130,6 +142,26 @@ function transformSource(filename, source, format, options) {
     sourceMap: true,
     options,
   };
+
+  if (!persistentTransformUnavailable) {
+    try {
+      const persistentResult = transformSourceWithPersistentHelper(request, filename);
+      if (persistentResult !== null) {
+        return persistentResult;
+      }
+    } catch (error) {
+      if (!error || !error.lpmPersistentTransport) {
+        throw error;
+      }
+      persistentTransformUnavailable = true;
+      shutdownPersistentTransformClient();
+    }
+  }
+
+  return transformSourceOnce(request, filename);
+}
+
+function transformSourceOnce(request, filename) {
   const result = childProcess.spawnSync(TRANSFORMER, ["internal-ts-transform"], {
     input: JSON.stringify(request),
     encoding: "utf8",
@@ -161,6 +193,178 @@ function transformSource(filename, source, format, options) {
     throw new Error(`LPM OXC TypeScript transform returned an invalid response for ${filename}`);
   }
   return response.code;
+}
+
+function transformSourceWithPersistentHelper(request, filename) {
+  const client = ensurePersistentTransformClient();
+  if (!client) {
+    return null;
+  }
+
+  const requestId = ++client.nextRequestId;
+  const requestPath = path.join(client.sessionDir, `request-${requestId}.json`);
+  const responsePath = path.join(client.sessionDir, `response-${requestId}.json`);
+  const requestTmpPath = `${requestPath}.${process.pid}.tmp`;
+  let resetToIdle = false;
+
+  try {
+    if (Atomics.load(client.control, CONTROL_STATE) !== STATE_IDLE) {
+      throw persistentTransportError("LPM TS runtime persistent helper is not idle");
+    }
+
+    fs.writeFileSync(requestTmpPath, JSON.stringify(request), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(requestTmpPath, requestPath);
+
+    Atomics.store(client.control, CONTROL_REQUEST_ID, requestId);
+    Atomics.store(client.control, CONTROL_STATE, STATE_REQUEST);
+    Atomics.notify(client.control, CONTROL_STATE, 1);
+
+    waitForPersistentResponse(client, filename);
+    resetToIdle = true;
+
+    let response;
+    try {
+      response = JSON.parse(fs.readFileSync(responsePath, "utf8"));
+    } catch (error) {
+      throw persistentTransportError(`LPM OXC TypeScript transform returned invalid JSON for ${filename}: ${error.message}`);
+    }
+
+    if (!response || response.schemaVersion !== TRANSFORM_PROTOCOL_VERSION) {
+      throw persistentTransportError(`LPM OXC TypeScript transform returned an invalid response for ${filename}`);
+    }
+    if (response.transportError && typeof response.error === "string") {
+      throw persistentTransportError(`LPM OXC TypeScript persistent helper failed for ${filename}:\n${response.error}`);
+    }
+    if (typeof response.error === "string") {
+      throw new Error(`LPM OXC TypeScript transform failed for ${filename}:\n${response.error}`);
+    }
+    if (typeof response.code !== "string") {
+      throw persistentTransportError(`LPM OXC TypeScript transform returned an invalid response for ${filename}`);
+    }
+    return response.code;
+  } finally {
+    try {
+      fs.rmSync(requestTmpPath, { force: true });
+      fs.rmSync(requestPath, { force: true });
+      fs.rmSync(responsePath, { force: true });
+    } catch (_error) {
+      // Best-effort cleanup for short-lived IPC files.
+    }
+    if (resetToIdle) {
+      Atomics.store(client.control, CONTROL_STATE, STATE_IDLE);
+      Atomics.notify(client.control, CONTROL_STATE, 1);
+    }
+  }
+}
+
+function ensurePersistentTransformClient() {
+  if (persistentTransformUnavailable || process.env.LPM_TS_RUNTIME_PERSISTENT_TRANSFORM === "0") {
+    return null;
+  }
+  if (persistentTransformClient) {
+    return persistentTransformClient;
+  }
+  if (
+    typeof Worker !== "function" ||
+    typeof SharedArrayBuffer !== "function" ||
+    typeof Atomics.wait !== "function" ||
+    !fs.existsSync(WORKER_PATH)
+  ) {
+    persistentTransformUnavailable = true;
+    return null;
+  }
+
+  const sessionRoot = path.join(CACHE_DIR, "sessions");
+  const sessionDir = path.join(
+    sessionRoot,
+    `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`
+  );
+  fs.mkdirSync(sessionDir, { recursive: true });
+
+  const sharedBuffer = new SharedArrayBuffer(3 * Int32Array.BYTES_PER_ELEMENT);
+  const control = new Int32Array(sharedBuffer);
+  const client = {
+    control,
+    nextRequestId: 0,
+    sessionDir,
+    worker: null,
+  };
+
+  try {
+    client.worker = new Worker(WORKER_PATH, {
+      workerData: {
+        sessionDir,
+        sharedBuffer,
+        transformer: TRANSFORMER,
+        protocolVersion: TRANSFORM_PROTOCOL_VERSION,
+        maxTransformOutputBytes: MAX_TRANSFORM_OUTPUT_BYTES,
+      },
+    });
+  } catch (_error) {
+    persistentTransformUnavailable = true;
+    cleanupPersistentSession(sessionDir);
+    return null;
+  }
+
+  client.worker.unref();
+  client.worker.on("error", () => {
+    persistentTransformUnavailable = true;
+  });
+  client.worker.on("exit", (code) => {
+    if (code !== 0) {
+      persistentTransformUnavailable = true;
+    }
+  });
+  process.once("exit", shutdownPersistentTransformClient);
+  persistentTransformClient = client;
+  return client;
+}
+
+function waitForPersistentResponse(client, filename) {
+  const deadline = Date.now() + PERSISTENT_TRANSFORM_TIMEOUT_MS;
+  while (Atomics.load(client.control, CONTROL_STATE) === STATE_REQUEST) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      Atomics.store(client.control, CONTROL_SHUTDOWN, 1);
+      Atomics.notify(client.control, CONTROL_STATE, 1);
+      throw persistentTransportError(`LPM OXC TypeScript persistent helper timed out for ${filename}`);
+    }
+    Atomics.wait(client.control, CONTROL_STATE, STATE_REQUEST, Math.min(remaining, 1000));
+  }
+
+  if (Atomics.load(client.control, CONTROL_STATE) !== STATE_RESPONSE) {
+    throw persistentTransportError(`LPM OXC TypeScript persistent helper stopped before transforming ${filename}`);
+  }
+}
+
+function persistentTransportError(message) {
+  const error = new Error(message);
+  error.lpmPersistentTransport = true;
+  return error;
+}
+
+function shutdownPersistentTransformClient() {
+  const client = persistentTransformClient;
+  if (!client) {
+    return;
+  }
+  persistentTransformClient = null;
+  Atomics.store(client.control, CONTROL_SHUTDOWN, 1);
+  Atomics.notify(client.control, CONTROL_STATE, 1);
+  try {
+    client.worker.terminate();
+  } catch (_error) {
+    persistentTransformUnavailable = true;
+  }
+  cleanupPersistentSession(client.sessionDir);
+}
+
+function cleanupPersistentSession(sessionDir) {
+  try {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  } catch (_error) {
+    persistentTransformUnavailable = true;
+  }
 }
 
 function transformOptionsFor(format) {

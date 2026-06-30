@@ -1,6 +1,6 @@
 mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -53,6 +53,26 @@ fn write_fake_tsx(project: &TempProject) {
     };
     std::fs::write(&tsx_path, script).expect("write fake tsx");
     make_executable(&tsx_path);
+}
+
+fn transform_cache_dir(project: &TempProject) -> PathBuf {
+    let runtime_root = project.home().join(".lpm/cache/exec-ts-runtime");
+    let mut candidates = std::fs::read_dir(&runtime_root)
+        .expect("LPM TS runtime root must exist")
+        .filter_map(|entry| {
+            let path = entry.expect("runtime root entry must be readable").path();
+            let cache_dir = path.join("transform-cache");
+            cache_dir.is_dir().then_some(cache_dir)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "test project must have exactly one LPM TS runtime transform cache dir under {}",
+        runtime_root.display()
+    );
+    candidates.remove(0)
 }
 
 fn write_fake_react_runtime(project: &TempProject) {
@@ -468,9 +488,7 @@ fn exec_typescript_transform_cache_contains_inline_source_map() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let cache_dir = project
-        .home()
-        .join(".lpm/cache/exec-ts-runtime/v2/transform-cache");
+    let cache_dir = transform_cache_dir(&project);
     let mut found_source_map = false;
     for entry in std::fs::read_dir(&cache_dir).expect("transform cache dir must exist") {
         let entry = entry.expect("cache entry must be readable");
@@ -1297,9 +1315,7 @@ fn exec_tsx_file_ignores_stale_transform_cache_after_runtime_output_changes() {
         String::from_utf8_lossy(&first_output.stdout),
         String::from_utf8_lossy(&first_output.stderr),
     );
-    let cache_dir = project
-        .home()
-        .join(".lpm/cache/exec-ts-runtime/v2/transform-cache");
+    let cache_dir = transform_cache_dir(&project);
     let mut corrupted_entries = 0;
     for entry in std::fs::read_dir(&cache_dir).expect("transform cache dir must exist") {
         let entry = entry.expect("cache entry must be readable");
