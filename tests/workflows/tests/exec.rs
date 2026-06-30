@@ -92,6 +92,30 @@ fn transform_cache_dir(project: &TempProject) -> PathBuf {
     candidates.remove(0)
 }
 
+fn read_ts_runtime_trace(trace_path: &Path) -> Vec<serde_json::Value> {
+    let trace = std::fs::read_to_string(trace_path)
+        .unwrap_or_else(|e| panic!("failed to read trace {}: {e}", trace_path.display()));
+    trace
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("trace line must be JSON"))
+        .collect()
+}
+
+fn has_persistent_transport_event(
+    events: &[serde_json::Value],
+    filename_suffix: &str,
+    request_mode: &str,
+) -> bool {
+    events.iter().any(|event| {
+        event["phase"].as_str() == Some("persistent_transport")
+            && event["filename"]
+                .as_str()
+                .is_some_and(|filename| filename.ends_with(filename_suffix))
+            && event["requestMode"].as_str() == Some(request_mode)
+    })
+}
+
 fn write_fake_react_runtime(project: &TempProject) {
     project.write_file(
         "node_modules/react/package.json",
@@ -615,6 +639,68 @@ fn exec_typescript_transform_cache_contains_inline_source_map() {
     assert!(
         found_source_map,
         "transform cache must store code with an inline source map"
+    );
+}
+
+#[test]
+fn exec_typescript_trace_reports_inline_persistent_transport_for_small_source() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "scripts/seed.ts",
+        "const message: string = 'trace-inline';\nconsole.log(message);\n",
+    );
+    let trace_path = project.path().join("trace-inline.jsonl");
+
+    let output = lpm(&project)
+        .env("LPM_TS_RUNTIME_TRACE", "1")
+        .env("LPM_TS_RUNTIME_TRACE_FILE", trace_path.as_os_str())
+        .args(["scripts/seed.ts"])
+        .output()
+        .expect("failed to run lpm on traced TypeScript");
+
+    assert!(
+        output.status.success(),
+        "traced managed TypeScript exec must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let events = read_ts_runtime_trace(&trace_path);
+    assert!(
+        has_persistent_transport_event(&events, "scripts/seed.ts", "inline"),
+        "small TS source must use inline persistent transport, got: {events:?}"
+    );
+}
+
+#[test]
+fn exec_typescript_trace_reports_file_transport_for_large_source() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    let payload = "x".repeat(300 * 1024);
+    let source = format!("const message: string = {payload:?};\nconsole.log(message.length);\n");
+    project.write_file("scripts/large.ts", &source);
+    let trace_path = project.path().join("trace-large.jsonl");
+
+    let output = lpm(&project)
+        .env("LPM_TS_RUNTIME_TRACE", "1")
+        .env("LPM_TS_RUNTIME_TRACE_FILE", trace_path.as_os_str())
+        .args(["scripts/large.ts"])
+        .output()
+        .expect("failed to run lpm on traced large TypeScript");
+
+    assert!(
+        output.status.success(),
+        "traced large TypeScript exec must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("307200"),
+        "large source must execute after transform, got:\n{stdout}"
+    );
+    let events = read_ts_runtime_trace(&trace_path);
+    assert!(
+        has_persistent_transport_event(&events, "scripts/large.ts", "file"),
+        "large TS source must use file fallback persistent transport, got: {events:?}"
     );
 }
 

@@ -6,12 +6,20 @@ const { workerData } = require("node:worker_threads");
 const STATE_IDLE = 0;
 const STATE_REQUEST = 1;
 const STATE_RESPONSE = 2;
+const MODE_INLINE = 1;
+const MODE_FILE = 2;
 const CONTROL_STATE = 0;
 const CONTROL_REQUEST_ID = 1;
 const CONTROL_SHUTDOWN = 2;
+const CONTROL_REQUEST_MODE = 3;
+const CONTROL_REQUEST_BYTES = 4;
+const CONTROL_RESPONSE_MODE = 5;
+const CONTROL_RESPONSE_BYTES = 6;
 const MAX_STDERR_BYTES = 64 * 1024;
 
 const control = new Int32Array(workerData.sharedBuffer);
+const requestBytes = new Uint8Array(workerData.requestBuffer);
+const responseBytes = new Uint8Array(workerData.responseBuffer);
 let helper = null;
 let stdoutBuffer = "";
 let stderrTail = "";
@@ -52,12 +60,21 @@ async function handleRequest(requestId) {
   const requestPath = path.join(workerData.sessionDir, `request-${requestId}.json`);
   const responsePath = path.join(workerData.sessionDir, `response-${requestId}.json`);
   try {
-    const requestJson = fs.readFileSync(requestPath, "utf8");
+    const requestJson = readRequestJson(requestPath);
     const responseJson = await transformWithHelper(requestJson);
-    writeResponseFile(responsePath, responseJson);
+    writeResponse(responsePath, responseJson);
   } catch (error) {
-    writeResponseFile(responsePath, JSON.stringify(errorResponse(error)));
+    writeResponse(responsePath, JSON.stringify(errorResponse(error)));
   }
+}
+
+function readRequestJson(requestPath) {
+  const requestMode = Atomics.load(control, CONTROL_REQUEST_MODE);
+  if (requestMode === MODE_INLINE) {
+    const byteLength = Atomics.load(control, CONTROL_REQUEST_BYTES);
+    return Buffer.from(requestBytes.subarray(0, byteLength)).toString("utf8");
+  }
+  return fs.readFileSync(requestPath, "utf8");
 }
 
 function transformWithHelper(requestJson) {
@@ -158,6 +175,20 @@ function writeResponseFile(responsePath, responseJson) {
   fs.renameSync(tmpPath, responsePath);
 }
 
+function writeResponse(responsePath, responseJson) {
+  const payload = Buffer.from(responseJson);
+  if (payload.length <= responseBytes.byteLength) {
+    responseBytes.set(payload);
+    Atomics.store(control, CONTROL_RESPONSE_BYTES, payload.length);
+    Atomics.store(control, CONTROL_RESPONSE_MODE, MODE_INLINE);
+    return;
+  }
+
+  writeResponseFile(responsePath, responseJson);
+  Atomics.store(control, CONTROL_RESPONSE_BYTES, payload.length);
+  Atomics.store(control, CONTROL_RESPONSE_MODE, MODE_FILE);
+}
+
 function errorResponse(error) {
   return {
     schemaVersion: workerData.protocolVersion,
@@ -171,7 +202,7 @@ function writeFatalResponse(error) {
   if (requestId > 0) {
     const responsePath = path.join(workerData.sessionDir, `response-${requestId}.json`);
     try {
-      writeResponseFile(responsePath, JSON.stringify(errorResponse(error)));
+      writeResponse(responsePath, JSON.stringify(errorResponse(error)));
     } catch (_writeError) {
       // The parent will time out if the response path cannot be written.
     }

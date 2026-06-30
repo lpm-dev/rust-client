@@ -597,30 +597,33 @@ fn build_command_plan(
             transformer,
         } => {
             let node_options = lpm_ts_runtime_node_options(loader);
+            let mut env_overrides = Vec::with_capacity(7);
+            env_overrides.extend([
+                (
+                    "LPM_TS_RUNTIME_PROJECT_DIR".to_string(),
+                    project_dir.to_string_lossy().to_string(),
+                ),
+                (
+                    "LPM_TS_RUNTIME_CACHE_DIR".to_string(),
+                    cache_dir.to_string_lossy().to_string(),
+                ),
+                (
+                    "LPM_TS_RUNTIME_TRANSFORMER".to_string(),
+                    transformer.to_string_lossy().to_string(),
+                ),
+                (
+                    "LPM_TS_RUNTIME_PROTOCOL_VERSION".to_string(),
+                    crate::ts_transform::TRANSFORM_PROTOCOL_VERSION.to_string(),
+                ),
+                ("NODE_OPTIONS".to_string(), node_options),
+            ]);
+            env_overrides.extend(lpm_ts_runtime_trace_env_overrides());
             let node = build_node_launch_config(
                 file_path,
                 extra_args,
                 path,
                 Vec::new(),
-                vec![
-                    (
-                        "LPM_TS_RUNTIME_PROJECT_DIR".to_string(),
-                        project_dir.to_string_lossy().to_string(),
-                    ),
-                    (
-                        "LPM_TS_RUNTIME_CACHE_DIR".to_string(),
-                        cache_dir.to_string_lossy().to_string(),
-                    ),
-                    (
-                        "LPM_TS_RUNTIME_TRANSFORMER".to_string(),
-                        transformer.to_string_lossy().to_string(),
-                    ),
-                    (
-                        "LPM_TS_RUNTIME_PROTOCOL_VERSION".to_string(),
-                        crate::ts_transform::TRANSFORM_PROTOCOL_VERSION.to_string(),
-                    ),
-                    ("NODE_OPTIONS".to_string(), node_options),
-                ],
+                env_overrides,
                 ChildPropagationMode::LpmTsRuntime,
             );
             (node.to_command_plan(), Some(node))
@@ -641,6 +644,22 @@ fn build_command_plan(
             )
         }
     }
+}
+
+fn lpm_ts_runtime_trace_env_overrides() -> Vec<(String, String)> {
+    if std::env::var("LPM_TS_RUNTIME_TRACE").as_deref() != Ok("1") {
+        return Vec::new();
+    }
+
+    let mut env = Vec::with_capacity(2);
+    env.push(("LPM_TS_RUNTIME_TRACE".to_string(), "1".to_string()));
+    if let Some(path) = std::env::var_os("LPM_TS_RUNTIME_TRACE_FILE") {
+        env.push((
+            "LPM_TS_RUNTIME_TRACE_FILE".to_string(),
+            path.to_string_lossy().to_string(),
+        ));
+    }
+    env
 }
 
 fn build_node_launch_config(
