@@ -370,7 +370,7 @@ jobs:
           set -euo pipefail
           rm -rf artifact-downloads binaries
           mkdir -p artifact-downloads binaries
-          gh run download "$GITHUB_RUN_ID" --dir artifact-downloads
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifact-downloads
 
           count=0
           for artifact_file in artifact-downloads/*/*; do
@@ -461,7 +461,7 @@ jobs:
           set -euo pipefail
           rm -rf artifact-downloads binaries
           mkdir -p artifact-downloads binaries
-          gh run download "$GITHUB_RUN_ID" --dir artifact-downloads
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifact-downloads
 
           count=0
           for artifact_file in artifact-downloads/*/*; do
