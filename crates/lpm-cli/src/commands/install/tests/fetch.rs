@@ -486,6 +486,157 @@ fn registry_speculation_key_matches_install_package_key() {
     );
 }
 
+#[test]
+fn canonical_cached_registry_tarball_url_uses_unscoped_archive_name_for_scoped_npm() {
+    let client = RegistryClient::new();
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+
+    assert_eq!(
+        canonical_cached_registry_tarball_url(
+            &client,
+            &route_table,
+            "@types/node",
+            "20.0.0",
+            false,
+        )
+        .as_deref(),
+        Some("https://registry.npmjs.org/@types/node/-/node-20.0.0.tgz"),
+    );
+}
+
+#[test]
+fn canonical_cached_registry_tarball_url_uses_package_archive_name_for_lpm() {
+    let client = RegistryClient::new();
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+
+    assert_eq!(
+        canonical_cached_registry_tarball_url(
+            &client,
+            &route_table,
+            "@lpm.dev/owner.react",
+            "1.0.0",
+            true,
+        )
+        .as_deref(),
+        Some("https://lpm.dev/api/registry/@lpm.dev/owner.react/-/react-1.0.0.tgz"),
+    );
+}
+
+#[tokio::test]
+async fn resolve_tarball_url_trusts_canonical_cached_npm_url_without_metadata_lookup() {
+    let server = wiremock::MockServer::start().await;
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let cached_url = format!("{}/left-pad/-/left-pad-1.0.0.tgz", server.uri());
+
+    let resolved = resolve_tarball_url(
+        &client,
+        &route_table,
+        "left-pad",
+        "1.0.0",
+        false,
+        Some(&cached_url),
+        false,
+    )
+    .await
+    .expect("canonical cached URL should not need registry metadata");
+
+    assert_eq!(resolved.url, cached_url);
+}
+
+#[tokio::test]
+async fn resolve_tarball_url_trusts_canonical_cached_lpm_url_without_metadata_lookup() {
+    let server = wiremock::MockServer::start().await;
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let cached_url = format!(
+        "{}/api/registry/@lpm.dev/owner.react/-/react-1.0.0.tgz",
+        server.uri()
+    );
+
+    let resolved = resolve_tarball_url(
+        &client,
+        &route_table,
+        "@lpm.dev/owner.react",
+        "1.0.0",
+        true,
+        Some(&cached_url),
+        false,
+    )
+    .await
+    .expect("canonical cached LPM URL should not need registry metadata");
+
+    assert_eq!(resolved.url, cached_url);
+}
+
+#[tokio::test]
+async fn resolve_tarball_url_verifies_noncanonical_cached_url_against_metadata() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    let metadata_url = format!("{}/left-pad/-/left-pad-1.0.0.tgz", server.uri());
+    let cached_url = format!("{}/tarballs/left-pad/-/left-pad-1.0.0.tgz", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/left-pad"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "left-pad",
+            "dist-tags": {
+                "latest": "1.0.0"
+            },
+            "versions": {
+                "1.0.0": {
+                    "name": "left-pad",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": metadata_url,
+                        "integrity": "sha512-test"
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let err = match resolve_tarball_url(
+        &client,
+        &route_table,
+        "left-pad",
+        "1.0.0",
+        false,
+        Some(&cached_url),
+        false,
+    )
+    .await
+    {
+        Ok(resolved) => panic!(
+            "non-canonical cached URL must still be checked against metadata, got {}",
+            resolved.url
+        ),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("does not match registry metadata"),
+        "metadata mismatch error should be preserved, got: {err}"
+    );
+}
+
 // ── : redirect handling ────────────────────────────────
 // The lockfile records the *declared* URL, not
 // the final-redirect target. The integrity is computed from the

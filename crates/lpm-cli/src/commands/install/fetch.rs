@@ -830,6 +830,86 @@ pub(super) struct ResolvedRegistryTarballUrl {
     pub(super) url: String,
 }
 
+fn tarball_file_prefix(name: &str) -> Option<&str> {
+    name.rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+}
+
+fn npm_compatible_canonical_tarball_url(
+    registry_base_url: &str,
+    name: &str,
+    version: &str,
+) -> Option<String> {
+    let file_prefix = tarball_file_prefix(name)?;
+    let registry_base_url = registry_base_url.trim_end_matches('/');
+    let mut url = String::with_capacity(
+        registry_base_url.len() + 1 + name.len() + 3 + file_prefix.len() + 1 + version.len() + 4,
+    );
+    url.push_str(registry_base_url);
+    url.push('/');
+    url.push_str(name);
+    url.push_str("/-/");
+    url.push_str(file_prefix);
+    url.push('-');
+    url.push_str(version);
+    url.push_str(".tgz");
+    Some(url)
+}
+
+fn lpm_canonical_tarball_url(base_url: &str, name: &str, version: &str) -> Option<String> {
+    let package = lpm_common::PackageName::parse(name).ok()?;
+    let base_url = base_url.trim_end_matches('/');
+    let api_prefix = "/api/registry/";
+    let lpm_scope = "@lpm.dev/";
+    let mut url = String::with_capacity(
+        base_url.len()
+            + api_prefix.len()
+            + lpm_scope.len()
+            + package.owner.len()
+            + 1
+            + package.name.len()
+            + 3
+            + package.name.len()
+            + 1
+            + version.len()
+            + 4,
+    );
+    url.push_str(base_url);
+    url.push_str(api_prefix);
+    url.push_str(lpm_scope);
+    url.push_str(&package.owner);
+    url.push('.');
+    url.push_str(&package.name);
+    url.push_str("/-/");
+    url.push_str(&package.name);
+    url.push('-');
+    url.push_str(version);
+    url.push_str(".tgz");
+    Some(url)
+}
+
+pub(super) fn canonical_cached_registry_tarball_url(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    name: &str,
+    version: &str,
+    is_lpm: bool,
+) -> Option<String> {
+    if is_lpm {
+        return lpm_canonical_tarball_url(client.base_url(), name, version);
+    }
+
+    match route_table.route_for_package(name) {
+        UpstreamRoute::Custom { target, .. } => {
+            npm_compatible_canonical_tarball_url(&target.base_url, name, version)
+        }
+        UpstreamRoute::NpmDirect | UpstreamRoute::LpmWorker => {
+            npm_compatible_canonical_tarball_url(client.npm_registry_url(), name, version)
+        }
+    }
+}
+
 pub(super) async fn metadata_tarball_url_for_package(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
@@ -856,16 +936,12 @@ pub(super) async fn metadata_tarball_url_for_package(
 }
 
 /// Resolve the tarball URL for a registry package. Lockfile-provided
-/// registry tarball hints are only cache hints: before fetching them,
-/// bind them back to the package version's current registry metadata.
+/// registry tarball hints are cache hints: use the route's canonical tarball
+/// URL without a metadata round trip when it matches, otherwise bind the hint
+/// back to the package version's current registry metadata.
 ///
-/// the non-LPM branch now routes through
-/// [`RegistryClient::get_npm_metadata_routed`] using
-/// `route_table.route_for_package(name)`. Previously this branch always
-/// hit the bare `get_npm_package_metadata` (Worker → npm.org fallback)
-/// even when the resolver had originally fetched from a `.npmrc`-
-/// declared custom registry — so a stale-tarball retry would re-resolve
-/// against the wrong registry and return either npm.org's view or 404.
+/// Non-LPM metadata lookups route through `route_table`, so custom registry
+/// hints are validated against the same registry that resolved them.
 pub(super) async fn resolve_tarball_url(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
@@ -877,6 +953,14 @@ pub(super) async fn resolve_tarball_url(
 ) -> Result<ResolvedRegistryTarballUrl, LpmError> {
     if let Some(url) = cached_url {
         if metadata_checked_for_tarball {
+            return Ok(ResolvedRegistryTarballUrl {
+                url: url.to_string(),
+            });
+        }
+        if canonical_cached_registry_tarball_url(client, route_table, name, version, is_lpm)
+            .as_deref()
+            == Some(url)
+        {
             return Ok(ResolvedRegistryTarballUrl {
                 url: url.to_string(),
             });
