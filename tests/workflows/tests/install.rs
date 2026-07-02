@@ -6965,6 +6965,69 @@ async fn install_prod_omits_dev_dependencies_from_disk_but_keeps_lockfile_entrie
 }
 
 #[tokio::test]
+async fn install_omit_dev_after_full_install_does_not_use_up_to_date_fast_path() {
+    let mock = MockRegistry::start().await;
+    let prod_tarball = make_tarball("prod-only", "1.0.0");
+    let dev_tarball = make_tarball("dev-only", "1.0.0");
+    mock.with_package("prod-only", "1.0.0", &prod_tarball).await;
+    mock.with_package("dev-only", "1.0.0", &dev_tarball).await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "omit-dev-after-full-install",
+        "version": "1.0.0",
+        "dependencies": { "prod-only": "1.0.0" },
+        "devDependencies": { "dev-only": "1.0.0" }
+    }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assertions::assert_in_node_modules(project.path(), "prod-only");
+    assertions::assert_in_node_modules(project.path(), "dev-only");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--omit=dev",
+            "--json",
+            "--timing",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run second lpm install --omit=dev");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "omit-dev reinstall after a full install failed:\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let json = assertions::parse_json_output(&output.stdout);
+    assert_ne!(
+        json["up_to_date"],
+        serde_json::json!(true),
+        "omit-dev reinstall must not take the up-to-date fast path:\n{json:#}\n{stderr}"
+    );
+    assertions::assert_in_node_modules(project.path(), "prod-only");
+    assert!(
+        !project.path().join("node_modules/dev-only").exists(),
+        "omit-dev reinstall must prune the previously linked dev dependency"
+    );
+}
+
+#[tokio::test]
 async fn install_omit_dev_does_not_prefetch_dev_only_packages() {
     let mock = MockRegistry::start().await;
     let dev_tarball = make_tarball("dev-only", "1.0.0");
