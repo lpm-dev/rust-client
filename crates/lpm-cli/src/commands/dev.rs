@@ -2442,20 +2442,15 @@ mod tests {
         assert!(hash.is_none());
     }
 
-    /// Dev composed contract: `auto_install_if_stale` MUST leave a
-    /// v7-shaped `.lpm/install-hash` on disk (4 lines: hash + `m:` +
-    /// `l:` + `i:`). Pre-fix dev wrote a competing bare single-line hash
-    /// post-install, clobbering the v7 mtime / config metadata that
-    /// `run_with_options` had just written; the post-fix design
-    /// delegates the entire write to the install pipeline. This test
-    /// exercises the real seam — calls `auto_install_if_stale` against
-    /// an empty-deps project (no network needed; the install pipeline
-    /// short-circuits at the empty-deps branch), then asserts the
-    /// install-hash file is v7 shape. A future regression that
-    /// reintroduces a parallel bare-hash overwrite in `auto_install_if_stale`
-    /// (or anywhere else in the dev flow) fails here immediately.
+    /// Dev composed contract: `auto_install_if_stale` leaves the same
+    /// metadata-rich `.lpm/install-hash` shape as the install pipeline.
+    /// This calls `auto_install_if_stale` against an empty-deps project
+    /// (no network needed; the install pipeline short-circuits at the
+    /// empty-deps branch), then asserts the install-hash file is v8 shape.
+    /// A future regression that reintroduces a parallel bare-hash overwrite
+    /// in `auto_install_if_stale` or the dev flow fails here immediately.
     #[tokio::test]
-    async fn auto_install_if_stale_writes_v7_install_hash_for_empty_deps() {
+    async fn auto_install_if_stale_writes_v8_install_hash_for_empty_deps() {
         // Isolate every env var the install pipeline reads so a
         // developer's exported state can't pollute the test. `LPM_HOME`
         // redirects the store + cache + global config away from the
@@ -2499,14 +2494,14 @@ mod tests {
             "fresh project must look stale before auto_install_if_stale runs"
         );
 
-        // Exercise the real dev seam.
+        // Exercise the real dev/install handoff.
         let result = auto_install_if_stale(&client, p, &[]).await;
         assert!(
             result.is_ok(),
             "auto_install_if_stale must succeed on empty-deps project, got: {result:?}"
         );
 
-        // Load-bearing pin: install-hash on disk has v7 shape (4 lines).
+        // Load-bearing pin: install-hash on disk has v8 shape (5 lines).
         // A regression that reintroduces `fs::write(install_hash, &bare_hash)`
         // anywhere in the dev path — inside auto_install_if_stale or a
         // helper it calls — fails the line-count assertion here.
@@ -2515,8 +2510,8 @@ mod tests {
         let lines: Vec<&str> = on_disk.lines().collect();
         assert_eq!(
             lines.len(),
-            4,
-            "install-hash MUST be v7 (4 lines: hash + m: + l: + i:), got:\n{on_disk}\n\
+            5,
+            "install-hash MUST be v8 (5 lines: hash + m: + l: + i: + p:), got:\n{on_disk}\n\
              A bare-hash overwrite anywhere in the dev path would fail here."
         );
         assert_eq!(lines[0].len(), 64, "line 1 must be a SHA-256 hex hash");
@@ -2539,8 +2534,13 @@ mod tests {
             lines[2]
         );
         assert_eq!(lines[3], "i:source", "line 4 must be integrity policy");
+        assert!(
+            lines[4].starts_with("p:"),
+            "line 5 must be platform tuple, got {:?}",
+            lines[4]
+        );
 
-        // Round-trip: needs_install reads the v7 shape as up-to-date.
+        // Round-trip: needs_install reads the v8 shape as up-to-date.
         let (stale_after, hash) = needs_install(p);
         assert!(
             !stale_after,

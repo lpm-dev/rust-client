@@ -8,18 +8,21 @@ pub(super) fn write_post_install_hash(
     let pkg = std::fs::read_to_string(project_dir.join("package.json")).unwrap_or_default();
     let lock = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
     let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
-    let hash = crate::install_state::compute_install_hash_v7(
+    let platform = lpm_store::v2::PlatformTuple::current();
+    let hash = crate::install_state::compute_install_hash_v8(
         &pkg,
         &lock,
         &file_link_bytes,
         linker_mode,
         object_integrity_policy,
+        &platform,
     );
-    if let Err(e) = crate::install_state::write_install_hash_with_integrity(
+    if let Err(e) = crate::install_state::write_install_hash_with_integrity_and_platform(
         project_dir,
         &hash,
         linker_mode,
         object_integrity_policy,
+        &platform,
     ) {
         tracing::warn!(
             "failed to write `.lpm/install-hash` after install ({e}) — \
