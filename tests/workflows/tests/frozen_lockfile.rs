@@ -3,7 +3,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, assertions, lpm, lpm_with_registry};
 
 async fn mount_ms(mock: &MockRegistry) {
     let tarball = make_tarball("ms", "2.1.3");
@@ -226,6 +226,69 @@ async fn ci_env_enables_frozen_install_when_lockfile_exists() {
     assert!(
         stderr.contains("Frozen lockfile mismatch") && stderr.contains("--no-frozen-lockfile"),
         "stderr must explain CI frozen mode and the escape hatch, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn ci_auto_frozen_repeat_install_uses_up_to_date_fast_path() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "ci-auto-frozen-fast-path",
+            "version": "1.0.0",
+            "dependencies": { "ms": "^2.1.3" }
+        }"#,
+    );
+    install_once(&project, &mock).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("CI", "true")
+        .args([
+            "install",
+            "--json",
+            "--timing",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run repeated CI=true lpm install");
+
+    assert!(
+        output.status.success(),
+        "matching CI auto-frozen install must fast-exit successfully:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = assertions::parse_json_output(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        json["success"],
+        serde_json::json!(true),
+        "{json:#}\n{stderr}"
+    );
+    assert_eq!(
+        json["up_to_date"],
+        serde_json::json!(true),
+        "{json:#}\n{stderr}"
+    );
+    assert_eq!(
+        json["timing"]["resolve_ms"],
+        serde_json::json!(0),
+        "{json:#}\n{stderr}"
+    );
+    assert_eq!(
+        json["timing"]["fetch_ms"],
+        serde_json::json!(0),
+        "{json:#}\n{stderr}"
+    );
+    assert_eq!(
+        json["timing"]["link_ms"],
+        serde_json::json!(0),
+        "{json:#}\n{stderr}"
     );
 }
 

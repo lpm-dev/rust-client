@@ -98,6 +98,12 @@ pub(crate) struct InstallOmitPolicy {
     pub optional: bool,
 }
 
+impl InstallOmitPolicy {
+    fn is_default(self) -> bool {
+        !self.dev && !self.optional
+    }
+}
+
 fn publish_ages_from_resolved_metadata(
     packages: &[InstallPackage],
 ) -> HashMap<(String, String), u64> {
@@ -1158,9 +1164,9 @@ async fn run_with_options_under_store_lock(
         || compatibility_bin_names.is_empty()
         || lpm_linker::v2::project_compatibility_bins_ready(project_dir, compatibility_bin_names);
     let cleanup_catalogs_in_pipeline = requested_add_count.is_none();
-    let fast_path_base_eligible = !frozen_lockfile_active
-        && !force
+    let fast_path_base_eligible = !force
         && !offline
+        && omit_policy.is_default()
         && !strict_peer_dependencies
         && install_state.up_to_date
         && compatibility_bins_ready;

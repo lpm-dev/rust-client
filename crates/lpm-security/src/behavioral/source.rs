@@ -1,13 +1,13 @@
 //! Source code behavioral tag detection (10 tags).
 //!
 //! Scans .js/.ts/.mjs/.cjs/.jsx/.tsx files for patterns indicating
-//! what system-level capabilities a package uses. Uses `RegexSet` for
-//! efficient single-pass multi-pattern matching.
+//! what system-level capabilities a package uses. Patterns are compiled once
+//! and checked per tag so matching can short-circuit when a tag is found.
 //!
 //! SECURITY: All patterns use the `regex` crate which guarantees linear-time
 //! matching (Thompson NFA). NEVER use `fancy-regex` here — we scan untrusted input.
 
-use regex::RegexSet;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
@@ -27,16 +27,12 @@ pub struct SourceTags {
     pub dynamic_require: bool,
 }
 
-/// Index ranges into the compiled RegexSet for each tag.
-/// Each tag owns a contiguous range of pattern indices.
-struct TagRange {
+struct CompiledSourceTagPatterns {
     name: &'static str,
-    start: usize,
-    end: usize, // exclusive
+    regexes: Vec<Regex>,
 }
 
-/// All source tag patterns, grouped by tag. The order here defines the
-/// index ranges used to map RegexSet matches back to tag booleans.
+/// All source tag patterns, grouped by tag.
 ///
 /// These patterns are exact ports from the server's `behavioral-tags.js`.
 const SOURCE_PATTERNS: &[(&str, &[&str])] = &[
@@ -127,33 +123,26 @@ const SOURCE_PATTERNS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Compiled regex set + tag ranges. Initialized once via `OnceLock`.
 struct CompiledSourcePatterns {
-    regex_set: RegexSet,
-    tag_ranges: Vec<TagRange>,
+    tags: Vec<CompiledSourceTagPatterns>,
 }
 
 /// Get or compile the source patterns (thread-safe, compile-once).
 fn compiled_patterns() -> &'static CompiledSourcePatterns {
     static INSTANCE: OnceLock<CompiledSourcePatterns> = OnceLock::new();
     INSTANCE.get_or_init(|| {
-        let mut all_patterns = Vec::new();
-        let mut tag_ranges = Vec::new();
+        let tags = SOURCE_PATTERNS
+            .iter()
+            .map(|(name, patterns)| CompiledSourceTagPatterns {
+                name,
+                regexes: patterns
+                    .iter()
+                    .map(|pattern| Regex::new(pattern).expect("source tag regex must compile"))
+                    .collect(),
+            })
+            .collect();
 
-        for (name, patterns) in SOURCE_PATTERNS {
-            let start = all_patterns.len();
-            all_patterns.extend_from_slice(patterns);
-            let end = all_patterns.len();
-            tag_ranges.push(TagRange { name, start, end });
-        }
-
-        let regex_set =
-            RegexSet::new(&all_patterns).expect("source tag regex patterns must compile");
-
-        CompiledSourcePatterns {
-            regex_set,
-            tag_ranges,
-        }
+        CompiledSourcePatterns { tags }
     })
 }
 
@@ -262,13 +251,11 @@ pub fn strip_comments(input: &[u8], output: &mut Vec<u8>) {
 /// Returns `SourceTags` with boolean flags for each detected capability.
 pub fn analyze_source(stripped: &str) -> SourceTags {
     let compiled = compiled_patterns();
-    let matches = compiled.regex_set.matches(stripped);
-
     let mut tags = SourceTags::default();
 
-    for range in &compiled.tag_ranges {
-        let matched = (range.start..range.end).any(|idx| matches.matched(idx));
-        match range.name {
+    for tag in &compiled.tags {
+        let matched = tag.regexes.iter().any(|regex| regex.is_match(stripped));
+        match tag.name {
             "filesystem" => tags.filesystem = matched,
             "network" => tags.network = matched,
             "childProcess" => tags.child_process = matched,
