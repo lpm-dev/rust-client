@@ -224,6 +224,84 @@ fn licenses_scope_keeps_dev_only_duplicate_versions_excluded() {
 }
 
 #[test]
+fn licenses_missing_policy_does_not_reuse_root_manifest_for_duplicate_version() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "licenses-duplicate-manifest",
+            "version": "1.0.0",
+            "license": "MIT",
+            "dependencies": {
+                "foo": "^1.0.0"
+            },
+            "devDependencies": {
+                "dev-parent": "^1.0.0"
+            }
+        }"#,
+    );
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "foo".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..Default::default()
+    });
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "foo".to_string(),
+        version: "2.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..Default::default()
+    });
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "dev-parent".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        dependencies: vec!["foo@2.0.0".to_string()],
+        ..Default::default()
+    });
+    lockfile
+        .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("failed to write duplicate-name lockfile");
+    project.write_file(
+        "node_modules/foo/package.json",
+        r#"{
+            "name": "foo",
+            "version": "1.0.0",
+            "license": "MIT"
+        }"#,
+    );
+    project.write_file(
+        "node_modules/dev-parent/package.json",
+        r#"{
+            "name": "dev-parent",
+            "version": "1.0.0",
+            "license": "MIT"
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["licenses", "--json", "--fail-on", "missing"])
+        .output()
+        .expect("failed to run lpm licenses --fail-on missing --json");
+    assert!(
+        !output.status.success(),
+        "licenses --fail-on missing must fail for foo@2 without matching metadata; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("licenses stdout must be valid JSON");
+    assert_eq!(envelope["summary"]["missing"], serde_json::json!(1));
+    let foo_two =
+        package_for_version(&envelope, "foo", "2.0.0").expect("foo@2.0.0 must be reported");
+    assert_eq!(foo_two["missing"], serde_json::json!(true));
+    assert_eq!(
+        foo_two["license_expression"],
+        serde_json::json!("NOASSERTION")
+    );
+}
+
+#[test]
 fn licenses_fail_on_copyleft_exits_nonzero_with_json_policy_result() {
     let project = seed_project();
     project.write_file(
@@ -282,13 +360,18 @@ fn package_scope_for_version<'a>(
     name: &str,
     version: &str,
 ) -> Option<&'a str> {
-    envelope["packages"]
-        .as_array()?
-        .iter()
-        .find(|package| {
-            package["name"] == serde_json::json!(name)
-                && package["version"] == serde_json::json!(version)
-        })?
+    package_for_version(envelope, name, version)?
         .get("scope")?
         .as_str()
+}
+
+fn package_for_version<'a>(
+    envelope: &'a serde_json::Value,
+    name: &str,
+    version: &str,
+) -> Option<&'a serde_json::Value> {
+    envelope["packages"].as_array()?.iter().find(|package| {
+        package["name"] == serde_json::json!(name)
+            && package["version"] == serde_json::json!(version)
+    })
 }

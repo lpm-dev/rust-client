@@ -42,14 +42,6 @@ pub(crate) fn read_json_file(path: &Path) -> Result<Value, LpmError> {
     })
 }
 
-pub(crate) fn read_manifest_metadata(path: &Path) -> Result<Option<ManifestMetadata>, LpmError> {
-    match read_json_file(path) {
-        Ok(value) => Ok(Some(extract_manifest_metadata(&value))),
-        Err(LpmError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 pub(crate) fn extract_manifest_metadata(value: &Value) -> ManifestMetadata {
     let description = value
         .get("description")
@@ -92,18 +84,20 @@ pub(crate) fn read_local_metadata(
         let mut out = BTreeMap::new();
         for package in packages {
             let mut metadata = ManifestMetadata::default();
-            if let Some(node_modules_metadata) =
-                read_manifest_metadata(&node_modules_package_json(project_dir, &package.name))?
-            {
+            if let Some(node_modules_metadata) = read_matching_manifest_metadata(
+                &node_modules_package_json(project_dir, &package.name),
+                package,
+            )? {
                 metadata.merge_missing(node_modules_metadata);
             }
             if let Some(baseline) = lpm_store::find_installed_package_baseline(
                 &root_for_lock,
                 &package.name,
                 &package.version,
-            )? && let Some(store_metadata) =
-                read_manifest_metadata(&baseline.package_dir.join("package.json"))?
-            {
+            )? && let Some(store_metadata) = read_matching_manifest_metadata(
+                &baseline.package_dir.join("package.json"),
+                package,
+            )? {
                 metadata.merge_missing(store_metadata);
             }
             if !metadata_is_empty(&metadata) {
@@ -112,6 +106,28 @@ pub(crate) fn read_local_metadata(
         }
         Ok(out)
     })
+}
+
+fn read_matching_manifest_metadata(
+    path: &Path,
+    package: &LockedPackage,
+) -> Result<Option<ManifestMetadata>, LpmError> {
+    match read_json_file(path) {
+        Ok(value) => {
+            if manifest_matches_package(&value, package) {
+                Ok(Some(extract_manifest_metadata(&value)))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(LpmError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn manifest_matches_package(value: &Value, package: &LockedPackage) -> bool {
+    value.get("name").and_then(Value::as_str) == Some(package.name.as_str())
+        && value.get("version").and_then(Value::as_str) == Some(package.version.as_str())
 }
 
 pub(crate) fn package_metadata_key(package: &LockedPackage) -> String {
