@@ -593,6 +593,14 @@ pub fn run_local_bin(
     Ok(())
 }
 
+/// Return whether `command_name` resolves to a project-local binary.
+///
+/// The lookup is intentionally the same `node_modules/.bin`-only resolution
+/// used by [`run_local_bin`]; it never consults the inherited system PATH.
+pub fn local_bin_exists(project_dir: &Path, command_name: &str) -> bool {
+    resolve_local_bin_path(project_dir, command_name).is_ok()
+}
+
 fn resolve_local_bin_path(project_dir: &Path, command_name: &str) -> Result<PathBuf, LpmError> {
     if command_name.trim().is_empty() {
         return Err(LpmError::Script(

@@ -266,6 +266,112 @@ fn naked_bare_word_still_runs_script_shortcut() {
 }
 
 #[test]
+fn bare_local_bin_shorthand_runs_project_local_binary_when_script_is_absent() {
+    let project = TempProject::empty(r#"{"name":"exec-bin-test","version":"1.0.0"}"#);
+    write_fake_local_bin(
+        &project,
+        "jest",
+        "#!/bin/sh\necho local-jest \"$@\"\n",
+        "@echo off\r\necho local-jest %*\r\n",
+    );
+
+    let output = lpm(&project)
+        .args(["jest", "--version"])
+        .output()
+        .expect("failed to run local-bin shorthand");
+
+    assert!(
+        output.status.success(),
+        "bare local-bin shorthand must run the project-local binary:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("local-jest --version"),
+        "local binary must receive forwarded args, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn bare_script_shortcut_wins_over_same_named_local_binary() {
+    let project = TempProject::empty(
+        r#"{"name":"exec-bin-test","version":"1.0.0","scripts":{"jest":"echo script-jest"}}"#,
+    );
+    write_fake_local_bin(
+        &project,
+        "jest",
+        "#!/bin/sh\necho local-jest \"$@\"\n",
+        "@echo off\r\necho local-jest %*\r\n",
+    );
+
+    let output = lpm(&project)
+        .args(["jest", "--version"])
+        .output()
+        .expect("failed to run script shortcut");
+
+    assert!(
+        output.status.success(),
+        "script shortcut must win over same-named local binary:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("script-jest --version") && !stdout.contains("local-jest"),
+        "script output must be used instead of local-bin output, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn missing_bare_word_reports_scripts_tasks_and_local_bins_were_checked() {
+    let project = TempProject::empty(r#"{"name":"exec-bin-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["missing-command"])
+        .output()
+        .expect("failed to run missing bare word");
+
+    assert!(!output.status.success(), "missing bare word must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("package.json script")
+            && stderr.contains("lpm.json task")
+            && stderr.contains("node_modules/.bin"),
+        "missing bare-word error must name both checked surfaces, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn path_like_source_file_invocation_runs_file_instead_of_local_bin_fallback() {
+    let project = TempProject::empty(r#"{"name":"exec-bin-test","version":"1.0.0"}"#);
+    project.write_file("scripts/seed.ts", "console.log('source-file-seed');\n");
+    write_fake_local_bin(
+        &project,
+        "scripts/seed.ts",
+        "#!/bin/sh\necho bin-fallback\n",
+        "@echo off\r\necho bin-fallback\r\n",
+    );
+
+    let output = lpm(&project)
+        .args(["scripts/seed.ts"])
+        .output()
+        .expect("failed to run source file");
+
+    assert!(
+        output.status.success(),
+        "path-like source-file invocation must run the file:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("source-file-seed") && !stdout.contains("bin-fallback"),
+        "source file must run instead of local-bin fallback, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn exec_js_file_loads_dotenv_and_forwards_args() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file(".env", "EXEC_MESSAGE=hello-from-dotenv\n");

@@ -50,7 +50,9 @@ lpm migrate                    # Migrate from npm/yarn/pnpm/bun
 # Scripts & execution
 lpm run <scripts...>           # Run scripts (parallel: -p, cached, watch)
 lpm dev                        # Zero-config dev server + HTTPS + tunnel
-lpm exec <file>                # Run JS/TS files directly
+lpm <file>                     # Run JS/TS files directly
+lpm exec <bin>                 # Run project-local binaries from node_modules/.bin
+lpm <bin>                      # Shorthand local bin when no built-in/file/script matches
 lpm dlx <package>              # Run without installing
 lpm test                       # Auto-detect test runner
 lpm bench                      # Auto-detect benchmark runner

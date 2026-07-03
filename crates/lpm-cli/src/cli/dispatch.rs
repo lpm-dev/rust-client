@@ -2835,12 +2835,8 @@ async fn async_main() -> Result<()> {
         }
         Commands::InternalTsTransform { .. } => unreachable!("handled before async command dispatch"),
         Commands::External(args) => {
-            // Try as package.json script shortcut: `lpm dev` → `lpm run dev`
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            let scripts = vec![args[0].clone()];
-            let extra_args = if args.len() > 1 { &args[1..] } else { &[] };
-            commands::run::run_multi(&cwd, &scripts, extra_args, None, false, false, false, false, cli.json)
-                .await
+            commands::run::run_external_shortcut(&cwd, &args, cli.json).await
         }
     }
     }
