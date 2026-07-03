@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 162;
+pub const EXPECTED_SURFACE_COUNT: usize = 166;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -58,6 +58,8 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Uninstall",
     "Add",
     "Publish",
+    "Version",
+    "Release",
     "Stage",
     "Login",
     "Logout",
@@ -2010,6 +2012,60 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/graph.rs",
             "tests/workflows/tests/graph.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 163,
+        name: "`lpm version <bump>`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/version.rs",
+            "tests/workflows/tests/version.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 164,
+        name: "`lpm release plan`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/release.rs",
+            "crates/lpm-cli/src/release_plan.rs",
+            "tests/workflows/tests/release.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 165,
+        name: "`lpm release apply`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/release.rs",
+            "crates/lpm-cli/src/release_plan.rs",
+            "tests/workflows/tests/release.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 166,
+        name: "`lpm release publish`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/release.rs",
+            "tests/workflows/tests/release.rs",
         ],
     },
 ];

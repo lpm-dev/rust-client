@@ -2,6 +2,55 @@ use lpm_common::LpmError;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
+use std::str::FromStr;
+
+/// npm-compatible version increment target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionBump {
+    Patch,
+    Minor,
+    Major,
+    PrePatch,
+    PreMinor,
+    PreMajor,
+    Prerelease,
+    Exact(String),
+}
+
+impl VersionBump {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Patch => "patch",
+            Self::Minor => "minor",
+            Self::Major => "major",
+            Self::PrePatch => "prepatch",
+            Self::PreMinor => "preminor",
+            Self::PreMajor => "premajor",
+            Self::Prerelease => "prerelease",
+            Self::Exact(version) => version,
+        }
+    }
+}
+
+impl FromStr for VersionBump {
+    type Err = LpmError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Ok(match input {
+            "patch" => Self::Patch,
+            "minor" => Self::Minor,
+            "major" => Self::Major,
+            "prepatch" => Self::PrePatch,
+            "preminor" => Self::PreMinor,
+            "premajor" => Self::PreMajor,
+            "prerelease" => Self::Prerelease,
+            exact => {
+                Version::parse(exact)?;
+                Self::Exact(exact.to_string())
+            }
+        })
+    }
+}
 
 /// A parsed semantic version.
 ///
@@ -62,6 +111,84 @@ impl Version {
     pub fn as_inner(&self) -> &node_semver::Version {
         &self.inner
     }
+
+    /// Increment this version using npm's `npm version` semantics.
+    pub fn bump(&self, bump: &VersionBump) -> Result<Self, LpmError> {
+        match bump {
+            VersionBump::Patch => {
+                if self.is_prerelease() {
+                    Version::parse(&format!(
+                        "{}.{}.{}",
+                        self.major(),
+                        self.minor(),
+                        self.patch()
+                    ))
+                } else {
+                    Version::parse(&format!(
+                        "{}.{}.{}",
+                        self.major(),
+                        self.minor(),
+                        self.patch() + 1
+                    ))
+                }
+            }
+            VersionBump::Minor => {
+                if self.is_prerelease() && self.patch() == 0 {
+                    Version::parse(&format!("{}.{}.0", self.major(), self.minor()))
+                } else {
+                    Version::parse(&format!("{}.{}.0", self.major(), self.minor() + 1))
+                }
+            }
+            VersionBump::Major => {
+                if self.is_prerelease() && self.minor() == 0 && self.patch() == 0 {
+                    Version::parse(&format!("{}.0.0", self.major()))
+                } else {
+                    Version::parse(&format!("{}.0.0", self.major() + 1))
+                }
+            }
+            VersionBump::PrePatch => Version::parse(&format!(
+                "{}.{}.{}-0",
+                self.major(),
+                self.minor(),
+                self.patch() + 1
+            )),
+            VersionBump::PreMinor => {
+                Version::parse(&format!("{}.{}.0-0", self.major(), self.minor() + 1))
+            }
+            VersionBump::PreMajor => Version::parse(&format!("{}.0.0-0", self.major() + 1)),
+            VersionBump::Prerelease => {
+                if self.is_prerelease() {
+                    let pre = increment_prerelease(self.pre_release());
+                    Version::parse(&format!(
+                        "{}.{}.{}-{}",
+                        self.major(),
+                        self.minor(),
+                        self.patch(),
+                        pre.join(".")
+                    ))
+                } else {
+                    Version::parse(&format!(
+                        "{}.{}.{}-0",
+                        self.major(),
+                        self.minor(),
+                        self.patch() + 1
+                    ))
+                }
+            }
+            VersionBump::Exact(version) => Version::parse(version),
+        }
+    }
+}
+
+fn increment_prerelease(mut identifiers: Vec<String>) -> Vec<String> {
+    if let Some(last) = identifiers.last_mut()
+        && let Ok(number) = last.parse::<u64>()
+    {
+        *last = (number + 1).to_string();
+        return identifiers;
+    }
+    identifiers.push("0".to_string());
+    identifiers
 }
 
 impl fmt::Display for Version {
@@ -184,5 +311,59 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         let parsed: Version = serde_json::from_str(&json).unwrap();
         assert_eq!(v, parsed);
+    }
+
+    #[test]
+    fn bump_patch_releases_existing_prerelease() {
+        let v = Version::parse("1.2.3-alpha.7").unwrap();
+        assert_eq!(v.bump(&VersionBump::Patch).unwrap().to_string(), "1.2.3");
+    }
+
+    #[test]
+    fn bump_prerelease_starts_next_patch_for_stable_version() {
+        let v = Version::parse("1.2.3").unwrap();
+        assert_eq!(
+            v.bump(&VersionBump::Prerelease).unwrap().to_string(),
+            "1.2.4-0"
+        );
+    }
+
+    #[test]
+    fn bump_prerelease_increments_numeric_identifier() {
+        let v = Version::parse("1.2.3-alpha.7").unwrap();
+        assert_eq!(
+            v.bump(&VersionBump::Prerelease).unwrap().to_string(),
+            "1.2.3-alpha.8"
+        );
+    }
+
+    #[test]
+    fn bump_prerelease_appends_numeric_identifier_when_missing() {
+        let v = Version::parse("1.2.3-alpha.beta").unwrap();
+        assert_eq!(
+            v.bump(&VersionBump::Prerelease).unwrap().to_string(),
+            "1.2.3-alpha.beta.0"
+        );
+    }
+
+    #[test]
+    fn bump_preminor_uses_numeric_prerelease_default() {
+        let v = Version::parse("1.2.3").unwrap();
+        assert_eq!(
+            v.bump(&VersionBump::PreMinor).unwrap().to_string(),
+            "1.3.0-0"
+        );
+    }
+
+    #[test]
+    fn bump_minor_releases_existing_minor_boundary_prerelease() {
+        let v = Version::parse("1.3.0-0").unwrap();
+        assert_eq!(v.bump(&VersionBump::Minor).unwrap().to_string(), "1.3.0");
+    }
+
+    #[test]
+    fn bump_major_releases_existing_major_boundary_prerelease() {
+        let v = Version::parse("2.0.0-0").unwrap();
+        assert_eq!(v.bump(&VersionBump::Major).unwrap().to_string(), "2.0.0");
     }
 }
