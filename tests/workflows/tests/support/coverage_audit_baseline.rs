@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 159;
+pub const EXPECTED_SURFACE_COUNT: usize = 162;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -77,6 +77,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Remove",
     "Audit",
     "Query",
+    "Licenses",
     "Rebuild",
     "Doctor",
     "Policy",
@@ -107,6 +108,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Dev",
     "Cert",
     "Graph",
+    "Why",
     "Ports",
     "Hosts",
     "Proxy",
@@ -1398,7 +1400,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
     },
     SurfaceBaseline {
         id: 113,
-        name: "`lpm graph` (tree default)",
+        name: "`lpm graph` (tree default; alias `lpm ls`)",
         unit: true,
         integration: false,
         workflow: true,
@@ -1969,6 +1971,45 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/policy.rs",
             "tests/workflows/tests/policy_extensions.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 160,
+        name: "`lpm upgrade <pkg>...`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/upgrade.rs",
+            "tests/workflows/tests/upgrade.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 161,
+        name: "`lpm licenses`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/licenses.rs",
+            "tests/workflows/tests/licenses.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 162,
+        name: "`lpm why <pkg>`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/graph.rs",
+            "tests/workflows/tests/graph.rs",
         ],
     },
 ];

@@ -1,3 +1,4 @@
+use crate::commands::install::select_locked_package_for_requested_spec;
 use crate::commands::manifest_metadata::{
     ManifestMetadata, extract_manifest_metadata, package_metadata_key, read_json_file,
     read_local_metadata,
@@ -404,7 +405,6 @@ fn package_scopes_by_lockfile_index(
     root_json: &Value,
     lockfile: &Lockfile,
 ) -> Vec<Option<LicenseScope>> {
-    let name_index = package_name_index(&lockfile.packages);
     let version_index = package_version_index(&lockfile.packages);
     let adjacency = package_adjacency(&lockfile.packages, &version_index);
     let root_seeds = root_dependency_seeds(root_json);
@@ -413,13 +413,19 @@ fn package_scopes_by_lockfile_index(
 
     for (local_name, (spec, scope)) in root_seeds {
         let target_name = root_dependency_target_name(&local_name, &spec, lockfile);
-        let Some(package_indices) = name_index.get(target_name.as_str()) else {
+        let Some(package) = select_locked_package_for_requested_spec(lockfile, &target_name, &spec)
+        else {
             continue;
         };
-        for &package_index in package_indices {
-            if set_package_scope(&mut scopes, package_index, scope) {
-                queue.push_back((package_index, scope));
-            }
+        let Some(package_index) = lockfile
+            .packages
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, package))
+        else {
+            continue;
+        };
+        if set_package_scope(&mut scopes, package_index, scope) {
+            queue.push_back((package_index, scope));
         }
     }
 
@@ -446,17 +452,6 @@ fn set_package_scope(
         return true;
     }
     false
-}
-
-fn package_name_index(packages: &[LockedPackage]) -> BTreeMap<String, Vec<usize>> {
-    let mut index: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (package_index, package) in packages.iter().enumerate() {
-        index
-            .entry(package.name.clone())
-            .or_default()
-            .push(package_index);
-    }
-    index
 }
 
 fn package_version_index(packages: &[LockedPackage]) -> BTreeMap<(String, String), Vec<usize>> {
