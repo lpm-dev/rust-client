@@ -3436,6 +3436,59 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/policy_extensions.rs", 1)],
         last_audited_at: "2026-06-28",
     },
+    SurfaceV2 {
+        id: 160,
+        scenarios: 4,
+        failure_modes_tested: &[
+            "package argument limits JSON upgrade candidates to requested dependency",
+            "missing manifest dependency hard-fails with JSON error naming the package",
+            "dependency without recorded public npm source hard-fails with JSON diagnostic",
+            "npm alias resolves metadata through canonical target while preserving alias spec",
+        ],
+        failure_modes_known: &[
+            "multiple package arguments with one missing dependency",
+            "targeted workspace dependency selection",
+            "interactive multiselect restricted to requested packages under a real TTY",
+        ],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/upgrade.rs", 4)],
+        last_audited_at: "2026-07-03",
+    },
+    SurfaceV2 {
+        id: 161,
+        scenarios: 6,
+        failure_modes_tested: &[
+            "JSON inventory snapshots installed package license metadata",
+            "production reachability takes precedence over dev-only root scope",
+            "dev-only alias transitives are marked excluded",
+            "duplicate package names keep dev-only duplicate versions excluded",
+            "mismatched root manifest metadata leaves duplicate version missing",
+            "copyleft fail-on exits nonzero with JSON policy result",
+            "deny exact license exits nonzero with denied-license summary",
+        ],
+        failure_modes_known: &[
+            "missing lockfile diagnostic",
+            "malformed lockfile diagnostic",
+            "workspace license aggregation",
+            "store-only license metadata without root node_modules manifests",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/licenses.rs", 6)],
+        last_audited_at: "2026-07-03",
+    },
+    SurfaceV2 {
+        id: 162,
+        scenarios: 1,
+        failure_modes_tested: &["top-level --json output matches graph --why --json exactly"],
+        failure_modes_known: &[
+            "top-level human output parity with graph --why",
+            "missing package diagnostic parity",
+            "missing lockfile diagnostic parity",
+        ],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/graph.rs", 1)],
+        last_audited_at: "2026-07-03",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

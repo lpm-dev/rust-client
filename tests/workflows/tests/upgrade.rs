@@ -125,6 +125,101 @@ async fn upgrade_emits_zero_upgraded_when_lpm_dep_already_at_latest() {
     assert_eq!(envelope["packages"], serde_json::json!([]));
 }
 
+#[tokio::test]
+async fn upgrade_package_argument_limits_json_candidates_to_requested_dependency() {
+    let requested = "@lpm.dev/owner.requested-upgrade";
+    let unrelated = "@lpm.dev/owner.unrelated-upgrade";
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name": "targeted-upgrade",
+            "version": "1.0.0",
+            "dependencies": {{
+                "{requested}": "^1.0.0",
+                "{unrelated}": "^1.0.0"
+            }}
+        }}"#
+    ));
+    project.write_file(
+        "lpm.lock",
+        &format!(
+            "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n\
+             [[packages]]\nname = \"{requested}\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://lpm.dev\"\n\n\
+             [[packages]]\nname = \"{unrelated}\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://lpm.dev\"\n",
+        ),
+    );
+
+    let mock = MockRegistry::start().await;
+    mount_lpm_pkg(&mock, requested, "1.1.0").await;
+    mount_lpm_pkg(&mock, unrelated, "1.2.0").await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", requested, "-y", "--dry-run", "--json"])
+        .output()
+        .expect("spawn targeted lpm upgrade --dry-run --json");
+    assert!(
+        out.status.success(),
+        "targeted upgrade must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["upgraded"], serde_json::json!(1));
+    assert_eq!(
+        envelope["packages"][0]["name"],
+        serde_json::json!(requested)
+    );
+}
+
+#[test]
+fn upgrade_package_argument_missing_manifest_dependency_fails_clearly() {
+    let project = TempProject::empty(
+        r#"{"name":"targeted-missing","version":"1.0.0","dependencies":{"zod":"^3.0.0"}}"#,
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "upgrade", "react", "-y"])
+        .output()
+        .expect("spawn targeted lpm upgrade for missing package");
+    assert!(!out.status.success());
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON error envelope");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("react")),
+        "error must name missing requested package: {envelope}"
+    );
+}
+
+#[test]
+fn upgrade_package_argument_unknown_registry_source_fails_clearly() {
+    let project = TempProject::empty(
+        r#"{"name":"targeted-private","version":"1.0.0","dependencies":{"left-pad":"^1.3.0"}}"#,
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "upgrade", "left-pad", "-y"])
+        .output()
+        .expect("spawn targeted lpm upgrade without recorded source");
+    assert!(!out.status.success());
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON error envelope");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("recorded public npm")),
+        "error must explain the missing source metadata: {envelope}"
+    );
+}
+
 // ─── Behavior contracts ─────────────────────────────────────────────────
 
 /// A dependency whose lockfile source is the public npm registry should
@@ -191,6 +286,82 @@ async fn upgrade_upgrades_npm_packages_with_public_npm_lock_source() {
         entry.version, "2.5.0",
         "lockfile must record the upgraded npm version"
     );
+}
+
+#[tokio::test]
+async fn upgrade_targeted_npm_alias_uses_canonical_source_and_preserves_alias_spec() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "npm-alias-up",
+            "version": "1.0.0",
+            "dependencies": {
+                "strip-ansi-cjs": "npm:strip-ansi@^6.0.0"
+            }
+        }"#,
+    );
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile
+        .root_aliases
+        .insert("strip-ansi-cjs".to_string(), "strip-ansi".to_string());
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "strip-ansi".to_string(),
+        version: "6.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..Default::default()
+    });
+    lockfile
+        .write_to_file(&project.path().join("lpm.lock"))
+        .expect("write aliased lockfile");
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "strip-ansi",
+        "6.1.0",
+        &[
+            (
+                "6.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("strip-ansi", "6.0.0")),
+            ),
+            (
+                "6.1.0",
+                serde_json::json!({}),
+                Some(make_tarball("strip-ansi", "6.1.0")),
+            ),
+        ],
+    )
+    .await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "strip-ansi-cjs", "-y"])
+        .output()
+        .expect("spawn targeted alias upgrade");
+    assert!(
+        out.status.success(),
+        "targeted npm alias upgrade must succeed via the canonical target\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(
+        manifest["dependencies"]["strip-ansi-cjs"],
+        serde_json::json!("npm:strip-ansi@^6.1.0")
+    );
+
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read upgraded lockfile");
+    assert_eq!(
+        lockfile.root_aliases.get("strip-ansi-cjs"),
+        Some(&"strip-ansi".to_string())
+    );
+    let entry = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "strip-ansi")
+        .expect("lockfile must record the canonical alias target");
+    assert_eq!(entry.version, "6.1.0");
 }
 
 #[tokio::test]

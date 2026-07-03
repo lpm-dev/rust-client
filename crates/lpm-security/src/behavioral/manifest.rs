@@ -95,7 +95,7 @@ pub fn analyze_manifest_with_privacy(
         let lower = lic.to_lowercase();
 
         // Copyleft check — scan SPDX expression for copyleft identifiers
-        if !tags.no_license && is_copyleft(&lower) {
+        if !tags.no_license && license_expression_is_copyleft_lower(&lower) {
             tags.copyleft_license = true;
         }
     }
@@ -161,7 +161,12 @@ pub fn analyze_manifest_with_privacy(
 /// Handles compound expressions: "MIT OR GPL-3.0" → copyleft present.
 /// Case-insensitive. Scans for any copyleft identifier as a substring
 /// within the SPDX tokens.
-fn is_copyleft(license_lower: &str) -> bool {
+pub fn license_expression_is_copyleft(license: &str) -> bool {
+    let license_lower = license.to_lowercase();
+    license_expression_is_copyleft_lower(&license_lower)
+}
+
+fn license_expression_is_copyleft_lower(license_lower: &str) -> bool {
     // Split on SPDX operators to get individual license identifiers
     // Operators: OR, AND, WITH (case-insensitive, already lowered)
     let tokens: Vec<&str> = license_lower
