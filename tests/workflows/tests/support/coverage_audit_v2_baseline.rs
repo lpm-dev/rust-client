@@ -3489,6 +3489,81 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/graph.rs", 1)],
         last_audited_at: "2026-07-03",
     },
+    SurfaceV2 {
+        id: 163,
+        scenarios: 6,
+        failure_modes_tested: &[
+            "built-in version command wins over package version script",
+            "dry-run JSON plan leaves manifest unchanged",
+            "git-tag-version creates release commit and target tag",
+            "dirty git tree fails before manifest mutation",
+            "existing target tag fails before manifest mutation",
+            "dash-prefixed tag fails before manifest mutation",
+        ],
+        failure_modes_known: &[
+            "workspace-internal dependent range rewrite",
+            "exact-version bump validation",
+            "pre-release bump forms",
+            "commit failure after manifest mutation rollback",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/version.rs", 6)],
+        last_audited_at: "2026-07-03",
+    },
+    SurfaceV2 {
+        id: 164,
+        scenarios: 1,
+        failure_modes_tested: &[
+            "JSON plan reports selected package bump",
+            "JSON plan reports workspace-internal dependent rewrite",
+            "dry-run plan leaves selected manifest unchanged",
+        ],
+        failure_modes_known: &[
+            "ambiguous selection flag validation",
+            "changed-package detection from base ref",
+            "changeset file parsing",
+            "workspace protocol dependent rewrite",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/release.rs", 1)],
+        last_audited_at: "2026-07-03",
+    },
+    SurfaceV2 {
+        id: 165,
+        scenarios: 1,
+        failure_modes_tested: &[
+            "apply mutates selected package version",
+            "apply mutates workspace-internal dependent range",
+            "JSON apply plan reports written files",
+        ],
+        failure_modes_known: &[
+            "partial write rollback on invalid manifest",
+            "multiple selected packages with shared dependents",
+            "workspace protocol dependent rewrite",
+            "changeset file consumption after apply",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/release.rs", 1)],
+        last_audited_at: "2026-07-03",
+    },
+    SurfaceV2 {
+        id: 166,
+        scenarios: 2,
+        failure_modes_tested: &[
+            "dry-run JSON reports topological dependency order",
+            "stale internal range fails before publish starts",
+            "JSON failure envelope exposes publish-blocking diagnostic",
+        ],
+        failure_modes_known: &[
+            "already-published version skip",
+            "registry authentication failure before upload",
+            "registry conflict during selected package publish",
+            "non-dry-run partial publish interruption",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/release.rs", 2)],
+        last_audited_at: "2026-07-03",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

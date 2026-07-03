@@ -8,7 +8,7 @@ use crate::{
 
 use super::args::{
     Cli, Commands, DoctorAction, InitPackageTargetCli, LinkerCli, OutdatedRegistryScope,
-    SetupAction, StageCommands,
+    ReleaseCommands, ReleaseSelectionArgs, SetupAction, StageCommands,
 };
 use super::format::{argv_has_global_registry_flag, exit_with_lpm_error, parse_cli_or_exit};
 use super::helpers::{
@@ -1168,6 +1168,79 @@ async fn async_main() -> Result<()> {
                 provenance_file.as_deref(),
             )
             .await
+        }
+        Commands::Version {
+            bump,
+            dry_run,
+            no_git_tag_version,
+            tag_prefix,
+            message,
+        } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let message = commands::version::default_message(message);
+            commands::version::run(
+                &cwd,
+                &bump,
+                dry_run,
+                cli.json,
+                !no_git_tag_version,
+                &tag_prefix,
+                &message,
+            )
+        }
+        Commands::Release { command } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            match command {
+                ReleaseCommands::Plan { selection, bump } => {
+                    let selection = release_selection(selection);
+                    commands::release::plan(&cwd, &selection, bump.as_ref(), cli.json)
+                }
+                ReleaseCommands::Apply {
+                    selection,
+                    bump,
+                    dry_run,
+                } => {
+                    let selection = release_selection(selection);
+                    commands::release::apply(&cwd, &selection, bump.as_ref(), dry_run, cli.json)
+                }
+                ReleaseCommands::Publish {
+                    selection,
+                    dry_run,
+                    yes,
+                    min_score,
+                    allow_secrets,
+                    npm,
+                    lpm,
+                    github,
+                    gitlab,
+                    publish_registry,
+                    provenance,
+                    no_provenance,
+                    provenance_file,
+                } => {
+                    if !cli.json {
+                        for warning in auth::check_token_expiry_warnings() {
+                            output::warn(&warning);
+                        }
+                    }
+                    let selection = release_selection(selection);
+                    let options = commands::release::ReleasePublishOptions {
+                        dry_run,
+                        yes,
+                        min_score,
+                        allow_secrets,
+                        npm,
+                        lpm,
+                        github,
+                        gitlab,
+                        publish_registry,
+                        provenance,
+                        no_provenance,
+                        provenance_file,
+                    };
+                    commands::release::publish(&client, &cwd, &selection, &options, cli.json).await
+                }
+            }
         }
         Commands::Stage { command } => {
             if argv_has_global_registry_flag(std::env::args_os()) {
@@ -2805,4 +2878,17 @@ async fn async_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn release_selection(args: ReleaseSelectionArgs) -> commands::release::ReleaseSelection {
+    commands::release::ReleaseSelection {
+        all: args.all,
+        affected: args.affected,
+        base: args.base,
+        filter: args.filter,
+        filter_prod: args.filter_prod,
+        changed_files_ignore_pattern: args.changed_files_ignore_pattern,
+        test_pattern: args.test_pattern,
+        fail_if_no_match: args.fail_if_no_match,
+    }
 }

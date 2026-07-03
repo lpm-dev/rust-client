@@ -17,7 +17,7 @@
 mod version;
 mod version_req;
 
-pub use version::Version;
+pub use version::{Version, VersionBump};
 pub use version_req::{VersionReq, parse_node_semver_range};
 
 /// Find the highest version from a list that satisfies a range.

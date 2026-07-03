@@ -41,6 +41,7 @@ mod registry_signatures;
 mod release_age_config;
 mod release_age_selection;
 mod release_lookup;
+mod release_plan;
 mod resolver_error;
 mod sandbox_config;
 mod save_config;
