@@ -144,6 +144,45 @@ deprecation note. Unknown warning lines remain visible in `rows.json`,
 `metrics.json`, per-run `warnings.json`, `warning-summary.json`,
 `warning-summary.md`, and the summary's `Warnings exp/unknown` column.
 
+## Run/bin wrapper benchmark
+
+`run-bin-benchmark.mjs` measures local script-runner and local-bin runner
+overhead against the same generated fixture. Setup installs exact local
+dependencies before timing; measured rows only execute `package.json` scripts
+or local `node_modules/.bin` entries.
+
+The suite reports p50 and p95 as primary metrics, with avg/min/max and raw
+samples in the JSON artifact. Markdown and JSON are written to
+`bench/perf-results/`.
+
+```bash
+node bench/scripts/run-bin-benchmark.mjs --self-test
+node bench/scripts/run-bin-benchmark.mjs --list
+
+ITERATIONS=3 WARMUP_ITERATIONS=1 \
+  node bench/scripts/run-bin-benchmark.mjs
+```
+
+Useful knobs:
+
+```bash
+LPM_BIN=/path/to/lpm-rs NUB_BIN=/path/to/nub NUBX_BIN=/path/to/nubx \
+  ITERATIONS=30 WARMUP_ITERATIONS=2 \
+  node bench/scripts/run-bin-benchmark.mjs
+
+GROUPS=script-runner SCENARIOS='noop|node-noop' \
+  node bench/scripts/run-bin-benchmark.mjs
+
+GROUPS=local-bin-runner RUNNERS='lpm-exec,lpm-shorthand,pnpm-exec,npx-no-install' \
+  node bench/scripts/run-bin-benchmark.mjs
+```
+
+Script-runner rows cover `noop`, `node-noop`, and a script that invokes the
+local native `esbuild` bin. Local-bin rows report native `esbuild --version`
+and Node CLI `tsc --version` separately; do not collapse those into one
+"faster than npx" claim, because target startup cost changes the wrapper
+overhead ratio.
+
 ## Historical fusion scripts
 
 The older scripts in this directory drove every measurement in Phase 56
