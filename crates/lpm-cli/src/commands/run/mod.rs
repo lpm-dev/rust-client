@@ -145,5 +145,92 @@ pub async fn run_multi(
     }
 }
 
+/// Run an unknown top-level command as a script/task shortcut, then as a
+/// project-local binary shorthand when no script/task surface exists.
+pub async fn run_external_shortcut(
+    project_dir: &Path,
+    args: &[String],
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let Some(command_name) = args.first() else {
+        return Ok(());
+    };
+    let extra_args = if args.len() > 1 { &args[1..] } else { &[] };
+
+    if script_or_task_exists(project_dir, command_name)? {
+        return run_multi(
+            project_dir,
+            std::slice::from_ref(command_name),
+            extra_args,
+            None,
+            false,
+            false,
+            false,
+            false,
+            json_output,
+        )
+        .await;
+    }
+
+    if !lpm_runner::script::local_bin_exists(project_dir, command_name) {
+        return Err(missing_external_shortcut_error(command_name));
+    }
+
+    let bin_hint = ensure_runtime(project_dir).await;
+    install_ui::phase(&format!("Executing {}", install_ui::yellow(command_name)));
+    let start = std::time::Instant::now();
+    lpm_runner::script::run_local_bin(
+        project_dir,
+        command_name,
+        extra_args,
+        None,
+        false,
+        &bin_hint,
+    )?;
+    install_ui::done(&format!(
+        "Done · exited 0 in {}",
+        install_ui::green(&install_ui::format_duration(start.elapsed())),
+    ));
+    Ok(())
+}
+
+fn script_or_task_exists(project_dir: &Path, name: &str) -> Result<bool, LpmError> {
+    let pkg_scripts = {
+        let pkg_json_path = project_dir.join("package.json");
+        if pkg_json_path.exists() {
+            Some(
+                lpm_workspace::read_package_json(&pkg_json_path)
+                    .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?
+                    .scripts,
+            )
+        } else {
+            None
+        }
+    };
+    if pkg_scripts
+        .as_ref()
+        .is_some_and(|scripts| scripts.contains_key(name))
+    {
+        return Ok(true);
+    }
+
+    let Some(config) =
+        lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?
+    else {
+        return Ok(false);
+    };
+    let Some(task) = config.tasks.get(name) else {
+        return Ok(false);
+    };
+
+    Ok(task.command.is_some() || !task.depends_on.is_empty())
+}
+
+fn missing_external_shortcut_error(command_name: &str) -> LpmError {
+    LpmError::Script(format!(
+        "command '{command_name}' was not found as a package.json script, lpm.json task, or project-local binary in node_modules/.bin"
+    ))
+}
+
 #[cfg(test)]
 mod tests;
