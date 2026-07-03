@@ -8,8 +8,9 @@ use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::PackageMetadata;
 use lpm_registry::RegistryClient;
+use lpm_resolver::specifier::Specifier;
 use lpm_semver::Version;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Instant;
@@ -86,11 +87,59 @@ enum MetadataLookup {
 }
 
 #[derive(Debug, Clone)]
+enum ManifestDependencySpec {
+    Plain,
+    NpmAlias { target: String },
+}
+
+impl ManifestDependencySpec {
+    fn from_manifest_value(name: &str, value: &str) -> Result<(Self, String), LpmError> {
+        if value.trim_start().starts_with("npm:") {
+            return match Specifier::parse(value) {
+                Ok(Specifier::NpmAlias { target, range }) => Ok((Self::NpmAlias { target }, range)),
+                Ok(_) => Err(LpmError::Script(format!(
+                    "dependency `{name}` uses invalid npm alias spec `{value}`"
+                ))),
+                Err(err) => Err(LpmError::Script(format!(
+                    "dependency `{name}` uses invalid npm alias spec `{value}`: {err}"
+                ))),
+            };
+        }
+
+        Ok((Self::Plain, value.to_string()))
+    }
+
+    fn render_new_value(&self, new_range: &str) -> String {
+        match self {
+            Self::Plain => new_range.to_string(),
+            Self::NpmAlias { target } => format!("npm:{target}@{new_range}"),
+        }
+    }
+}
+
+fn dependency_lookup_name(
+    manifest_name: &str,
+    manifest_spec: &ManifestDependencySpec,
+    lockfile: Option<&lpm_lockfile::Lockfile>,
+) -> String {
+    match manifest_spec {
+        ManifestDependencySpec::NpmAlias { target } => target.clone(),
+        ManifestDependencySpec::Plain => lockfile
+            .and_then(|lf| lf.root_aliases.get(manifest_name))
+            .cloned()
+            .unwrap_or_else(|| manifest_name.to_string()),
+    }
+}
+
+#[derive(Debug, Clone)]
 struct UpgradeDependency {
     name: String,
+    lookup_name: String,
     range: String,
+    manifest_value: String,
     is_dev: bool,
     lookup: MetadataLookup,
+    manifest_spec: ManifestDependencySpec,
 }
 
 /// enriched candidate — drives both the interactive multiselect
@@ -119,6 +168,7 @@ struct EnrichedCandidate {
 pub async fn run(
     client: &RegistryClient,
     project_dir: &Path,
+    requested_packages: &[String],
     major: bool,
     dry_run: bool,
     interactive: bool,
@@ -166,34 +216,52 @@ pub async fn run(
     };
 
     let mut skipped_private: Vec<String> = Vec::new();
-    let all_deps = extract_deps_from_value(&doc);
-    let upgradeable_deps: Vec<UpgradeDependency> = all_deps
-        .into_iter()
-        .filter_map(|(name, range, is_dev)| {
-            if name.starts_with("@lpm.dev/") {
-                let pkg_name = PackageName::parse(&name).ok()?;
-                return Some(UpgradeDependency {
+    let all_deps = filter_requested_deps(extract_deps_from_value(&doc), requested_packages)?;
+    let mut upgradeable_deps = Vec::with_capacity(all_deps.len());
+    for (name, manifest_value, is_dev) in all_deps {
+        let (manifest_spec, range) =
+            ManifestDependencySpec::from_manifest_value(&name, &manifest_value)?;
+        let lookup_name = dependency_lookup_name(&name, &manifest_spec, lockfile.as_ref());
+
+        if lookup_name.starts_with("@lpm.dev/") {
+            if let Ok(pkg_name) = PackageName::parse(&lookup_name) {
+                upgradeable_deps.push(UpgradeDependency {
                     name,
+                    lookup_name,
                     range,
+                    manifest_value,
                     is_dev,
                     lookup: MetadataLookup::Lpm(pkg_name),
+                    manifest_spec,
                 });
             }
+            continue;
+        }
 
-            if let Some(source) = lockfile_npm_metadata_source(lockfile.as_ref(), &name, client) {
-                return Some(UpgradeDependency {
-                    name,
-                    range,
-                    is_dev,
-                    lookup: MetadataLookup::Npm(source),
-                });
-            }
+        if let Some(source) = lockfile_npm_metadata_source(lockfile.as_ref(), &lookup_name, client)
+        {
+            upgradeable_deps.push(UpgradeDependency {
+                name,
+                lookup_name,
+                range,
+                manifest_value,
+                is_dev,
+                lookup: MetadataLookup::Npm(source),
+                manifest_spec,
+            });
+            continue;
+        }
 
-            skipped_private.push(name);
-            None
-        })
-        .collect();
+        skipped_private.push(name);
+    }
     skipped_private.sort();
+
+    if !requested_packages.is_empty() && !skipped_private.is_empty() {
+        return Err(LpmError::Script(format!(
+            "cannot upgrade requested package(s) without a recorded public npm or LPM-registry source: {}. Run `lpm install` to record sources in lpm.lock, then re-run.",
+            skipped_private.join(", ")
+        )));
+    }
 
     if !json_output {
         install_ui::phase("Checking dependencies for newer matching versions");
@@ -203,8 +271,8 @@ pub async fn run(
     let fetch_futures: Vec<_> = upgradeable_deps
         .iter()
         .map(|dep| async move {
-            let result = fetch_metadata(client, &dep.lookup, &dep.name).await;
-            (dep.name.as_str(), dep.range.as_str(), dep.is_dev, result)
+            let result = fetch_metadata(client, &dep.lookup, &dep.lookup_name).await;
+            (dep, result)
         })
         .collect();
     let fetch_results = futures::future::join_all(fetch_futures).await;
@@ -212,11 +280,16 @@ pub async fn run(
     let mut candidates: Vec<EnrichedCandidate> = Vec::new();
     let mut fetch_errors: usize = 0;
 
-    for (name, current_range, is_dev, metadata_result) in fetch_results {
+    for (dep, metadata_result) in fetch_results {
         let metadata = match metadata_result {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("failed to fetch metadata for {}: {}", name, e);
+                tracing::warn!(
+                    "failed to fetch metadata for {} via {}: {}",
+                    dep.name,
+                    dep.lookup_name,
+                    e
+                );
                 fetch_errors += 1;
                 continue;
             }
@@ -233,7 +306,7 @@ pub async fn run(
         if !is_valid_version_string(&latest) {
             tracing::warn!(
                 "skipping {}: registry returned invalid version string {:?}",
-                name,
+                dep.name,
                 latest
             );
             continue;
@@ -242,9 +315,10 @@ pub async fn run(
         let available_versions =
             crate::release_age_selection::allowed_version_strings(&metadata, &release_age_policy);
 
-        let installed_ver = lockfile
-            .as_ref()
-            .and_then(|lf| lf.find_package(name).map(|p| p.version.as_str()));
+        let installed_ver = lockfile.as_ref().and_then(|lf| {
+            lf.find_package(&dep.lookup_name)
+                .map(|p| p.version.as_str())
+        });
 
         // Build enrichment data from the target version's metadata.
         // We use the LATEST version's metadata for enrichment since that's
@@ -259,7 +333,7 @@ pub async fn run(
             let from_ver = installed_ver.unwrap_or("0.0.0");
             let patch_inv = upgrade_engine::detect_patch_invalidation(
                 &patched_deps,
-                name,
+                &dep.lookup_name,
                 from_ver,
                 target_version,
             );
@@ -270,7 +344,7 @@ pub async fn run(
             ResolvedMode::NonInteractive => {
                 // Today's behavior: single candidate per dep
                 let (target_version, new_range) =
-                    compute_upgrade(current_range, &latest, &available_versions, major);
+                    compute_upgrade(&dep.range, &latest, &available_versions, major);
                 let target_version = match target_version {
                     Some(v) => v,
                     None => continue,
@@ -279,24 +353,25 @@ pub async fn run(
                 let should_skip = if let Some(installed) = installed_ver {
                     installed == target_version
                 } else {
-                    current_range == new_range
+                    dep.range == new_range
                 };
                 if should_skip {
                     continue;
                 }
 
                 let from =
-                    installed_ver.map_or_else(|| version_from_range(current_range), str::to_string);
+                    installed_ver.map_or_else(|| version_from_range(&dep.range), str::to_string);
                 let semver_class = upgrade_engine::classify_semver_change(&from, &target_version);
                 let (has_scripts, peer_impact, patch_inv) = enrich(&target_version);
+                let new_manifest_value = dep.manifest_spec.render_new_value(&new_range);
 
                 candidates.push(EnrichedCandidate {
-                    name: name.to_string(),
+                    name: dep.name.clone(),
                     from,
-                    current_range: current_range.to_string(),
-                    new_range,
+                    current_range: dep.manifest_value.clone(),
+                    new_range: new_manifest_value,
                     to: target_version,
-                    is_dev,
+                    is_dev: dep.is_dev,
                     target_kind: if major {
                         TargetKind::AbsoluteLatest
                     } else {
@@ -311,30 +386,31 @@ pub async fn run(
             ResolvedMode::Interactive => {
                 // D-design-1 dual-row: compute within-major AND absolute-latest
                 let (within_target, within_range) =
-                    compute_upgrade(current_range, &latest, &available_versions, false);
+                    compute_upgrade(&dep.range, &latest, &available_versions, false);
                 let (abs_target, abs_range) =
-                    compute_upgrade(current_range, &latest, &available_versions, true);
+                    compute_upgrade(&dep.range, &latest, &available_versions, true);
 
                 let from =
-                    installed_ver.map_or_else(|| version_from_range(current_range), str::to_string);
+                    installed_ver.map_or_else(|| version_from_range(&dep.range), str::to_string);
 
                 // Emit within-major row if it's a real upgrade
                 if let Some(ref wt) = within_target {
                     let should_skip = if let Some(installed) = installed_ver {
                         installed == wt.as_str()
                     } else {
-                        current_range == within_range
+                        dep.range == within_range
                     };
                     if !should_skip {
                         let semver_class = upgrade_engine::classify_semver_change(&from, wt);
                         let (has_scripts, peer_impact, patch_inv) = enrich(wt);
+                        let new_manifest_value = dep.manifest_spec.render_new_value(&within_range);
                         candidates.push(EnrichedCandidate {
-                            name: name.to_string(),
+                            name: dep.name.clone(),
                             from: from.clone(),
-                            current_range: current_range.to_string(),
-                            new_range: within_range.clone(),
+                            current_range: dep.manifest_value.clone(),
+                            new_range: new_manifest_value,
                             to: wt.clone(),
-                            is_dev,
+                            is_dev: dep.is_dev,
                             target_kind: TargetKind::WithinMajor,
                             semver_class,
                             has_install_scripts: has_scripts,
@@ -351,18 +427,19 @@ pub async fn run(
                         let should_skip = if let Some(installed) = installed_ver {
                             installed == at.as_str()
                         } else {
-                            current_range == abs_range
+                            dep.range == abs_range
                         };
                         if !should_skip {
                             let semver_class = upgrade_engine::classify_semver_change(&from, at);
                             let (has_scripts, peer_impact, patch_inv) = enrich(at);
+                            let new_manifest_value = dep.manifest_spec.render_new_value(&abs_range);
                             candidates.push(EnrichedCandidate {
-                                name: name.to_string(),
+                                name: dep.name.clone(),
                                 from: from.clone(),
-                                current_range: current_range.to_string(),
-                                new_range: abs_range.clone(),
+                                current_range: dep.manifest_value.clone(),
+                                new_range: new_manifest_value,
                                 to: at.clone(),
-                                is_dev,
+                                is_dev: dep.is_dev,
                                 target_kind: TargetKind::AbsoluteLatest,
                                 semver_class,
                                 has_install_scripts: has_scripts,
@@ -401,7 +478,12 @@ pub async fn run(
             attach_skipped_private(&mut json, &skipped_private);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         } else {
-            install_ui::done("All checked package.json dependencies are up to date");
+            let message = if requested_packages.is_empty() {
+                "All checked package.json dependencies are up to date"
+            } else {
+                "All requested package.json dependencies are up to date"
+            };
+            install_ui::done(message);
             warn_skipped_private(&skipped_private);
         }
         return Ok(());
@@ -901,6 +983,36 @@ fn extract_deps_from_value(doc: &serde_json::Value) -> Vec<(String, String, bool
     deps
 }
 
+fn filter_requested_deps(
+    deps: Vec<(String, String, bool)>,
+    requested_packages: &[String],
+) -> Result<Vec<(String, String, bool)>, LpmError> {
+    if requested_packages.is_empty() {
+        return Ok(deps);
+    }
+
+    let requested = requested_packages.iter().cloned().collect::<BTreeSet<_>>();
+    let available = deps
+        .iter()
+        .map(|(name, _, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    let missing = requested
+        .difference(&available)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(LpmError::Script(format!(
+            "package(s) not found in package.json dependencies or devDependencies: {}",
+            missing.join(", ")
+        )));
+    }
+
+    Ok(deps
+        .into_iter()
+        .filter(|(name, _, _)| requested.contains(name))
+        .collect())
+}
+
 /// Compute the upgrade target version and new range.
 ///
 /// In default (non-major) mode, stays within the current major version.
@@ -985,6 +1097,62 @@ fn is_valid_version_string(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filter_requested_deps_keeps_only_named_manifest_dependencies() {
+        let deps = vec![
+            ("zod".to_string(), "^3.0.0".to_string(), false),
+            ("typescript".to_string(), "^5.0.0".to_string(), true),
+            ("react".to_string(), "^18.0.0".to_string(), false),
+        ];
+
+        let filtered = filter_requested_deps(deps, &["typescript".to_string()]).unwrap();
+
+        assert_eq!(
+            filtered,
+            vec![("typescript".to_string(), "^5.0.0".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn filter_requested_deps_errors_when_package_is_not_manifest_dependency() {
+        let deps = vec![("zod".to_string(), "^3.0.0".to_string(), false)];
+
+        let err = filter_requested_deps(deps, &["react".to_string()]).unwrap_err();
+
+        assert!(
+            err.to_string().contains("react"),
+            "missing package error should name the requested dependency: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_dependency_spec_parses_unscoped_npm_alias() {
+        let (spec, range) =
+            ManifestDependencySpec::from_manifest_value("strip-ansi-cjs", "npm:strip-ansi@^6")
+                .unwrap();
+
+        assert!(matches!(
+            &spec,
+            ManifestDependencySpec::NpmAlias { target } if target == "strip-ansi"
+        ));
+        assert_eq!(range, "^6");
+        assert_eq!(spec.render_new_value("^6.1.0"), "npm:strip-ansi@^6.1.0");
+    }
+
+    #[test]
+    fn manifest_dependency_spec_parses_scoped_npm_alias() {
+        let (spec, range) =
+            ManifestDependencySpec::from_manifest_value("node-types", "npm:@types/node@^20")
+                .unwrap();
+
+        assert!(matches!(
+            &spec,
+            ManifestDependencySpec::NpmAlias { target } if target == "@types/node"
+        ));
+        assert_eq!(range, "^20");
+        assert_eq!(spec.render_new_value("^20.1.0"), "npm:@types/node@^20.1.0");
+    }
 
     // ── compute_upgrade (preserved from original) ───────────────────
 

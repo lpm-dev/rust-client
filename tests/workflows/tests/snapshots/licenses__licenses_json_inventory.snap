@@ -1,0 +1,58 @@
+---
+source: tests/workflows/tests/licenses.rs
+expression: envelope
+---
+{
+  "success": true,
+  "root": {
+    "name": "licenses-app",
+    "version": "1.0.0",
+    "licenses": [
+      "MIT"
+    ],
+    "license_expression": "MIT",
+    "missing": false,
+    "copyleft": false
+  },
+  "packages": [
+    {
+      "name": "ansi-regex",
+      "version": "5.0.1",
+      "source": "registry+https://registry.npmjs.org",
+      "scope": "required",
+      "licenses": [
+        "MIT"
+      ],
+      "license_expression": "MIT",
+      "missing": false,
+      "copyleft": false,
+      "denied": false,
+      "denied_licenses": []
+    },
+    {
+      "name": "left-pad",
+      "version": "1.3.0",
+      "source": "registry+https://registry.npmjs.org",
+      "scope": "required",
+      "licenses": [
+        "WTFPL"
+      ],
+      "license_expression": "WTFPL",
+      "missing": false,
+      "copyleft": false,
+      "denied": false,
+      "denied_licenses": []
+    }
+  ],
+  "count": 2,
+  "summary": {
+    "copyleft": 0,
+    "missing": 0,
+    "denied": 0
+  },
+  "policy": {
+    "fail_on": [],
+    "deny": [],
+    "failed": false
+  }
+}

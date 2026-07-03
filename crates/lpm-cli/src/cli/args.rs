@@ -1082,6 +1082,9 @@ pub(crate) enum Commands {
     /// (today's behavior). Use `-y` to force non-interactive in a TTY,
     /// or `-i` to force interactive in a non-TTY context.
     Upgrade {
+        /// Only upgrade the named direct dependency package(s).
+        #[arg(value_name = "PACKAGE")]
+        packages: Vec<String>,
         /// Upgrade to latest major versions (breaking changes).
         /// Non-interactive mode only; in interactive mode, major
         /// upgrades appear as separate rows you can toggle on.
@@ -1324,6 +1327,21 @@ pub(crate) enum Commands {
         /// Output format: list (default) or mermaid (dependency subgraph diagram).
         #[arg(long, default_value = "list")]
         format: String,
+    },
+
+    /// Inventory installed dependency licenses and enforce policy gates.
+    Licenses {
+        /// Fail when a package has the selected license condition.
+        ///
+        /// Repeatable and comma-separated: `--fail-on copyleft,missing`.
+        #[arg(long = "fail-on", value_enum, value_delimiter = ',')]
+        fail_on: Vec<commands::licenses::LicenseFailOn>,
+
+        /// Fail when a package declares this exact license expression.
+        ///
+        /// Repeatable and comma-separated: `--deny GPL-3.0 --deny AGPL-3.0`.
+        #[arg(long, value_name = "LICENSE", value_delimiter = ',')]
+        deny: Vec<String>,
     },
 
     /// Execute dependency lifecycle scripts for installed packages (phase 2 of install).
@@ -2585,7 +2603,15 @@ pub(crate) enum Commands {
         dry_run: bool,
     },
 
+    /// Explain why a package is installed.
+    Why {
+        /// Package to trace from the project root.
+        #[arg(value_name = "PACKAGE")]
+        package: String,
+    },
+
     /// Visualize the dependency graph (tree, DOT, Mermaid, JSON, stats, HTML).
+    #[command(visible_alias = "ls")]
     Graph {
         /// Package to show subtree for (optional — shows full graph if omitted).
         #[arg(value_name = "PACKAGE")]
@@ -4668,6 +4694,74 @@ mod tests {
                 assert_eq!(format, "html");
             }
             _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
+    fn graph_ls_alias_parses_as_graph_command() {
+        let cli = Cli::try_parse_from(["lpm", "ls", "--depth", "2"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Graph { depth, .. } => {
+                assert_eq!(depth, Some(2));
+            }
+            _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
+    fn why_top_level_command_parses_package_name() {
+        let cli = Cli::try_parse_from(["lpm", "--json", "why", "zod"]).unwrap();
+        assert!(cli.json);
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Why { package } => {
+                assert_eq!(package, "zod");
+            }
+            _ => panic!("expected Why command"),
+        }
+    }
+
+    #[test]
+    fn upgrade_package_arguments_parse_before_flags() {
+        let cli =
+            Cli::try_parse_from(["lpm", "upgrade", "zod", "react", "--dry-run", "-y"]).unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Upgrade {
+                packages,
+                dry_run,
+                yes,
+                ..
+            } => {
+                assert_eq!(packages, vec!["zod".to_string(), "react".to_string()]);
+                assert!(dry_run);
+                assert!(yes);
+            }
+            _ => panic!("expected Upgrade command"),
+        }
+    }
+
+    #[test]
+    fn licenses_policy_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "licenses",
+            "--fail-on",
+            "copyleft,missing",
+            "--deny",
+            "GPL-3.0",
+        ])
+        .unwrap();
+        match cli.command.expect("test parse missing subcommand") {
+            Commands::Licenses { fail_on, deny } => {
+                assert_eq!(
+                    fail_on,
+                    vec![
+                        commands::licenses::LicenseFailOn::Copyleft,
+                        commands::licenses::LicenseFailOn::Missing,
+                    ]
+                );
+                assert_eq!(deny, vec!["GPL-3.0".to_string()]);
+            }
+            _ => panic!("expected Licenses command"),
         }
     }
 

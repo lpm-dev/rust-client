@@ -1,15 +1,19 @@
+use crate::commands::manifest_metadata::{
+    ManifestMetadata, extract_manifest_metadata, package_metadata_key, read_json_file,
+    read_local_metadata,
+};
 use crate::commands::registry_reads::{fetch_routed_package_metadata, prepare_routed_read_context};
 use crate::install_ui;
 use crate::provenance_fetch;
 use clap::ValueEnum;
 use lpm_common::provenance::{ProvenanceSnapshot, ProvenanceStatus};
-use lpm_common::{LpmError, LpmRoot, with_shared_lock};
+use lpm_common::{LpmError, LpmRoot};
 use lpm_lockfile::{LockedPackage, Lockfile};
 use lpm_registry::{PackageMetadata, RegistryClient};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 const CYCLONEDX_SPEC_VERSION: &str = "1.7";
@@ -20,37 +24,6 @@ const SBOM_SCHEMA_VERSION: u32 = 1;
 pub enum SbomFormat {
     Cyclonedx,
     Spdx,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ManifestMetadata {
-    description: Option<String>,
-    licenses: Vec<String>,
-    homepage: Option<String>,
-    repository: Option<String>,
-    author: Option<String>,
-}
-
-impl ManifestMetadata {
-    fn merge_missing(&mut self, other: ManifestMetadata) {
-        if self.description.is_none() {
-            self.description = other.description;
-        }
-        if self.homepage.is_none() {
-            self.homepage = other.homepage;
-        }
-        if self.repository.is_none() {
-            self.repository = other.repository;
-        }
-        if self.author.is_none() {
-            self.author = other.author;
-        }
-        for license in other.licenses {
-            if !self.licenses.iter().any(|existing| existing == &license) {
-                self.licenses.push(license);
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -248,7 +221,7 @@ async fn build_document(
     let mut components = Vec::with_capacity(lockfile.packages.len());
     let mut component_refs = BTreeSet::new();
     for package in lockfile.packages {
-        let key = component_key(&package);
+        let key = package_metadata_key(&package);
         let bom_ref = bom_ref_for_package(&package);
         component_refs.insert(bom_ref.clone());
         let mut metadata = ManifestMetadata::default();
@@ -332,7 +305,7 @@ async fn fetch_registry_metadata(
         let value = serde_json::to_value(version)
             .map_err(|e| LpmError::Registry(format!("failed to serialize metadata: {e}")))?;
         by_key.insert(
-            component_key(package),
+            package_metadata_key(package),
             RegistryComponentMetadata {
                 manifest: extract_manifest_metadata(&value),
                 attestation_ref: version
@@ -360,7 +333,7 @@ async fn collect_provenance_metadata(
     if registry {
         let http = reqwest::Client::new();
         for package in packages {
-            let key = component_key(package);
+            let key = package_metadata_key(package);
             let attestation_ref = registry_metadata
                 .get(&key)
                 .and_then(|metadata| metadata.attestation_ref.as_ref());
@@ -389,7 +362,7 @@ async fn collect_provenance_metadata(
             &package.version,
         )? {
             out.insert(
-                component_key(package),
+                package_metadata_key(package),
                 ProvenanceMetadata {
                     status: "cached",
                     snapshot: Some(snapshot),
@@ -434,39 +407,6 @@ fn provenance_from_status(status: ProvenanceStatus) -> ProvenanceMetadata {
             reason: Some(reason),
         },
     }
-}
-
-fn read_local_metadata(
-    project_dir: &Path,
-    packages: &[LockedPackage],
-) -> Result<BTreeMap<String, ManifestMetadata>, LpmError> {
-    let root = LpmRoot::from_env()?;
-    let lock_path = root.store_lock();
-    let root_for_lock = root;
-    with_shared_lock(lock_path, || {
-        let mut out = BTreeMap::new();
-        for package in packages {
-            let mut metadata = ManifestMetadata::default();
-            if let Some(node_modules_metadata) =
-                read_manifest_metadata(&node_modules_package_json(project_dir, &package.name))?
-            {
-                metadata.merge_missing(node_modules_metadata);
-            }
-            if let Some(baseline) = lpm_store::find_installed_package_baseline(
-                &root_for_lock,
-                &package.name,
-                &package.version,
-            )? && let Some(store_metadata) =
-                read_manifest_metadata(&baseline.package_dir.join("package.json"))?
-            {
-                metadata.merge_missing(store_metadata);
-            }
-            if !metadata_is_empty(&metadata) {
-                out.insert(component_key(package), metadata);
-            }
-        }
-        Ok(out)
-    })
 }
 
 fn read_patch_metadata(lockfile: &Lockfile) -> BTreeMap<String, PatchMetadata> {
@@ -921,106 +861,6 @@ fn split_dependency_pin(input: &str) -> Option<(String, String)> {
     Some((name.to_string(), version.to_string()))
 }
 
-fn read_manifest_metadata(path: &Path) -> Result<Option<ManifestMetadata>, LpmError> {
-    match read_json_file(path) {
-        Ok(value) => Ok(Some(extract_manifest_metadata(&value))),
-        Err(LpmError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn read_json_file(path: &Path) -> Result<Value, LpmError> {
-    let content = std::fs::read_to_string(path).map_err(LpmError::Io)?;
-    serde_json::from_str(&content).map_err(|e| {
-        LpmError::Registry(format!("failed to parse JSON from {}: {e}", path.display()))
-    })
-}
-
-fn extract_manifest_metadata(value: &Value) -> ManifestMetadata {
-    let description = value
-        .get("description")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let homepage = value
-        .get("homepage")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let repository = value.get("repository").and_then(extract_urlish);
-    let author = value.get("author").and_then(extract_author);
-    let mut licenses = Vec::new();
-    if let Some(license) = value.get("license") {
-        collect_licenses(license, &mut licenses);
-    }
-    if let Some(license) = value.get("licenses") {
-        collect_licenses(license, &mut licenses);
-    }
-    licenses.sort();
-    licenses.dedup();
-    ManifestMetadata {
-        description,
-        licenses,
-        homepage,
-        repository,
-        author,
-    }
-}
-
-fn collect_licenses(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::String(s) if !s.is_empty() => out.push(s.clone()),
-        Value::Object(obj) => {
-            if let Some(s) = obj
-                .get("type")
-                .or_else(|| obj.get("name"))
-                .or_else(|| obj.get("url"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                out.push(s.to_string());
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_licenses(item, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn extract_urlish(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) if !s.is_empty() => Some(s.clone()),
-        Value::Object(obj) => obj
-            .get("url")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        _ => None,
-    }
-}
-
-fn extract_author(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) if !s.is_empty() => Some(s.clone()),
-        Value::Object(obj) => obj
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        _ => None,
-    }
-}
-
-fn node_modules_package_json(project_dir: &Path, name: &str) -> PathBuf {
-    project_dir
-        .join("node_modules")
-        .join(name)
-        .join("package.json")
-}
-
 fn purl_for_package(name: &str, version: &str) -> String {
     format!(
         "pkg:npm/{}@{}",
@@ -1089,10 +929,6 @@ fn sanitize_ref_fragment(input: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-fn component_key(package: &LockedPackage) -> String {
-    bom_ref_for_package(package)
-}
-
 fn license_declared(metadata: &ManifestMetadata) -> String {
     if metadata.licenses.is_empty() {
         "NOASSERTION".to_string()
@@ -1145,14 +981,6 @@ fn pseudo_uuid(kind: &str, document: &SbomDocument) -> String {
         &hex[16..20],
         &hex[20..32]
     )
-}
-
-fn metadata_is_empty(metadata: &ManifestMetadata) -> bool {
-    metadata.description.is_none()
-        && metadata.licenses.is_empty()
-        && metadata.homepage.is_none()
-        && metadata.repository.is_none()
-        && metadata.author.is_none()
 }
 
 fn emit_sbom(value: &Value, output: Option<&Path>) -> Result<(), LpmError> {

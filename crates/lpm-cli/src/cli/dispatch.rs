@@ -1421,13 +1421,24 @@ async fn async_main() -> Result<()> {
             .await
         }
         Commands::Upgrade {
+            packages,
             major,
             dry_run,
             interactive,
             yes,
         } => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::upgrade::run(&client, &cwd, major, dry_run, interactive, yes, cli.json).await
+            commands::upgrade::run(
+                &client,
+                &cwd,
+                &packages,
+                major,
+                dry_run,
+                interactive,
+                yes,
+                cli.json,
+            )
+            .await
         }
         Commands::Init {
             yes,
@@ -1586,6 +1597,10 @@ async fn async_main() -> Result<()> {
                 &format,
             )
             .await
+        }
+        Commands::Licenses { fail_on, deny } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::licenses::run(&cwd, &fail_on, &deny, cli.json)
         }
         Commands::Rebuild {
             packages,
@@ -2584,6 +2599,22 @@ async fn async_main() -> Result<()> {
                 dev,
                 cli.json,
                 no_open,
+            )
+            .await
+        }
+        Commands::Why { package } => {
+            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            commands::graph::run(
+                &cwd,
+                None,
+                Some(package.as_str()),
+                "tree",
+                None,
+                None,
+                false,
+                false,
+                cli.json,
+                false,
             )
             .await
         }

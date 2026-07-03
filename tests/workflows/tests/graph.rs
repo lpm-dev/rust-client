@@ -561,6 +561,65 @@ fn graph_why_json_output_includes_applied_overrides() {
     assert_eq!(arr[0]["via_parent"].as_str(), Some("debug"));
 }
 
+#[test]
+fn why_top_level_json_matches_graph_why_json() {
+    let project = TempProject::empty(
+        r#"{"name":"why-top-level","version":"0.0.0","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+    write_simple_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+
+    let graph_out = lpm(&project)
+        .args(["--json", "graph", "--why", "lodash"])
+        .output()
+        .expect("spawn lpm graph --why --json");
+    let why_out = lpm(&project)
+        .args(["--json", "why", "lodash"])
+        .output()
+        .expect("spawn lpm why --json");
+
+    assert!(
+        graph_out.status.success() && why_out.status.success(),
+        "both graph --why and why must succeed\ngraph stdout:\n{}\ngraph stderr:\n{}\nwhy stdout:\n{}\nwhy stderr:\n{}",
+        String::from_utf8_lossy(&graph_out.stdout),
+        String::from_utf8_lossy(&graph_out.stderr),
+        String::from_utf8_lossy(&why_out.stdout),
+        String::from_utf8_lossy(&why_out.stderr),
+    );
+
+    let graph_json: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&graph_out.stdout)))
+            .expect("graph --why stdout must be JSON");
+    let why_json: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&why_out.stdout)))
+            .expect("why stdout must be JSON");
+    assert_eq!(why_json, graph_json);
+}
+
+#[test]
+fn ls_alias_renders_graph_tree() {
+    let project = graph_fixture();
+
+    let output = lpm(&project)
+        .args(["ls", "--depth", "2"])
+        .output()
+        .expect("failed to run lpm ls");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "lpm ls should succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("graph-project") || stdout.contains("express"),
+        "ls alias must render graph tree output, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("Rendered dependency tree"),
+        "ls alias must reuse graph tree completion output, got:\n{stderr}"
+    );
+}
+
 /// Graceful absence: with no `.lpm/overrides-state.json`, JSON output
 /// still succeeds and emits an empty `applied_overrides` array — not
 /// `null`, not absent. Pins the empty-state contract for downstream
