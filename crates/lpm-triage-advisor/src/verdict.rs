@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(parse_verdict(output).unwrap(), AdvisorVerdict::Approve);
     }
 
-    // ── Negation must NOT grant Approve (Finding 2) ────────────────
+    // ── Negation must NOT grant Approve ──────────────────────────
 
     #[test]
     fn negated_approve_does_not_grant_approve() {

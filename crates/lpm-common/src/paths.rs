@@ -775,7 +775,7 @@ where
 /// lockfile commit window. Without this lock, both processes would
 /// snapshot the same pre-edit `package.json`, both stage their own
 /// dep on top, and the second-to-commit silently overwrites the
-/// first's edits — see finding #77.
+/// first's edits.
 ///
 /// Lock scope is per-project: unrelated installs in different
 /// projects do not contend. Within a single project, the lock holds
@@ -1656,8 +1656,7 @@ mod tests {
     /// stream of readers would starve the writer indefinitely
     /// (`flock` itself has no SH-vs-EX fairness guarantee).
     ///
-    /// Regression for the high-severity finding: this scenario was
-    /// possible in the pre-turnstile design.
+    /// This scenario was possible in the pre-turnstile design.
     #[test]
     fn late_reader_blocks_when_writer_queued() {
         let tmp = TempDir::new().unwrap();
@@ -1771,7 +1770,7 @@ mod tests {
     /// has no SH-vs-EX fairness guarantee from the kernel and W2 can
     /// starve under reader pressure.
     ///
-    /// Regression for the medium-severity multi-writer finding.
+    /// This scenario was possible before the writer-queue baton.
     #[test]
     fn second_writer_not_leapfrogged_by_late_readers() {
         let tmp = TempDir::new().unwrap();

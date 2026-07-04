@@ -78,7 +78,7 @@ pub enum ReconciliationOutcome {
     /// COMMIT or ABORT was written, recovery will retry on the next
     /// `lpm` invocation. Recovery does NOT propagate this as an error
     /// because doing so would wedge every subsequent global-state
-    /// command (audit Medium from the audit).
+    /// command.
     Deferred {
         reason: String,
     },
@@ -415,12 +415,11 @@ fn reconcile_one(
 /// because bin entries are discovered post-extract from the marker.
 /// Pre-fix this comparison was strict and a manifest-written-but-
 /// WAL-COMMIT-missing crash would have failed Case A, fallen into
-/// Case C, and deleted the live install root (audit High #1).
+/// Case C, and deleted the live install root.
 ///
 /// `installed_at` is excluded because recovery may set a different
 /// timestamp than the original install. `source` is compared
-/// strictly (audit Medium #1): two installs
-/// of the "same" package from `lpm-dev` vs `upstream-npm` differ in
+/// strictly: two installs of the "same" package from `lpm-dev` vs `upstream-npm` differ in
 /// future `lpm global update` resolution behavior.
 fn active_matches_intent(manifest: &GlobalManifest, intent: &IntentPayload) -> bool {
     let Some(active) = manifest.packages.get(&intent.package) else {
@@ -1685,7 +1684,7 @@ mod tests {
         assert!(bytes_after > 0);
     }
 
-    // ─── audit regressions ────────────────────────────────────
+    // ─── Recovery regressions ─────────────────────────────────
 
     /// Helper: construct an INTENT with a pre-built `new_row_json` so the
     /// "active matches new_row" check has structured fields to compare.
@@ -1718,8 +1717,8 @@ mod tests {
         }))
     }
 
-    /// Audit High Finding 1+2: when the manifest already reflects the
-    /// committed state (Case A — crash between manifest persist and
+    /// When the manifest already reflects the committed state
+    /// (Case A — crash between manifest persist and
     /// WAL COMMIT), recovery must NOT delete the active install root.
     /// It must emit COMMIT and report `AlreadyCommitted`.
     #[test]
@@ -1848,8 +1847,7 @@ mod tests {
 
     /// Even with subset semantics, an Intent that explicitly lists a
     /// command the active row doesn't own is still a real mismatch —
-    /// strict subset, not arbitrary acceptance. (Symmetric of the
-    /// audit Medium that source comparison must be strict.)
+    /// strict subset, not arbitrary acceptance.
     #[test]
     fn case_a_does_not_match_when_intent_commands_not_subset_of_active() {
         let tmp = TempDir::new().unwrap();
@@ -2794,8 +2792,7 @@ mod tests {
         );
     }
 
-    /// Audit Medium Finding 3: roll-forward must remove obsolete
-    /// aliases that the new snapshot doesn't claim, including their
+    /// Roll-forward must remove obsolete aliases that the new snapshot doesn't claim, including their
     /// shims. Without the fix, an upgrade that drops an alias would
     /// leave the stale row + stale shim.
     #[test]
@@ -3045,8 +3042,8 @@ mod tests {
         );
     }
 
-    /// Audit Medium Finding 4: rollback must remove alias shims the
-    /// new install would have owned, AND restore alias shims for the
+    /// Rollback must remove alias shims the new install would have owned
+    /// and restore alias shims for the
     /// prior version. Pre-fix, only command shims got handled.
     #[test]
     #[cfg(unix)]

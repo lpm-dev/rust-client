@@ -830,8 +830,7 @@ mod tests {
         assert_eq!(v[0], inside);
     }
 
-    /// Reviewer's acceptance #2: descendant path accepted when
-    /// allowlist is non-empty.
+    /// Descendant path accepted when allowlist is non-empty.
     #[test]
     fn slice5_descendant_of_allowlist_root_accepted() {
         let entry = unix_abs_str("/Users/alice/src/build-output");
@@ -843,8 +842,8 @@ mod tests {
         assert_eq!(v, vec![unix_abs_pathbuf("/Users/alice/src/build-output")]);
     }
 
-    /// Reviewer's acceptance #3: non-descendant absolute path
-    /// rejected when allowlist is non-empty. Error names both
+    /// Non-descendant absolute path rejected when allowlist is non-empty.
+    /// Error names both
     /// project_dir + allowlist so the user can see which side
     /// needs fixing.
     #[test]
@@ -877,8 +876,7 @@ mod tests {
         }
     }
 
-    /// Reviewer's acceptance #4: `..` escape rejected. This test
-    /// runs with an empty allowlist — traversal is an
+    /// `..` escape rejected. This test runs with an empty allowlist — traversal is an
     /// unconditional check, not gated on the allowlist being set.
     ///
     /// Path choice: `../sibling-outside`. The earlier `../../etc`
@@ -908,8 +906,7 @@ mod tests {
         }
     }
 
-    /// Reviewer's acceptance #5: dangerous roots rejected even
-    /// when they would match the allowlist — the dangerous
+    /// Dangerous roots rejected even when they would match the allowlist — the dangerous
     /// denylist has final veto.
     ///
     /// The dangerous-system-root literals differ between POSIX

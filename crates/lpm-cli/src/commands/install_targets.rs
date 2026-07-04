@@ -511,7 +511,7 @@ mod tests {
 
         assert_eq!(targets.member_manifests.len(), 1);
         assert!(targets.member_manifests[0].ends_with("packages/foo/package.json"));
-        // audit correction: install root is the MEMBER dir, not the
+        // Install root is the MEMBER dir, not the
         // workspace root. LPM uses per-directory lockfiles + node_modules,
         // so member-targeted installs must run their pipeline at the member.
         let expected = tmp.path().join("packages").join("foo");
@@ -627,12 +627,11 @@ mod tests {
         assert!(targets.member_manifests[0].ends_with("packages/bar/package.json"));
     }
 
-    // ── audit fix: per-target install root invariant ──────────────
+    // ── Per-target install root invariant ────────────────────────
 
     #[test]
     fn install_root_for_returns_manifest_parent_directory() {
         // The install root for any target manifest is its parent directory.
-        // This is the architectural correction from the audit:
         // LPM uses per-directory lockfiles + node_modules, so the install
         // pipeline runs at the manifest's parent, not at some shared root.
         use std::path::PathBuf;
@@ -651,8 +650,8 @@ mod tests {
 
     #[test]
     fn workspace_filter_install_root_is_member_dir_not_workspace_root() {
-        // CRITICAL audit regression: when --filter targets a member,
-        // the install root for that target is the member's dir, NOT the
+        // When --filter targets a member, the install root for that target is
+        // the member's dir, NOT the
         // workspace root. The old (incorrect) implementation set
         // install_root to workspace_root and tripped the empty-deps
         // early-return on workspaces with no root dependencies.

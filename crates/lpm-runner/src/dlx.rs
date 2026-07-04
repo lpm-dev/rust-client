@@ -641,9 +641,8 @@ mod tests {
 
     #[test]
     fn migrate_legacy_dlx_cache_legacy_wins_when_modern_incomplete() {
-        // Regression test for the audit finding: a half-written modern entry
-        // (e.g. from a crash during install) must NOT silently discard a
-        // complete legacy copy.
+        // A half-written modern entry (e.g. from a crash during install) must
+        // NOT silently discard a complete legacy copy.
         let dir = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(dir.path());
 

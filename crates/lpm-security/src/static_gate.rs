@@ -1099,7 +1099,7 @@ pub fn extract_delegate_path(body: &str) -> Option<String> {
 /// - A malicious package CAN lie about its repository field. The
 ///   counter-measure is that `lpm approve-scripts` embeds the
 ///   delegate file's actual content in the review prompt — the lie
-///   is one step removed from the payload, which the reviewer sees
+///   is one step removed from the payload, which the user sees
 ///   directly. This check alone trusts the field; the user-explicit
 ///   `lpm approve-scripts` review remains the safety floor.
 fn matches_delegating_identity_green(body: &str, ctx: &ManifestContext<'_>) -> bool {
@@ -1199,7 +1199,7 @@ fn package_base_name(name: &str) -> String {
 /// unrelated repository URLs to be a useful signal. A future
 /// extension could keep a richer denylist or weight against URL
 /// segment frequency; for now the simple form is enough to gate the
-/// audit's false-Green stress test.
+/// false-Green stress test.
 fn repo_url_contains_identity(repo: &str, base: &str) -> bool {
     if base.len() < 3 {
         return false;
@@ -1345,8 +1345,8 @@ mod tests {
 
     #[test]
     fn audit_repro_softfail_wrappers_are_not_red() {
-        // The six top-5000 packages the audit caught as false-positive
-        // reds (rank, monthly downloads in parens for context only).
+        // Known top-5000 packages that must not classify as false-positive reds
+        // (rank, monthly downloads in parens for context only).
         let cases = [
             // core-js (582, 253M/mo) and core-js-pure (2024, 70M/mo)
             r#"node -e "try{require('./postinstall')}catch(e){}""#,

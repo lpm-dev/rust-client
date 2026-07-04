@@ -5,7 +5,7 @@
 //! - `lpm.lockb` (binary) — generated companion for doctor validation/writeback
 //!
 //! The binary lockfile is written alongside TOML on every resolution.
-//! On read, commands use the reviewer-visible TOML as the authoritative input.
+//! On read, commands use the human-readable TOML as the authoritative input.
 //!
 //! Design principles (from research doc Section 8):
 //! - Sorted entries for deterministic diffs

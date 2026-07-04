@@ -569,9 +569,8 @@ fn do_capture_msvc_env() -> Result<HashMap<String, String>, String> {
     // PRESENT but produces a runtime error (wrong toolset for the
     // host arch, missing matching SDK, etc.) must NOT block
     // fallback to an older install whose batch file does succeed.
-    // The audit's medium-severity finding was that the prior
-    // version returned eagerly on the first vcvarsall RUN failure;
-    // this loop closes that hole.
+    // If the first vcvarsall candidate fails at runtime, keep searching instead
+    // of returning eagerly.
     let arch = std::env::var("LPM_MSVC_TARGET")
         .ok()
         .unwrap_or_else(|| host_msvc_arch().to_string());

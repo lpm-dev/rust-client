@@ -1546,11 +1546,10 @@ mod tests {
             "strict_root=true must refuse a reparse-point root; got {strict_result:?}",
         );
 
-        // Best-effort: warn + continue. This is the audit fix —
-        // pre-patch the reparse-point branch returned Err before
-        // the strict_root check fired, so a PATH-derived best-
-        // effort dir that happened to be a junction (common on
-        // Windows) hard-aborted the entire spawn.
+        // Best-effort: warn + continue. Pre-patch the reparse-point branch
+        // returned Err before the strict_root check fired, so a PATH-derived
+        // best-effort dir that happened to be a junction (common on Windows)
+        // hard-aborted the entire spawn.
         let best_effort_result = grant_dacl_ace_to_tree(
             &junction,
             sid.0,

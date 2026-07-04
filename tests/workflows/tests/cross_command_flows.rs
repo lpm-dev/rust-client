@@ -341,7 +341,7 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
         .expect("spawn lpm rebuild");
     assert!(
         out_rebuild.status.success(),
-        "post-audit rebuild --dry-run failed: stdout={} stderr={}",
+        "rebuild --dry-run failed: stdout={} stderr={}",
         String::from_utf8_lossy(&out_rebuild.stdout),
         String::from_utf8_lossy(&out_rebuild.stderr)
     );

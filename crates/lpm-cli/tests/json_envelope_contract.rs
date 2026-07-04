@@ -3,7 +3,7 @@
 //! Pins two paired contracts that previously drifted in opposite
 //! directions:
 //!
-//! 1. **Envelope universality (finding #76):** every `lpm --json <cmd>`
+//! 1. **Envelope universality:** every `lpm --json <cmd>`
 //!    that errors BEFORE reaching the command's own JSON-output branch
 //!    must still emit a structured `{"success": false, "error": ...,
 //!    "error_code": ...}` envelope on stdout — not a human-formatted
@@ -11,7 +11,7 @@
 //!    body short-circuited `async_main` directly, bypassing the
 //!    top-level envelope handler.
 //!
-//! 2. **Exit-code mirroring (finding #73):** when stdout carries a
+//! 2. **Exit-code mirroring:** when stdout carries a
 //!    `success: false` envelope, the process must exit non-zero. The
 //!    contract: exit code mirrors the envelope's `success` field on
 //!    every supported path.
@@ -27,13 +27,12 @@
 //!   from an explicit early-return inside the ApproveScripts arm body.
 //! - `install --policy=invalid` — `?` early-exit through
 //!   `.map_err(LpmError::Script)?` from the policy-parse helper,
-//!   inside the Install arm body. Finding #76 named this as a known
-//!   pre-fix-failing path.
+//!   inside the Install arm body.
 //! - `use --pin` (without a spec) — explicit `return Err` via
 //!   `.ok_or_else(|| LpmError::Script(...))?` from inside the Use arm
 //!   body, which was flattened from a per-arm `async {}.await` wrap
-//!   to the outer wrap (finding A); this case proves the outer wrap
-//!   handles flattened arms correctly.
+//!   to the outer wrap; this case proves the outer wrap handles
+//!   flattened arms correctly.
 //!
 //! All three need only a bare `package.json` and no network, so the
 //! envelope assertion is uncontaminated by unrelated initialisation
@@ -85,8 +84,7 @@ struct DispatchCase {
 
 const CASES: &[DispatchCase] = &[
     // ApproveScripts arm: explicit `return Err(LpmError::Script(...))`
-    // path inside the arm body. Pre-finding-#76 this was lost to
-    // human stderr.
+    // path inside the arm body. Pre-fix this was lost to human stderr.
     DispatchCase {
         arm: "ApproveScripts",
         args: &["--json", "approve-scripts", "--group"],
@@ -94,8 +92,7 @@ const CASES: &[DispatchCase] = &[
         expected_error_code: "script",
     },
     // Install arm: `?` early-exit through `.map_err(LpmError::Script)?`
-    // from `collapse_policy_flags`. Finding #76 named this as a
-    // verified pre-fix-failing path.
+    // from `collapse_policy_flags`, a verified pre-fix-failing path.
     DispatchCase {
         arm: "Install",
         args: &["--json", "install", "--policy=invalid"],
@@ -104,8 +101,7 @@ const CASES: &[DispatchCase] = &[
     },
     // Use arm: `return Err` via `.ok_or_else()?` from the `--pin
     // (no-spec)` branch. Tests the flattened Use arm specifically —
-    // finding A removed its per-arm `async {}.await` wrap so the
-    // outer wrap is now the sole envelope route for this arm.
+    // the outer wrap is now the sole envelope route for this arm.
     DispatchCase {
         arm: "Use",
         args: &["--json", "use", "--pin"],
@@ -114,7 +110,7 @@ const CASES: &[DispatchCase] = &[
     },
 ];
 
-/// **Finding #76 contract.** Every `lpm --json <cmd>` whose arm body
+/// Every `lpm --json <cmd>` whose arm body
 /// errors before reaching the command's own JSON-output branch must
 /// still emit a structured envelope on stdout. The matrix below
 /// exercises three distinct arm-body shapes (explicit `return Err`,
@@ -173,8 +169,8 @@ fn json_dispatch_early_error_emits_envelope_on_stdout() {
     }
 }
 
-/// **Finding #73 contract.** When stdout carries `success: false`,
-/// exit code MUST be `1` — not just non-zero. Pre-fix, the
+/// When stdout carries `success: false`, exit code MUST be `1` — not
+/// just non-zero. Pre-fix, the
 /// `?`-early-exit paths that bypassed the envelope also bypassed the
 /// exit-code mirror at the bottom of `async_main`. The contract
 /// pinned here is the precise direction of the mirror: every

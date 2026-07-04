@@ -115,8 +115,7 @@ impl IsolatedInstall {
 
 /// Check that the install-root completeness markers
 /// `{package.json, node_modules/.bin}` are both present. Same predicate
-/// used by `dlx_entry_appears_complete` in the dlx module (the
-/// migration audit fixed the collision branch to use it). Kept here
+/// used by `dlx_entry_appears_complete` in the dlx module. Kept here
 /// as a private helper because the predicate is the contract this
 /// primitive enforces, not a public concept.
 fn markers_present(root: &Path) -> bool {

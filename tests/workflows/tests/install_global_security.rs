@@ -426,8 +426,7 @@ fn install_global_validator_still_rejects_yes_flag() {
 }
 
 /// `lpm install --help` mentions the rerun caveat for global installs.
-/// Pinned by the round-2 audit's open question — this hint must ship
-/// in real CLI strings, not just plan docs.
+/// This hint must ship in real CLI strings, not just plan docs.
 #[test]
 fn install_help_mentions_global_rerun_caveat() {
     let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);

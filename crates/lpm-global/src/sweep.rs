@@ -143,8 +143,7 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
     let pending: Vec<String> = std::mem::take(&mut manifest.tombstones);
 
     for relative_path in pending {
-        // Audit: Finding 1 (High): manifests are not necessarily
-        // trustworthy. Recovery's `relative_install_root` already
+        // Manifests are not necessarily trustworthy. Recovery's `relative_install_root` already
         // refuses to *write* a tombstone path that escapes
         // `global_root`, but a corrupted, hand-edited, or
         // adversarially-poisoned manifest could still feed us paths
@@ -207,13 +206,12 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
 /// shape produced by `LpmRoot::install_root_for`.
 ///
 /// **Why such a strict shape and not "any relative path under the
-/// global root"?** The first audit pass (Audit Finding 1) only
-/// blocked `..` and absolute paths, with a final `starts_with(global_root)`
-/// guard. That closed the `../../etc` escape but still admitted poisoned
+/// global root"?** Blocking only `..` and absolute paths, with a final
+/// `starts_with(global_root)` guard, closes the `../../etc` escape but still admits poisoned
 /// entries like `"."` (resolves to `global_root` itself) or `"installs"`
 /// (resolves to `global_root/installs`) — both of which `remove_dir_all`
 /// would happily wipe, taking the entire global state or every live
-/// install root with them. The audit's second-pass High finding.
+/// install root with them.
 ///
 /// The legitimate writers (`relative_install_root` in recover.rs, the
 /// `install_root_relative` field in install/update commits, and the
@@ -357,9 +355,8 @@ fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<P
             }
             Component::CurDir => {
                 // Real writers never emit `./` prefixes; treating them as
-                // benign (the first-pass audit's regression) admitted
-                // shapes like `"./installs"` whose component count was
-                // misjudged downstream. Refuse outright.
+                // benign admits shapes like `"./installs"` whose component
+                // count is misjudged downstream. Refuse outright.
                 return Err(format!(
                     "refusing to sweep tombstone {relative_path:?}: contains current-directory \
                      reference — real install-root tombstones never include `./`"
@@ -662,7 +659,7 @@ mod tests {
         assert_eq!(report.swept.len(), 1);
     }
 
-    // ─── Audit Finding 1 (High): poisoned-tombstone validation ──
+    // ─── Poisoned-tombstone validation ─────────────────────────
     //
     // Recovery's `relative_install_root` only writes tombstones that
     // strip cleanly under `global_root`. The sweep, however, reads
@@ -826,8 +823,7 @@ mod tests {
         assert!(validated_tombstone_path(global_root, "installs/../escape").is_err());
         assert!(validated_tombstone_path(global_root, "/etc/passwd").is_err());
 
-        // Audit Finding 1 (High) — these used to slip
-        // through the "stays under global_root" check and let
+        // These used to slip through the "stays under global_root" check and let
         // remove_dir_all wipe the whole global state or every install root.
         // Either of two refusal axes (shape OR component-kind) is
         // acceptable; both block the dangerous primitive.
@@ -858,8 +854,8 @@ mod tests {
         assert!(no_at.contains("`<name>@<version>`"));
     }
 
-    /// End-to-end equivalent of the audit's poisoning scenario. A
-    /// tombstone of `"."` would (pre-fix) have made the sweep
+    /// End-to-end poisoning scenario. A tombstone of `"."` would (pre-fix)
+    /// have made the sweep
     /// `remove_dir_all(global_root)`, wiping the whole global tree —
     /// manifest, installs, WAL, the lot. Assert the tree survives.
     #[test]

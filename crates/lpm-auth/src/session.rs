@@ -360,8 +360,8 @@ impl SessionManager {
     ///
     /// 1. The `ExposeSecret` boundary, so command code stays free of
     ///    `secrecy` imports.
-    /// 2. The refresh-only-state case (audit fix #1): if the cached
-    ///    access token is empty but the source is refresh-eligible
+    /// 2. The refresh-only-state case: if the cached access token is
+    ///    empty but the source is refresh-eligible
     ///    (a `StoredSession` placeholder seeded from the on-disk
     ///    refresh token), this method performs one silent refresh
     ///    and returns the rotated bearer.
@@ -1564,9 +1564,8 @@ mod refresh_http_tests {
         assert!(matches!(res, Err(LpmError::SessionExpired)));
         // Refresh token was cleared so subsequent refreshes don't loop.
         assert!(crate::get_refresh_token(&server.uri()).is_none());
-        // Audit fix #2: cached access token AND its in-memory cache
-        // are both wiped, so the next request goes out anonymous
-        // instead of replaying a dead bearer.
+        // Cached access token AND its in-memory cache are both wiped, so the
+        // next request goes out anonymous instead of replaying a dead bearer.
         assert!(
             !mgr.has_token(),
             "in-memory cache must be cleared after authoritative refresh failure"

@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn install_n_writes_snapshot_install_n_plus_1_detects_addition() {
-        // Simulates the audit-prescribed flow:
+        // Simulates the install-to-install diff flow:
         //   1. User runs install with manifest M1.
         //   2. Snapshot is written with M1's bindings.
         //   3. A poisoned PR adds "axios@1.14.1" to the manifest.
@@ -494,8 +494,7 @@ mod tests {
         assert_eq!(
             adds,
             vec!["axios@1.14.1".to_string()],
-            "silent manifest addition MUST be flagged on the next install \
-             (audit-prescribed end-to-end regression)"
+            "silent manifest addition MUST be flagged on the next install"
         );
 
         // And the rendered notice names the CTA to inspect.

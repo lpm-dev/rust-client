@@ -44,11 +44,11 @@ fn write_project_no_trusted_deps(project: &TempProject) {
 }
 
 // Project-mode build-state.json seeding lives in
-// `support::build_state::seed_blocked_build_state_with_real_hash`
-// (finding D). The helper stages a real store entry and computes the
+// `support::build_state::seed_blocked_build_state_with_real_hash`.
+// The helper stages a real store entry and computes the
 // hash via `lpm_security::script_hash::compute_script_hash`, so a
 // future test that adds a `lpm rebuild` step doesn't trip the
-// finding #75 BindingDrift footgun.
+// BindingDrift footgun.
 
 /// Synthesize an empty blocked-set build-state — exercises the
 /// short-circuit branch in `approve_scripts::run`.
@@ -1063,9 +1063,9 @@ fn approve_scripts_first_time_review_emits_null_version_diff_and_no_card() {
     );
 }
 
-// ─── audit regression tests ─────────────────────────
+// ─── End-to-end trust regression tests ──────────────
 //
-// Three audit regression tests, end-to-end:
+// Three trust regression tests, end-to-end:
 //  - **Legacy bare-name upgrade:** legacy `["esbuild"]` upgrades to `esbuild@*` after
 //    `--yes` and stays trusted on the next install (no re-block).
 //  - **Filter by current install state:** `--list` filters persisted state through CURRENT

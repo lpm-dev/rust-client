@@ -2672,7 +2672,7 @@ fn mode_switch_hoisted_to_isolated_handles_scoped_dirs() {
 // contract that the linker reports every physical destination it
 // wrote — including the `<project>/.lpm/hoisted/nested/<name>/`
 // shape (post-symmetry; pre-symmetry: `node_modules/.lpm/nested/`)
-// that the first draft of missed (D-design-1).
+// that the first draft missed.
 
 #[test]
 fn isolated_mode_records_canonical_destination() {
@@ -3520,8 +3520,8 @@ fn materialize_directory_source_errors_on_missing_source() {
 /// resolution from the source itself), but the wrapper symlink
 /// points at the off-tree target. The contract is intentional:
 /// the linker is transparent to whatever the source declares.
-/// This test pins the success-with-escape behavior so a future
-/// reviewer doesn't tighten the warn into a hard error.
+/// This test pins the success-with-escape behavior so a future change
+/// doesn't tighten the warn into a hard error.
 #[cfg(unix)]
 #[test]
 fn materialize_directory_source_passes_through_symlink_that_escapes_root() {

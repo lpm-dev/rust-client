@@ -111,8 +111,8 @@ pub struct AppliedPatchHit {
     /// install-pipeline `apply_patch` baseline.
     ///
     /// **Backward compat:** declared as `Option<String>` with serde
-    /// default so state files written before the audit fix
-    ///  — which lacked this field — still parse cleanly.
+    /// default so state files written before this field existed still
+    /// parse cleanly.
     /// Readers that find `None` should treat the integrity as "not
     /// recorded" rather than degrading the user experience.
     #[serde(default, skip_serializing_if = "Option::is_none")]

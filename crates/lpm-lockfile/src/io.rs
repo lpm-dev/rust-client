@@ -152,7 +152,7 @@ impl Lockfile {
     /// `lpm.lockb` remains a generated companion that `doctor` and install
     /// writeback can validate/regenerate, but it is not trusted as an install
     /// input. A committed binary cache is opaque in code review, so the
-    /// reviewer-visible TOML form is what commands execute.
+    /// human-readable TOML form is what commands execute.
     pub fn read_fast(toml_path: &Path) -> Result<Self, LockfileError> {
         Self::read_from_file(toml_path)
     }

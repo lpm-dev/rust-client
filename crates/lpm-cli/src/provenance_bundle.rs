@@ -506,8 +506,7 @@ fn find_leaf_cert_rawbytes(v: &serde_json::Value) -> Option<String> {
 /// cross-release while keeping `workflow_ref` as audit-only data.
 /// Motivation: without the split, a legitimate v1.14.0 → v1.14.1
 /// release (same repo, same workflow file, necessarily different ref)
-/// would register as "identity changed" and block. See the reviewer's
-/// drift-comparator finding for the full trace.
+/// would register as "identity changed" and block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SanIdentity {
     /// `github:<org>/<repo>` — stable across releases. Part of the

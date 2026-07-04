@@ -539,7 +539,7 @@ fn read_package_json_release_age_config(
 ///
 /// String coercion accepts values like `"86400"` because the generic
 /// `lpm config set <key> <value>` command writes every value as a TOML
-/// string (Finding A in [`crate::save_config`]) — the documented
+/// string; the documented
 /// persistent-config path must actually work.
 #[cfg(test)]
 fn read_global_min_age_from_file(path: &Path) -> Result<Option<u64>, LpmError> {
@@ -931,7 +931,7 @@ mod tests {
     }
 
     /// `lpm config set minimum-release-age-secs 259200` writes a TOML
-    /// string (Finding A). The loader MUST accept that form or the
+    /// string. The loader MUST accept that form or the
     /// documented persistent-config path is unusable.
     #[test]
     fn global_file_string_value_for_config_set_compat() {
@@ -1063,8 +1063,8 @@ mod tests {
         );
     }
 
-    /// Reviewer finding : `u64::from_str("+5")` returns `Ok(5)`,
-    /// so without an explicit sign-prefix rejection the global-TOML
+    /// `u64::from_str("+5")` returns `Ok(5)`, so without an explicit
+    /// sign-prefix rejection the global-TOML
     /// string path would silently accept `"+259200"` even though the
     /// CLI flag rejects `+5h`. Both string-coercion sites now route
     /// through [`parse_strict_u64_string`] for uniform behaviour; this
@@ -1667,8 +1667,8 @@ minimum-release-age-exclude = ["global-pkg"]
         assert_eq!(cfg.get_u64("absent"), None);
     }
 
-    /// Reviewer regression: the convenience reader must reject
-    /// sign-prefixed strings too, not just the path-aware loader.
+    /// The convenience reader must reject sign-prefixed strings too,
+    /// not just the path-aware loader.
     /// Without this, a user who runs
     /// `lpm config set some-key +5` would have `GlobalConfig::get_u64`
     /// silently return `Some(5)` while `--some-flag=+5` would be

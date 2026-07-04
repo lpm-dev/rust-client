@@ -474,7 +474,7 @@ fn tarball_mixed_population_roundtrips() {
 }
 
 #[test]
-fn registry_signature_metadata_roundtrips_as_reviewer_visible_toml() {
+fn registry_signature_metadata_roundtrips_as_human_readable_toml() {
     let toml = r#"
 [metadata]
 lockfile-version = 3
@@ -2329,7 +2329,7 @@ fn auto_isolated_peer_conflicts_metadata_triggers_binary_fallback() {
     lf.metadata.auto_isolated_peer_conflicts = true;
     assert!(
         !crate::binary::binary_format_supports(&lf),
-        "auto-isolated peer-conflict metadata must stay in reviewer-visible TOML"
+        "auto-isolated peer-conflict metadata must stay in human-readable TOML"
     );
 }
 
@@ -2359,7 +2359,7 @@ fn registry_signature_metadata_triggers_binary_fallback() {
 
     assert!(
         !crate::binary::binary_format_supports(&lf),
-        "registry signature metadata must stay in reviewer-visible TOML"
+        "registry signature metadata must stay in human-readable TOML"
     );
 }
 

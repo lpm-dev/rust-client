@@ -1,6 +1,6 @@
 //! Workflow tests for `lpm install` + the patch-apply pipeline.
 //!
-//! Acceptance criteria and audit fixes for the patch feature:
+//! Acceptance criteria for the patch feature:
 //! - Patches apply after the linker pass (canonical isolated location).
 //! - Idempotent reruns are no-ops (no double-apply, no zero-op summary
 //!   in JSON or human output).
@@ -997,8 +997,8 @@ fn install_json_envelope_includes_applied_patches_field() {
     assert_eq!(arr[0]["files_modified"].as_u64(), Some(1));
 }
 
-/// Audit fix (2026-04-12, Medium): a no-op idempotent rerun must NOT
-/// claim work it didn't do. JSON `applied_patches` empty on the rerun;
+/// A no-op idempotent rerun must NOT claim work it didn't do. JSON
+/// `applied_patches` empty on the rerun;
 /// human mode must NOT print "Applied N patches"; state file MUST
 /// persist (so `lpm graph --why` keeps its provenance).
 #[test]

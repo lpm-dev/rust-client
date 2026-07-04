@@ -729,9 +729,8 @@ fn patch_remove_dry_run_keeps_manifest_entry_and_patch_file() {
     assert!(project.file_exists("patches/lodash@4.17.21.patch"));
 }
 
-/// **GPT audit follow-up (2026-05-15).** Scoped packages (both npm-
-/// style `@scope/name` and lpm.dev-style `@lpm.dev/owner.name`) flow
-/// through `patch-commit` correctly:
+/// Scoped packages (both npm-style `@scope/name` and lpm.dev-style
+/// `@lpm.dev/owner.name`) flow through `patch-commit` correctly:
 ///
 /// 1. The on-disk filename sanitizes `/` to `__`:
 ///    `patches/@posthog__nextjs-config@4.17.21.patch`.
