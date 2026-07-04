@@ -207,8 +207,8 @@ pub fn get_token(registry_url: &str) -> Option<String> {
 
     // 3. Encrypted file fallback (Rust-native format, NOT compatible with JS CLI's format)
     get_token_from_file(registry_url)
-    // Staleness check removed — replaced by expiry-based warnings
-    // called at command level via check_token_expiry_warnings() (Feature 42)
+    // Expiry-based warnings are emitted at command level via
+    // check_token_expiry_warnings().
 }
 
 /// Store a token for a given registry URL.
@@ -1061,7 +1061,7 @@ pub fn set_otp_required(registry: &str, required: bool) {
     }
 }
 
-// ─── Refresh Token Storage (Feature 44 Part B) ──────────────────────
+// ─── Refresh Token Storage ──────────────────────
 // Uses the same keychain + encrypted-file path as the main token.
 // Separate account prefix to avoid collision.
 

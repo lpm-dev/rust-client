@@ -2114,10 +2114,9 @@ mod tests {
 
     #[test]
     fn lever4_node_install_js_with_matching_repo_is_green() {
-        // The canonical Lever-#4 win: a package whose body is a
-        // bare delegate `node install.js` AND whose manifest's
-        // repository URL contains the package name as a path
-        // segment.
+        // A package whose body is a bare delegate `node install.js`
+        // AND whose manifest's repository URL contains the package
+        // name as a path segment.
         let c = ctx(
             "sharp",
             Some("git+https://github.com/lovell/sharp.git"),

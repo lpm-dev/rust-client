@@ -292,8 +292,7 @@ fn libc_filter_composes_with_os_and_cpu() {
 /// Host libc unknown × package libc declared: refuse the package.
 /// The package opted into a libc-dependent build; we can't verify
 /// the host satisfies it, so failing closed avoids materializing
-/// a binary that may not load. Matches pnpm's package-is-installable
-/// behavior. If `meta.libc` is non-empty the package is at minimum
+/// a binary that may not load. If `meta.libc` is non-empty the package is at minimum
 /// linux-only, and the os filter independently rejects it on
 /// non-linux hosts — this rule only kicks in on linux hosts where
 /// libc probing failed (e.g., distroless without `ld-musl-*` or

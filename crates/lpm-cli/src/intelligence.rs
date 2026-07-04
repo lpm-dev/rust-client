@@ -5,9 +5,6 @@
 //! - **Install-time import verification**: After linking, verify all imports in source
 //!   code resolve to installed packages. Catch missing deps before runtime.
 //! - **Quality/security warnings**: Surface registry-side analysis during install.
-//!
-//! These features are the marketing differentiator. npm/yarn/pnpm can't do this
-//! because they don't own the registry data.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -38,7 +35,7 @@ pub struct SourceImport {
 /// **Nested-package boundaries are opaque.** Descent stops at any
 /// subdirectory containing its own `package.json` — that directory is
 /// its own package and its imports are checked against its own manifest,
-/// not the parent's. Matches what npm / pnpm / yarn assume too.
+/// not the parent's.
 ///
 /// Target: < 100ms for a typical project (~500 source files).
 pub fn scan_source_imports(project_dir: &Path) -> Vec<SourceImport> {

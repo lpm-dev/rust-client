@@ -100,7 +100,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
 
     server_handle.abort();
 
-    // Exchange code for token if needed (Feature 42 / Feature 44)
+    // Exchange code for token if needed.
     let (token, expires_at, refresh_token) = if let Some(code) = credential.strip_prefix("code:") {
         if !json_output {
             install_ui::phase("Exchanging authorization code");
@@ -140,7 +140,6 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
             .ok_or_else(|| LpmError::Registry("no token in exchange response".to_string()))?
             .to_string();
         let expires_at = data["expiresAt"].as_str().map(|s| s.to_string());
-        // Feature 44: refresh token for session-based auth
         let refresh_token = data["refreshToken"].as_str().map(|s| s.to_string());
         (token, expires_at, refresh_token)
     } else if let Some(token) = credential.strip_prefix("token:") {
@@ -172,7 +171,7 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         .map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
     let mut storage_status = auth::AuthStorageStatus::from_backend(access_backend);
 
-    // Store refresh token for session-based auth (Feature 44 Part B)
+    // Store refresh token for session-based auth.
     if let Some(ref rt) = refresh_token {
         if let Some(ref ea) = expires_at {
             auth::set_session_access_token_expiry(registry_url, ea);
@@ -249,7 +248,7 @@ fn login_detail_row(label: &str, value: &str) -> String {
 
 /// Handle the OAuth callback HTTP request.
 ///
-/// Expects: POST /callback with form body code=xxx&state=yyy (Feature 42 secure flow)
+/// Expects: POST /callback with form body code=xxx&state=yyy
 ///   or:    GET  /callback?code=xxx&state=yyy (exchange code flow, legacy)
 ///   or:    GET  /callback?token=lpm_xxx (direct token flow, legacy)
 /// Responds with a simple HTML page that auto-closes.

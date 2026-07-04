@@ -49,8 +49,8 @@ struct HermeticEntry {
     attestation_present: bool,
     /// optional repository URL surfaced to the
     /// advisor prompt as the `Repository:` line. Defaults to `None`
-    /// for pre-Lever-#1 fixture entries so the field can be rolled
-    /// out incrementally; new amber entries (especially delegate-
+    /// for older fixture entries so the field can be rolled out
+    /// incrementally; new amber entries (especially delegate-
     /// to-local-file installers) should carry the URL so the L4
     /// advisor can apply the matching-identity APPROVE rule.
     #[serde(default)]
@@ -168,9 +168,8 @@ fn hermetic_entry_to_audit(entry: HermeticEntry) -> PackageAudit {
         advisor_provider: None,
         // hermetic fixtures may declare a
         // `repository` URL so the L4 advisor sees it in the prompt.
-        // Existing pre-Lever-#1 fixtures don't carry the field, so
-        // `serde(default)` lets them load as `None` without a
-        // fixture rewrite.
+        // Existing fixtures may omit the field, so `serde(default)`
+        // lets them load as `None` without a fixture rewrite.
         repository: entry.repository.clone(),
         // hermetic fixtures may declare
         // referenced file content so the L4 advisor sees it

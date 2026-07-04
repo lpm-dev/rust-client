@@ -592,26 +592,25 @@ fn compute_blocked_packages_with_metadata_and_baseline(
             let phase_bodies = script_data.phase_bodies;
             let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
 
-            //: classify each present phase and aggregate
+            // Classify each present phase and aggregate
             // worst-wins. Populated unconditionally (not gated on
             // `script-policy`) — the annotation is
             // user-visible UX in all three modes.
             //
-            // Lever #4: pass identity context so a
-            // delegate-to-local-file + matching identity body
-            // surfaces as Green in the UI's blocked-set annotation
-            // (consistent with what the install pipeline's amber-
-            // filter at `collect_amber_classification_requests`
-            // sees).
+            // Pass identity context so a delegate-to-local-file +
+            // matching identity body surfaces as Green in the UI's
+            // blocked-set annotation, consistent with what the install
+            // pipeline's amber filter at
+            // `collect_amber_classification_requests` sees.
             //
             // Option B: `publish_age_secs = None` +
             // `min_release_age_secs = 0` means the L1 widening fires
             // independently of cooldown. This is correct here because
             // `compute_blocked_packages_with_metadata` produces a
             // UI-annotation tier on the BLOCKED set. Auto-run
-            // packages (those Lever #4 widened in the install
-            // pipeline) are already excluded from the blocked set
-            // upstream — so the cooldown defense was already applied
+            // packages widened by the install pipeline are already
+            // excluded from the blocked set upstream — so the cooldown
+            // defense was already applied
             // there. The annotation here only fires for packages
             // already in the blocked set; widening them to Green at
             // annotation time has no security impact (they'll still
@@ -977,8 +976,8 @@ pub fn read_install_phase_bodies(pkg_dir: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Lever #1 — extract the `repository` URL from a
-/// package's `package.json` at the given store directory.
+/// Extract the `repository` URL from a package's `package.json` at
+/// the given store directory.
 ///
 /// Accepts both manifest shapes:
 /// - String form: `"repository": "github.com/lovell/sharp"`
@@ -1004,23 +1003,23 @@ pub fn read_manifest_repository(pkg_dir: &Path) -> Option<String> {
     }
 }
 
-/// Lever #3 — maximum bytes of a referenced script's
-/// content embedded in the advisor prompt. 32 KB matches the runbook
+/// Maximum bytes of a referenced script's content embedded in the
+/// advisor prompt. 32 KB matches the runbook
 /// cap. Files larger than this are truncated mid-line and the
 /// embedded view ends with a `\n... [truncated for prompt context]\n`
 /// marker so the model knows the slice is partial.
 pub const REFERENCED_SCRIPT_MAX_BYTES: usize = 32 * 1024;
 
-/// Lever #3 — embeddable file content for the advisor
-/// prompt. The runbook caps depth at 1 (no recursive require
+/// Embeddable file content for the advisor prompt. The runbook caps
+/// depth at 1 (no recursive require
 /// following) and scope to explicit safe-relative paths.
 pub struct ReferencedScriptCap {
     pub filename: String,
     pub content: String,
 }
 
-/// Lever #3 — scan a script body for files it delegates
-/// to, then read each from the package's store directory with the
+/// Scan a script body for files it delegates to, then read each from
+/// the package's store directory with the
 /// caps the runbook prescribes:
 ///
 /// - **Depth = 1.** Only the file the body names directly is
@@ -1066,7 +1065,7 @@ fn parse_delegated_paths(script_body: &str) -> Vec<String> {
 }
 
 /// Read one referenced file from the package directory with the
-/// Lever-#3 caps. Returns `None` for missing files, path-escape
+/// referenced-script caps. Returns `None` for missing files, path-escape
 /// attempts (defense in depth — the safe-relative check above
 /// should catch these but a sym-linked package root could still
 /// surprise us), non-text files (detected by NUL bytes in the head),
@@ -2863,7 +2862,7 @@ mod tests {
         );
     }
 
-    // ── Lever #3 — referenced-script file reader ────────
+    // ── Referenced-script file reader ────────
 
     fn write_file(dir: &Path, rel: &str, content: &str) {
         let path = dir.join(rel);

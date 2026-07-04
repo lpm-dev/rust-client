@@ -2430,8 +2430,8 @@ impl RegistryClient {
     /// `registry.npmjs.org`, with **halve-on-429** adaptive back-pressure.
     ///
     /// Returned vector is in input order; each entry is a per-package
-    /// `Result`. Per-package failures do NOT abort the batch — matches
-    /// bun/pnpm semantics and lets the walker log + continue.
+    /// `Result`. Per-package failures do NOT abort the batch, which lets
+    /// the walker log + continue.
     ///
     /// ## Halve-on-429
     ///

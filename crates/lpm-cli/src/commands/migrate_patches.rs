@@ -1,8 +1,8 @@
-//! #35 — translate `package.json > pnpm.patchedDependencies`
+//! Translate `package.json > pnpm.patchedDependencies`
 //! into LPM's native `patches/` directory + `lpm.patchedDependencies`
 //! manifest entries at migrate time.
 //!
-//! Mirrors the #34 design (see [`super::migrate_overrides`])
+//! Mirrors the override migration design (see [`super::migrate_overrides`])
 //! with two extra concerns specific to patches:
 //!
 //! 1. **Integrity binding** — LPM's `lpm.patchedDependencies[k]` carries
@@ -14,8 +14,8 @@
 //!
 //! 2. **Patch source path containment** — the value of each
 //!    `pnpm.patchedDependencies[k]` is a user-authored path string. We
-//!    reuse Phase A's `resolve_manifest_path` (4-rule check: absolute /
-//!    `..` / nearest-ancestor canonicalize / starts_with project root)
+//!    reuse `resolve_manifest_path` (4-rule check: absolute / `..` /
+//!    nearest-ancestor canonicalize / starts_with project root)
 //!    and add patch-source-specific rejections on top: empty /
 //!    whitespace-only values, paths whose target is a directory, paths
 //!    whose source file is missing on disk.
@@ -277,7 +277,7 @@ pub fn build_plan(
             continue;
         }
 
-        // ── Containment (delegates to Phase A's helper). ─────────
+        // ── Containment (delegates to the manifest-path helper). ─────────
         let src_absolute = match resolve_manifest_path(project_dir, trimmed) {
             Ok(p) => p,
             Err(e) => {

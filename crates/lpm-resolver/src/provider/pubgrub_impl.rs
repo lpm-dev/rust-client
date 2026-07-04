@@ -40,9 +40,8 @@ impl LpmDependencyProvider {
     ///   as a debug-level warning.
     /// - `Range` intersects the override range with the consumer range
     ///   (via the cache's available versions list for THIS package)
-    ///   and picks the newest match. The intersect-then-pick semantics
-    ///   matches pnpm's range-target behavior: a `^2.0.0` override
-    ///   means "use the newest 2.x", not "force `2.0.0`".
+    ///   and picks the newest match. A `^2.0.0` override means "use the
+    ///   newest 2.x", not "force `2.0.0`".
     pub(super) fn apply_override_target(
         &self,
         package: &ResolverPackage,
@@ -431,7 +430,7 @@ impl DependencyProvider for LpmDependencyProvider {
         // each declare a dep on, say, `json-schema-traverse`. Using the
         // parent's full Display form propagates the split downward:
         // grandchildren get `[ajv[<root>]]` vs `[ajv[eslint]]` and resolve
-        // independently, matching the nested-node_modules shape npm/bun produce.
+        // independently, preserving the nested node_modules shape.
         let parent_name = package.to_string();
         let mut constraints = pubgrub::Map::default();
 

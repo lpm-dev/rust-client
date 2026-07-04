@@ -118,9 +118,9 @@ median_ms_with_setup() {
 # shipped default — npm fetches bypass the CF Worker) vs Proxy mode
 # (`LPM_NPM_ROUTE=proxy`, the escape hatch that routes through the
 # Worker) inside one bench invocation so CDN state can't confound the
-# delta. This is the A/B the  ship gate anchors on: Direct mode
-# must beat bun-competitive targets while Proxy mode proves the
-# Worker path still performs within the pre-49 baseline.
+# delta. This is the A/B the ship gate anchors on: Direct mode must
+# clear the latency target while Proxy mode proves the Worker path still
+# performs within the baseline.
 median_ms_ab_with_setup() {
 	local setup="$1"
 	local cmd_a="$2"
@@ -210,7 +210,7 @@ bench_cold_install() {
 	# measurement instead of the intended "fully cold" measurement.
 	# Verified A/B (n=11): wiping `bun.lockb` only gave bun median 551 ms
 	# on bench/fixture-large; wiping both gave 878 ms — a 327 ms
-	# lockfile-reuse advantage that biased lpm-vs-bun ratios.
+		# lockfile-reuse advantage that biased the ratios.
 	if check_tool bun; then
 		cd "$work"
 		rm -rf node_modules bun.lock bun.lockb
@@ -234,10 +234,8 @@ bench_cold_install() {
 # 2026-04-14: empirical measurement confirmed that the per-iteration `rm -rf`
 # of each tool's global cache charges ~700ms of syscall time to that tool's
 # "cold install" number. LPM wipes two paths (~/.lpm/cache + ~/.lpm/store);
-# bun wipes one; npm/pnpm wipe their own equivalents. That asymmetric wipe
-# cost was the dominant term in the lpm-vs-bun wall-clock gap, not engine
-# speed. See 37-rust-client-RUNNER-VISION-phase-a-worker-batch.md Step 5
-# commentary for the measurements.
+# each tool wipes its own equivalent. That asymmetric wipe cost was a
+# dominant term in the wall-clock gap, not engine speed.
 #
 # This benchmark runs the exact same tools + fixture as `cold-install`, but
 # moves the wipe OUTSIDE the timed region. The result is a true

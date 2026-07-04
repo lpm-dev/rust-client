@@ -1,8 +1,7 @@
 //! Shared force-security-floor guard helpers.
 //!
-//! Phase 1 intentionally extends the existing `force-security-floor`
-//! kill-switch beyond `script-policy` while preserving its "soft floor"
-//! posture for command execution:
+//! The `force-security-floor` kill-switch applies beyond `script-policy`
+//! while preserving its "soft floor" posture for command execution:
 //!
 //! - CLI / project loosening requests are suppressed to the current
 //!   machine floor and surfaced as warnings.

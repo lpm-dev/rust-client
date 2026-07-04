@@ -408,9 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_does_not_touch_store_even_without_subcategory() {
-        // Dedicated regression test for the semantic flip — the whole
-        // point of phase 37's cache/store rename is that `cache clean`
-        // must never reach into the store, regardless of flags.
+        // `cache clean` must never reach into the store, regardless of flags.
         let tmp = TempDir::new().unwrap();
         let root = setup(&tmp);
 

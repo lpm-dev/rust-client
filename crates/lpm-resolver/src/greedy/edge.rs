@@ -9,10 +9,8 @@ use super::version::{VersionPick, find_best_version_with_policy};
 
 /// Process one edge: reuse an existing node whose version satisfies
 /// the edge's range, OR allocate a new node for the best version
-/// matching the range. Mirrors bun's "dedupe when compatible,
-/// allocate when not" model — same as npm + pnpm semantics. PubGrub's
-/// flat-then-split-retry workaround is unnecessary because
-/// multi-version is the natural representation here.
+/// matching the range. PubGrub's flat-then-split-retry workaround is
+/// unnecessary because multi-version is the natural representation here.
 ///
 /// **Overrides.** When `state.overrides` is non-empty, we compute the
 /// natural pick FIRST and consult `find_match` for an applicable

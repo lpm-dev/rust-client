@@ -477,10 +477,9 @@ impl AdvisorSession {
                     );
                 }
 
-                // Lever #3 — borrow the referenced-
-                // file content as a slice of `ReferencedScript`
-                // so the prompt's "Referenced files" section
-                // can render the embedded view.
+                // Borrow the referenced-file content as a slice of
+                // `ReferencedScript` so the prompt's "Referenced files"
+                // section can render the embedded view.
                 let referenced: Vec<lpm_triage_advisor::ReferencedScript<'_>> = c
                     .referenced_scripts
                     .iter()
@@ -618,8 +617,8 @@ pub struct AmberPackageRequest {
     /// the request must carry the same identity the downstream
     /// trust-evaluation path will use.
     pub integrity: Option<String>,
-    /// Lever #1 — `repository` URL from the package
-    /// manifest (typically `package.json > repository.url` or the
+    /// `repository` URL from the package manifest (typically
+    /// `package.json > repository.url` or the
     /// legacy shorthand string). Forwarded to the advisor prompt as
     /// the `Repository:` line; pairs with the "fetch IDENTITY"
     /// rule so the model can approve delegate-to-local-file
@@ -634,8 +633,8 @@ pub struct AmberPackageRequest {
     /// would otherwise vacuously promote to Approve — guarded
     /// against in the consumer).
     pub amber_phases: Vec<(String, String)>,
-    /// Lever #3 — files the script body delegates to,
-    /// each as `(filename, content)`. The advisor prompt's
+    /// Files the script body delegates to, each as `(filename, content)`.
+    /// The advisor prompt's
     /// "Referenced files" section embeds these so the model can
     /// evaluate the actual fetch / build / payload, not just the
     /// delegating one-liner. Empty when the body doesn't delegate
@@ -714,9 +713,9 @@ fn open_cache_or_warn(json_output: bool) -> Option<Arc<L4Cache>> {
 
 /// — build the L4-cache key for one [`AmberPackageRequest`].
 /// Borrows the request's owned strings without copying. Folds in the
-/// repository URL (Lever #1) and the referenced-scripts content
-/// (Lever #3) so a manifest that adds, removes, or changes any of
-/// those produces a different cache slot — the verdict can
+/// repository URL and the referenced-scripts content so a manifest
+/// that adds, removes, or changes any of those produces a different
+/// cache slot — the verdict can
 /// legitimately differ on those axes.
 fn build_package_cache_key(
     c: &AmberPackageRequest,

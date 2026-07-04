@@ -2135,7 +2135,7 @@ fn peer_rules_allow_any_suppresses_version_mismatch_only() {
     assert!(warnings[0].resolved_version.is_none());
 }
 
-// ─── allowedVersions selector grammar (full pnpm parity) ─────────
+// ─── allowedVersions selector grammar ─────────
 
 /// Bare peer name selectors match any consumer for that peer.
 #[test]

@@ -1,6 +1,6 @@
 //! Security policies for LPM package installation.
 //!
-//! Key policies (following pnpm v10 and Bun best practices):
+//! Key policies:
 //!
 //! 1. **Dependency lifecycle scripts blocked by default** — `preinstall`, `install`,
 //!    `postinstall` scripts are NOT executed for dependencies unless the package
@@ -13,7 +13,6 @@
 //! 3. **Minimum release age** (future) — block packages published less than 24h ago.
 //!
 //! Supply chain security: SLSA, Sigstore, typosquatting, OSV audit, release age.
-//! See phase-19-todo.md.
 
 pub mod behavioral;
 pub mod provenance;
@@ -111,7 +110,7 @@ pub struct SecurityPolicy {
 }
 
 impl SecurityPolicy {
-    /// Default minimum release age: 24 hours (matches pnpm v10 default).
+    /// Default minimum release age: 24 hours.
     const DEFAULT_MIN_RELEASE_AGE: u64 = 86400;
 
     /// Create a default policy (nothing trusted — all scripts blocked, 24h release age).

@@ -287,7 +287,7 @@ async fn run_patch_commit_inner(
     let integrity = baseline.integrity;
 
     // 5. Write patches/<safe_key>.patch. Scoped names get `/` → `__`
-    //    so the file is portable across platforms (mirrors pnpm).
+    //    so the file is portable across platforms.
     let safe_key = key.replace('/', "__");
     let patches_dir = project_dir.join("patches");
     std::fs::create_dir_all(&patches_dir).map_err(LpmError::Io)?;

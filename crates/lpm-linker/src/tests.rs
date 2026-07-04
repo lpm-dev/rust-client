@@ -3466,7 +3466,7 @@ fn materialize_directory_source_symlinks_target_canonical_source() {
     materialize_directory_source(&src, &dst).unwrap();
 
     let link_target = std::fs::read_link(dst.join("index.js")).unwrap();
-    // Symlinks are absolute (matches bun's strategy).
+    // Symlinks are absolute.
     assert!(
         link_target.is_absolute(),
         "wrapper symlinks must be absolute, got {link_target:?}",

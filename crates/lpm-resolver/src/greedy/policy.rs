@@ -133,9 +133,7 @@ pub(super) fn handle_no_version(
 ) -> Result<(), ResolveError> {
     if edge.behavior.optional {
         // Optional dep with no satisfying or platform-compatible
-        // version: skip silently. Matches bun's behavior
-        // (`PackageManagerEnqueue.zig:77-78` warning path) minus the
-        // warning itself.
+        // version: skip silently.
         if platform_filtered {
             state.platform_skipped += 1;
         }

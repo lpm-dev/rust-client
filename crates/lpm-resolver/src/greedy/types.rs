@@ -9,10 +9,8 @@ pub(super) type NodeId = u32;
 
 /// One unresolved edge: parent N needs `name @ range` with `behavior`.
 ///
-/// Mirrors bun's `(dependency_id, version_range)` queue entry pattern
-/// (`PackageManagerEnqueue.zig:830-838`). The edge carries enough
-/// context for [`process_edge`] to look up the right manifest, pick a
-/// version, and link parent → child in the resolved tree.
+/// Carries enough context for [`process_edge`] to look up the right
+/// manifest, pick a version, and link parent → child in the resolved tree.
 #[derive(Debug, Clone)]
 pub(super) struct Edge {
     /// Parent node in the resolved tree. The root project is the
@@ -92,7 +90,8 @@ pub struct PeerConflictReport {
     pub unsatisfied_consumers: Vec<(String, String)>,
 }
 
-/// Bitfield matching bun's `Dependency.Behavior` (`dependency.zig:35-37`).
+/// Dependency behavior flags for resolver miss semantics.
+///
 /// Root-level dev dependencies are treated as required (only root
 /// edges are ever marked dev — transitive `devDependencies` are not
 /// followed by npm clients per spec). The `required` bit is retained
@@ -105,9 +104,6 @@ pub(super) struct DepBehavior {
     pub(super) optional: bool,
 }
 
-/// Per-canonical manifest state. Mirrors bun's combined
-/// `network_dedupe_map` and `task_queue` HashMap pair. Uses the
-/// per-canonical [`Notify`] from [`NotifyMap`] instead of a custom
-/// `Pending(Vec<Edge>)` state.
+/// Per-canonical manifest state.
 #[allow(dead_code)]
 pub(super) type ManifestState = Arc<CachedPackageInfo>;

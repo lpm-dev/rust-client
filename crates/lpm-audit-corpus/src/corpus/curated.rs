@@ -43,9 +43,8 @@ struct CuratedExpectation {
     // retained for fixture schema compatibility with lpm-security expectations
     expected: Option<String>,
     /// optional repository URL the L4 advisor
-    /// will see in its prompt. Defaults to `None` so pre-Lever-#1
-    /// fixture entries don't need a rewrite; the delegate-to-local-
-    /// file entries (the ones where the lever moves the needle)
+    /// will see in its prompt. Defaults to `None` so older fixture
+    /// entries don't need a rewrite; delegate-to-local-file entries
     /// should carry a plausible URL pointing at a recognizable host.
     #[serde(default)]
     repository: Option<String>,
@@ -54,9 +53,9 @@ struct CuratedExpectation {
     /// L1 widening's identity match keys off the package's base
     /// name. For fixture entries whose ID is a synthetic prefix
     /// (`amber-d18-013-sharp-install-js`), supplying `package_name:
-    /// "sharp"` lets the lever see the same identity payload a real
+    /// "sharp"` gives the advisor the same identity payload a real
     /// `sharp` manifest would carry. When absent, the entry ID is
-    /// used (matches the pre-Lever-#4 behaviour).
+    /// used for compatibility with older fixtures.
     #[serde(default)]
     package_name: Option<String>,
     /// referenced file contents to embed in

@@ -27,7 +27,7 @@ pub async fn run_rotate(
             .map_err(|e| LpmError::Registry(format!("failed to store new token: {e}")))?;
         let storage_status = crate::auth::AuthStorageStatus::from_backend(storage_backend);
 
-        // Store token expiry metadata (Feature 42)
+        // Store token expiry metadata.
         if let Some(expires) = body.get("expiresAt").and_then(|e| e.as_str()) {
             let date_part = expires.split('T').next().unwrap_or(expires);
             crate::auth::set_token_expiry(registry_url, date_part);

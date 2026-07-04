@@ -263,9 +263,7 @@ fn is_dist_tag(v: &str) -> bool {
 /// the exact `(name, version)` that will be written as the persisted
 /// key. Pure function — no I/O, no lock, no registry access.
 ///
-/// Disambiguation rules (modeled on Bun's
-/// `pkgInfoForNameAndVersion` but adapted for LPM's source-aware
-/// lockfile):
+/// Disambiguation rules for LPM's source-aware lockfile:
 ///
 /// - **0 matches** → user-facing "not installed" error pointing at
 ///   `lpm install <name>` as the next step.
@@ -1516,7 +1514,7 @@ mod tests {
     }
 
     /// Multiple DISTINCT versions → list-and-exit with a precise-version
-    /// hint. Mirrors Bun's `Global.crash()` behavior.
+    /// hint.
     #[test]
     fn resolve_selector_multi_distinct_versions_errors_with_list() {
         let lf = lockfile_with(&[("lodash", "3.10.0", NPM), ("lodash", "4.17.21", NPM)]);

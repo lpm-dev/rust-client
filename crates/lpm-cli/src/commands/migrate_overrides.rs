@@ -1,4 +1,4 @@
-//! #34 — translate `package.json > pnpm.overrides` into LPM's
+//! Translate `package.json > pnpm.overrides` into LPM's
 //! native override location at migrate time.
 //!
 //! The plan is computed and validated before any file mutation: parse
@@ -14,14 +14,13 @@
 //!   `package.json > lpm.overrides`.
 //! - **Conflicts** (same raw key in both `pnpm.overrides` and
 //!   `lpm.overrides` with different targets) are blocking errors. The
-//!   raw key is the comparison unit — see audit FLAG A for
-//!   the design rationale.
+//!   raw key is the comparison unit.
 //! - **Parse errors** (e.g. multi-segment paths, invalid version
 //!   ranges) are blocking errors. We surface the offending entry with
 //!   the underlying parser message so the user can port manually.
 //! - **Unsupported value shapes** (object, array, null — pnpm allows
 //!   some of these for niche cases) are blocking errors. We don't
-//!   silently skip them per FLAG B.
+//!   silently skip them.
 //!
 //! ## Why this lives in `lpm-cli` instead of `lpm-migrate`
 //!
@@ -34,7 +33,7 @@
 //! ## Idempotence
 //!
 //! After a successful migrate, `pnpm.overrides` stays in `package.json`
-//! (we don't strip it — see audit FLAG F). On a second
+//! (we don't strip it). On a second
 //! `lpm migrate`, every entry already lives in `lpm.overrides` with the
 //! same target — it's a no-op merge, not a conflict. The diff-aware
 //! install-time warning silences automatically.
@@ -186,7 +185,7 @@ pub fn build_plan(pkg: &PackageJson) -> Result<PnpmOverridesPlan, LpmError> {
             continue;
         }
 
-        // Conflict check at the raw key level (FLAG A).
+        // Conflict check at the raw key level.
         if let Some(existing) = lpm_overrides.get(key) {
             if existing != &target {
                 plan.conflicts.push(OverridesConflict {
@@ -302,10 +301,10 @@ mod tests {
 
     #[test]
     fn build_plan_raw_key_conflict_semantics() {
-        // FLAG A: `lodash` and `lodash@>=0.0.0` are different RAW keys
-        // even though they refer to the same package. Different keys
-        // never conflict — both end up either in to_apply or already
-        // in lpm.overrides without any cross-talk.
+        // `lodash` and `lodash@>=0.0.0` are different raw keys even
+        // though they refer to the same package. Different keys never
+        // conflict — both end up either in to_apply or already in
+        // lpm.overrides without any cross-talk.
         let pkg = pkg_from(
             r#"{
                 "name": "x",

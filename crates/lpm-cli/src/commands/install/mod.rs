@@ -1065,7 +1065,7 @@ async fn run_with_options_under_store_lock(
     // `LpmConfig.auto_install_peers`:
     // `package.json > lpm > autoInstallPeers`
     // → `~/.lpm/config.toml > auto-install-peers`
-    // → default `true` (bun-parity beta).
+    // → default `true`.
     let auto_install_peers: bool = pkg
         .lpm
         .as_ref()
@@ -1474,8 +1474,8 @@ async fn run_with_options_under_store_lock(
     // The fix: build a separate `all_workspace_members` slice
     // straight from `ws.members`, independent of extraction. This is
     // the slice + the invariant should have used all along (membership
-    // is membership; bun/pnpm don't gate transitive `workspace:`
-    // resolution on top-level reference).
+    // is membership; transitive `workspace:` resolution must not depend
+    // on a top-level reference).
     let all_workspace_members: Vec<WorkspaceMemberLink> = workspace
         .as_ref()
         .map(|ws| {
@@ -2715,11 +2715,9 @@ async fn run_with_options_under_store_lock(
                 // dispatcher-specific issues with greedy-resolver
                 // behavior held constant.
                 //
-                // Reference n=20 bench (median, bench/fixture-large) from
-                //:
+                // Reference n=20 bench (median, bench/fixture-large):
                 // greedy-stream (walker) 4,521 ms total
-                // greedy-fusion 918 ms total — 1.10× bun
-                // bun reference 833 ms
+                // greedy-fusion 918 ms total
                 // -3,603 ms median delta, paired t = -23.27. The default-
                 // flip preserves these numbers (now reachable without the
                 // `LPM_RESOLVER=greedy` opt-in env var).
@@ -5727,8 +5725,8 @@ async fn run_with_options_under_store_lock(
     // Step 10: Auto-build trusted packages (after lockfile is written)
     // Triggers when: --auto-build flag, lpm.scripts.autoBuild config,
     // ALL scripted packages are individually trusted, OR the effective
-    // policy is Allow (— `--yolo` / `--policy=allow` runs
-    // scripts at install time, matching npm/pnpm/bun semantics).
+    // policy is Allow (`--yolo` / `--policy=allow` runs scripts at
+    // install time).
     //
     //: consolidated into ScriptPolicyConfig so all four
     // script-related keys come from a single read.

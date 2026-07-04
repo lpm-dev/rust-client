@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// This delivers the "packages × tasks" execution matrix.
 ///
 /// Filter selection goes through the shared `lpm_task::filter::FilterEngine`
-/// with pnpm-parity grammar. Bare names no longer substring-match; users must
+/// with explicit glob grammar. Bare names no longer substring-match; users must
 /// write explicit globs (`*foo*`, `foo-*`, etc.).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_workspace(
