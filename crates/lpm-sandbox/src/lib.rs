@@ -1263,14 +1263,14 @@ mod tests {
     #[test]
     fn unsupported_remediation_uses_generic_message_on_windows() {
         // Pin the removal of the legacy Windows special case so a
-        // future "let's add a Windows case back here" PR has to
-        // delete this test on the way through. Windows has a real backend;
+        // future change has to delete this test on the way through.
+        // Windows has a real backend;
         // the generic message is the right shape now that Windows reaches the
         // same surface as the other supported OSes.
         let s = unsupported_remediation("windows");
         assert!(
             s.contains("has no LPM sandbox backend"),
-            "Windows must use the generic shape post-46.2: {s}",
+            "Windows must use the generic shape now that it has a backend: {s}",
         );
         assert!(
             !s.contains("isn't supported"),

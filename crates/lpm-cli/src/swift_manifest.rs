@@ -859,7 +859,7 @@ let package = Package(
 
     // === before_keyword — inserts dependencies array when missing ===
     #[test]
-    fn test_finding1_inserts_dependencies_when_missing_before_targets() {
+    fn inserts_top_level_dependencies_array_before_targets_when_missing() {
         // Package.swift where there's NO top-level `dependencies:` before `targets:`,
         // but a target has `dependencies:`.
         let input = r#"// swift-tools-version: 5.9
@@ -904,7 +904,7 @@ let package = Package(
     }
 
     #[test]
-    fn test_finding1_add_registry_dependency_inserts_deps_when_missing() {
+    fn add_registry_dependency_inserts_top_level_dependencies_array_when_missing() {
         // Verify that add_registry_dependency inserts a top-level dependencies array
         // when one doesn't exist (e.g., Swift 6.3 `swift package init` output).
         let input = r#"// swift-tools-version: 5.9
@@ -919,7 +919,7 @@ let package = Package(
     ]
 )
 "#;
-        let tmp = std::env::temp_dir().join("test_finding1.swift");
+        let tmp = std::env::temp_dir().join("swift_manifest_missing_dependencies.swift");
         std::fs::write(&tmp, input).unwrap();
 
         let result =
@@ -941,7 +941,7 @@ let package = Package(
 
     // === escaped quotes break bracket matcher ===
     #[test]
-    fn test_finding2_escaped_quotes_in_string() {
+    fn find_matching_bracket_ignores_escaped_brackets_inside_strings() {
         let content = "dependencies: [\n    .package(url: \"test\\\"]\"),\n]";
         let open = content.find('[').unwrap();
         let close = find_matching_bracket(content, open);
@@ -961,7 +961,7 @@ let package = Package(
 
     // === comments break bracket matcher ===
     #[test]
-    fn test_finding3_comments_with_unmatched_brackets() {
+    fn find_matching_bracket_ignores_line_comment_brackets() {
         let content = "dependencies: [\n    // removed: ]\n    .package(url: \"https://example.com/repo.git\", from: \"1.0.0\"),\n]";
         let open = content.find('[').unwrap();
         let close = find_matching_bracket(content, open);
@@ -978,7 +978,7 @@ let package = Package(
     }
 
     #[test]
-    fn test_finding3_block_comments_with_unmatched_brackets() {
+    fn find_matching_bracket_ignores_block_comment_brackets() {
         let content = "dependencies: [\n    /* removed: ] */\n    .package(url: \"https://example.com/repo.git\", from: \"1.0.0\"),\n]";
         let open = content.find('[').unwrap();
         let close = find_matching_bracket(content, open);
@@ -992,7 +992,7 @@ let package = Package(
 
     // === wrong target modified when target lacks dependencies ===
     #[test]
-    fn test_finding4_target_without_deps_finds_next_targets_deps() {
+    fn target_dependency_insert_does_not_modify_following_target_when_array_missing() {
         let input = r#"// swift-tools-version: 5.9
 import PackageDescription
 
@@ -1052,7 +1052,7 @@ let package = Package(
 
     // === no validation of version/product_name ===
     #[test]
-    fn test_finding6_malicious_product_name() {
+    fn add_registry_dependency_rejects_product_name_with_quotes() {
         let input = r#"// swift-tools-version: 5.9
 import PackageDescription
 
@@ -1064,7 +1064,7 @@ let package = Package(
     ]
 )
 "#;
-        let tmp = std::env::temp_dir().join("test_finding6.swift");
+        let tmp = std::env::temp_dir().join("swift_manifest_invalid_product_name.swift");
         std::fs::write(&tmp, input).unwrap();
 
         let result = add_registry_dependency(
@@ -1084,7 +1084,7 @@ let package = Package(
     }
 
     #[test]
-    fn test_finding6_malicious_version() {
+    fn add_registry_dependency_rejects_version_with_quotes() {
         let input = r#"// swift-tools-version: 5.9
 import PackageDescription
 
@@ -1096,7 +1096,7 @@ let package = Package(
     ]
 )
 "#;
-        let tmp = std::env::temp_dir().join("test_finding6_ver.swift");
+        let tmp = std::env::temp_dir().join("swift_manifest_invalid_version.swift");
         std::fs::write(&tmp, input).unwrap();
 
         let result = add_registry_dependency(
@@ -1114,7 +1114,7 @@ let package = Package(
 
     // === indent assumes 4-space ===
     #[test]
-    fn test_finding11_two_space_indent_empty_array() {
+    fn insert_into_dependencies_array_preserves_two_space_indent() {
         let input = "// swift-tools-version: 5.9\nimport PackageDescription\n\nlet package = Package(\n  name: \"MyApp\",\n  dependencies: [],\n  targets: [\n    .target(name: \"MyApp\", dependencies: []),\n  ]\n)\n";
 
         let content = insert_into_dependencies_array(
@@ -1142,7 +1142,7 @@ let package = Package(
     }
 
     #[test]
-    fn test_finding11_tab_indent_empty_array() {
+    fn insert_into_dependencies_array_preserves_tab_indent() {
         let input = "// swift-tools-version: 5.9\nimport PackageDescription\n\nlet package = Package(\n\tname: \"MyApp\",\n\tdependencies: [],\n\ttargets: [\n\t\t.target(name: \"MyApp\", dependencies: []),\n\t]\n)\n";
 
         let content = insert_into_dependencies_array(
@@ -1185,7 +1185,7 @@ let package = Package(
 
     // === verify insert creates deps array in target ===
     #[test]
-    fn test_finding4_insert_deps_into_target_without_deps_array() {
+    fn insert_into_target_deps_creates_dependencies_array_when_target_lacks_one() {
         let input = r#"// swift-tools-version: 5.9
 import PackageDescription
 
