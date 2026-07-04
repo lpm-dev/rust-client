@@ -1882,7 +1882,7 @@ mod tests {
     // Both are here so a regression in either direction fails CI.
 
     #[test]
-    fn phase46_reader_defaults_missing_fields_from_v1_json() {
+    fn reader_defaults_missing_added_fields_from_v1_json() {
         // Hand-written JSON as a pre-existing writer would produce:
         // only the v1 fields, no static_tier / provenance / etc.
         let v1_json = r#"{
@@ -1919,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_reader_silently_drops_phase46_fields_on_read() {
+    fn v1_reader_silently_drops_added_fields_on_read() {
         // Simulate a v1 reader by defining a struct that ONLY has the
         // v1 fields. A JSON must parse into it with
         // all v1 fields intact; the unknown fields must be
@@ -1935,7 +1935,7 @@ mod tests {
             binding_drift: bool,
         }
 
-        let p46 = BlockedPackage {
+        let package_with_added_fields = BlockedPackage {
             name: "sharp".into(),
             version: "0.33.0".into(),
             integrity: Some("sha512-aaa".into()),
@@ -1952,7 +1952,7 @@ mod tests {
             behavioral_tags_hash: Some("sha256-ccc".into()),
             behavioral_tags: Some(vec!["network".into(), "shell".into()]),
         };
-        let json = serde_json::to_string(&p46).unwrap();
+        let json = serde_json::to_string(&package_with_added_fields).unwrap();
 
         let v1: V1BlockedPackage = serde_json::from_str(&json).unwrap();
         assert_eq!(v1.name, "sharp");
@@ -1964,7 +1964,7 @@ mod tests {
     }
 
     #[test]
-    fn phase46_populated_fields_roundtrip() {
+    fn populated_added_fields_roundtrip() {
         let original = BlockedPackage {
             name: "puppeteer".into(),
             version: "22.0.0".into(),

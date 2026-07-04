@@ -143,7 +143,7 @@ fn append_lockfile_patch_records_at(base_dir: &std::path::Path, records: &[(&str
 /// Mirror of `patch_state::compute_fingerprint`. **MUST stay in sync**
 /// with the resolver — divergence makes the matching-fingerprint tests
 /// fail loudly.
-fn phase6_fingerprint(entries: &[(&str, &str, &str)]) -> String {
+fn patch_state_fingerprint(entries: &[(&str, &str, &str)]) -> String {
     use sha2::{Digest, Sha256};
     let mut keys: Vec<&(&str, &str, &str)> = entries.iter().collect();
     keys.sort_by(|a, b| a.0.cmp(b.0));
@@ -260,7 +260,7 @@ fn build_patch_install_fixture(
 
     let key = format!("{pkg_name}@{pkg_version}");
     append_lockfile_patch_records(project, &[(&key, &patch_rel, &integrity)]);
-    let fp = phase6_fingerprint(&[(&key, &patch_rel, &integrity)]);
+    let fp = patch_state_fingerprint(&[(&key, &patch_rel, &integrity)]);
     write_patch_state(
         project,
         &fp,
@@ -346,7 +346,7 @@ fn install_patches_in_workspace_member_resolve_path_from_member_manifest() {
     .unwrap();
     write_lockfile_at(&member_dir, &[("lodash", "4.17.21", &[])]);
     append_lockfile_patch_records_at(&member_dir, &[("lodash@4.17.21", patch_rel, &integrity)]);
-    let fingerprint = phase6_fingerprint(&[("lodash@4.17.21", patch_rel, &integrity)]);
+    let fingerprint = patch_state_fingerprint(&[("lodash@4.17.21", patch_rel, &integrity)]);
     let patch_state = serde_json::json!({
         "state_version": 1,
         "fingerprint": fingerprint,
@@ -552,7 +552,7 @@ fn install_patches_hard_errors_on_missing_patch_file() {
     write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
     // Pre-stage matching state so the offline drift gate passes; the
     // missing-file check fires inside the apply pass.
-    let fp = phase6_fingerprint(&[("lodash@4.17.21", patch_rel, &integrity)]);
+    let fp = patch_state_fingerprint(&[("lodash@4.17.21", patch_rel, &integrity)]);
     write_patch_state(
         &project,
         &fp,
@@ -703,7 +703,7 @@ fn install_patches_offline_hard_errors_when_patches_change_between_runs() {
         &project,
         &[("lodash@4.17.21", "patches/v1.patch", &integrity)],
     );
-    let fp_v1 = phase6_fingerprint(&[("lodash@4.17.21", "patches/v1.patch", &integrity)]);
+    let fp_v1 = patch_state_fingerprint(&[("lodash@4.17.21", "patches/v1.patch", &integrity)]);
     write_patch_state(
         &project,
         &fp_v1,
@@ -945,7 +945,7 @@ fn install_patches_deletes_patch_state_file_when_patches_removed() {
 }"#,
     );
     write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
-    let empty_fp = phase6_fingerprint(&[]);
+    let empty_fp = patch_state_fingerprint(&[]);
     write_patch_state(&project, &empty_fp, &[], &[]);
 
     lpm_isolated(&project, "http://127.0.0.1:1")

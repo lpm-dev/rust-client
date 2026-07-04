@@ -285,10 +285,7 @@ pub struct SandboxOptions {
     /// `~/.lpm/config.toml` / `./lpm.toml`, or
     /// `LPM_STRICT_SANDBOX=1` in the env.
     ///
-    /// See
-    /// `DOCS/new-features/37-rust-client-RUNNER-VISION-phase46-DX.md`
-    /// for the full scenario matrix and CLI / config / env
-    /// precedence chain.
+    /// Participates in the sandbox CLI / config / env precedence chain.
     pub deny_outbound_network: bool,
 }
 
@@ -1265,13 +1262,12 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_remediation_no_longer_specials_windows_post_phase_46_2() {
+    fn unsupported_remediation_uses_generic_message_on_windows() {
         // Pin the removal of the legacy Windows special case so a
         // future "let's add a Windows case back here" PR has to
-        // delete this test on the way through. ships a
-        // real Windows backend; the generic message is the right
-        // shape now that Windows reaches the same surface as the
-        // other supported OSes.
+        // delete this test on the way through. Windows has a real backend;
+        // the generic message is the right shape now that Windows reaches the
+        // same surface as the other supported OSes.
         let s = unsupported_remediation("windows");
         assert!(
             s.contains("has no LPM sandbox backend"),

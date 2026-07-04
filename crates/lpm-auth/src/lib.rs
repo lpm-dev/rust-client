@@ -2181,7 +2181,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore]
+    #[ignore = "macOS keychain integration; opt-in only and serial execution required"]
     fn auth_storage_status_reports_keychain_backed_stored_token() {
         require_keychain_opt_in();
         with_temp_home(|_| {
