@@ -1,4 +1,6 @@
 /target
+.DS_Store
+**/.DS_Store
 .npmrc
 /.lpm/
 /node_modules/
