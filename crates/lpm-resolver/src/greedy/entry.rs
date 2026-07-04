@@ -52,9 +52,9 @@ impl TreeManifestProvider for WalkerTreeProvider<'_> {
 /// [`crate::resolve::resolve_with_shared_cache`] so the dispatch in
 /// [`crate::resolve`] can swap implementations behind a feature flag.
 ///
-/// **`auto_install_peers`** — `true` to enable bun-parity eager peer
-/// auto-install: any non-optional `peerDependency` not already satisfied
-/// by the resolved tree gets promoted to an ambient root-scoped install.
+/// **`auto_install_peers`** — `true` to enable eager peer auto-install:
+/// any non-optional `peerDependency` not already satisfied by the resolved
+/// tree gets promoted to an ambient root-scoped install.
 /// `false` falls back to warn-only behavior (the post-resolve
 /// [`crate::check_unmet_peers`] pass surfaces missing peers as
 /// `PeerWarning`s, no auto-install). The lpm beta default is `true`

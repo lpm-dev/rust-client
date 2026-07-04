@@ -1,17 +1,15 @@
-//! Greedy multi-version resolver, bun-recipe port.
+//! Greedy multi-version resolver.
 //!
 //! Replaces PubGrub-with-split-retry with a greedy enqueue + first-match
-//! version pick that doubles as the fetch dispatcher. Mirrors bun's
-//! `enqueueDependencyWithMain` shape (`src/install/PackageManagerEnqueue.zig`
-//! + `runTasks.zig::flushDependencyQueue`).
+//! version pick that doubles as the fetch dispatcher.
 //!
 //! ## Scope
 //!
 //! - **Multi-version-per-canonical via reuse-on-compatible / allocate-on-
 //!   incompatible.** When edge A picks `lodash@4.17.21` and edge B
 //!   wants `lodash@^4`, edge B reuses A's node — first-version-wins
-//!   inside any single satisfying range bucket (matches bun + npm + pnpm
-//!   semantics). When edge B's range is `^3` and 4.17.21 doesn't satisfy
+//!   inside any single satisfying range bucket. When edge B's range is
+//!   `^3` and 4.17.21 doesn't satisfy
 //!   it, the resolver allocates a new node for `lodash@3.10.1` (or
 //!   whatever the best match is); both versions live independently in
 //!   the resolved tree, keyed by `(canonical, version)`.
@@ -34,10 +32,9 @@
 //!
 //! ## Dispatch model
 //!
-//! The loop is single-threaded — bun's PackageManager event loop runs on
-//! one thread, and parallelism comes from the I/O fan-out (the BfsWalker's
-//! 50-permit batch fetch + the existing 24-permit download pool). Each
-//! iteration:
+//! The loop is single-threaded; parallelism comes from the I/O fan-out
+//! (the BfsWalker's 50-permit batch fetch + the existing 24-permit download
+//! pool). Each iteration:
 //!
 //! 1. Pop an [`Edge`] off `task_queue`.
 //! 2. Resolve its canonical's manifest via [`ensure_manifest`] — fast path
@@ -46,8 +43,7 @@
 //!    [`tokio::sync::Notify`] up to `fetch_wait_timeout`, then falls
 //!    through to a direct registry fetch.
 //! 3. Pick a version with [`find_best_version`] (reverse-iterate sorted
-//!    versions; first satisfying match wins — matches bun's `npm.zig:
-//!    1808-1819`).
+//!    versions; first satisfying match wins).
 //! 4. Either reuse an existing node for `canonical` when the selected
 //!    version is compatible, or allocate a new one and enqueue its deps as fresh
 //!    edges.

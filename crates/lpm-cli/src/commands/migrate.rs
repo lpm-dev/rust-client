@@ -87,12 +87,11 @@ pub async fn run(
         }
     }
 
-    // #34 / #35 — plan the `pnpm.overrides` and
-    // `pnpm.patchedDependencies` translations BEFORE any file mutation
-    // so parse errors / shape errors / containment violations / merge
-    // conflicts / missing-integrity bindings surface up-front. Read
-    // package.json once here; both plans + the install-time warning
-    // logic want it.
+    // Plan the `pnpm.overrides` and `pnpm.patchedDependencies`
+    // translations before any file mutation so parse errors / shape
+    // errors / containment violations / merge conflicts /
+    // missing-integrity bindings surface up-front. Read package.json once
+    // here; both plans + the install-time warning logic want it.
     let pkg_json_path = cwd.join("package.json");
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
@@ -223,20 +222,18 @@ pub async fn run(
     let gitattributes_path = cwd.join(".gitattributes");
     migration_backup.backup_file(&gitattributes_path)?;
 
-    // #34 / #35 — back up package.json IFF EITHER plan is
-    // about to write to it. Skipping when there's nothing to apply
-    // keeps the backup surface narrow and avoids littering the
-    // project with stray `.backup` files for migrations that didn't
-    // touch the manifest.
+    // Back up package.json iff either plan is about to write to it.
+    // Skipping when there's nothing to apply keeps the backup surface
+    // narrow and avoids littering the project with stray `.backup` files
+    // for migrations that didn't touch the manifest.
     if overrides_plan.has_entries() || patches_plan.has_entries() {
         migration_backup.backup_file(&pkg_json_path)?;
     }
 
-    // #35 — for each non-self-copy patch entry whose
-    // destination ALREADY exists pre-migration (rare: user mid-manual-
-    // port), back up the destination so a rollback restores its prior
-    // content. Self-copy entries don't write to the destination, so
-    // they don't widen the backup surface.
+    // For each non-self-copy patch entry whose destination already exists
+    // pre-migration (rare: user mid-manual-port), back up the destination
+    // so a rollback restores its prior content. Self-copy entries don't
+    // write to the destination, so they don't widen the backup surface.
     for translation in &patches_plan.to_apply {
         if !translation.is_self_copy && translation.dest_pre_exists {
             migration_backup.backup_file(&translation.dest_absolute)?;
@@ -264,10 +261,10 @@ pub async fn run(
         render_written_file("lpm.lockb");
     }
 
-    // #34 — apply the validated `pnpm.overrides` translation
-    // to `package.json > lpm.overrides`. The plan was already checked
-    // for blocking errors before any disk mutation; reaching here means
-    // every entry in `to_apply` is parsable and non-conflicting.
+    // Apply the validated `pnpm.overrides` translation to
+    // `package.json > lpm.overrides`. The plan was already checked for
+    // blocking errors before any disk mutation; reaching here means every
+    // entry in `to_apply` is parsable and non-conflicting.
     //
     // On failure: the backup chain (extended above when the plan had
     // entries) carries package.json, so `migration_backup.rollback()`
@@ -286,8 +283,8 @@ pub async fn run(
         }
     }
 
-    // #35 — apply the validated `pnpm.patchedDependencies`
-    // translation. Per-entry: copy the source patch file into LPM's
+    // Apply the validated `pnpm.patchedDependencies` translation.
+    // Per-entry: copy the source patch file into LPM's
     // canonical `patches/<safe_key>.patch` location (skipped for
     // self-copy entries), then write the matching
     // `lpm.patchedDependencies[key] = { path, originalIntegrity }`
@@ -334,11 +331,11 @@ pub async fn run(
         }
     }
 
-    // #33 — apply the validated `pnpm.peerDependencyRules`
-    // translation to `lpm.peerDependencyRules`. Three sub-fields are
-    // appended/merged independently. Same rollback contract: any
-    // failure triggers `migration_backup.rollback()` which restores
-    // package.json from the backup taken alongside the lockfile.
+    // Apply the validated `pnpm.peerDependencyRules` translation to
+    // `lpm.peerDependencyRules`. Three sub-fields are appended/merged
+    // independently. Same rollback contract: any failure triggers
+    // `migration_backup.rollback()` which restores package.json from the
+    // backup taken alongside the lockfile.
     if peer_rules_plan.has_entries() {
         if let Err(e) = apply_peer_rules_to_package_json(&pkg_json_path, &peer_rules_plan) {
             render_migration_failure_with_rollback(&e, &migration_backup);

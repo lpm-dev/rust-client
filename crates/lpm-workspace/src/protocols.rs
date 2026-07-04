@@ -33,7 +33,7 @@ pub fn resolve_workspace_protocol(
                 "*" | "" => member_version.to_string(),
                 "^" => format!("^{member_version}"),
                 "~" => format!("~{member_version}"),
-                // workspace:>=1.0.0 → passthrough as-is (matches pnpm behavior)
+                // workspace:>=1.0.0 → passthrough as-is
                 exact => exact.to_string(),
             };
             resolved.push((name.clone(), original, range.clone()));
@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(deps["utils"], "1.2.3"); // exact passthrough
     }
 
-    /// `workspace:` with arbitrary semver range is a passthrough (matches pnpm behavior).
+    /// `workspace:` with arbitrary semver range is a passthrough.
     /// e.g., "workspace:>=1.0.0" for a member with version "2.0.0" → resolves to ">=1.0.0".
     #[test]
     fn workspace_semver_range_passthrough() {

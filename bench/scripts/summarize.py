@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Phase 56 W1 bench summary — median + paired t-stat across arms.
+"""Bench summary: median + paired t-stat across arms.
 
 Usage: $0 <results_dir>
 Reads iter-N-<arm>.wall_ms and prints per-arm distribution + paired comparisons.
 
 Arms: pubgrub-stream, greedy-stream, greedy-fusion, bun.
-At W1 HEAD (no fusion code yet) `greedy-fusion` collapses to default-walker greedy,
-so the harness-validation gate is "all three lpm arms within ±200 ms median."
-W3 reports the actual fusion delta after W2 wires the dispatcher.
 
 Critical t at α=0.05, df=19 (n=20) is 2.093.
 """
@@ -36,7 +33,7 @@ def stats(xs):
     med = statistics.median(xs)
     mean = statistics.mean(xs)
     sd = statistics.stdev(xs) if n > 1 else 0
-    # 10% trimmed mean per pre-plan §4 W3
+    # 10% trimmed mean.
     if n >= 10:
         trim = max(1, n // 10)
         sorted_xs = sorted(xs)
@@ -94,18 +91,13 @@ if 'bun' in loaded:
         ratio = med / bun_med
         print(f"  {arm:<18s} median={med:.0f} ms   {ratio:.2f}× bun")
 
-# Phase 56 W4+ gates — applied to the greedy-fusion arm only. The
-# pre-W2 baselines (pubgrub-stream ≈ 4020 ms, greedy-stream ≈ 3936 ms
-# on the W1 harness-validation run) are preserved here only as
-# regression sentinels: a sudden fusion median > 2000 ms would
-# invalidate the W3 result, but the W1-era same-arm reproducibility
-# gate is no longer informative now that fusion is the default and
-# baseline targets are 4× tighter.
+# Gates applied to the greedy-fusion arm only. The older stream baselines
+# are preserved here only as regression sentinels; same-arm reproducibility
+# is no longer informative now that fusion is the default and baseline
+# targets are tighter.
 #
-# Tightened tier (post-W3), per Phase 56 pre-plan §2.1 stretch +
-# user direction at W4:
-#   HARD     ≤ 1,500 ms (was W3 stretch)   — must clear or investigate
-#   STRETCH  ≤ 1,000 ms                     — bun-parity territory
+#   HARD     ≤ 1,500 ms                     — must clear or investigate
+#   STRETCH  ≤ 1,000 ms                     — stretch target
 #   STDEV    ≤   500 ms                     — tail-stability invariant
 HARD_GATE_MS = 1500
 STRETCH_GATE_MS = 1000

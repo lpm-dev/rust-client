@@ -1,4 +1,4 @@
-//! #33 — translate `package.json > pnpm.peerDependencyRules`
+//! Translate `package.json > pnpm.peerDependencyRules`
 //! into `package.json > lpm.peerDependencyRules`.
 //!
 //! Mirrors the layered shape used by [`super::migrate_overrides`] and
@@ -390,9 +390,9 @@ mod tests {
 
     #[test]
     fn idempotent_when_lpm_already_has_same_entries() {
-        // After a previous migrate, lpm.peerDependencyRules already
-        // mirrors pnpm.peerDependencyRules. The next migrate must be
-        // a no-op merge, not a conflict.
+        // After a previous migrate, lpm.peerDependencyRules already carries
+        // the same entries. The next migrate must be a no-op merge, not a
+        // conflict.
         let pkg = pkg_from(
             r#"{
                 "name": "x",
@@ -534,8 +534,8 @@ mod tests {
 
     #[test]
     fn allowed_versions_selector_grammar_translates_verbatim_for_valid_keys() {
-        // Full pnpm parity: bare names, scoped names, parent>peer,
-        // parent@range>peer, scoped parent — all translate verbatim.
+        // Bare names, scoped names, parent>peer, parent@range>peer, and
+        // scoped parent selectors all translate verbatim.
         // Includes scoped names whose package half starts with `.`
         // or `_` (npm-spec valid: the leading-char check fires
         // against the WHOLE name, which starts with `@`).
@@ -595,21 +595,17 @@ mod tests {
             "foo>react@2",
             ">react",
             "foo>",
-            // Glob wildcards must reject in every selector position
-            // (#33 second-pass: `is_valid_dep_name` is too
-            // permissive for the selector grammar — `*` slipped
-            // through pre-fix).
+            // Glob wildcards must reject in every selector position;
+            // `is_valid_dep_name` is too permissive for the selector grammar.
             "*",
             "@scope/*",
             "*-eslint-plugin",
             "foo>*",
             "*>react",
             "@*/foo>react",
-            // #33 third-pass: malformed non-wildcard names
-            // (spaces, uppercase, leading `.`/`_`, special chars)
-            // also slipped through `is_valid_dep_name` and silently
-            // no-op'd at runtime. The new strict npm-name predicate
-            // rejects them on both surfaces.
+            // Malformed non-wildcard names (spaces, uppercase, leading
+            // `.`/`_`, special chars) also need the strict npm-name predicate
+            // so both surfaces reject them.
             "foo bar",
             "FooBar",
             ".hidden",

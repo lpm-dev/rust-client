@@ -777,8 +777,7 @@ pub fn check_install_state_with_linker_and_integrity(
 /// Safety: only TRUSTS the stored hash when mtimes match. An adversary
 /// who can rewrite the file's manifest bytes also changes its mtime
 /// (any `fs::write` updates mtime); the only way to defeat this check
-/// is deliberate mtime tampering (`touch -t ...`), which is also
-/// sufficient to defeat npm/pnpm/bun. Acceptable tradeoff.
+/// is deliberate mtime tampering (`touch -t ...`). Acceptable tradeoff.
 ///
 /// when `.lpm/has-local-sources` exists,
 /// the project has file:/link: directory deps whose `package.json`

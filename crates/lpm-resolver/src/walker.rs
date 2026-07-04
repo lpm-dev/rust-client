@@ -374,8 +374,8 @@ impl BfsWalker {
     /// normal exit; [`WalkerError::Fatal`] on unrecoverable errors.
     ///
     /// Per-package fetch failures are logged at debug and the walk
-    /// continues — matches bun/pnpm semantics. The provider's escape-hatch
-    /// path will handle any package the walker skipped.
+    /// continues. The provider's escape-hatch path will handle any package
+    /// the walker skipped.
     ///
     /// `LPM_WALKER=stream` selects the continuous-stream walker;
     /// default is the level-step BFS walker.
@@ -668,10 +668,9 @@ impl BfsWalker {
         Ok(summary)
     }
 
-    /// Continuous-stream walker. Bun-style "fetch on manifest parse":
-    /// no level barrier; the moment a parent's manifest body lands and
-    /// reveals its `dependencies` map, each child is enqueued for fetching
-    /// independently. Concurrency is bounded by a single
+    /// Continuous-stream walker: no level barrier; the moment a parent's
+    /// manifest body lands and reveals its `dependencies` map, each child
+    /// is enqueued for fetching independently. Concurrency is bounded by a single
     /// `Semaphore(npm_fanout)` instead of per-level batching, so the
     /// throughput cap is global, not per-level.
     ///

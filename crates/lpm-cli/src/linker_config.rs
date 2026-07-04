@@ -14,7 +14,7 @@
 //!    CI runs.
 //! 4. `package.json > lpm > linker` — project-scoped value (read inside
 //!    the install pipeline because it lives next to the manifest read).
-//! 5. **Workspace-aware default** (Bun-parity heuristic): if
+//! 5. **Workspace-aware default**: if
 //!    [`lpm_workspace::discover_workspace`] resolves to a workspace root
 //!    (npm/yarn `workspaces` field OR `pnpm-workspace.yaml`) at the
 //!    project dir or any ancestor, return `Isolated` — strict per-package
@@ -88,8 +88,7 @@ impl LinkerModeSource {
 /// path (where the resolved mode is folded into the install-hash so a
 /// post-install env or config change invalidates the "up to date" cache).
 ///
-/// `project_dir` powers the workspace-detection step (Bun-parity, see
-/// the module-level doc): a project sitting under a workspace root
+/// `project_dir` powers the workspace-detection step: a project sitting under a workspace root
 /// auto-resolves to `Isolated` even without an explicit
 /// `package.json > lpm > linker` setting. Single-package projects keep
 /// the default `Hoisted`. Adding/removing a workspace globs file flips
@@ -143,7 +142,7 @@ pub(crate) fn resolve_effective_linker_with_source(
             .map_err(|e| format!("invalid `lpm.linker` in package.json: {e}"))?;
         return Ok((mode, LinkerModeSource::PackageJson));
     }
-    // Workspace-aware default — Bun-parity heuristic. `discover_workspace`
+    // Workspace-aware default. `discover_workspace`
     // walks up from `project_dir` looking for a root manifest with a
     // `workspaces` glob OR a `pnpm-workspace.yaml`; either signal flips
     // us to `Isolated`. On I/O failure (permission denied, broken parent

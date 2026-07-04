@@ -382,8 +382,7 @@ pub struct LpmConfig {
     #[serde(default, rename = "engineStrict")]
     pub engine_strict: Option<bool>,
 
-    /// LPM-native overrides location. Mirrors pnpm's `pnpm.overrides` and
-    /// npm's top-level `overrides`, but declared inside the `"lpm"` section
+    /// LPM-native overrides location, declared inside the `"lpm"` section
     /// so package authors can keep all LPM-aware config grouped together.
     ///
     /// Map of selector → target version/range. Selectors support:
@@ -416,9 +415,9 @@ pub struct LpmConfig {
     #[serde(default, rename = "patchedDependencies")]
     pub patched_dependencies: HashMap<String, PatchedDependencyEntry>,
 
-    /// Peer-dependency rules for the resolver. Mirrors pnpm's
+    /// Peer-dependency rules for the resolver. Uses the
     /// `pnpm.peerDependencyRules` shape verbatim so `lpm migrate` can
-    /// move pnpm authors over without surgery.
+    /// translate without value transformation.
     ///
     /// Three independent sub-keys; each addresses a distinct
     /// peer-dependency complaint:
@@ -458,8 +457,8 @@ pub struct LpmConfig {
     ///
     /// When `true` (or unset), missing non-optional peer dependencies
     /// are automatically promoted to ambient root-scoped installs by
-    /// the resolver — bun-parity behavior. When `false`, missing peers
-    /// fall back to pre-R2 warn-only semantics: the post-resolve
+    /// the resolver. When `false`, missing peers use warn-only semantics:
+    /// the post-resolve
     /// [`lpm_resolver::check_unmet_peers`] pass surfaces them as
     /// `PeerWarning`s and the user manually adds them to
     /// `dependencies`.
@@ -467,8 +466,7 @@ pub struct LpmConfig {
     /// **Default is `true` (auto-install on)** — beta-default favors
     /// the eager model so peer-declaring packages "just work" without
     /// the user having to re-read the install log to find missing
-    /// names. Set to `false` for the pnpm-classic / npm-classic
-    /// experience.
+    /// names. Set to `false` for warn-only peer handling.
     ///
     /// Precedence (resolved in `install.rs`):
     ///   `package.json > lpm > autoInstallPeers`
@@ -484,10 +482,10 @@ pub struct LpmConfig {
     /// Fail installs when peer-dependency warnings or best-effort peer
     /// conflicts are detected.
     ///
-    /// Default is `false`, matching pnpm's current default and LPM's
-    /// existing warn-only behavior. Set `true` for CI or strict
-    /// compatibility runs that should reject missing peers, incompatible
-    /// resolved peer versions, and peer-conflict fallback selections.
+    /// Default is `false`, preserving LPM's warn-only behavior. Set `true`
+    /// for CI or strict compatibility runs that should reject missing peers,
+    /// incompatible resolved peer versions, and peer-conflict fallback
+    /// selections.
     ///
     /// Precedence (resolved in `install.rs`):
     ///   CLI `--strict-peer-dependencies` / `--no-strict-peer-dependencies`
@@ -520,8 +518,8 @@ pub enum CatalogMode {
 /// rules consumed by the resolver's post-resolution peer-warning
 /// pass.
 ///
-/// Shape mirrors pnpm's `pnpm.peerDependencyRules` exactly so
-/// `lpm migrate` can translate without value transformation. See the
+/// Uses the `pnpm.peerDependencyRules` shape so `lpm migrate` can translate
+/// without value transformation. See the
 /// [`LpmConfig::peer_dependency_rules`] field doc for per-sub-key
 /// semantics.
 ///

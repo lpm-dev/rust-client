@@ -30,11 +30,9 @@ use std::path::Path;
 /// carry intentional package metadata (`.npmrc`, `.npmignore`,
 /// dotted bin shims).
 ///
-/// **Symlinks are absolute** (mirrors bun's strategy). Both
-/// absolute and relative are equally fragile under moves: identity
-/// includes the source path, so any move is already a re-resolve
-/// event. Absolute is the simpler default and matches the
-/// reference contract.
+/// **Symlinks are absolute.** Both absolute and relative are equally
+/// fragile under moves: identity includes the source path, so any move is
+/// already a re-resolve event. Absolute is the simpler default.
 ///
 /// Returns the count of symlinks created (used by the caller's
 /// `OnePackageResult::symlinks_created` stat).
