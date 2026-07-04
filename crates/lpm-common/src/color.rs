@@ -71,9 +71,8 @@ pub fn enabled() -> bool {
 /// an ANSI-wrapped string when enabled. Chainable on `String` so
 /// `text.green().bold()` works the same as the `OwoColorize` original.
 ///
-/// Only the methods actually used in the workspace are shadowed (verified by
-/// a `grep -E` audit on 2026-05-15). Adding a new color/style is a one-line
-/// addition here.
+/// Only the methods actually used in the workspace are shadowed. Adding a
+/// new color/style is a one-line addition here.
 pub trait Painted {
     fn green(&self) -> String;
     fn red(&self) -> String;

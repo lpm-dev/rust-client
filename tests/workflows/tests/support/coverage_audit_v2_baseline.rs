@@ -2,8 +2,7 @@
 //!
 //! v1 (`coverage_audit_baseline.rs`) tracks surface-level coverage and
 //! an accounted JSON contract status per row. That coarse metric
-//! saturated at 97.8% workflow / 70% JSON during the 2026-05-14 coverage
-//! push but doesn't reflect:
+//! saturated at 97.8% workflow / 70% JSON but doesn't reflect:
 //!
 //! - **Scenario depth.** A surface with 1 trivial test and one with 50
 //!   thorough tests get the same v1 flag.
@@ -28,8 +27,6 @@
 //!    contracts).
 //! 3. List the failure modes that ARE tested by name.
 //! 4. List the failure modes that are KNOWN but not tested — the gap.
-//!    See `private/test-gaps-strategic-audit.md` for the
-//!    by-category gap inventory.
 //! 5. Set `json_contract_depth` based on what the test file does:
 //!    - `None` — surface doesn't emit `--json`, OR tests don't read
 //!      the envelope.
@@ -2957,8 +2954,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     },
     // ── id 137: lpm install pnpm migration warnings ──
     //
-    // Carved out of id 12 during the 2026-05-14 v2 partition pass.
-    // These tests exercise install's cross-tool-input behavior: when a
+    // Split from id 12 because these tests exercise install's
+    // cross-tool-input behavior: when a
     // project still carries pnpm-shaped `overrides` / `patches` blocks
     // and `lpm migrate` either hasn't run, has partially translated,
     // or has diverged from the lpm-section state, install should
@@ -2992,8 +2989,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     },
     // ── id 138: lpm install linker validation (LPM_LINKER) ──
     //
-    // Carved out of id 12 during the 2026-05-14 v2 partition pass.
-    // These tests exercise install's config-validation contract for
+    // Split from id 12 because these tests exercise install's
+    // config-validation contract for
     // the LPM_LINKER env var + --linker CLI flag: unknown values are
     // rejected loudly at the earliest practical surface (clap parse,
     // env normalization, or sync fast-lane). Also covers the

@@ -1,8 +1,7 @@
 //! Tarball-extraction security contracts at the workflow tier.
 //!
-//! Item 3 of `private/test-coverage-followup-plan.md`. Pins the
-//! end-to-end behavior of `lpm install` against malicious tarballs
-//! served through the registry. Each test constructs the malicious
+//! These tests pin the end-to-end behavior of `lpm install` against malicious
+//! tarballs served through the registry. Each test constructs the malicious
 //! tarball **in-test** with `tar::Builder` (no checked-in fixtures —
 //! they age poorly and obscure intent), serves it via `MockRegistry`,
 //! runs `lpm install`, and asserts the contract:
@@ -23,13 +22,8 @@
 //!   extract → link) honors the same contracts when an attacker
 //!   reaches the extractor through `lpm install`.
 //!
-//! Findings surfaced during this work are filed in
-//! `private/findings.md`. Tests that pin a current behavior different
-//! from the plan's prescribed contract carry a `// TODO #NN — tighten
-//! when finding fixed` comment.
-//!
-//! See `private/test-coverage-followup-plan.md` for the full design
-//! and the 10-test surface.
+//! The test documentation names the current contract for each attack shape
+//! so future changes are reviewed deliberately.
 
 mod support;
 
@@ -1320,12 +1314,10 @@ async fn tarball_with_single_path_component_exceeding_name_max_fails_cleanly() {
     );
 }
 
-// ─── Additional candidate surfaces (added 2026-05-14) ───────────────
+// ─── Additional tarball attack surfaces ───────────────
 //
-// These tests cover the second-wave "Additional candidate surfaces"
-// rows from Item 3 of `private/test-coverage-followup-plan.md`. Each
-// row hardens the install pipeline against a tarball-shape attack
-// vector the 10 baseline tests above did not exercise.
+// Each test hardens the install pipeline against a tarball-shape attack
+// vector the baseline tests above did not exercise.
 
 /// **Candidate — PAX-extended path-header traversal is rejected.**
 ///

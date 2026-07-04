@@ -5,7 +5,7 @@
 //! v1 ([coverage_audit.rs](tests/workflows/tests/coverage_audit.rs)) tracks
 //! surface-level coverage and an accounted JSON contract status per row.
 //! That coarse metric saturated at 97.8% workflow / 70% JSON contract
-//! during the 2026-05-14 coverage push without reflecting:
+//! without reflecting:
 //!
 //! - **Scenario depth.** A surface with 1 trivial test and one with 50
 //!   thorough tests get the same v1 flag.
@@ -19,8 +19,7 @@
 //! See [`support/coverage_audit_v2_baseline.rs`](support/coverage_audit_v2_baseline.rs)
 //! for the schema and the populated rows.
 //!
-//! See [`private/test-gaps-strategic-audit.md`](private/test-gaps-strategic-audit.md)
-//! for the strategic gap inventory that informed the failure-mode lists.
+//! The failure-mode lists summarize the known coverage gaps for each surface.
 //!
 //! ## How these tests behave today
 //!
@@ -29,13 +28,10 @@
 //! - `EXPECT_FULL_V2_SURFACES_BACKFILL` — true once every
 //!   workflow-covered or cli-binary-covered surface has a v2 row.
 //!   When true, the backfill-progress test hard-fails if any surface
-//!   loses its v2 row. **Locked in 2026-05-14 after the 133/133
-//!   backfill landed.** Drop a new surface? You owe it a v2 row.
+//!   loses its v2 row. Drop a new surface? You owe it a v2 row.
 //! - `EXPECT_FULL_V2_FLOWS_BACKFILL` — true once every cross-command
 //!   flow has been implemented as an integration test and its row
-//!   marked `tested: true` with a `test_file` path. **Locked in
-//!   2026-05-14** after all 10 flows landed as
-//!   `tests/workflows/tests/cross_command_flows.rs`.
+//!   marked `tested: true` with a `test_file` path.
 //!
 //! Both flags are independent on purpose. Surface backfill and
 //! cross-command-flow implementation move at different speeds and
@@ -59,15 +55,13 @@ use v2::{CROSS_COMMAND_FLOWS, JsonContractDepth, SURFACES_V2};
 /// Locks in the surface backfill. When `true`, the
 /// `v2_backfill_progress_report_for_workflow_and_cli_binary_surfaces`
 /// test hard-fails if any v1-covered surface is missing its v2 row.
-/// Flipped to `true` on 2026-05-14 after every workflow-covered and
-/// cli-binary-covered surface gained a v2 entry.
+/// Enabled after every workflow-covered and cli-binary-covered surface gained
+/// a v2 entry.
 const EXPECT_FULL_V2_SURFACES_BACKFILL: bool = true;
 
 /// Locks in the cross-command flow backfill. When `true`, the
 /// `cross_command_flows_inventory_report` test hard-fails if any
-/// enumerated flow still has `tested: false`. Flipped to `true` on
-/// 2026-05-14 after all 10 flows shipped as
-/// `tests/workflows/tests/cross_command_flows.rs`.
+/// enumerated flow still has `tested: false`.
 const EXPECT_FULL_V2_FLOWS_BACKFILL: bool = true;
 
 // ─── Schema integrity ─────────────────────────────────────────────────
