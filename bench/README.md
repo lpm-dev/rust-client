@@ -26,7 +26,7 @@ LPM_BENCH_ALLOW_WIPE=1 ./bench/run.sh lpm-stages
 
 | Benchmark | What it measures |
 |-----------|-----------------|
-| `cold-install` | Full-round cold install — `rm -rf` INSIDE the timer. Measures the full "wipe + install" loop as a CI fresh-clone or bench iteration would see it. Pins Phase 32 guardrails. |
+| `cold-install` | Full-round cold install — `rm -rf` INSIDE the timer. Measures the full "wipe + install" loop as a CI fresh-clone or bench iteration would see it. Pins install performance guardrails. |
 | `cold-install-clean` | Equal-footing cold install — `rm -rf` OUTSIDE the timer. Measures the install command ALONE, so per-tool global-cache wipe asymmetry doesn't skew the cross-tool comparison. |
 | `warm-install` | Install with lockfile + cached packages (real-world daily workflow) |
 | `up-to-date` | Install with everything already in place (the no-op fast path agents care about) |
@@ -57,7 +57,7 @@ Empirical measurement (2026-04-14) confirmed that per-iteration `rm -rf` of each
 - Runs warm and up-to-date variants by default — both are non-destructive.
 - The cold variant wipes `~/.lpm/cache` and `~/.lpm/store` — only runs when `LPM_BENCH_ALLOW_WIPE=1` is set.
 - Per-stage timings are LPM-only because no other package manager exposes a stable structured shape for stage breakdowns.
-- Used by Phase 32 guardrail #3: install-path features must not regress these numbers.
+- Used by the install performance guardrail: install-path features must not regress these numbers.
 - Requires `python3` for portable JSON parsing.
 
 ### Local deterministic install benchmark (`local-install.sh`)

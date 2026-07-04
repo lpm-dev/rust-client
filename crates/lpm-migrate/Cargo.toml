@@ -2,6 +2,7 @@
 name = "lpm-migrate"
 version.workspace = true
 edition.workspace = true
+description = "Lockfile and workspace migration helpers for the LPM Rust client"
 license.workspace = true
 
 [dependencies]
