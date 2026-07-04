@@ -1898,7 +1898,7 @@ mod tests {
         let forbidden_root = tmp.path().join("forbidden-area");
         std::fs::create_dir_all(&forbidden_root).unwrap();
         let forbidden = forbidden_root.join(format!(
-            "lpm-sandbox-phase46.2-forbidden-{}.txt",
+            "lpm-sandbox-forbidden-write-{}.txt",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&forbidden);

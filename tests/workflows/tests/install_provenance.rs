@@ -502,17 +502,13 @@ async fn install_ignore_provenance_drift_all_requires_security_approval() {
 /// moved to attacker fork). Drift blocks with "publisher identity
 /// changed" verdict.
 ///
-/// **Ignored as of Phase 2.1.** The install path now goes through
-/// `sigstore_verify::verify_sigstore_bundle` which hard-fails on
-/// bundles missing `dsseEnvelope` / `tlogEntries` (the verifier's
-/// pre-flight check). The fixtures here are minimal v0.2 bundles
-/// designed for the pre-Phase-2.1 identity-only parser and
-/// intentionally lack those fields. The drift-comparator logic this
-/// test pins is still covered by the pure unit tests in
-/// `lpm-security::provenance`; what's missing is end-to-end coverage
-/// with REAL Sigstore bundles. Phase 3.1 of the C1 plan ships golden
-/// fixtures from real npm bundles which will let this test fly again.
-#[ignore = "Phase 2.1: needs full Sigstore bundle fixtures, deferred to Phase 3.1"]
+/// Ignored until this workflow has full Sigstore bundle fixtures. The install
+/// path now goes through `sigstore_verify::verify_sigstore_bundle`, which
+/// hard-fails on bundles missing `dsseEnvelope` / `tlogEntries`. The
+/// drift-comparator logic this test pins is still covered by the pure unit
+/// tests in `lpm-security::provenance`; what's missing is end-to-end coverage
+/// with real npm bundle fixtures.
+#[ignore = "needs full Sigstore bundle fixtures"]
 #[tokio::test]
 async fn install_drift_blocks_when_publisher_identity_changed() {
     let (project, mock) = setup_identity_changed().await;
@@ -539,14 +535,13 @@ async fn install_drift_blocks_when_publisher_identity_changed() {
 /// tuple intentionally excludes both. If this regresses, every
 /// legitimate patch bump hard-blocks.
 ///
-/// **Ignored as of Phase 2.1** for the same reason as
-/// `install_drift_blocks_when_publisher_identity_changed`: minimal
-/// v0.2 bundles can't satisfy the new verifier's `dsseEnvelope` /
-/// `tlogEntries` requirement. The comparator's
-/// excludes-workflow-ref-and-cert-sha rule is still pinned by
-/// `lpm-security::provenance`'s unit tests; this end-to-end test
-/// returns once Phase 3.1's golden fixtures land.
-#[ignore = "Phase 2.1: needs full Sigstore bundle fixtures, deferred to Phase 3.1"]
+/// Ignored for the same reason as
+/// `install_drift_blocks_when_publisher_identity_changed`: minimal v0.2
+/// bundles can't satisfy the verifier's `dsseEnvelope` / `tlogEntries`
+/// requirement. The comparator's excludes-workflow-ref-and-cert-sha rule is
+/// still pinned by `lpm-security::provenance`'s unit tests; this end-to-end
+/// test returns once real npm bundle fixtures land.
+#[ignore = "needs full Sigstore bundle fixtures"]
 #[tokio::test]
 async fn install_legitimate_release_bump_does_not_drift() {
     let (project, mock) = setup_legitimate_release_bump().await;

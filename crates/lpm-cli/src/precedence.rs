@@ -432,10 +432,10 @@ mod tests {
     ///
     /// `force-security-floor = false` + project `scriptPolicy = "allow"`
     /// (user unset) → effective is `allow`. project > user
-    /// order preserved for the legacy knob; the default flip is
-    /// the job, not's.
+    /// order preserved for the legacy knob; the security-floor default
+    /// is responsible for the stricter behavior.
     #[test]
-    fn legacy_knob_without_force_flag_preserves_phase46_order() {
+    fn legacy_knob_without_force_flag_preserves_project_over_user_order() {
         let inputs = PolicyInputs::<ScriptPolicy> {
             cli: None,
             project: Some(ScriptPolicy::Allow),

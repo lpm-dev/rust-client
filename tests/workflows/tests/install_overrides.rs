@@ -14,7 +14,7 @@
 //!    `lpm.overrides` is a hard error rather than a silent stale-link.
 //!
 //! In its own file (not appended to `install.rs`) because the helpers
-//! — `phase5_fingerprint` mirror, `seed_store_package`, lockfile/state
+//! — `override_state_fingerprint` mirror, `seed_store_package`, lockfile/state
 //! synthesis — are scoped to this gate. install.rs is also already
 //! past the file-size review trigger.
 //!
@@ -146,7 +146,7 @@ fn write_overrides_state(
 /// **MUST stay in sync** with the resolver's `compute_fingerprint`. If
 /// the resolver changes, this helper diverges and the matching-fingerprint
 /// test will fail loudly.
-fn phase5_fingerprint(entries: &[(&str, &str, &str)]) -> String {
+fn override_state_fingerprint(entries: &[(&str, &str, &str)]) -> String {
     use sha2::{Digest, Sha256};
     let mut canonical: Vec<String> = entries
         .iter()
@@ -421,7 +421,7 @@ fn offline_install_succeeds_when_overrides_fingerprint_matches() {
     );
     write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
     seed_store_package(&project, "lodash", "4.17.20");
-    let fingerprint = phase5_fingerprint(&[("lpm.overrides", "lodash", "4.17.20")]);
+    let fingerprint = override_state_fingerprint(&[("lpm.overrides", "lodash", "4.17.20")]);
     write_overrides_state(
         &project,
         &fingerprint,
