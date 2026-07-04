@@ -19,7 +19,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::npmrc::{NpmrcConfig, RegistryAuth, RegistryTarget};
+use crate::npmrc::{NpmrcConfig, RegistryAuth, RegistryKind, RegistryTarget};
+
+const JSR_NPM_REGISTRY_URL: &str = "https://npm.jsr.io";
 
 /// How the rust-client routes npm-scoped package fetches.
 ///
@@ -144,9 +146,11 @@ impl RouteTable {
     /// no errors). Convenience for callers that don't need `.npmrc`
     /// support, and for tests.
     pub fn from_mode_only(mode: RouteMode) -> Self {
+        let mut npmrc = NpmrcConfig::default();
+        npmrc.finalize();
         Self {
             mode,
-            npmrc: Arc::new(NpmrcConfig::default()),
+            npmrc: Arc::new(npmrc),
         }
     }
 
@@ -169,8 +173,9 @@ impl RouteTable {
     ///    always go through the Worker for auth + batch + attribution).
     /// 2. `@scope/foo` and `npmrc.scope_registries[@scope]` exists →
     ///    `Custom { target, auth }`.
-    /// 3. `npmrc.default_registry` is `Some(target)` → `Custom { … }`.
-    /// 4. Else → fall back to `mode.route_for_package(name)` (existing
+    /// 3. `@jsr/*` → `Custom { target: https://npm.jsr.io, auth }`.
+    /// 4. `npmrc.default_registry` is `Some(target)` → `Custom { … }`.
+    /// 5. Else → fall back to `mode.route_for_package(name)` (existing
     ///    2-arm `LpmWorker`/`NpmDirect` behavior).
     ///
     /// Auth lookup uses the **destination URL's origin**, not the
@@ -182,7 +187,23 @@ impl RouteTable {
         if name.starts_with("@lpm.dev/") {
             return UpstreamRoute::LpmWorker;
         }
-        if let Some(target) = self.npmrc.target_for_package(name) {
+        if let Some(target) = self.npmrc_scope_target_for_package(name) {
+            let auth = self.npmrc.auth_for_url(&target.base_url).cloned();
+            return UpstreamRoute::Custom {
+                target: target.clone(),
+                auth,
+            };
+        }
+        if name.starts_with("@jsr/") {
+            return UpstreamRoute::Custom {
+                target: RegistryTarget {
+                    base_url: Arc::from(JSR_NPM_REGISTRY_URL),
+                    kind: RegistryKind::NpmCompatible,
+                },
+                auth: self.npmrc.auth_for_url(JSR_NPM_REGISTRY_URL).cloned(),
+            };
+        }
+        if let Some(target) = self.npmrc.default_registry.as_ref() {
             let auth = self.npmrc.auth_for_url(&target.base_url).cloned();
             return UpstreamRoute::Custom {
                 target: target.clone(),
@@ -190,6 +211,15 @@ impl RouteTable {
             };
         }
         self.mode.route_for_package(name)
+    }
+
+    fn npmrc_scope_target_for_package(&self, name: &str) -> Option<&RegistryTarget> {
+        let scope_end = name.find('/')?;
+        let scope = name.get(..scope_end)?;
+        if !scope.starts_with('@') {
+            return None;
+        }
+        self.npmrc.scope_registries.get(&scope.to_ascii_lowercase())
     }
 
     /// Non-fatal warnings raised during npmrc parse + walker discovery.
@@ -468,6 +498,43 @@ mod tests {
     }
 
     #[test]
+    fn route_table_routes_jsr_scope_to_jsr_registry_by_default() {
+        let table = RouteTable::from_mode_only(RouteMode::Direct);
+        match table.route_for_package("@jsr/std__path") {
+            UpstreamRoute::Custom { target, auth } => {
+                assert_eq!(target.base_url.as_ref(), "https://npm.jsr.io");
+                assert_eq!(target.kind, RegistryKind::NpmCompatible);
+                assert!(auth.is_none());
+            }
+            other => panic!("expected Custom JSR route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_table_jsr_scope_registry_from_npmrc_overrides_builtin_jsr_registry() {
+        let npmrc = NpmrcConfig::parse("@jsr:registry=https://mirror.internal/\n", "test", &no_env);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
+        match table.route_for_package("@jsr/std__path") {
+            UpstreamRoute::Custom { target, .. } => {
+                assert_eq!(target.base_url.as_ref(), "https://mirror.internal");
+            }
+            other => panic!("expected Custom for @jsr scope override, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_table_jsr_builtin_precedes_default_registry_from_npmrc() {
+        let npmrc = NpmrcConfig::parse("registry=https://npm.internal/\n", "test", &no_env);
+        let table = RouteTable::new(RouteMode::Direct, npmrc).expect("npmrc has no errors");
+        match table.route_for_package("@jsr/std__path") {
+            UpstreamRoute::Custom { target, .. } => {
+                assert_eq!(target.base_url.as_ref(), "https://npm.jsr.io");
+            }
+            other => panic!("expected built-in JSR route, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn route_table_attaches_origin_matched_auth() {
         // Default registry + matching auth → Custom carries the auth.
         let content = concat!(
@@ -617,6 +684,19 @@ mod tests {
         );
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].host_lower, "registry.npmjs.org");
+    }
+
+    #[test]
+    fn effective_origins_jsr_specs_scope_to_jsr_registry() {
+        let table = make_table("", RouteMode::Direct);
+        let specs = vec!["@jsr/std__path".to_string()];
+        let got = table.effective_registry_origins(
+            &specs,
+            "https://lpm.dev",
+            "https://registry.npmjs.org",
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].host_lower, "npm.jsr.io");
     }
 
     /// Mixed top-level: one `@lpm.dev/*` + one bare → BOTH origins.

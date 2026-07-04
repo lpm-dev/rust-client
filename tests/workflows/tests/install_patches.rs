@@ -91,6 +91,10 @@ fn seed_store_package(
 
 /// Write a synthetic `lpm.lock`.
 fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
+    write_lockfile_at(project.path(), entries);
+}
+
+fn write_lockfile_at(base_dir: &std::path::Path, entries: &[(&str, &str, &[&str])]) {
     let pkgs: Vec<String> = entries
         .iter()
         .map(|(name, version, deps)| {
@@ -112,24 +116,28 @@ fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
         lpm_lockfile::LOCKFILE_VERSION,
         pkgs.join("\n")
     );
-    project.write_file("lpm.lock", &toml);
+    std::fs::write(base_dir.join("lpm.lock"), toml).unwrap();
 }
 
-fn patch_sha256(project: &TempProject, rel_path: &str) -> String {
+fn patch_sha256_at(base_dir: &std::path::Path, rel_path: &str) -> String {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(project.path().join(rel_path)).unwrap();
+    let bytes = std::fs::read(base_dir.join(rel_path)).unwrap();
     format!("sha256-{}", hex::encode(Sha256::digest(bytes)))
 }
 
 fn append_lockfile_patch_records(project: &TempProject, records: &[(&str, &str, &str)]) {
-    let mut toml = project.read_file("lpm.lock");
+    append_lockfile_patch_records_at(project.path(), records);
+}
+
+fn append_lockfile_patch_records_at(base_dir: &std::path::Path, records: &[(&str, &str, &str)]) {
+    let mut toml = std::fs::read_to_string(base_dir.join("lpm.lock")).unwrap();
     for (selector, path, integrity) in records {
         toml.push_str(&format!(
             "\n[patches.\"{selector}\"]\npath = \"{path}\"\nsha256 = \"{}\"\noriginal-integrity = \"{integrity}\"\n",
-            patch_sha256(project, path),
+            patch_sha256_at(base_dir, path),
         ));
     }
-    project.write_file("lpm.lock", &toml);
+    std::fs::write(base_dir.join("lpm.lock"), toml).unwrap();
 }
 
 /// Mirror of `patch_state::compute_fingerprint`. **MUST stay in sync**
@@ -295,6 +303,81 @@ fn install_patches_applied_after_link_in_isolated_layout() {
         std::fs::read_to_string(&nm_file).unwrap(),
         patched,
         "patch must be applied to the linked tree"
+    );
+}
+
+#[test]
+fn install_patches_in_workspace_member_resolve_path_from_member_manifest() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "patch-workspace-root",
+  "version": "0.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    let member_dir = project.path().join("packages/app");
+    std::fs::create_dir_all(member_dir.join("patches")).unwrap();
+
+    let original = "module.exports = 'orig'\n";
+    let patched = "module.exports = 'member-patched'\n";
+    let patch_text = "--- a/index.js\n+++ b/index.js\n@@ -1 +1 @@\n-module.exports = 'orig'\n+module.exports = 'member-patched'\n";
+    let integrity = seed_store_package(&project, "lodash", "4.17.21", &[("index.js", original)]);
+    let patch_rel = "patches/lodash@4.17.21.patch";
+    std::fs::write(member_dir.join(patch_rel), patch_text).unwrap();
+    std::fs::write(
+        member_dir.join("package.json"),
+        format!(
+            r#"{{
+  "name": "patch-workspace-member",
+  "version": "0.0.0",
+  "dependencies": {{ "lodash": "^4.17.21" }},
+  "lpm": {{
+    "patchedDependencies": {{
+      "lodash@4.17.21": {{
+        "path": "{patch_rel}",
+        "originalIntegrity": "{integrity}"
+      }}
+    }}
+  }}
+}}"#
+        ),
+    )
+    .unwrap();
+    write_lockfile_at(&member_dir, &[("lodash", "4.17.21", &[])]);
+    append_lockfile_patch_records_at(&member_dir, &[("lodash@4.17.21", patch_rel, &integrity)]);
+    let fingerprint = phase6_fingerprint(&[("lodash@4.17.21", patch_rel, &integrity)]);
+    let patch_state = serde_json::json!({
+        "state_version": 1,
+        "fingerprint": fingerprint,
+        "captured_at": "2026-04-12T00:00:00Z",
+        "parsed": [{
+            "raw_key": "lodash@4.17.21",
+            "name": "lodash",
+            "version": "4.17.21",
+            "path": patch_rel,
+            "original_integrity": "sha512-fixture",
+        }],
+        "applied": [],
+    });
+    std::fs::create_dir_all(member_dir.join(".lpm")).unwrap();
+    std::fs::write(
+        member_dir.join(".lpm/patch-state.json"),
+        serde_json::to_string_pretty(&patch_state).unwrap(),
+    )
+    .unwrap();
+
+    let mut cmd = lpm_isolated(&project, "http://127.0.0.1:1");
+    cmd.current_dir(&member_dir)
+        .args(["install", "--offline"])
+        .assert()
+        .success();
+
+    let nm_file = member_dir.join(".lpm/wrappers/lodash@4.17.21/node_modules/lodash/index.js");
+    assert_eq!(std::fs::read_to_string(&nm_file).unwrap(), patched);
+    assert!(
+        !project.path().join("patches/lodash@4.17.21.patch").exists(),
+        "test must not create a root-relative patch fallback"
     );
 }
 

@@ -227,33 +227,49 @@ pub(super) fn reject_workspace_self_dependency(
 
 pub(super) fn workspace_member_cache_info(
     member: &WorkspaceMemberLink,
-) -> Option<lpm_resolver::CachedPackageInfo> {
-    let version = lpm_resolver::NpmVersion::parse(&member.version).ok()?;
-    let pkg = lpm_workspace::read_package_json(&member.source_dir.join("package.json")).ok()?;
+) -> Result<Option<lpm_resolver::CachedPackageInfo>, LpmError> {
+    let Some(version) = lpm_resolver::NpmVersion::parse(&member.version).ok() else {
+        return Ok(None);
+    };
+    let pkg_json_path = member.source_dir.join("package.json");
+    let Ok(pkg) = lpm_workspace::read_package_json(&pkg_json_path) else {
+        return Ok(None);
+    };
     let version_str = version.to_string();
 
     let mut deps = HashMap::with_capacity(pkg.dependencies.len() + pkg.optional_dependencies.len());
     let mut aliases = HashMap::new();
     let mut optional_names = HashSet::with_capacity(pkg.optional_dependencies.len());
     {
-        let mut insert_dep =
-            |local_name: String, raw_spec: String| match lpm_resolver::ranges::parse_npm_alias(
-                &raw_spec,
-            ) {
+        let mut insert_dep = |local_name: String, raw_spec: String| -> Result<(), LpmError> {
+            let effective_spec = lpm_resolver::normalize_jsr_dependency(&local_name, &raw_spec)
+                .map_err(|err| {
+                    LpmError::Workspace(format!(
+                        "workspace member `{}` dependency `{local_name}` has invalid spec \
+                         `{raw_spec}` in {}: {err}",
+                        member.name,
+                        pkg_json_path.display(),
+                    ))
+                })?
+                .unwrap_or(raw_spec);
+
+            match lpm_resolver::ranges::parse_npm_alias(&effective_spec) {
                 Some(alias) => {
                     aliases.insert(local_name.clone(), alias.target);
                     deps.insert(local_name, alias.range);
                 }
                 None => {
-                    deps.insert(local_name, raw_spec);
+                    deps.insert(local_name, effective_spec);
                 }
-            };
+            }
+            Ok(())
+        };
         for (name, spec) in pkg.dependencies {
-            insert_dep(name, spec);
+            insert_dep(name, spec)?;
         }
         for (name, spec) in pkg.optional_dependencies {
             optional_names.insert(name.clone());
-            insert_dep(name, spec);
+            insert_dep(name, spec)?;
         }
     }
 
@@ -288,7 +304,7 @@ pub(super) fn workspace_member_cache_info(
     let mut dist = HashMap::with_capacity(1);
     dist.insert(version_str, lpm_resolver::CachedDistInfo::default());
 
-    Some(lpm_resolver::CachedPackageInfo {
+    Ok(Some(lpm_resolver::CachedPackageInfo {
         // Local workspace metadata is authoritative; avoid registry upgrade probes under policy checks.
         modified: Some("1970-01-01T00:00:00.000Z".to_string()),
         modified_unix: Some(0),
@@ -304,20 +320,21 @@ pub(super) fn workspace_member_cache_info(
         platform: HashMap::new(),
         dist,
         aliases: aliases_by_version,
-    })
+    }))
 }
 
 pub(super) fn seed_workspace_resolver_cache(
     shared_cache: &lpm_resolver::SharedCache,
     members: &[WorkspaceMemberLink],
-) {
+) -> Result<(), LpmError> {
     for member in members {
-        let Some(info) = workspace_member_cache_info(member) else {
+        let Some(info) = workspace_member_cache_info(member)? else {
             continue;
         };
         let key = lpm_resolver::CanonicalKey::from_dep_name(&member.name);
         shared_cache.insert(key, Arc::new(info));
     }
+    Ok(())
 }
 
 pub(super) fn workspace_member_source(project_dir: &Path, source_dir: &Path) -> String {

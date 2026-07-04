@@ -125,6 +125,21 @@ fn manifest_install_deps(pkg: &lpm_workspace::PackageJson) -> HashMap<String, St
     deps
 }
 
+fn normalize_jsr_manifest_deps(deps: &mut HashMap<String, String>) -> Result<(), LpmError> {
+    for (name, spec) in deps.iter_mut() {
+        if let Some(normalized) =
+            lpm_resolver::normalize_jsr_dependency(name, spec).map_err(|err| {
+                LpmError::Registry(format!(
+                    "dep '{name}' in package.json has invalid spec '{spec}': {err}"
+                ))
+            })?
+        {
+            *spec = normalized;
+        }
+    }
+    Ok(())
+}
+
 fn release_age_policy_applies_to_install_package(
     policy: crate::release_age_config::ReleaseAgePolicy,
     package: &InstallPackage,
@@ -1132,7 +1147,8 @@ async fn run_with_options_under_store_lock(
         configured_linker_mode
     };
     let requested_v2_mode = lpm_store::StoreVersion::from_env().is_v2();
-    let manifest_deps = manifest_install_deps(&pkg);
+    let mut manifest_deps = manifest_install_deps(&pkg);
+    normalize_jsr_manifest_deps(&mut manifest_deps)?;
     let production_dependency_names: HashSet<String> = pkg.dependencies.keys().cloned().collect();
     reject_remote_tarball_url_deps_with_policy_extensions(
         &policy_extension_configs,
@@ -2764,7 +2780,7 @@ async fn run_with_options_under_store_lock(
                     );
 
                     let shared_cache: lpm_resolver::SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
+                    seed_workspace_resolver_cache(&shared_cache, &all_workspace_members)?;
                     let (spec_tx, spec_rx) =
                         tokio::sync::mpsc::channel::<(String, SpeculativePackageMetadata)>(512);
                     let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
@@ -2897,7 +2913,7 @@ async fn run_with_options_under_store_lock(
                     // aborted" invariant.
                     use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
                     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
-                    seed_workspace_resolver_cache(&shared_cache, &all_workspace_members);
+                    seed_workspace_resolver_cache(&shared_cache, &all_workspace_members)?;
                     let notify_map: NotifyMap = Arc::new(dashmap::DashMap::new());
                     // wait-loop shutdown handshake: the walker stores
                     // `true` (Release) and broadcasts `notify_waiters()` across

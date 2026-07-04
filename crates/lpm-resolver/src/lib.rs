@@ -53,7 +53,7 @@ pub use resolve::{
     resolve_with_shared_cache_options, resolve_with_shared_cache_options_and_policy,
     validate_allowed_versions_range, validate_allowed_versions_selector,
 };
-pub use specifier::{Specifier, SpecifierParseError};
+pub use specifier::{Specifier, SpecifierParseError, normalize_jsr_dependency};
 pub use speculation::SpeculativePackageMetadata;
 pub use walker::{BfsWalker, DEFAULT_NPM_FANOUT, LevelTiming, WalkerError, WalkerSummary};
 

@@ -184,6 +184,52 @@ fn workspace_protocol_dep_is_extracted_before_resolver_sees_it() {
     );
 }
 
+#[test]
+fn workspace_member_cache_info_normalizes_jsr_dependency_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let member_dir = dir.path().join("packages/app");
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(
+        member_dir.join("package.json"),
+        r#"{
+  "name": "app",
+  "version": "1.0.0",
+  "dependencies": {
+    "@std/path": "jsr:@std/path@1.1.6"
+  }
+}"#,
+    )
+    .unwrap();
+
+    let info = workspace_member_cache_info(&WorkspaceMemberLink {
+        name: "app".to_string(),
+        version: "1.0.0".to_string(),
+        source_dir: member_dir,
+    })
+    .expect("valid jsr dependency should normalize")
+    .expect("valid workspace member should produce cache info");
+
+    let deps = info
+        .deps
+        .get("1.0.0")
+        .expect("workspace member version should have dependency metadata");
+    assert_eq!(
+        deps.get("@std/path").map(String::as_str),
+        Some("1.1.6"),
+        "JSR dependency must be cached as the npm-alias target range"
+    );
+
+    let aliases = info
+        .aliases
+        .get("1.0.0")
+        .expect("workspace member version should have alias metadata");
+    assert_eq!(
+        aliases.get("@std/path").map(String::as_str),
+        Some("@jsr/std__path"),
+        "JSR dependency must map the local package name to the npm.jsr.io package"
+    );
+}
+
 /// `discover_workspace` must walk up from a member dir to the workspace
 /// root so `workspace:^` extraction can run.
 #[test]
