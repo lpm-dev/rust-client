@@ -55,8 +55,8 @@ pub async fn run(action: &str, deep: bool, fix: bool, json_output: bool) -> Resu
 /// Blunt store wipe — removes `~/.lpm/store/v1/` AND
 /// `~/.lpm/store/v2/` in their entirety.
 ///
-/// This is the phase-37 counterpart to the old `lpm cache clean`
-/// behavior: an explicit, scoped, named command for the rare "nuke
+/// This preserves the old whole-store wipe behavior as an explicit,
+/// scoped, named command for the rare "nuke
 /// everything" workflow. For everyday maintenance use
 /// `lpm cache prune --apply`, which is reference-aware and won't evict packages
 /// currently referenced by a project lockfile.

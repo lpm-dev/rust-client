@@ -642,8 +642,8 @@ pub async fn run(
     }
 
     // Multi-member confirmation prompt — mirror of the install-side
-    // `confirm_multi_member_mutation` call. See its docstring and the
-    // phase 2 status doc's  entry for the full contract.
+    // `confirm_multi_member_mutation` call. See its docstring for the
+    // full contract.
     if targets.multi_member {
         crate::commands::install::confirm_multi_member_mutation(
             "Removing",

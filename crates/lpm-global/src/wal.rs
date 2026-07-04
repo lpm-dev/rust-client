@@ -199,8 +199,7 @@ pub struct TrustPruneEntry {
 }
 
 /// One ownership mutation applied during commit and replayed during
-/// recovery. See the section of the phase-37 plan for the full
-/// model. Each variant carries everything needed to (a) apply the
+/// recovery. Each variant carries everything needed to (a) apply the
 /// mutation idempotently in roll-forward and (b) undo it in roll-back.
 ///
 /// Snapshot bodies inside are `serde_json::Value` rather than strong

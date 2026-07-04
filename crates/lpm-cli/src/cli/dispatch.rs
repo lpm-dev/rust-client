@@ -613,7 +613,7 @@ async fn async_main() -> Result<()> {
                 ));
             }
 
-            // Token expiry warnings (Feature 42)
+            // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
                     output::warn(&warning);
@@ -1090,7 +1090,7 @@ async fn async_main() -> Result<()> {
             target,
             no_engine_strict,
         } => {
-            // Token expiry warnings (Feature 42)
+            // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
                     output::warn(&warning);
@@ -1139,7 +1139,7 @@ async fn async_main() -> Result<()> {
             no_provenance,
             provenance_file,
         } => {
-            // Token expiry warnings (Feature 42)
+            // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
                     output::warn(&warning);

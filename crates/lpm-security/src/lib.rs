@@ -13,7 +13,6 @@
 //! 3. **Minimum release age** (future) — block packages published less than 24h ago.
 //!
 //! Supply chain security: SLSA, Sigstore, typosquatting, OSV audit, release age.
-//! See phase-19-todo.md.
 
 pub mod behavioral;
 pub mod provenance;

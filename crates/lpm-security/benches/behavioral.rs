@@ -2,7 +2,7 @@
 //!
 //! Run: `cargo bench -p lpm-security`
 //!
-//! Performance budget (from phase-25-todo.md):
+//! Performance budget:
 //! - analyze_package (100 files, 500KB): < 100ms
 //! - Shannon entropy, 1000 strings: < 5ms
 //! - Regex compilation (OnceLock): < 10ms (one-time)
